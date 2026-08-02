@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
 from datetime import datetime, timezone, timedelta
@@ -15,6 +16,7 @@ CANON_SOURCE_CONTRACT_VERSION = "canon_source_contract_v1"
 HYBRID_CANON_CLAIM_CONTRACT_VERSION = "hybrid_canon_claim_v1"
 CANON_CLAIM_ID_NAMESPACE = "bnl_canon_claim_identity_v1"
 LEGACY_CANON_ADAPTER_VERSION = "legacy_canon_adapter_v1"
+DECLARED_CANON_ADAPTER_VERSION = "declared_canon_adapter_v1"
 BROADCAST_CANON_ADAPTER_VERSION = "broadcast_declared_adapter_v1"
 LIVING_CANON_ADAPTER_VERSION = "living_canon_adapter_v1"
 OPEN_SIGNAL_ADAPTER_VERSION = "open_signal_adapter_v1"
@@ -200,6 +202,9 @@ class CanonClaim:
     recurrence_contract_version: str = ""
     projection_state: str = "shadow"
     projection_version: str = HYBRID_CANON_CLAIM_CONTRACT_VERSION
+    subject_type: str = ""
+    object_subject_type: str = ""
+    object_subject_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -334,9 +339,10 @@ _BINDING_RECEIPT_PREFIXES = (
     "owner_command:",
     "service_receipt:",
 )
-_DECLARATION_RECEIPT_PREFIXES = (
-    "owner_command:",
-    "service_receipt:",
+_TRUSTED_SERVICE_ACTOR_REFS = frozenset(
+    {
+        "service_actor:legacy_canon_registry_v1",
+    }
 )
 
 
@@ -369,7 +375,7 @@ def _claim_revision_payload(
 ) -> tuple[Any, ...]:
     """Return every normalized field that makes one immutable revision."""
 
-    return (
+    payload = (
         HYBRID_CANON_CLAIM_CONTRACT_VERSION,
         claim.source_revision,
         claim.claim_id,
@@ -399,6 +405,16 @@ def _claim_revision_payload(
         claim.projection_state,
         claim.projection_version,
     )
+    typed_identity = (
+        str(claim.subject_type or ""),
+        str(claim.object_subject_type or ""),
+        str(claim.object_subject_id or ""),
+    )
+    # Preserve existing revision IDs for adapters that predate typed subjects;
+    # a Declared claim opts into the extension by carrying at least one field.
+    if any(typed_identity):
+        payload += ("typed_subject_contract_v1", *typed_identity)
+    return payload
 
 
 def _finalize_claim_revision(
@@ -448,11 +464,8 @@ def _explicit_contract_false(value: Any) -> bool:
 def _opaque_actor_valid(actor: Any) -> bool:
     normalized_actor = str(actor or "").strip()
     return bool(
-        re.fullmatch(r"discord_user:[0-9]+", normalized_actor)
-        or re.fullmatch(
-            r"(?:owner_ref|service_actor):[a-z0-9][a-z0-9_.:-]{0,127}",
-            normalized_actor,
-        )
+        re.fullmatch(r"discord_user:[1-9][0-9]{0,24}", normalized_actor)
+        or normalized_actor in _TRUSTED_SERVICE_ACTOR_REFS
     )
 
 
@@ -556,7 +569,7 @@ def adapt_legacy_canon_fact(fact: CanonFact) -> CanonClaim:
         visibility=fact.visibility,
         lifecycle=ClaimLifecycle.ESTABLISHED,
         confidence=fact.confidence,
-        authority_actor="owner_ref:legacy_registry",
+        authority_actor="service_actor:legacy_canon_registry_v1",
         authority_receipt=(
             "code_revision:%s" % CANON_SOURCE_CONTRACT_VERSION
         ),
@@ -587,6 +600,27 @@ def _mapping_text(row: Mapping[str, Any], *keys: str) -> str:
     return ""
 
 
+@contextmanager
+def _read_snapshot(conn: Any):
+    """Reuse a caller transaction or own one read-only SQLite snapshot."""
+
+    owns_snapshot = not bool(getattr(conn, "in_transaction", False))
+    before_changes = int(getattr(conn, "total_changes", 0) or 0)
+    if owns_snapshot:
+        conn.execute("BEGIN")
+    try:
+        yield
+        if int(getattr(conn, "total_changes", 0) or 0) != before_changes:
+            raise RuntimeError("read_snapshot_mutated_state")
+    except Exception:
+        if owns_snapshot and bool(getattr(conn, "in_transaction", False)):
+            conn.rollback()
+        raise
+    else:
+        if owns_snapshot and bool(getattr(conn, "in_transaction", False)):
+            conn.commit()
+
+
 def adapt_broadcast_memory_claim(
     row: Mapping[str, Any],
     *,
@@ -594,11 +628,13 @@ def adapt_broadcast_memory_claim(
     authority_actor: str = "",
     authority_receipt: str = "",
 ) -> CanonAdapterResult:
-    """Build a read-only Declared projection from one Broadcast source row.
+    """Build the raw Broadcast compatibility view.
 
-    Historical or unauthenticated rows intentionally remain review-only.  PR 2
-    owns mutation APIs and the full Declared lifecycle; this adapter only
-    freezes the common shape and prevents legacy type coercion.
+    A ``broadcast_memory`` row is first-party source material, not proof that
+    the owner declared it canon.  The legacy caller authority parameters are
+    retained only for source compatibility and are intentionally ignored.  An
+    exact, current ``declared_canon_revisions`` join is the only path to the
+    Declared read model (see :func:`adapt_declared_canon_revision`).
     """
 
     row_id = _mapping_text(row, "id", "row_id")
@@ -610,18 +646,11 @@ def adapt_broadcast_memory_claim(
         return CanonAdapterResult(None, "missing_broadcast_source_identity")
     subject_id = _mapping_text(row, "subject_id", "subject_key") or BARCODE_RADIO.key
     defaults = BROADCAST_DECLARED_TYPE_DEFAULTS.get(entry_type)
-    status = (_mapping_text(row, "status") or "active").casefold()
     recognized = defaults is not None
     if defaults is None:
         domain, claim_kind = CanonDomain.BROADCAST_HISTORY, ClaimKind.OTHER
     else:
         domain, claim_kind = defaults
-    if status == "superseded":
-        lifecycle = ClaimLifecycle.SUPERSEDED
-    elif status == "resolved":
-        lifecycle = ClaimLifecycle.RESOLVED
-    else:
-        lifecycle = ClaimLifecycle.REVIEW_ONLY
     source_ref = "broadcast_memory:%s" % row_id
     claim_id = _stable_claim_id(
         "broadcast_memory",
@@ -633,44 +662,9 @@ def adapt_broadcast_memory_claim(
         "updated_at",
         "created_at",
     ) or row_id
-    owner_authorized = strict_contract_bool(owner_authorized)
-    authority_verified = bool(
-        owner_authorized
-        and _opaque_authority_valid(
-            authority_actor,
-            authority_receipt,
-            receipt_prefixes=_DECLARATION_RECEIPT_PREFIXES,
-        )
-    )
-    public_safe = strict_contract_bool(row.get("public_safe"))
-    usage_scope = {
-        token.strip().casefold()
-        for token in _mapping_text(row, "usage_scope").split(",")
-        if token.strip()
-    }
-    public_route_scope = bool(
-        "internal" not in usage_scope
-        and entry_type != "moderation_context"
-        and bool(
-            usage_scope.intersection(
-                {
-                    "ambient",
-                    "direct",
-                    "public",
-                    "public_context",
-                    "relay",
-                    "show_status",
-                }
-            )
-        )
-    )
-    public_projection = bool(
-        authority_verified
-        and cleaned_value
-        and public_safe
-        and public_route_scope
-        and status == "active"
-    )
+    # Do not remove these compatibility parameters until all external callers
+    # have migrated.  Reading them would recreate the pre-PR2 authority bug.
+    _ = (owner_authorized, authority_actor, authority_receipt)
     supersedes = _mapping_text(row, "supersedes_id")
     correction_of = _mapping_text(row, "correction_of")
     claim = CanonClaim(
@@ -679,11 +673,7 @@ def adapt_broadcast_memory_claim(
         subject_id=subject_id,
         predicate=entry_type,
         value=value,
-        canon_status=(
-            CanonStatus.DECLARED
-            if authority_verified
-            else CanonStatus.OPEN_SIGNAL
-        ),
+        canon_status=CanonStatus.OPEN_SIGNAL,
         domain=domain,
         claim_kind=claim_kind,
         source_system="broadcast_memory",
@@ -692,25 +682,17 @@ def adapt_broadcast_memory_claim(
         source_refs=(source_ref,),
         root_ids=(source_ref,),
         occurrence_ids=(source_ref,),
-        visibility=(
-            Visibility.PUBLIC_SAFE
-            if public_projection
-            else Visibility.INTERNAL
-        ),
-        lifecycle=lifecycle,
-        confidence=(Confidence.HIGH if authority_verified else Confidence.LOW),
-        authority_actor=(authority_actor if authority_verified else ""),
-        authority_receipt=(authority_receipt if authority_verified else ""),
-        eligible_routes=(
-            ("broadcast_memory", "public_home")
-            if public_projection
-            else ("broadcast_memory",)
-        ),
+        visibility=Visibility.INTERNAL,
+        lifecycle=ClaimLifecycle.REVIEW_ONLY,
+        confidence=Confidence.LOW,
+        authority_actor="",
+        authority_receipt="",
+        eligible_routes=("broadcast_memory",),
         valid_from=_mapping_text(row, "valid_from", "created_at"),
         valid_until=_mapping_text(row, "valid_until"),
         supersedes=(("broadcast_memory:%s" % supersedes,) if supersedes else ()),
         correction_of=(("broadcast_memory:%s" % correction_of,) if correction_of else ()),
-        projection_state="review_only" if lifecycle == ClaimLifecycle.REVIEW_ONLY else "shadow",
+        projection_state="review_only",
         projection_version=BROADCAST_CANON_ADAPTER_VERSION,
     )
     claim = _with_final_revision(
@@ -720,16 +702,235 @@ def adapt_broadcast_memory_claim(
     return CanonAdapterResult(
         claim,
         (
-            "superseded_or_resolved"
-            if lifecycle
-            in {ClaimLifecycle.SUPERSEDED, ClaimLifecycle.RESOLVED}
-            else "legacy_type_review_only"
+            "legacy_type_review_only"
             if not recognized
-            else "owner_verified_review_only"
-            if authority_verified
-            else "owner_authority_review_only"
+            else "broadcast_source_review_only"
         ),
     )
+
+
+def _declared_revision_claim(
+    revision: Any,
+    *,
+    broadcast_row: Mapping[str, Any] | None = None,
+) -> CanonClaim:
+    """Normalize one already-validated PR2 revision without adding authority."""
+
+    from bnl_declared_canon import (
+        BROADCAST_MEMORY_SOURCE,
+        GENERAL_DECLARATION_SOURCE,
+    )
+
+    routes = tuple(json.loads(str(revision.eligible_routes_json or "[]")))
+    domain = CanonDomain(str(revision.domain))
+    claim_kind = ClaimKind(str(revision.claim_kind))
+    visibility = Visibility(str(revision.visibility))
+    lifecycle = ClaimLifecycle(str(revision.lifecycle_status))
+    declaration_ref = "declared_canon:%s" % revision.declaration_id
+    revision_ref = "declared_canon_revision:%s" % revision.revision_id
+    correction_of = (
+        ("declared_canon_revision:%s" % revision.correction_of_revision_id,)
+        if revision.correction_of_revision_id
+        else ()
+    )
+    supersedes = (
+        ("declared_canon:%s" % revision.supersedes_declaration_id,)
+        if revision.supersedes_declaration_id
+        else ()
+    )
+    if revision.source_system == BROADCAST_MEMORY_SOURCE:
+        if broadcast_row is None:
+            raise ValueError("broadcast_source_required")
+        source_ref = "broadcast_memory:%s" % revision.source_row_id
+        value: Any = _mapping_text(broadcast_row, "cleaned_summary")
+        if not value:
+            raise ValueError("broadcast_cleaned_summary_required")
+        source_supersedes = _mapping_text(broadcast_row, "supersedes_id")
+        if source_supersedes:
+            supersedes = tuple(
+                dict.fromkeys(
+                    (*supersedes, "broadcast_memory:%s" % source_supersedes)
+                )
+            )
+        claim_id = _stable_claim_id("broadcast_memory", source_ref)
+        source_system = "broadcast_memory"
+        source_refs = (source_ref, revision_ref)
+        root_ids = (source_ref,)
+        source_class = SourceClass.FIRST_PARTY_RECORD
+    elif revision.source_system == GENERAL_DECLARATION_SOURCE:
+        source_ref = declaration_ref
+        value = json.loads(str(revision.value_json))
+        claim_id = _stable_claim_id("declared_canon", declaration_ref)
+        source_system = "declared_canon"
+        source_refs = (declaration_ref, revision_ref)
+        root_ids = (declaration_ref,)
+        source_class = (
+            SourceClass.OWNER_CORRECTION
+            if str(revision.operation) == "correct"
+            else SourceClass.APPROVED_CANON
+        )
+    else:
+        raise ValueError("declared_source_system_invalid")
+    if claim_kind == ClaimKind.RELATIONSHIP:
+        value = {
+            "value": value,
+            "object_subject_type": str(revision.object_subject_type),
+            "object_subject_id": str(revision.object_subject_id),
+        }
+    adapter_version = (
+        BROADCAST_CANON_ADAPTER_VERSION
+        if revision.source_system == BROADCAST_MEMORY_SOURCE
+        else DECLARED_CANON_ADAPTER_VERSION
+    )
+    claim = CanonClaim(
+        claim_id=claim_id,
+        revision_id="",
+        subject_id=str(revision.subject_id),
+        predicate=str(revision.predicate),
+        value=value,
+        canon_status=CanonStatus.DECLARED,
+        domain=domain,
+        claim_kind=claim_kind,
+        source_system=source_system,
+        adapter_version=adapter_version,
+        source_class=source_class,
+        source_refs=source_refs,
+        root_ids=root_ids,
+        occurrence_ids=root_ids,
+        visibility=visibility,
+        lifecycle=lifecycle,
+        confidence=Confidence.APPROVED,
+        authority_actor=str(revision.authority_actor),
+        authority_receipt=str(revision.authority_receipt),
+        eligible_routes=routes,
+        valid_from=str(revision.valid_from or ""),
+        valid_until=str(revision.valid_until or ""),
+        supersedes=supersedes,
+        correction_of=correction_of,
+        projection_state="shadow",
+        projection_version=adapter_version,
+        subject_type=str(revision.subject_type),
+        object_subject_type=str(revision.object_subject_type or ""),
+        object_subject_id=str(revision.object_subject_id or ""),
+    )
+    return _with_final_revision(
+        claim,
+        source_revision=str(revision.revision_id),
+    )
+
+
+def _adapt_declared_canon_revision_in_snapshot(
+    conn: Any,
+    *,
+    actor_user_id: int,
+    authority_nonce: str,
+    guild_id: int,
+    declaration_id: str,
+    expected_revision_id: str,
+    expected_source_fingerprint: str,
+    now: str = "",
+) -> CanonAdapterResult:
+    """Adapt an exact current PR2 revision through its owner read boundary.
+
+    The lifecycle module revalidates stored authority, latest-revision state,
+    validity, and the authoritative source.  Broadcast content is then read a
+    second time and fingerprinted as the exact value snapshot returned here.
+    No schema is created and the result remains shadow-only/non-live.
+    """
+
+    from bnl_declared_canon import (
+        BROADCAST_MEMORY_SOURCE,
+        DECLARED_CANON_CONTRACT_VERSION,
+        DeclaredCanonError,
+        _digest,
+        validate_current_declared_canon_revision,
+    )
+
+    before = int(getattr(conn, "total_changes", 0) or 0)
+    try:
+        revision = validate_current_declared_canon_revision(
+            conn,
+            actor_user_id=int(actor_user_id or 0),
+            authority_nonce=str(authority_nonce or ""),
+            guild_id=int(guild_id or 0),
+            declaration_id=str(declaration_id or ""),
+            expected_revision_id=str(expected_revision_id or ""),
+            expected_source_fingerprint=str(expected_source_fingerprint or ""),
+            now=str(now or ""),
+        )
+        if revision.source_system == BROADCAST_MEMORY_SOURCE:
+            expected_declaration_id = "dcl_" + _digest(
+                DECLARED_CANON_CONTRACT_VERSION,
+                int(guild_id or 0),
+                BROADCAST_MEMORY_SOURCE,
+                int(revision.source_row_id),
+            )[:32]
+            if revision.declaration_id != expected_declaration_id:
+                return CanonAdapterResult(
+                    None, "declared_broadcast_identity_invalid"
+                )
+            duplicate_authorities = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT declaration_id)
+                    FROM main.declared_canon_revisions
+                    WHERE guild_id=? AND source_system='broadcast_memory'
+                      AND source_row_id=?
+                    """,
+                    (int(guild_id or 0), str(revision.source_row_id)),
+                ).fetchone()[0]
+                or 0
+            )
+            if duplicate_authorities != 1:
+                return CanonAdapterResult(
+                    None, "declared_broadcast_duplicate_authority"
+                )
+        evaluation_now = (
+            _parse_contract_time(now)
+            if str(now or "").strip()
+            else datetime.now(timezone.utc)
+        )
+        if evaluation_now is None:
+            return CanonAdapterResult(None, "declared_validation_now_invalid")
+        claim, internal_reason = _inventory_current_declared_claim(
+            conn,
+            revision,
+            now=evaluation_now,
+        )
+        if claim is None:
+            return CanonAdapterResult(None, internal_reason)
+    except (DeclaredCanonError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        code = getattr(exc, "code", "") or str(exc or "invalid")
+        return CanonAdapterResult(None, "declared_%s" % code)
+    if int(getattr(conn, "total_changes", 0) or 0) != before:
+        return CanonAdapterResult(None, "declared_adapter_mutated_state")
+    return CanonAdapterResult(claim, "declared_shadow_current", False)
+
+
+def adapt_declared_canon_revision(
+    conn: Any,
+    *,
+    actor_user_id: int,
+    authority_nonce: str,
+    guild_id: int,
+    declaration_id: str,
+    expected_revision_id: str,
+    expected_source_fingerprint: str,
+    now: str = "",
+) -> CanonAdapterResult:
+    """Return one exact current Declared claim from one read snapshot."""
+
+    with _read_snapshot(conn):
+        return _adapt_declared_canon_revision_in_snapshot(
+            conn,
+            actor_user_id=actor_user_id,
+            authority_nonce=authority_nonce,
+            guild_id=guild_id,
+            declaration_id=declaration_id,
+            expected_revision_id=expected_revision_id,
+            expected_source_fingerprint=expected_source_fingerprint,
+            now=now,
+        )
 
 
 def _normalized_identity_tuple(value: Any) -> tuple[str, ...]:
@@ -1391,6 +1592,9 @@ def canon_claim_inventory_diagnostics(
     normalized_claims = tuple(claims)
     claim_scopes: dict[str, set[str]] = {}
     revision_payloads: dict[str, set[str]] = {}
+    current_source_claims: dict[tuple[str, str], set[str]] = {}
+    declared_root_authorities: dict[str, set[str]] = {}
+    declared_subject_types: dict[str, set[str]] = {}
     for claim in normalized_claims:
         claim_scopes.setdefault(claim.claim_id, set()).add(
             _stable_contract_digest(
@@ -1401,6 +1605,20 @@ def canon_claim_inventory_diagnostics(
         revision_payloads.setdefault(claim.revision_id, set()).add(
             _stable_contract_digest(*_claim_revision_payload(claim))
         )
+        primary_source_ref = claim.source_refs[0] if claim.source_refs else ""
+        if primary_source_ref:
+            current_source_claims.setdefault(
+                (claim.source_system, primary_source_ref), set()
+            ).add(claim.revision_id)
+        if claim.canon_status == CanonStatus.DECLARED:
+            if claim.subject_id and claim.subject_type:
+                declared_subject_types.setdefault(claim.subject_id, set()).add(
+                    claim.subject_type
+                )
+            for root_id in set(claim.root_ids):
+                declared_root_authorities.setdefault(root_id, set()).add(
+                    str(claim.authority_receipt or "")
+                )
     account_entities: dict[tuple[str, str], set[str]] = {}
     for binding in bindings:
         if not strict_contract_bool(binding.active) or not _binding_authority_valid(
@@ -1444,6 +1662,43 @@ def canon_claim_inventory_diagnostics(
             for claim in normalized_claims
             if claim.revision_id != _finalize_claim_revision(claim)
         ),
+        "duplicateCurrentSourceClaimCount": sum(
+            1
+            for revision_ids in current_source_claims.values()
+            if len(revision_ids) > 1
+        ),
+        "duplicateRootWithinClaimCount": sum(
+            1
+            for claim in normalized_claims
+            if len(claim.root_ids) != len(set(claim.root_ids))
+        ),
+        "duplicateDeclaredRootAuthorityCount": sum(
+            1
+            for receipts in declared_root_authorities.values()
+            if len(receipts) > 1
+        ),
+        "declaredTypedSubjectCount": sum(
+            1
+            for claim in normalized_claims
+            if claim.canon_status == CanonStatus.DECLARED and claim.subject_type
+        ),
+        "declaredUntypedSubjectCount": sum(
+            1
+            for claim in normalized_claims
+            if claim.canon_status == CanonStatus.DECLARED and not claim.subject_type
+        ),
+        "declaredRelationshipEndpointMissingCount": sum(
+            1
+            for claim in normalized_claims
+            if claim.canon_status == CanonStatus.DECLARED
+            and claim.claim_kind == ClaimKind.RELATIONSHIP
+            and (not claim.object_subject_type or not claim.object_subject_id)
+        ),
+        "declaredSubjectIdMultiTypeCount": sum(
+            1
+            for subject_types in declared_subject_types.values()
+            if len(subject_types) > 1
+        ),
         "identityBindingCollisionCount": sum(
             1 for entity_ids in account_entities.values() if len(entity_ids) > 1
         ),
@@ -1480,15 +1735,18 @@ def canon_claim_inventory_diagnostics(
 
 
 def _sqlite_table_columns(conn: Any, table_name: str) -> tuple[str, ...]:
+    normalized_table = str(table_name or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized_table):
+        raise ValueError("sqlite_table_name_invalid")
     if not conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        (str(table_name or ""),),
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=?",
+        (normalized_table,),
     ).fetchone():
         return ()
     return tuple(
         str(row[1] or "")
         for row in conn.execute(
-            "PRAGMA table_info(%s)" % str(table_name or "")
+            "PRAGMA main.table_info(%s)" % normalized_table
         ).fetchall()
         if len(row) > 1 and str(row[1] or "")
     )
@@ -1502,6 +1760,7 @@ def _inventory_table_rows(
     guild_id: int | None,
     limit: int,
 ) -> tuple[int, tuple[dict[str, Any], ...], bool]:
+    normalized_table = str(table_name or "").strip()
     columns = _sqlite_table_columns(conn, table_name)
     selected = tuple(column for column in wanted_columns if column in columns)
     if not columns:
@@ -1516,7 +1775,7 @@ def _inventory_table_rows(
         params.append(int(guild_id or 0))
     total = int(
         conn.execute(
-            "SELECT COUNT(*) FROM %s%s" % (table_name, where),
+            "SELECT COUNT(*) FROM main.%s%s" % (normalized_table, where),
             tuple(params),
         ).fetchone()[0]
         or 0
@@ -1538,7 +1797,12 @@ def _inventory_table_rows(
     )
     rows = conn.execute(
         "SELECT %s FROM %s%s ORDER BY %s LIMIT ?"
-        % (",".join(selected), table_name, where, order_column),
+        % (
+            ",".join(selected),
+            "main.%s" % normalized_table,
+            where,
+            order_column,
+        ),
         (*params, max(1, min(int(limit or 1), 2000))),
     ).fetchall()
     return (
@@ -1563,7 +1827,8 @@ def _inventory_scoped_lineage_map(
 ) -> dict[str, list[str]]:
     """Load roots only for the bounded owners already selected for inventory."""
 
-    columns = _sqlite_table_columns(conn, table_name)
+    normalized_table = str(table_name or "").strip()
+    columns = _sqlite_table_columns(conn, normalized_table)
     required = {owner_column, root_column}
     normalized_ids = tuple(
         dict.fromkeys(str(value or "").strip() for value in owner_ids)
@@ -1588,7 +1853,7 @@ def _inventory_scoped_lineage_map(
             % (
                 owner_column,
                 root_column,
-                table_name,
+                "main.%s" % normalized_table,
                 " AND ".join(where),
                 owner_column,
                 root_column,
@@ -1600,11 +1865,353 @@ def _inventory_scoped_lineage_map(
     return result
 
 
-def build_claim_contract_inventory(
+def _inventory_current_declared_claim(
+    conn: Any,
+    revision: Any,
+    *,
+    now: datetime,
+) -> tuple[CanonClaim | None, str]:
+    """Validate one latest sidecar revision for content-free inventory use.
+
+    Unlike the value-returning public adapter, inventory does not impersonate
+    an authenticated owner request.  It validates stored authority directly,
+    constructs a claim only in memory, and emits counts rather than content.
+    """
+
+    from bnl_declared_canon import (
+        BROADCAST_MEMORY_SOURCE,
+        BROADCAST_TYPE_DEFAULTS,
+        BROADCAST_USAGE_SCOPES,
+        GENERAL_DECLARATION_SOURCE,
+        PUBLIC_VISIBILITIES,
+        _broadcast_lifecycle,
+        _broadcast_row,
+        _general_fingerprint,
+        _require_revision_contract,
+        _scope_tokens,
+        _stored_authority_valid,
+        _validate_broadcast_public_routes,
+        _validity_window_state,
+        broadcast_source_fingerprint,
+    )
+
+    try:
+        if not _stored_authority_valid(revision):
+            return None, "declared_stored_authority_invalid"
+        _require_revision_contract(revision)
+        if str(revision.lifecycle_status) != "established":
+            return None, "declared_latest_historical"
+        if _validity_window_state(
+            revision.valid_from,
+            revision.valid_until,
+            now,
+        ) not in {"unbounded", "current"}:
+            return None, "declared_validity_not_current"
+        broadcast_row = None
+        if revision.source_system == GENERAL_DECLARATION_SOURCE:
+            if revision.source_row_id != revision.declaration_id:
+                return None, "declared_general_identity_invalid"
+            fields = {
+                "raw_declaration": revision.raw_declaration,
+                "cleaned_summary": revision.cleaned_summary,
+                "subject_type": revision.subject_type,
+                "subject_id": revision.subject_id,
+                "object_subject_type": revision.object_subject_type,
+                "object_subject_id": revision.object_subject_id,
+                "predicate": revision.predicate,
+                "value_json": revision.value_json,
+                "domain": revision.domain,
+                "claim_kind": revision.claim_kind,
+                "visibility": revision.visibility,
+                "eligible_routes_json": revision.eligible_routes_json,
+                "valid_from": revision.valid_from,
+                "valid_until": revision.valid_until,
+            }
+            if _general_fingerprint(fields) != revision.source_fingerprint:
+                return None, "declared_general_fingerprint_invalid"
+        elif revision.source_system == BROADCAST_MEMORY_SOURCE:
+            try:
+                source_row_id = int(str(revision.source_row_id))
+            except (TypeError, ValueError):
+                return None, "declared_broadcast_identity_invalid"
+            broadcast_row = _broadcast_row(
+                conn,
+                guild_id=int(revision.guild_id),
+                row_id=source_row_id,
+            )
+            if broadcast_row is None:
+                return None, "declared_broadcast_source_missing"
+            if (
+                broadcast_source_fingerprint(broadcast_row)
+                != str(revision.source_fingerprint)
+            ):
+                return None, "declared_broadcast_fingerprint_stale"
+            if _broadcast_lifecycle(broadcast_row, now) != "established":
+                return None, "declared_broadcast_source_not_current"
+            entry_type = str(broadcast_row.get("entry_type") or "")
+            recognized = entry_type in BROADCAST_TYPE_DEFAULTS
+            classification_mode = str(revision.classification_mode)
+            legacy_mode = classification_mode == "owner_explicit_legacy_mapping"
+            if recognized == legacy_mode:
+                return None, "declared_broadcast_mapping_invalid"
+            if classification_mode == "owner_explicit_default_mapping":
+                default_domain, default_kind = BROADCAST_TYPE_DEFAULTS[entry_type]
+                if (
+                    str(revision.domain) != default_domain
+                    or str(revision.claim_kind) != default_kind
+                    or str(revision.predicate) != entry_type
+                ):
+                    return None, "declared_broadcast_default_mapping_invalid"
+            scopes = _scope_tokens(broadcast_row.get("usage_scope"))
+            if scopes.difference(BROADCAST_USAGE_SCOPES):
+                return None, "declared_broadcast_scope_unrecognized"
+            if revision.visibility in PUBLIC_VISIBILITIES:
+                if (
+                    not strict_contract_bool(broadcast_row.get("public_safe"))
+                    or "internal" in scopes
+                    or entry_type == "moderation_context"
+                ):
+                    return None, "declared_broadcast_public_intersection_invalid"
+                _validate_broadcast_public_routes(
+                    routes_json=revision.eligible_routes_json,
+                    source_scopes=scopes,
+                )
+        else:
+            return None, "declared_source_system_invalid"
+        return (
+            _declared_revision_claim(
+                revision,
+                broadcast_row=broadcast_row,
+            ),
+            "declared_shadow_current",
+        )
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return None, "declared_%s" % (str(exc or "invalid"))
+
+
+def _inventory_declared_canon_claims(
+    conn: Any,
+    *,
+    guild_id: int | None,
+    broadcast_rows: Sequence[Mapping[str, Any]],
+    limit: int,
+    now: datetime,
+) -> tuple[tuple[CanonClaim, ...], dict[str, CanonClaim], dict[str, int], bool]:
+    """Load latest PR2 sidecars without exposing source or revision IDs."""
+
+    from bnl_declared_canon import (
+        BROADCAST_MEMORY_SOURCE,
+        DECLARED_CANON_TABLE,
+        GENERAL_DECLARATION_SOURCE,
+        _REVISION_COLUMNS,
+        _digest,
+        _row_to_revision,
+        DECLARED_CANON_CONTRACT_VERSION,
+    )
+
+    stats = Counter(
+        {
+            "declaredRevisionCount": 0,
+            "declaredHistoricalRevisionCount": 0,
+            "declaredCurrentClaimCount": 0,
+            "declaredInvalidLatestCount": 0,
+            "broadcastDeclaredCurrentCount": 0,
+            "broadcastOpenReviewCount": len(broadcast_rows),
+            "broadcastStaleSidecarCount": 0,
+            "broadcastDuplicateAuthorityCount": 0,
+            "declaredOrphanBroadcastSourceCount": 0,
+        }
+    )
+    columns = set(_sqlite_table_columns(conn, DECLARED_CANON_TABLE))
+    if not columns:
+        return (), {}, dict(stats), False
+    if not set(_REVISION_COLUMNS).issubset(columns) or guild_id is None:
+        return (), {}, dict(stats), True
+    safe_limit = max(1, min(int(limit or 1), 2000))
+    scoped_guild = int(guild_id or 0)
+    total_revisions, total_declarations = conn.execute(
+        """
+        SELECT COUNT(*),COUNT(DISTINCT declaration_id)
+        FROM main.declared_canon_revisions WHERE guild_id=?
+        """,
+        (scoped_guild,),
+    ).fetchone()
+    stats["declaredRevisionCount"] = int(total_revisions or 0)
+    stats["declaredHistoricalRevisionCount"] = max(
+        0, int(total_revisions or 0) - int(total_declarations or 0)
+    )
+    general_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(DISTINCT declaration_id)
+            FROM main.declared_canon_revisions
+            WHERE guild_id=? AND source_system=?
+            """,
+            (scoped_guild, GENERAL_DECLARATION_SOURCE),
+        ).fetchone()[0]
+        or 0
+    )
+    general_rows = conn.execute(
+        """
+        SELECT %s
+        FROM main.declared_canon_revisions d
+        JOIN (
+          SELECT declaration_id,MAX(revision_number) AS max_revision
+          FROM main.declared_canon_revisions
+          WHERE guild_id=? AND source_system=?
+          GROUP BY declaration_id
+        ) latest
+          ON latest.declaration_id=d.declaration_id
+         AND latest.max_revision=d.revision_number
+        WHERE d.guild_id=? AND d.source_system=?
+        ORDER BY d.declaration_id LIMIT ?
+        """ % ",".join("d.%s" % column for column in _REVISION_COLUMNS),
+        (
+            scoped_guild,
+            GENERAL_DECLARATION_SOURCE,
+            scoped_guild,
+            GENERAL_DECLARATION_SOURCE,
+            safe_limit,
+        ),
+    ).fetchall()
+    general_claims: list[CanonClaim] = []
+    for raw_revision in general_rows:
+        claim, _reason = _inventory_current_declared_claim(
+            conn,
+            _row_to_revision(raw_revision),
+            now=now,
+        )
+        if claim is None:
+            stats["declaredInvalidLatestCount"] += 1
+        else:
+            general_claims.append(claim)
+            stats["declaredCurrentClaimCount"] += 1
+
+    broadcast_ids = tuple(
+        dict.fromkeys(
+            _mapping_text(row, "id", "row_id") for row in broadcast_rows
+        )
+    )
+    broadcast_ids = tuple(value for value in broadcast_ids if value)
+    sidecar_counts: dict[str, int] = {}
+    expected_declarations: dict[str, str] = {
+        source_id: "dcl_"
+        + _digest(
+            DECLARED_CANON_CONTRACT_VERSION,
+            scoped_guild,
+            BROADCAST_MEMORY_SOURCE,
+            int(source_id),
+        )[:32]
+        for source_id in broadcast_ids
+        if str(source_id).isdigit()
+    }
+    if broadcast_ids:
+        for start in range(0, len(broadcast_ids), 400):
+            chunk = broadcast_ids[start : start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            for source_id, declaration_count in conn.execute(
+                """
+                SELECT source_row_id,COUNT(DISTINCT declaration_id)
+                FROM main.declared_canon_revisions
+                WHERE guild_id=? AND source_system=?
+                  AND source_row_id IN (%s)
+                GROUP BY source_row_id
+                """ % placeholders,
+                (scoped_guild, BROADCAST_MEMORY_SOURCE, *chunk),
+            ).fetchall():
+                sidecar_counts[str(source_id)] = int(declaration_count or 0)
+    latest_by_source: dict[str, Any] = {}
+    expected_ids = tuple(expected_declarations.values())
+    for start in range(0, len(expected_ids), 400):
+        chunk = expected_ids[start : start + 400]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            """
+            SELECT %s
+            FROM main.declared_canon_revisions d
+            JOIN (
+              SELECT declaration_id,MAX(revision_number) AS max_revision
+              FROM main.declared_canon_revisions
+              WHERE guild_id=? AND declaration_id IN (%s)
+              GROUP BY declaration_id
+            ) latest
+              ON latest.declaration_id=d.declaration_id
+             AND latest.max_revision=d.revision_number
+            WHERE d.guild_id=? AND d.source_system=?
+            """ % (
+                ",".join("d.%s" % column for column in _REVISION_COLUMNS),
+                placeholders,
+            ),
+            (
+                scoped_guild,
+                *chunk,
+                scoped_guild,
+                BROADCAST_MEMORY_SOURCE,
+            ),
+        ).fetchall()
+        for raw_revision in rows:
+            revision = _row_to_revision(raw_revision)
+            latest_by_source[str(revision.source_row_id)] = revision
+    broadcast_claims: dict[str, CanonClaim] = {}
+    for source_id in broadcast_ids:
+        declaration_count = sidecar_counts.get(source_id, 0)
+        if declaration_count == 0:
+            continue
+        if declaration_count != 1:
+            stats["broadcastDuplicateAuthorityCount"] += 1
+            stats["broadcastStaleSidecarCount"] += 1
+            continue
+        revision = latest_by_source.get(source_id)
+        if revision is None:
+            stats["broadcastStaleSidecarCount"] += 1
+            continue
+        claim, _reason = _inventory_current_declared_claim(
+            conn,
+            revision,
+            now=now,
+        )
+        if claim is None:
+            stats["broadcastStaleSidecarCount"] += 1
+            continue
+        broadcast_claims[source_id] = claim
+        stats["broadcastDeclaredCurrentCount"] += 1
+        stats["broadcastOpenReviewCount"] -= 1
+        stats["declaredCurrentClaimCount"] += 1
+
+    stats["declaredOrphanBroadcastSourceCount"] = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+              SELECT d.source_row_id
+              FROM main.declared_canon_revisions d
+              LEFT JOIN main.broadcast_memory b
+                ON b.guild_id=d.guild_id
+               AND CAST(b.id AS TEXT)=d.source_row_id
+              WHERE d.guild_id=? AND d.source_system=? AND b.id IS NULL
+              GROUP BY d.source_row_id
+            )
+            """,
+            (scoped_guild, BROADCAST_MEMORY_SOURCE),
+        ).fetchone()[0]
+        or 0
+    ) if _sqlite_table_columns(conn, "broadcast_memory") else 0
+    truncated = bool(general_count > len(general_rows))
+    return (
+        tuple(general_claims),
+        broadcast_claims,
+        dict(stats),
+        truncated,
+    )
+
+
+def _build_claim_contract_inventory_in_snapshot(
     conn: Any,
     *,
     guild_id: int | None = None,
     max_rows_per_source: int = 2000,
+    now: datetime | str | None = None,
 ) -> dict[str, Any]:
     """Build a bounded, content-free, zero-write adapter inventory.
 
@@ -1615,6 +2222,17 @@ def build_claim_contract_inventory(
     """
 
     before_changes = int(getattr(conn, "total_changes", 0) or 0)
+    if isinstance(now, datetime):
+        inventory_now = now
+        if inventory_now.tzinfo is None:
+            inventory_now = inventory_now.replace(tzinfo=timezone.utc)
+        inventory_now = inventory_now.astimezone(timezone.utc)
+    elif now is None or not str(now or "").strip():
+        inventory_now = datetime.now(timezone.utc)
+    else:
+        inventory_now = _parse_contract_time(now)
+        if inventory_now is None:
+            inventory_now = datetime.min.replace(tzinfo=timezone.utc)
     claims: list[CanonClaim] = [
         adapt_legacy_canon_fact(fact) for fact in CANON_FACTS
     ]
@@ -1680,8 +2298,34 @@ def build_claim_contract_inventory(
     inspected_rows["broadcast_memory"] = len(broadcast_rows)
     if broadcast_truncated:
         truncated_sources.append("broadcast_memory")
+    (
+        general_declared_claims,
+        broadcast_declared_claims,
+        declared_inventory_stats,
+        declared_inventory_truncated,
+    ) = _inventory_declared_canon_claims(
+        conn,
+        guild_id=guild_id,
+        broadcast_rows=broadcast_rows,
+        limit=max_rows_per_source,
+        now=inventory_now,
+    )
+    claims.extend(general_declared_claims)
+    reason_counts["declared_shadow_current"] += len(general_declared_claims)
+    if declared_inventory_truncated:
+        truncated_sources.append("declared_canon_revisions")
     for row in broadcast_rows:
-        result = adapt_broadcast_memory_claim(row)
+        source_id = _mapping_text(row, "id", "row_id")
+        declared_claim = broadcast_declared_claims.get(source_id)
+        result = (
+            CanonAdapterResult(
+                declared_claim,
+                "declared_shadow_current",
+                False,
+            )
+            if declared_claim is not None
+            else adapt_broadcast_memory_claim(row)
+        )
         reason_counts[result.reason] += 1
         if result.claim is not None:
             claims.append(result.claim)
@@ -1885,9 +2529,28 @@ def build_claim_contract_inventory(
             "sourceAdaptedReconciled": complete_source_reconciliation,
             "sourceReconciliationStatus": reconciliation_status,
             "mutationCount": max(0, after_changes - before_changes),
+            **declared_inventory_stats,
         }
     )
     return diagnostics
+
+
+def build_claim_contract_inventory(
+    conn: Any,
+    *,
+    guild_id: int | None = None,
+    max_rows_per_source: int = 2000,
+    now: datetime | str | None = None,
+) -> dict[str, Any]:
+    """Build the bounded content-free inventory from one read snapshot."""
+
+    with _read_snapshot(conn):
+        return _build_claim_contract_inventory_in_snapshot(
+            conn,
+            guild_id=guild_id,
+            max_rows_per_source=max_rows_per_source,
+            now=now,
+        )
 
 
 def canon_facts_for_subject(

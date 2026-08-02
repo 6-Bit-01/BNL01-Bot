@@ -338,7 +338,8 @@ class OwnerOnlySurfaceTests(unittest.IsolatedAsyncioTestCase):
 
         bnl01_bot._broadcast_memory_denial_last_at.clear()
         non_owner_message.reply.reset_mock()
-        with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 999):
+        with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 999), \
+             mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 10):
             denied = await bnl01_bot.maybe_reject_unauthorized_official_broadcast_memory(
                 non_owner_message,
                 "Official show note.",
@@ -355,6 +356,34 @@ class OwnerOnlySurfaceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(allowed)
         owner_message.reply.assert_not_awaited()
+
+        bnl01_bot._broadcast_memory_denial_last_at.clear()
+        owner_message.reply.reset_mock()
+        with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 999), \
+             mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 0):
+            unconfigured = await bnl01_bot.maybe_reject_unauthorized_official_broadcast_memory(
+                owner_message,
+                "Official show note.",
+            )
+        self.assertTrue(unconfigured)
+        self.assertIn("BNL_PRIMARY_GUILD_ID", owner_message.reply.await_args.args[0])
+
+        bnl01_bot._broadcast_memory_denial_last_at.clear()
+        owner_message.reply.reset_mock()
+        cross_guild_message = SimpleNamespace(
+            guild=SimpleNamespace(id=11),
+            channel=channel,
+            author=SimpleNamespace(id=999),
+            reply=AsyncMock(),
+        )
+        with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 999), \
+             mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 10):
+            cross_guild = await bnl01_bot.maybe_reject_unauthorized_official_broadcast_memory(
+                cross_guild_message,
+                "Official show note.",
+            )
+        self.assertTrue(cross_guild)
+        self.assertIn("primary guild", cross_guild_message.reply.await_args.args[0])
 
     async def test_broadcast_memory_route_denies_admin_and_allows_owner_storage(self):
         admin = member(3, administrator=True)
@@ -388,6 +417,7 @@ class OwnerOnlySurfaceTests(unittest.IsolatedAsyncioTestCase):
         }]
 
         with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 999), \
+             mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 10), \
              patched_broadcast_memory_route(processed) as (process, add):
             await bnl01_bot.on_message(denied_message)
             process.assert_not_awaited()

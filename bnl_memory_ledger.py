@@ -7,6 +7,7 @@ adapters may consume only revalidated, route-safe projections.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -7555,31 +7556,597 @@ def shadow_broadcast_memory_row(conn: sqlite3.Connection, *, row_id: int, guild_
 
 
 def _unique_broadcast_primary_entry(conn: sqlite3.Connection, *, guild_id: int, source_row_id: int | str) -> str:
+    entries = _effective_broadcast_primary_entries(
+        conn,
+        guild_id=guild_id,
+        source_row_id=source_row_id,
+    )
+    return entries[0] if len(entries) == 1 else ""
+
+
+@dataclass(frozen=True)
+class BroadcastEffectiveRepresentations:
+    """Every unretracted Ledger representation of one Broadcast source row."""
+
+    primary_entry_ids: tuple[str, ...] = ()
+    declared_projection_entry_ids: tuple[str, ...] = ()
+
+    @property
+    def all_entry_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                set(self.primary_entry_ids)
+                | set(self.declared_projection_entry_ids)
+            )
+        )
+
+
+def _entry_is_unretracted_sql(alias: str) -> str:
+    return """
+        NOT EXISTS (
+            SELECT 1 FROM memory_ledger_lineage AS incoming
+            WHERE incoming.guild_id={alias}.guild_id
+              AND incoming.target_entry_id={alias}.entry_id
+              AND incoming.lineage_type IN ('supersedes','retracts')
+        )
+    """.format(alias=alias)
+
+
+def _effective_broadcast_representations(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    source_row_id: int | str,
+) -> BroadcastEffectiveRepresentations:
+    """Return all effective roots and Declared shadows for one Broadcast row.
+
+    A projection may still be effective after its primary root was already
+    retracted or even removed.  Root lineage therefore discovers ordinary
+    projections from *all* matching roots, while the authoritative Declared
+    sidecar mapping catches an orphan whose root/edge is missing.  Multiplicity
+    is preserved for invalidation; this helper never elects one row as truth.
+    """
+
     ensure_memory_ledger_schema(conn)
-    rows = conn.execute(
-        "SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND source_table='broadcast_memory' AND source_row_id=? AND source_role='broadcast_memory' ORDER BY created_at DESC",
-        (guild_id, str(source_row_id)),
+    normalized_guild_id = int(guild_id or 0)
+    normalized_source_row_id = str(source_row_id)
+    effective_clause = _entry_is_unretracted_sql("entry")
+    primary_rows = conn.execute(
+        """
+        SELECT entry.entry_id
+        FROM memory_ledger_entries AS entry
+        WHERE entry.guild_id=?
+          AND entry.source_table='broadcast_memory'
+          AND entry.source_row_id=?
+          AND entry.source_role='broadcast_memory'
+          AND %s
+        ORDER BY entry.created_at,entry.entry_id
+        """ % effective_clause,
+        (normalized_guild_id, normalized_source_row_id),
     ).fetchall()
-    return rows[0][0] if len(rows) == 1 else ""
+    primary_ids = {
+        str(row[0]) for row in primary_rows if str(row[0] or "")
+    }
+
+    projection_clause = _entry_is_unretracted_sql("projection_row")
+    derived_projection_rows = conn.execute(
+        """
+        SELECT DISTINCT projection_row.entry_id
+        FROM memory_ledger_entries AS projection_row
+        JOIN memory_ledger_lineage AS source_edge
+          ON source_edge.guild_id=projection_row.guild_id
+         AND source_edge.entry_id=projection_row.entry_id
+         AND source_edge.lineage_type='derived_from'
+        JOIN memory_ledger_entries AS source_root
+          ON source_root.guild_id=source_edge.guild_id
+         AND source_root.entry_id=source_edge.target_entry_id
+        WHERE projection_row.guild_id=?
+          AND projection_row.source_table='declared_canon_projection'
+          AND projection_row.source_role='declared_canon_projection'
+          AND source_root.source_table='broadcast_memory'
+          AND source_root.source_row_id=?
+          AND source_root.source_role='broadcast_memory'
+          AND %s
+        ORDER BY projection_row.entry_id
+        """ % projection_clause,
+        (normalized_guild_id, normalized_source_row_id),
+    ).fetchall()
+    projection_ids = {
+        str(row[0])
+        for row in derived_projection_rows
+        if str(row[0] or "")
+    }
+
+    declared_columns = {
+        str(row[1] or "")
+        for row in conn.execute("PRAGMA table_info(declared_canon_revisions)")
+    }
+    if {
+        "revision_id",
+        "declaration_id",
+        "guild_id",
+        "source_system",
+        "source_row_id",
+        "lifecycle_status",
+    }.issubset(declared_columns):
+        orphan_rows = conn.execute(
+            """
+            SELECT DISTINCT projection_row.entry_id
+            FROM memory_ledger_entries AS projection_row
+            JOIN declared_canon_revisions AS revision
+              ON revision.guild_id=projection_row.guild_id
+             AND revision.declaration_id=projection_row.source_row_id
+             AND revision.revision_id=projection_row.source_revision
+            WHERE projection_row.guild_id=?
+              AND projection_row.source_table='declared_canon_projection'
+              AND projection_row.source_role='declared_canon_projection'
+              AND revision.source_system='broadcast_memory'
+              AND revision.source_row_id=?
+              AND revision.lifecycle_status='established'
+              AND %s
+            ORDER BY projection_row.entry_id
+            """ % projection_clause,
+            (normalized_guild_id, normalized_source_row_id),
+        ).fetchall()
+        projection_ids.update(
+            str(row[0]) for row in orphan_rows if str(row[0] or "")
+        )
+
+    return BroadcastEffectiveRepresentations(
+        primary_entry_ids=tuple(sorted(primary_ids)),
+        declared_projection_entry_ids=tuple(sorted(projection_ids)),
+    )
 
 
-def shadow_broadcast_status_event(conn: sqlite3.Connection, *, row_id: int, guild_id: int, status: str, updated_at: str, actor_id: int | None = None, actor_name: str = "", superseded_by_id: int | None = None) -> LedgerWriteResult:
-    rev = source_revision_for(row_id, updated_at, event=f"status:{status}:{updated_at}")
-    lineage = ()
-    reason_override = "ok"
-    if status == "superseded" and superseded_by_id:
-        old_entry = _unique_broadcast_primary_entry(conn, guild_id=guild_id, source_row_id=row_id)
-        replacement_entry = _unique_broadcast_primary_entry(conn, guild_id=guild_id, source_row_id=superseded_by_id)
-        if old_entry and replacement_entry:
-            lineage = (("derived_from", old_entry), ("derived_from", replacement_entry))
-        else:
-            reason_override = "unresolved_broadcast_status_lineage"
-    lifecycle = RESOLVED_LIFECYCLE if status == "resolved" else REVIEW_ONLY_LIFECYCLE
-    predicate = f"broadcast_status:{status or 'unknown'}"
-    result = insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="broadcast_memory", source_row_id=row_id, source_revision=rev, source_event_key=f"status:{status}", source_role="broadcast_memory_status", entry_type="event", subject_key="barcode_radio", subject_display_name="BARCODE Radio", predicate_key=predicate, value=status or "unknown", source_class=SourceClass.FIRST_PARTY_RECORD, visibility=Visibility.INTERNAL, confidence=Confidence.HIGH, public_usable=False, observed_at=updated_at or _now(), source_sequence=int(row_id or 0), lifecycle_status=lifecycle, participants=tuple([LedgerParticipant(f"discord_user:{actor_id}", actor_name or "", "correction_actor", 0)] if actor_id else ()), lineage=lineage))
-    if reason_override != "ok" and result.outcome == "inserted":
-        return LedgerWriteResult(result.entry_id, result.outcome, reason_override, result.source_table, result.source_row_id, result.source_revision, result.source_event_key, result.guild_id)
-    return result
+def _effective_broadcast_primary_entries(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    source_row_id: int | str,
+) -> tuple[str, ...]:
+    """Return every unretracted primary root for one Broadcast source row."""
+
+    return _effective_broadcast_representations(
+        conn,
+        guild_id=guild_id,
+        source_row_id=source_row_id,
+    ).primary_entry_ids
+
+
+@contextmanager
+def _ledger_atomic_projection_transaction(conn: sqlite3.Connection):
+    """Hold one snapshot/write transaction without owning a caller's commit."""
+
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise
+    else:
+        if owns_transaction:
+            conn.commit()
+
+
+def _configured_owner_and_guild() -> tuple[int, int]:
+    try:
+        owner_id = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
+    except (TypeError, ValueError):
+        owner_id = 0
+    try:
+        primary_guild_id = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
+    except (TypeError, ValueError):
+        primary_guild_id = 0
+    return owner_id, primary_guild_id
+
+
+def _stored_ledger_entry_matches(
+    conn: sqlite3.Connection,
+    entry: LedgerEntry,
+) -> bool:
+    """Prove a deduplicated identity is the exact row we intended to extend."""
+
+    stored = conn.execute(
+        """
+        SELECT schema_version,guild_id,subject_key,subject_display_name,
+               entry_type,predicate_key,normalized_value,source_class,
+               source_table,source_row_id,source_revision,source_event_key,
+               source_role,route_mode,channel_id,channel_name,channel_policy,
+               source_message_id,visibility,confidence,public_usable,derived,
+               projection,salience,observed_at,source_sequence,valid_from,
+               valid_until,freshness,lifecycle_status
+        FROM memory_ledger_entries WHERE entry_id=?
+        """,
+        (entry.entry_id,),
+    ).fetchone()
+    expected = (
+        MEMORY_LEDGER_SCHEMA_VERSION,
+        int(entry.guild_id or 0),
+        entry.subject_key,
+        entry.subject_display_name,
+        entry.entry_type,
+        entry.predicate_key,
+        entry.value[:1000],
+        entry.source_class.value,
+        entry.source_table,
+        str(entry.source_row_id),
+        entry.source_revision,
+        entry.source_event_key,
+        entry.source_role,
+        entry.route_mode,
+        int(entry.channel_id or 0),
+        entry.channel_name[:120],
+        entry.channel_policy[:80],
+        entry.source_message_id,
+        entry.visibility.value,
+        entry.confidence.value,
+        1 if entry.public_usable else 0,
+        1 if entry.derived else 0,
+        1 if entry.projection else 0,
+        float(entry.salience or 0.0),
+        entry.observed_at,
+        entry.source_sequence,
+        entry.valid_from,
+        entry.valid_until,
+        entry.freshness,
+        entry.lifecycle_status,
+    )
+    if stored != expected:
+        return False
+    expected_participants = {
+        (
+            participant.participant_key,
+            participant.display_name[:120],
+            participant.role[:40],
+            index,
+        )
+        for index, participant in enumerate(
+            sorted(
+                entry.participants,
+                key=lambda item: (item.order_index, item.participant_key),
+            )
+        )
+    }
+    stored_participants = {
+        (str(row[0]), str(row[1] or ""), str(row[2] or ""), int(row[3] or 0))
+        for row in conn.execute(
+            """
+            SELECT participant_key,display_name,participant_role,order_index
+            FROM memory_ledger_participants WHERE entry_id=?
+            """,
+            (entry.entry_id,),
+        ).fetchall()
+    }
+    return stored_participants == expected_participants
+
+
+def _insert_or_reconcile_ledger_lineage(
+    conn: sqlite3.Connection,
+    entry: LedgerEntry,
+    *,
+    conflict_reason: str,
+) -> LedgerWriteResult:
+    """Insert an entry or safely append missing edges to an exact duplicate.
+
+    Generic Ledger deduplication intentionally does not accept new caller-
+    supplied lineage.  Terminal invalidation is the narrow exception: after
+    revalidating the complete stored row and participant set, a retry may add
+    newly discovered retraction edges with ``INSERT OR IGNORE``.
+    """
+
+    result = insert_ledger_entry(conn, entry)
+    if result.outcome != "deduplicated":
+        return result
+    if not _stored_ledger_entry_matches(conn, entry):
+        return LedgerWriteResult(
+            entry_id=entry.entry_id,
+            outcome="error",
+            reason_code=conflict_reason,
+            source_table=entry.source_table,
+            source_row_id=str(entry.source_row_id),
+            source_revision=entry.source_revision,
+            source_event_key=entry.source_event_key,
+            guild_id=int(entry.guild_id or 0),
+        )
+    now = _now()
+    for lineage_type, target in entry.lineage:
+        if lineage_type not in LINEAGE_TYPES or not str(target or ""):
+            continue
+        target_row = conn.execute(
+            """
+            SELECT 1 FROM memory_ledger_entries
+            WHERE guild_id=? AND entry_id=?
+            """,
+            (int(entry.guild_id or 0), str(target)),
+        ).fetchone()
+        if target_row is None:
+            return LedgerWriteResult(
+                entry_id=entry.entry_id,
+                outcome="error",
+                reason_code="%s_target_missing" % conflict_reason,
+                source_table=entry.source_table,
+                source_row_id=str(entry.source_row_id),
+                source_revision=entry.source_revision,
+                source_event_key=entry.source_event_key,
+                guild_id=int(entry.guild_id or 0),
+            )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO memory_ledger_lineage
+              (entry_id,guild_id,lineage_type,target_entry_id,created_at)
+            VALUES(?,?,?,?,?)
+            """,
+            (
+                entry.entry_id,
+                int(entry.guild_id or 0),
+                lineage_type,
+                str(target),
+                now,
+            ),
+        )
+    return LedgerWriteResult(
+        entry_id=entry.entry_id,
+        outcome="deduplicated",
+        reason_code="exact_source_duplicate_lineage_reconciled",
+        source_table=entry.source_table,
+        source_row_id=str(entry.source_row_id),
+        source_revision=entry.source_revision,
+        source_event_key=entry.source_event_key,
+        guild_id=int(entry.guild_id or 0),
+    )
+
+
+def shadow_broadcast_status_event(
+    conn: sqlite3.Connection,
+    *,
+    row_id: int,
+    guild_id: int,
+    status: str,
+    updated_at: str,
+    actor_id: int | None = None,
+    actor_name: str = "",
+    superseded_by_id: int | None = None,
+) -> LedgerWriteResult:
+    """Project an authenticated, already-applied Broadcast transition.
+
+    The authoritative ``broadcast_memory`` row is re-read in the same SQLite
+    snapshot/write transaction as the retraction insert.  Callers that already
+    hold the source mutation transaction keep ownership of its commit; direct
+    callers receive a local ``BEGIN IMMEDIATE`` boundary.
+    """
+
+    try:
+        normalized_row_id = int(row_id or 0)
+    except (TypeError, ValueError):
+        normalized_row_id = 0
+    try:
+        normalized_guild_id = int(guild_id or 0)
+    except (TypeError, ValueError):
+        normalized_guild_id = 0
+    try:
+        normalized_actor_id = int(actor_id or 0)
+    except (TypeError, ValueError):
+        normalized_actor_id = 0
+    normalized_status = str(status or "").strip().casefold()
+    normalized_updated_at = str(updated_at or "").strip()
+    rev = source_revision_for(
+        normalized_row_id,
+        normalized_updated_at,
+        event="status:%s:%s" % (normalized_status, normalized_updated_at),
+    )
+
+    owner_id, primary_guild_id = _configured_owner_and_guild()
+    if owner_id <= 0:
+        return skipped_result(
+            guild_id=normalized_guild_id,
+            source_table="broadcast_memory",
+            source_row_id=normalized_row_id,
+            source_revision=rev,
+            source_event_key="status:%s" % normalized_status,
+            reason_code="broadcast_status_owner_not_configured",
+        )
+    if primary_guild_id <= 0:
+        return skipped_result(
+            guild_id=normalized_guild_id,
+            source_table="broadcast_memory",
+            source_row_id=normalized_row_id,
+            source_revision=rev,
+            source_event_key="status:%s" % normalized_status,
+            reason_code="broadcast_status_primary_guild_not_configured",
+        )
+    if normalized_actor_id != owner_id:
+        return skipped_result(
+            guild_id=normalized_guild_id,
+            source_table="broadcast_memory",
+            source_row_id=normalized_row_id,
+            source_revision=rev,
+            source_event_key="status:%s" % normalized_status,
+            reason_code="broadcast_status_configured_owner_required",
+        )
+    if normalized_guild_id != primary_guild_id:
+        return skipped_result(
+            guild_id=normalized_guild_id,
+            source_table="broadcast_memory",
+            source_row_id=normalized_row_id,
+            source_revision=rev,
+            source_event_key="status:%s" % normalized_status,
+            reason_code="broadcast_status_primary_guild_required",
+        )
+    if (
+        normalized_row_id <= 0
+        or normalized_status not in {"resolved", "superseded"}
+        or not normalized_updated_at
+    ):
+        return skipped_result(
+            guild_id=normalized_guild_id,
+            source_table="broadcast_memory",
+            source_row_id=normalized_row_id,
+            source_revision=rev,
+            source_event_key="status:%s" % normalized_status,
+            reason_code="broadcast_status_snapshot_invalid",
+        )
+
+    invalid_superseded_by = False
+    if superseded_by_id is None:
+        expected_superseded_by = None
+    else:
+        try:
+            expected_superseded_by = int(superseded_by_id)
+        except (TypeError, ValueError):
+            expected_superseded_by = None
+            invalid_superseded_by = True
+    if invalid_superseded_by:
+        return skipped_result(
+            guild_id=normalized_guild_id,
+            source_table="broadcast_memory",
+            source_row_id=normalized_row_id,
+            source_revision=rev,
+            source_event_key="status:%s" % normalized_status,
+            reason_code="broadcast_status_snapshot_invalid",
+        )
+    if normalized_status == "superseded":
+        if expected_superseded_by is None or expected_superseded_by <= 0:
+            return skipped_result(
+                guild_id=normalized_guild_id,
+                source_table="broadcast_memory",
+                source_row_id=normalized_row_id,
+                source_revision=rev,
+                source_event_key="status:%s" % normalized_status,
+                reason_code="broadcast_status_snapshot_invalid",
+            )
+    elif expected_superseded_by is not None:
+        return skipped_result(
+            guild_id=normalized_guild_id,
+            source_table="broadcast_memory",
+            source_row_id=normalized_row_id,
+            source_revision=rev,
+            source_event_key="status:%s" % normalized_status,
+            reason_code="broadcast_status_snapshot_invalid",
+        )
+
+    with _ledger_atomic_projection_transaction(conn):
+        columns = {
+            str(row[1] or "")
+            for row in conn.execute("PRAGMA table_info(broadcast_memory)")
+        }
+        required_columns = {
+            "id",
+            "guild_id",
+            "status",
+            "updated_at",
+            "corrected_by_user_id",
+            "corrected_by_name",
+            "superseded_by_id",
+        }
+        if not required_columns.issubset(columns):
+            return skipped_result(
+                guild_id=normalized_guild_id,
+                source_table="broadcast_memory",
+                source_row_id=normalized_row_id,
+                source_revision=rev,
+                source_event_key="status:%s" % normalized_status,
+                reason_code="broadcast_status_source_schema_invalid",
+            )
+        source_row = conn.execute(
+            """
+            SELECT guild_id,status,updated_at,corrected_by_user_id,
+                   corrected_by_name,superseded_by_id
+            FROM broadcast_memory
+            WHERE guild_id=? AND id=?
+            LIMIT 1
+            """,
+            (normalized_guild_id, normalized_row_id),
+        ).fetchone()
+        if source_row is None:
+            return skipped_result(
+                guild_id=normalized_guild_id,
+                source_table="broadcast_memory",
+                source_row_id=normalized_row_id,
+                source_revision=rev,
+                source_event_key="status:%s" % normalized_status,
+                reason_code="broadcast_status_source_not_found",
+            )
+        try:
+            source_superseded_by = (
+                int(source_row[5]) if source_row[5] is not None else None
+            )
+        except (TypeError, ValueError):
+            source_superseded_by = "invalid"
+        if (
+            int(source_row[0] or 0) != normalized_guild_id
+            or str(source_row[1] or "").strip().casefold() != normalized_status
+            or str(source_row[2] or "").strip() != normalized_updated_at
+            or int(source_row[3] or 0) != normalized_actor_id
+            or source_superseded_by != expected_superseded_by
+        ):
+            return skipped_result(
+                guild_id=normalized_guild_id,
+                source_table="broadcast_memory",
+                source_row_id=normalized_row_id,
+                source_revision=rev,
+                source_event_key="status:%s" % normalized_status,
+                reason_code="broadcast_status_source_snapshot_mismatch",
+            )
+
+        old_entries = _effective_broadcast_primary_entries(
+            conn,
+            guild_id=normalized_guild_id,
+            source_row_id=normalized_row_id,
+        )
+        lineage_items = [
+            ("retracts", old_entry) for old_entry in old_entries
+        ]
+        if normalized_status == "superseded":
+            replacement_entries = _effective_broadcast_primary_entries(
+                conn,
+                guild_id=normalized_guild_id,
+                source_row_id=expected_superseded_by,
+            )
+            lineage_items.extend(
+                ("derived_from", entry_id)
+                for entry_id in (*old_entries, *replacement_entries)
+            )
+
+        lifecycle = (
+            RESOLVED_LIFECYCLE
+            if normalized_status == "resolved"
+            else REVIEW_ONLY_LIFECYCLE
+        )
+        return insert_ledger_entry(
+            conn,
+            LedgerEntry(
+                guild_id=normalized_guild_id,
+                source_table="broadcast_memory",
+                source_row_id=normalized_row_id,
+                source_revision=rev,
+                source_event_key="status:%s" % normalized_status,
+                source_role="broadcast_memory_status",
+                entry_type="event",
+                subject_key="barcode_radio",
+                subject_display_name="BARCODE Radio",
+                predicate_key="broadcast_status:%s" % normalized_status,
+                value=normalized_status,
+                source_class=SourceClass.FIRST_PARTY_RECORD,
+                visibility=Visibility.INTERNAL,
+                confidence=Confidence.HIGH,
+                public_usable=False,
+                observed_at=normalized_updated_at,
+                source_sequence=normalized_row_id,
+                lifecycle_status=lifecycle,
+                participants=(
+                    LedgerParticipant(
+                        "discord_user:%s" % normalized_actor_id,
+                        str(source_row[4] or ""),
+                        "correction_actor",
+                        0,
+                    ),
+                ),
+                lineage=tuple(lineage_items),
+            ),
+        )
 
 
 def shadow_canon_reference(
@@ -7640,6 +8207,397 @@ def shadow_canon_reference(
             lineage=tuple(("derived_from", entry_id) for entry_id in roots),
         ),
     )
+
+
+def _declared_projection_subject_key(subject_type: str, subject_id: str) -> str:
+    return "%s:%s" % (
+        str(subject_type or "").strip().casefold(),
+        str(subject_id or "").strip(),
+    )
+
+
+def shadow_declared_canon_projection(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    declaration_id: str,
+    revision_id: str,
+    actor_user_id: int,
+    authority_nonce: str,
+    expected_source_fingerprint: str,
+    expected_lifecycle_status: str,
+    root_entry_ids: tuple[str, ...] = (),
+) -> LedgerWriteResult:
+    """Project one Declared revision without making it live evidence.
+
+    The append-only declaration or Broadcast row remains authoritative.  PR 2
+    deliberately keeps this projection internal, derived, review-only, and
+    non-public so existing packet, Journal, Relay, dossier, and site readers
+    cannot consume a second representation before final convergence.
+    """
+
+    from bnl_declared_canon import (
+        BROADCAST_MEMORY_SOURCE,
+        DeclaredCanonError,
+        validate_current_declared_canon_revision,
+        validate_latest_declared_canon_revision,
+    )
+
+    declaration_id = str(declaration_id or "").strip()
+    revision_id = str(revision_id or "").strip()
+    expected_source_fingerprint = str(expected_source_fingerprint or "").strip()
+    if not declaration_id or not revision_id or not expected_source_fingerprint:
+        return skipped_result(
+            guild_id=guild_id,
+            source_table="declared_canon_projection",
+            source_row_id=declaration_id,
+            source_revision=revision_id,
+            reason_code="missing_declared_projection_identity",
+        )
+    normalized_guild_id = int(guild_id or 0)
+    normalized_lifecycle = str(expected_lifecycle_status or "").strip().casefold()
+    provided_roots = tuple(
+        str(entry_id or "").strip()
+        for entry_id in root_entry_ids
+        if str(entry_id or "").strip()
+    )
+    roots = tuple(sorted(set(provided_roots)))
+
+    with _ledger_atomic_projection_transaction(conn):
+        try:
+            if normalized_lifecycle == "established":
+                revision = validate_current_declared_canon_revision(
+                    conn,
+                    actor_user_id=int(actor_user_id or 0),
+                    authority_nonce=authority_nonce,
+                    guild_id=normalized_guild_id,
+                    declaration_id=declaration_id,
+                    expected_revision_id=revision_id,
+                    expected_source_fingerprint=expected_source_fingerprint,
+                )
+            else:
+                revision = validate_latest_declared_canon_revision(
+                    conn,
+                    actor_user_id=int(actor_user_id or 0),
+                    authority_nonce=authority_nonce,
+                    guild_id=normalized_guild_id,
+                    declaration_id=declaration_id,
+                    expected_revision_id=revision_id,
+                    expected_source_fingerprint=expected_source_fingerprint,
+                    expected_lifecycle_status=normalized_lifecycle,
+                )
+        except DeclaredCanonError as exc:
+            return skipped_result(
+                guild_id=normalized_guild_id,
+                source_table="declared_canon_projection",
+                source_row_id=declaration_id,
+                source_revision=revision_id,
+                reason_code=(
+                    "declared_projection_%s" % str(exc or "invalid")
+                )[:120],
+            )
+
+        terminal = revision.lifecycle_status in {
+            "contested",
+            "resolved",
+            "retired",
+            "superseded",
+        }
+
+        if revision.source_system == BROADCAST_MEMORY_SOURCE:
+            if terminal:
+                if provided_roots:
+                    return skipped_result(
+                        guild_id=normalized_guild_id,
+                        source_table="declared_canon_projection",
+                        source_row_id=declaration_id,
+                        source_revision=revision_id,
+                        reason_code=(
+                            "declared_projection_broadcast_terminal_roots_forbidden"
+                        ),
+                    )
+                # A terminal sidecar carries no Broadcast content.  Its sole
+                # purpose is to retract the prior Declared projection after
+                # validate_latest_declared_canon_revision has re-intersected
+                # the exact terminal source row in this transaction.
+                value = revision.lifecycle_status
+            elif len(provided_roots) != 1 or len(roots) != 1:
+                return skipped_result(
+                    guild_id=normalized_guild_id,
+                    source_table="declared_canon_projection",
+                    source_row_id=declaration_id,
+                    source_revision=revision_id,
+                    reason_code="declared_projection_broadcast_root_required",
+                )
+            else:
+                source_row = conn.execute(
+                    """
+                    SELECT cleaned_summary,updated_at,status
+                    FROM broadcast_memory
+                    WHERE guild_id=? AND id=?
+                    """,
+                    (normalized_guild_id, int(revision.source_row_id)),
+                ).fetchone()
+                if (
+                    not source_row
+                    or not str(source_row[0] or "").strip()
+                    or not str(source_row[1] or "").strip()
+                    or str(source_row[2] or "").strip().casefold() != "active"
+                ):
+                    return skipped_result(
+                        guild_id=normalized_guild_id,
+                        source_table="declared_canon_projection",
+                        source_row_id=declaration_id,
+                        source_revision=revision_id,
+                        reason_code="declared_projection_broadcast_value_missing",
+                    )
+                value = str(source_row[0])
+                expected_root_revision = source_revision_for(
+                    revision.source_row_id,
+                    str(source_row[1]),
+                )
+                root_row = conn.execute(
+                    """
+                    SELECT guild_id,source_table,source_row_id,source_role,
+                           source_revision,normalized_value,lifecycle_status
+                    FROM memory_ledger_entries
+                    WHERE entry_id=?
+                    """,
+                    (roots[0],),
+                ).fetchone()
+                if root_row is None or int(root_row[0] or 0) != normalized_guild_id:
+                    return skipped_result(
+                        guild_id=normalized_guild_id,
+                        source_table="declared_canon_projection",
+                        source_row_id=declaration_id,
+                        source_revision=revision_id,
+                        reason_code="declared_projection_root_scope_invalid",
+                    )
+                if (
+                    str(root_row[1] or "") != "broadcast_memory"
+                    or str(root_row[2] or "") != revision.source_row_id
+                    or str(root_row[3] or "") != "broadcast_memory"
+                ):
+                    return skipped_result(
+                        guild_id=normalized_guild_id,
+                        source_table="declared_canon_projection",
+                        source_row_id=declaration_id,
+                        source_revision=revision_id,
+                        reason_code="declared_projection_broadcast_root_required",
+                    )
+                if (
+                    str(root_row[4] or "") != expected_root_revision
+                    or str(root_row[5] or "") != value[:500]
+                    or str(root_row[6] or "") != ACTIVE_LIFECYCLE
+                    or conn.execute(
+                        """
+                        SELECT 1
+                        FROM memory_ledger_lineage
+                        WHERE guild_id=? AND target_entry_id=?
+                          AND lineage_type IN ('supersedes','retracts')
+                        LIMIT 1
+                        """,
+                        (normalized_guild_id, roots[0]),
+                    ).fetchone()
+                ):
+                    return skipped_result(
+                        guild_id=normalized_guild_id,
+                        source_table="declared_canon_projection",
+                        source_row_id=declaration_id,
+                        source_revision=revision_id,
+                        reason_code="declared_projection_broadcast_root_stale",
+                    )
+                current_primary_count = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM memory_ledger_entries AS root
+                    WHERE root.guild_id=?
+                      AND root.source_table='broadcast_memory'
+                      AND root.source_row_id=?
+                      AND root.source_role='broadcast_memory'
+                      AND root.lifecycle_status='active'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM memory_ledger_lineage AS edge
+                        WHERE edge.guild_id=root.guild_id
+                          AND edge.target_entry_id=root.entry_id
+                          AND edge.lineage_type IN ('supersedes','retracts')
+                    )
+                    """,
+                    (normalized_guild_id, revision.source_row_id),
+                ).fetchone()[0]
+                if int(current_primary_count or 0) != 1:
+                    return skipped_result(
+                        guild_id=normalized_guild_id,
+                        source_table="declared_canon_projection",
+                        source_row_id=declaration_id,
+                        source_revision=revision_id,
+                        reason_code="declared_projection_broadcast_root_ambiguous",
+                    )
+        else:
+            if provided_roots:
+                return skipped_result(
+                    guild_id=normalized_guild_id,
+                    source_table="declared_canon_projection",
+                    source_row_id=declaration_id,
+                    source_revision=revision_id,
+                    reason_code="declared_projection_general_roots_forbidden",
+                )
+            value = revision.cleaned_summary or revision.value_json
+
+        previous: tuple[str, ...] = ()
+        if revision.previous_revision_id:
+            prior_rows = conn.execute(
+                """
+                SELECT entry_id
+                FROM memory_ledger_entries
+                WHERE guild_id=?
+                  AND source_table='declared_canon_projection'
+                  AND source_row_id=?
+                  AND source_revision=?
+                ORDER BY created_at DESC
+                """,
+                (
+                    normalized_guild_id,
+                    declaration_id,
+                    revision.previous_revision_id,
+                ),
+            ).fetchall()
+            if len(prior_rows) != 1:
+                return skipped_result(
+                    guild_id=normalized_guild_id,
+                    source_table="declared_canon_projection",
+                    source_row_id=declaration_id,
+                    source_revision=revision_id,
+                    reason_code="declared_projection_previous_revision_missing",
+                )
+            previous = (str(prior_rows[0][0]),)
+
+        cross_declaration_previous: tuple[str, ...] = ()
+        if revision.supersedes_declaration_id:
+            superseded_latest = conn.execute(
+                """
+                SELECT previous_revision_id,lifecycle_status,
+                       superseded_by_declaration_id
+                FROM declared_canon_revisions
+                WHERE guild_id=? AND declaration_id=?
+                ORDER BY revision_number DESC
+                LIMIT 1
+                """,
+                (
+                    normalized_guild_id,
+                    revision.supersedes_declaration_id,
+                ),
+            ).fetchone()
+            if (
+                superseded_latest is None
+                or str(superseded_latest[1] or "") != "superseded"
+                or str(superseded_latest[2] or "") != declaration_id
+                or not str(superseded_latest[0] or "")
+            ):
+                return skipped_result(
+                    guild_id=normalized_guild_id,
+                    source_table="declared_canon_projection",
+                    source_row_id=declaration_id,
+                    source_revision=revision_id,
+                    reason_code=(
+                        "declared_projection_cross_supersession_invalid"
+                    ),
+                )
+            superseded_projection_rows = conn.execute(
+                """
+                SELECT entry_id
+                FROM memory_ledger_entries
+                WHERE guild_id=?
+                  AND source_table='declared_canon_projection'
+                  AND source_row_id=?
+                  AND source_revision=?
+                ORDER BY created_at DESC
+                """,
+                (
+                    normalized_guild_id,
+                    revision.supersedes_declaration_id,
+                    str(superseded_latest[0]),
+                ),
+            ).fetchall()
+            if len(superseded_projection_rows) != 1:
+                return skipped_result(
+                    guild_id=normalized_guild_id,
+                    source_table="declared_canon_projection",
+                    source_row_id=declaration_id,
+                    source_revision=revision_id,
+                    reason_code=(
+                        "declared_projection_superseded_source_projection_missing"
+                    ),
+                )
+            cross_declaration_previous = (
+                str(superseded_projection_rows[0][0]),
+            )
+
+        lineage_items = [("derived_from", entry_id) for entry_id in roots]
+        lineage_items.extend(
+            ("retracts" if terminal else "supersedes", entry_id)
+            for entry_id in previous
+        )
+        lineage_items.extend(
+            ("supersedes", entry_id)
+            for entry_id in cross_declaration_previous
+        )
+        lineage = tuple(dict.fromkeys(lineage_items))
+
+        subject_key = _declared_projection_subject_key(
+            revision.subject_type,
+            revision.subject_id,
+        )
+        participants = [
+            LedgerParticipant(subject_key, "", "subject", 0),
+        ]
+        if revision.claim_kind == "relationship":
+            participants.append(
+                LedgerParticipant(
+                    _declared_projection_subject_key(
+                        revision.object_subject_type,
+                        revision.object_subject_id,
+                    ),
+                    "",
+                    "relationship_object",
+                    1,
+                )
+            )
+
+        return insert_ledger_entry(
+            conn,
+            LedgerEntry(
+                guild_id=normalized_guild_id,
+                source_table="declared_canon_projection",
+                source_row_id=declaration_id,
+                source_revision=revision_id,
+                source_event_key="revision:%s" % revision_id,
+                source_role="declared_canon_projection",
+                entry_type="canon_reference",
+                subject_key=subject_key,
+                subject_display_name="",
+                predicate_key=revision.predicate,
+                value=(value or "")[:500],
+                source_class=SourceClass.EVIDENCE_PROJECTION,
+                route_mode="declared_canon_review",
+                channel_policy="declared_canon_review",
+                visibility=Visibility.INTERNAL,
+                confidence=Confidence.LOW,
+                public_usable=False,
+                derived=True,
+                projection=True,
+                observed_at=revision.created_at or _now(),
+                lifecycle_status=(
+                    RESOLVED_LIFECYCLE
+                    if revision.lifecycle_status
+                    in {"resolved", "retired", "superseded"}
+                    else REVIEW_ONLY_LIFECYCLE
+                ),
+                participants=tuple(participants),
+                lineage=lineage,
+            ),
+        )
 
 
 def build_memory_ledger_evaluation(

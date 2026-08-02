@@ -1,15 +1,140 @@
+import os
 import sqlite3
+import tempfile
 import unittest
 from dataclasses import replace
 from unittest import mock
 
 import bnl_canon_source_contract as canon
+import bnl_declared_canon as declared_canon
 import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_unified_intelligence_packet as packet
 
 
 class HybridCanonClaimContractTests(unittest.TestCase):
+    def create_pr2_broadcast_table(self, conn):
+        conn.execute(
+            """
+            CREATE TABLE broadcast_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                episode_date TEXT NOT NULL,
+                submitted_by_user_id INTEGER,
+                submitted_by_name TEXT,
+                raw_note TEXT,
+                cleaned_summary TEXT NOT NULL,
+                entry_type TEXT NOT NULL,
+                importance TEXT DEFAULT 'medium',
+                public_safe INTEGER DEFAULT 0,
+                affects_next_show INTEGER DEFAULT 0,
+                usage_scope TEXT DEFAULT 'internal',
+                target_show_date TEXT,
+                valid_until TEXT,
+                override_span_count INTEGER DEFAULT 1,
+                needs_clarification INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                corrected_by_user_id INTEGER,
+                corrected_by_name TEXT,
+                correction_reason TEXT,
+                supersedes_id INTEGER,
+                superseded_by_id INTEGER
+            )
+            """
+        )
+        conn.commit()
+        declared_canon.ensure_declared_canon_schema(conn)
+
+    def insert_pr2_broadcast(
+        self,
+        conn,
+        *,
+        cleaned="A source-owned Broadcast summary.",
+        raw="Private operator wording.",
+        entry_type="notable_moment",
+        status="active",
+        public_safe=1,
+        usage_scope="ambient,direct",
+        created_at="2026-08-01T00:00:00+00:00",
+        valid_until="",
+    ):
+        cursor = conn.execute(
+            """
+            INSERT INTO broadcast_memory(
+                guild_id,episode_date,submitted_by_user_id,submitted_by_name,
+                raw_note,cleaned_summary,entry_type,importance,public_safe,
+                affects_next_show,usage_scope,target_show_date,valid_until,
+                override_span_count,needs_clarification,status,created_at,
+                updated_at,corrected_by_user_id,corrected_by_name,
+                correction_reason,supersedes_id,superseded_by_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                7,
+                "2026-08-01",
+                61,
+                "Owner Fixture",
+                raw,
+                cleaned,
+                entry_type,
+                "medium",
+                public_safe,
+                0,
+                usage_scope,
+                None,
+                valid_until,
+                1,
+                0,
+                status,
+                created_at,
+                created_at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+    def classify_pr2_broadcast(
+        self,
+        conn,
+        row_id,
+        *,
+        nonce="classify-contract-0001",
+        expected_revision_id="",
+        visibility="public_safe",
+        eligible_routes=("public_home",),
+    ):
+        columns = tuple(
+            row[1] for row in conn.execute("PRAGMA table_info(broadcast_memory)")
+        )
+        values = conn.execute(
+            "SELECT %s FROM broadcast_memory WHERE id=?" % ",".join(columns),
+            (row_id,),
+        ).fetchone()
+        fingerprint = declared_canon.broadcast_source_fingerprint(
+            dict(zip(columns, values))
+        )
+        return declared_canon.classify_broadcast_memory(
+            conn,
+            actor_user_id=61,
+            authority_nonce=nonce,
+            guild_id=7,
+            broadcast_row_id=row_id,
+            expected_source_fingerprint=fingerprint,
+            expected_revision_id=expected_revision_id,
+            subject_type="broadcast",
+            subject_id="barcode_radio",
+            visibility=visibility,
+            eligible_routes=eligible_routes,
+            now="2026-08-01T01:00:00+00:00",
+        ).primary
+
     def test_contract_separates_status_domain_and_lifecycle(self):
         fact = next(
             item
@@ -225,6 +350,20 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         self.assertEqual(name_shaped_actor.status, "hint_only")
         self.assertEqual(name_shaped_actor.subject, canon.CACHE_BACK)
 
+        name_shaped_owner_ref = canon.resolve_entity_identity(
+            platform="discord",
+            account_id="4242",
+            labels=("Cache Back",),
+            bindings=(
+                replace(
+                    binding,
+                    authority_actor="owner_ref:first.last",
+                ),
+            ),
+        )
+        self.assertEqual(name_shaped_owner_ref.status, "hint_only")
+        self.assertEqual(name_shaped_owner_ref.subject, canon.CACHE_BACK)
+
         empty_scope = canon.resolve_entity_identity(
             platform="",
             account_id="",
@@ -265,7 +404,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                     platform="DISCORD",
                     account_id="9001",
                     authority_receipt="binding_receipt:sheila",
-                    authority_actor="owner_ref:binding_owner",
+                    authority_actor="discord_user:1",
                     authority_verified=True,
                 ),
             ),
@@ -284,7 +423,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                     platform="discord",
                     account_id="9002",
                     authority_receipt="binding_receipt:cliff",
-                    authority_actor="owner_ref:binding_owner",
+                    authority_actor="discord_user:1",
                     authority_verified=True,
                 ),
             ),
@@ -374,7 +513,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         self.assertEqual(legacy.claim.visibility, canon.Visibility.INTERNAL)
         self.assertEqual(legacy.claim.eligible_routes, ("broadcast_memory",))
 
-    def test_broadcast_adapter_stays_review_only_in_pr1(self):
+    def test_raw_broadcast_adapter_ignores_legacy_caller_authority(self):
         row = {
             "id": 4,
             "entry_type": "notable_moment",
@@ -403,22 +542,21 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         )
         self.assertEqual(review.claim.visibility, canon.Visibility.INTERNAL)
         self.assertNotIn("public_home", review.claim.eligible_routes)
-        self.assertEqual(
-            declared.claim.lifecycle,
-            canon.ClaimLifecycle.REVIEW_ONLY,
-        )
+        self.assertEqual(declared.claim.lifecycle, canon.ClaimLifecycle.REVIEW_ONLY)
         self.assertFalse(declared.live_eligible)
-        self.assertEqual(declared.reason, "owner_verified_review_only")
+        self.assertEqual(declared.reason, "broadcast_source_review_only")
         self.assertEqual(
             declared.claim.canon_status,
-            canon.CanonStatus.DECLARED,
+            canon.CanonStatus.OPEN_SIGNAL,
         )
         self.assertEqual(
             declared.claim.domain,
             canon.CanonDomain.BROADCAST_HISTORY,
         )
-        self.assertEqual(declared.claim.visibility, canon.Visibility.PUBLIC_SAFE)
-        self.assertNotIn("Private operator wording", declared.claim.value)
+        self.assertEqual(declared.claim.visibility, canon.Visibility.INTERNAL)
+        self.assertEqual(declared.claim.authority_actor, "")
+        self.assertEqual(declared.claim.authority_receipt, "")
+        self.assertFalse(declared.live_eligible)
 
     def test_broadcast_adapter_fails_closed_on_scope_and_boolean_strings(self):
         cases = (
@@ -467,7 +605,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             authority_actor="Personal Human Name",
             authority_receipt="owner_confirmed",
         )
-        self.assertEqual(forged.reason, "owner_authority_review_only")
+        self.assertEqual(forged.reason, "broadcast_source_review_only")
         self.assertEqual(forged.claim.authority_actor, "")
         self.assertEqual(forged.claim.authority_receipt, "")
         self.assertEqual(forged.claim.confidence, canon.Confidence.LOW)
@@ -487,6 +625,524 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             canon.Visibility.INTERNAL,
         )
         self.assertNotIn("public_home", mixed_internal.claim.eligible_routes)
+
+    def test_exact_current_sidecar_join_is_declared_shadow_and_rereads_source(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ):
+            conn = sqlite3.connect(":memory:")
+            try:
+                self.create_pr2_broadcast_table(conn)
+                row_id = self.insert_pr2_broadcast(conn)
+                revision = self.classify_pr2_broadcast(conn, row_id)
+                before = conn.total_changes
+                result = canon.adapt_declared_canon_revision(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="adapt-declared-0001",
+                    guild_id=7,
+                    declaration_id=revision.declaration_id,
+                    expected_revision_id=revision.revision_id,
+                    expected_source_fingerprint=revision.source_fingerprint,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertEqual(conn.total_changes, before)
+                self.assertEqual(result.reason, "declared_shadow_current")
+                self.assertFalse(result.live_eligible)
+                self.assertEqual(result.claim.canon_status, canon.CanonStatus.DECLARED)
+                self.assertEqual(result.claim.lifecycle, canon.ClaimLifecycle.ESTABLISHED)
+                self.assertEqual(result.claim.value, "A source-owned Broadcast summary.")
+                self.assertNotIn("Private operator wording", result.claim.value)
+                self.assertEqual(
+                    result.claim.root_ids,
+                    ("broadcast_memory:%s" % row_id,),
+                )
+                self.assertEqual(result.claim.occurrence_ids, result.claim.root_ids)
+                self.assertIn(
+                    "declared_canon_revision:%s" % revision.revision_id,
+                    result.claim.source_refs,
+                )
+                self.assertNotIn(
+                    "declared_canon_revision:%s" % revision.revision_id,
+                    result.claim.root_ids,
+                )
+                self.assertEqual(result.claim.eligible_routes, ("public_home",))
+                self.assertEqual(result.claim.authority_receipt, revision.authority_receipt)
+                raw = canon.adapt_broadcast_memory_claim(
+                    {
+                        "id": row_id,
+                        "entry_type": "notable_moment",
+                        "cleaned_summary": "A source-owned Broadcast summary.",
+                    }
+                ).claim
+                duplicate_view = canon.canon_claim_inventory_diagnostics(
+                    (raw, result.claim)
+                )
+                self.assertEqual(
+                    duplicate_view["duplicateCurrentSourceClaimCount"],
+                    1,
+                )
+                conn.execute("BEGIN")
+                nested = canon.adapt_declared_canon_revision(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="adapt-caller-snapshot",
+                    guild_id=7,
+                    declaration_id=revision.declaration_id,
+                    expected_revision_id=revision.revision_id,
+                    expected_source_fingerprint=revision.source_fingerprint,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertEqual(nested.reason, "declared_shadow_current")
+                self.assertTrue(conn.in_transaction)
+                conn.rollback()
+                latest = self.classify_pr2_broadcast(
+                    conn,
+                    row_id,
+                    nonce="classify-contract-latest",
+                    expected_revision_id=revision.revision_id,
+                )
+                old = canon.adapt_declared_canon_revision(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="adapt-declared-old1",
+                    guild_id=7,
+                    declaration_id=revision.declaration_id,
+                    expected_revision_id=revision.revision_id,
+                    expected_source_fingerprint=revision.source_fingerprint,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertIsNone(old.claim)
+                self.assertEqual(old.reason, "declared_expected_revision_mismatch")
+                self.assertNotEqual(latest.revision_id, revision.revision_id)
+            finally:
+                conn.close()
+
+    def test_declared_join_rejects_stale_source_and_duplicate_authority(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ):
+            conn = sqlite3.connect(":memory:")
+            try:
+                self.create_pr2_broadcast_table(conn)
+                row_id = self.insert_pr2_broadcast(conn)
+                revision = self.classify_pr2_broadcast(conn, row_id)
+                conn.execute(
+                    """
+                    INSERT INTO declared_canon_revisions(%s)
+                    SELECT %s FROM declared_canon_revisions
+                    WHERE revision_id=?
+                    """ % (
+                        ",".join(declared_canon._REVISION_COLUMNS),
+                        ",".join(
+                            "?" if column in {"revision_id", "declaration_id"}
+                            else column
+                            for column in declared_canon._REVISION_COLUMNS
+                        ),
+                    ),
+                    (
+                        "dcr_" + "a" * 40,
+                        "dcl_" + "b" * 32,
+                        revision.revision_id,
+                    ),
+                )
+                conn.commit()
+                duplicate = canon.adapt_declared_canon_revision(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="adapt-duplicate-0001",
+                    guild_id=7,
+                    declaration_id=revision.declaration_id,
+                    expected_revision_id=revision.revision_id,
+                    expected_source_fingerprint=revision.source_fingerprint,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertIsNone(duplicate.claim)
+                self.assertEqual(
+                    duplicate.reason,
+                    "declared_broadcast_duplicate_authority",
+                )
+            finally:
+                conn.close()
+
+            conn = sqlite3.connect(":memory:")
+            try:
+                self.create_pr2_broadcast_table(conn)
+                row_id = self.insert_pr2_broadcast(conn)
+                revision = self.classify_pr2_broadcast(conn, row_id)
+                conn.execute(
+                    """
+                    UPDATE broadcast_memory
+                    SET cleaned_summary=?,public_safe=0,usage_scope='internal',
+                        updated_at='2026-08-01T03:00:00+00:00'
+                    WHERE id=?
+                    """,
+                    ("Changed after classification.", row_id),
+                )
+                conn.commit()
+                stale = canon.adapt_declared_canon_revision(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="adapt-stale-0001",
+                    guild_id=7,
+                    declaration_id=revision.declaration_id,
+                    expected_revision_id=revision.revision_id,
+                    expected_source_fingerprint=revision.source_fingerprint,
+                    now="2026-08-01T04:00:00+00:00",
+                )
+                self.assertIsNone(stale.claim)
+                self.assertEqual(
+                    stale.reason,
+                    "declared_expected_source_fingerprint_mismatch",
+                )
+            finally:
+                conn.close()
+
+            conn = sqlite3.connect(":memory:")
+            try:
+                self.create_pr2_broadcast_table(conn)
+                row_id = self.insert_pr2_broadcast(
+                    conn,
+                    public_safe=0,
+                    usage_scope="internal,unreviewed_scope",
+                )
+                revision = self.classify_pr2_broadcast(
+                    conn,
+                    row_id,
+                    nonce="classify-scope-0001",
+                    visibility="internal",
+                    eligible_routes=("broadcast_memory",),
+                )
+                invalid_scope = canon.adapt_declared_canon_revision(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="adapt-scope-0001",
+                    guild_id=7,
+                    declaration_id=revision.declaration_id,
+                    expected_revision_id=revision.revision_id,
+                    expected_source_fingerprint=revision.source_fingerprint,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertIsNone(invalid_scope.claim)
+                self.assertEqual(
+                    invalid_scope.reason,
+                    "declared_broadcast_scope_unrecognized",
+                )
+            finally:
+                conn.close()
+
+    def test_general_declared_adapter_uses_latest_owner_revision_only(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ):
+            conn = sqlite3.connect(":memory:")
+            try:
+                declared_canon.ensure_declared_canon_schema(conn)
+                revision = declared_canon.add_declared_canon(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="general-declared-0001",
+                    guild_id=7,
+                    subject_type="project",
+                    subject_id="barcode_radio",
+                    predicate="official_role",
+                    value={"role": "weekly broadcast"},
+                    raw_declaration="BARCODE Radio is the weekly broadcast.",
+                    cleaned_summary="The weekly BARCODE broadcast.",
+                    domain="broadcast_history",
+                    claim_kind="role",
+                    visibility="internal",
+                    eligible_routes=("declared_canon_review",),
+                    now="2026-08-01T01:00:00+00:00",
+                ).primary
+                before = conn.total_changes
+                result = canon.adapt_declared_canon_revision(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="adapt-general-0001",
+                    guild_id=7,
+                    declaration_id=revision.declaration_id,
+                    expected_revision_id=revision.revision_id,
+                    expected_source_fingerprint=revision.source_fingerprint,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertEqual(conn.total_changes, before)
+                self.assertEqual(result.reason, "declared_shadow_current")
+                self.assertEqual(result.claim.value, {"role": "weekly broadcast"})
+                self.assertEqual(result.claim.canon_status, canon.CanonStatus.DECLARED)
+                self.assertEqual(result.claim.root_ids, ("declared_canon:%s" % revision.declaration_id,))
+                self.assertFalse(result.live_eligible)
+            finally:
+                conn.close()
+
+    def test_declared_adapter_uses_one_snapshot_across_concurrent_source_change(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ), tempfile.TemporaryDirectory() as temp_dir:
+            database_path = os.path.join(temp_dir, "declared_snapshot.sqlite3")
+            reader = sqlite3.connect(database_path, timeout=2)
+            writer = None
+            try:
+                reader.execute("PRAGMA journal_mode=WAL")
+                self.create_pr2_broadcast_table(reader)
+                row_id = self.insert_pr2_broadcast(
+                    reader,
+                    cleaned="Snapshot-old Broadcast value.",
+                )
+                revision = self.classify_pr2_broadcast(reader, row_id)
+                writer = sqlite3.connect(database_path, timeout=2)
+                original_validator = (
+                    declared_canon.validate_current_declared_canon_revision
+                )
+                interleaved = {"committed": False}
+
+                def validate_then_change(*args, **kwargs):
+                    validated = original_validator(*args, **kwargs)
+                    writer.execute(
+                        """
+                        UPDATE broadcast_memory
+                        SET cleaned_summary='Snapshot-new Broadcast value.',
+                            public_safe=0,usage_scope='internal',
+                            updated_at='2026-08-01T03:00:00+00:00'
+                        WHERE id=?
+                        """,
+                        (row_id,),
+                    )
+                    writer.commit()
+                    interleaved["committed"] = True
+                    return validated
+
+                before = reader.total_changes
+                with mock.patch.object(
+                    declared_canon,
+                    "validate_current_declared_canon_revision",
+                    side_effect=validate_then_change,
+                ):
+                    result = canon.adapt_declared_canon_revision(
+                        reader,
+                        actor_user_id=61,
+                        authority_nonce="adapt-snapshot-0001",
+                        guild_id=7,
+                        declaration_id=revision.declaration_id,
+                        expected_revision_id=revision.revision_id,
+                        expected_source_fingerprint=revision.source_fingerprint,
+                        now="2026-08-01T02:00:00+00:00",
+                    )
+                self.assertTrue(interleaved["committed"])
+                self.assertEqual(reader.total_changes, before)
+                self.assertFalse(reader.in_transaction)
+                self.assertEqual(result.reason, "declared_shadow_current")
+                self.assertEqual(result.claim.value, "Snapshot-old Broadcast value.")
+                self.assertNotEqual(
+                    result.claim.value,
+                    writer.execute(
+                        "SELECT cleaned_summary FROM broadcast_memory WHERE id=?",
+                        (row_id,),
+                    ).fetchone()[0],
+                )
+                self.assertFalse(result.live_eligible)
+            finally:
+                if writer is not None:
+                    writer.close()
+                reader.close()
+
+    def test_inventory_uses_one_snapshot_across_concurrent_source_change(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ), tempfile.TemporaryDirectory() as temp_dir:
+            database_path = os.path.join(temp_dir, "inventory_snapshot.sqlite3")
+            reader = sqlite3.connect(database_path, timeout=2)
+            writer = None
+            try:
+                reader.execute("PRAGMA journal_mode=WAL")
+                self.create_pr2_broadcast_table(reader)
+                row_id = self.insert_pr2_broadcast(
+                    reader,
+                    cleaned="Inventory-old source value.",
+                )
+                self.classify_pr2_broadcast(reader, row_id)
+                writer = sqlite3.connect(database_path, timeout=2)
+                original_inventory_join = canon._inventory_declared_canon_claims
+                interleaved = {"committed": False}
+
+                def change_then_join(*args, **kwargs):
+                    writer.execute(
+                        """
+                        UPDATE broadcast_memory
+                        SET cleaned_summary='Inventory-new source value.',
+                            public_safe=0,usage_scope='internal',
+                            updated_at='2026-08-01T03:00:00+00:00'
+                        WHERE id=?
+                        """,
+                        (row_id,),
+                    )
+                    writer.commit()
+                    interleaved["committed"] = True
+                    return original_inventory_join(*args, **kwargs)
+
+                before = reader.total_changes
+                with mock.patch.object(
+                    canon,
+                    "_inventory_declared_canon_claims",
+                    side_effect=change_then_join,
+                ):
+                    inventory = canon.build_claim_contract_inventory(
+                        reader,
+                        guild_id=7,
+                        now="2026-08-01T02:00:00+00:00",
+                    )
+                self.assertTrue(interleaved["committed"])
+                self.assertEqual(reader.total_changes, before)
+                self.assertFalse(reader.in_transaction)
+                self.assertEqual(inventory["mutationCount"], 0)
+                self.assertEqual(inventory["broadcastDeclaredCurrentCount"], 1)
+                self.assertEqual(inventory["broadcastOpenReviewCount"], 0)
+                self.assertEqual(inventory["broadcastStaleSidecarCount"], 0)
+                self.assertNotIn("Inventory-old source value", repr(inventory))
+                self.assertNotIn("Inventory-new source value", repr(inventory))
+            finally:
+                if writer is not None:
+                    writer.close()
+                reader.close()
+
+    def test_declared_subject_type_distinguishes_same_id_across_entity_kinds(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ):
+            conn = sqlite3.connect(":memory:")
+            try:
+                declared_canon.ensure_declared_canon_schema(conn)
+                claims = []
+                for subject_type, nonce in (
+                    ("person", "typed-person-0001"),
+                    ("project", "typed-project-0001"),
+                ):
+                    revision = declared_canon.add_declared_canon(
+                        conn,
+                        actor_user_id=61,
+                        authority_nonce=nonce,
+                        guild_id=7,
+                        subject_type=subject_type,
+                        subject_id="shared_signal_id",
+                        predicate="official_role",
+                        value={"role": "fixture"},
+                        raw_declaration="Typed subject fixture.",
+                        cleaned_summary="Typed subject fixture.",
+                        domain="real_community",
+                        claim_kind="role",
+                        visibility="internal",
+                        eligible_routes=("declared_canon_review",),
+                        now="2026-08-01T01:00:00+00:00",
+                    ).primary
+                    adapted = canon.adapt_declared_canon_revision(
+                        conn,
+                        actor_user_id=61,
+                        authority_nonce="adapt-%s" % nonce,
+                        guild_id=7,
+                        declaration_id=revision.declaration_id,
+                        expected_revision_id=revision.revision_id,
+                        expected_source_fingerprint=revision.source_fingerprint,
+                        now="2026-08-01T02:00:00+00:00",
+                    )
+                    self.assertFalse(adapted.live_eligible)
+                    claims.append(adapted.claim)
+                self.assertEqual(
+                    tuple(claim.subject_type for claim in claims),
+                    ("person", "project"),
+                )
+                self.assertEqual(claims[0].subject_id, claims[1].subject_id)
+                self.assertNotEqual(claims[0].claim_id, claims[1].claim_id)
+                retyped = canon._with_final_revision(
+                    replace(
+                        claims[0],
+                        revision_id="",
+                        subject_type="project",
+                    ),
+                    source_revision=claims[0].source_revision,
+                )
+                self.assertNotEqual(retyped.revision_id, claims[0].revision_id)
+                diagnostics = canon.canon_claim_inventory_diagnostics(claims)
+                self.assertEqual(diagnostics["declaredTypedSubjectCount"], 2)
+                self.assertEqual(diagnostics["declaredUntypedSubjectCount"], 0)
+                self.assertEqual(diagnostics["declaredSubjectIdMultiTypeCount"], 1)
+            finally:
+                conn.close()
+
+    def test_declared_relationship_preserves_typed_object_endpoint(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ):
+            conn = sqlite3.connect(":memory:")
+            try:
+                declared_canon.ensure_declared_canon_schema(conn)
+                revision = declared_canon.add_declared_canon(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="typed-relation-0001",
+                    guild_id=7,
+                    subject_type="person",
+                    subject_id="six_bit",
+                    object_subject_type="project",
+                    object_subject_id="barcode_radio",
+                    predicate="broadcasts_for",
+                    value={"role": "host"},
+                    raw_declaration="6 Bit hosts BARCODE Radio.",
+                    cleaned_summary="6 Bit hosts BARCODE Radio.",
+                    domain="real_community",
+                    claim_kind="relationship",
+                    visibility="internal",
+                    eligible_routes=("declared_canon_review",),
+                    now="2026-08-01T01:00:00+00:00",
+                ).primary
+                result = canon.adapt_declared_canon_revision(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="adapt-relation-0001",
+                    guild_id=7,
+                    declaration_id=revision.declaration_id,
+                    expected_revision_id=revision.revision_id,
+                    expected_source_fingerprint=revision.source_fingerprint,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertEqual(result.claim.subject_type, "person")
+                self.assertEqual(result.claim.subject_id, "six_bit")
+                self.assertEqual(result.claim.object_subject_type, "project")
+                self.assertEqual(result.claim.object_subject_id, "barcode_radio")
+                self.assertEqual(
+                    result.claim.value["object_subject_id"],
+                    "barcode_radio",
+                )
+                self.assertFalse(result.live_eligible)
+                diagnostics = canon.canon_claim_inventory_diagnostics(
+                    (result.claim,)
+                )
+                self.assertEqual(
+                    diagnostics["declaredRelationshipEndpointMissingCount"],
+                    0,
+                )
+                malformed = replace(
+                    result.claim,
+                    object_subject_type="",
+                    object_subject_id="",
+                )
+                malformed_diagnostics = canon.canon_claim_inventory_diagnostics(
+                    (malformed,)
+                )
+                self.assertEqual(
+                    malformed_diagnostics[
+                        "declaredRelationshipEndpointMissingCount"
+                    ],
+                    1,
+                )
+            finally:
+                conn.close()
 
     def test_living_adapter_rejects_heterogeneous_or_unestablished_rows(self):
         role = canon.adapt_living_atomic_claim(
@@ -763,7 +1419,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             authority_actor="discord_user:1",
             authority_receipt="owner_command:40",
         ).claim
-        self.assertEqual(claim.canon_status, canon.CanonStatus.DECLARED)
+        self.assertEqual(claim.canon_status, canon.CanonStatus.OPEN_SIGNAL)
         self.assertEqual(claim.visibility, canon.Visibility.INTERNAL)
         self.assertEqual(claim.lifecycle, canon.ClaimLifecycle.REVIEW_ONLY)
         self.assertTrue(
@@ -778,7 +1434,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                 at="2026-08-03T00:00:00+00:00",
             )
         )
-        self.assertEqual(claim.canon_status, canon.CanonStatus.DECLARED)
+        self.assertEqual(claim.canon_status, canon.CanonStatus.OPEN_SIGNAL)
         self.assertEqual(claim.lifecycle, canon.ClaimLifecycle.REVIEW_ONLY)
 
     def test_inventory_reports_contract_and_content_free_collisions(self):
@@ -795,6 +1451,9 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         self.assertEqual(diagnostics["claimIdCollisionCount"], 0)
         self.assertEqual(diagnostics["revisionIdCollisionCount"], 0)
         self.assertEqual(diagnostics["revisionDigestMismatchCount"], 0)
+        self.assertEqual(diagnostics["duplicateCurrentSourceClaimCount"], 0)
+        self.assertEqual(diagnostics["duplicateRootWithinClaimCount"], 0)
+        self.assertEqual(diagnostics["duplicateDeclaredRootAuthorityCount"], 0)
         self.assertEqual(diagnostics["identityBindingCollisionCount"], 0)
         self.assertEqual(diagnostics["nonOpaqueAuthorityActorCount"], 0)
 
@@ -806,7 +1465,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
 
         hostile_claim = replace(
             claims[0],
-            authority_actor="discord_user:Jane Doe",
+            authority_actor="owner_ref:first.last",
         )
         hostile = canon.canon_claim_inventory_diagnostics(
             (hostile_claim,),
@@ -816,7 +1475,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                     platform="discord",
                     account_id="7",
                     authority_receipt="binding_receipt:hostile",
-                    authority_actor="discord_user:Jane Doe",
+                    authority_actor="owner_ref:first.last",
                     authority_verified=True,
                 ),
             ),
@@ -863,6 +1522,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                     ),
                 ),
             )
+            conn.commit()
             before = conn.total_changes
             inventory = canon.build_claim_contract_inventory(
                 conn,
@@ -879,8 +1539,146 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             rendered = repr(inventory)
             self.assertNotIn("Private fixture", rendered)
             self.assertNotIn("Another private", rendered)
+            conn.execute("BEGIN")
+            nested = canon.build_claim_contract_inventory(conn, guild_id=1)
+            self.assertEqual(nested["mutationCount"], 0)
+            self.assertTrue(conn.in_transaction)
+            conn.rollback()
         finally:
             conn.close()
+
+    def test_database_inventory_ignores_temp_source_shadow(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            source_schema = """
+                CREATE {scope} TABLE broadcast_memory(
+                  id INTEGER PRIMARY KEY,
+                  guild_id INTEGER,
+                  entry_type TEXT,
+                  raw_note TEXT,
+                  status TEXT,
+                  public_safe INTEGER,
+                  created_at TEXT
+                )
+            """
+            conn.execute(source_schema.format(scope=""))
+            conn.execute(
+                "INSERT INTO main.broadcast_memory VALUES(?,?,?,?,?,?,?)",
+                (
+                    1,
+                    1,
+                    "notable_moment",
+                    "Main source",
+                    "active",
+                    1,
+                    "2026-08-01T00:00:00+00:00",
+                ),
+            )
+            conn.execute(source_schema.format(scope="TEMP"))
+            conn.executemany(
+                "INSERT INTO temp.broadcast_memory VALUES(?,?,?,?,?,?,?)",
+                (
+                    (9, 1, "recap", "Temp one", "active", 1, "2025-01-01"),
+                    (10, 1, "recap", "Temp two", "active", 1, "2025-01-02"),
+                ),
+            )
+            conn.commit()
+
+            inventory = canon.build_claim_contract_inventory(conn, guild_id=1)
+
+            self.assertEqual(inventory["sourceRows"]["broadcast_memory"], 1)
+            self.assertEqual(inventory["adaptedRows"]["broadcast_memory"], 1)
+            self.assertNotIn("Temp one", repr(inventory))
+            self.assertNotIn("Temp two", repr(inventory))
+        finally:
+            conn.close()
+
+    def test_inventory_collapses_broadcast_sidecar_and_counts_old_revisions(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ):
+            conn = sqlite3.connect(":memory:")
+            try:
+                self.create_pr2_broadcast_table(conn)
+                declared_row = self.insert_pr2_broadcast(
+                    conn,
+                    cleaned="Declared fixture content must stay out of diagnostics.",
+                )
+                self.insert_pr2_broadcast(
+                    conn,
+                    cleaned="Open fixture content must stay out of diagnostics.",
+                )
+                first = self.classify_pr2_broadcast(conn, declared_row)
+                second = self.classify_pr2_broadcast(
+                    conn,
+                    declared_row,
+                    nonce="classify-contract-0002",
+                    expected_revision_id=first.revision_id,
+                )
+                self.assertNotEqual(first.revision_id, second.revision_id)
+                before = conn.total_changes
+                inventory = canon.build_claim_contract_inventory(
+                    conn,
+                    guild_id=7,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertEqual(conn.total_changes, before)
+                self.assertEqual(inventory["mutationCount"], 0)
+                self.assertEqual(inventory["adaptedRows"]["broadcast_memory"], 2)
+                self.assertEqual(inventory["broadcastDeclaredCurrentCount"], 1)
+                self.assertEqual(inventory["broadcastOpenReviewCount"], 1)
+                self.assertEqual(inventory["broadcastStaleSidecarCount"], 0)
+                self.assertEqual(inventory["duplicateCurrentSourceClaimCount"], 0)
+                self.assertEqual(inventory["duplicateRootWithinClaimCount"], 0)
+                self.assertEqual(inventory["duplicateDeclaredRootAuthorityCount"], 0)
+                self.assertEqual(inventory["declaredHistoricalRevisionCount"], 1)
+                self.assertEqual(inventory["statuses"]["declared"], 1)
+                self.assertGreaterEqual(inventory["statuses"]["open_signal"], 1)
+                rendered = repr(inventory)
+                self.assertNotIn("Declared fixture content", rendered)
+                self.assertNotIn("Open fixture content", rendered)
+                self.assertNotIn(first.revision_id, rendered)
+                self.assertNotIn("broadcast_memory:%s" % declared_row, rendered)
+            finally:
+                conn.close()
+
+    def test_inventory_falls_back_to_one_open_claim_for_stale_or_duplicate_sidecar(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ):
+            conn = sqlite3.connect(":memory:")
+            try:
+                self.create_pr2_broadcast_table(conn)
+                row_id = self.insert_pr2_broadcast(conn)
+                revision = self.classify_pr2_broadcast(conn, row_id)
+                conn.execute(
+                    """
+                    UPDATE broadcast_memory
+                    SET status='resolved',public_safe=0,usage_scope='internal',
+                        updated_at='2026-08-01T03:00:00+00:00'
+                    WHERE id=?
+                    """,
+                    (row_id,),
+                )
+                conn.commit()
+                before = conn.total_changes
+                inventory = canon.build_claim_contract_inventory(
+                    conn,
+                    guild_id=7,
+                    now="2026-08-01T04:00:00+00:00",
+                )
+                self.assertEqual(conn.total_changes, before)
+                self.assertEqual(inventory["broadcastDeclaredCurrentCount"], 0)
+                self.assertEqual(inventory["broadcastOpenReviewCount"], 1)
+                self.assertEqual(inventory["broadcastStaleSidecarCount"], 1)
+                self.assertEqual(inventory["statuses"]["declared"], 0)
+                self.assertGreaterEqual(inventory["statuses"]["open_signal"], 1)
+                self.assertEqual(inventory["adaptedRows"]["broadcast_memory"], 1)
+                self.assertNotIn(revision.revision_id, repr(inventory))
+            finally:
+                conn.close()
 
     def test_current_atomic_source_row_normalizes_as_review_only(self):
         conn = sqlite3.connect(":memory:")
