@@ -20,6 +20,23 @@ import bnl01_bot
 
 
 class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
+    NATURAL_SELECTED_SUBJECT_QUESTIONS = (
+        (
+            "What do you know about what I've actually done in BARCODE "
+            "and my established role here?"
+        ),
+        (
+            "What do you know about how I participate in BARCODE, "
+            "including recent work or recurring patterns you've actually "
+            "observed?"
+        ),
+        (
+            "Who am I in BARCODE, and what is my relationship to Cache "
+            "Back? Be clear about whether we are the same identity."
+        ),
+        "What do you actually know about me from BARCODE?",
+    )
+
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.db_path = str(
@@ -248,6 +265,60 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "project_canon_required=",
             "\n".join(result.diagnostics),
         )
+
+    async def test_natural_selected_subject_questions_generate_both_comparisons(
+        self,
+    ):
+        source_hash = self._source_hash()
+        for wording in self.NATURAL_SELECTED_SUBJECT_QUESTIONS:
+            calls = []
+
+            async def generator(prompt, route):
+                calls.append((route, prompt))
+                if route.endswith("baseline"):
+                    return "The established path has a narrow view."
+                return (
+                    "You keep fixing the bot code and memory system "
+                    "carefully."
+                )
+
+            async def guard(response, _prompt):
+                return response, {
+                    "suppressed": False,
+                    "suppression_reason": "",
+                }
+
+            with self.subTest(wording=wording):
+                result = await bnl01_bot.execute_bnl_memory_preview(
+                    source_db_path=self.db_path,
+                    guild_id=1,
+                    subject_user_id=7,
+                    subject_display_name="Crow",
+                    simulated_channel_id=10,
+                    wording=wording,
+                    generator=generator,
+                    guard=guard,
+                )
+
+                self.assertEqual(result.route_status, "matched")
+                self.assertEqual(
+                    result.established_response,
+                    "The established path has a narrow view.",
+                )
+                self.assertEqual(
+                    result.packet_candidate_response,
+                    "You keep fixing the bot code and memory system "
+                    "carefully.",
+                )
+                self.assertEqual(
+                    [route for route, _prompt in calls],
+                    [
+                        "bnl_memory_preview_baseline",
+                        "bnl_memory_preview_candidate",
+                    ],
+                )
+                self.assert_single_candidate_budget(result)
+        self.assertEqual(source_hash, self._source_hash())
 
     async def test_empty_packet_preserves_established_response(self):
         generator = mock.AsyncMock(

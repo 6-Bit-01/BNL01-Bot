@@ -371,6 +371,7 @@ class IntelligencePacketRequest:
     immediate_recap: bool = False
     now: str = ""
     declared_canon_authorized: bool = False
+    broad_profile_intent: bool = False
 
 
 @dataclass(frozen=True)
@@ -1085,6 +1086,17 @@ def _broad_profile_request(value: str) -> bool:
     return classify_personal_recall_intent(value).broad_self_profile
 
 
+def _request_is_broad_profile(
+    request: IntelligencePacketRequest,
+) -> bool:
+    """Honor a trusted upstream route decision without rewriting its text."""
+
+    return bool(
+        request.broad_profile_intent
+        or _broad_profile_request(request.user_text)
+    )
+
+
 def _profile_project_request(value: str) -> bool:
     return bool(_PROFILE_PROJECT_SCOPE_RE.search(str(value or "")))
 
@@ -1095,7 +1107,7 @@ def _profile_canon_anchor(
 ) -> IntelligencePacketItem | None:
     """Choose one canon point that best contextualizes selected public work."""
 
-    if not _broad_profile_request(request.user_text):
+    if not _request_is_broad_profile(request):
         return None
     subject = subject_key_for_user(request.subject_user_id)
     recognized = tuple(
@@ -2943,7 +2955,7 @@ def _canon_items(
 ) -> list[IntelligencePacketItem]:
     items: list[IntelligencePacketItem] = []
     lowered = str(request.user_text or "").lower()
-    broad = _broad_profile_request(request.user_text)
+    broad = _request_is_broad_profile(request)
     subject_key = subject_key_for_user(request.subject_user_id)
     signal = _canon_identity_signal(conn, request)
     diagnostics.canon_identity_status = signal.status
@@ -3348,7 +3360,7 @@ def _select_items(
     tuple[IntelligencePacketItem, ...],
     tuple[IntelligencePacketItem, ...],
 ]:
-    broad = _broad_profile_request(request.user_text)
+    broad = _request_is_broad_profile(request)
     if request.immediate_recap:
         kept = []
         for item in candidates:
@@ -3658,7 +3670,7 @@ def _profile_sufficiency(
     selected: Sequence[IntelligencePacketItem],
     candidates: Sequence[IntelligencePacketItem],
 ) -> ProfileSufficiency:
-    if not _broad_profile_request(request.user_text):
+    if not _request_is_broad_profile(request):
         return ProfileSufficiency(
             status="not_applicable",
             satisfied=True,
@@ -3842,7 +3854,7 @@ def _moment_version(
     item: IntelligencePacketItem,
 ) -> str:
     subject = subject_key_for_user(packet.request.subject_user_id)
-    broad = _broad_profile_request(packet.request.user_text)
+    broad = _request_is_broad_profile(packet.request)
     moments = select_public_participant_moment_gists(
         conn,
         guild_id=packet.request.guild_id,
@@ -4164,7 +4176,7 @@ def _packet_invariants(
 ) -> tuple[str, ...]:
     invalid = []
     subject = subject_key_for_user(packet.request.subject_user_id)
-    broad = _broad_profile_request(packet.request.user_text)
+    broad = _request_is_broad_profile(packet.request)
     for item in packet.items:
         if not _route_allows_item(packet.request, item):
             invalid.append("selected_visibility_violation")
@@ -4328,7 +4340,7 @@ def build_packet(
     ensure_schema(conn)
     diagnostics = IntelligencePacketDiagnostics()
     exclusions: list[IntelligencePacketExclusion] = []
-    broad = _broad_profile_request(request.user_text)
+    broad = _request_is_broad_profile(request)
     request_terms = _terms(request.user_text)
     candidates: list[IntelligencePacketItem] = []
     try:

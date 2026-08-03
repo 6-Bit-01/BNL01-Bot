@@ -65,6 +65,22 @@ PREVIEW_FACTUAL_PLACEHOLDER = (
     "threads are supplied to the established-path comparison."
 )
 PREVIEW_CONVERSATION_CONTEXT_LIMIT = 80
+_PREVIEW_BROAD_PROFILE_ROUTE_TEXT = "What do you know about me?"
+_PREVIEW_SELECTED_SUBJECT_PROFILE_QUERY_RE = re.compile(
+    r"^(?:"
+    r"what\s+(?:do|did|have)\s+you"
+    r"(?:\s+(?:actually|currently|already|really|genuinely|honestly))?"
+    r"\s+(?:know|remember|recall|learn(?:ed)?|observ(?:e|ed)|"
+    r"notic(?:e|ed))\s+about\s+"
+    r"(?:me\b|what\s+i(?:'ve|\s+have)?\b|how\s+i\b|"
+    r"my\s+(?:role|work|participation|history|contributions?|patterns?|"
+    r"relationships?|identity)\b)"
+    r"|who\s+am\s+i\b"
+    r"|what\s+(?:is|are)\s+my\s+"
+    r"(?:role|place|part|identity|relationships?)\b"
+    r")",
+    re.I,
+)
 _PREVIEW_BARE_MEDIA_FALLBACK_PATTERNS = (
     re.compile(
         r"\bi saw (?:your|[a-z0-9_. '\-]{1,80}'?s|someone'?s|their|his|her)?"
@@ -325,6 +341,29 @@ def preview_environment(
         }
     )
     return env
+
+
+def _selected_subject_preview_intent(
+    wording: str,
+) -> governance.PersonalRecallIntent:
+    """Interpret profile wording only inside the explicit-subject preview."""
+
+    intent = governance.classify_personal_recall_intent(wording)
+    if (
+        intent.status != "not_recall"
+        or intent.reason != "not_personal_recall"
+    ):
+        return intent
+    if not _PREVIEW_SELECTED_SUBJECT_PROFILE_QUERY_RE.search(
+        intent.normalized_text
+    ):
+        return intent
+    return governance.PersonalRecallIntent(
+        normalized_text=intent.normalized_text,
+        status="matched",
+        route_family=governance.PERSONAL_RECALL_ROUTE_FAMILY,
+        reason="selected_subject_profile_preview",
+    )
 
 
 def _open_read_only_memory_clone(path: str) -> sqlite3.Connection:
@@ -1144,6 +1183,7 @@ def _packet_request(
         declared_canon_authorized=bool(
             shared_brain_configuration(environ).get("effective")
         ),
+        broad_profile_intent=True,
     )
 
 
@@ -1506,7 +1546,7 @@ def prepare_memory_preview(
 ) -> PreparedMemoryPreview:
     """Prepare one route-equivalent snapshot without touching the source DB."""
 
-    intent = governance.classify_personal_recall_intent(request.wording)
+    intent = _selected_subject_preview_intent(request.wording)
     if not intent.broad_self_profile:
         return PreparedMemoryPreview(
             connection=None,
@@ -1636,7 +1676,11 @@ def prepare_memory_preview(
             route_mode=SIMULATED_ROUTE_MODE,
             channel_policy=SIMULATED_CHANNEL_POLICY,
             current_direct=True,
-            user_text=effective_request.wording,
+            # The selected-subject preview made the trusted route decision
+            # above.  Keep the natural wording in the packet and prompt while
+            # using the canonical route text only for the existing gated
+            # synthesis scope check.  Public routing remains unchanged.
+            user_text=_PREVIEW_BROAD_PROFILE_ROUTE_TEXT,
             packet=packet,
             assessment=assessment,
             competing_factual_contexts=(
