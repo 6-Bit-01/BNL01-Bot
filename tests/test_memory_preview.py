@@ -12,6 +12,7 @@ from bnl_canon_source_contract import (
     SourceClass,
     Visibility,
 )
+import bnl_memory_governance as governance
 import bnl_memory_ledger as ledger
 from bnl_memory_preview import (
     MemoryPreviewDiagnostics,
@@ -28,6 +29,23 @@ from bnl_memory_preview import (
 
 
 class MemoryPreviewTests(unittest.TestCase):
+    NATURAL_SELECTED_SUBJECT_QUESTIONS = (
+        (
+            "What do you know about what I've actually done in BARCODE "
+            "and my established role here?"
+        ),
+        (
+            "What do you know about how I participate in BARCODE, "
+            "including recent work or recurring patterns you've actually "
+            "observed?"
+        ),
+        (
+            "Who am I in BARCODE, and what is my relationship to Cache "
+            "Back? Be clear about whether we are the same identity."
+        ),
+        "What do you actually know about me from BARCODE?",
+    )
+
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.db_path = str(
@@ -318,6 +336,60 @@ class MemoryPreviewTests(unittest.TestCase):
             prepared.diagnostics.route_reason,
             "recall_target_ambiguous",
         )
+
+    def test_natural_selected_subject_profile_questions_enter_preview_route(self):
+        source_hash_before = self._source_hash()
+        for wording in self.NATURAL_SELECTED_SUBJECT_QUESTIONS:
+            with self.subTest(wording=wording):
+                self.assertFalse(
+                    governance.classify_personal_recall_intent(
+                        wording
+                    ).broad_self_profile
+                )
+                prepared = prepare_memory_preview(self._request(wording))
+                try:
+                    self.assertEqual(
+                        prepared.diagnostics.route_status,
+                        "matched",
+                    )
+                    self.assertEqual(
+                        prepared.diagnostics.route_reason,
+                        "selected_subject_profile_preview",
+                    )
+                    self.assertIsNotNone(prepared.connection)
+                    self.assertIsNotNone(prepared.packet)
+                    self.assertTrue(
+                        prepared.packet.request.broad_profile_intent
+                    )
+                    self.assertNotEqual(
+                        prepared.diagnostics.profile_status,
+                        "not_applicable",
+                    )
+                finally:
+                    prepared.close()
+        self.assertEqual(source_hash_before, self._source_hash())
+
+    def test_selected_subject_preview_still_rejects_non_profile_requests(self):
+        cases = (
+            ("Tell me a joke.", "not_recall"),
+            ("What do you know about Cache Back?", "not_recall"),
+            (
+                "What do you know about me and tell me a joke?",
+                "not_recall",
+            ),
+            (
+                "Do not tell me what you know about me yet.",
+                "blocked",
+            ),
+        )
+        for wording, expected_status in cases:
+            with self.subTest(wording=wording):
+                prepared = prepare_memory_preview(self._request(wording))
+                self.assertIsNone(prepared.connection)
+                self.assertEqual(
+                    prepared.diagnostics.route_status,
+                    expected_status,
+                )
 
     def test_sealed_test_rows_never_participate_in_public_home_preview(self):
         with sqlite3.connect(self.db_path) as source:
