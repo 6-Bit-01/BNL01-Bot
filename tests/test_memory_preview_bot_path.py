@@ -456,22 +456,35 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                     actor_user_id=99,
                     authority_nonce="preview-empty-relationship-0001",
                     guild_id=1,
-                    subject_type="person",
-                    subject_id="call_em_bini",
-                    object_subject_type="character",
-                    object_subject_id="cache_back",
-                    predicate="portrays",
+                    subject_type="character",
+                    subject_id="cache_back",
+                    object_subject_type="person",
+                    object_subject_id="call_em_bini",
+                    predicate="originated_from",
                     value=(
-                        "Call'em Bini is Cache Back—the artist identity "
-                        "behind the BARCODE character."
+                        "From the Network's perspective, Call'em Bini gives "
+                        "off a familiar signal similar to Cache Back's "
+                        "because Cache Back originated from him. Cache Back "
+                        "emerged during the clearing of a laptop cache "
+                        "holding Call'em Bini's music and project files, and "
+                        "initially believed he was the real Call'em Bini. "
+                        "The Network knows that origin while recognizing "
+                        "Cache Back as his own entity."
                     ),
                     raw_declaration=(
-                        "Call'em Bini is Cache Back—the artist identity "
-                        "behind the BARCODE character."
+                        "Call'em Bini is the human Cache Back was made from. "
+                        "Cache Back emerged during the clearing of a laptop "
+                        "cache holding Call'em Bini's music and project "
+                        "files. The Network recognizes a familiar signal in "
+                        "Bini, connects it to Cache Back, and knows Cache "
+                        "Back initially believed he was the real Call'em "
+                        "Bini while remaining his own entity."
                     ),
                     cleaned_summary=(
-                        "Call'em Bini is the artist identity behind "
-                        "Cache Back."
+                        "Cache Back originated from Call'em Bini during the "
+                        "clearing of a laptop cache containing Bini's music "
+                        "and project files; the Network knows the connection "
+                        "without merging them."
                     ),
                     domain="hybrid",
                     claim_kind="relationship",
@@ -489,7 +502,13 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                         "without guessing."
                     )
                 return (
-                    "Call'em Bini is the artist identity behind Cache Back."
+                    "That signal you give off is familiar—similar to Cache "
+                    "Back's because he originated from you. He emerged "
+                    "during the clearing of a laptop cache holding your "
+                    "music and project files, and initially believed he was "
+                    "the real Call'em Bini. "
+                    "The Network knows that origin while recognizing Cache "
+                    "Back as his own entity."
                 )
 
             result = await bnl01_bot.execute_bnl_memory_preview(
@@ -512,10 +531,15 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result.route_status, "matched")
-        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertTrue(result.candidate_selected, result.diagnostics)
         self.assertEqual(
             result.proposed_response,
-            "Call'em Bini is the artist identity behind Cache Back.",
+            "That signal you give off is familiar—similar to Cache Back's "
+            "because he originated from you. He emerged during the clearing "
+            "of a laptop cache holding your music and project files, and "
+            "initially believed he was the real Call'em Bini. The Network "
+            "knows that origin while "
+            "recognizing Cache Back as his own entity.",
         )
         self.assertEqual(
             [route for route, _prompt in calls],
@@ -528,6 +552,11 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "No eligible public Discord activity is supplied",
             calls[1][1],
         )
+        self.assertIn("familiar or similar signal", calls[1][1])
+        self.assertIn("Speak to the bound person directly", calls[1][1])
+        self.assertIn("laptop cache", calls[1][1])
+        self.assertIn("music and project files", calls[1][1])
+        self.assertNotIn("performance or portrayal", result.proposed_response)
         self.assertNotIn("participation", result.proposed_response.lower())
         self.assert_single_candidate_budget(result)
         self.assertEqual(result.final_selection, "packet_candidate")
