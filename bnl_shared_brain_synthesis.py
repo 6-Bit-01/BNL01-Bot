@@ -562,6 +562,11 @@ _IDENTITY_DISTINCTION_CLAIM_RE = re.compile(
     r"\bnot\s+(?:the\s+)?same\b)",
     re.I,
 )
+_SIGNAL_ORIGIN_RELATIONSHIP_PREDICATES = frozenset(
+    {
+        "originated_from",
+    }
+)
 _CLAIM_GENERIC_TERMS = frozenset(
     {
         "alright",
@@ -1213,6 +1218,30 @@ def _identity_canon_only_packet(
     )
 
 
+def _identity_signal_origin_packet(
+    packet: UnifiedIntelligencePacket | None,
+) -> bool:
+    """Identify an approved source-pattern relationship without naming actors.
+
+    The predicate carries the expression contract. Content remains in owner-
+    controlled Declared Canon, so this helper cannot create an origin story or
+    turn a stable account binding into an identity merge.
+    """
+
+    return bool(
+        _identity_canon_only_packet(packet)
+        and packet is not None
+        and any(
+            item.lane == "canon"
+            and item.source_type == "recognized_declared_canon_claim"
+            and item.canon_claim_kind == "relationship"
+            and item.predicate_key
+            in _SIGNAL_ORIGIN_RELATIONSHIP_PREDICATES
+            for item in packet.items
+        )
+    )
+
+
 def _identity_canon_only_usable(
     packet: UnifiedIntelligencePacket | None,
     assessment: UnifiedResponseAssessment | None,
@@ -1770,6 +1799,7 @@ def render_packet_context(
         getattr(profile, "status", "not_applicable") or "not_applicable"
     ).strip().lower()
     identity_canon_only = _identity_canon_only_packet(packet)
+    identity_signal_origin = _identity_signal_origin_packet(packet)
     if identity_canon_only:
         profile_rule = (
             "- No eligible public Discord activity is supplied for this "
@@ -1805,9 +1835,19 @@ def render_packet_context(
         profile_rule = ""
     recognized_canon_present = _profile_has_recognized_canon_identity(packet)
     project_rule = (
-        "- The approved identity relationship is the factual answer in this "
-        "zero-activity case. State it directly once and do not pad it with "
-        "unrelated character canon.\n"
+        "- The approved source-pattern relationship is the factual basis. "
+        "Express it through BNL's Network perspective: notice a familiar or "
+        "similar signal in the person, connect that recognition to the named "
+        "character, and then explain only the supplied origin. Speak to the "
+        "bound person directly when natural; do not recite both subject names "
+        "like a relationship record. Do not reduce the answer to a sterile "
+        "'human source behind' definition, frame the relationship as "
+        "performance or portrayal, or imply that the two subjects are one "
+        "evidence record.\n"
+        if identity_signal_origin
+        else "- The approved identity relationship is the factual answer in "
+        "this zero-activity case. State it directly once and do not pad it "
+        "with unrelated character canon.\n"
         if identity_canon_only
         else
         "- A stable approved BARCODE identity is available as additive "
@@ -1833,8 +1873,11 @@ def render_packet_context(
     identity_comparison_rule = (
         "- The request asks for an identity or relationship distinction. "
         + (
-            "State the directly supported relationship once in one plain "
-            "sentence. "
+            "Present the supported connection once as a natural signal "
+            "recognition, not as a definition or identity equation. "
+            if identity_signal_origin
+            else "State the directly supported relationship once in one "
+            "plain sentence. "
             if identity_canon_only
             else "State the supported distinction once in one plain sentence "
             "after the member-specific substance. "
@@ -1852,8 +1895,12 @@ def render_packet_context(
         else ""
     )
     lead_rule = (
-        "- Lead with the directly applicable approved identity relationship. "
-        "Do not claim or imply a Discord activity history.\n"
+        "- Lead with BNL noticing the familiar or similar signal, then connect "
+        "it to the approved origin. Do not claim or imply a Discord activity "
+        "history.\n"
+        if identity_signal_origin
+        else "- Lead with the directly applicable approved identity "
+        "relationship. Do not claim or imply a Discord activity history.\n"
         if identity_canon_only
         else "- Lead with member-specific substance. Relevant BARCODE canon "
         "may add one concise context anchor afterward, but can never "
@@ -3458,6 +3505,30 @@ def _item_predicate_grounded(
     return False
 
 
+def _candidate_member_subject_keys(
+    member_items: Sequence[Any],
+    canon_items: Sequence[Any],
+) -> frozenset[str]:
+    """Include only relationships proven through the stable account binding."""
+
+    keys = {
+        str(getattr(item, "subject_key", "") or "")
+        for item in member_items
+        if str(getattr(item, "subject_key", "") or "")
+    }
+    keys.update(
+        str(getattr(item, "subject_key", "") or "")
+        for item in canon_items
+        if str(getattr(item, "subject_key", "") or "")
+        and str(getattr(item, "lane", "") or "") == "canon"
+        and str(getattr(item, "source_type", "") or "")
+        == "recognized_declared_canon_claim"
+        and str(getattr(item, "canon_claim_kind", "") or "")
+        == "relationship"
+    )
+    return frozenset(keys)
+
+
 def _classify_candidate_claims(
     response: str,
     *,
@@ -3481,10 +3552,9 @@ def _classify_candidate_claims(
     unsupported = 0
     first_supported_member: bool | None = None
     has_member_basis = bool(supported_member_points)
-    member_subject_keys = frozenset(
-        str(getattr(item, "subject_key", "") or "")
-        for item in member_items
-        if str(getattr(item, "subject_key", "") or "")
+    member_subject_keys = _candidate_member_subject_keys(
+        member_items,
+        canon_items,
     )
     for claim in _candidate_claim_units(response):
         if _claim_is_transient_expression(claim):
@@ -3608,10 +3678,11 @@ def candidate_profile_coverage(
         and item.subject_key == requester_subject_key
         and _item_point_group(item)
     )
-    member_subject_keys = frozenset(
-        str(getattr(item, "subject_key", "") or "")
-        for item in member_items
-        if str(getattr(item, "subject_key", "") or "")
+    member_subject_keys = _candidate_member_subject_keys(
+        member_items,
+        tuple(
+            item for item in validation_items if item.lane == "canon"
+        ),
     )
     material_point_map = material_profile_point_map(member_items)
 
