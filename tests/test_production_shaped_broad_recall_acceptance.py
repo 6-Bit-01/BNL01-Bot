@@ -1051,39 +1051,7 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                 finally:
                     prepared.close()
 
-    def test_six_bit_uses_generic_open_signal_with_additive_canon(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE canon_entity_account_bindings(
-                  guild_id INTEGER NOT NULL,
-                  platform TEXT NOT NULL,
-                  account_id TEXT NOT NULL,
-                  entity_id TEXT NOT NULL,
-                  authority_receipt TEXT NOT NULL,
-                  authority_actor TEXT NOT NULL,
-                  binding_version TEXT NOT NULL,
-                  authority_verified INTEGER NOT NULL,
-                  active INTEGER NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                "INSERT INTO canon_entity_account_bindings "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    1,
-                    "discord",
-                    "114",
-                    "6_bit",
-                    "binding_receipt:114",
-                    "discord_user:1",
-                    "canon_entity_account_binding_v1",
-                    1,
-                    1,
-                ),
-            )
-            conn.commit()
+    def test_six_bit_uses_configured_owner_binding_with_additive_canon(self):
         self.add_raw_message(
             user_id=114,
             user_name="6 Bit",
@@ -1096,13 +1064,25 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
             content="I test the smaller interface change before release.",
             observed_at="2026-07-22T18:00:00+00:00",
         )
-        prepared = prepare_memory_preview(
-            self.request(
-                user_id=114,
-                user_name="6 Bit",
-                wording="BNL, what am I all about?",
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BNL_OWNER_USER_ID": "114",
+                "BNL_PRIMARY_GUILD_ID": "1",
+            },
+            clear=False,
+        ):
+            prepared = prepare_memory_preview(
+                self.request(
+                    user_id=114,
+                    user_name="6 Bit",
+                    wording=(
+                        "Who am I in BARCODE, and what is my relationship "
+                        "to Cache Back? Be clear about whether we are the "
+                        "same identity."
+                    ),
+                )
             )
-        )
         try:
             self.assertTrue(prepared.ready)
             self.assertEqual(prepared.diagnostics.profile_status, "rich")
@@ -1119,6 +1099,26 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
             self.assertEqual(len(observation_indexes), 2)
             self.assertTrue(canon_indexes)
             self.assertLess(max(observation_indexes), min(canon_indexes))
+            evaluation = evaluate_memory_preview(
+                prepared,
+                baseline_response=(
+                    "The available record is still too narrow to answer."
+                ),
+                candidate_response=(
+                    "From your public activity, you compare two antenna "
+                    "layouts before choosing one. You also test the smaller "
+                    "interface change before release. In BARCODE, you are "
+                    "6 Bit—an artist, MC, host, and founding member first; "
+                    "Cache Back is a founding BARCODE member and BARCODE "
+                    "Archive specialist."
+                ),
+            )
+            self.assertTrue(
+                evaluation.candidate_selected,
+                evaluation.fallback_reason,
+            )
+            self.assertEqual(evaluation.candidate_member_point_count, 2)
+            self.assertGreaterEqual(evaluation.candidate_canon_count, 1)
         finally:
             prepared.close()
 

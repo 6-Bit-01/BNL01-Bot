@@ -93,19 +93,26 @@ receipt, and an immutable platform-ID shape (Discord IDs are numeric). A label
 such as `owner_confirmed`, a display name in an account-ID field, a malformed
 boolean, or an unversioned lookalike row is not authority.
 
-The existing live packet prefers a fully versioned, boundary-verified binding
-when an approved binding table and row are already present. An invalid or
-ambiguous row fails closed rather than falling back to a conflicting display
-label. PR 1 creates no binding table or row and performs no data mutation;
-creating or approving binding data remains a separately authorized operation.
-Without an approved row, the existing label-compatibility path remains, except
-for removal of the false alias.
+The live packet prefers a fully versioned, boundary-verified binding. An
+invalid, retired, or ambiguous row fails closed rather than falling back to a
+conflicting display label. The append-only
+`canon_entity_account_binding_lifecycle_v1` owner completes the separately
+authorized bind/retire path without creating any row automatically. The
+configured owner account in the configured primary guild is the explicit
+same-platform 6 Bit binding; a stored lifecycle decision takes precedence.
+Without either approved binding source, the existing label-compatibility path
+remains, except for removal of the false alias.
 
 Call'em Bini and Cache Back are distinct entities. Any relationship between
 them requires a separately typed, sourced claim; neither name is an alias or
 account-binding shortcut for the other. The existing website origin sentence
 is retained as an internal, review-only lore relationship candidate and has no
 fact or identity authority.
+
+An approved Call'em Bini account binding makes a separately approved Declared
+Canon claim applicable when Call'em Bini is its subject or typed relationship
+endpoint. That projection remains canon, never Discord activity or a member
+profile point, and is revalidated against both the declaration and binding.
 
 The content-free inventory distinguishes complete source reconciliation from
 a bounded partial scan. Any truncated source forces

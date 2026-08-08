@@ -8,6 +8,7 @@ from dataclasses import replace
 from unittest import mock
 
 import bnl_canon_source_contract as canon
+import bnl_canon_entity_binding as entity_binding
 import bnl_declared_canon as declared_canon
 import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
@@ -592,6 +593,207 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             invalid = packet._canon_identity_signal(conn, request)
             self.assertFalse(invalid.recognized)
             self.assertEqual(invalid.status, "invalid_account_binding")
+        finally:
+            conn.close()
+
+    def test_configured_owner_binding_recognizes_6_bit_without_label_inference(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            request = packet.IntelligencePacketRequest(
+                guild_id=7,
+                channel_id=10,
+                channel_policy="public_home",
+                route_mode="normal_chat",
+                conversation_surface="public_home",
+                subject_user_id=61,
+                subject_display_name="Cache Back",
+                user_text="BNL, what am I all about?",
+            )
+            signal = packet._canon_identity_signal(
+                conn,
+                request,
+                environ={
+                    "BNL_OWNER_USER_ID": "61",
+                    "BNL_PRIMARY_GUILD_ID": "7",
+                },
+            )
+            self.assertTrue(signal.recognized)
+            self.assertEqual(signal.subject, canon.SIX_BIT)
+            self.assertEqual(signal.stable_row_count, 1)
+
+            wrong_guild = packet._canon_identity_signal(
+                conn,
+                request,
+                environ={
+                    "BNL_OWNER_USER_ID": "61",
+                    "BNL_PRIMARY_GUILD_ID": "8",
+                },
+            )
+            self.assertFalse(wrong_guild.recognized)
+            self.assertNotEqual(wrong_guild.subject, canon.SIX_BIT)
+        finally:
+            conn.close()
+
+    def test_lifecycle_binding_resolves_callem_bini_without_cache_back_merge(self):
+        conn = sqlite3.connect(":memory:")
+        env = {
+            "BNL_OWNER_USER_ID": "61",
+            "BNL_PRIMARY_GUILD_ID": "7",
+            "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                "hybrid-binding-integration-secret-0001"
+            ),
+        }
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                entity_binding.ensure_canon_entity_binding_schema(conn)
+                entity_binding.bind_discord_account(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="hybrid-binding-0001",
+                    guild_id=7,
+                    account_id="4242",
+                    entity_id=canon.CALL_EM_BINI.key,
+                    reason="Approve Call'em Bini's Discord account binding.",
+                )
+                request = packet.IntelligencePacketRequest(
+                    guild_id=7,
+                    channel_id=10,
+                    channel_policy="public_home",
+                    route_mode="normal_chat",
+                    conversation_surface="public_home",
+                    subject_user_id=4242,
+                    subject_display_name="Cache Back",
+                    user_text="BNL, what am I all about?",
+                )
+                signal = packet._canon_identity_signal(
+                    conn,
+                    request,
+                    environ=env,
+                )
+            self.assertEqual(signal.status, "bound_non_signal_identity")
+            self.assertEqual(signal.subject, canon.CALL_EM_BINI)
+            self.assertNotEqual(signal.subject, canon.CACHE_BACK)
+            self.assertTrue(signal.evidence_digest)
+        finally:
+            conn.close()
+
+    def test_typed_relationship_applies_through_binding_without_becoming_activity(self):
+        conn = sqlite3.connect(":memory:")
+        env = {
+            "BNL_OWNER_USER_ID": "61",
+            "BNL_PRIMARY_GUILD_ID": "7",
+            "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                "hybrid-binding-relationship-secret-0001"
+            ),
+        }
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                declared_canon.ensure_declared_canon_schema(conn)
+                entity_binding.ensure_canon_entity_binding_schema(conn)
+                bound = entity_binding.bind_discord_account(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="relationship-binding-0001",
+                    guild_id=7,
+                    account_id="4242",
+                    entity_id=canon.CALL_EM_BINI.key,
+                    reason="Approve the same-platform entity binding.",
+                ).revision
+                declared_canon.add_declared_canon(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="relationship-declare-0001",
+                    guild_id=7,
+                    subject_type="entity",
+                    subject_id=canon.CACHE_BACK.key,
+                    object_subject_type="entity",
+                    object_subject_id=canon.CALL_EM_BINI.key,
+                    predicate="test_typed_relationship",
+                    value={"description": "Approved test relationship."},
+                    raw_declaration="Approve the test relationship.",
+                    cleaned_summary="Approved test relationship.",
+                    domain="lore",
+                    claim_kind="relationship",
+                    visibility="public_safe",
+                    eligible_routes=("public_home",),
+                    valid_from="2026-08-01T00:00:00+00:00",
+                )
+                request = packet.IntelligencePacketRequest(
+                    guild_id=7,
+                    channel_id=10,
+                    channel_policy="public_home",
+                    route_mode="normal_chat",
+                    conversation_surface="public_home",
+                    subject_user_id=4242,
+                    subject_display_name="Call'em Bini",
+                    user_text=(
+                        "Who am I in BARCODE, and what is my relationship "
+                        "to Cache Back?"
+                    ),
+                    declared_canon_authorized=True,
+                    broad_profile_intent=True,
+                    now="2026-08-08T12:00:00+00:00",
+                )
+                diagnostics = packet.IntelligencePacketDiagnostics()
+                exclusions = []
+                items = packet._declared_items(
+                    conn,
+                    request,
+                    diagnostics,
+                    exclusions,
+                    broad=True,
+                    request_terms={"cache", "back", "relationship"},
+                    environ=env,
+                )
+                self.assertEqual(len(items), 1)
+                item = items[0]
+                self.assertEqual(item.lane, "canon")
+                self.assertEqual(
+                    item.source_type,
+                    "recognized_declared_canon_claim",
+                )
+                self.assertEqual(item.subject_key, "discord_user:4242")
+                self.assertFalse(item.point_identity)
+                self.assertIn("Call'em Bini", item.text)
+                self.assertIn("Cache Back", item.text)
+                self.assertNotIn("object_subject_id", item.text)
+
+                built = packet.UnifiedIntelligencePacket(
+                    schema_version=packet.SCHEMA_VERSION,
+                    packet_id="test-packet",
+                    request=request,
+                    items=(item,),
+                    exclusions=(),
+                    diagnostics=diagnostics,
+                    validation_items=(item,),
+                )
+                self.assertEqual(
+                    packet._declared_version(
+                        conn,
+                        built,
+                        item,
+                        environ=env,
+                    ),
+                    item.source_digest,
+                )
+                entity_binding.retire_discord_account_binding(
+                    conn,
+                    actor_user_id=61,
+                    authority_nonce="relationship-binding-retire-0001",
+                    guild_id=7,
+                    binding_id=bound.binding_id,
+                    expected_revision_id=bound.binding_revision_id,
+                    reason="Retire the test binding.",
+                )
+                self.assertEqual(
+                    packet._declared_version(
+                        conn,
+                        built,
+                        item,
+                        environ=env,
+                    ),
+                    "",
+                )
         finally:
             conn.close()
 

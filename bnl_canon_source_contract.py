@@ -2807,6 +2807,15 @@ def _build_claim_contract_inventory_in_snapshot(
             rejected_rows["memory_moment"] += 1
 
     bindings: list[EntityAccountBinding] = []
+    binding_columns = set(
+        _sqlite_table_columns(conn, "canon_entity_account_bindings")
+    )
+    lifecycle_binding_table = {
+        "binding_revision_id",
+        "binding_id",
+        "revision_number",
+        "lifecycle_version",
+    }.issubset(binding_columns)
     binding_total, binding_rows, binding_truncated = _inventory_table_rows(
         conn,
         table_name="canon_entity_account_bindings",
@@ -2820,6 +2829,10 @@ def _build_claim_contract_inventory_in_snapshot(
             "binding_version",
             "authority_verified",
             "active",
+            "binding_revision_id",
+            "binding_id",
+            "revision_number",
+            "lifecycle_version",
         ),
         guild_id=guild_id,
         limit=max_rows_per_source,
@@ -2831,44 +2844,99 @@ def _build_claim_contract_inventory_in_snapshot(
     known_entity_ids = {
         subject.key for subject in CANON_ENTITY_IDENTITIES
     }
-    for row in binding_rows:
-        binding = EntityAccountBinding(
-            entity_id=_mapping_text(row, "entity_id"),
-            platform=_mapping_text(row, "platform").casefold(),
-            account_id=_mapping_text(row, "account_id"),
-            authority_receipt=_mapping_text(
-                row,
-                "authority_receipt",
-            ),
-            authority_actor=_mapping_text(row, "authority_actor"),
-            binding_version=(
-                _mapping_text(row, "binding_version")
-                or "unversioned"
-            ),
-            authority_verified=strict_contract_bool(
-                row.get("authority_verified")
-            ),
-            active=strict_contract_bool(row.get("active")),
-        )
-        if (
-            not binding.entity_id
-            or binding.entity_id not in known_entity_ids
-            or not _platform_account_id_valid(
-                binding.platform,
-                binding.account_id,
+    if lifecycle_binding_table:
+        if binding_truncated:
+            rejected_rows["entity_account_bindings"] += len(binding_rows)
+            reason_counts["binding_lifecycle_scan_truncated"] += len(
+                binding_rows
             )
-            or not _binding_authority_valid(binding)
-        ):
-            rejected_rows["entity_account_bindings"] += 1
-            reason_counts["invalid_account_binding"] += 1
-            continue
-        bindings.append(binding)
-        adapted_rows["entity_account_bindings"] += 1
-        reason_counts[
-            "eligible_account_binding"
-            if binding.active
-            else "inactive_account_binding"
-        ] += 1
+        else:
+            from bnl_canon_entity_binding import (
+                read_current_guild_entity_account_bindings,
+            )
+
+            lifecycle_guild_ids = tuple(
+                sorted(
+                    {
+                        int(row.get("guild_id") or 0)
+                        for row in binding_rows
+                        if int(row.get("guild_id") or 0) > 0
+                    }
+                )
+            )
+            lifecycle_reads = tuple(
+                read_current_guild_entity_account_bindings(
+                    conn,
+                    guild_id=scoped_guild_id,
+                )
+                for scoped_guild_id in lifecycle_guild_ids
+            )
+            if lifecycle_reads and all(
+                lifecycle_read.status
+                in {
+                    "active",
+                    "retired_account_binding",
+                    "no_binding",
+                }
+                for lifecycle_read in lifecycle_reads
+            ):
+                current_bindings = tuple(
+                    current_binding
+                    for lifecycle_read in lifecycle_reads
+                    for current_binding in lifecycle_read.bindings
+                )
+                bindings.extend(current_bindings)
+                adapted_rows["entity_account_bindings"] += len(binding_rows)
+                reason_counts["eligible_account_binding"] += len(
+                    current_bindings
+                )
+                reason_counts[
+                    "historical_or_inactive_account_binding_revision"
+                ] += max(0, len(binding_rows) - len(current_bindings))
+            else:
+                rejected_rows["entity_account_bindings"] += len(binding_rows)
+                reason_counts["invalid_account_binding_lifecycle"] += len(
+                    binding_rows
+                )
+    else:
+        for row in binding_rows:
+            binding = EntityAccountBinding(
+                entity_id=_mapping_text(row, "entity_id"),
+                platform=_mapping_text(row, "platform").casefold(),
+                account_id=_mapping_text(row, "account_id"),
+                authority_receipt=_mapping_text(
+                    row,
+                    "authority_receipt",
+                ),
+                authority_actor=_mapping_text(row, "authority_actor"),
+                binding_version=(
+                    _mapping_text(row, "binding_version")
+                    or "unversioned"
+                ),
+                authority_verified=strict_contract_bool(
+                    row.get("authority_verified")
+                ),
+                active=strict_contract_bool(row.get("active")),
+            )
+            if (
+                not binding.entity_id
+                or binding.entity_id not in known_entity_ids
+                or not _platform_account_id_valid(
+                    binding.platform,
+                    binding.account_id,
+                )
+                or not _binding_authority_valid(binding)
+            ):
+                rejected_rows["entity_account_bindings"] += 1
+                reason_counts["invalid_account_binding"] += 1
+                continue
+            bindings.append(binding)
+            adapted_rows["entity_account_bindings"] += 1
+            reason_counts[
+                "eligible_account_binding"
+                if binding.active
+                else "inactive_account_binding"
+            ] += 1
 
     diagnostics = canon_claim_inventory_diagnostics(
         claims,

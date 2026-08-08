@@ -516,6 +516,26 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertNotIn("relationship_posture", dict(lane_counts))
         self.assertNotIn("approved canon", rendered)
 
+    def test_renderer_keeps_identity_comparison_additive_to_activity(self):
+        request = replace(
+            self.packet.request,
+            user_text=(
+                "Who am I in BARCODE, and what is my relationship to Cache "
+                "Back? Be clear about whether we are the same identity."
+            ),
+        )
+        packet = replace(self.packet, request=request)
+        rendered, _counts, _count, _digests = render_packet_context(packet)
+        self.assertIn(
+            "State the supported distinction once in one plain sentence",
+            rendered,
+        )
+        self.assertIn(
+            "Canon identifies who the activity belongs to",
+            rendered,
+        )
+        self.assertIn("Do not repeat negative identity wording", rendered)
+
     def test_renderer_allocates_concrete_examples_across_points(self):
         base = self.packet.items[0]
         first = replace(
