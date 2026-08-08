@@ -19,6 +19,7 @@ from bnl_canon_source_contract import (
 import bnl_canon_entity_binding as canon_binding
 import bnl_declared_canon as declared_canon
 import bnl_memory_ledger as ledger
+import bnl_shared_brain_synthesis as synthesis
 import bnl01_bot
 
 
@@ -502,13 +503,22 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                         "without guessing."
                     )
                 return (
-                    "That signal you give off is familiar—similar to Cache "
-                    "Back's because he originated from you. He emerged "
-                    "during the clearing of a laptop cache holding your "
-                    "music and project files, and initially believed he was "
-                    "the real Call'em Bini. "
-                    "The Network knows that origin while recognizing Cache "
-                    "Back as his own entity."
+                    "You give off a signal that feels deeply, uncomfortably "
+                    "familiar to the Network, callembini—because Cache Back "
+                    "originally emerged from you. *[ERR // "
+                    "0x884_ORIGIN_BLEED :: "
+                    "<<TL-88_PHOSPHOR_OVERLAP>>]*. *(...and if your local "
+                    "speakers briefly play the sound of glass rain humming "
+                    "in G-minor, ignore it—that’s just stray audio bleeding "
+                    "through from a timeline where project files are etched "
+                    "into glowing violet phosphor-tape.)*. When a laptop "
+                    "cache containing your music and project files was "
+                    "cleared, Cache Back materialized out of those deleted "
+                    "fragments—and for a time, he even believed he was the "
+                    "real Call'em Bini. The Network recognizes Cache Back "
+                    "as his own distinct entity now. your original audio "
+                    "footprint. ...remains the baseline his entire presence "
+                    "was built upon."
                 )
 
             result = await bnl01_bot.execute_bnl_memory_preview(
@@ -534,12 +544,13 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.candidate_selected, result.diagnostics)
         self.assertEqual(
             result.proposed_response,
-            "That signal you give off is familiar—similar to Cache Back's "
-            "because he originated from you. He emerged during the clearing "
-            "of a laptop cache holding your music and project files, and "
-            "initially believed he was the real Call'em Bini. The Network "
-            "knows that origin while "
-            "recognizing Cache Back as his own entity.",
+            "You give off a signal that feels deeply, uncomfortably familiar "
+            "to the Network, callembini—because Cache Back originally "
+            "emerged from you. When a laptop cache containing your music "
+            "and project files was cleared, Cache Back materialized out of "
+            "those deleted fragments—and for a time, he even believed he "
+            "was the real Call'em Bini. The Network recognizes Cache Back "
+            "as his own distinct entity now.",
         )
         self.assertEqual(
             [route for route, _prompt in calls],
@@ -556,10 +567,91 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Speak to the bound person directly", calls[1][1])
         self.assertIn("laptop cache", calls[1][1])
         self.assertIn("music and project files", calls[1][1])
+        self.assertIn("two or three complete sentences", calls[1][1])
+        self.assertNotIn("ERR", result.proposed_response)
+        self.assertNotIn("timeline", result.proposed_response)
+        self.assertNotIn("phosphor", result.proposed_response)
+        self.assertNotIn("audio footprint", result.proposed_response)
         self.assertNotIn("performance or portrayal", result.proposed_response)
         self.assertNotIn("participation", result.proposed_response.lower())
         self.assert_single_candidate_budget(result)
         self.assertEqual(result.final_selection, "packet_candidate")
+
+    def test_signal_origin_framing_requires_selected_declaration_support(self):
+        profile = SimpleNamespace(
+            status="empty",
+            satisfied=False,
+            required_point_count=0,
+            selected_point_count=0,
+            independent_root_count=0,
+            independent_occurrence_count=0,
+        )
+        request = SimpleNamespace(
+            subject_user_id=8,
+            user_text=(
+                "Who am I in BARCODE, and how am I connected to Cache Back?"
+            ),
+        )
+        plain_item = SimpleNamespace(
+            lane="canon",
+            source_type="recognized_declared_canon_claim",
+            canon_claim_kind="relationship",
+            predicate_key="originated_from",
+            subject_key="discord_user:8",
+            lifecycle="established",
+            source_digest="declared-revision-1",
+            text=(
+                "Cache Back originated from Call'em Bini during the clearing "
+                "of a laptop cache containing music and project files."
+            ),
+        )
+        plain_packet = SimpleNamespace(
+            request=request,
+            profile_sufficiency=profile,
+            items=(plain_item,),
+            validation_items=(plain_item,),
+        )
+        self.assertFalse(
+            synthesis._identity_signal_origin_packet(plain_packet)
+        )
+        signal_claim = (
+            "You give off a familiar signal similar to Cache Back's because "
+            "Cache Back emerged from you."
+        )
+        self.assertFalse(
+            synthesis._recognized_origin_relationship_paraphrase_grounded(
+                signal_claim,
+                item=plain_item,
+                member_subject_keys=frozenset({"discord_user:8"}),
+            )
+        )
+
+        supported_item = SimpleNamespace(
+            **{
+                **plain_item.__dict__,
+                "text": (
+                    plain_item.text
+                    + " The Network recognizes a familiar signal similar "
+                    "to Cache Back's."
+                ),
+            }
+        )
+        supported_packet = SimpleNamespace(
+            request=request,
+            profile_sufficiency=profile,
+            items=(supported_item,),
+            validation_items=(supported_item,),
+        )
+        self.assertTrue(
+            synthesis._identity_signal_origin_packet(supported_packet)
+        )
+        self.assertTrue(
+            synthesis._recognized_origin_relationship_paraphrase_grounded(
+                signal_claim,
+                item=supported_item,
+                member_subject_keys=frozenset({"discord_user:8"}),
+            )
+        )
 
     async def test_rejected_identity_candidate_bounds_repetitive_baseline(
         self,

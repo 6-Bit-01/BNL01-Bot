@@ -34357,6 +34357,7 @@ async def maybe_generate_shared_brain_synthesis_canary(
     candidate_response = bound_identity_comparison_response(
         candidate_response or "",
         identity_request_text,
+        basis=basis,
     )
     candidate_generation_latency_ms = max(
         0,
@@ -37893,6 +37894,7 @@ async def execute_bnl_memory_preview(
                 initial.packet.request.user_text
                 if initial.packet
                 else wording,
+                basis=initial.basis,
             )
             candidate_latency_ms = max(
                 0,
