@@ -144,6 +144,7 @@ from bnl_shared_brain_synthesis import (
     SharedBrainSynthesisBasis,
     SynthesisCanaryDecision,
     begin_run as begin_shared_brain_synthesis_run,
+    bound_identity_comparison_response,
     build_basis as build_shared_brain_synthesis_basis,
     build_packet_owned_prompt,
     configuration as shared_brain_synthesis_canary_configuration,
@@ -10305,7 +10306,8 @@ async def maybe_handle_debug_last_route_command(message: discord.Message, clean_
 
 _IDENTITY_COMPARISON_REQUEST_RE = re.compile(
     r"(?:\b(?:same|different|distinct|separate)\s+(?:person|people|identity|"
-    r"identities|entity|entities)\b|\b(?:relationship|related)\s+to\b|"
+    r"identities|entity|entities)\b|"
+    r"\b(?:relationship|related|connected|connection)\s+to\b|"
     r"\bam\s+i\b.{0,80}\b(?:same\s+as|different\s+from)\b|"
     r"\bare\s+we\b.{0,80}\b(?:same|different|distinct|separate)\b)",
     re.I,
@@ -34241,6 +34243,18 @@ async def maybe_generate_shared_brain_synthesis_canary(
 
     if basis is None:
         return None
+    identity_request_text = str(
+        getattr(
+            getattr(getattr(basis, "packet", None), "request", None),
+            "user_text",
+            "",
+        )
+        or ""
+    )
+    baseline_response = bound_identity_comparison_response(
+        baseline_response,
+        identity_request_text,
+    )
     if basis.honest_empty_profile_fallback:
         fallback_response = (
             str(baseline_response or "").strip()
@@ -34340,6 +34354,10 @@ async def maybe_generate_shared_brain_synthesis_canary(
             type(exc).__name__,
         )
         candidate_response = ""
+    candidate_response = bound_identity_comparison_response(
+        candidate_response or "",
+        identity_request_text,
+    )
     candidate_generation_latency_ms = max(
         0,
         int(
@@ -37848,6 +37866,10 @@ async def execute_bnl_memory_preview(
                     "I do not have enough eligible public-safe memory to "
                     "give you a grounded profile without guessing."
                 )
+        baseline_response = bound_identity_comparison_response(
+            baseline_response,
+            initial.packet.request.user_text if initial.packet else wording,
+        )
 
         candidate_response = ""
         candidate_prompt = (
@@ -37866,6 +37888,12 @@ async def execute_bnl_memory_preview(
                 )
                 or ""
             ).strip()
+            candidate_response = bound_identity_comparison_response(
+                candidate_response,
+                initial.packet.request.user_text
+                if initial.packet
+                else wording,
+            )
             candidate_latency_ms = max(
                 0,
                 int(
