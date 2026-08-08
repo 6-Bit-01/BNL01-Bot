@@ -59,6 +59,27 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.candidate_generation_attempts, expected)
         self.assertEqual(result.additional_candidate_attempts, "disabled")
 
+    def test_identity_comparison_prompt_bounds_repetition_and_keeps_activity_primary(self):
+        wording = (
+            "Who am I in BARCODE, and what is my relationship to Cache Back? "
+            "Be clear about whether we are the same identity."
+        )
+        prompt = bnl01_bot.build_bnl_memory_preview_baseline_prompt(
+            wording=wording,
+            subject_display_name="6 Bit",
+        )
+        self.assertEqual(prompt.count("Identity-comparison scope:"), 1)
+        self.assertIn("state it once in one plain sentence", prompt)
+        self.assertIn("Discord activity is supplied", prompt)
+        self.assertIn("remains the main body", prompt)
+        self.assertIn("Do not repeat negative identity wording", prompt)
+
+        ordinary = bnl01_bot.build_bnl_memory_preview_baseline_prompt(
+            wording="What do you actually know about me from BARCODE?",
+            subject_display_name="6 Bit",
+        )
+        self.assertNotIn("Identity-comparison scope:", ordinary)
+
     def _add_message(self, conn, row_id, text, observed_at):
         conn.execute(
             """

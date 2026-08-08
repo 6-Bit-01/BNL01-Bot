@@ -22,9 +22,11 @@ from typing import Any, Mapping, Sequence
 
 from bnl_canon_source_contract import (
     AUTOMATIC_CANON_SIGNAL_IDENTITIES,
+    CANON_ENTITY_IDENTITIES,
     CANON_FACTS,
     CANON_MEMBER_IDENTITIES,
     CANON_SOURCE_CONTRACT_VERSION,
+    SIX_BIT,
     CanonStatus,
     Confidence,
     EntityAccountBinding,
@@ -38,6 +40,10 @@ from bnl_canon_source_contract import (
     resolve_entity_identity,
     select_declared_canon_claims_for_packet,
     strict_contract_bool,
+)
+from bnl_canon_entity_binding import (
+    BINDING_LIFECYCLE_VERSION,
+    read_current_entity_account_bindings,
 )
 from bnl_memory_governance import (
     APPROVED_MEMBER_SCALAR_PREDICATES,
@@ -190,6 +196,13 @@ _CANON_MEMBER_SUBJECT_KEYS = frozenset(
 _PROFILE_PROJECT_SCOPE_RE = re.compile(
     r"\b(?:barcode(?:\s+(?:network|radio))?|"
     r"project|collective|broadcast)\b",
+    re.I,
+)
+_IDENTITY_COMPARISON_REQUEST_RE = re.compile(
+    r"(?:\b(?:same|different|distinct|separate)\s+(?:person|people|identity|"
+    r"identities|entity|entities)\b|\b(?:relationship|related)\s+to\b|"
+    r"\bam\s+i\b.{0,80}\b(?:same\s+as|different\s+from)\b|"
+    r"\bare\s+we\b.{0,80}\b(?:same|different|distinct|separate)\b)",
     re.I,
 )
 _ASSESSMENT_LANE_MAP = {
@@ -684,6 +697,72 @@ def _explicit_canon_binding_signal(
     }
     if not required.issubset(columns):
         return None
+    if {
+        "binding_revision_id",
+        "binding_id",
+        "revision_number",
+        "lifecycle_version",
+    }.issubset(columns):
+        binding_read = read_current_entity_account_bindings(
+            conn,
+            guild_id=int(request.guild_id or 0),
+            platform="discord",
+            account_id=str(int(request.subject_user_id or 0)),
+        )
+        if binding_read.status in {
+            "binding_table_unavailable",
+            "no_binding",
+        }:
+            return None
+        if binding_read.status == "retired_account_binding":
+            return _CanonIdentitySignal("retired_account_binding")
+        if binding_read.status != "active":
+            return _CanonIdentitySignal("invalid_account_binding")
+        bindings = binding_read.bindings
+        resolution = resolve_entity_identity(
+            platform="discord",
+            account_id=str(int(request.subject_user_id or 0)),
+            bindings=bindings,
+        )
+        if resolution.status == "ambiguous":
+            return _CanonIdentitySignal("ambiguous_account_binding")
+        if resolution.status != "resolved" or resolution.subject is None:
+            return _CanonIdentitySignal("invalid_account_binding")
+        if resolution.subject.key not in _CANON_MEMBER_SUBJECT_KEYS:
+            return _CanonIdentitySignal(
+                "bound_non_signal_identity",
+                subject=resolution.subject,
+                stable_row_count=1,
+                evidence_digest=_digest(
+                    BINDING_LIFECYCLE_VERSION,
+                    tuple(
+                        (
+                            revision.binding_revision_id,
+                            revision.authority_receipt,
+                        )
+                        for revision in binding_read.revisions
+                    ),
+                ),
+            )
+        return _CanonIdentitySignal(
+            "recognized",
+            subject=resolution.subject,
+            stable_row_count=1,
+            evidence_digest=_digest(
+                BINDING_LIFECYCLE_VERSION,
+                CANON_SOURCE_CONTRACT_VERSION,
+                int(request.guild_id or 0),
+                int(request.subject_user_id or 0),
+                resolution.subject.key,
+                tuple(
+                    (
+                        revision.binding_revision_id,
+                        revision.authority_receipt,
+                    )
+                    for revision in binding_read.revisions
+                ),
+            ),
+        )
     rows = conn.execute(
         """
         SELECT entity_id,platform,account_id,authority_receipt,
@@ -748,9 +827,53 @@ def _explicit_canon_binding_signal(
     )
 
 
+def _configured_owner_canon_binding_signal(
+    request: IntelligencePacketRequest,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> _CanonIdentitySignal | None:
+    """Resolve the configured BARCODE owner as 6 Bit in the primary guild.
+
+    ``BNL_OWNER_USER_ID`` is already the authenticated Discord control
+    boundary for this repository, whose owner-facing identity is 6 Bit.  This
+    is a same-platform runtime binding, not a persistent merge or a display-
+    name inference.  A stored binding row, including an invalid or retired
+    one, is evaluated before this fallback so an explicit lifecycle decision
+    always wins.
+    """
+
+    env = os.environ if environ is None else environ
+    try:
+        owner_user_id = int(env.get("BNL_OWNER_USER_ID", "0") or 0)
+        primary_guild_id = int(env.get("BNL_PRIMARY_GUILD_ID", "0") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (
+        owner_user_id > 0
+        and primary_guild_id > 0
+        and int(request.subject_user_id or 0) == owner_user_id
+        and int(request.guild_id or 0) == primary_guild_id
+    ):
+        return None
+    return _CanonIdentitySignal(
+        "recognized",
+        subject=SIX_BIT,
+        stable_row_count=1,
+        evidence_digest=_digest(
+            "configured_owner_account_binding_v1",
+            CANON_SOURCE_CONTRACT_VERSION,
+            primary_guild_id,
+            owner_user_id,
+            SIX_BIT.key,
+        ),
+    )
+
+
 def _canon_identity_signal(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
+    *,
+    environ: Mapping[str, str] | None = None,
 ) -> _CanonIdentitySignal:
     """Recognize one reversible same-platform canon signal.
 
@@ -767,6 +890,12 @@ def _canon_identity_signal(
     explicit_binding = _explicit_canon_binding_signal(conn, request)
     if explicit_binding is not None:
         return explicit_binding
+    configured_owner_binding = _configured_owner_canon_binding_signal(
+        request,
+        environ=environ,
+    )
+    if configured_owner_binding is not None:
+        return configured_owner_binding
     labels = [str(request.subject_display_name or "")]
     profile_columns = _table_columns(conn, "user_profiles")
     if {
@@ -2037,6 +2166,7 @@ def _declared_items(
     *,
     broad: bool,
     request_terms: set[str],
+    environ: Mapping[str, str] | None = None,
 ) -> list[IntelligencePacketItem]:
     """Normalize current Declared claims only for the effective PR 5 owner."""
 
@@ -2069,11 +2199,35 @@ def _declared_items(
         return []
 
     subject = subject_key_for_user(request.subject_user_id)
+    binding_signal = _canon_identity_signal(
+        conn,
+        request,
+        environ=environ,
+    )
+    bound_entity_id = (
+        binding_signal.subject.key
+        if binding_signal.subject is not None
+        and binding_signal.status
+        in {"recognized", "bound_non_signal_identity"}
+        else ""
+    )
     items: list[IntelligencePacketItem] = []
     for claim in selection.claims:
         member_claim = claim.subject_id == subject
+        bound_entity_claim = bool(
+            bound_entity_id
+            and (
+                claim.subject_id == bound_entity_id
+                or (
+                    claim.claim_kind.value == "relationship"
+                    and isinstance(claim.value, Mapping)
+                    and str(claim.value.get("object_subject_id") or "")
+                    == bound_entity_id
+                )
+            )
+        )
         lane = "approved_fact" if member_claim else "canon"
-        text = _canon_value(claim.value).strip()
+        text = _declared_claim_text(claim).strip()
         diagnostics.candidates_by_lane[lane] = (
             diagnostics.candidates_by_lane.get(lane, 0) + 1
         )
@@ -2086,7 +2240,7 @@ def _declared_items(
                 source_class=claim.source_class.value,
             )
             continue
-        if not member_claim and not _relevant(
+        if not member_claim and not bound_entity_claim and not _relevant(
             request_terms=request_terms,
             broad=broad,
             lane=lane,
@@ -2108,17 +2262,23 @@ def _declared_items(
         item = IntelligencePacketItem(
             lane=lane,
             source_class=claim.source_class.value,
-            source_type="declared_canon_claim",
+            source_type=(
+                "recognized_declared_canon_claim"
+                if bound_entity_claim
+                else "declared_canon_claim"
+            ),
             source_ref=claim.source_refs[0],
             source_digest=claim.revision_id,
-            subject_key=claim.subject_id,
+            subject_key=(subject if bound_entity_claim else claim.subject_id),
             predicate_key=claim.predicate,
             text=text[:1000],
             visibility=claim.visibility.value,
             confidence=claim.confidence.value,
             lifecycle=claim.lifecycle.value,
             authority=_AUTHORITY_RANK.get(claim.source_class.value, 0),
-            participants=((subject,) if member_claim else ()),
+            participants=(
+                (subject,) if member_claim or bound_entity_claim else ()
+            ),
             lineage=claim.source_refs,
             observed_at=claim.valid_from,
             usage="content",
@@ -2152,6 +2312,52 @@ def _declared_items(
             continue
         items.append(item)
     return items
+
+
+def _canon_entity_name(subject_id: str) -> str:
+    subject = next(
+        (
+            candidate
+            for candidate in CANON_ENTITY_IDENTITIES
+            if candidate.key == str(subject_id or "")
+        ),
+        None,
+    )
+    return subject.name if subject is not None else str(subject_id or "")
+
+
+def _mentioned_canon_entity_keys(value: str) -> frozenset[str]:
+    lowered = str(value or "").casefold()
+    return frozenset(
+        subject.key
+        for subject in CANON_ENTITY_IDENTITIES
+        if any(
+            re.search(r"\b%s\b" % re.escape(label.casefold()), lowered)
+            for label in (subject.name, *subject.aliases)
+            if label
+        )
+    )
+
+
+def _declared_claim_text(claim: Any) -> str:
+    """Render typed relationships without leaking adapter field names."""
+
+    if claim.claim_kind.value != "relationship" or not isinstance(
+        claim.value,
+        Mapping,
+    ):
+        return _canon_value(claim.value)
+    subject_name = _canon_entity_name(claim.subject_id)
+    object_id = str(claim.value.get("object_subject_id") or "")
+    object_name = _canon_entity_name(object_id)
+    relationship_value = _canon_value(claim.value.get("value"))
+    predicate = str(claim.predicate or "relationship").replace("_", " ")
+    return "%s %s %s: %s" % (
+        subject_name,
+        predicate,
+        object_name,
+        relationship_value,
+    )
 
 
 def _atomic_candidate_row(
@@ -2952,12 +3158,13 @@ def _canon_items(
     exclusions: list[IntelligencePacketExclusion],
     *,
     request_terms: set[str],
+    environ: Mapping[str, str] | None = None,
 ) -> list[IntelligencePacketItem]:
     items: list[IntelligencePacketItem] = []
     lowered = str(request.user_text or "").lower()
     broad = _request_is_broad_profile(request)
     subject_key = subject_key_for_user(request.subject_user_id)
-    signal = _canon_identity_signal(conn, request)
+    signal = _canon_identity_signal(conn, request, environ=environ)
     diagnostics.canon_identity_status = signal.status
     diagnostics.canon_identity_stable_row_count = int(
         signal.stable_row_count or 0
@@ -3418,7 +3625,8 @@ def _select_items(
     subject_key = subject_key_for_user(request.subject_user_id)
     recognized_canon_signal = any(
         item.lane == "canon"
-        and item.source_type == "recognized_canon_fact"
+        and item.source_type
+        in {"recognized_canon_fact", "recognized_declared_canon_claim"}
         and item.subject_key == subject_key
         for item in candidates
     )
@@ -3625,6 +3833,9 @@ def _select_items(
     )
     validation_items: list[IntelligencePacketItem] = []
     seen_validation_sources: set[tuple[str, str, str]] = set()
+    comparison_canon_subject_keys = _mentioned_canon_entity_keys(
+        request.user_text
+    )
     validation_canon = tuple(
         candidate
         for candidate in ordered
@@ -3632,8 +3843,20 @@ def _select_items(
         and (
             (
                 recognized_canon_signal
-                and candidate.source_type == "recognized_canon_fact"
+                and candidate.source_type
+                in {
+                    "recognized_canon_fact",
+                    "recognized_declared_canon_claim",
+                }
                 and candidate.subject_key == subject_key
+            )
+            or (
+                recognized_canon_signal
+                and _IDENTITY_COMPARISON_REQUEST_RE.search(
+                    str(request.user_text or "")
+                )
+                and candidate.source_type == "canon_fact"
+                and candidate.subject_key in comparison_canon_subject_keys
             )
             or (
                 not recognized_canon_signal
@@ -3892,8 +4115,14 @@ def _recognized_canon_version(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
     item: IntelligencePacketItem,
+    *,
+    environ: Mapping[str, str] | None = None,
 ) -> str:
-    signal = _canon_identity_signal(conn, packet.request)
+    signal = _canon_identity_signal(
+        conn,
+        packet.request,
+        environ=environ,
+    )
     if not signal.recognized or signal.subject is None:
         return ""
     parts = str(item.source_ref or "").split(":", 3)
@@ -3973,6 +4202,8 @@ def _declared_version(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
     item: IntelligencePacketItem,
+    *,
+    environ: Mapping[str, str] | None = None,
 ) -> str:
     selection = select_declared_canon_claims_for_packet(
         conn,
@@ -3995,12 +4226,42 @@ def _declared_version(
         ),
         None,
     )
+    bound_entity_claim = False
+    if claim is not None and item.source_type == "recognized_declared_canon_claim":
+        signal = _canon_identity_signal(
+            conn,
+            packet.request,
+            environ=environ,
+        )
+        bound_entity_id = (
+            signal.subject.key
+            if signal.subject is not None
+            and signal.status in {"recognized", "bound_non_signal_identity"}
+            else ""
+        )
+        bound_entity_claim = bool(
+            bound_entity_id
+            and (
+                claim.subject_id == bound_entity_id
+                or (
+                    claim.claim_kind.value == "relationship"
+                    and isinstance(claim.value, Mapping)
+                    and str(claim.value.get("object_subject_id") or "")
+                    == bound_entity_id
+                )
+            )
+        )
+    expected_subject_key = (
+        subject_key_for_user(packet.request.subject_user_id)
+        if bound_entity_claim
+        else (claim.subject_id if claim is not None else "")
+    )
     if claim is None or not (
         item.source_ref == claim.source_refs[0]
         and item.source_digest == claim.revision_id
-        and item.subject_key == claim.subject_id
+        and item.subject_key == expected_subject_key
         and item.predicate_key == claim.predicate
-        and item.text == _canon_value(claim.value).strip()[:1000]
+        and item.text == _declared_claim_text(claim).strip()[:1000]
         and item.visibility == claim.visibility.value
         and item.lifecycle == claim.lifecycle.value
         and item.root_identities == claim.root_ids
@@ -4109,9 +4370,15 @@ def _revalidate_packet_in_snapshot(
                     conn,
                     packet,
                     item,
+                    environ=environ,
                 )
             elif item.revalidation_kind == "declared":
-                current = _declared_version(conn, packet, item)
+                current = _declared_version(
+                    conn,
+                    packet,
+                    item,
+                    environ=environ,
+                )
             elif item.revalidation_kind == "relationship":
                 current = _relationship_version(
                     conn,
@@ -4373,6 +4640,7 @@ def build_packet(
                 exclusions,
                 broad=broad,
                 request_terms=request_terms,
+                environ=environ,
             )
         )
         candidates.extend(
@@ -4392,6 +4660,7 @@ def build_packet(
                 diagnostics,
                 exclusions,
                 request_terms=request_terms,
+                environ=environ,
             )
         )
         candidates.extend(

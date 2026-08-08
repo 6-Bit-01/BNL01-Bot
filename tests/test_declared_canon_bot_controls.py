@@ -338,6 +338,71 @@ class DeclaredCanonBotControlTests(unittest.TestCase):
             before,
         )
 
+    def test_account_binding_controls_are_reversible_and_never_echo_account_id(self):
+        account_id = "424242424242"
+        bound = self.invoke(
+            "!bnl canon bind-account "
+            + json.dumps(
+                {
+                    "account_id": account_id,
+                    "entity_id": "call_em_bini",
+                    "reason": "Approve Call'em Bini's Discord binding.",
+                },
+                sort_keys=True,
+            ),
+            message_id=1511,
+        )
+        self.assertIn("state=active", bound.replies[0])
+        self.assertIn("No identity merge", bound.replies[0])
+        self.assertNotIn(account_id, bound.replies[0])
+        binding_id, revision_id, entity_id, active = self.rows(
+            "SELECT binding_id,binding_revision_id,entity_id,active "
+            "FROM canon_entity_account_bindings"
+        )[0]
+        self.assertEqual((entity_id, active), ("call_em_bini", 1))
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) FROM declared_canon_revisions")[0][0],
+            0,
+        )
+
+        preview = self.invoke(
+            "!bnl canon binding-preview",
+            message_id=1512,
+        )
+        self.assertIn("active=1", preview.replies[0])
+        self.assertIn(binding_id, preview.replies[0])
+        self.assertNotIn(account_id, preview.replies[0])
+
+        retired = self.invoke(
+            "!bnl canon retire-binding "
+            + json.dumps(
+                {
+                    "binding_id": binding_id,
+                    "expected_revision_id": revision_id,
+                    "reason": "Retire the test account binding.",
+                },
+                sort_keys=True,
+            ),
+            message_id=1513,
+        )
+        self.assertIn("state=retired", retired.replies[0])
+        self.assertNotIn(account_id, retired.replies[0])
+        self.assertEqual(
+            self.rows(
+                "SELECT active FROM canon_entity_account_bindings "
+                "ORDER BY revision_number"
+            ),
+            [(1,), (0,)],
+        )
+
+        after = self.invoke(
+            "!bnl canon binding-preview",
+            message_id=1514,
+        )
+        self.assertIn("active=0", after.replies[0])
+        self.assertIn("retired=1", after.replies[0])
+        self.assertNotIn(account_id, after.replies[0])
+
     def test_on_message_preserves_raw_control_before_any_conversational_sink(self):
         raw_declaration = "6 Bit keeps <@123>  and  exact spacing."
         payload = self.add_payload()

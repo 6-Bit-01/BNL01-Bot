@@ -80,10 +80,17 @@ the approved explicit same-platform account-binding path rather than automatic
 name recognition; that binding adds canon only after generic member evidence.
 
 Recognition adds the approved identity only after the same generic member
-evidence rule succeeds. A single observation stays sparse; multiple materially
-distinct observations may be rich only with independent roots and occurrences.
-No assessment observation becomes a trait, Moment, or atomic-memory candidate
-through response-time use.
+evidence rule succeeds. The configured owner/guild account is the explicit
+same-platform 6 Bit binding; other approved entity bindings use the append-only
+owner-authorized lifecycle. A single observation stays sparse; multiple
+materially distinct observations may be rich only with independent roots and
+occurrences. No assessment observation becomes a trait, Moment, or atomic-
+memory candidate through response-time use.
+
+Identity/relationship comparisons are bounded to one supported sentence and
+cannot become the answer's organizing frame. Discord activity remains the
+member evidence; canon only identifies the applicable entity and relationship
+context.
 
 An empty packet never suppresses a nonempty established response. The fixed
 thin-record response is used only when both the packet route and the already
