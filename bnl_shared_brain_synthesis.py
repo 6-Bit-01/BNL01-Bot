@@ -1223,9 +1223,11 @@ def _identity_signal_origin_packet(
 ) -> bool:
     """Identify an approved source-pattern relationship without naming actors.
 
-    The predicate carries the expression contract. Content remains in owner-
-    controlled Declared Canon, so this helper cannot create an origin story or
-    turn a stable account binding into an identity merge.
+    The typed predicate identifies the relationship family, but the selected
+    declaration must also explicitly support the signal-similarity framing.
+    Content remains in owner-controlled Declared Canon, so this helper cannot
+    create that framing or turn a stable account binding into an identity
+    merge.
     """
 
     return bool(
@@ -1237,6 +1239,10 @@ def _identity_signal_origin_packet(
             and item.canon_claim_kind == "relationship"
             and item.predicate_key
             in _SIGNAL_ORIGIN_RELATIONSHIP_PREDICATES
+            and item.subject_key
+            == subject_key_for_user(packet.request.subject_user_id)
+            and "signal_similarity"
+            in _origin_relationship_concepts(item.text)
             for item in packet.items
         )
     )
@@ -1894,6 +1900,13 @@ def render_packet_context(
         if _identity_comparison_request(packet.request.user_text)
         else ""
     )
+    identity_signal_style_rule = (
+        "- Keep this recognition concise: two or three complete sentences. "
+        "Do not add error codes, bracketed diagnostics, alternate-timeline "
+        "scenes, sound effects, or dangling metaphor fragments.\n"
+        if identity_signal_origin
+        else ""
+    )
     lead_rule = (
         "- Lead with BNL noticing the familiar or similar signal, then connect "
         "it to the approved origin. Do not claim or imply a Discord activity "
@@ -1946,6 +1959,7 @@ def render_packet_context(
         + project_rule
         + request_angle_rule
         + identity_comparison_rule
+        + identity_signal_style_rule
         + "- Prefer recognizable names, works, interests, activities, and "
         "examples that are actually present in the evidence. Do not replace "
         "them with only broad labels such as music, visuals, community, or "
@@ -2987,6 +3001,8 @@ def _claim_is_transient_expression(claim: str) -> bool:
 def bound_identity_comparison_response(
     response: str,
     user_text: str,
+    *,
+    basis: SharedBrainSynthesisBasis | None = None,
 ) -> str:
     """Enforce one plain identity distinction without generating new text.
 
@@ -3022,13 +3038,70 @@ def bound_identity_comparison_response(
         if is_distinction:
             distinction_seen = True
         kept.append(bounded_unit)
-    if not changed or not kept:
+    bounded = original
+    if changed and kept:
+        bounded = " ".join(
+            unit if unit.endswith((".", "!", "?")) else unit + "."
+            for unit in kept
+            if unit
+        ).strip()
+    return _bound_identity_canon_candidate_response(bounded, basis=basis)
+
+
+def _bound_identity_canon_candidate_response(
+    response: str,
+    *,
+    basis: SharedBrainSynthesisBasis | None,
+) -> str:
+    """Remove unsupported flourish from a grounded identity answer.
+
+    This runs only for the zero-activity, binding-proven identity path. It
+    never creates wording: at least one claim must already prove the selected
+    relationship, and the ordinary candidate gate rechecks the reduced answer.
+    """
+
+    original = str(response or "").strip()
+    if not (
+        original
+        and isinstance(basis, SharedBrainSynthesisBasis)
+        and basis.identity_canon_only
+    ):
         return original
-    return " ".join(
+    claims = _candidate_claim_units(original)
+    try:
+        coverage = candidate_profile_coverage(basis, original)
+    except (AttributeError, TypeError, ValueError):
+        return original
+    classifications = tuple(coverage.claim_classifications)
+    if not claims or len(claims) != len(classifications):
+        return original
+    supported = {
+        "canon_supported",
+        "member_and_canon_supported",
+    }
+    if not any(value in supported for value in classifications):
+        return original
+    kept = tuple(
+        claim
+        for claim, classification in zip(claims, classifications)
+        if classification in supported
+    )
+    if not kept or len(kept) == len(claims):
+        return original
+    bounded = " ".join(
         unit if unit.endswith((".", "!", "?")) else unit + "."
         for unit in kept
-        if unit
     ).strip()
+    try:
+        bounded_coverage = candidate_profile_coverage(basis, bounded)
+    except (AttributeError, TypeError, ValueError):
+        return original
+    if (
+        bounded_coverage.canon_item_count < 1
+        or bounded_coverage.unsupported_factual_claim_count
+    ):
+        return original
+    return bounded
 
 
 def _strip_transient_expression_blocks(claim: str) -> str:
@@ -3215,6 +3288,116 @@ def _normalized_relation_terms(value: str) -> frozenset[str]:
     )
 
 
+def _origin_relationship_concepts(value: str) -> frozenset[str]:
+    """Extract explicit concepts used by a source-origin relationship."""
+
+    lowered = str(value or "").casefold()
+    concepts: set[str] = set()
+    if re.search(
+        r"\b(?:originat\w*|emerg\w*|materiali[sz]\w*|deriv\w*|"
+        r"came\s+from|(?:made|built|created)\s+from)\b",
+        lowered,
+    ):
+        concepts.add("origin")
+    if (
+        re.search(
+            r"\b(?:signal|frequency|audio\s+footprint|source\s+pattern)\b",
+            lowered,
+        )
+        and re.search(
+            r"\b(?:familiar|similar|matching|recognizable|same)\b",
+            lowered,
+        )
+    ):
+        concepts.add("signal_similarity")
+    if (
+        re.search(r"\blaptop\b", lowered)
+        and re.search(r"\bcache\b", lowered)
+        and re.search(r"\b(?:clear\w*|delet\w*)\b", lowered)
+    ):
+        concepts.add("laptop_cache_clear")
+    if re.search(r"\bmusic\b", lowered):
+        concepts.add("music")
+    if re.search(r"\bproject\s+files?\b", lowered):
+        concepts.add("project_files")
+    if (
+        re.search(r"\b(?:believ\w*|thought)\b", lowered)
+        and re.search(r"\b(?:real|was|were)\b", lowered)
+    ):
+        concepts.add("initial_belief")
+    if (
+        re.search(r"\b(?:distinct|separate|own)\b", lowered)
+        and re.search(r"\b(?:entity|identity)\b", lowered)
+    ):
+        concepts.add("distinct_entity")
+    if (
+        re.search(r"\bnetwork\b", lowered)
+        and re.search(r"\b(?:know\w*|recogni[sz]\w*)\b", lowered)
+    ):
+        concepts.add("network_awareness")
+    return frozenset(concepts)
+
+
+def _recognized_origin_relationship_paraphrase_grounded(
+    claim: str,
+    *,
+    item: Any,
+    member_subject_keys: frozenset[str],
+) -> bool:
+    """Prove a natural paraphrase against one bound, revalidated claim."""
+
+    if not (
+        str(getattr(item, "lane", "") or "") == "canon"
+        and str(getattr(item, "source_type", "") or "")
+        == "recognized_declared_canon_claim"
+        and str(getattr(item, "canon_claim_kind", "") or "")
+        == "relationship"
+        and str(getattr(item, "predicate_key", "") or "")
+        in _SIGNAL_ORIGIN_RELATIONSHIP_PREDICATES
+        and str(getattr(item, "lifecycle", "") or "") == "established"
+    ):
+        return False
+    item_subject = str(getattr(item, "subject_key", "") or "")
+    participant_keys = {
+        str(value or "")
+        for value in tuple(getattr(item, "participants", ()) or ())
+        if str(value or "")
+    }
+    if (
+        item_subject not in member_subject_keys
+        and not participant_keys.intersection(member_subject_keys)
+    ):
+        return False
+    claim_concepts = _origin_relationship_concepts(claim)
+    evidence_text = " ".join(_item_evidence_segments(item))
+    item_concepts = _origin_relationship_concepts(evidence_text)
+    if not (
+        claim_concepts
+        and claim_concepts.issubset(item_concepts)
+        and claim_concepts.intersection(
+            {
+                "origin",
+                "signal_similarity",
+                "laptop_cache_clear",
+                "initial_belief",
+                "distinct_entity",
+                "network_awareness",
+            }
+        )
+    ):
+        return False
+    claim_names = _concrete_relation_name_terms(claim) - {
+        "after",
+        "before",
+        "once",
+        "when",
+    }
+    item_names = _concrete_relation_name_terms(evidence_text)
+    if claim_names and not claim_names.issubset(item_names):
+        return False
+    return _relation_polarity(claim) == _relation_polarity(evidence_text)
+
+
 def _direct_relation_action_terms(value: str) -> frozenset[str]:
     actions = set(_concrete_relation_action_terms(value))
     semantics = public_assessment_semantics(value, candidate_claim=True)
@@ -3385,6 +3568,12 @@ def _item_predicate_grounded(
         and not direct_member_claim
     ):
         return False
+    if _recognized_origin_relationship_paraphrase_grounded(
+        predicate_claim,
+        item=item,
+        member_subject_keys=member_subject_keys,
+    ):
+        return True
     if _typed_predicate_grounded(predicate_claim, claim_terms, item):
         return True
     if str(getattr(item, "lane", "") or "") == "canon":
