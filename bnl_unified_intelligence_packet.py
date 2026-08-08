@@ -200,7 +200,8 @@ _PROFILE_PROJECT_SCOPE_RE = re.compile(
 )
 _IDENTITY_COMPARISON_REQUEST_RE = re.compile(
     r"(?:\b(?:same|different|distinct|separate)\s+(?:person|people|identity|"
-    r"identities|entity|entities)\b|\b(?:relationship|related)\s+to\b|"
+    r"identities|entity|entities)\b|"
+    r"\b(?:relationship|related|connected|connection)\s+to\b|"
     r"\bam\s+i\b.{0,80}\b(?:same\s+as|different\s+from)\b|"
     r"\bare\s+we\b.{0,80}\b(?:same|different|distinct|separate)\b)",
     re.I,
@@ -1243,13 +1244,29 @@ def _profile_canon_anchor(
         item
         for item in candidates
         if item.lane == "canon"
-        and item.source_type == "recognized_canon_fact"
+        and item.source_type
+        in {"recognized_canon_fact", "recognized_declared_canon_claim"}
         and item.subject_key == subject
     )
     if recognized:
+        identity_comparison = bool(
+            _IDENTITY_COMPARISON_REQUEST_RE.search(
+                str(request.user_text or "")
+            )
+        )
         return sorted(
             recognized,
-            key=lambda item: (-item.score, item.source_ref),
+            key=lambda item: (
+                -int(
+                    identity_comparison
+                    and item.source_type
+                    == "recognized_declared_canon_claim"
+                    and item.canon_claim_kind == "relationship"
+                ),
+                -item.score,
+                -item.authority,
+                item.source_ref,
+            ),
         )[0]
     if not _profile_project_request(request.user_text):
         return None
@@ -3961,7 +3978,8 @@ def _profile_sufficiency(
         )
     recognized_canon_signal = any(
         item.lane == "canon"
-        and item.source_type == "recognized_canon_fact"
+        and item.source_type
+        in {"recognized_canon_fact", "recognized_declared_canon_claim"}
         and item.subject_key
         == subject_key_for_user(request.subject_user_id)
         for item in selected
@@ -4532,7 +4550,8 @@ def _packet_invariants(
         ):
             invalid.append("legacy_canon_contract_violation")
         if item.canon_status == CanonStatus.DECLARED.value and not (
-            item.source_type == "declared_canon_claim"
+            item.source_type
+            in {"declared_canon_claim", "recognized_declared_canon_claim"}
             and item.lane in {"approved_fact", "canon"}
             and item.lifecycle == "established"
             and item.revalidation_kind == "declared"
@@ -4541,6 +4560,13 @@ def _packet_invariants(
             and (
                 item.lane != "approved_fact"
                 or item.subject_key == subject
+            )
+            and (
+                item.source_type != "recognized_declared_canon_claim"
+                or (
+                    item.lane == "canon"
+                    and item.subject_key == subject
+                )
             )
         ):
             invalid.append("declared_canon_contract_violation")

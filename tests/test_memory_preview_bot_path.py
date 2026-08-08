@@ -11,10 +11,13 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 from bnl_canon_source_contract import (
+    CALL_EM_BINI,
     Confidence,
     SourceClass,
     Visibility,
 )
+import bnl_canon_entity_binding as canon_binding
+import bnl_declared_canon as declared_canon
 import bnl_memory_ledger as ledger
 import bnl01_bot
 
@@ -79,6 +82,22 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             subject_display_name="6 Bit",
         )
         self.assertNotIn("Identity-comparison scope:", ordinary)
+
+        bounded = bnl01_bot.bound_identity_comparison_response(
+            (
+                "You have kept the live broadcast moving. "
+                "[SYS_ERR: ARCHIVE_BLEED // 0x004F] "
+                "You are 6 Bit, distinct from Cache Back. "
+                "You and Cache Back are separate identities. "
+                "[TRANSMISSION_OVERLAP]"
+            ),
+            wording,
+        )
+        self.assertIn("kept the live broadcast moving", bounded)
+        self.assertIn("distinct from Cache Back", bounded)
+        self.assertNotIn("separate identities", bounded)
+        self.assertNotIn("SYS_ERR", bounded)
+        self.assertNotIn("TRANSMISSION_OVERLAP", bounded)
 
     def _add_message(self, conn, row_id, text, observed_at):
         conn.execute(
@@ -408,6 +427,171 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             result.final_selection,
             "honest_empty_profile_fallback",
         )
+
+    async def test_bound_identity_relationship_answers_without_activity_history(
+        self,
+    ):
+        authority_env = {
+            "BNL_OWNER_USER_ID": "99",
+            "BNL_PRIMARY_GUILD_ID": "1",
+            "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                "preview-empty-identity-secret-0001"
+            ),
+        }
+        with mock.patch.dict(os.environ, authority_env, clear=False):
+            with sqlite3.connect(self.db_path) as conn:
+                declared_canon.ensure_declared_canon_schema(conn)
+                canon_binding.ensure_canon_entity_binding_schema(conn)
+                canon_binding.bind_discord_account(
+                    conn,
+                    actor_user_id=99,
+                    authority_nonce="preview-empty-binding-0001",
+                    guild_id=1,
+                    account_id="8",
+                    entity_id=CALL_EM_BINI.key,
+                    reason="Approve the selected member's account binding.",
+                )
+                declared_canon.add_declared_canon(
+                    conn,
+                    actor_user_id=99,
+                    authority_nonce="preview-empty-relationship-0001",
+                    guild_id=1,
+                    subject_type="person",
+                    subject_id="call_em_bini",
+                    object_subject_type="character",
+                    object_subject_id="cache_back",
+                    predicate="portrays",
+                    value=(
+                        "Call'em Bini is Cache Back—the artist identity "
+                        "behind the BARCODE character."
+                    ),
+                    raw_declaration=(
+                        "Call'em Bini is Cache Back—the artist identity "
+                        "behind the BARCODE character."
+                    ),
+                    cleaned_summary=(
+                        "Call'em Bini is the artist identity behind "
+                        "Cache Back."
+                    ),
+                    domain="hybrid",
+                    claim_kind="relationship",
+                    visibility="reference_canon",
+                    eligible_routes=("public_home",),
+                )
+
+            calls = []
+
+            async def generator(prompt, route):
+                calls.append((route, prompt))
+                if route.endswith("baseline"):
+                    return (
+                        "I cannot verify how you connect to Cache Back "
+                        "without guessing."
+                    )
+                return (
+                    "Call'em Bini is the artist identity behind Cache Back."
+                )
+
+            result = await bnl01_bot.execute_bnl_memory_preview(
+                source_db_path=self.db_path,
+                guild_id=1,
+                subject_user_id=8,
+                subject_display_name="Call'em Bini",
+                simulated_channel_id=10,
+                wording=(
+                    "Who am I in BARCODE, and how am I connected to "
+                    "Cache Back?"
+                ),
+                generator=generator,
+                guard=mock.AsyncMock(
+                    side_effect=lambda response, _prompt: (
+                        response,
+                        {"suppressed": False, "suppression_reason": ""},
+                    )
+                ),
+            )
+
+        self.assertEqual(result.route_status, "matched")
+        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertEqual(
+            result.proposed_response,
+            "Call'em Bini is the artist identity behind Cache Back.",
+        )
+        self.assertEqual(
+            [route for route, _prompt in calls],
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+            ],
+        )
+        self.assertIn(
+            "No eligible public Discord activity is supplied",
+            calls[1][1],
+        )
+        self.assertNotIn("participation", result.proposed_response.lower())
+        self.assert_single_candidate_budget(result)
+        self.assertEqual(result.final_selection, "packet_candidate")
+
+    async def test_rejected_identity_candidate_bounds_repetitive_baseline(
+        self,
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I test the smaller interface change before release.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            conn.commit()
+
+        baseline = (
+            "You are 6 Bit, the founding MC and host of BARCODE Radio, "
+            "whereas Cache Back is a separate founding member who serves "
+            "as the Network's archive specialist. You two formed the "
+            "original digital hip-hop collective alongside DJ Floppydisc "
+            "and Mac Modem, making you distinct entities working different "
+            "ends of the same system."
+        )
+
+        async def generator(_prompt, route):
+            if route.endswith("baseline"):
+                return baseline
+            return "You are an unsupported interdimensional architect."
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BNL_OWNER_USER_ID": "7",
+                "BNL_PRIMARY_GUILD_ID": "1",
+            },
+            clear=False,
+        ):
+            result = await bnl01_bot.execute_bnl_memory_preview(
+                source_db_path=self.db_path,
+                guild_id=1,
+                subject_user_id=7,
+                subject_display_name="6 Bit",
+                simulated_channel_id=10,
+                wording=(
+                    "Who am I in BARCODE, and what is my relationship to "
+                    "Cache Back? Be clear about whether we are the same "
+                    "identity."
+                ),
+                generator=generator,
+                guard=mock.AsyncMock(
+                    side_effect=lambda response, _prompt: (
+                        response,
+                        {"suppressed": False, "suppression_reason": ""},
+                    )
+                ),
+            )
+
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(result.final_selection, "established_path")
+        self.assertIn("Cache Back is a separate", result.proposed_response)
+        self.assertNotIn("distinct entities", result.proposed_response)
+        self.assertEqual(result.proposed_response.count("Cache Back"), 1)
+        self.assert_single_candidate_budget(result)
 
     async def test_rich_preview_rejects_category_only_draft_without_retry(self):
         with sqlite3.connect(self.db_path) as conn:

@@ -57,8 +57,11 @@ process-profile questions admit only process-relevant observations.
 
 Canon never unlocks that personal evidence. On broad profiles it is ordered
 after member-specific evidence and remains additive; canon alone leaves
-profile sufficiency empty and triggers no candidate generation. Direct
-non-broad canon and lore questions retain their existing route.
+profile sufficiency empty and normally triggers no candidate generation. The
+only exception is an explicit identity/relationship question for an actively
+bound account with an exact current Declared Canon relationship: BNL may state
+that relationship once while making no claim of observed Discord activity.
+Direct non-broad canon and lore questions retain their existing route.
 
 ## Same-platform canon recognition
 

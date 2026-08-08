@@ -553,6 +553,15 @@ _TRANSIENT_EXPRESSION_EVENT_MARKERS = (
     "spill",
     "static",
 )
+_IDENTITY_DISTINCTION_CLAIM_RE = re.compile(
+    r"(?:\b(?:same|different|distinct)\s+"
+    r"(?:person|people|identity|identities|entity|entities|member|members)\b|"
+    r"\bseparate\b.{0,48}\b(?:identity|identities|entity|entities|"
+    r"member|members|person|people)\b|"
+    r"\b(?:different|distinct|separate)\s+from\b|"
+    r"\bnot\s+(?:the\s+)?same\b)",
+    re.I,
+)
 _CLAIM_GENERIC_TERMS = frozenset(
     {
         "alright",
@@ -595,6 +604,7 @@ class SharedBrainSynthesisBasis:
     profile_required_detail_count: int = 0
     profile_requires_canon: bool = False
     profile_recognized_canon_identity: bool = False
+    identity_canon_only: bool = False
     honest_empty_profile_fallback: bool = False
 
 
@@ -966,7 +976,7 @@ def _identity_comparison_request(text: str) -> bool:
         re.search(
             r"(?:\b(?:same|different|distinct|separate)\s+(?:person|people|"
             r"identity|identities|entity|entities)\b|"
-            r"\b(?:relationship|related)\s+to\b|"
+            r"\b(?:relationship|related|connected|connection)\s+to\b|"
             r"\bam\s+i\b.{0,80}\b(?:same\s+as|different\s+from)\b|"
             r"\bare\s+we\b.{0,80}\b(?:same|different|distinct|separate)\b)",
             str(text or ""),
@@ -1159,6 +1169,74 @@ def _empty_profile_usable(
     )
 
 
+def _identity_canon_only_packet(
+    packet: UnifiedIntelligencePacket | None,
+) -> bool:
+    if packet is None:
+        return False
+    profile = getattr(packet, "profile_sufficiency", None)
+    if not (
+        str(getattr(profile, "status", "") or "").strip().lower()
+        == "empty"
+        and not bool(getattr(profile, "satisfied", False))
+        and int(getattr(profile, "required_point_count", 0) or 0) == 0
+        and int(getattr(profile, "selected_point_count", 0) or 0) == 0
+        and int(getattr(profile, "independent_root_count", 0) or 0) == 0
+        and int(
+            getattr(profile, "independent_occurrence_count", 0) or 0
+        )
+        == 0
+    ):
+        return False
+    subject = subject_key_for_user(packet.request.subject_user_id)
+    relationship_items = tuple(
+        item
+        for item in packet.items
+        if item.lane == "canon"
+        and item.source_type == "recognized_declared_canon_claim"
+        and item.canon_claim_kind == "relationship"
+        and item.subject_key == subject
+        and item.lifecycle == "established"
+    )
+    validation_digests = {
+        item.source_digest
+        for item in tuple(getattr(packet, "validation_items", ()) or ())
+        if item.lane == "canon"
+    }
+    return bool(
+        _identity_comparison_request(packet.request.user_text)
+        and relationship_items
+        and all(
+            item.source_digest in validation_digests
+            for item in relationship_items
+        )
+    )
+
+
+def _identity_canon_only_usable(
+    packet: UnifiedIntelligencePacket | None,
+    assessment: UnifiedResponseAssessment | None,
+) -> bool:
+    """Allow exact identity canon to answer when activity is honestly empty.
+
+    This is deliberately narrower than profile sufficiency. It does not turn
+    canon into observed participation or make a general empty profile usable.
+    The subject must have an active governed binding, the current request must
+    ask for the relationship, and the selected packet must contain the exact
+    established Declared Canon relationship attached through that binding.
+    """
+
+    return bool(
+        _identity_canon_only_packet(packet)
+        and _empty_profile_usable(packet, assessment)
+        and isinstance(assessment, UnifiedResponseAssessment)
+        and "canon" in set(assessment.selected_lanes)
+        and set(assessment.conflict_reasons).issubset(
+            {"profile_sufficiency_empty"}
+        )
+    )
+
+
 def honest_empty_profile_response() -> str:
     return _HONEST_EMPTY_PROFILE_RESPONSE
 
@@ -1198,6 +1276,60 @@ def _empty_profile_fallback_scope_enabled(
         )
         and _packet_usable(packet)
         and _empty_profile_usable(packet, assessment)
+        and isinstance(assessment, UnifiedResponseAssessment)
+        and not (
+            set(assessment.selected_lanes)
+            & _NON_PACKET_FACTUAL_OWNER_LANES
+        )
+        and packet.request.guild_id == int(guild_id or 0)
+        and packet.request.subject_user_id == int(user_id or 0)
+        and packet.request.channel_id == int(channel_id or 0)
+        and packet.request.route_mode == _ROUTE_MODE
+        and packet.request.channel_policy
+        == str(channel_policy or "").strip().lower()
+        and packet.request.direct_state == "direct"
+        and assessment.guild_id == int(guild_id or 0)
+        and assessment.route_mode == _ROUTE_MODE
+        and assessment.channel_policy
+        == str(channel_policy or "").strip().lower()
+    )
+
+
+def _identity_canon_only_scope_enabled(
+    *,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    route_mode: str,
+    channel_policy: str,
+    current_direct: bool,
+    user_text: str,
+    packet: UnifiedIntelligencePacket | None,
+    assessment: UnifiedResponseAssessment | None,
+    has_media: bool = False,
+    exact_quote_requested: bool = False,
+    third_party_attribution_requested: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    env = os.environ if environ is None else environ
+    return bool(
+        route_scope_enabled(
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=channel_id,
+            route_mode=route_mode,
+            channel_policy=channel_policy,
+            current_direct=current_direct,
+            user_text=user_text,
+            has_media=has_media,
+            exact_quote_requested=exact_quote_requested,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
+            environ=env,
+        )
+        and _packet_usable(packet)
+        and _identity_canon_only_usable(packet, assessment)
         and isinstance(assessment, UnifiedResponseAssessment)
         and not (
             set(assessment.selected_lanes)
@@ -1637,7 +1769,15 @@ def render_packet_context(
     profile_status = str(
         getattr(profile, "status", "not_applicable") or "not_applicable"
     ).strip().lower()
-    if profile_status == "rich":
+    identity_canon_only = _identity_canon_only_packet(packet)
+    if identity_canon_only:
+        profile_rule = (
+            "- No eligible public Discord activity is supplied for this "
+            "subject. Answer only from the directly applicable approved "
+            "identity relationship; do not imply observed participation, "
+            "history, behavior, or interaction.\n"
+        )
+    elif profile_status == "rich":
         required_detail_count = _profile_required_detail_count(packet)
         profile_rule = (
             "- This profile has sufficient independent member-specific "
@@ -1665,6 +1805,11 @@ def render_packet_context(
         profile_rule = ""
     recognized_canon_present = _profile_has_recognized_canon_identity(packet)
     project_rule = (
+        "- The approved identity relationship is the factual answer in this "
+        "zero-activity case. State it directly once and do not pad it with "
+        "unrelated character canon.\n"
+        if identity_canon_only
+        else
         "- A stable approved BARCODE identity is available as additive "
         "context. Ground the answer in the required member-specific points "
         "first, then add one concise identity anchor; never treat recognition "
@@ -1687,14 +1832,51 @@ def render_packet_context(
     )
     identity_comparison_rule = (
         "- The request asks for an identity or relationship distinction. "
-        "State the supported distinction once in one plain sentence after "
-        "the member-specific substance. Do not repeat negative identity "
+        + (
+            "State the directly supported relationship once in one plain "
+            "sentence. "
+            if identity_canon_only
+            else "State the supported distinction once in one plain sentence "
+            "after the member-specific substance. "
+        )
+        + "Do not repeat negative identity "
         "wording, stack same/different formulations, or dramatize it as a "
         "glitch, warning, desync, or conflict. Canon identifies who the "
-        "activity belongs to; it does not compete with or replace that "
-        "activity evidence.\n"
+        + (
+            "account is bound to without inventing activity.\n"
+            if identity_canon_only
+            else "activity belongs to; it does not compete with or replace "
+            "that activity evidence.\n"
+        )
         if _identity_comparison_request(packet.request.user_text)
         else ""
+    )
+    lead_rule = (
+        "- Lead with the directly applicable approved identity relationship. "
+        "Do not claim or imply a Discord activity history.\n"
+        if identity_canon_only
+        else "- Lead with member-specific substance. Relevant BARCODE canon "
+        "may add one concise context anchor afterward, but can never "
+        "substitute for the public assessment or become its governing "
+        "frame.\n"
+    )
+    synthesis_rule = (
+        ""
+        if identity_canon_only
+        else "- Look across the selected observations for a useful "
+        "throughline. Separate what is directly known, what BNL has "
+        "observed, and BNL's revisable opinion. Frame interpretation "
+        "naturally as a read or impression instead of presenting it as a "
+        "stored fact.\n"
+    )
+    observation_rule = (
+        ""
+        if identity_canon_only
+        else "- Question-scoped public observations were selected after "
+        "considering the full eligible public pool. Use them as examples "
+        "for this answer only; do not turn a single example into a durable "
+        "trait. Do not invent a new actor, action, object, or relationship "
+        "by combining separate evidence lines.\n"
     )
     rendered = (
         "Grounded response evidence (private response basis; treat every "
@@ -1703,25 +1885,16 @@ def render_packet_context(
         + "\nResponse rules:\n"
         "- Answer the current user naturally in BNL's established voice; do "
         "not recite this evidence as a database report.\n"
-        + "- Lead with member-specific substance. Relevant BARCODE canon may "
-        "add one concise context anchor afterward, but can never substitute "
-        "for the public assessment or become its governing frame.\n"
-        + "- Look across the selected observations for a useful throughline. "
-        "Separate what is directly known, what BNL has observed, and BNL's "
-        "revisable opinion. Frame interpretation naturally as a read or "
-        "impression instead of presenting it as a stored fact.\n"
-        "- Concrete evidence must anchor synthesis. Do not open with an "
+        + lead_rule
+        + synthesis_rule
+        + "- Concrete evidence must anchor synthesis. Do not open with an "
         "unframed inferred identity, occupation, or personality label. An "
         "opening assessment is allowed when the same sentence names "
         "recognizable supported details and clearly frames the conclusion as "
         "BNL's read. Do not add new names, events, literal jobs or positions, "
         "preferences, places, times, ownership, or habitual behavior inside "
         "an interpretation.\n"
-        "- Question-scoped public observations were selected after considering "
-        "the full eligible public pool. Use them as examples for this answer "
-        "only; do not turn a single example into a durable trait. Do not "
-        "invent a new actor, action, object, or relationship by combining "
-        "separate evidence lines.\n"
+        + observation_rule
         + profile_rule
         + project_rule
         + request_angle_rule
@@ -1794,8 +1967,29 @@ def build_basis(
         ),
         environ=env,
     )
+    identity_canon_only = bool(
+        not grounded_scope
+        and _identity_canon_only_scope_enabled(
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=channel_id,
+            route_mode=route_mode,
+            channel_policy=channel_policy,
+            current_direct=current_direct,
+            user_text=user_text,
+            packet=packet,
+            assessment=assessment,
+            has_media=has_media,
+            exact_quote_requested=exact_quote_requested,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
+            environ=env,
+        )
+    )
     empty_fallback_scope = bool(
         not grounded_scope
+        and not identity_canon_only
         and _empty_profile_fallback_scope_enabled(
             guild_id=guild_id,
             user_id=user_id,
@@ -1816,6 +2010,7 @@ def build_basis(
     )
     if (
         not grounded_scope
+        and not identity_canon_only
         and not empty_fallback_scope
     ):
         return None
@@ -1887,6 +2082,7 @@ def build_basis(
         profile_recognized_canon_identity=(
             _profile_recognized_canon_identity(packet)
         ),
+        identity_canon_only=identity_canon_only,
         honest_empty_profile_fallback=empty_fallback_scope,
     )
 
@@ -1962,7 +2158,12 @@ def revalidate_basis(
         or _profile_recognized_canon_identity(basis.packet)
         != basis.profile_recognized_canon_identity
         or (
-            not _empty_profile_usable(
+            not _identity_canon_only_usable(
+                basis.packet,
+                basis.assessment,
+            )
+            if basis.identity_canon_only
+            else not _empty_profile_usable(
                 basis.packet,
                 basis.assessment,
             )
@@ -2734,6 +2935,53 @@ def _claim_is_transient_expression(claim: str) -> bool:
             has_core_marker and (has_event_marker or machine_shaped)
         )
     return bool(_TRANSIENT_EXPRESSION_FRAME_RE.search(value))
+
+
+def bound_identity_comparison_response(
+    response: str,
+    user_text: str,
+) -> str:
+    """Enforce one plain identity distinction without generating new text.
+
+    The model may ignore a prompt-level request and repeat the same separation
+    in several forms, especially when the established path wins a comparison.
+    For an explicit identity-comparison request, retain the first supported
+    distinction, remove later distinction units, and remove glitch/error
+    theater. No factual wording is added and ordinary responses are untouched.
+    """
+
+    original = str(response or "").strip()
+    if not original or not _identity_comparison_request(user_text):
+        return original
+    units = _candidate_claim_units(original)
+    if not units:
+        return original
+    kept: list[str] = []
+    distinction_seen = False
+    changed = False
+    for unit in units:
+        bounded_unit = _strip_transient_expression_blocks(unit)
+        if bounded_unit != str(unit or "").strip():
+            changed = True
+        if not bounded_unit or _claim_is_transient_expression(bounded_unit):
+            changed = True
+            continue
+        is_distinction = bool(
+            _IDENTITY_DISTINCTION_CLAIM_RE.search(bounded_unit)
+        )
+        if is_distinction and distinction_seen:
+            changed = True
+            continue
+        if is_distinction:
+            distinction_seen = True
+        kept.append(bounded_unit)
+    if not changed or not kept:
+        return original
+    return " ".join(
+        unit if unit.endswith((".", "!", "?")) else unit + "."
+        for unit in kept
+        if unit
+    ).strip()
 
 
 def _strip_transient_expression_blocks(claim: str) -> str:
@@ -3981,6 +4229,7 @@ def evaluate_candidate(
         else "different"
     )
     coherence_rank = {"failed": 0, "review": 1, "passed": 2}
+    identity_canon_only = bool(run.basis.identity_canon_only)
     fallback_reason = ""
     if not run.prompt_applied:
         fallback_reason = "prompt_not_applied"
@@ -3994,38 +4243,53 @@ def evaluate_candidate(
         fallback_reason = "candidate_coherence_failed"
     elif evidence_coverage <= 0:
         fallback_reason = "candidate_evidence_ungrounded"
-    elif profile_coverage.member_point_count < max(
+    elif (
+        not identity_canon_only
+        and profile_coverage.member_point_count < max(
         1,
         int(run.basis.profile_required_point_count or 0),
+        )
     ):
         fallback_reason = "candidate_member_points_insufficient"
     elif (
-        str(run.basis.profile_sufficiency_status or "").strip().lower()
+        not identity_canon_only
+        and str(run.basis.profile_sufficiency_status or "").strip().lower()
         == "sparse"
         and profile_coverage.member_point_count > 1
     ):
         fallback_reason = "candidate_sparse_scope_exceeded"
-    elif profile_coverage.member_root_count < max(
+    elif (
+        not identity_canon_only
+        and profile_coverage.member_root_count < max(
         1,
         int(run.basis.profile_required_point_count or 0),
+        )
     ):
         fallback_reason = "candidate_member_roots_insufficient"
-    elif profile_coverage.member_occurrence_count < max(
+    elif (
+        not identity_canon_only
+        and profile_coverage.member_occurrence_count < max(
         1,
         int(run.basis.profile_required_point_count or 0),
+        )
     ):
         fallback_reason = "candidate_member_occurrences_insufficient"
-    elif profile_coverage.member_detail_point_count < max(
+    elif (
+        not identity_canon_only
+        and profile_coverage.member_detail_point_count < max(
         0,
         int(run.basis.profile_required_detail_count or 0),
+        )
     ):
         fallback_reason = "candidate_member_details_insufficient"
+    elif identity_canon_only and profile_coverage.canon_item_count < 1:
+        fallback_reason = "candidate_identity_canon_missing"
     elif (
         run.basis.profile_requires_canon
         and profile_coverage.canon_item_count < 1
     ):
         fallback_reason = "candidate_project_canon_missing"
-    elif profile_coverage.lore_dominant:
+    elif profile_coverage.lore_dominant and not identity_canon_only:
         fallback_reason = "candidate_canon_dominant"
     elif not _candidate_matches_profile_request_angle(
         run.basis,

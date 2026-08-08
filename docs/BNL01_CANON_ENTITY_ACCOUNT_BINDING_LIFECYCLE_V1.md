@@ -62,4 +62,7 @@ When a question explicitly asks whether two identities are the same or asks
 for their relationship, BNL may state the supported distinction once in one
 plain sentence. It must not repeat negative identity wording or turn the
 distinction into glitch/desync theater. Eligible Discord activity remains the
-main profile evidence; canon identifies who that activity belongs to.
+main profile evidence; canon identifies who that activity belongs to. If the
+bound account has no eligible Discord activity, an exact current Declared
+Canon relationship may answer that identity question by itself, but it cannot
+imply participation, history, behavior, or interaction that was not observed.
