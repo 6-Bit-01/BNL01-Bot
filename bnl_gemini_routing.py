@@ -84,6 +84,7 @@ def _route_lane(route: str) -> str:
         "population",
         "entity_intelligence",
         "canon",
+        "single_packet",
     )
     if any(marker in normalized for marker in protected_markers):
         return "protected"
@@ -114,6 +115,26 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
         minimum=0,
         maximum=2,
     )
+    if normalized_route == "ordinary_chat_single_packet_canary":
+        # The accepted cutover path is one logical and physical provider
+        # attempt: no retry multiplication and no model fallback.
+        return GeminiRoutePolicy(
+            lane="protected",
+            max_output_tokens=_bounded_env_int(
+                "BNL_GEMINI_CONVERSATION_MAX_OUTPUT_TOKENS",
+                4_096,
+                minimum=1_024,
+                maximum=16_384,
+            ),
+            legacy_thinking_budget=_bounded_env_int(
+                "BNL_GEMINI_CONVERSATION_LEGACY_THINKING_BUDGET",
+                2_048,
+                minimum=0,
+                maximum=8_192,
+            ),
+            provider_retries=0,
+            allow_fallback=False,
+        )
     if lane == "journal":
         return GeminiRoutePolicy(
             lane=lane,

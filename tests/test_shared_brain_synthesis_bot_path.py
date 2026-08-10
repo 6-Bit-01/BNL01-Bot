@@ -931,6 +931,328 @@ class SharedBrainSynthesisBotPathTests(
         evaluate.assert_not_called()
         finalize.assert_not_called()
 
+    async def test_single_packet_provider_wrapper_has_no_history_or_repair_call(self):
+        generated = mock.AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                text="A clean packet-owned answer.",
+            )
+        )
+        strict_repair = mock.AsyncMock(return_value="repaired")
+        media_repair = mock.AsyncMock(return_value="repaired")
+        history = mock.Mock(return_value=[])
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "check_quota_availability",
+                return_value=True,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_conversation_history",
+                new=history,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_generate_gemini_content_result_async",
+                new=generated,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_strict_regenerate_grounded_conversation_response",
+                new=strict_repair,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_repair_current_room_media_grounding_response",
+                new=media_repair,
+            ),
+        ):
+            response = await bnl01_bot.get_gemini_response(
+                "Current user request: answer this.\n"
+                "PACKET-OWNED RESPONSE CONTRACT:\n"
+                "Use the selected evidence.",
+                7,
+                1,
+                route=bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+                source_context_available=True,
+            )
+
+        self.assertEqual(response, "A clean packet-owned answer.")
+        generated.assert_awaited_once()
+        history.assert_not_called()
+        strict_repair.assert_not_awaited()
+        media_repair.assert_not_awaited()
+        request_contents = generated.await_args.args[0]
+        self.assertIn("sole authority for BARCODE", request_contents)
+        self.assertNotIn("Conversation history:", request_contents)
+        self.assertNotIn("THE FORBIDDEN REFERENCE", request_contents)
+
+    async def test_single_packet_unsafe_output_is_suppressed_not_regenerated(self):
+        generated = mock.AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                text="Network archives yielded no results.",
+            )
+        )
+        strict_repair = mock.AsyncMock(return_value="must not run")
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "check_quota_availability",
+                return_value=True,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_generate_gemini_content_result_async",
+                new=generated,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_strict_regenerate_grounded_conversation_response",
+                new=strict_repair,
+            ),
+        ):
+            response = await bnl01_bot.get_gemini_response(
+                "Current user request: answer this.\n"
+                "PACKET-OWNED RESPONSE CONTRACT:\n"
+                "Use the selected evidence.",
+                7,
+                1,
+                route=bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+                source_context_available=True,
+            )
+
+        self.assertEqual(response, "")
+        generated.assert_awaited_once()
+        strict_repair.assert_not_awaited()
+
+    async def test_single_packet_execution_calls_provider_exactly_once(self):
+        basis = SimpleNamespace(
+            packet=SimpleNamespace(source_snapshot_digest="source-digest")
+        )
+        run = SimpleNamespace(
+            prompt_applied=True,
+            fallback_reason="",
+            revalidation_status="passed",
+            basis=basis,
+        )
+        decision = SimpleNamespace(
+            candidate_selected=True,
+            fallback_reason="",
+            run=run,
+        )
+        provider = mock.AsyncMock(return_value="One generated answer.")
+        evaluate = mock.Mock(return_value=decision)
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "build_packet_owned_prompt",
+                return_value=SimpleNamespace(
+                    ready=True,
+                    prompt="packet-owned prompt",
+                    reason="",
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "revalidate_situation_frame",
+                return_value=SimpleNamespace(status="valid"),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_begin_ordinary_chat_single_packet_receipt",
+                return_value=run,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=provider,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_ordinary_chat_single_packet_receipt",
+                new=evaluate,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "is_generic_non_answer_response",
+                return_value=False,
+            ),
+        ):
+            execution = (
+                await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
+                    channel=FakeChannel(),
+                    prompt="base prompt",
+                    basis=basis,
+                    scope_applied=True,
+                    preflight_block_reason="",
+                    situation_frame=SimpleNamespace(),
+                    situation_frame_current_text="Answer this.",
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_context",
+                    conversation_surface="mention_or_reply",
+                    user_id=7,
+                    guild_id=1,
+                    user_display_name="Test Member",
+                    source_context_available=True,
+                )
+            )
+
+        self.assertTrue(execution.candidate_active)
+        self.assertEqual(execution.provider_call_count, 1)
+        self.assertEqual(execution.corrective_call_count, 0)
+        provider.assert_awaited_once()
+        self.assertEqual(
+            provider.await_args.kwargs["route"],
+            bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+        )
+        self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 1)
+        self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
+
+    async def test_single_packet_ambiguous_preflight_uses_zero_provider_calls(self):
+        basis = SimpleNamespace(
+            packet=SimpleNamespace(source_snapshot_digest="source-digest")
+        )
+        run = SimpleNamespace(
+            prompt_applied=False,
+            fallback_reason="candidate_prompt_frame_ambiguous",
+            revalidation_status="ambiguous",
+            basis=basis,
+        )
+        provider = mock.AsyncMock()
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "build_packet_owned_prompt",
+                return_value=SimpleNamespace(
+                    ready=True,
+                    prompt="packet-owned prompt",
+                    reason="",
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "revalidate_situation_frame",
+                return_value=SimpleNamespace(status="ambiguous"),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_begin_ordinary_chat_single_packet_receipt",
+                return_value=run,
+            ) as begin,
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=provider,
+            ),
+        ):
+            execution = (
+                await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
+                    channel=FakeChannel(),
+                    prompt="base prompt",
+                    basis=basis,
+                    scope_applied=True,
+                    preflight_block_reason="",
+                    situation_frame=SimpleNamespace(),
+                    situation_frame_current_text="Who do you mean?",
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_context",
+                    conversation_surface="mention_or_reply",
+                    user_id=7,
+                    guild_id=1,
+                    user_display_name="Test Member",
+                    source_context_available=True,
+                )
+            )
+
+        self.assertFalse(execution.candidate_active)
+        self.assertEqual(execution.provider_call_count, 0)
+        provider.assert_not_awaited()
+        self.assertTrue(begin.call_args.kwargs["prompt_ready"])
+        self.assertEqual(
+            begin.call_args.kwargs["frame_revalidation_status"],
+            "ambiguous",
+        )
+
+    async def test_single_packet_guard_modification_suppresses_send(self):
+        message = FakeMessage()
+        message.author.display_name = "Test Member"
+        run = SimpleNamespace(run_id="single-run")
+        decision = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Packet candidate.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        guard = mock.AsyncMock(
+            return_value=(
+                "Modified candidate.",
+                {"suppressed": False},
+            )
+        )
+        blocked_decision = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="single_packet_guard_modified_response",
+        )
+        record_block = mock.AsyncMock(return_value=blocked_decision)
+        finalize = mock.AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_record_ordinary_chat_single_packet_block",
+                    new=record_block,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalize,
+                )
+            )
+
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "ignored baseline",
+                self.plan(),
+                prompt="ignored baseline prompt",
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+                ordinary_chat_single_packet_execution=execution,
+            )
+
+        self.assertEqual(message.replies, [])
+        self.assertFalse(guard.await_args.kwargs["regeneration_allowed"])
+        record_block.assert_awaited_once()
+        self.assertEqual(
+            record_block.await_args.kwargs["reason"],
+            "single_packet_guard_modified_response",
+        )
+        finalize.assert_awaited_once()
+        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,7 @@ from bnl_unified_intelligence_packet import (
 from bnl_shared_brain_synthesis import (
     build_evaluation_report as build_shared_brain_synthesis_report,
     configuration as shared_brain_synthesis_configuration,
+    ordinary_chat_configuration,
 )
 from bnl_unified_response_assessment import (
     build_evaluation_report as build_unified_assessment_evaluation_report,
@@ -31,7 +32,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v6"
+SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v7"
 SHADOW_EVALUATION_ORDER = (
     "memory_ledger",
     "moment_engine",
@@ -68,6 +69,7 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
     unified_assessment = unified_assessment_shadow_configuration(env)
     intelligence_packet = intelligence_packet_shadow_configuration(env)
     shared_brain_synthesis = shared_brain_synthesis_configuration(env)
+    ordinary_chat_single_packet = ordinary_chat_configuration(env)
     return {
         "conversation_context_v2": context_enabled,
         "memory_ledger_shadow_requested": ledger,
@@ -134,8 +136,26 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
         "shared_brain_synthesis_kill_switch_env": str(
             shared_brain_synthesis["kill_switch_env"]
         ),
+        "ordinary_chat_single_packet_requested": bool(
+            ordinary_chat_single_packet["configured_enabled"]
+        ),
+        "ordinary_chat_single_packet_effective": bool(
+            ordinary_chat_single_packet["effective"]
+        ),
+        "ordinary_chat_single_packet_reason": str(
+            ordinary_chat_single_packet["reason"]
+        ),
+        "ordinary_chat_single_packet_fully_scoped": bool(
+            ordinary_chat_single_packet["fully_scoped"]
+        ),
+        "ordinary_chat_single_packet_kill_switch_env": str(
+            ordinary_chat_single_packet["kill_switch_env"]
+        ),
         "all_live_gates_clear": not (
-            governance_live_requested or relationship_live or engagement_live
+            governance_live_requested
+            or relationship_live
+            or engagement_live
+            or ordinary_chat_single_packet["effective"]
         ),
     }
 
@@ -807,7 +827,7 @@ def _read_shared_brain_synthesis_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "shared_brain_synthesis_v8",
+                "schemaVersion": "shared_brain_synthesis_v9",
                 "runs": 0,
                 "promptAppliedRuns": 0,
                 "liveAppliedRuns": 0,
@@ -837,6 +857,14 @@ def _read_shared_brain_synthesis_report(
                 "promptFactualOwnerRuns": 0,
                 "promptOwnershipFailureRuns": 0,
                 "routeFamilyCounts": {},
+                "authorityModeCounts": {},
+                "ordinaryChatRuns": 0,
+                "providerCallTotal": 0,
+                "correctiveCallTotal": 0,
+                "ordinaryCallCountViolationRuns": 0,
+                "ordinaryCorrectiveCallViolationRuns": 0,
+                "frameRevalidationStatusCounts": {},
+                "sourceRevalidationStatusCounts": {},
                 "candidateGenerationLatencyMs": {
                     "average": 0,
                     "maximum": 0,
@@ -1005,6 +1033,10 @@ def build_v2_shadow_acceptance_snapshot(
             ("BNL_MEMORY_GOVERNANCE_LIVE_ENABLED", gates["memory_governance_live_requested"]),
             ("BNL_RELATIONSHIP_V2_LIVE_ENABLED", gates["relationship_v2_live_requested"]),
             ("BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED", gates["active_engagement_v2_live_requested"]),
+            (
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED",
+                gates["ordinary_chat_single_packet_effective"],
+            ),
         )
         if enabled
     ]
@@ -1585,6 +1617,46 @@ def build_v2_shadow_acceptance_snapshot(
                 unauthorized_packet_applications
             ),
         },
+        "ordinaryChatSinglePacket": {
+            "requested": bool(
+                gates.get("ordinary_chat_single_packet_requested")
+            ),
+            "effective": bool(
+                gates.get("ordinary_chat_single_packet_effective")
+            ),
+            "reason": str(
+                gates.get(
+                    "ordinary_chat_single_packet_reason",
+                    "disabled",
+                )
+            ),
+            "fullyScoped": bool(
+                gates.get("ordinary_chat_single_packet_fully_scoped")
+            ),
+            "killSwitchEnv": str(
+                gates.get(
+                    "ordinary_chat_single_packet_kill_switch_env",
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED",
+                )
+            ),
+            "runs": int(
+                shared_brain_synthesis.get("ordinaryChatRuns", 0) or 0
+            ),
+            "providerCallViolations": int(
+                shared_brain_synthesis.get(
+                    "ordinaryCallCountViolationRuns",
+                    0,
+                )
+                or 0
+            ),
+            "correctiveCallViolations": int(
+                shared_brain_synthesis.get(
+                    "ordinaryCorrectiveCallViolationRuns",
+                    0,
+                )
+                or 0
+            ),
+        },
         "unifiedResponseAssessmentShadow": {
             "requested": bool(
                 gates.get(
@@ -1615,6 +1687,7 @@ def build_v2_shadow_acceptance_snapshot(
         "rollback": {
             "legacyProductionTruthPreserved": bool(
                 gates["all_live_gates_clear"]
+                and not gates.get("ordinary_chat_single_packet_effective")
                 and not int(
                     shared_brain_synthesis.get(
                         "liveAppliedRuns",
@@ -1626,6 +1699,7 @@ def build_v2_shadow_acceptance_snapshot(
             "databaseDeletionRequired": False,
             "restartRequiredAfterEnvironmentChange": True,
             "disableOrder": [
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED",
                 "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED",
                 "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED",
                 "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED",
@@ -1677,6 +1751,9 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
         or snapshot.get("sharedBrainSynthesisCanary")
         or {}
     )
+    ordinary_chat_single_packet_state = (
+        snapshot.get("ordinaryChatSinglePacket") or {}
+    )
     unified_state = snapshot.get("unifiedResponseAssessmentShadow") or {}
     blockers = snapshot.get("blockers") or []
     warnings = snapshot.get("warnings") or []
@@ -1696,6 +1773,28 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
         ),
         "- evaluation_order: `%s`" % " -> ".join(snapshot.get("evaluationOrder") or SHADOW_EVALUATION_ORDER),
         "- all_live_gates_clear: `%s`" % ("yes" if gates.get("all_live_gates_clear") else "NO - STOP"),
+        "- ordinary_chat_single_packet: requested=`%s` effective=`%s` "
+        "reason=`%s` fully_scoped=`%s` runs=`%s` provider_call_violations=`%s` "
+        "corrective_call_violations=`%s` kill_switch=`%s`"
+        % (
+            _on(ordinary_chat_single_packet_state.get("requested")),
+            _on(ordinary_chat_single_packet_state.get("effective")),
+            ordinary_chat_single_packet_state.get("reason", "disabled"),
+            _on(ordinary_chat_single_packet_state.get("fullyScoped")),
+            ordinary_chat_single_packet_state.get("runs", 0),
+            ordinary_chat_single_packet_state.get(
+                "providerCallViolations",
+                0,
+            ),
+            ordinary_chat_single_packet_state.get(
+                "correctiveCallViolations",
+                0,
+            ),
+            ordinary_chat_single_packet_state.get(
+                "killSwitchEnv",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED",
+            ),
+        ),
         "- context_v2_preflight: `%s` scope=`process_last_run` same_room_pairs=`%s` cross_channel_pairs=`%s` focus=`%s` payload_anchors=`%s` matched_threads=`%s` suppressed_threads=`%s` fallback=`%s`" % (
             (snapshot.get("conversationContextPreflight") or {}).get("status", "unknown"),
             context.get("same_room_paired_turn_count", 0),
@@ -2017,7 +2116,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             _on(shared_brain_synthesis_state.get("fullyScoped")),
             shared_brain_synthesis.get(
                 "schemaVersion",
-                "shared_brain_synthesis_v8",
+                "shared_brain_synthesis_v9",
             ),
             shared_brain_synthesis.get("runs", 0),
             json.dumps(

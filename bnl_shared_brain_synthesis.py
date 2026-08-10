@@ -1,10 +1,10 @@
 """Guarded synthesis for the unified intelligence packet.
 
-The established response is always generated first.  This module may prepare a
-second, packet-grounded comparison for either the scoped acceptance canary or
-the separately gated public-home broad-recall owner.  Both modes reuse the same
-packet, selector, fallback, revalidation, and content-free receipt path.  This
-module owns no knowledge and persists no packet or response content.
+The legacy comparison modes may prepare a second packet-grounded candidate
+after the established response.  The separately gated ordinary-chat cutover
+uses the same packet, renderer, revalidation, and content-free receipt owner,
+but deliberately has no baseline candidate and permits one provider call.
+This module owns no knowledge and persists no packet or response content.
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_v8"
+SCHEMA_VERSION = "shared_brain_synthesis_v9"
 CAPABILITY_NAME = "shared_brain_public_broad_recall"
 CAPABILITY_CONTRACT_VERSION = "hybrid_shared_brain_v1"
 CAPABILITY_RECEIPT_VERSION = "shared_brain_capability_receipt_v1"
@@ -74,14 +74,36 @@ PUBLIC_HOME_OWNER_GUILD_IDS_ENV = (
 PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
     "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_CHANNEL_IDS"
 )
+ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
+ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
+    "ordinary_chat_single_packet_v1"
+)
+ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
+ORDINARY_CHAT_GUILD_IDS_ENV = (
+    "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS"
+)
+ORDINARY_CHAT_USER_IDS_ENV = (
+    "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS"
+)
+ORDINARY_CHAT_CHANNEL_IDS_ENV = (
+    "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS"
+)
 SCOPED_CANARY_AUTHORITY = "scoped_canary"
 PUBLIC_HOME_OWNER_AUTHORITY = "public_home_broad_recall_owner"
+ORDINARY_CHAT_AUTHORITY = "ordinary_chat_single_packet_canary"
+ORDINARY_CHAT_ROUTE_FAMILY = "ordinary_chat"
 _ROUTE_MODE = "normal_chat"
 _CANARY_CHANNEL_POLICIES = frozenset({"public_home", "public_context"})
 _PUBLIC_HOME_OWNER_CHANNEL_POLICIES = frozenset({"public_home"})
+_ORDINARY_CHAT_CHANNEL_POLICIES = frozenset(
+    {"sealed_test", "public_home", "public_context"}
+)
 _MAX_SCOPED_USERS = 8
 _MAX_SCOPED_CHANNELS = 4
 _MAX_PUBLIC_HOME_OWNER_CHANNELS = 1
+_MAX_ORDINARY_CHAT_GUILDS = 1
+_MAX_ORDINARY_CHAT_USERS = 1
+_MAX_ORDINARY_CHAT_CHANNELS = 1
 _LIVE_GATES = (
     "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED",
     "BNL_RELATIONSHIP_V2_LIVE_ENABLED",
@@ -283,6 +305,28 @@ _PROFILE_SUPPORT_GENERIC_TERMS = frozenset(
 _PACKET_FACTUAL_OWNER_REPLACEMENT = (
     "Use only the selected evidence block below for stored member facts, "
     "observations, episodes, and unresolved threads."
+)
+_ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT = (
+    "PACKET-OWNED RESPONSE CONTRACT:\n"
+    "- The current request and exact reply/referent evidence govern the task.\n"
+    "- For BARCODE, member, publication, episode, relationship, identity, or "
+    "stored-history claims, use only the selected evidence below.\n"
+    "- A publication projection is exact published prose only; it adds no "
+    "independent fact, recurrence, canon, identity, or relationship weight.\n"
+    "- If selected evidence is absent or insufficient for a requested stored "
+    "claim, say so or ask one focused clarification. Do not reconstruct a "
+    "legacy memory, archive, dossier, source, Journal, Relay, or canon view.\n"
+    "- General public knowledge may answer ordinary external questions, but it "
+    "must not be presented as BARCODE memory or private system evidence."
+)
+_ORDINARY_CHAT_FORBIDDEN_PROMPT_MARKERS = (
+    "Durable memory context:",
+    "Broadcast memory context:",
+    "Public website read model",
+    "Website read model",
+    "SOURCE FILE CONTEXT",
+    "Source-file context",
+    "UNIFIED MOMENT CANARY CONTEXT",
 )
 _HONEST_EMPTY_PROFILE_RESPONSE = (
     "I do not have enough reliable public history to summarize you without "
@@ -618,6 +662,8 @@ class SharedBrainSynthesisBasis:
     rendered_lane_counts: tuple[tuple[str, int], ...]
     rendered_source_digests: tuple[str, ...]
     authority_mode: str = SCOPED_CANARY_AUTHORITY
+    route_family: str = PERSONAL_RECALL_ROUTE_FAMILY
+    ordinary_chat_single_packet: bool = False
     competing_factual_contexts: tuple[str, ...] = ()
     competing_factual_context_digests: tuple[str, ...] = ()
     blocking_factual_owner_lanes: tuple[str, ...] = ()
@@ -676,6 +722,8 @@ class RouteScopeDecision:
     intent_status: str
     route_family: str
     authority_mode: str = "none"
+    requested: bool = False
+    effective: bool = False
 
 
 @dataclass(frozen=True)
@@ -819,7 +867,7 @@ def _configuration_details(
         "claim_contract_version": _EXPECTED_CLAIM_CONTRACT_VERSION,
         "assessment_version": _EXPECTED_ASSESSMENT_VERSION,
         "identity_contract_version": _EXPECTED_IDENTITY_CONTRACT_VERSION,
-        "synthesis_version": "shared_brain_synthesis_v8",
+        "synthesis_version": "shared_brain_synthesis_v9",
     }
     version_conflicts = tuple(
         sorted(
@@ -983,6 +1031,216 @@ def configuration(
             else "none"
         ),
     }
+
+
+def _ordinary_chat_configuration_details(
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    """Resolve the exact one-guild/user/channel ordinary-chat authority."""
+
+    requested = _flag(environ.get(ORDINARY_CHAT_ENABLED_ENV, ""))
+    guilds = _positive_ids(environ.get(ORDINARY_CHAT_GUILD_IDS_ENV, ""))
+    users = _positive_ids(environ.get(ORDINARY_CHAT_USER_IDS_ENV, ""))
+    channels = _positive_ids(
+        environ.get(ORDINARY_CHAT_CHANNEL_IDS_ENV, "")
+    )
+    comparison_authority_requested = bool(
+        _flag(environ.get(ENABLED_ENV, ""))
+        or _flag(environ.get(PUBLIC_HOME_OWNER_ENABLED_ENV, ""))
+    )
+    scope_present = bool(guilds and users and channels)
+    scope_within_limits = bool(
+        len(guilds) == _MAX_ORDINARY_CHAT_GUILDS
+        and len(users) == _MAX_ORDINARY_CHAT_USERS
+        and len(channels) == _MAX_ORDINARY_CHAT_CHANNELS
+    )
+    packet_ready = packet_shadow_enabled(environ)
+    assessment_ready = assessment_shadow_enabled(environ)
+    prerequisite_versions = {
+        "packet_version": PACKET_SCHEMA_VERSION,
+        "claim_contract_version": HYBRID_CANON_CLAIM_CONTRACT_VERSION,
+        "assessment_version": ASSESSMENT_VERSION,
+        "identity_contract_version": (
+            ENTITY_ACCOUNT_BINDING_CONTRACT_VERSION
+        ),
+        "synthesis_version": SCHEMA_VERSION,
+    }
+    expected_versions = {
+        "packet_version": _EXPECTED_PACKET_SCHEMA_VERSION,
+        "claim_contract_version": _EXPECTED_CLAIM_CONTRACT_VERSION,
+        "assessment_version": _EXPECTED_ASSESSMENT_VERSION,
+        "identity_contract_version": _EXPECTED_IDENTITY_CONTRACT_VERSION,
+        "synthesis_version": "shared_brain_synthesis_v9",
+    }
+    version_conflicts = tuple(
+        sorted(
+            "version:%s" % name
+            for name, version in prerequisite_versions.items()
+            if version != expected_versions[name]
+        )
+    )
+    active_live_gates = tuple(
+        name for name in _LIVE_GATES if _flag(environ.get(name, ""))
+    )
+    prerequisites_ready = bool(
+        packet_ready and assessment_ready and not version_conflicts
+    )
+    fully_scoped = bool(requested and scope_present and scope_within_limits)
+    effective = bool(
+        fully_scoped
+        and prerequisites_ready
+        and not comparison_authority_requested
+        and not active_live_gates
+    )
+    if not requested:
+        reason = "disabled"
+    elif scope_present and not scope_within_limits:
+        reason = "scope_limit_exceeded"
+    elif not fully_scoped:
+        reason = "scope_incomplete"
+    elif comparison_authority_requested:
+        reason = "comparison_authority_conflict"
+    elif active_live_gates:
+        reason = "global_live_authority_detected"
+    elif version_conflicts:
+        reason = "prerequisite_version_conflict"
+    elif not prerequisites_ready:
+        reason = "missing_shadow_prerequisites"
+    else:
+        reason = ORDINARY_CHAT_AUTHORITY
+    return {
+        "requested": requested,
+        "effective": effective,
+        "reason": reason,
+        "authority_mode": ORDINARY_CHAT_AUTHORITY,
+        "guilds": guilds,
+        "users": users,
+        "channels": channels,
+        "channel_policies": _ORDINARY_CHAT_CHANNEL_POLICIES,
+        "scope_present": scope_present,
+        "fully_scoped": fully_scoped,
+        "packet_ready": packet_ready,
+        "assessment_ready": assessment_ready,
+        "prerequisites_ready": prerequisites_ready,
+        "prerequisite_versions": prerequisite_versions,
+        "version_conflicts": version_conflicts,
+        "active_live_gates": active_live_gates,
+        "comparison_authority_requested": comparison_authority_requested,
+        "scope_digest": (
+            _digest(
+                "ordinary_chat_single_packet_scope_v1",
+                tuple(sorted(guilds)),
+                tuple(sorted(users)),
+                tuple(sorted(channels)),
+                tuple(sorted(_ORDINARY_CHAT_CHANNEL_POLICIES)),
+                _ROUTE_MODE,
+            )
+            if requested
+            else ""
+        ),
+    }
+
+
+def ordinary_chat_configuration(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return content-free state for the default-off one-call capability."""
+
+    env = os.environ if environ is None else environ
+    details = _ordinary_chat_configuration_details(env)
+    conflicts = tuple(
+        dict.fromkeys(
+            (
+                *details["version_conflicts"],
+                *details["active_live_gates"],
+                *(
+                    ("comparison_authority_conflict",)
+                    if details["comparison_authority_requested"]
+                    else ()
+                ),
+            )
+        )
+    )
+    return {
+        "capability": ORDINARY_CHAT_CAPABILITY_NAME,
+        "contract_version": ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION,
+        "configured_enabled": details["requested"],
+        "effective": details["effective"],
+        "reason": details["reason"],
+        "authority_mode": ORDINARY_CHAT_AUTHORITY,
+        "fully_scoped": details["fully_scoped"],
+        "guild_allowlist_count": len(details["guilds"]),
+        "user_allowlist_count": len(details["users"]),
+        "channel_allowlist_count": len(details["channels"]),
+        "route_mode": _ROUTE_MODE,
+        "route_family": ORDINARY_CHAT_ROUTE_FAMILY,
+        "channel_policies": tuple(
+            sorted(details["channel_policies"])
+        ),
+        "prerequisites_ready": details["prerequisites_ready"],
+        "conflicts": conflicts,
+        "scope_digest": details["scope_digest"],
+        "kill_switch_env": ORDINARY_CHAT_ENABLED_ENV,
+        "provider_call_limit": 1,
+        "corrective_call_limit": 0,
+    }
+
+
+def ordinary_chat_route_scope_decision(
+    *,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    route_mode: str,
+    channel_policy: str,
+    current_direct: bool,
+    user_text: str,
+    has_media: bool = False,
+    specialized_owner_present: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> RouteScopeDecision:
+    """Decide the cutover scope before building or calling the provider."""
+
+    env = os.environ if environ is None else environ
+    details = _ordinary_chat_configuration_details(env)
+    if not details["effective"]:
+        reason = "configuration_%s" % details["reason"]
+    elif int(guild_id or 0) not in details["guilds"]:
+        reason = "guild_not_allowlisted"
+    elif int(user_id or 0) not in details["users"]:
+        reason = "user_not_allowlisted"
+    elif int(channel_id or 0) not in details["channels"]:
+        reason = "channel_not_allowlisted"
+    elif str(route_mode or "") != _ROUTE_MODE:
+        reason = "route_mode_not_supported"
+    elif (
+        str(channel_policy or "").strip().lower()
+        not in details["channel_policies"]
+    ):
+        reason = "channel_policy_not_supported"
+    elif not current_direct:
+        reason = "not_direct"
+    elif not str(user_text or "").strip():
+        reason = "empty_turn"
+    elif has_media:
+        reason = "media_present"
+    elif specialized_owner_present:
+        reason = "specialized_owner_present"
+    else:
+        reason = "eligible"
+    return RouteScopeDecision(
+        eligible=reason == "eligible",
+        reason=reason,
+        intent_status="ordinary_chat",
+        route_family=ORDINARY_CHAT_ROUTE_FAMILY,
+        authority_mode=ORDINARY_CHAT_AUTHORITY,
+        requested=bool(details["requested"]),
+        effective=bool(details["effective"]),
+    )
+
+
+def ordinary_chat_route_scope_enabled(**kwargs: Any) -> bool:
+    return ordinary_chat_route_scope_decision(**kwargs).eligible
 
 
 def broad_profile_request(text: str) -> bool:
@@ -2025,6 +2283,105 @@ def render_packet_context(
     )
 
 
+def _ordinary_packet_context(
+    packet: UnifiedIntelligencePacket,
+) -> tuple[str, tuple[tuple[str, int], ...], int, tuple[str, ...]]:
+    """Render a valid packet, including an explicit honest-empty selection."""
+
+    structurally_usable = bool(
+        not packet.diagnostics.processing_errors
+        and not packet.diagnostics.invalid_invariants
+        and packet.diagnostics.revalidation_status.startswith("passed")
+        and packet.diagnostics.receipt_run_id
+    )
+    if not structurally_usable:
+        return "", (), 0, ()
+    rendered, lane_counts, item_count, source_digests = (
+        render_packet_context(packet)
+    )
+    if rendered and item_count:
+        return rendered, lane_counts, item_count, source_digests
+    return (
+        "SELECTED EVIDENCE:\n"
+        "- No stored BARCODE/member/publication/history evidence was selected "
+        "for this turn. Do not infer any. Use only the current request and "
+        "general public knowledge, or ask a focused clarification when the "
+        "request depends on unavailable stored evidence.",
+        (),
+        0,
+        (),
+    )
+
+
+def build_ordinary_chat_basis(
+    *,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    route_mode: str,
+    channel_policy: str,
+    current_direct: bool,
+    user_text: str,
+    packet: UnifiedIntelligencePacket | None,
+    assessment: UnifiedResponseAssessment | None,
+    has_media: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> SharedBrainSynthesisBasis | None:
+    """Freeze one packet-owned basis for the one-call ordinary-chat route."""
+
+    env = os.environ if environ is None else environ
+    if not ordinary_chat_route_scope_enabled(
+        guild_id=guild_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        current_direct=current_direct,
+        user_text=user_text,
+        has_media=has_media,
+        environ=env,
+    ):
+        return None
+    if packet is None or not isinstance(
+        assessment,
+        UnifiedResponseAssessment,
+    ):
+        return None
+    rendered, lane_counts, item_count, source_digests = (
+        _ordinary_packet_context(packet)
+    )
+    blocking_lanes = tuple(
+        sorted(
+            set(assessment.selected_lanes)
+            & _NON_PACKET_FACTUAL_OWNER_LANES
+        )
+    )
+    profile = getattr(packet, "profile_sufficiency", None)
+    return SharedBrainSynthesisBasis(
+        packet=packet,
+        assessment=assessment,
+        rendered_context=rendered,
+        expected_packet_digest=packet.diagnostics.packet_digest,
+        expected_context_digest=_digest(rendered),
+        guild_id=int(guild_id or 0),
+        user_id=int(user_id or 0),
+        channel_id=int(channel_id or 0),
+        route_mode=str(route_mode or ""),
+        channel_policy=str(channel_policy or "").strip().lower(),
+        rendered_item_count=item_count,
+        rendered_lane_counts=lane_counts,
+        rendered_source_digests=source_digests,
+        authority_mode=ORDINARY_CHAT_AUTHORITY,
+        route_family=ORDINARY_CHAT_ROUTE_FAMILY,
+        ordinary_chat_single_packet=True,
+        blocking_factual_owner_lanes=blocking_lanes,
+        profile_sufficiency_status=str(
+            getattr(profile, "status", "not_applicable")
+            or "not_applicable"
+        ).strip().lower(),
+    )
+
+
 def build_basis(
     *,
     guild_id: int,
@@ -2150,6 +2507,7 @@ def build_basis(
         rendered_lane_counts=lane_counts,
         rendered_source_digests=source_digests,
         authority_mode=authority_mode,
+        route_family=PERSONAL_RECALL_ROUTE_FAMILY,
         competing_factual_contexts=factual_contexts,
         competing_factual_context_digests=tuple(
             _digest(value) for value in factual_contexts
@@ -2189,6 +2547,58 @@ def revalidate_basis(
     journal_control_snapshot_provided: bool = False,
 ) -> tuple[bool, str]:
     env = os.environ if environ is None else environ
+    if basis.ordinary_chat_single_packet:
+        details = _ordinary_chat_configuration_details(env)
+        config = ordinary_chat_configuration(env)
+        fresh_rendered, fresh_lane_counts, fresh_item_count, fresh_digests = (
+            _ordinary_packet_context(basis.packet)
+        )
+        if (
+            not config["effective"]
+            or basis.authority_mode != ORDINARY_CHAT_AUTHORITY
+            or basis.route_family != ORDINARY_CHAT_ROUTE_FAMILY
+            or basis.guild_id not in details["guilds"]
+            or basis.user_id not in details["users"]
+            or basis.channel_id not in details["channels"]
+            or basis.route_mode != _ROUTE_MODE
+            or basis.channel_policy not in details["channel_policies"]
+            or basis.packet.schema_version != PACKET_SCHEMA_VERSION
+            or basis.packet.request.guild_id != basis.guild_id
+            or basis.packet.request.channel_id != basis.channel_id
+            or basis.packet.request.route_mode != basis.route_mode
+            or basis.packet.request.channel_policy != basis.channel_policy
+            or basis.packet.request.direct_state != "direct"
+            or basis.assessment.guild_id != basis.guild_id
+            or basis.assessment.route_mode != basis.route_mode
+            or basis.assessment.channel_policy != basis.channel_policy
+            or basis.packet.diagnostics.packet_digest
+            != basis.expected_packet_digest
+            or _digest(basis.rendered_context)
+            != basis.expected_context_digest
+            or fresh_rendered != basis.rendered_context
+            or fresh_lane_counts != basis.rendered_lane_counts
+            or fresh_item_count != basis.rendered_item_count
+            or fresh_digests != basis.rendered_source_digests
+            or basis.competing_factual_contexts
+            or basis.blocking_factual_owner_lanes
+            or tuple(
+                sorted(
+                    set(basis.assessment.selected_lanes)
+                    & _NON_PACKET_FACTUAL_OWNER_LANES
+                )
+            )
+        ):
+            return False, "scope_or_basis_changed"
+        result = revalidate_packet(
+            conn,
+            basis.packet,
+            environ=env,
+            journal_control_snapshot=journal_control_snapshot,
+            journal_control_snapshot_provided=(
+                journal_control_snapshot_provided
+            ),
+        )
+        return result.valid, result.status
     details = _configuration_details(env)
     config = configuration(env)
     if not config["effective"]:
@@ -2295,6 +2705,62 @@ def build_packet_owned_prompt(
     """
 
     updated = str(prompt or "")
+    if basis.ordinary_chat_single_packet:
+        if not updated.strip():
+            return PacketOwnedPrompt(
+                prompt=updated,
+                ready=False,
+                reason="single_packet_prompt_missing",
+            )
+        if basis.blocking_factual_owner_lanes:
+            return PacketOwnedPrompt(
+                prompt=updated,
+                ready=False,
+                reason="nonpacket_factual_owner_selected",
+            )
+        if basis.competing_factual_contexts:
+            return PacketOwnedPrompt(
+                prompt=updated,
+                ready=False,
+                reason="competing_factual_context_present",
+            )
+        forbidden = next(
+            (
+                marker
+                for marker in _ORDINARY_CHAT_FORBIDDEN_PROMPT_MARKERS
+                if marker.casefold() in updated.casefold()
+            ),
+            "",
+        )
+        if forbidden:
+            return PacketOwnedPrompt(
+                prompt=updated,
+                ready=False,
+                reason="legacy_factual_prompt_marker_present",
+            )
+        if not basis.rendered_context:
+            return PacketOwnedPrompt(
+                prompt=updated,
+                ready=False,
+                reason="packet_context_unavailable",
+            )
+        if basis.rendered_context in updated:
+            return PacketOwnedPrompt(
+                prompt=updated,
+                ready=False,
+                reason="packet_context_already_present",
+            )
+        return PacketOwnedPrompt(
+            prompt=(
+                updated.rstrip()
+                + "\n\n"
+                + _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT
+                + "\n\n"
+                + basis.rendered_context
+            ),
+            ready=True,
+            replaced_factual_context_count=0,
+        )
     if basis.honest_empty_profile_fallback:
         return PacketOwnedPrompt(
             prompt=updated,
@@ -4218,6 +4684,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             response_sent INTEGER NOT NULL DEFAULT 0,
             guard_status TEXT NOT NULL DEFAULT 'not_evaluated',
             fallback_reason TEXT NOT NULL DEFAULT '',
+            frame_revision TEXT NOT NULL DEFAULT '',
+            frame_input_evidence_digest TEXT NOT NULL DEFAULT '',
+            source_snapshot_digest TEXT NOT NULL DEFAULT '',
+            selected_lane_counts_json TEXT NOT NULL DEFAULT '{}',
+            selected_status_counts_json TEXT NOT NULL DEFAULT '{}',
+            selected_domain_counts_json TEXT NOT NULL DEFAULT '{}',
+            provider_call_count INTEGER NOT NULL DEFAULT 0,
+            corrective_call_count INTEGER NOT NULL DEFAULT 0,
+            frame_revalidation_status TEXT NOT NULL DEFAULT 'not_evaluated',
+            source_revalidation_status TEXT NOT NULL DEFAULT 'not_evaluated',
             processing_error_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -4328,6 +4804,34 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "replaced_factual_context_count",
             "INTEGER NOT NULL DEFAULT 0",
         ),
+        ("frame_revision", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "frame_input_evidence_digest",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
+        ("source_snapshot_digest", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "selected_lane_counts_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        ),
+        (
+            "selected_status_counts_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        ),
+        (
+            "selected_domain_counts_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        ),
+        ("provider_call_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("corrective_call_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "frame_revalidation_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated'",
+        ),
+        (
+            "source_revalidation_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated'",
+        ),
     ):
         if column in columns:
             continue
@@ -4433,7 +4937,7 @@ def begin_run(
             basis.guild_id,
             _digest(subject_key_for_user(basis.user_id))[:16],
             _digest(basis.guild_id, basis.channel_id)[:16],
-            PERSONAL_RECALL_ROUTE_FAMILY,
+            basis.route_family,
             basis.authority_mode,
             basis.route_mode,
             basis.channel_policy,
@@ -4486,6 +4990,256 @@ def begin_run(
         prompt_applied=prompt_applied,
         fallback_reason=fallback_reason,
         revalidation_status=revalidation_status,
+    )
+
+
+def begin_single_packet_run(
+    conn: sqlite3.Connection,
+    basis: SharedBrainSynthesisBasis,
+    *,
+    prompt_ready: bool,
+    prompt_failure_reason: str = "",
+    frame_revalidation_status: str = "invalid",
+    created_at: str = "",
+    environ: Mapping[str, str] | None = None,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
+) -> SynthesisCanaryRun:
+    """Open the one-call receipt only after deterministic preflight checks."""
+
+    frame_valid = str(frame_revalidation_status or "") == "valid"
+    candidate_ready = bool(
+        basis.ordinary_chat_single_packet
+        and prompt_ready
+        and frame_valid
+    )
+    failure = (
+        str(prompt_failure_reason or "")
+        if not prompt_ready
+        else "frame_%s" % str(frame_revalidation_status or "invalid")
+        if not frame_valid
+        else "ordinary_chat_basis_required"
+        if not basis.ordinary_chat_single_packet
+        else ""
+    )
+    run = begin_run(
+        conn,
+        basis,
+        baseline_response="single_packet_preflight",
+        created_at=created_at,
+        candidate_prompt_ready=candidate_ready,
+        candidate_prompt_failure_reason=failure,
+        replaced_factual_context_count=0,
+        environ=environ,
+        journal_control_snapshot=journal_control_snapshot,
+        journal_control_snapshot_provided=(
+            journal_control_snapshot_provided
+        ),
+    )
+    lane_counts = Counter(item.lane or "unknown" for item in basis.packet.items)
+    status_counts = Counter(
+        str(item.lifecycle or item.uncertainty_status or "unknown")
+        for item in basis.packet.items
+    )
+    domain_counts = Counter(
+        str(getattr(item, "domain", "") or "unspecified")
+        for item in basis.packet.items
+    )
+    conn.execute(
+        """
+        UPDATE memory_governance_shared_brain_synthesis_runs
+        SET baseline_generated=0,baseline_response_hash=?,
+            baseline_response_length=0,route_family=?,authority_mode=?,
+            frame_revision=?,frame_input_evidence_digest=?,
+            source_snapshot_digest=?,selected_lane_counts_json=?,
+            selected_status_counts_json=?,selected_domain_counts_json=?,
+            provider_call_count=0,corrective_call_count=0,
+            frame_revalidation_status=?,source_revalidation_status=?,
+            updated_at=?
+        WHERE run_id=?
+        """,
+        (
+            _digest(""),
+            ORDINARY_CHAT_ROUTE_FAMILY,
+            ORDINARY_CHAT_AUTHORITY,
+            str(basis.packet.request.frame_revision or "")[:160],
+            str(
+                basis.packet.request.frame_input_evidence_digest or ""
+            )[:128],
+            str(basis.packet.source_snapshot_digest or "")[:128],
+            json.dumps(dict(lane_counts), sort_keys=True),
+            json.dumps(dict(status_counts), sort_keys=True),
+            json.dumps(dict(domain_counts), sort_keys=True),
+            str(frame_revalidation_status or "invalid")[:80],
+            str(run.revalidation_status or "not_evaluated")[:80],
+            _now(),
+            run.run_id,
+        ),
+    )
+    return run
+
+
+def blocked_single_packet_decision(
+    run: SynthesisCanaryRun,
+    *,
+    reason: str = "deterministic_block",
+) -> SynthesisCanaryDecision:
+    """Represent a zero-provider deterministic block without a fallback."""
+
+    return SynthesisCanaryDecision(
+        run=run,
+        response="",
+        candidate_selected=False,
+        fallback_reason=str(reason or run.fallback_reason or "blocked")[:160],
+        comparison_status="not_comparable",
+        baseline_coherence_status="not_evaluated",
+        candidate_coherence_status="not_evaluated",
+        candidate_evidence_coverage_count=0,
+        revalidation_status=run.revalidation_status,
+    )
+
+
+def evaluate_single_packet_response(
+    conn: sqlite3.Connection,
+    run: SynthesisCanaryRun,
+    *,
+    response: str,
+    provider_call_count: int,
+    corrective_call_count: int = 0,
+    generation_latency_ms: int | None = None,
+    environ: Mapping[str, str] | None = None,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
+) -> SynthesisCanaryDecision:
+    """Validate one generated response; this path has no baseline fallback."""
+
+    candidate = str(response or "").strip()
+    valid, source_status = revalidate_basis(
+        conn,
+        run.basis,
+        environ=environ,
+        journal_control_snapshot=journal_control_snapshot,
+        journal_control_snapshot_provided=(
+            journal_control_snapshot_provided
+        ),
+    )
+    coherence = assess_response_coherence(run.basis.assessment, candidate)
+    output_leak = response_exposes_controls(candidate)
+    calls = max(0, int(provider_call_count or 0))
+    corrective_calls = max(0, int(corrective_call_count or 0))
+    fallback_reason = ""
+    if not run.prompt_applied:
+        fallback_reason = "prompt_not_applied"
+    elif calls != 1:
+        fallback_reason = "provider_call_count_invalid"
+    elif corrective_calls:
+        fallback_reason = "corrective_provider_call_forbidden"
+    elif not valid:
+        fallback_reason = "post_generation_%s" % source_status
+    elif not candidate:
+        fallback_reason = "generation_failed"
+    elif output_leak:
+        fallback_reason = "control_marker_leak"
+    elif coherence.status == "failed":
+        fallback_reason = "coherence_failed"
+    candidate_selected = not fallback_reason
+    coverage = candidate_profile_coverage(run.basis, candidate)
+    conn.execute(
+        """
+        UPDATE memory_governance_shared_brain_synthesis_runs
+        SET candidate_generated=?,candidate_response_hash=?,
+            candidate_response_length=?,candidate_generation_latency_ms=?,
+            comparison_status='single_packet',
+            baseline_coherence_status='not_evaluated',
+            candidate_coherence_status=?,
+            candidate_evidence_coverage_count=?,candidate_output_leak=?,
+            candidate_member_point_coverage_count=?,
+            candidate_member_detail_coverage_count=?,
+            candidate_member_root_coverage_count=?,
+            candidate_member_occurrence_coverage_count=?,
+            candidate_canon_coverage_count=?,candidate_lore_dominant=?,
+            candidate_member_supported_claim_count=?,
+            candidate_canon_supported_claim_count=?,
+            candidate_opinion_claim_count=?,
+            candidate_connective_claim_count=?,
+            candidate_unsupported_factual_claim_count=?,
+            candidate_claim_classification_counts_json=?,
+            provider_call_count=?,corrective_call_count=?,
+            revalidation_status=?,source_revalidation_status=?,
+            candidate_selected=?,fallback_reason=?,updated_at=?
+        WHERE run_id=?
+        """,
+        (
+            int(bool(candidate)),
+            _digest(candidate),
+            len(candidate),
+            max(0, int(generation_latency_ms or 0)),
+            coherence.status,
+            coverage.total_item_count,
+            int(output_leak),
+            coverage.member_point_count,
+            coverage.member_detail_point_count,
+            coverage.member_root_count,
+            coverage.member_occurrence_count,
+            coverage.canon_item_count,
+            int(coverage.lore_dominant),
+            coverage.member_supported_claim_count,
+            coverage.canon_supported_claim_count,
+            coverage.opinion_claim_count,
+            coverage.connective_claim_count,
+            coverage.unsupported_factual_claim_count,
+            json.dumps(
+                dict(Counter(coverage.claim_classifications)),
+                sort_keys=True,
+            ),
+            calls,
+            corrective_calls,
+            source_status,
+            source_status,
+            int(candidate_selected),
+            fallback_reason,
+            _now(),
+            run.run_id,
+        ),
+    )
+    return SynthesisCanaryDecision(
+        run=run,
+        response=candidate if candidate_selected else "",
+        candidate_selected=candidate_selected,
+        fallback_reason=fallback_reason,
+        comparison_status="single_packet",
+        baseline_coherence_status="not_evaluated",
+        candidate_coherence_status=coherence.status,
+        candidate_evidence_coverage_count=coverage.total_item_count,
+        revalidation_status=source_status,
+        candidate_generation_latency_ms=max(
+            0,
+            int(generation_latency_ms or 0),
+        ),
+        candidate_member_point_coverage_count=(
+            coverage.member_point_count
+        ),
+        candidate_member_detail_coverage_count=(
+            coverage.member_detail_point_count
+        ),
+        candidate_member_root_coverage_count=coverage.member_root_count,
+        candidate_member_occurrence_coverage_count=(
+            coverage.member_occurrence_count
+        ),
+        candidate_canon_coverage_count=coverage.canon_item_count,
+        candidate_lore_dominant=coverage.lore_dominant,
+        candidate_member_supported_claim_count=(
+            coverage.member_supported_claim_count
+        ),
+        candidate_canon_supported_claim_count=(
+            coverage.canon_supported_claim_count
+        ),
+        candidate_opinion_claim_count=coverage.opinion_claim_count,
+        candidate_connective_claim_count=coverage.connective_claim_count,
+        candidate_unsupported_factual_claim_count=(
+            coverage.unsupported_factual_claim_count
+        ),
+        candidate_claim_classifications=coverage.claim_classifications,
     )
 
 
@@ -4852,6 +5606,52 @@ def record_fallback(
     )
 
 
+def record_single_packet_block(
+    conn: sqlite3.Connection,
+    decision: SynthesisCanaryDecision,
+    *,
+    reason: str,
+    provider_call_count: int | None = None,
+    corrective_call_count: int | None = None,
+    frame_revalidation_status: str = "",
+    source_revalidation_status: str = "",
+    processing_error: bool = False,
+) -> SynthesisCanaryDecision:
+    """Record a cutover block without storing prompt or response content."""
+
+    blocked = record_fallback(conn, decision, reason=reason)
+    conn.execute(
+        """
+        UPDATE memory_governance_shared_brain_synthesis_runs
+        SET provider_call_count=COALESCE(?,provider_call_count),
+            corrective_call_count=COALESCE(?,corrective_call_count),
+            frame_revalidation_status=CASE
+              WHEN ?='' THEN frame_revalidation_status ELSE ? END,
+            source_revalidation_status=CASE
+              WHEN ?='' THEN source_revalidation_status ELSE ? END,
+            processing_error_count=processing_error_count+?,updated_at=?
+        WHERE run_id=? AND authority_mode=?
+        """,
+        (
+            None
+            if provider_call_count is None
+            else max(0, int(provider_call_count or 0)),
+            None
+            if corrective_call_count is None
+            else max(0, int(corrective_call_count or 0)),
+            str(frame_revalidation_status or "")[:80],
+            str(frame_revalidation_status or "")[:80],
+            str(source_revalidation_status or "")[:80],
+            str(source_revalidation_status or "")[:80],
+            int(bool(processing_error)),
+            _now(),
+            decision.run.run_id,
+            ORDINARY_CHAT_AUTHORITY,
+        ),
+    )
+    return blocked
+
+
 def finalize_run(
     conn: sqlite3.Connection,
     decision: SynthesisCanaryDecision,
@@ -4933,6 +5733,13 @@ def _empty_report() -> dict[str, Any]:
         "promptOwnershipFailureRuns": 0,
         "routeFamilyCounts": {},
         "authorityModeCounts": {},
+        "ordinaryChatRuns": 0,
+        "providerCallTotal": 0,
+        "correctiveCallTotal": 0,
+        "ordinaryCallCountViolationRuns": 0,
+        "ordinaryCorrectiveCallViolationRuns": 0,
+        "frameRevalidationStatusCounts": {},
+        "sourceRevalidationStatusCounts": {},
         "candidateGenerationLatencyMs": {
             "average": 0,
             "maximum": 0,
@@ -5096,6 +5903,26 @@ def build_evaluation_report(
         if "replaced_factual_context_count" in columns
         else "0"
     )
+    provider_call_expr = (
+        "provider_call_count"
+        if "provider_call_count" in columns
+        else "0"
+    )
+    corrective_call_expr = (
+        "corrective_call_count"
+        if "corrective_call_count" in columns
+        else "0"
+    )
+    frame_revalidation_expr = (
+        "frame_revalidation_status"
+        if "frame_revalidation_status" in columns
+        else "'not_evaluated'"
+    )
+    source_revalidation_expr = (
+        "source_revalidation_status"
+        if "source_revalidation_status" in columns
+        else "'not_evaluated'"
+    )
     invalid_scope_runs = int(
         conn.execute(
             """
@@ -5104,17 +5931,37 @@ def build_evaluation_report(
             WHERE guild_id=?
               AND (
                 route_mode<>?
-                OR channel_policy NOT IN ('public_home','public_context')
-                OR {authority_mode_expr} NOT IN (
-                  'scoped_canary','public_home_broad_recall_owner'
+                OR subject_hash='' OR channel_scope_hash=''
+                OR (
+                  {authority_mode_expr}='{ordinary_authority}'
+                  AND (
+                    {route_family_expr}<>'{ordinary_route_family}'
+                    OR channel_policy NOT IN (
+                      'sealed_test','public_home','public_context'
+                    )
+                  )
                 )
                 OR (
-                  {authority_mode_expr}='public_home_broad_recall_owner'
-                  AND channel_policy<>'public_home'
+                  {authority_mode_expr}<>'{ordinary_authority}'
+                  AND (
+                    channel_policy NOT IN ('public_home','public_context')
+                    OR {authority_mode_expr} NOT IN (
+                      'scoped_canary','public_home_broad_recall_owner'
+                    )
+                    OR (
+                      {authority_mode_expr}=
+                        'public_home_broad_recall_owner'
+                      AND channel_policy<>'public_home'
+                    )
+                  )
                 )
-                OR subject_hash='' OR channel_scope_hash=''
               )
-            """.format(authority_mode_expr=authority_mode_expr),
+            """.format(
+                authority_mode_expr=authority_mode_expr,
+                route_family_expr=route_family_expr,
+                ordinary_authority=ORDINARY_CHAT_AUTHORITY,
+                ordinary_route_family=ORDINARY_CHAT_ROUTE_FAMILY,
+            ),
             (int(guild_id or 0), _ROUTE_MODE),
         ).fetchone()[0]
         or 0
@@ -5137,8 +5984,12 @@ def build_evaluation_report(
             SELECT COUNT(*)
             FROM memory_governance_shared_brain_synthesis_runs
             WHERE guild_id=? AND live_applied=1
+              AND {authority_mode_expr}<>'{ordinary_authority}'
               AND candidate_evidence_coverage_count<=0
-            """,
+            """.format(
+                authority_mode_expr=authority_mode_expr,
+                ordinary_authority=ORDINARY_CHAT_AUTHORITY,
+            ),
             (int(guild_id or 0),),
         ).fetchone()[0]
         or 0
@@ -5149,6 +6000,7 @@ def build_evaluation_report(
             SELECT COUNT(*)
             FROM memory_governance_shared_brain_synthesis_runs
             WHERE guild_id=? AND live_applied=1
+              AND {authority_mode_expr}<>'{ordinary_authority}'
               AND (
                 {member_point_expr} < CASE
                   WHEN {profile_status_expr}='rich' THEN 2
@@ -5171,6 +6023,8 @@ def build_evaluation_report(
                 member_root_expr=member_root_expr,
                 member_occurrence_expr=member_occurrence_expr,
                 profile_status_expr=profile_status_expr,
+                authority_mode_expr=authority_mode_expr,
+                ordinary_authority=ORDINARY_CHAT_AUTHORITY,
             ),
             (int(guild_id or 0),),
         ).fetchone()[0]
@@ -5182,8 +6036,13 @@ def build_evaluation_report(
             SELECT COUNT(*)
             FROM memory_governance_shared_brain_synthesis_runs
             WHERE guild_id=? AND live_applied=1
+              AND {authority_mode_expr}<>'{ordinary_authority}'
               AND {lore_dominant_expr}=1
-            """.format(lore_dominant_expr=lore_dominant_expr),
+            """.format(
+                authority_mode_expr=authority_mode_expr,
+                ordinary_authority=ORDINARY_CHAT_AUTHORITY,
+                lore_dominant_expr=lore_dominant_expr,
+            ),
             (int(guild_id or 0),),
         ).fetchone()[0]
         or 0
@@ -5194,8 +6053,11 @@ def build_evaluation_report(
             SELECT COUNT(*)
             FROM memory_governance_shared_brain_synthesis_runs
             WHERE guild_id=? AND live_applied=1
+              AND {authority_mode_expr}<>'{ordinary_authority}'
               AND {unsupported_factual_claim_expr}>0
             """.format(
+                authority_mode_expr=authority_mode_expr,
+                ordinary_authority=ORDINARY_CHAT_AUTHORITY,
                 unsupported_factual_claim_expr=(
                     unsupported_factual_claim_expr
                 )
@@ -5210,8 +6072,11 @@ def build_evaluation_report(
             SELECT COUNT(*)
             FROM memory_governance_shared_brain_synthesis_runs
             WHERE guild_id=? AND live_applied=1
+              AND {authority_mode_expr}<>'{ordinary_authority}'
               AND {supported_coverage_regressed_expr}=1
             """.format(
+                authority_mode_expr=authority_mode_expr,
+                ordinary_authority=ORDINARY_CHAT_AUTHORITY,
                 supported_coverage_regressed_expr=(
                     supported_coverage_regressed_expr
                 )
@@ -5296,6 +6161,8 @@ def build_evaluation_report(
                {canon_supported_claim_expr},{opinion_claim_expr},
                {connective_claim_expr},{unsupported_factual_claim_expr},
                {supported_coverage_regressed_expr},
+               {provider_call_expr},{corrective_call_expr},
+               {frame_revalidation_expr},{source_revalidation_expr},
                created_at
         FROM memory_governance_shared_brain_synthesis_runs
         WHERE guild_id=?
@@ -5323,6 +6190,10 @@ def build_evaluation_report(
             supported_coverage_regressed_expr=(
                 supported_coverage_regressed_expr
             ),
+            provider_call_expr=provider_call_expr,
+            corrective_call_expr=corrective_call_expr,
+            frame_revalidation_expr=frame_revalidation_expr,
+            source_revalidation_expr=source_revalidation_expr,
         ),
         (int(guild_id or 0), max(1, min(int(limit or 500), 2000))),
     ).fetchall()
@@ -5333,6 +6204,8 @@ def build_evaluation_report(
     revalidation: Counter[str] = Counter()
     route_families: Counter[str] = Counter()
     authority_modes: Counter[str] = Counter()
+    frame_revalidation: Counter[str] = Counter()
+    source_revalidation: Counter[str] = Counter()
     latency_values: list[int] = []
     prompt = live = selected = coverage = leaks = errors = sent = 0
     validation_items = 0
@@ -5343,6 +6216,8 @@ def build_evaluation_report(
     member_supported_claims = canon_supported_claims = 0
     opinion_claims = connective_claims = unsupported_factual_claims = 0
     supported_coverage_regressions = 0
+    ordinary_chat_runs = provider_call_total = corrective_call_total = 0
+    ordinary_call_violations = ordinary_corrective_violations = 0
     for row in rows:
         (
             _schema,
@@ -5377,6 +6252,10 @@ def build_evaluation_report(
             candidate_connective_claims,
             candidate_unsupported_factual_claims,
             supported_coverage_regressed,
+            provider_call_count,
+            corrective_call_count,
+            frame_revalidation_status,
+            source_revalidation_status,
             _created_at,
         ) = row
         prompt += int(bool(prompt_applied))
@@ -5418,6 +6297,22 @@ def build_evaluation_report(
         authority_modes[
             str(authority_mode or SCOPED_CANARY_AUTHORITY)
         ] += 1
+        calls = max(0, int(provider_call_count or 0))
+        corrective_calls = max(0, int(corrective_call_count or 0))
+        provider_call_total += calls
+        corrective_call_total += corrective_calls
+        frame_revalidation[
+            str(frame_revalidation_status or "not_evaluated")
+        ] += 1
+        source_revalidation[
+            str(source_revalidation_status or "not_evaluated")
+        ] += 1
+        if str(authority_mode or "") == ORDINARY_CHAT_AUTHORITY:
+            ordinary_chat_runs += 1
+            ordinary_call_violations += int(
+                calls > 1 or (bool(prompt_applied) and calls != 1)
+            )
+            ordinary_corrective_violations += int(corrective_calls > 0)
         latency = max(0, int(candidate_latency_ms or 0))
         if latency:
             latency_values.append(latency)
@@ -5462,6 +6357,19 @@ def build_evaluation_report(
         "promptOwnershipFailureRuns": prompt_ownership_failures,
         "routeFamilyCounts": dict(sorted(route_families.items())),
         "authorityModeCounts": dict(sorted(authority_modes.items())),
+        "ordinaryChatRuns": ordinary_chat_runs,
+        "providerCallTotal": provider_call_total,
+        "correctiveCallTotal": corrective_call_total,
+        "ordinaryCallCountViolationRuns": ordinary_call_violations,
+        "ordinaryCorrectiveCallViolationRuns": (
+            ordinary_corrective_violations
+        ),
+        "frameRevalidationStatusCounts": dict(
+            sorted(frame_revalidation.items())
+        ),
+        "sourceRevalidationStatusCounts": dict(
+            sorted(source_revalidation.items())
+        ),
         "candidateGenerationLatencyMs": {
             "average": (
                 int(round(sum(latency_values) / len(latency_values)))
