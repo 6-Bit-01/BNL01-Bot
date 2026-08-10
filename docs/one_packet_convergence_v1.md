@@ -1,6 +1,6 @@
 # One-Packet Convergence v1
 
-`unified_intelligence_packet_v7` is the single factual owner for gated broad
+`unified_intelligence_packet_v8` is the single factual owner for gated broad
 self-profile synthesis and shadow/private ordinary-turn preview. It consumes
 the immutable Situation Frame revision and resolves one governed subject
 before source scoring. It normalizes four canon statuses without moving their
@@ -32,6 +32,18 @@ requires fresh recurrence. One occurrence may appear only in sealed preview,
 with an explicit `single_occurrence_not_recurrence` qualifier, and is never
 public or canon. Journal, Relay, Ambient, dossier, site, derived summary, and
 prior BNL prose remain projections and contribute zero independent recurrence.
+
+Explicit publication questions use bounded `journal_publication` and
+`relay_publication` lanes. Journal selection requires both the bot's latest
+canonical published revision and the website's authenticated, persisted,
+fresh visibility/reuse snapshot. Exact identity/title/date reads honor
+`publicVisible` but remain separate from topic reuse, which additionally
+requires `memoryEligible`. Relay selection reads the permanent accepted bot
+archive rather than its recent projection; unmatched site-hydrated records
+require an exact published-at acceptance receipt. A projection or
+`approved_canon` source-class label alone is insufficient. Both lanes are
+publication-only and carry no fact, canon, identity, Moment, Relationship,
+root, occurrence, or recurrence authority.
 
 Member-specific `approved_fact`, Living, conversation, and Open evidence is
 ranked before additive project canon. Render-equivalent projections collapse

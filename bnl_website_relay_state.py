@@ -12,6 +12,9 @@ from bnl_journal_source_store import record_source_event, timestamp_to_epoch_ms
 
 MAX_HISTORY = 25
 MAX_ATTEMPTS_PER_GUILD = 100
+RELAY_PUBLICATION_READ_VERSION = "accepted_relay_publication_read_v1"
+RELAY_PUBLICATION_TOPIC_SCAN_LIMIT = 200
+RELAY_PUBLICATION_RESULT_LIMIT = 4
 STOCK_FAMILIES = {
     "waiting_standby": (
         "waiting", "standing by", "standby", "awaiting signal", "awaiting fresh", "remains online",
@@ -55,6 +58,31 @@ class WebsiteRelayDecision:
     mode: str = "OBSERVATION"
     relayLane: str = "current_signal"
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AcceptedRelayPublication:
+    relay_id: str
+    public_message: str
+    public_directive: str
+    mode: str
+    relay_lane: str
+    event_type: str
+    published_timestamp: str
+    query_mode: str
+    provenance_kind: str
+    provenance_digest: str
+    source_digest: str
+
+
+@dataclass(frozen=True)
+class AcceptedRelayPublicationSelection:
+    status: str
+    query_mode: str
+    publications: tuple[AcceptedRelayPublication, ...] = ()
+    candidate_count: int = 0
+    unapproved_provenance_count: int = 0
+    presence_only_count: int = 0
 
 
 def utc_now_iso() -> str:
@@ -207,6 +235,467 @@ def recent_history(db_path: str, guild_id: int, limit: int = MAX_HISTORY) -> lis
             (guild_id, bounded_limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+_RELAY_PUBLICATION_ID_RE = re.compile(
+    r"\bbnl-[A-Za-z0-9][A-Za-z0-9._:-]{5,159}\b",
+    re.IGNORECASE,
+)
+_RELAY_EXPLICIT_ID_RE = re.compile(
+    r"\brelay(?:\s+(?:publication|message))?\s+id\s*"
+    r"[:#=-]?\s*([A-Za-z0-9][A-Za-z0-9._:-]{2,159})\b",
+    re.IGNORECASE,
+)
+_RELAY_QUERY_CUE_RE = re.compile(
+    r"\b(?:relay|website\s+(?:message|signal|status))\b",
+    re.IGNORECASE,
+)
+_RELAY_QUERY_ACTION_RE = re.compile(
+    r"\b(?:accepted|archive|find|history|latest|message|published|recent|"
+    r"said|show|signal|status|what)\b",
+    re.IGNORECASE,
+)
+_RELAY_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+_RELAY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,159}$")
+_RELAY_QUERY_STOPWORDS = {
+    "about",
+    "accepted",
+    "archive",
+    "barcode",
+    "current",
+    "dated",
+    "discord",
+    "find",
+    "from",
+    "history",
+    "latest",
+    "message",
+    "network",
+    "published",
+    "recent",
+    "relay",
+    "said",
+    "show",
+    "signal",
+    "status",
+    "that",
+    "what",
+    "website",
+    "with",
+}
+_PRESENCE_ONLY_LANES = {
+    "presence",
+    "presence_only",
+    "heartbeat",
+}
+_PRESENCE_ONLY_EVENT_TYPES = {
+    "presence",
+    "presence_only",
+    "heartbeat",
+    "online",
+    "offline",
+}
+_RELAY_PUBLICATION_COLUMNS = (
+    "relay_id",
+    "guild_id",
+    "public_message",
+    "public_directive",
+    "mode",
+    "relay_lane",
+    "event_type",
+    "highest_source_conversation_id",
+    "normalized_message",
+    "semantic_family",
+    "published_timestamp",
+)
+
+
+def _relay_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+    )
+
+
+def _relay_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(%s)" % table).fetchall()
+    }
+
+
+def relay_publication_query_mode(user_text: str) -> str:
+    text = str(user_text or "")
+    if _RELAY_PUBLICATION_ID_RE.search(text):
+        return "identity"
+    explicit = _RELAY_EXPLICIT_ID_RE.search(text)
+    if explicit and explicit.group(1).lower() not in {
+        "archive",
+        "history",
+        "message",
+        "signal",
+        "status",
+    }:
+        return "identity"
+    if not (
+        _RELAY_QUERY_CUE_RE.search(text)
+        and _RELAY_QUERY_ACTION_RE.search(text)
+    ):
+        return "not_requested"
+    if _RELAY_DATE_RE.search(text):
+        return "date"
+    return "requested"
+
+
+def _relay_query_identity(user_text: str) -> str:
+    direct = _RELAY_PUBLICATION_ID_RE.search(str(user_text or ""))
+    if direct:
+        return direct.group(0)
+    explicit = _RELAY_EXPLICIT_ID_RE.search(str(user_text or ""))
+    if explicit and explicit.group(1).lower() not in {
+        "archive",
+        "history",
+        "message",
+        "signal",
+        "status",
+    }:
+        return explicit.group(1)
+    return ""
+
+
+def _relay_query_terms(user_text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(user_text or "").lower())
+        if len(token) >= 4 and token not in _RELAY_QUERY_STOPWORDS
+    }
+
+
+def _relay_publication_rows(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    relay_id: str = "",
+    publication_date: str = "",
+    limit: int = RELAY_PUBLICATION_TOPIC_SCAN_LIMIT,
+) -> list[dict[str, Any]]:
+    if not _relay_table_exists(conn, "website_relay_history"):
+        return []
+    columns = _relay_table_columns(conn, "website_relay_history")
+    if not set(_RELAY_PUBLICATION_COLUMNS).issubset(columns):
+        return []
+    where = ["guild_id=?"]
+    params: list[Any] = [int(guild_id or 0)]
+    if relay_id:
+        where.append("relay_id=?")
+        params.append(relay_id)
+    if publication_date:
+        where.append("SUBSTR(published_timestamp,1,10)=?")
+        params.append(publication_date)
+    params.append(max(1, min(int(limit or 1), 500)))
+    rows = conn.execute(
+        "SELECT "
+        + ",".join(_RELAY_PUBLICATION_COLUMNS)
+        + " FROM website_relay_history WHERE "
+        + " AND ".join(where)
+        + " ORDER BY published_timestamp DESC,relay_id DESC LIMIT ?",
+        tuple(params),
+    ).fetchall()
+    return [dict(zip(_RELAY_PUBLICATION_COLUMNS, row)) for row in rows]
+
+
+def _relay_acceptance_provenance(
+    conn: sqlite3.Connection,
+    row: dict[str, Any],
+) -> tuple[str, str]:
+    relay_id = str(row.get("relay_id") or "")
+    relay_lane = str(row.get("relay_lane") or "").strip().lower()
+    event_type = str(row.get("event_type") or "").strip().lower()
+    if (
+        relay_lane in _PRESENCE_ONLY_LANES
+        or event_type in _PRESENCE_ONLY_EVENT_TYPES
+    ):
+        return "", "presence_only"
+    if relay_lane != "hydrated":
+        proof = hashlib.sha256(
+            ("bot_accepted_history|" + relay_id).encode("utf-8")
+        ).hexdigest()
+        return "bot_accepted_history", proof
+    if not _relay_table_exists(conn, "website_relay_attempts"):
+        return "", "site_manual_owner_receipt_missing"
+    columns = _relay_table_columns(conn, "website_relay_attempts")
+    required = {
+        "attempt_id",
+        "guild_id",
+        "trigger",
+        "outcome",
+        "accepted_relay_id",
+        "prepared_relay_id",
+        "website_published_at",
+        "completed_at",
+    }
+    if not required.issubset(columns):
+        return "", "site_manual_owner_receipt_missing"
+    receipts = conn.execute(
+        """
+        SELECT attempt_id,completed_at
+        FROM website_relay_attempts
+        WHERE guild_id=? AND outcome='published'
+          AND trigger IN ('owner_manual','owner_approved',
+                          'manual_owner_approval')
+          AND accepted_relay_id=? AND prepared_relay_id=?
+          AND website_published_at=?
+          AND TRIM(COALESCE(completed_at,''))<>''
+        ORDER BY attempt_id ASC
+        """,
+        (
+            int(row.get("guild_id") or 0),
+            relay_id,
+            relay_id,
+            str(row.get("published_timestamp") or ""),
+        ),
+    ).fetchall()
+    if not receipts:
+        # source_class/event_type values such as approved_canon are not an
+        # owner-approval receipt and deliberately do not affect this result.
+        return "", "site_manual_owner_receipt_missing"
+    proof = hashlib.sha256(
+        repr(tuple((str(item[0]), str(item[1])) for item in receipts)).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return "site_manual_owner_receipt", proof
+
+
+def _accepted_relay_source_digest(
+    row: dict[str, Any],
+    *,
+    query_mode: str,
+    provenance_kind: str,
+    provenance_digest: str,
+) -> str:
+    values = (
+        RELAY_PUBLICATION_READ_VERSION,
+        str(row.get("relay_id") or ""),
+        int(row.get("guild_id") or 0),
+        str(row.get("public_message") or ""),
+        str(row.get("public_directive") or ""),
+        str(row.get("mode") or ""),
+        str(row.get("relay_lane") or ""),
+        str(row.get("event_type") or ""),
+        int(row.get("highest_source_conversation_id") or 0),
+        str(row.get("normalized_message") or ""),
+        str(row.get("semantic_family") or ""),
+        str(row.get("published_timestamp") or ""),
+        str(query_mode or ""),
+        provenance_kind,
+        provenance_digest,
+    )
+    return hashlib.sha256(repr(values).encode("utf-8")).hexdigest()
+
+
+def _accepted_relay_from_row(
+    conn: sqlite3.Connection,
+    row: dict[str, Any],
+    *,
+    query_mode: str,
+) -> tuple[AcceptedRelayPublication | None, str]:
+    relay_id = str(row.get("relay_id") or "").strip()
+    public_message = str(row.get("public_message") or "").strip()
+    published_timestamp = str(row.get("published_timestamp") or "").strip()
+    if (
+        not _RELAY_ID_RE.fullmatch(relay_id)
+        or not public_message
+        or timestamp_to_epoch_ms(published_timestamp) is None
+    ):
+        return None, "source_invalid"
+    provenance_kind, provenance_digest = _relay_acceptance_provenance(
+        conn,
+        row,
+    )
+    if not provenance_kind:
+        return None, provenance_digest
+    return (
+        AcceptedRelayPublication(
+            relay_id=relay_id,
+            public_message=public_message,
+            public_directive=str(row.get("public_directive") or "").strip(),
+            mode=str(row.get("mode") or "OBSERVATION").strip(),
+            relay_lane=str(row.get("relay_lane") or "").strip(),
+            event_type=str(row.get("event_type") or "").strip(),
+            published_timestamp=published_timestamp,
+            query_mode=query_mode,
+            provenance_kind=provenance_kind,
+            provenance_digest=provenance_digest,
+            source_digest=_accepted_relay_source_digest(
+                row,
+                query_mode=query_mode,
+                provenance_kind=provenance_kind,
+                provenance_digest=provenance_digest,
+            ),
+        ),
+        "",
+    )
+
+
+def render_accepted_relay_publication(
+    publication: AcceptedRelayPublication,
+    *,
+    limit: int = 900,
+) -> str:
+    directive = (
+        " Directive: " + publication.public_directive
+        if publication.public_directive
+        else ""
+    )
+    text = "Accepted Relay %s (%s): %s%s" % (
+        publication.relay_id,
+        publication.published_timestamp[:10],
+        publication.public_message,
+        directive,
+    )
+    return re.sub(r"\s+", " ", text).strip()[: max(160, int(limit or 0))]
+
+
+def select_accepted_relay_publications_on_connection(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    user_text: str,
+    limit: int = RELAY_PUBLICATION_RESULT_LIMIT,
+) -> AcceptedRelayPublicationSelection:
+    requested_mode = relay_publication_query_mode(user_text)
+    if requested_mode == "not_requested":
+        return AcceptedRelayPublicationSelection(
+            "not_requested",
+            "not_requested",
+        )
+    if not _relay_table_exists(conn, "website_relay_history"):
+        return AcceptedRelayPublicationSelection(
+            "source_unavailable",
+            requested_mode,
+        )
+    identity = _relay_query_identity(user_text)
+    date_match = _RELAY_DATE_RE.search(str(user_text or ""))
+    publication_date = date_match.group(1) if date_match else ""
+    if identity:
+        query_mode = "exact_identity"
+        rows = _relay_publication_rows(
+            conn,
+            guild_id=guild_id,
+            relay_id=identity,
+            limit=max(1, limit),
+        )
+    elif publication_date:
+        query_mode = "exact_date"
+        rows = _relay_publication_rows(
+            conn,
+            guild_id=guild_id,
+            publication_date=publication_date,
+            limit=max(8, limit),
+        )
+    else:
+        query_mode = "topic"
+        rows = _relay_publication_rows(
+            conn,
+            guild_id=guild_id,
+            limit=RELAY_PUBLICATION_TOPIC_SCAN_LIMIT,
+        )
+        terms = _relay_query_terms(user_text)
+        if terms:
+            scored: list[tuple[int, str, dict[str, Any]]] = []
+            for row in rows:
+                candidate_terms = {
+                    token
+                    for token in re.findall(
+                        r"[a-z0-9]+",
+                        " ".join(
+                            str(row.get(key) or "").lower()
+                            for key in (
+                                "public_message",
+                                "public_directive",
+                                "event_type",
+                            )
+                        ),
+                    )
+                    if len(token) >= 4
+                }
+                score = len(terms & candidate_terms)
+                if score:
+                    scored.append(
+                        (
+                            score,
+                            str(row.get("published_timestamp") or ""),
+                            row,
+                        )
+                    )
+            scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            rows = [row for _score, _timestamp, row in scored]
+    candidate_count = len(rows)
+    selected: list[AcceptedRelayPublication] = []
+    provenance_excluded = 0
+    presence_excluded = 0
+    invalid_count = 0
+    for row in rows:
+        publication, reason = _accepted_relay_from_row(
+            conn,
+            row,
+            query_mode=query_mode,
+        )
+        if publication is None:
+            if reason == "presence_only":
+                presence_excluded += 1
+            elif reason == "source_invalid":
+                invalid_count += 1
+            else:
+                provenance_excluded += 1
+            continue
+        selected.append(publication)
+        if len(selected) >= max(1, min(int(limit or 1), 8)):
+            break
+    if selected:
+        status = "eligible"
+    elif provenance_excluded:
+        status = "provenance_unapproved"
+    elif presence_excluded:
+        status = "presence_only"
+    elif invalid_count:
+        status = "source_invalid"
+    else:
+        status = "not_found"
+    return AcceptedRelayPublicationSelection(
+        status=status,
+        query_mode=query_mode,
+        publications=tuple(selected),
+        candidate_count=candidate_count,
+        unapproved_provenance_count=provenance_excluded,
+        presence_only_count=presence_excluded,
+    )
+
+
+def revalidate_accepted_relay_publication_on_connection(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    relay_id: str,
+    query_mode: str,
+) -> str:
+    rows = _relay_publication_rows(
+        conn,
+        guild_id=guild_id,
+        relay_id=relay_id,
+        limit=2,
+    )
+    if len(rows) != 1:
+        return ""
+    publication, _reason = _accepted_relay_from_row(
+        conn,
+        rows[0],
+        query_mode=query_mode,
+    )
+    return publication.source_digest if publication is not None else ""
 
 
 def accepted_publication_count(db_path: str, guild_id: int, event_types: tuple[str, ...] = ()) -> int:

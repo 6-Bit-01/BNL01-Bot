@@ -778,6 +778,12 @@ def _read_intelligence_packet_report(
                 "invalidInvariants": 0,
                 "revalidationStatusCounts": {},
                 "revalidationChangedRuns": 0,
+                "journalQueryStatusCounts": {},
+                "journalControlStatusCounts": {},
+                "journalCandidateTotal": 0,
+                "relayQueryStatusCounts": {},
+                "relayCandidateTotal": 0,
+                "publicationProjectionTotal": 0,
                 "promptAppliedRuns": 0,
                 "liveAppliedRuns": 0,
                 "contentFieldsPresent": [],
@@ -801,7 +807,7 @@ def _read_shared_brain_synthesis_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "shared_brain_synthesis_v7",
+                "schemaVersion": "shared_brain_synthesis_v8",
                 "runs": 0,
                 "promptAppliedRuns": 0,
                 "liveAppliedRuns": 0,
@@ -1912,7 +1918,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             ),
         ),
         "- relationship_legacy_v2_comparison: `%s`" % relationship.get("legacy_v2_comparison", "not_collected"),
-        "- unified_intelligence_packet: status=`%s` requested=`%s` effective=`%s` reason=`%s` schema=`%s` runs=`%s` items=`%s` validation_items=`%s` lanes=`%s` validation_lanes=`%s` sources=`%s` atomic_states=`%s` missing=`%s` conflicts=`%s` revalidation=`%s` source_changes=`%s` errors=`%s` invalid_invariants=`%s` prompt_applied=`%s` live_applied=`%s` content_fields=`%s` window_last=`%s`" % (
+        "- unified_intelligence_packet: status=`%s` requested=`%s` effective=`%s` reason=`%s` schema=`%s` runs=`%s` items=`%s` validation_items=`%s` lanes=`%s` validation_lanes=`%s` sources=`%s` atomic_states=`%s` missing=`%s` conflicts=`%s` journal_query=`%s` journal_control=`%s` relay_query=`%s` publication_projections=`%s` revalidation=`%s` source_changes=`%s` errors=`%s` invalid_invariants=`%s` prompt_applied=`%s` live_applied=`%s` content_fields=`%s` window_last=`%s`" % (
             intelligence_packet_state.get(
                 "status",
                 "unknown",
@@ -1948,6 +1954,19 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 sort_keys=True,
             ),
             intelligence_packet.get("conflictRuns", 0),
+            json.dumps(
+                intelligence_packet.get("journalQueryStatusCounts", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                intelligence_packet.get("journalControlStatusCounts", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                intelligence_packet.get("relayQueryStatusCounts", {}),
+                sort_keys=True,
+            ),
+            intelligence_packet.get("publicationProjectionTotal", 0),
             json.dumps(
                 intelligence_packet.get(
                     "revalidationStatusCounts",
@@ -1998,7 +2017,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             _on(shared_brain_synthesis_state.get("fullyScoped")),
             shared_brain_synthesis.get(
                 "schemaVersion",
-                "shared_brain_synthesis_v7",
+                "shared_brain_synthesis_v8",
             ),
             shared_brain_synthesis.get("runs", 0),
             json.dumps(

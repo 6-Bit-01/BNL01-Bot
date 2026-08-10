@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from bnl_canon_source_contract import (
     CANON_FACTS,
@@ -34,6 +34,10 @@ STATES = {
 }
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
+JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
+JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
+JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT = 200
+JOURNAL_PUBLICATION_RESULT_LIMIT = 4
 # Must match the website receiver's raw UTF-8 request-body limit. The complete
 # serialized envelope is measured; article text is never truncated to fit it.
 JOURNAL_SITE_REQUEST_BODY_MAX_BYTES = 24_000
@@ -240,6 +244,59 @@ class JournalResult:
     idempotent: bool = False
 
 
+@dataclass(frozen=True)
+class JournalControlSnapshot:
+    """Content-free site authority used by conversational Journal reads."""
+
+    snapshot_version: int
+    revision: str
+    digest: str
+    observed_at: str
+    fresh_until: str
+    fresh_for_seconds: int
+    public_excluded_entry_ids: tuple[str, ...] = ()
+    memory_excluded_entry_ids: tuple[str, ...] = ()
+
+    @property
+    def authority_identity(self) -> tuple[Any, ...]:
+        # Observation time moves on every authenticated GET. The control
+        # revision, digest, and exact exclusion sets identify authoritative
+        # state; freshness is checked independently at every use.
+        return (
+            self.snapshot_version,
+            self.revision,
+            self.digest,
+            self.public_excluded_entry_ids,
+            self.memory_excluded_entry_ids,
+        )
+
+
+@dataclass(frozen=True)
+class JournalPublication:
+    entry_id: str
+    revision: int
+    title: str
+    excerpt: str
+    sections_json: str
+    content_hash: str
+    published_at: str
+    created_at: str
+    source_window_start: str
+    source_window_end: str
+    query_mode: str
+    source_digest: str
+
+
+@dataclass(frozen=True)
+class JournalPublicationSelection:
+    status: str
+    query_mode: str
+    publications: tuple[JournalPublication, ...] = ()
+    candidate_count: int = 0
+    public_hidden_count: int = 0
+    memory_ineligible_count: int = 0
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -281,6 +338,594 @@ def ensure_schema(db_path: str) -> None:
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+_JOURNAL_CONTROL_ENTRY_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"
+)
+_JOURNAL_PUBLICATION_ID_RE = re.compile(
+    r"\bjournal_[A-Za-z0-9._:-]{3,159}\b",
+    re.IGNORECASE,
+)
+_JOURNAL_EXPLICIT_ENTRY_ID_RE = re.compile(
+    r"\b(?:journal\s+)?entry(?:\s+id)?\s*[:#=-]?\s*"
+    r"([A-Za-z0-9][A-Za-z0-9._:-]{2,159})\b",
+    re.IGNORECASE,
+)
+_JOURNAL_QUERY_CUE_RE = re.compile(
+    r"\b(?:journal|daily\s+entry|weekly\s+entry)\b",
+    re.IGNORECASE,
+)
+_JOURNAL_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+_JOURNAL_QUERY_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
+    "article",
+    "called",
+    "dated",
+    "entry",
+    "find",
+    "history",
+    "latest",
+    "published",
+    "publishing",
+    "recent",
+    "show",
+    "title",
+    "titled",
+    "what",
+    "wrote",
+}
+
+
+def _publication_utc(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        )
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _publication_now(value: Any = None) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return _publication_utc(value) or datetime.now(timezone.utc)
+
+
+def _control_entry_ids(value: Any) -> Optional[tuple[str, ...]]:
+    if not isinstance(value, list) or len(value) > 20_000:
+        return None
+    items: list[str] = []
+    for candidate in value:
+        if not isinstance(candidate, str):
+            return None
+        entry_id = candidate.strip()
+        if not _JOURNAL_CONTROL_ENTRY_ID_RE.fullmatch(entry_id):
+            return None
+        items.append(entry_id)
+    if len(items) != len(set(items)):
+        return None
+    return tuple(sorted(items))
+
+
+def parse_journal_control_snapshot(
+    payload: Mapping[str, Any] | None,
+    *,
+    now: Any = None,
+) -> tuple[JournalControlSnapshot | None, str]:
+    """Validate the authenticated site's content-free control snapshot."""
+
+    if not isinstance(payload, Mapping):
+        return None, "control_snapshot_unavailable"
+    if payload.get("persisted") is not True:
+        return None, "control_snapshot_unpersisted"
+    if int(payload.get("contractVersion") or 0) != 1:
+        return None, "control_contract_mismatch"
+    if (
+        int(payload.get("controlSnapshotVersion") or 0)
+        != JOURNAL_CONTROL_SNAPSHOT_VERSION
+    ):
+        return None, "control_snapshot_version_mismatch"
+    revision = str(payload.get("controlRevision") or "").strip()
+    digest = str(payload.get("controlDigest") or "").strip().lower()
+    observed_at = str(payload.get("controlObservedAt") or "").strip()
+    fresh_until = str(payload.get("controlFreshUntil") or "").strip()
+    try:
+        fresh_for_seconds = int(payload.get("controlFreshForSeconds") or 0)
+    except (TypeError, ValueError):
+        return None, "control_snapshot_invalid"
+    public_excluded = _control_entry_ids(
+        payload.get("publicExcludedEntryIds")
+    )
+    memory_excluded = _control_entry_ids(
+        payload.get("memoryExcludedEntryIds")
+    )
+    revision_time = _publication_utc(revision)
+    observed_time = _publication_utc(observed_at)
+    fresh_until_time = _publication_utc(fresh_until)
+    if (
+        revision_time is None
+        or not re.fullmatch(r"[a-f0-9]{64}", digest)
+        or observed_time is None
+        or fresh_until_time is None
+        or not 1 <= fresh_for_seconds <= 300
+        or public_excluded is None
+        or memory_excluded is None
+    ):
+        return None, "control_snapshot_invalid"
+    declared_window = (fresh_until_time - observed_time).total_seconds()
+    if not 0 < declared_window <= fresh_for_seconds + 1:
+        return None, "control_snapshot_invalid_freshness"
+    current_time = _publication_now(now)
+    if observed_time > current_time + timedelta(seconds=30):
+        return None, "control_snapshot_clock_skew"
+    if current_time > fresh_until_time:
+        return None, "control_snapshot_stale"
+    return (
+        JournalControlSnapshot(
+            snapshot_version=JOURNAL_CONTROL_SNAPSHOT_VERSION,
+            revision=revision,
+            digest=digest,
+            observed_at=observed_at,
+            fresh_until=fresh_until,
+            fresh_for_seconds=fresh_for_seconds,
+            public_excluded_entry_ids=public_excluded,
+            memory_excluded_entry_ids=memory_excluded,
+        ),
+        "",
+    )
+
+
+def journal_control_snapshot_status(
+    snapshot: JournalControlSnapshot | None,
+    *,
+    now: Any = None,
+) -> str:
+    if not isinstance(snapshot, JournalControlSnapshot):
+        return "control_snapshot_unavailable"
+    observed = _publication_utc(snapshot.observed_at)
+    fresh_until = _publication_utc(snapshot.fresh_until)
+    revision = _publication_utc(snapshot.revision)
+    if (
+        snapshot.snapshot_version != JOURNAL_CONTROL_SNAPSHOT_VERSION
+        or revision is None
+        or observed is None
+        or fresh_until is None
+        or not re.fullmatch(r"[a-f0-9]{64}", snapshot.digest)
+        or not 1 <= int(snapshot.fresh_for_seconds or 0) <= 300
+    ):
+        return "control_snapshot_invalid"
+    current = _publication_now(now)
+    if observed > current + timedelta(seconds=30):
+        return "control_snapshot_clock_skew"
+    if current > fresh_until:
+        return "control_snapshot_stale"
+    return "valid"
+
+
+def journal_publication_query_mode(user_text: str) -> str:
+    text = str(user_text or "")
+    if _JOURNAL_PUBLICATION_ID_RE.search(text):
+        return "identity"
+    explicit = _JOURNAL_EXPLICIT_ENTRY_ID_RE.search(text)
+    if explicit and explicit.group(1).lower().startswith("journal_"):
+        return "identity"
+    if not _JOURNAL_QUERY_CUE_RE.search(text):
+        return "not_requested"
+    if _JOURNAL_DATE_RE.search(text):
+        return "date"
+    return "requested"
+
+
+def _journal_query_identity(user_text: str) -> str:
+    direct = _JOURNAL_PUBLICATION_ID_RE.search(str(user_text or ""))
+    if direct:
+        return direct.group(0)
+    explicit = _JOURNAL_EXPLICIT_ENTRY_ID_RE.search(str(user_text or ""))
+    if explicit and explicit.group(1).lower().startswith("journal_"):
+        return explicit.group(1)
+    return ""
+
+
+def _journal_query_terms(user_text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(user_text or "").lower())
+        if len(token) >= 4 and token not in _JOURNAL_QUERY_STOPWORDS
+    }
+
+
+_JOURNAL_PUBLICATION_COLUMNS = (
+    "entry_id",
+    "revision",
+    "title",
+    "excerpt",
+    "sections_json",
+    "public_payload_json",
+    "canonical_payload_bytes",
+    "content_hash",
+    "published_at",
+    "created_at",
+    "source_window_start",
+    "source_window_end",
+    "authored_at",
+)
+
+
+def _latest_published_journal_rows(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    entry_id: str = "",
+    publication_date: str = "",
+    containing_title_in: str = "",
+    limit: int = JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT,
+) -> list[dict[str, Any]]:
+    if not table_exists(conn, "bnl_journal_entries"):
+        return []
+    columns = _cols(conn, "bnl_journal_entries")
+    if not set(_JOURNAL_PUBLICATION_COLUMNS).issubset(columns):
+        return []
+    where = [
+        "e.guild_id=?",
+        "e.lifecycle_state='published'",
+        "NOT EXISTS ("
+        "SELECT 1 FROM bnl_journal_entries newer "
+        "WHERE newer.guild_id=e.guild_id "
+        "AND newer.entry_id=e.entry_id "
+        "AND newer.lifecycle_state='published' "
+        "AND newer.revision>e.revision)",
+    ]
+    params: list[Any] = [int(guild_id or 0)]
+    if entry_id:
+        where.append("e.entry_id=?")
+        params.append(entry_id)
+    if publication_date:
+        where.append(
+            "SUBSTR(COALESCE(e.published_at,e.created_at),1,10)=?"
+        )
+        params.append(publication_date)
+    if containing_title_in:
+        where.append(
+            "LENGTH(TRIM(e.title))>=3 "
+            "AND INSTR(LOWER(?),LOWER(TRIM(e.title)))>0"
+        )
+        params.append(containing_title_in)
+    params.append(max(1, min(int(limit or 1), 500)))
+    rows = conn.execute(
+        "SELECT "
+        + ",".join("e." + name for name in _JOURNAL_PUBLICATION_COLUMNS)
+        + " FROM bnl_journal_entries e WHERE "
+        + " AND ".join(where)
+        + " ORDER BY COALESCE(e.published_at,e.created_at) DESC,"
+        "e.entry_id ASC,e.revision DESC LIMIT ?",
+        tuple(params),
+    ).fetchall()
+    return [dict(zip(_JOURNAL_PUBLICATION_COLUMNS, row)) for row in rows]
+
+
+def _journal_publication_digest(
+    row: Mapping[str, Any],
+    snapshot: JournalControlSnapshot,
+    query_mode: str,
+) -> str:
+    payload = {
+        "version": JOURNAL_PUBLICATION_READ_VERSION,
+        "entryId": str(row.get("entry_id") or ""),
+        "revision": int(row.get("revision") or 0),
+        "title": str(row.get("title") or ""),
+        "excerpt": str(row.get("excerpt") or ""),
+        "sectionsJson": str(row.get("sections_json") or ""),
+        "canonicalPayloadHash": canonical_payload_hash(
+            bytes(row.get("canonical_payload_bytes") or b"")
+        ),
+        "contentHash": str(row.get("content_hash") or ""),
+        "publishedAt": str(row.get("published_at") or ""),
+        "createdAt": str(row.get("created_at") or ""),
+        "sourceWindowStart": str(row.get("source_window_start") or ""),
+        "sourceWindowEnd": str(row.get("source_window_end") or ""),
+        "queryMode": str(query_mode or ""),
+        "controlAuthority": snapshot.authority_identity,
+    }
+    return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+
+
+def _journal_publication_from_row(
+    row: Mapping[str, Any],
+    *,
+    snapshot: JournalControlSnapshot,
+    query_mode: str,
+) -> JournalPublication | None:
+    entry_id = str(row.get("entry_id") or "").strip()
+    title = str(row.get("title") or "").strip()
+    excerpt = str(row.get("excerpt") or "").strip()
+    content_hash = str(row.get("content_hash") or "").strip()
+    sections_json = str(row.get("sections_json") or "[]")
+    canonical_payload = bytes(row.get("canonical_payload_bytes") or b"")
+    public_payload_json = str(row.get("public_payload_json") or "")
+    try:
+        sections = json.loads(sections_json)
+        canonical_object = json.loads(canonical_payload.decode("utf-8"))
+        public_payload = json.loads(public_payload_json)
+        canonical_entry = (
+            canonical_object.get("entry")
+            if isinstance(canonical_object, dict)
+            else None
+        )
+        canonical_revision = int(
+            canonical_entry.get("revision") or 0
+            if isinstance(canonical_entry, dict)
+            else 0
+        )
+    except (
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return None
+    expected_content_hash = _hash(title, excerpt, _json(sections))
+    if (
+        not _JOURNAL_CONTROL_ENTRY_ID_RE.fullmatch(entry_id)
+        or not title
+        or not excerpt
+        or not re.fullmatch(r"[a-fA-F0-9]{64}", content_hash)
+        or content_hash.lower() != expected_content_hash
+        or not isinstance(sections, list)
+        or not sections
+        or any(
+            not isinstance(section, dict)
+            or not str(section.get("heading") or "").strip()
+            or not str(section.get("body") or "").strip()
+            for section in sections
+        )
+        or public_payload != canonical_object
+        or canonical_payload != _json(canonical_object).encode("utf-8")
+        or not isinstance(canonical_entry, dict)
+        or canonical_object.get("contractVersion") != 1
+        or canonical_object.get("kind") != "journal_entry"
+        or str(canonical_entry.get("entryId") or "") != entry_id
+        or canonical_revision != int(row.get("revision") or 0)
+        or str(canonical_entry.get("title") or "") != title
+        or str(canonical_entry.get("excerpt") or "") != excerpt
+        or canonical_entry.get("sections") != sections
+        or str(canonical_entry.get("contentHash") or "").lower()
+        != content_hash.lower()
+        or str(canonical_entry.get("authoredAt") or "")
+        != str(row.get("authored_at") or "")
+        or str(canonical_entry.get("sourceWindowStart") or "")
+        != str(row.get("source_window_start") or "")
+        or str(canonical_entry.get("sourceWindowEnd") or "")
+        != str(row.get("source_window_end") or "")
+    ):
+        return None
+    return JournalPublication(
+        entry_id=entry_id,
+        revision=int(row.get("revision") or 0),
+        title=title,
+        excerpt=excerpt,
+        sections_json=sections_json,
+        content_hash=content_hash.lower(),
+        published_at=str(row.get("published_at") or ""),
+        created_at=str(row.get("created_at") or ""),
+        source_window_start=str(row.get("source_window_start") or ""),
+        source_window_end=str(row.get("source_window_end") or ""),
+        query_mode=query_mode,
+        source_digest=_journal_publication_digest(
+            row,
+            snapshot,
+            query_mode,
+        ),
+    )
+
+
+def render_journal_publication(
+    publication: JournalPublication,
+    *,
+    limit: int = 1400,
+) -> str:
+    try:
+        sections = json.loads(publication.sections_json)
+    except (TypeError, json.JSONDecodeError):
+        sections = []
+    section_text = " ".join(
+        "%s: %s"
+        % (
+            re.sub(r"\s+", " ", str(section.get("heading") or "")).strip(),
+            re.sub(r"\s+", " ", str(section.get("body") or "")).strip(),
+        )
+        for section in sections
+        if isinstance(section, dict)
+    )
+    published_date = (
+        publication.published_at or publication.created_at
+    )[:10]
+    text = (
+        'Published Journal "%s" (%s; entry %s; revision %s): %s %s'
+        % (
+            publication.title,
+            published_date,
+            publication.entry_id,
+            publication.revision,
+            publication.excerpt,
+            section_text,
+        )
+    )
+    return re.sub(r"\s+", " ", text).strip()[: max(200, int(limit or 0))]
+
+
+def select_published_journal_entries_on_connection(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    user_text: str,
+    control_snapshot: JournalControlSnapshot | None,
+    now: Any = None,
+    limit: int = JOURNAL_PUBLICATION_RESULT_LIMIT,
+) -> JournalPublicationSelection:
+    requested_mode = journal_publication_query_mode(user_text)
+    if requested_mode == "not_requested":
+        return JournalPublicationSelection("not_requested", "not_requested")
+    control_status = journal_control_snapshot_status(
+        control_snapshot,
+        now=now,
+    )
+    if control_status != "valid" or control_snapshot is None:
+        return JournalPublicationSelection(control_status, requested_mode)
+    if not table_exists(conn, "bnl_journal_entries"):
+        return JournalPublicationSelection("source_unavailable", requested_mode)
+
+    identity = _journal_query_identity(user_text)
+    publication_date_match = _JOURNAL_DATE_RE.search(str(user_text or ""))
+    publication_date = (
+        publication_date_match.group(1) if publication_date_match else ""
+    )
+    if identity:
+        query_mode = "exact_identity"
+        rows = _latest_published_journal_rows(
+            conn,
+            guild_id=guild_id,
+            entry_id=identity,
+            limit=max(1, limit),
+        )
+    else:
+        title_rows = _latest_published_journal_rows(
+            conn,
+            guild_id=guild_id,
+            containing_title_in=str(user_text or ""),
+            limit=max(8, limit),
+        )
+        if title_rows:
+            query_mode = "exact_title"
+            rows = title_rows
+        elif publication_date:
+            query_mode = "exact_date"
+            rows = _latest_published_journal_rows(
+                conn,
+                guild_id=guild_id,
+                publication_date=publication_date,
+                limit=max(8, limit),
+            )
+        else:
+            query_mode = "topic"
+            rows = _latest_published_journal_rows(
+                conn,
+                guild_id=guild_id,
+                limit=JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT,
+            )
+            terms = _journal_query_terms(user_text)
+            if terms:
+                scored: list[tuple[int, str, dict[str, Any]]] = []
+                for row in rows:
+                    candidate_terms = _topic_terms(
+                        " ".join(
+                            str(row.get(key) or "")
+                            for key in ("title", "excerpt", "sections_json")
+                        )
+                    )
+                    score = len(terms & candidate_terms)
+                    if score:
+                        scored.append(
+                            (
+                                score,
+                                str(
+                                    row.get("published_at")
+                                    or row.get("created_at")
+                                    or ""
+                                ),
+                                row,
+                            )
+                        )
+                scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                rows = [row for _score, _timestamp, row in scored]
+
+    candidate_count = len(rows)
+    public_excluded = set(control_snapshot.public_excluded_entry_ids)
+    memory_excluded = set(control_snapshot.memory_excluded_entry_ids)
+    selected: list[JournalPublication] = []
+    hidden_count = 0
+    memory_ineligible_count = 0
+    for row in rows:
+        entry_id = str(row.get("entry_id") or "")
+        if entry_id in public_excluded:
+            hidden_count += 1
+            continue
+        if query_mode == "topic" and entry_id in memory_excluded:
+            memory_ineligible_count += 1
+            continue
+        publication = _journal_publication_from_row(
+            row,
+            snapshot=control_snapshot,
+            query_mode=query_mode,
+        )
+        if publication is not None:
+            selected.append(publication)
+        if len(selected) >= max(1, min(int(limit or 1), 8)):
+            break
+    if selected:
+        status = "eligible"
+    elif hidden_count:
+        status = "public_hidden"
+    elif memory_ineligible_count:
+        status = "memory_ineligible"
+    elif candidate_count:
+        status = "source_invalid"
+    else:
+        status = "not_found"
+    return JournalPublicationSelection(
+        status=status,
+        query_mode=query_mode,
+        publications=tuple(selected),
+        candidate_count=candidate_count,
+        public_hidden_count=hidden_count,
+        memory_ineligible_count=memory_ineligible_count,
+    )
+
+
+def revalidate_published_journal_entry_on_connection(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    entry_id: str,
+    revision: int,
+    query_mode: str,
+    control_snapshot: JournalControlSnapshot | None,
+    now: Any = None,
+) -> str:
+    if (
+        journal_control_snapshot_status(control_snapshot, now=now) != "valid"
+        or control_snapshot is None
+    ):
+        return ""
+    if entry_id in set(control_snapshot.public_excluded_entry_ids):
+        return ""
+    if (
+        query_mode == "topic"
+        and entry_id in set(control_snapshot.memory_excluded_entry_ids)
+    ):
+        return ""
+    rows = _latest_published_journal_rows(
+        conn,
+        guild_id=guild_id,
+        entry_id=entry_id,
+        limit=2,
+    )
+    if len(rows) != 1 or int(rows[0].get("revision") or 0) != int(revision):
+        return ""
+    publication = _journal_publication_from_row(
+        rows[0],
+        snapshot=control_snapshot,
+        query_mode=query_mode,
+    )
+    return publication.source_digest if publication is not None else ""
 
 
 def journal_topic_counts(sources: list[dict[str, Any]], limit: int = 30) -> dict[str, int]:
