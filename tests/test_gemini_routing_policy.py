@@ -45,6 +45,18 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             )
             self.assertFalse(policy.allow_fallback)
 
+    def test_ordinary_chat_single_packet_is_one_physical_attempt(self):
+        policy = routing.policy_for_route(
+            "ordinary_chat_single_packet_canary"
+        )
+        self.assertEqual(policy.lane, "protected")
+        self.assertEqual(policy.provider_retries, 0)
+        self.assertFalse(policy.allow_fallback)
+        self.assertEqual(
+            routing.estimated_generation_reservation("abc", policy),
+            routing.single_attempt_reservation("abc", policy),
+        )
+
     def test_journal_and_relay_reserves_are_mutual_and_released_as_used(self):
         with mock.patch.dict(
             "os.environ",
