@@ -23117,7 +23117,12 @@ def build_live_conversation_orchestration_decision(
         else ()
     )
     moment_state = (
-        "recent_%s" % moment_situation.lifecycle_status
+        (
+            str(getattr(moment_situation, "selection_reason", "") or "")
+            if str(getattr(moment_situation, "selection_reason", "") or "")
+            not in {"", "recent_match"}
+            else "recent_%s" % moment_situation.lifecycle_status
+        )
         if moment_situation is not None
         else "none"
     )
@@ -23413,7 +23418,7 @@ def _build_unified_intelligence_packet_shadow(
         else ()
     )
     if isinstance(situation_frame, SituationFrameV1):
-        # Packet v6 resolves only the frozen frame candidates. A named or
+        # Packet v7 resolves only the frozen frame candidates. A named or
         # mentioned third party can never silently fall back to the speaker.
         subject_user_id = 0
     elif len(targets) == 1:

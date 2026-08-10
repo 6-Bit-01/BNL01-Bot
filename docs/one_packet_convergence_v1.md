@@ -1,6 +1,6 @@
 # One-Packet Convergence v1
 
-`unified_intelligence_packet_v6` is the single factual owner for gated broad
+`unified_intelligence_packet_v7` is the single factual owner for gated broad
 self-profile synthesis and shadow/private ordinary-turn preview. It consumes
 the immutable Situation Frame revision and resolves one governed subject
 before source scoring. It normalizes four canon statuses without moving their
@@ -12,6 +12,26 @@ source authority:
 - Living claims require the complete recurrence, grouping, root, occurrence,
   lifecycle, visibility, and route contract.
 - Open Signal remains question-scoped and source-bound.
+
+Situation-aware event questions use a bounded `episode` lane over the current
+Moment window/episode owner. The adapter applies the immutable frame's event,
+task, phase, participant, correction, and currentness decision before scoring.
+It supports source-backed next/open/change/correction/retest/completion reads,
+unique delayed or explicit public-channel continuation, and concurrent or
+participant-change scenes. A new-event frame cannot leak the older episode;
+an unresolved or multiply matching resume fails closed. Episode text is a
+paraphrase projection, retains original human root/occurrence lineage, and is
+revalidated against the exact Moment, episode link, visibility, lifecycle,
+and source state before use.
+
+Explicit recurring-theme questions use a bounded `recurring_theme` lane over
+the existing Living recurrence proof. An established theme requires at least
+two independent eligible human roots across two independent occurrences;
+overlapping exchange/Moment representations count once, and a correction
+requires fresh recurrence. One occurrence may appear only in sealed preview,
+with an explicit `single_occurrence_not_recurrence` qualifier, and is never
+public or canon. Journal, Relay, Ambient, dossier, site, derived summary, and
+prior BNL prose remain projections and contribute zero independent recurrence.
 
 Member-specific `approved_fact`, Living, conversation, and Open evidence is
 ranked before additive project canon. Render-equivalent projections collapse
@@ -39,4 +59,5 @@ existing exclusion and root-collapse reasons.
 
 All gates remain default-off. This version performs no deployment, historical
 promotion, live activation, member-facing correction inference, or knowledge
-edit/delete function.
+edit/delete function. It does not change Journal or Relay generation,
+publication, scheduling, or lifecycle behavior.

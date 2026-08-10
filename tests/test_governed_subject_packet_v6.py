@@ -134,8 +134,8 @@ class GovernedSubjectPacketV6Tests(unittest.TestCase):
             reason="governed subject test binding",
         )
 
-    def test_packet_schema_is_v6_and_alias_matrix_stays_distinct(self):
-        self.assertEqual(SCHEMA_VERSION, "unified_intelligence_packet_v6")
+    def test_packet_schema_is_v7_and_alias_matrix_stays_distinct(self):
+        self.assertEqual(SCHEMA_VERSION, "unified_intelligence_packet_v7")
         cases = {
             "Who is Mac Mod3m?": ("mac_modem",),
             "Tell me about DJ Floppy Disc.": ("dj_floppydisc",),
