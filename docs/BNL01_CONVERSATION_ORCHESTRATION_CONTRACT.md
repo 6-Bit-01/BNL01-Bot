@@ -40,8 +40,8 @@ turn.
 5. Add content-free governed-memory, Relationship posture, canon-applicability,
    and source-control states. General durable content is not allowed to become
    a routing veto.
-6. Freeze one typed packet revision and coordinate exactly one response act for
-   it.
+6. Freeze one typed packet revision, coordinate exactly one response act, and
+   build one immutable Situation Frame v1 from those existing-owner results.
 7. If a new contribution interrupts the turn, discard the superseded draft,
    rebuild the entire packet, assign a new revision, and assess that revision
    once. No answer-intent latch survives the rebuild.
@@ -63,6 +63,46 @@ Relationship, Moment, canon, and other prompt lanes, and it may produce a
 post-send shadow receipt. It is not a second response-act authority and must not
 change answer, clarify, observe, or block after the conversation coordinator
 has decided the current packet.
+
+## Situation Frame v1 (shadow-only)
+
+The conversation coordinator now owns one immutable, response-scoped
+`situation_frame_v1`. It is a typed applicability decision, not a new context
+engine, memory store, retriever, identity service, or factual packet.
+
+The frame freezes:
+
+- its schema revision, input-evidence digest, and current-contribution digest;
+- current speakers, authoritative addressee kinds, Discord message/reply/source
+  anchors, and reversible subject candidates;
+- stable target references received from existing owners, while treating
+  display labels only as low-confidence hints;
+- current Moment reference and whether the scene is the same event, a new
+  phase, a resume, a comparison/participant change, a new event, or uncertain;
+- task, object, request phase, role/domain hints, temporal scope, currentness,
+  objective, and required response act;
+- decision, correction, unresolved-question, and open-loop states; and
+- route, surface, channel policy, visibility allowance, competing frames, and
+  material ambiguity.
+
+Frame construction is deterministic and makes no provider call. A question
+about another person never falls back to the current speaker merely because a
+stable subject binding is absent. Multiple people, unresolved referents,
+same-name candidates, blocked visibility, and competing event/role readings
+remain explicit rather than being guessed away.
+
+The frame is passed unchanged as shadow metadata through prompt construction,
+the existing packet/assessment path, response guards, and a separate pre-send
+`frame_source_revalidation_v1` result. Revalidation references the original
+frame and packet digests; it never mutates either object. During this stage the
+frame cannot change retrieval, prompt prose, generation, delivery, routing, or
+durable memory. It creates no authority and activates no gate.
+
+Only content-free frame receipts may persist: version/revision/digest, status,
+typed counts, phase/object/event-relation classifications, and revalidation
+status/reason counts. Raw contribution text, display labels, account IDs, and
+subject values are excluded from those receipts. Disabling or rolling back the
+shadow wiring requires no data deletion or backfill.
 
 ## Governed BNL self-names
 

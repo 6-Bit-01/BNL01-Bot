@@ -12,6 +12,7 @@ authority.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -25,7 +26,9 @@ from bnl_conversation_context_v2 import assess_payload_grounding
 
 
 ASSESSMENT_VERSION = "unified_response_assessment_v7"
-CONVERSATION_TURN_PACKET_VERSION = "conversation_turn_evidence_v2"
+CONVERSATION_TURN_PACKET_VERSION = "conversation_turn_evidence_v3"
+SITUATION_FRAME_VERSION = "situation_frame_v1"
+FRAME_SOURCE_REVALIDATION_VERSION = "frame_source_revalidation_v1"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -261,6 +264,515 @@ _TERM_FAMILIES = {
     "serious": frozenset({"serious", "formal", "professional", "solemn"}),
 }
 
+_SITUATION_PHASE_PATTERNS = (
+    ("correction", re.compile(r"\b(?:correction|i\s+meant|not\s+that|that(?:'|’)s\s+wrong|instead)\b", re.I)),
+    ("retest", re.compile(r"\b(?:retest|test\s+again|try\s+again|retry|rerun|re-run|second\s+pass)\b", re.I)),
+    ("failure", re.compile(r"\b(?:failed?|failure|broken|crash(?:ed)?|error|didn(?:'|’)t\s+work|not\s+working)\b", re.I)),
+    ("diagnosis", re.compile(r"\b(?:diagnos(?:e|is)|root\s+cause|why\s+did|what\s+happened|figure\s+out|investigate)\b", re.I)),
+    ("completion", re.compile(r"\b(?:complete|completed|finished|done|resolved|fixed|merged|landed)\b", re.I)),
+    ("execution", re.compile(r"\b(?:implement|build|fix|change|update|create|proceed|continue|start|run|deploy)\b", re.I)),
+    ("planning", re.compile(r"\b(?:plan|roadmap|propose|design|scope|next\s+steps?|how\s+should)\b", re.I)),
+)
+_SITUATION_OBJECT_PATTERNS = (
+    ("journal", re.compile(r"\bjournal(?:s|\s+entry|\s+entries)?\b", re.I)),
+    ("relay", re.compile(r"\brelay(?:s)?\b", re.I)),
+    ("moment", re.compile(r"\bmoment(?:s)?\b|\bepisode(?:s)?\b", re.I)),
+    ("memory", re.compile(r"\bmemory\b|\bshared\s+brain\b|\brecall\b", re.I)),
+    ("queue", re.compile(r"\bqueue\b|\bsubmission(?:s)?\b|\bwheel\s+spin(?:s)?\b", re.I)),
+    ("broadcast", re.compile(r"\bbarcode\s+radio\b|\bshow\b|\bbroadcast\b", re.I)),
+    ("website", re.compile(r"\bwebsite\b|\bsite\b|\bterminal\b", re.I)),
+    ("source_file", re.compile(r"\bsource\s+files?\b|\bdossier(?:s)?\b", re.I)),
+    ("canon", re.compile(r"\bcanon\b|\blore\b|\bmytholog(?:y|ical)\b", re.I)),
+    ("person", re.compile(r"\b(?:who\s+is|tell\s+me\s+about|what\s+do\s+you\s+know\s+about|remember\s+about)\b", re.I)),
+)
+_SITUATION_ROLE_DOMAIN_PATTERNS = (
+    ("artist", "music", re.compile(r"\b(?:artist|song|track|album|release|music|producer|rapper|dj)\b", re.I)),
+    ("community_member", "real_community", re.compile(r"\b(?:community|member|discord|friend|mod(?:erator)?)\b", re.I)),
+    ("broadcast_participant", "broadcast_history", re.compile(r"\b(?:barcode\s+radio|broadcast|show|host|queue|submission)\b", re.I)),
+    ("operator", "operational", re.compile(r"\b(?:operator|admin|owner|run\s+the|manage|moderate)\b", re.I)),
+    ("in_world_entity", "lore", re.compile(r"\b(?:lore|canon|character|story|world|in-world)\b", re.I)),
+    ("system_subject", "technical", re.compile(r"\b(?:bot|code|database|api|memory|website|server|deploy|pr)\b", re.I)),
+)
+_THIRD_PARTY_SUBJECT_CUE_RE = re.compile(
+    r"\b(?:who\s+is|tell\s+me\s+about|what\s+do\s+you\s+(?:know|remember)\s+about|"
+    r"what\s+happened\s+with|ask(?:ing)?\s+about)\b",
+    re.I,
+)
+_CURRENT_TIME_RE = re.compile(r"\b(?:now|currently|today|tonight|this\s+(?:week|show|turn|time)|latest|current)\b", re.I)
+_HISTORICAL_TIME_RE = re.compile(r"\b(?:before|previously|earlier|last\s+(?:time|week|show)|used\s+to|histor(?:y|ical))\b", re.I)
+
+
+@dataclass(frozen=True)
+class SituationSubjectReference:
+    """One response-scoped subject candidate supplied by existing owners.
+
+    ``label_hint`` is reversible context, never identity authority.  Stable
+    identity/account binding is deliberately deferred to the existing canon
+    binding owner and packet adapter.
+    """
+
+    user_id: int = 0
+    entity_ref: str = ""
+    label_hint: str = ""
+    binding_method: str = "unresolved"
+    confidence: str = "unknown"
+    role_hints: Tuple[str, ...] = ()
+    domain_hints: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SituationFrameV1:
+    """Immutable, response-scoped applicability decision.
+
+    The frame contains typed references and hashes, not a second fact store.
+    It cannot grant visibility, create canon, merge identities, or select
+    factual evidence on its own.
+    """
+
+    schema_version: str
+    frame_revision: str
+    input_evidence_digest: str
+    current_text_digest: str
+    status: str
+    route_allowed: bool
+    route_mode: str
+    conversation_surface: str
+    channel_policy: str
+    visibility_allowance: str
+    current_speaker_user_ids: Tuple[int, ...]
+    current_speaker_labels: Tuple[str, ...]
+    addressee_kinds: Tuple[str, ...]
+    addressee_user_ids: Tuple[int, ...]
+    source_message_ids: Tuple[int, ...]
+    reply_message_ids: Tuple[int, ...]
+    exact_source_row_ids: Tuple[int, ...]
+    explicit_mention_count: int
+    subjects: Tuple[SituationSubjectReference, ...]
+    event_ref: str
+    event_relation: str
+    task_kind: str
+    object_kind: str
+    phase: str
+    role_hints: Tuple[str, ...]
+    domain_hints: Tuple[str, ...]
+    temporal_scope: str
+    currentness: str
+    objective_kind: str
+    required_response_act: str
+    decision_present: bool
+    correction_present: bool
+    unresolved_question_count: int
+    open_loop_present: bool
+    competing_frames: Tuple[str, ...]
+    ambiguity_reasons: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FrameSourceRevalidationResult:
+    """Separate immutable result; revalidation never mutates the frame."""
+
+    schema_version: str
+    frame_revision: str
+    frame_input_evidence_digest: str
+    packet_source_snapshot_digest: str
+    status: str
+    reason_codes: Tuple[str, ...]
+
+
+def _situation_digest(value: Any) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _situation_visibility(channel_policy: Any, route_allowed: bool) -> str:
+    if not route_allowed:
+        return "blocked"
+    policy = str(channel_policy or "unknown").strip().lower()
+    if policy in {"public_home", "public_selective", "public_conversation"}:
+        return "public_safe"
+    if policy == "sealed_test":
+        return "sealed_test"
+    if policy in {"internal_controlled", "admin_only", "private"}:
+        return "internal"
+    return "unknown"
+
+
+def _situation_phase(text: str) -> str:
+    for phase, pattern in _SITUATION_PHASE_PATTERNS:
+        if pattern.search(text or ""):
+            return phase
+    return "request" if _OBJECTIVE_RE.search(text or "") else "other"
+
+
+def _situation_object(text: str) -> str:
+    matches = tuple(
+        object_kind
+        for object_kind, pattern in _SITUATION_OBJECT_PATTERNS
+        if pattern.search(text or "")
+    )
+    return matches[0] if len(matches) == 1 else "multiple" if matches else "unknown"
+
+
+def _situation_roles_domains(text: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    matches = tuple(
+        (role, domain)
+        for role, domain, pattern in _SITUATION_ROLE_DOMAIN_PATTERNS
+        if pattern.search(text or "")
+    )
+    return (
+        tuple(dict.fromkeys(role for role, _domain in matches)),
+        tuple(dict.fromkeys(domain for _role, domain in matches)),
+    )
+
+
+def _situation_temporal_scope(text: str) -> Tuple[str, str]:
+    current = bool(_CURRENT_TIME_RE.search(text or ""))
+    historical = bool(_HISTORICAL_TIME_RE.search(text or ""))
+    if current and historical:
+        return "comparison", "mixed"
+    if current:
+        return "current", "current"
+    if historical:
+        return "historical", "historical"
+    return "unspecified", "unknown"
+
+
+def _situation_event_relation(
+    *,
+    moment_situation_state: str,
+    moment_topic_coherent: bool,
+    moment_participant_overlap: bool,
+    phase: str,
+) -> str:
+    state = str(moment_situation_state or "none").strip().lower()
+    if state in {"", "none"}:
+        return "uncertain"
+    if "reopen" in state or "resume" in state:
+        return "resume"
+    if moment_topic_coherent and moment_participant_overlap:
+        return "same_event_new_phase" if phase in {"correction", "retest", "diagnosis", "completion"} else "same_event"
+    if moment_topic_coherent:
+        return "comparison_or_participant_change"
+    if moment_participant_overlap:
+        return "new_event_same_participant"
+    return "new_event_or_uncertain"
+
+
+def _situation_task_kind(*, phase: str, object_kind: str, objective_kind: str) -> str:
+    if objective_kind == "compare_options":
+        return "compare"
+    if object_kind in {"journal", "relay"}:
+        return "retrieve_publication" if phase in {"request", "diagnosis"} else phase
+    if phase in {"planning", "execution", "failure", "diagnosis", "correction", "retest", "completion"}:
+        return phase
+    return "answer" if objective_kind != "unspecified" else "observe"
+
+
+def build_situation_frame_v1(
+    *,
+    route_allowed: bool,
+    route_mode: str,
+    conversation_surface: str,
+    channel_policy: str,
+    current_text: str,
+    current_speaker_user_ids: Sequence[int] = (),
+    current_speaker_labels: Sequence[str] = (),
+    addressee_kinds: Sequence[str] = (),
+    addressee_user_ids: Sequence[int] = (),
+    source_message_ids: Sequence[int] = (),
+    reply_message_ids: Sequence[int] = (),
+    exact_source_row_ids: Sequence[int] = (),
+    explicit_mention_count: int = 0,
+    subject_user_ids: Sequence[int] = (),
+    subject_label_hints: Sequence[str] = (),
+    subject_entity_refs: Sequence[str] = (),
+    moment_id: str = "",
+    moment_situation_state: str = "none",
+    moment_topic_coherent: bool = False,
+    moment_participant_overlap: bool = False,
+    referent_status: str = "not_requested",
+    response_act: str = "observe",
+    packet_revision: str = "",
+) -> SituationFrameV1:
+    """Build one deterministic shadow frame from existing typed owner output."""
+
+    text = str(current_text or "")[:8000]
+    speakers = _unique_positive_ints(current_speaker_user_ids)
+    speaker_labels = _unique_strings(current_speaker_labels)[:8]
+    target_ids = _unique_positive_ints(addressee_user_ids)
+    subject_ids = _unique_positive_ints(subject_user_ids)
+    label_hints = _unique_strings(subject_label_hints)[:8]
+    entity_refs = _unique_strings(subject_entity_refs)[:8]
+    roles, domains = _situation_roles_domains(text)
+    phase = _situation_phase(text)
+    object_kind = _situation_object(text)
+    temporal_scope, currentness = _situation_temporal_scope(text)
+    evidence = build_conversation_evidence_item(text=text, current_turn=True)
+    options = _extract_option_anchors(text)
+    objective = _current_objective(text)
+    objective_kind = _objective_kind(
+        objective=objective,
+        current_options=options,
+        immediate_recap=False,
+        exact_quote_requested=False,
+        evidence_items=(evidence,),
+    )
+    third_party_cue = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(text))
+
+    subjects = []
+    if subject_ids:
+        for index, user_id in enumerate(subject_ids):
+            subjects.append(
+                SituationSubjectReference(
+                    user_id=user_id,
+                    entity_ref=(entity_refs[index] if index < len(entity_refs) else ""),
+                    label_hint=(label_hints[index] if index < len(label_hints) else ""),
+                    binding_method="existing_typed_target",
+                    confidence="high" if len(subject_ids) == 1 else "ambiguous",
+                    role_hints=roles,
+                    domain_hints=domains,
+                )
+            )
+    elif label_hints or entity_refs:
+        count = max(len(label_hints), len(entity_refs))
+        for index in range(count):
+            subjects.append(
+                SituationSubjectReference(
+                    entity_ref=(entity_refs[index] if index < len(entity_refs) else ""),
+                    label_hint=(label_hints[index] if index < len(label_hints) else ""),
+                    binding_method="reversible_label_hint",
+                    confidence="low",
+                    role_hints=roles,
+                    domain_hints=domains,
+                )
+            )
+    elif len(speakers) == 1 and not third_party_cue:
+        subjects.append(
+            SituationSubjectReference(
+                user_id=speakers[0],
+                label_hint=(speaker_labels[0] if speaker_labels else ""),
+                binding_method="current_speaker_context",
+                confidence="contextual",
+                role_hints=roles,
+                domain_hints=domains,
+            )
+        )
+
+    ambiguity = []
+    competing = []
+    normalized_referent = str(referent_status or "not_requested").strip().lower()
+    if normalized_referent in {"ambiguous", "unresolved"}:
+        ambiguity.append("referent_%s" % normalized_referent)
+        competing.append("nearby_referent_candidates")
+    if len(subject_ids) > 1 or len(subjects) > 1:
+        ambiguity.append("multiple_subject_candidates")
+        competing.append("subject_candidates")
+    if third_party_cue and not subjects:
+        ambiguity.append("third_party_subject_unresolved")
+        competing.append("speaker_fallback_rejected")
+    if len(domains) > 1 and subjects:
+        competing.append("subject_role_domain_candidates")
+    if not route_allowed:
+        competing.append("route_policy_block")
+
+    event_relation = _situation_event_relation(
+        moment_situation_state=moment_situation_state,
+        moment_topic_coherent=bool(moment_topic_coherent),
+        moment_participant_overlap=bool(moment_participant_overlap),
+        phase=phase,
+    )
+    task_kind = _situation_task_kind(
+        phase=phase,
+        object_kind=object_kind,
+        objective_kind=objective_kind,
+    )
+    digest_payload = {
+        "schema": SITUATION_FRAME_VERSION,
+        "packet_revision": str(packet_revision or ""),
+        "text_digest": _situation_digest(text),
+        "route_allowed": bool(route_allowed),
+        "route_mode": str(route_mode or "unknown"),
+        "surface": str(conversation_surface or "unknown"),
+        "policy": str(channel_policy or "unknown"),
+        "speakers": speakers,
+        "speaker_labels": speaker_labels,
+        "addressee_kinds": _unique_strings(addressee_kinds),
+        "addressees": target_ids,
+        "source_messages": _unique_positive_ints(source_message_ids),
+        "reply_messages": _unique_positive_ints(reply_message_ids),
+        "source_rows": _unique_positive_ints(exact_source_row_ids),
+        "mention_count": max(0, int(explicit_mention_count or 0)),
+        "subjects": tuple(
+            (
+                subject.user_id,
+                subject.entity_ref,
+                subject.label_hint,
+                subject.binding_method,
+                subject.confidence,
+                subject.role_hints,
+                subject.domain_hints,
+            )
+            for subject in subjects
+        ),
+        "event_ref": str(moment_id or ""),
+        "event_relation": event_relation,
+        "task": task_kind,
+        "object": object_kind,
+        "phase": phase,
+        "temporal": temporal_scope,
+        "objective": objective_kind,
+        "response_act": str(response_act or "observe"),
+        "decision": "decision" in evidence.semantic_roles,
+        "correction": "correction" in evidence.semantic_roles,
+        "open_loop": "open_loop" in evidence.semantic_roles,
+        "ambiguity": tuple(ambiguity),
+        "competing": tuple(competing),
+    }
+    input_digest = _situation_digest(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":"))
+    )
+    status = "blocked" if not route_allowed else "ambiguous" if ambiguity else "resolved"
+    return SituationFrameV1(
+        schema_version=SITUATION_FRAME_VERSION,
+        frame_revision="sf_" + input_digest[:24],
+        input_evidence_digest=input_digest,
+        current_text_digest=_situation_digest(text),
+        status=status,
+        route_allowed=bool(route_allowed),
+        route_mode=str(route_mode or "unknown")[:80],
+        conversation_surface=str(conversation_surface or "unknown")[:80],
+        channel_policy=str(channel_policy or "unknown")[:80],
+        visibility_allowance=_situation_visibility(channel_policy, bool(route_allowed)),
+        current_speaker_user_ids=speakers,
+        current_speaker_labels=speaker_labels,
+        addressee_kinds=_unique_strings(addressee_kinds)[:8],
+        addressee_user_ids=target_ids,
+        source_message_ids=_unique_positive_ints(source_message_ids),
+        reply_message_ids=_unique_positive_ints(reply_message_ids),
+        exact_source_row_ids=_unique_positive_ints(exact_source_row_ids),
+        explicit_mention_count=max(0, int(explicit_mention_count or 0)),
+        subjects=tuple(subjects),
+        event_ref=str(moment_id or "")[:120],
+        event_relation=event_relation,
+        task_kind=task_kind,
+        object_kind=object_kind,
+        phase=phase,
+        role_hints=roles,
+        domain_hints=domains,
+        temporal_scope=temporal_scope,
+        currentness=currentness,
+        objective_kind=objective_kind,
+        required_response_act=str(response_act or "observe")[:80],
+        decision_present="decision" in evidence.semantic_roles,
+        correction_present="correction" in evidence.semantic_roles,
+        unresolved_question_count=(text.count("?") if text else 0),
+        open_loop_present="open_loop" in evidence.semantic_roles,
+        competing_frames=tuple(competing),
+        ambiguity_reasons=tuple(ambiguity),
+    )
+
+
+def revalidate_situation_frame(
+    frame: SituationFrameV1 | None,
+    *,
+    current_text: str = "",
+    route_mode: str = "",
+    conversation_surface: str = "",
+    channel_policy: str = "",
+    packet_source_snapshot_digest: str = "",
+    source_status: str = "valid",
+) -> FrameSourceRevalidationResult:
+    """Check current inputs without mutating the frozen frame or packet."""
+
+    if not isinstance(frame, SituationFrameV1):
+        return FrameSourceRevalidationResult(
+            schema_version=FRAME_SOURCE_REVALIDATION_VERSION,
+            frame_revision="",
+            frame_input_evidence_digest="",
+            packet_source_snapshot_digest=str(packet_source_snapshot_digest or "")[:128],
+            status="invalid",
+            reason_codes=("frame_missing",),
+        )
+    reasons = []
+    if current_text and _situation_digest(str(current_text or "")[:8000]) != frame.current_text_digest:
+        reasons.append("current_text_changed")
+    if route_mode and str(route_mode) != frame.route_mode:
+        reasons.append("route_mode_changed")
+    if conversation_surface and str(conversation_surface) != frame.conversation_surface:
+        reasons.append("conversation_surface_changed")
+    if channel_policy and str(channel_policy) != frame.channel_policy:
+        reasons.append("channel_policy_changed")
+    normalized_source = str(source_status or "valid").strip().lower()
+    if normalized_source not in {"valid", "unchanged"}:
+        reasons.append("source_%s" % normalized_source)
+    if not frame.route_allowed:
+        status = "blocked"
+        reasons.append("route_policy_blocked")
+    elif any(reason.endswith("_changed") for reason in reasons):
+        status = "stale"
+    elif any(reason.startswith("source_") for reason in reasons):
+        status = "invalid"
+    elif frame.status == "ambiguous":
+        status = "ambiguous"
+        reasons.extend(frame.ambiguity_reasons)
+    elif frame.status == "resolved":
+        status = "valid"
+    else:
+        status = "invalid"
+        reasons.append("frame_status_invalid")
+    return FrameSourceRevalidationResult(
+        schema_version=FRAME_SOURCE_REVALIDATION_VERSION,
+        frame_revision=frame.frame_revision,
+        frame_input_evidence_digest=frame.input_evidence_digest,
+        packet_source_snapshot_digest=str(packet_source_snapshot_digest or "")[:128],
+        status=status,
+        reason_codes=_unique_strings(reasons),
+    )
+
+
+def render_situation_frame_receipt(
+    frame: SituationFrameV1 | None,
+    revalidation: FrameSourceRevalidationResult | None = None,
+) -> Dict[str, Any]:
+    """Return content-free diagnostics: no raw text, labels, or account IDs."""
+
+    if not isinstance(frame, SituationFrameV1):
+        return {
+            "schemaVersion": SITUATION_FRAME_VERSION,
+            "present": False,
+            "mutationCount": 0,
+        }
+    return {
+        "schemaVersion": frame.schema_version,
+        "present": True,
+        "frameRevision": frame.frame_revision,
+        "inputEvidenceDigest": frame.input_evidence_digest,
+        "status": frame.status,
+        "speakerCount": len(frame.current_speaker_user_ids),
+        "addresseeCount": len(frame.addressee_user_ids),
+        "subjectCount": len(frame.subjects),
+        "sourceAnchorCount": (
+            len(frame.source_message_ids)
+            + len(frame.reply_message_ids)
+            + len(frame.exact_source_row_ids)
+        ),
+        "ambiguityCount": len(frame.ambiguity_reasons),
+        "competingFrameCount": len(frame.competing_frames),
+        "phase": frame.phase,
+        "objectKind": frame.object_kind,
+        "eventRelation": frame.event_relation,
+        "revalidationStatus": (
+            revalidation.status
+            if isinstance(revalidation, FrameSourceRevalidationResult)
+            else "not_run"
+        ),
+        "revalidationReasonCount": (
+            len(revalidation.reason_codes)
+            if isinstance(revalidation, FrameSourceRevalidationResult)
+            else 0
+        ),
+        "mutationCount": 0,
+    }
+
 
 @dataclass(frozen=True)
 class ConversationTurnEvidencePacket:
@@ -327,6 +839,7 @@ class ConversationOrchestrationDecision:
     relationship_state: str
     canon_state: str
     source_control_state: str
+    situation_frame: SituationFrameV1 | None = None
 
     @property
     def should_generate(self) -> bool:
@@ -1078,6 +1591,8 @@ class UnifiedResponseAssessment:
     profile_independent_root_count: int = 0
     profile_independent_occurrence_count: int = 0
     profile_sufficiency_reasons: Tuple[str, ...] = ()
+    situation_frame: SituationFrameV1 | None = None
+    frame_revalidation: FrameSourceRevalidationResult | None = None
 
 
 def build_unified_response_assessment(
@@ -1134,6 +1649,8 @@ def build_unified_response_assessment(
     profile_independent_root_count: int = 0,
     profile_independent_occurrence_count: int = 0,
     profile_sufficiency_reasons: Sequence[str] = (),
+    situation_frame: SituationFrameV1 | None = None,
+    frame_revalidation: FrameSourceRevalidationResult | None = None,
 ) -> UnifiedResponseAssessment:
     """Assemble one deterministic assessment without rendering it live."""
 
@@ -1429,6 +1946,19 @@ def build_unified_response_assessment(
     diagnostics.append("criterion_count:%s" % len(criteria))
     diagnostics.append("option_count:%s" % len(current_options))
     diagnostics.append("prompt_comparison:%s" % comparison)
+    if isinstance(situation_frame, SituationFrameV1):
+        diagnostics.append("situation_frame:%s" % situation_frame.status)
+        if situation_frame.route_mode != str(route_mode or "unknown")[:80]:
+            diagnostics.append("situation_frame_route_mismatch")
+        if situation_frame.channel_policy != str(
+            channel_policy or "unknown"
+        )[:80]:
+            diagnostics.append("situation_frame_policy_mismatch")
+        if (
+            situation_frame.current_speaker_user_ids
+            and situation_frame.current_speaker_user_ids != current_speakers
+        ):
+            diagnostics.append("situation_frame_speaker_mismatch")
 
     return UnifiedResponseAssessment(
         schema_version=ASSESSMENT_VERSION,
@@ -1488,6 +2018,19 @@ def build_unified_response_assessment(
             normalized_profile_occurrences
         ),
         profile_sufficiency_reasons=normalized_profile_reasons,
+        situation_frame=(
+            situation_frame
+            if isinstance(situation_frame, SituationFrameV1)
+            else None
+        ),
+        frame_revalidation=(
+            frame_revalidation
+            if isinstance(
+                frame_revalidation,
+                FrameSourceRevalidationResult,
+            )
+            else None
+        ),
     )
 
 
@@ -2138,6 +2681,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             profile_independent_root_count INTEGER NOT NULL DEFAULT 0,
             profile_independent_occurrence_count INTEGER NOT NULL DEFAULT 0,
             profile_sufficiency_reasons_json TEXT NOT NULL DEFAULT '[]',
+            situation_frame_version TEXT NOT NULL DEFAULT '',
+            situation_frame_revision TEXT NOT NULL DEFAULT '',
+            situation_frame_input_digest TEXT NOT NULL DEFAULT '',
+            situation_frame_status TEXT NOT NULL DEFAULT 'not_present',
+            situation_frame_ambiguity_count INTEGER NOT NULL DEFAULT 0,
+            frame_revalidation_status TEXT NOT NULL DEFAULT 'not_run',
+            frame_revalidation_reason_count INTEGER NOT NULL DEFAULT 0,
             response_alignment TEXT NOT NULL,
             processing_errors_json TEXT NOT NULL DEFAULT '[]',
             behavior_changed INTEGER NOT NULL DEFAULT 0,
@@ -2261,6 +2811,28 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         (
             "profile_sufficiency_reasons_json",
             "TEXT NOT NULL DEFAULT '[]'",
+        ),
+        ("situation_frame_version", "TEXT NOT NULL DEFAULT ''"),
+        ("situation_frame_revision", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "situation_frame_input_digest",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "situation_frame_status",
+            "TEXT NOT NULL DEFAULT 'not_present'",
+        ),
+        (
+            "situation_frame_ambiguity_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "frame_revalidation_status",
+            "TEXT NOT NULL DEFAULT 'not_run'",
+        ),
+        (
+            "frame_revalidation_reason_count",
+            "INTEGER NOT NULL DEFAULT 0",
         ),
     )
     for column_name, column_definition in additive_columns:
@@ -2500,6 +3072,13 @@ def persist_shadow_run(
         "profile_independent_root_count",
         "profile_independent_occurrence_count",
         "profile_sufficiency_reasons_json",
+        "situation_frame_version",
+        "situation_frame_revision",
+        "situation_frame_input_digest",
+        "situation_frame_status",
+        "situation_frame_ambiguity_count",
+        "frame_revalidation_status",
+        "frame_revalidation_reason_count",
         "response_alignment",
         "processing_errors_json",
         "behavior_changed",
@@ -2592,6 +3171,47 @@ def persist_shadow_run(
         assessment.profile_independent_root_count,
         assessment.profile_independent_occurrence_count,
         json.dumps(assessment.profile_sufficiency_reasons),
+        (
+            assessment.situation_frame.schema_version
+            if isinstance(assessment.situation_frame, SituationFrameV1)
+            else ""
+        ),
+        (
+            assessment.situation_frame.frame_revision
+            if isinstance(assessment.situation_frame, SituationFrameV1)
+            else ""
+        ),
+        (
+            assessment.situation_frame.input_evidence_digest
+            if isinstance(assessment.situation_frame, SituationFrameV1)
+            else ""
+        ),
+        (
+            assessment.situation_frame.status
+            if isinstance(assessment.situation_frame, SituationFrameV1)
+            else "not_present"
+        ),
+        (
+            len(assessment.situation_frame.ambiguity_reasons)
+            if isinstance(assessment.situation_frame, SituationFrameV1)
+            else 0
+        ),
+        (
+            assessment.frame_revalidation.status
+            if isinstance(
+                assessment.frame_revalidation,
+                FrameSourceRevalidationResult,
+            )
+            else "not_run"
+        ),
+        (
+            len(assessment.frame_revalidation.reason_codes)
+            if isinstance(
+                assessment.frame_revalidation,
+                FrameSourceRevalidationResult,
+            )
+            else 0
+        ),
         alignment,
         json.dumps(
             tuple(

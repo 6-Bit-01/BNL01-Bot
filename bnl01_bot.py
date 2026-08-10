@@ -174,8 +174,11 @@ from bnl_unified_response_assessment import (
     ConversationOrchestrationDecision,
     ConversationOrchestrationInput,
     ConversationEvidenceItem,
+    FrameSourceRevalidationResult,
+    SituationFrameV1,
     UnifiedResponseAssessment,
     assess_response_coherence,
+    build_situation_frame_v1,
     build_conversation_evidence_item,
     build_unified_response_assessment,
     coordinate_conversation_turn,
@@ -183,6 +186,8 @@ from bnl_unified_response_assessment import (
     persist_shadow_run as persist_unified_response_assessment_shadow_run,
     render_sealed_canary_brief,
     response_exposes_canary_control_markers,
+    revalidate_situation_frame,
+    render_situation_frame_receipt,
     render_conversation_orchestration_prompt,
     shadow_enabled as unified_response_assessment_shadow_enabled,
     with_prompt_lane_presence,
@@ -22984,6 +22989,15 @@ def build_live_conversation_orchestration_decision(
     moment_situation: MomentSituationReference | None,
     guild_id: int = 0,
     channel_id: int = 0,
+    route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+    conversation_surface: str = "unknown",
+    current_text: str = "",
+    current_speaker_user_ids: tuple[int, ...] = (),
+    current_speaker_labels: tuple[str, ...] = (),
+    addressee_user_ids: tuple[int, ...] = (),
+    subject_user_ids: tuple[int, ...] = (),
+    subject_label_hints: tuple[str, ...] = (),
+    subject_entity_refs: tuple[str, ...] = (),
     influence_mode: str | None = None,
     packet_revision: str = "",
     governed_memory_state: str = "",
@@ -23030,11 +23044,10 @@ def build_live_conversation_orchestration_decision(
             channel_policy=channel_policy,
         )
     )
+    route_allowed = str(channel_policy or "unknown") in CONVERSATIONAL_POLICIES
     decision = coordinate_conversation_turn(
         ConversationOrchestrationInput(
-            route_allowed=(
-                str(channel_policy or "unknown") in CONVERSATIONAL_POLICIES
-            ),
+            route_allowed=route_allowed,
             engagement_decision=engagement_decision,
             engagement_reason=engagement_reason,
             response_obligation=response_obligation,
@@ -23091,6 +23104,80 @@ def build_live_conversation_orchestration_decision(
             ),
         )
     )
+    frame_subject_labels = tuple(
+        dict.fromkeys(
+            str(label or "").lstrip("@").strip()[:72]
+            for label in (
+                *subject_label_hints,
+                *(
+                    context_result.referent_candidate_labels
+                    if context_result is not None
+                    else ()
+                ),
+                *(
+                    recipient
+                    for meta in addressings
+                    for recipient in meta.explicit_tag_recipients
+                    if str(recipient or "").strip().casefold()
+                    not in {"@bnl-01", "bnl-01"}
+                ),
+            )
+            if str(label or "").strip()
+        )
+    )
+    situation_frame = build_situation_frame_v1(
+        route_allowed=route_allowed,
+        route_mode=str(route_mode or ROUTE_MODE_NORMAL_CHAT),
+        conversation_surface=str(conversation_surface or "unknown"),
+        channel_policy=str(channel_policy or "unknown"),
+        current_text=str(current_text or ""),
+        current_speaker_user_ids=current_speaker_user_ids,
+        current_speaker_labels=(
+            current_speaker_labels
+            or tuple(meta.speaker for meta in addressings if meta.speaker)
+        ),
+        addressee_kinds=tuple(
+            meta.address_kind for meta in addressed if meta.address_kind
+        ),
+        addressee_user_ids=addressee_user_ids,
+        source_message_ids=tuple(
+            meta.source_message_id
+            for meta in addressings
+            if int(meta.source_message_id or 0) > 0
+        ),
+        reply_message_ids=tuple(
+            meta.reply_message_id
+            for meta in addressings
+            if int(meta.reply_message_id or 0) > 0
+        ),
+        exact_source_row_ids=tuple(
+            meta.reply_conversation_row_id
+            for meta in addressings
+            if int(meta.reply_conversation_row_id or 0) > 0
+        ),
+        explicit_mention_count=sum(
+            len(meta.explicit_tag_recipients) for meta in addressings
+        ),
+        subject_user_ids=subject_user_ids,
+        subject_label_hints=frame_subject_labels,
+        subject_entity_refs=subject_entity_refs,
+        moment_id=(
+            moment_situation.moment_id
+            if moment_situation is not None
+            else ""
+        ),
+        moment_situation_state=moment_state,
+        moment_topic_coherent=bool(
+            moment_situation and moment_situation.topic_coherent
+        ),
+        moment_participant_overlap=bool(
+            moment_situation and moment_situation.participant_overlap
+        ),
+        referent_status=referent_status,
+        response_act=decision.response_act,
+        packet_revision=str(packet_revision or decision.packet_revision),
+    )
+    decision = replace(decision, situation_frame=situation_frame)
     logging.info(
         "conversation_orchestration_decision act=%s reason=%s "
         "response_required=%s address_kind=%s referent_status=%s "
@@ -23116,6 +23203,20 @@ def build_live_conversation_orchestration_decision(
         decision.packet_version,
         decision.packet_revision,
     )
+    logging.info(
+        "situation_frame_shadow version=%s revision=%s digest=%s "
+        "status=%s subject_count=%s ambiguity_count=%s event_relation=%s "
+        "phase=%s object_kind=%s behavior_changed=0 authority_applied=0",
+        situation_frame.schema_version,
+        situation_frame.frame_revision,
+        situation_frame.input_evidence_digest,
+        situation_frame.status,
+        len(situation_frame.subjects),
+        len(situation_frame.ambiguity_reasons),
+        situation_frame.event_relation,
+        situation_frame.phase,
+        situation_frame.object_kind,
+    )
     return decision
 
 
@@ -23135,6 +23236,7 @@ def _build_unified_intelligence_packet_shadow(
     source_context_snapshot: str,
     source_context_authorized: bool,
     current_direct: bool,
+    situation_frame: SituationFrameV1 | None = None,
 ) -> UnifiedIntelligencePacket | None:
     """Build and persist one packet receipt without exposing it to the prompt."""
 
@@ -23273,6 +23375,7 @@ def build_unified_response_assessment_shadow(
     current_direct: bool = True,
     broadcast_memory_present: bool = False,
     intelligence_packet_out: dict | None = None,
+    situation_frame: SituationFrameV1 | None = None,
 ) -> UnifiedResponseAssessment | None:
     """Build a shadow view from evidence already selected by existing owners."""
     if not unified_response_assessment_shadow_enabled():
@@ -23411,6 +23514,7 @@ def build_unified_response_assessment_shadow(
         source_context_snapshot=source_context_snapshot,
         source_context_authorized=bool(source_context_present),
         current_direct=current_direct,
+        situation_frame=situation_frame,
     )
     packet_usable = bool(
         intelligence_packet is not None
@@ -23423,6 +23527,26 @@ def build_unified_response_assessment_shadow(
     if intelligence_packet_out is not None:
         intelligence_packet_out["packet"] = intelligence_packet
         intelligence_packet_out["usable"] = packet_usable
+        intelligence_packet_out["situation_frame"] = situation_frame
+    frame_revalidation = (
+        revalidate_situation_frame(
+            situation_frame,
+            current_text=current_text,
+            route_mode=route_mode,
+            conversation_surface=conversation_surface,
+            channel_policy=channel_policy,
+            packet_source_snapshot_digest=str(
+                getattr(
+                    intelligence_packet,
+                    "source_snapshot_digest",
+                    "",
+                )
+                or ""
+            ),
+        )
+        if isinstance(situation_frame, SituationFrameV1)
+        else None
+    )
     canon_relevant = _canon_relevant_to_response(current_text)
     if intelligence_packet is None:
         assessment_moment_refs = (
@@ -23623,6 +23747,8 @@ def build_unified_response_assessment_shadow(
             if packet_profile is not None
             else ()
         ),
+        situation_frame=situation_frame,
+        frame_revalidation=frame_revalidation,
     )
 
 
@@ -23643,6 +23769,21 @@ def record_unified_response_assessment_shadow(
         if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
             assessment = basis.assessment
             break
+    frame_revalidation = (guard_diagnostics or {}).get(
+        "_situation_frame_revalidation"
+    )
+    if (
+        assessment is not None
+        and isinstance(assessment.situation_frame, SituationFrameV1)
+        and isinstance(
+            frame_revalidation,
+            FrameSourceRevalidationResult,
+        )
+    ):
+        assessment = replace(
+            assessment,
+            frame_revalidation=frame_revalidation,
+        )
     if assessment is None:
         return ""
     try:
@@ -29558,6 +29699,18 @@ async def build_active_batch_orchestration(
         moment_situation=moment_situation,
         guild_id=guild_id,
         channel_id=channel_id,
+        route_mode=route_mode,
+        conversation_surface=conversation_surface_for_channel_policy(
+            channel_policy,
+            is_active_channel,
+        ),
+        current_text=combined_text,
+        current_speaker_user_ids=tuple(unique_user_ids),
+        current_speaker_labels=tuple(
+            _safe_prompt_display_label(name, "")
+            for name, _content, _uid in collapsed_items
+            if _safe_prompt_display_label(name, "")
+        ),
         packet_revision=conversation_turn_packet_revision(
             guild_id=guild_id,
             channel_id=channel_id,
@@ -30300,6 +30453,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     intelligence_packet_out=(
                         batch_intelligence_packet_out
                     ),
+                    situation_frame=(
+                        orchestration_state["decision"].situation_frame
+                    ),
                 )
             )
             batch_unified_moment_canary_basis = (
@@ -30883,6 +31039,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             ),
             prompt_source_bases=tuple(batch_prompt_source_bases),
             regeneration_allowed=not batch_synthesis_candidate_active,
+            situation_frame=(
+                orchestration_state["decision"].situation_frame
+            ),
         )
         if (
             batch_synthesis_candidate_active
@@ -30962,6 +31121,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             batch_prompt_source_bases
                         ),
                         regeneration_allowed=True,
+                        situation_frame=(
+                            orchestration_state["decision"].situation_frame
+                        ),
                     )
                 )
         guard_triggered = bool(
@@ -31143,6 +31305,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_prompt_source_bases
                     ),
                     regeneration_allowed=True,
+                    situation_frame=(
+                        orchestration_state["decision"].situation_frame
+                    ),
                 )
             )
             if guard_diagnostics.get("suppressed"):
@@ -31224,6 +31389,42 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="batch_prompt_source_presend_failed",
             )
             return
+        batch_frame = orchestration_state["decision"].situation_frame
+        if isinstance(batch_frame, SituationFrameV1):
+            batch_frame_revalidation = revalidate_situation_frame(
+                batch_frame,
+                current_text=combined_text,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                conversation_surface=(
+                    conversation_surface_for_channel_policy(
+                        channel_policy,
+                        channel_id == get_guild_config(guild_id),
+                    )
+                ),
+                channel_policy=channel_policy,
+            )
+            guard_diagnostics.update(
+                {
+                    "situation_frame_present": True,
+                    "situation_frame_status": batch_frame.status,
+                    "situation_frame_revalidation_status": (
+                        batch_frame_revalidation.status
+                    ),
+                    "situation_frame_revalidation_reason_count": len(
+                        batch_frame_revalidation.reason_codes
+                    ),
+                    "_situation_frame_revalidation": (
+                        batch_frame_revalidation
+                    ),
+                }
+            )
+            logging.info(
+                "situation_frame_presend_shadow revision=%s status=%s "
+                "reason_count=%s behavior_changed=0 route=batch",
+                batch_frame.frame_revision,
+                batch_frame_revalidation.status,
+                len(batch_frame_revalidation.reason_codes),
+            )
         _log_batch_event(
             logging.INFO,
             "response_send_commit_start",
@@ -31579,6 +31780,7 @@ def build_user_aware_prompt(
     moment_attribution_target_user_id: int = 0,
     verified_exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
     conversation_context_result: ConversationContextResult | None = None,
+    conversation_orchestration: ConversationOrchestrationDecision | None = None,
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -31853,6 +32055,14 @@ def build_user_aware_prompt(
         source_context_snapshot=source_context_block,
         broadcast_memory_present=bool(broadcast_context),
         intelligence_packet_out=intelligence_packet_out,
+        situation_frame=(
+            conversation_orchestration.situation_frame
+            if isinstance(
+                conversation_orchestration,
+                ConversationOrchestrationDecision,
+            )
+            else None
+        ),
     )
     unified_moment_canary_basis = (
         build_unified_moment_canary_prompt_source_basis(
@@ -31932,6 +32142,24 @@ def build_user_aware_prompt(
         )
         prompt_metadata["source_safe_recall_synthesis"] = bool(
             source_safe_recall
+        )
+        prompt_metadata["situation_frame_shadow"] = (
+            conversation_orchestration.situation_frame
+            if isinstance(
+                conversation_orchestration,
+                ConversationOrchestrationDecision,
+            )
+            else None
+        )
+        prompt_metadata["situation_frame_receipt"] = (
+            render_situation_frame_receipt(
+                conversation_orchestration.situation_frame
+            )
+            if isinstance(
+                conversation_orchestration,
+                ConversationOrchestrationDecision,
+            )
+            else render_situation_frame_receipt(None)
         )
 
     room_prompt_block = ""
@@ -32919,6 +33147,13 @@ async def _generate_direct_payload_session(session_key, reason: str):
         moment_situation=session_moment_situation,
         guild_id=session["guild_id"],
         channel_id=session.get("channel_id", 0),
+        route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
+        conversation_surface=conversation_surface_for_channel_policy(
+            session.get("channel_policy", "unknown")
+        ),
+        current_text=direct_content,
+        current_speaker_user_ids=(session["requester_user_id"],),
+        current_speaker_labels=(session["requester_display_name"],),
         packet_revision=conversation_turn_packet_revision(
             guild_id=session["guild_id"],
             channel_id=session.get("channel_id", 0),
@@ -32981,6 +33216,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         moment_attribution_target_user_id=moment_attribution_target_user_id,
         verified_exact_quote_authority=verified_exact_quote_authority,
         conversation_context_result=session_context_result_out.get("result"),
+        conversation_orchestration=session_orchestration,
     )
     source_context_available = bool(prompt_metadata.get("source_context_available"))
     prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
@@ -33064,6 +33300,9 @@ async def _generate_direct_payload_session(session_key, reason: str):
         prompt_source_bases=tuple(
             prompt_metadata.get("prompt_source_bases") or ()
         ),
+        situation_frame=session_orchestration.situation_frame,
+        situation_frame_current_text=direct_content,
+        situation_frame_route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
     )
     if guard_diagnostics.get("suppressed"):
         logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", "direct_payload_session", session.get("channel_policy", "unknown"))
@@ -33126,6 +33365,40 @@ async def _generate_direct_payload_session(session_key, reason: str):
             "prompt_source_presend_failed",
         )
         return
+    session_frame = session_orchestration.situation_frame
+    if isinstance(session_frame, SituationFrameV1):
+        session_frame_revalidation = revalidate_situation_frame(
+            session_frame,
+            current_text=direct_content,
+            route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
+            conversation_surface=conversation_surface_for_channel_policy(
+                session.get("channel_policy", "unknown")
+            ),
+            channel_policy=session.get("channel_policy", "unknown"),
+        )
+        guard_diagnostics.update(
+            {
+                "situation_frame_present": True,
+                "situation_frame_status": session_frame.status,
+                "situation_frame_revalidation_status": (
+                    session_frame_revalidation.status
+                ),
+                "situation_frame_revalidation_reason_count": len(
+                    session_frame_revalidation.reason_codes
+                ),
+                "_situation_frame_revalidation": (
+                    session_frame_revalidation
+                ),
+            }
+        )
+        logging.info(
+            "situation_frame_presend_shadow revision=%s status=%s "
+            "reason_count=%s behavior_changed=0 "
+            "route=direct_payload_session",
+            session_frame.frame_revision,
+            session_frame_revalidation.status,
+            len(session_frame_revalidation.reason_codes),
+        )
     sent_message_ids = []
     try:
         if len(response) <= 2000:
@@ -33439,6 +33712,9 @@ async def apply_guarded_response_regeneration(
     exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
     third_party_attribution_requested: bool = False,
     prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
+    situation_frame: SituationFrameV1 | None = None,
+    situation_frame_current_text: str = "",
+    situation_frame_route_mode: str = "",
 ) -> tuple[str, dict]:
     diagnostics = {
         "scripted_mode_leak_guard_triggered": False,
@@ -33485,6 +33761,10 @@ async def apply_guarded_response_regeneration(
         "source_safe_recall_synthesis_applied": False,
         "source_safe_recall_output_leak_guard_triggered": False,
         "source_safe_recall_output_leak_regenerated": False,
+        "situation_frame_present": False,
+        "situation_frame_status": "not_present",
+        "situation_frame_revalidation_status": "not_run",
+        "situation_frame_revalidation_reason_count": 0,
         "suppressed": False,
         "suppression_reason": "",
         "guard_fallback_or_generic_non_answer": False,
@@ -33499,6 +33779,36 @@ async def apply_guarded_response_regeneration(
         third_party_attribution_requested
     )
     prompt_source_bases = tuple(prompt_source_bases or ())
+    if isinstance(situation_frame, SituationFrameV1):
+        frame_revalidation = revalidate_situation_frame(
+            situation_frame,
+            current_text=(
+                situation_frame_current_text or current_user_text
+            ),
+            route_mode=(situation_frame_route_mode or route_mode),
+            channel_policy=channel_policy,
+        )
+        diagnostics.update(
+            {
+                "situation_frame_present": True,
+                "situation_frame_status": situation_frame.status,
+                "situation_frame_revalidation_status": (
+                    frame_revalidation.status
+                ),
+                "situation_frame_revalidation_reason_count": len(
+                    frame_revalidation.reason_codes
+                ),
+                "_situation_frame_revalidation": frame_revalidation,
+            }
+        )
+        logging.info(
+            "situation_frame_guard_shadow revision=%s status=%s "
+            "revalidation=%s reason_count=%s behavior_changed=0",
+            situation_frame.frame_revision,
+            situation_frame.status,
+            frame_revalidation.status,
+            len(frame_revalidation.reason_codes),
+        )
     source_safe_recall = bool(
         source_safe_recall_synthesis_enabled(
             guild_id=guild_id,
@@ -34967,6 +35277,8 @@ async def send_planned_conversation_response(
     third_party_attribution_requested: bool = False,
     prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
     unified_response_assessment_shadow: UnifiedResponseAssessment | None = None,
+    situation_frame: SituationFrameV1 | None = None,
+    situation_frame_current_text: str = "",
     shared_brain_synthesis_canary_basis: (
         SharedBrainSynthesisBasis | None
     ) = None,
@@ -35102,6 +35414,8 @@ async def send_planned_conversation_response(
             ),
             prompt_source_bases=selected_bases,
             regeneration_allowed=regeneration_allowed,
+            situation_frame=situation_frame,
+            situation_frame_current_text=situation_frame_current_text,
         )
 
     archive_guard_triggered = bool(
@@ -35372,6 +35686,38 @@ async def send_planned_conversation_response(
             "prompt_source_presend_failed",
         )
         return model_decision
+    if isinstance(situation_frame, SituationFrameV1):
+        final_frame_revalidation = revalidate_situation_frame(
+            situation_frame,
+            current_text=(
+                situation_frame_current_text
+                or getattr(message, "content", "")
+            ),
+            route_mode=plan.route_mode,
+            channel_policy=plan.channel_policy,
+        )
+        guard_diagnostics.update(
+            {
+                "situation_frame_present": True,
+                "situation_frame_status": situation_frame.status,
+                "situation_frame_revalidation_status": (
+                    final_frame_revalidation.status
+                ),
+                "situation_frame_revalidation_reason_count": len(
+                    final_frame_revalidation.reason_codes
+                ),
+                "_situation_frame_revalidation": (
+                    final_frame_revalidation
+                ),
+            }
+        )
+        logging.info(
+            "situation_frame_presend_shadow revision=%s status=%s "
+            "reason_count=%s behavior_changed=0",
+            situation_frame.frame_revision,
+            final_frame_revalidation.status,
+            len(final_frame_revalidation.reason_codes),
+        )
     sent_message_ids = []
     try:
         if len(response) <= 2000:
@@ -36448,6 +36794,13 @@ async def on_message(message: discord.Message):
                     moment_situation=direct_moment_situation,
                     guild_id=message.guild.id,
                     channel_id=message.channel.id,
+                    route_mode=route_mode,
+                    conversation_surface=conversation_surface,
+                    current_text=direct_content,
+                    current_speaker_user_ids=(message.author.id,),
+                    current_speaker_labels=(
+                        message.author.display_name,
+                    ),
                     packet_revision=conversation_turn_packet_revision(
                         guild_id=message.guild.id,
                         channel_id=message.channel.id,
@@ -36515,6 +36868,7 @@ async def on_message(message: discord.Message):
                 conversation_context_result=direct_context_result_out.get(
                     "result"
                 ),
+                conversation_orchestration=direct_orchestration,
             )
             source_context_available = bool(prompt_metadata.get("source_context_available"))
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
@@ -36625,6 +36979,8 @@ async def on_message(message: discord.Message):
                 unified_response_assessment_shadow=prompt_metadata.get(
                     "unified_response_assessment_shadow"
                 ),
+                situation_frame=direct_orchestration.situation_frame,
+                situation_frame_current_text=direct_content,
                 shared_brain_synthesis_canary_basis=prompt_metadata.get(
                     "shared_brain_synthesis_canary_basis"
                 ),
@@ -36880,6 +37236,11 @@ async def on_message(message: discord.Message):
             moment_situation=direct_moment_situation,
             guild_id=message.guild.id,
             channel_id=message.channel.id,
+            route_mode=route_mode,
+            conversation_surface=conversation_surface,
+            current_text=direct_content,
+            current_speaker_user_ids=(message.author.id,),
+            current_speaker_labels=(message.author.display_name,),
             packet_revision=conversation_turn_packet_revision(
                 guild_id=message.guild.id,
                 channel_id=message.channel.id,
@@ -36944,6 +37305,7 @@ async def on_message(message: discord.Message):
             moment_attribution_target_user_id=moment_attribution_target_user_id,
             verified_exact_quote_authority=verified_exact_quote_authority,
             conversation_context_result=direct_context_result_out.get("result"),
+            conversation_orchestration=direct_orchestration,
         )
         source_context_available = bool(prompt_metadata.get("source_context_available"))
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
@@ -37067,6 +37429,8 @@ async def on_message(message: discord.Message):
             unified_response_assessment_shadow=prompt_metadata.get(
                 "unified_response_assessment_shadow"
             ),
+            situation_frame=direct_orchestration.situation_frame,
+            situation_frame_current_text=direct_content,
             shared_brain_synthesis_canary_basis=prompt_metadata.get(
                 "shared_brain_synthesis_canary_basis"
             ),
@@ -37266,6 +37630,11 @@ async def on_message(message: discord.Message):
             moment_situation=direct_moment_situation,
             guild_id=message.guild.id,
             channel_id=message.channel.id,
+            route_mode=route_mode,
+            conversation_surface=conversation_surface,
+            current_text=direct_content,
+            current_speaker_user_ids=(message.author.id,),
+            current_speaker_labels=(message.author.display_name,),
             packet_revision=conversation_turn_packet_revision(
                 guild_id=message.guild.id,
                 channel_id=message.channel.id,
@@ -37330,6 +37699,7 @@ async def on_message(message: discord.Message):
             moment_attribution_target_user_id=moment_attribution_target_user_id,
             verified_exact_quote_authority=verified_exact_quote_authority,
             conversation_context_result=direct_context_result_out.get("result"),
+            conversation_orchestration=direct_orchestration,
         )
         source_context_available = bool(prompt_metadata.get("source_context_available"))
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
@@ -37453,6 +37823,8 @@ async def on_message(message: discord.Message):
             unified_response_assessment_shadow=prompt_metadata.get(
                 "unified_response_assessment_shadow"
             ),
+            situation_frame=direct_orchestration.situation_frame,
+            situation_frame_current_text=direct_content,
             shared_brain_synthesis_canary_basis=prompt_metadata.get(
                 "shared_brain_synthesis_canary_basis"
             ),
