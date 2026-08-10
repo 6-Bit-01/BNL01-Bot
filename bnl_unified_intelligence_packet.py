@@ -70,6 +70,13 @@ from bnl_memory_ledger import (
     select_public_conversation_assessment_evidence,
     subject_key_for_user,
 )
+from bnl_journal import (
+    JournalControlSnapshot,
+    journal_control_snapshot_status,
+    render_journal_publication,
+    revalidate_published_journal_entry_on_connection,
+    select_published_journal_entries_on_connection,
+)
 from bnl_moment_engine import (
     SITUATION_EPISODE_READ_VERSION,
     select_public_participant_moment_gists,
@@ -77,11 +84,18 @@ from bnl_moment_engine import (
 )
 from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import shadow_packet_posture
+from bnl_website_relay_state import (
+    render_accepted_relay_publication,
+    revalidate_accepted_relay_publication_on_connection,
+    select_accepted_relay_publications_on_connection,
+)
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v7"
+SCHEMA_VERSION = "unified_intelligence_packet_v8"
 SUBJECT_RESOLUTION_VERSION = "governed_packet_subject_resolution_v1"
-SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v1"
+SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v2"
+JOURNAL_PUBLICATION_SOURCE_CLASS = "journal_publication_projection"
+RELAY_PUBLICATION_SOURCE_CLASS = "relay_publication_projection"
 TABLE_NAME = "memory_governance_intelligence_packet_runs"
 SHADOW_ENV = "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED"
 _SHADOW_PREREQUISITES = (
@@ -149,6 +163,8 @@ _LANE_CAPS = {
     "recurring_theme": 3,
     "open_loop": 3,
     "canon": 4,
+    "journal_publication": 4,
+    "relay_publication": 4,
     "source_file": 2,
     "relationship_posture": 1,
 }
@@ -176,6 +192,8 @@ _VALIDATION_SUPPORT_LANES = frozenset(
         "recurring_theme",
         "open_loop",
         "canon",
+        "journal_publication",
+        "relay_publication",
         "source_file",
     }
 )
@@ -454,6 +472,8 @@ class IntelligencePacketRequest:
     frame_phase: str = ""
     frame_temporal_scope: str = "unspecified"
     frame_currentness: str = "unknown"
+    journal_control_snapshot: JournalControlSnapshot | None = None
+    journal_control_status: str = "not_requested"
 
 
 @dataclass(frozen=True)
@@ -553,6 +573,12 @@ class IntelligencePacketDiagnostics:
     theme_query_status: str = "not_requested"
     theme_independent_root_count: int = 0
     theme_independent_occurrence_count: int = 0
+    journal_query_status: str = "not_requested"
+    journal_control_status: str = "not_requested"
+    journal_candidate_count: int = 0
+    relay_query_status: str = "not_requested"
+    relay_candidate_count: int = 0
+    publication_projection_count: int = 0
     processing_errors: list[str] = field(default_factory=list)
     invalid_invariants: list[str] = field(default_factory=list)
     revalidation_status: str = "not_evaluated"
@@ -659,6 +685,14 @@ class UnifiedIntelligencePacket:
     def canon_refs(self) -> tuple[str, ...]:
         return tuple(
             item.source_ref for item in self.items if item.lane == "canon"
+        )
+
+    @property
+    def publication_refs(self) -> tuple[str, ...]:
+        return tuple(
+            item.source_ref
+            for item in self.items
+            if item.lane in {"journal_publication", "relay_publication"}
         )
 
     @property
@@ -2017,6 +2051,21 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "theme_independent_occurrence_count",
             "INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "journal_query_status",
+            "TEXT NOT NULL DEFAULT 'not_requested'",
+        ),
+        (
+            "journal_control_status",
+            "TEXT NOT NULL DEFAULT 'not_requested'",
+        ),
+        ("journal_candidate_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "relay_query_status",
+            "TEXT NOT NULL DEFAULT 'not_requested'",
+        ),
+        ("relay_candidate_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("publication_projection_count", "INTEGER NOT NULL DEFAULT 0"),
     ):
         try:
             conn.execute(
@@ -4516,6 +4565,192 @@ def _frame_allowed_canon_domains(
     return allowed
 
 
+def _publication_exclusion_reason(prefix: str, status: str) -> str:
+    safe_status = re.sub(
+        r"[^a-z0-9_]+",
+        "_",
+        str(status or "unavailable").strip().lower(),
+    ).strip("_")
+    return "%s_%s" % (prefix, safe_status or "unavailable")
+
+
+def _journal_publication_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+) -> list[IntelligencePacketItem]:
+    selection = select_published_journal_entries_on_connection(
+        conn,
+        guild_id=int(request.guild_id or 0),
+        user_text=request.user_text,
+        control_snapshot=request.journal_control_snapshot,
+        now=request.now or None,
+    )
+    diagnostics.journal_query_status = selection.status
+    diagnostics.journal_candidate_count = int(selection.candidate_count or 0)
+    if selection.status == "not_requested":
+        diagnostics.journal_control_status = str(
+            request.journal_control_status or "not_requested"
+        )
+        return []
+    diagnostics.journal_control_status = (
+        "valid"
+        if selection.status
+        in {
+            "eligible",
+            "not_found",
+            "public_hidden",
+            "memory_ineligible",
+            "source_invalid",
+            "source_unavailable",
+        }
+        and isinstance(request.journal_control_snapshot, JournalControlSnapshot)
+        else (
+            str(request.journal_control_status)
+            if str(request.journal_control_status or "not_requested")
+            != "not_requested"
+            else selection.status
+        )
+    )
+    if not selection.publications:
+        _add_exclusion(
+            diagnostics,
+            exclusions,
+            lane="journal_publication",
+            reason=_publication_exclusion_reason(
+                "journal",
+                selection.status,
+            ),
+            source_class=JOURNAL_PUBLICATION_SOURCE_CLASS,
+        )
+        return []
+    items: list[IntelligencePacketItem] = []
+    score_by_mode = {
+        "exact_identity": 160.0,
+        "exact_title": 155.0,
+        "exact_date": 150.0,
+        "topic": 135.0,
+    }
+    for publication in selection.publications:
+        diagnostics.candidates_by_lane["journal_publication"] = (
+            diagnostics.candidates_by_lane.get("journal_publication", 0)
+            + 1
+        )
+        items.append(
+            IntelligencePacketItem(
+                lane="journal_publication",
+                source_class=JOURNAL_PUBLICATION_SOURCE_CLASS,
+                source_type="canonical_published_journal",
+                source_ref="journal:%s:%s"
+                % (publication.entry_id, publication.revision),
+                source_digest=publication.source_digest,
+                subject_key="bnl_01",
+                predicate_key="published_journal_entry",
+                text=render_journal_publication(publication),
+                visibility="public",
+                confidence=Confidence.APPROVED.value,
+                lifecycle="published",
+                authority=0,
+                observed_at=(
+                    publication.published_at or publication.created_at
+                ),
+                usage="publication_projection",
+                score=score_by_mode.get(publication.query_mode, 130.0),
+                revalidation_kind="journal_publication",
+                revalidation_key=json.dumps(
+                    {
+                        "entryId": publication.entry_id,
+                        "revision": publication.revision,
+                        "queryMode": publication.query_mode,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                attribution_mode="publication_only",
+                uncertainty_status=(
+                    "derived_publication_zero_fact_weight"
+                ),
+            )
+        )
+    diagnostics.publication_projection_count += len(items)
+    return items
+
+
+def _relay_publication_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+) -> list[IntelligencePacketItem]:
+    selection = select_accepted_relay_publications_on_connection(
+        conn,
+        guild_id=int(request.guild_id or 0),
+        user_text=request.user_text,
+    )
+    diagnostics.relay_query_status = selection.status
+    diagnostics.relay_candidate_count = int(selection.candidate_count or 0)
+    if selection.status == "not_requested":
+        return []
+    if not selection.publications:
+        _add_exclusion(
+            diagnostics,
+            exclusions,
+            lane="relay_publication",
+            reason=_publication_exclusion_reason(
+                "relay",
+                selection.status,
+            ),
+            source_class=RELAY_PUBLICATION_SOURCE_CLASS,
+        )
+        return []
+    items: list[IntelligencePacketItem] = []
+    score_by_mode = {
+        "exact_identity": 160.0,
+        "exact_date": 150.0,
+        "topic": 135.0,
+    }
+    for publication in selection.publications:
+        diagnostics.candidates_by_lane["relay_publication"] = (
+            diagnostics.candidates_by_lane.get("relay_publication", 0)
+            + 1
+        )
+        items.append(
+            IntelligencePacketItem(
+                lane="relay_publication",
+                source_class=RELAY_PUBLICATION_SOURCE_CLASS,
+                source_type="accepted_relay_publication",
+                source_ref="relay:%s" % publication.relay_id,
+                source_digest=publication.source_digest,
+                subject_key="bnl_01",
+                predicate_key="accepted_relay_publication",
+                text=render_accepted_relay_publication(publication),
+                visibility="public",
+                confidence=Confidence.APPROVED.value,
+                lifecycle="published",
+                authority=0,
+                observed_at=publication.published_timestamp,
+                usage="publication_projection",
+                score=score_by_mode.get(publication.query_mode, 130.0),
+                revalidation_kind="relay_publication",
+                revalidation_key=json.dumps(
+                    {
+                        "relayId": publication.relay_id,
+                        "queryMode": publication.query_mode,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                attribution_mode="publication_only",
+                uncertainty_status=(
+                    "derived_publication_zero_fact_weight"
+                ),
+            )
+        )
+    diagnostics.publication_projection_count += len(items)
+    return items
+
+
 def _filter_frame_applicable_candidates(
     request: IntelligencePacketRequest,
     subject_resolution: PacketSubjectResolution,
@@ -4722,6 +4957,8 @@ def _select_items(
     profile_candidates: list[IntelligencePacketItem] = []
     broad_lane_priority = {
         "current_intent": 0,
+        "journal_publication": 1,
+        "relay_publication": 1,
         "approved_fact": 1,
         "recurring_theme": 2,
         "atomic_knowledge": 3,
@@ -4750,6 +4987,8 @@ def _select_items(
         )
     governed_subject_priority = {
         "current_intent": 0,
+        "journal_publication": 1,
+        "relay_publication": 1,
         "approved_fact": 1,
         "atomic_knowledge": 1,
         "recurring_theme": 1,
@@ -5521,11 +5760,21 @@ def _relationship_version(
     return str(posture.get("source_digest") or "")
 
 
+def _publication_revalidation_payload(item: IntelligencePacketItem) -> dict[str, Any]:
+    try:
+        value = json.loads(str(item.revalidation_key or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def _revalidate_packet_in_snapshot(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
     *,
     environ: Mapping[str, str] | None = None,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
 ) -> PacketRevalidationResult:
     """Re-read every durable source without applying packet content live."""
     changed = 0
@@ -5563,6 +5812,29 @@ def _revalidate_packet_in_snapshot(
             for item in (*packet.items, *packet.validation_items)
         }.values()
     )
+    current_journal_control = (
+        journal_control_snapshot
+        if journal_control_snapshot_provided
+        else packet.request.journal_control_snapshot
+    )
+    journal_query_requested = (
+        str(packet.diagnostics.journal_query_status or "not_requested")
+        != "not_requested"
+    )
+    if journal_control_snapshot_provided and journal_query_requested:
+        original_control = packet.request.journal_control_snapshot
+        if (
+            not isinstance(original_control, JournalControlSnapshot)
+            or not isinstance(current_journal_control, JournalControlSnapshot)
+            or journal_control_snapshot_status(
+                current_journal_control,
+                now=packet.request.now or None,
+            )
+            != "valid"
+            or original_control.authority_identity
+            != current_journal_control.authority_identity
+        ):
+            changed += 1
     for item in revalidation_items:
         try:
             if item.revalidation_kind == "conversation":
@@ -5648,6 +5920,25 @@ def _revalidate_packet_in_snapshot(
                     item,
                     environ=environ,
                 )
+            elif item.revalidation_kind == "journal_publication":
+                payload = _publication_revalidation_payload(item)
+                current = revalidate_published_journal_entry_on_connection(
+                    conn,
+                    guild_id=int(packet.request.guild_id or 0),
+                    entry_id=str(payload.get("entryId") or ""),
+                    revision=int(payload.get("revision") or 0),
+                    query_mode=str(payload.get("queryMode") or ""),
+                    control_snapshot=current_journal_control,
+                    now=packet.request.now or None,
+                )
+            elif item.revalidation_kind == "relay_publication":
+                payload = _publication_revalidation_payload(item)
+                current = revalidate_accepted_relay_publication_on_connection(
+                    conn,
+                    guild_id=int(packet.request.guild_id or 0),
+                    relay_id=str(payload.get("relayId") or ""),
+                    query_mode=str(payload.get("queryMode") or ""),
+                )
             elif item.revalidation_kind in {"current", "snapshot"}:
                 current = item.revalidation_key
             else:
@@ -5685,6 +5976,8 @@ def revalidate_packet(
     packet: UnifiedIntelligencePacket,
     *,
     environ: Mapping[str, str] | None = None,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
 ) -> PacketRevalidationResult:
     """Revalidate every source against one coherent database snapshot."""
 
@@ -5696,6 +5989,10 @@ def revalidate_packet(
             conn,
             packet,
             environ=environ,
+            journal_control_snapshot=journal_control_snapshot,
+            journal_control_snapshot_provided=(
+                journal_control_snapshot_provided
+            ),
         )
     finally:
         if owns_snapshot and conn.in_transaction:
@@ -5745,6 +6042,22 @@ def _packet_invariants(
         != packet.subject_resolution.status
     ):
         invalid.append("subject_resolution_receipt_mismatch")
+    for lane, status in (
+        (
+            "journal_publication",
+            packet.diagnostics.journal_query_status,
+        ),
+        (
+            "relay_publication",
+            packet.diagnostics.relay_query_status,
+        ),
+    ):
+        if status not in {"not_requested", "eligible"}:
+            invalid.append("%s_query_failed_closed" % lane)
+        elif status == "eligible" and not any(
+            item.lane == lane for item in packet.items
+        ):
+            invalid.append("%s_selection_missing" % lane)
     broad = _request_is_broad_profile(packet.request)
     for item in packet.items:
         if not _route_allows_item(packet.request, item):
@@ -5767,6 +6080,31 @@ def _packet_invariants(
             invalid.append("selected_subject_violation")
         if item.lane == "relationship_posture" and item.usage != "tone_only":
             invalid.append("relationship_fact_authority_violation")
+        if item.lane in {"journal_publication", "relay_publication"} and not (
+            item.usage == "publication_projection"
+            and item.lifecycle == "published"
+            and item.visibility in _PUBLIC_VISIBILITIES
+            and item.attribution_mode == "publication_only"
+            and item.uncertainty_status
+            == "derived_publication_zero_fact_weight"
+            and not item.root_identities
+            and not item.occurrence_identities
+            and not item.point_identity
+            and not item.canon_status
+            and not item.canon_domain
+            and not item.canon_claim_kind
+            and (
+                item.lane == "journal_publication"
+                and item.source_class == JOURNAL_PUBLICATION_SOURCE_CLASS
+                and item.source_type == "canonical_published_journal"
+                and item.revalidation_kind == "journal_publication"
+                or item.lane == "relay_publication"
+                and item.source_class == RELAY_PUBLICATION_SOURCE_CLASS
+                and item.source_type == "accepted_relay_publication"
+                and item.revalidation_kind == "relay_publication"
+            )
+        ):
+            invalid.append("publication_projection_authority_violation")
         if item.revalidation_kind in {"atomic", "recurring_theme"} and item.lifecycle not in {
             "established",
             "provisional",
@@ -5983,6 +6321,22 @@ def build_packet(
             _conversation_items(conn, request, diagnostics, exclusions)
         )
         candidates.extend(
+            _journal_publication_items(
+                conn,
+                request,
+                diagnostics,
+                exclusions,
+            )
+        )
+        candidates.extend(
+            _relay_publication_items(
+                conn,
+                request,
+                diagnostics,
+                exclusions,
+            )
+        )
+        candidates.extend(
             _assessment_observation_items(
                 conn,
                 request,
@@ -6116,6 +6470,11 @@ def build_packet(
         )
         for item in validation_items
     )
+    journal_control_identity = (
+        request.journal_control_snapshot.authority_identity
+        if isinstance(request.journal_control_snapshot, JournalControlSnapshot)
+        else (str(request.journal_control_status or "not_requested"),)
+    )
     diagnostics.packet_digest = _digest(
         SCHEMA_VERSION,
         request.frame_revision,
@@ -6123,6 +6482,7 @@ def build_packet(
         subject_resolution,
         prompt_digest_payload,
         validation_digest_payload,
+        journal_control_identity,
         profile_sufficiency,
     )
     source_snapshot_digest = _digest(
@@ -6132,6 +6492,7 @@ def build_packet(
         subject_resolution.binding_digest,
         prompt_digest_payload,
         validation_digest_payload,
+        journal_control_identity,
     )
     packet_id = "uip_" + _digest(
         SCHEMA_VERSION,
@@ -6300,7 +6661,10 @@ def persist_packet_run(
             frame_applicability_exclusion_count=?,source_snapshot_digest=?,
             episode_query_status=?,episode_candidate_count=?,
             theme_query_status=?,theme_independent_root_count=?,
-            theme_independent_occurrence_count=?
+            theme_independent_occurrence_count=?,journal_query_status=?,
+            journal_control_status=?,journal_candidate_count=?,
+            relay_query_status=?,relay_candidate_count=?,
+            publication_projection_count=?
         WHERE run_id=?
         """,
         (
@@ -6327,6 +6691,12 @@ def persist_packet_run(
             int(
                 packet.diagnostics.theme_independent_occurrence_count or 0
             ),
+            packet.diagnostics.journal_query_status,
+            packet.diagnostics.journal_control_status,
+            int(packet.diagnostics.journal_candidate_count or 0),
+            packet.diagnostics.relay_query_status,
+            int(packet.diagnostics.relay_candidate_count or 0),
+            int(packet.diagnostics.publication_projection_count or 0),
             run_id,
         ),
     )
@@ -6430,6 +6800,12 @@ def _empty_report() -> dict[str, Any]:
         "themeQueryStatusCounts": {},
         "themeIndependentRootTotal": 0,
         "themeIndependentOccurrenceTotal": 0,
+        "journalQueryStatusCounts": {},
+        "journalControlStatusCounts": {},
+        "journalCandidateTotal": 0,
+        "relayQueryStatusCounts": {},
+        "relayCandidateTotal": 0,
+        "publicationProjectionTotal": 0,
         "promptAppliedRuns": 0,
         "liveAppliedRuns": 0,
         "contentFieldsPresent": [],
@@ -6481,7 +6857,7 @@ def build_evaluation_report(
                processing_error_count,
                invalid_invariant_count,revalidation_status,
                revalidation_changed_count,prompt_applied,live_applied,
-               %s,%s,%s,%s,%s,%s,%s,%s,
+               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                created_at
         FROM memory_governance_intelligence_packet_runs
         WHERE guild_id=?
@@ -6511,6 +6887,12 @@ def build_evaluation_report(
             column("theme_query_status", "'not_requested'"),
             column("theme_independent_root_count", "0"),
             column("theme_independent_occurrence_count", "0"),
+            column("journal_query_status", "'not_requested'"),
+            column("journal_control_status", "'not_requested'"),
+            column("journal_candidate_count", "0"),
+            column("relay_query_status", "'not_requested'"),
+            column("relay_candidate_count", "0"),
+            column("publication_projection_count", "0"),
         ),
         (int(guild_id or 0), max(1, min(int(limit or 1000), 5000))),
     ).fetchall()
@@ -6527,12 +6909,16 @@ def build_evaluation_report(
     subject_methods: Counter[str] = Counter()
     episode_statuses: Counter[str] = Counter()
     theme_statuses: Counter[str] = Counter()
+    journal_statuses: Counter[str] = Counter()
+    journal_control_statuses: Counter[str] = Counter()
+    relay_statuses: Counter[str] = Counter()
     item_total = validation_item_total = 0
     conflicts = visibility = budget = duplicates = 0
     root_collapses = shared_roots = profile_met = 0
     profile_points = profile_roots = profile_occurrences = 0
     errors = invalid = changed = prompt = live = frame_exclusions = 0
     episode_candidates = theme_roots = theme_occurrences = 0
+    journal_candidates = relay_candidates = publication_projections = 0
     for row in rows:
         (
             _schema,
@@ -6571,6 +6957,12 @@ def build_evaluation_report(
             theme_query_status,
             theme_root_count,
             theme_occurrence_count,
+            journal_query_status,
+            journal_control_status,
+            journal_candidate_count,
+            relay_query_status,
+            relay_candidate_count,
+            publication_projection_count,
             _created_at,
         ) = row
         item_total += int(item_count or 0)
@@ -6631,6 +7023,14 @@ def build_evaluation_report(
         theme_statuses[str(theme_query_status or "not_requested")] += 1
         theme_roots += int(theme_root_count or 0)
         theme_occurrences += int(theme_occurrence_count or 0)
+        journal_statuses[str(journal_query_status or "not_requested")] += 1
+        journal_control_statuses[
+            str(journal_control_status or "not_requested")
+        ] += 1
+        journal_candidates += int(journal_candidate_count or 0)
+        relay_statuses[str(relay_query_status or "not_requested")] += 1
+        relay_candidates += int(relay_candidate_count or 0)
+        publication_projections += int(publication_projection_count or 0)
     return {
         "tablePresent": True,
         "schemaVersion": str(rows[0][0]) if rows else SCHEMA_VERSION,
@@ -6673,6 +7073,14 @@ def build_evaluation_report(
         "themeQueryStatusCounts": dict(sorted(theme_statuses.items())),
         "themeIndependentRootTotal": theme_roots,
         "themeIndependentOccurrenceTotal": theme_occurrences,
+        "journalQueryStatusCounts": dict(sorted(journal_statuses.items())),
+        "journalControlStatusCounts": dict(
+            sorted(journal_control_statuses.items())
+        ),
+        "journalCandidateTotal": journal_candidates,
+        "relayQueryStatusCounts": dict(sorted(relay_statuses.items())),
+        "relayCandidateTotal": relay_candidates,
+        "publicationProjectionTotal": publication_projections,
         "promptAppliedRuns": prompt,
         "liveAppliedRuns": live,
         "contentFieldsPresent": disallowed,

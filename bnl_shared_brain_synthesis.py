@@ -27,6 +27,7 @@ from bnl_memory_governance import (
     PERSONAL_RECALL_ROUTE_FAMILY,
     classify_personal_recall_intent,
 )
+from bnl_journal import JournalControlSnapshot
 from bnl_memory_ledger import (
     public_assessment_candidate_core_text,
     public_assessment_claim_compatible,
@@ -51,11 +52,11 @@ from bnl_unified_response_assessment import (
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_v7"
+SCHEMA_VERSION = "shared_brain_synthesis_v8"
 CAPABILITY_NAME = "shared_brain_public_broad_recall"
 CAPABILITY_CONTRACT_VERSION = "hybrid_shared_brain_v1"
 CAPABILITY_RECEIPT_VERSION = "shared_brain_capability_receipt_v1"
-_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v7"
+_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v8"
 _EXPECTED_CLAIM_CONTRACT_VERSION = "hybrid_canon_claim_v1"
 _EXPECTED_ASSESSMENT_VERSION = "unified_response_assessment_v7"
 _EXPECTED_IDENTITY_CONTRACT_VERSION = "canon_entity_account_binding_v1"
@@ -96,6 +97,8 @@ _RENDERABLE_LANES = {
     "recurring_theme",
     "open_loop",
     "canon",
+    "journal_publication",
+    "relay_publication",
     "source_file",
 }
 _PROFILE_MEMBER_LANES = frozenset(
@@ -139,6 +142,8 @@ _LANE_LABELS = {
     "recurring_theme": "recurring-theme evidence",
     "open_loop": "unresolved thread",
     "canon": "approved canon",
+    "journal_publication": "canonical Journal publication",
+    "relay_publication": "accepted Relay publication",
     "source_file": "authorized source context",
 }
 _CONTROL_MARKERS = (
@@ -188,6 +193,8 @@ _EVIDENCE_STOPWORDS = {
     "your",
 }
 _LANE_RENDER_PRIORITY = {
+    "journal_publication": 0,
+    "relay_publication": 0,
     "approved_fact": 0,
     "atomic_knowledge": 1,
     "recurring_theme": 1,
@@ -812,7 +819,7 @@ def _configuration_details(
         "claim_contract_version": _EXPECTED_CLAIM_CONTRACT_VERSION,
         "assessment_version": _EXPECTED_ASSESSMENT_VERSION,
         "identity_contract_version": _EXPECTED_IDENTITY_CONTRACT_VERSION,
-        "synthesis_version": "shared_brain_synthesis_v7",
+        "synthesis_version": "shared_brain_synthesis_v8",
     }
     version_conflicts = tuple(
         sorted(
@@ -1799,6 +1806,11 @@ def render_packet_context(
             )
         elif item.lane == "open_loop":
             qualifier = "; unresolved, not settled fact"
+        elif item.lane in {"journal_publication", "relay_publication"}:
+            qualifier = (
+                "; exact published prose; publication continuity only; "
+                "zero independent fact or recurrence weight"
+            )
         line = "[E%s | %s%s] %s" % (
             len(lines) + 1,
             label,
@@ -2173,6 +2185,8 @@ def revalidate_basis(
     basis: SharedBrainSynthesisBasis,
     *,
     environ: Mapping[str, str] | None = None,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
 ) -> tuple[bool, str]:
     env = os.environ if environ is None else environ
     details = _configuration_details(env)
@@ -2256,7 +2270,15 @@ def revalidate_basis(
         )
     ):
         return False, "scope_or_basis_changed"
-    result = revalidate_packet(conn, basis.packet, environ=env)
+    result = revalidate_packet(
+        conn,
+        basis.packet,
+        environ=env,
+        journal_control_snapshot=journal_control_snapshot,
+        journal_control_snapshot_provided=(
+            journal_control_snapshot_provided
+        ),
+    )
     return result.valid, result.status
 
 
@@ -4333,6 +4355,8 @@ def begin_run(
     candidate_prompt_failure_reason: str = "",
     replaced_factual_context_count: int = 0,
     environ: Mapping[str, str] | None = None,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
 ) -> SynthesisCanaryRun:
     ensure_schema(conn)
     run_id = "sbsr_" + uuid.uuid4().hex
@@ -4340,6 +4364,10 @@ def begin_run(
         conn,
         basis,
         environ=environ,
+        journal_control_snapshot=journal_control_snapshot,
+        journal_control_snapshot_provided=(
+            journal_control_snapshot_provided
+        ),
     )
     prompt_applied = bool(
         valid
@@ -4469,6 +4497,8 @@ def evaluate_candidate(
     candidate_response: str,
     candidate_generation_latency_ms: int | None = None,
     environ: Mapping[str, str] | None = None,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
 ) -> SynthesisCanaryDecision:
     baseline = str(baseline_response or "").strip()
     candidate = str(candidate_response or "").strip()
@@ -4476,6 +4506,10 @@ def evaluate_candidate(
         conn,
         run.basis,
         environ=environ,
+        journal_control_snapshot=journal_control_snapshot,
+        journal_control_snapshot_provided=(
+            journal_control_snapshot_provided
+        ),
     )
     baseline_coherence = assess_response_coherence(
         run.basis.assessment,

@@ -196,6 +196,7 @@ from bnl_unified_response_assessment import (
 )
 from bnl_journal import (
     JOURNAL_ROUTE,
+    JournalControlSnapshot,
     ensure_schema as ensure_journal_schema,
     approve_draft as approve_journal_draft,
     deliver_approved as deliver_approved_journal,
@@ -206,6 +207,8 @@ from bnl_journal import (
     regenerate_draft as regenerate_journal_draft,
     rehydrate_published_entries as rehydrate_published_journal_entries,
     reject_draft as reject_journal_draft,
+    journal_publication_query_mode,
+    parse_journal_control_snapshot,
 )
 from bnl_journal_source_store import (
     ensure_schema as ensure_journal_source_schema,
@@ -7449,7 +7452,12 @@ def _journal_control_url() -> str:
     return f"{base}/api/bnl/journal/control" if base else ""
 
 
-def _journal_control_request_sync(method: str, payload: dict | None = None) -> tuple[dict | None, str]:
+def _journal_control_request_sync(
+    method: str,
+    payload: dict | None = None,
+    *,
+    timeout_seconds: float = 10.0,
+) -> tuple[dict | None, str]:
     """Read or update the website control plane without making it a runtime dependency."""
     url = _journal_control_url()
     if not url or not BNL_API_KEY:
@@ -7461,7 +7469,10 @@ def _journal_control_request_sync(method: str, payload: dict | None = None) -> t
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=body, method=method.upper(), headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=max(0.25, min(float(timeout_seconds or 10.0), 10.0)),
+        ) as response:
             status = int(getattr(response, "status", None) or response.getcode())
             raw = response.read().decode("utf-8", errors="replace")
             data = json.loads(raw) if raw else {}
@@ -7472,6 +7483,27 @@ def _journal_control_request_sync(method: str, payload: dict | None = None) -> t
         return None, f"control_plane_http_{int(exc.code or 0)}"
     except Exception as exc:
         return None, f"control_plane_{type(exc).__name__.lower()}"
+
+
+def _journal_publication_control_snapshot_sync(
+    *,
+    now: str = "",
+) -> tuple[JournalControlSnapshot | None, str]:
+    """Fetch one fresh, authenticated visibility/reuse authority snapshot."""
+
+    control, reason = _journal_control_request_sync(
+        "GET",
+        timeout_seconds=1.5,
+    )
+    if control is None:
+        return None, reason or "control_snapshot_unavailable"
+    snapshot, parse_reason = parse_journal_control_snapshot(
+        control,
+        now=now or None,
+    )
+    if snapshot is None:
+        return None, parse_reason or "control_snapshot_invalid"
+    return snapshot, "valid"
 
 
 def _journal_control_flags(control: dict | None, fallback: dict) -> dict:
@@ -23467,6 +23499,13 @@ def _build_unified_intelligence_packet_shadow(
     shared_brain_configuration = (
         shared_brain_synthesis_canary_configuration()
     )
+    journal_control_snapshot: JournalControlSnapshot | None = None
+    journal_control_status = "not_requested"
+    if journal_publication_query_mode(current_text) != "not_requested":
+        (
+            journal_control_snapshot,
+            journal_control_status,
+        ) = _journal_publication_control_snapshot_sync()
     request = IntelligencePacketRequest(
         guild_id=int(guild_id or 0),
         subject_user_id=int(subject_user_id or 0),
@@ -23564,6 +23603,8 @@ def _build_unified_intelligence_packet_shadow(
             if isinstance(situation_frame, SituationFrameV1)
             else "unknown"
         ),
+        journal_control_snapshot=journal_control_snapshot,
+        journal_control_status=journal_control_status,
     )
     try:
         with sqlite3.connect(DB_FILE, timeout=0.25) as packet_conn:
@@ -24654,16 +24695,43 @@ def build_batch_moment_prompt_source_basis(
     )
 
 
+def _shared_brain_journal_revalidation_snapshot(
+    basis: SharedBrainSynthesisBasis,
+) -> tuple[JournalControlSnapshot | None, bool]:
+    requested = bool(
+        str(
+            getattr(
+                basis.packet.diagnostics,
+                "journal_query_status",
+                "not_requested",
+            )
+            or "not_requested"
+        )
+        != "not_requested"
+    )
+    if not requested:
+        return None, False
+    snapshot, _status = _journal_publication_control_snapshot_sync()
+    # A failed fetch is still an explicitly supplied revalidation result. The
+    # packet owner will reject it instead of silently reusing the old view.
+    return snapshot, True
+
+
 def refresh_prompt_source_basis(
     basis: PromptSourceBasis,
 ) -> tuple[PromptSourceBasis, bool]:
     """Synchronously rebuild one source basis after any provider await."""
     if isinstance(basis, SharedBrainSynthesisBasis):
         try:
+            snapshot, provided = (
+                _shared_brain_journal_revalidation_snapshot(basis)
+            )
             with sqlite3.connect(DB_FILE, timeout=0.25) as synthesis_conn:
                 valid, _status = revalidate_shared_brain_synthesis_basis(
                     synthesis_conn,
                     basis,
+                    journal_control_snapshot=snapshot,
+                    journal_control_snapshot_provided=provided,
                 )
             return basis, not valid
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
@@ -35178,6 +35246,9 @@ def _begin_shared_brain_synthesis_receipt(
     candidate_prompt_failure_reason: str = "",
     replaced_factual_context_count: int = 0,
 ):
+    journal_snapshot, journal_snapshot_provided = (
+        _shared_brain_journal_revalidation_snapshot(basis)
+    )
     with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
         run = begin_shared_brain_synthesis_run(
             conn,
@@ -35190,6 +35261,10 @@ def _begin_shared_brain_synthesis_receipt(
             replaced_factual_context_count=(
                 replaced_factual_context_count
             ),
+            journal_control_snapshot=journal_snapshot,
+            journal_control_snapshot_provided=(
+                journal_snapshot_provided
+            ),
         )
         conn.commit()
         return run
@@ -35201,6 +35276,9 @@ def _evaluate_shared_brain_synthesis_receipt(
     candidate_response: str,
     candidate_generation_latency_ms: int | None = None,
 ) -> SynthesisCanaryDecision:
+    journal_snapshot, journal_snapshot_provided = (
+        _shared_brain_journal_revalidation_snapshot(run.basis)
+    )
     with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
         decision = evaluate_shared_brain_synthesis_candidate(
             conn,
@@ -35209,6 +35287,10 @@ def _evaluate_shared_brain_synthesis_receipt(
             candidate_response=candidate_response,
             candidate_generation_latency_ms=(
                 candidate_generation_latency_ms
+            ),
+            journal_control_snapshot=journal_snapshot,
+            journal_control_snapshot_provided=(
+                journal_snapshot_provided
             ),
         )
         conn.commit()
