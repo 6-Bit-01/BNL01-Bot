@@ -26,6 +26,8 @@ from bnl_canon_source_contract import (
     CANON_FACTS,
     CANON_MEMBER_IDENTITIES,
     CANON_SOURCE_CONTRACT_VERSION,
+    LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+    LIVING_CANON_RECURRENCE_VERSION,
     SIX_BIT,
     CanonStatus,
     Confidence,
@@ -68,12 +70,16 @@ from bnl_memory_ledger import (
     select_public_conversation_assessment_evidence,
     subject_key_for_user,
 )
-from bnl_moment_engine import select_public_participant_moment_gists
+from bnl_moment_engine import (
+    SITUATION_EPISODE_READ_VERSION,
+    select_public_participant_moment_gists,
+    select_situation_aware_episode_gists,
+)
 from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import shadow_packet_posture
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v6"
+SCHEMA_VERSION = "unified_intelligence_packet_v7"
 SUBJECT_RESOLUTION_VERSION = "governed_packet_subject_resolution_v1"
 SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v1"
 TABLE_NAME = "memory_governance_intelligence_packet_runs"
@@ -138,7 +144,9 @@ _LANE_CAPS = {
     "assessment_observation": 4,
     "approved_fact": 4,
     "moment": 3,
+    "episode": 4,
     "atomic_knowledge": 6,
+    "recurring_theme": 3,
     "open_loop": 3,
     "canon": 4,
     "source_file": 2,
@@ -150,6 +158,8 @@ _BROAD_PROFILE_LANE_CAPS = {
     "assessment_observation": 4,
     "atomic_knowledge": 6,
     "moment": 2,
+    "episode": 2,
+    "recurring_theme": 2,
     "open_loop": 1,
     "canon": 1,
     "source_file": 1,
@@ -161,7 +171,9 @@ _VALIDATION_SUPPORT_LANES = frozenset(
         "assessment_observation",
         "approved_fact",
         "moment",
+        "episode",
         "atomic_knowledge",
+        "recurring_theme",
         "open_loop",
         "canon",
         "source_file",
@@ -172,7 +184,9 @@ _CLAIM_SUBJECT_SCOPED_LANES = frozenset(
         "assessment_observation",
         "approved_fact",
         "moment",
+        "episode",
         "atomic_knowledge",
+        "recurring_theme",
         "open_loop",
     }
 )
@@ -219,6 +233,8 @@ _ASSESSMENT_LANE_MAP = {
     "atomic_knowledge": "governed_memory",
     "open_loop": "governed_memory",
     "moment": "prior_moment",
+    "episode": "prior_moment",
+    "recurring_theme": "governed_memory",
     "canon": "canon",
     "source_file": "source_context",
     "relationship_posture": "relationship",
@@ -232,6 +248,24 @@ _ADDITIVE_PREDICATES = {
     "topic_or_motif",
 }
 _LIVING_CANON_NEUTRAL_PREDICATE_PREFIX = "conversation_motif_neutral_"
+_RECURRING_THEME_QUERY_RE = re.compile(
+    r"\b(?:recurring\s+(?:theme|pattern|topic|motif)s?|"
+    r"what\s+keeps\s+(?:recurring|coming\s+up|happening)|"
+    r"what\s+(?:themes?|patterns?)\s+(?:keep\s+)?"
+    r"(?:recurring|coming\s+up)|again\s+and\s+again|"
+    r"common\s+(?:theme|pattern)s?)\b",
+    re.I,
+)
+_EPISODE_QUERY_RE = re.compile(
+    r"\b(?:what\s+happened(?:\s+next)?|what\s+came\s+next|"
+    r"what\s+(?:is|was|remains?)\s+(?:still\s+)?open|"
+    r"what\s+remains|what\s+changed|what\s+was\s+corrected|"
+    r"what\s+was\s+(?:retested|tested\s+again|completed|resolved)|"
+    r"(?:correction|retest|retry|completion)\s+(?:history|result|status)|"
+    r"(?:resume|continue|reopen|return\s+to)\s+(?:that|this|the)|"
+    r"(?:moment|episode|open\s+loop|unresolved\s+thread)s?)\b",
+    re.I,
+)
 _TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]*", re.I)
 _TERM_STOPWORDS = {
     "a",
@@ -475,6 +509,11 @@ class IntelligencePacketItem:
     canon_status: str = ""
     canon_domain: str = ""
     canon_claim_kind: str = ""
+    event_ref: str = ""
+    episode_ref: str = ""
+    event_relation: str = ""
+    phase: str = ""
+    uncertainty_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -509,6 +548,11 @@ class IntelligencePacketDiagnostics:
     subject_resolution_method: str = "none"
     subject_resolution_candidate_count: int = 0
     frame_applicability_exclusion_count: int = 0
+    episode_query_status: str = "not_requested"
+    episode_candidate_count: int = 0
+    theme_query_status: str = "not_requested"
+    theme_independent_root_count: int = 0
+    theme_independent_occurrence_count: int = 0
     processing_errors: list[str] = field(default_factory=list)
     invalid_invariants: list[str] = field(default_factory=list)
     revalidation_status: str = "not_evaluated"
@@ -594,13 +638,21 @@ class UnifiedIntelligencePacket:
         return tuple(
             item.source_ref
             for item in self.items
-            if item.lane in {"approved_fact", "atomic_knowledge", "open_loop"}
+            if item.lane
+            in {
+                "approved_fact",
+                "atomic_knowledge",
+                "recurring_theme",
+                "open_loop",
+            }
         )
 
     @property
     def moment_refs(self) -> tuple[str, ...]:
         return tuple(
-            item.source_ref for item in self.items if item.lane == "moment"
+            item.source_ref
+            for item in self.items
+            if item.lane in {"moment", "episode"}
         )
 
     @property
@@ -1615,6 +1667,43 @@ def _moment_root_metadata(
     )
 
 
+def _moment_all_root_metadata(
+    conn: sqlite3.Connection,
+    *,
+    moment_id: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return independent human lineage for a subject-neutral event gist."""
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT member.ledger_entry_id
+            FROM memory_moment_members member
+            JOIN main.memory_ledger_entries entry
+              ON entry.entry_id=member.ledger_entry_id
+            WHERE member.moment_id=?
+              AND member.membership_role='human_author'
+              AND entry.source_role='user'
+              AND entry.lifecycle_status='active'
+              AND entry.derived=0 AND entry.projection=0
+            ORDER BY member.ledger_entry_id
+            """,
+            (str(moment_id or ""),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = ()
+    roots: list[str] = []
+    occurrences: list[str] = []
+    for (entry_id,) in rows:
+        root = knowledge_root_identity(conn, str(entry_id or ""))
+        occurrence = knowledge_occurrence_identity(conn, str(entry_id or ""))
+        if root:
+            roots.append(root)
+        if occurrence:
+            occurrences.append(occurrence)
+    return tuple(dict.fromkeys(roots)), tuple(dict.fromkeys(occurrences))
+
+
 def _profile_member_item(
     request: IntelligencePacketRequest,
     item: IntelligencePacketItem,
@@ -1803,7 +1892,9 @@ def _relevant(
     if broad and lane in {
         "approved_fact",
         "moment",
+        "episode",
         "atomic_knowledge",
+        "recurring_theme",
         "open_loop",
     }:
         return True
@@ -1912,6 +2003,20 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "INTEGER NOT NULL DEFAULT 0",
         ),
         ("source_snapshot_digest", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "episode_query_status",
+            "TEXT NOT NULL DEFAULT 'not_requested'",
+        ),
+        ("episode_candidate_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "theme_query_status",
+            "TEXT NOT NULL DEFAULT 'not_requested'",
+        ),
+        ("theme_independent_root_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "theme_independent_occurrence_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
     ):
         try:
             conn.execute(
@@ -2629,6 +2734,152 @@ def _governed_items(
     return items
 
 
+def _episode_projection_digest(
+    item: Any,
+    roots: tuple[str, ...],
+    occurrences: tuple[str, ...],
+) -> str:
+    return _digest(
+        SITUATION_EPISODE_READ_VERSION,
+        item,
+        roots,
+        occurrences,
+    )
+
+
+def _episode_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    subject_resolution: PacketSubjectResolution,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+) -> list[IntelligencePacketItem]:
+    """Read one frame-bound Moment/episode lane without owning lifecycle."""
+
+    if not _EPISODE_QUERY_RE.search(str(request.user_text or "")):
+        return []
+    diagnostics.episode_query_status = "requested"
+    subject_required = (
+        str(request.frame_subject_requirement or "").strip().lower()
+        == "required"
+    )
+    subject_key = str(subject_resolution.subject_key or "")
+    if subject_required and not re.fullmatch(
+        r"discord_user:[1-9]\d*",
+        subject_key,
+    ):
+        diagnostics.episode_query_status = "subject_has_no_discord_activity"
+        return []
+    participant_key = subject_key if subject_required else ""
+    rows = select_situation_aware_episode_gists(
+        conn,
+        guild_id=int(request.guild_id or 0),
+        participant_key=participant_key,
+        topic_text=str(request.user_text or "")[:8000],
+        frame_event_ref=str(request.frame_event_ref or ""),
+        frame_event_relation=str(request.frame_event_relation or "uncertain"),
+        frame_phase=str(request.frame_phase or ""),
+        broad_recall=bool(request.frame_event_ref),
+        allowed_channel_policies=("public_home", "public_context"),
+        max_results=4,
+    )
+    diagnostics.episode_candidate_count = len(rows)
+    diagnostics.episode_query_status = "selected" if rows else (
+        "ambiguous_or_unavailable"
+        if str(request.frame_event_relation or "")
+        in {"resume", "resume_unresolved", "concurrent_activity"}
+        else "no_applicable_episode"
+    )
+    items: list[IntelligencePacketItem] = []
+    for row in rows:
+        roots, occurrences = (
+            _moment_root_metadata(
+                conn,
+                moment_id=row.moment_id,
+                subject_key=participant_key,
+            )
+            if participant_key
+            else _moment_all_root_metadata(
+                conn,
+                moment_id=row.moment_id,
+            )
+        )
+        if not roots or not occurrences:
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="episode",
+                reason="episode_root_lineage_missing",
+                source_class="moment_gist",
+            )
+            continue
+        source_digest = _episode_projection_digest(row, roots, occurrences)
+        source_ref = "episode:%s:moment:%s" % (
+            row.episode_id or "standalone",
+            row.moment_id,
+        )
+        item = IntelligencePacketItem(
+            lane="episode",
+            source_class="moment_gist",
+            source_type=(
+                "participant_episode_gist"
+                if participant_key
+                else "situation_episode_summary"
+            ),
+            source_ref=source_ref,
+            source_digest=source_digest,
+            subject_key=(
+                participant_key
+                or "event:%s" % (row.episode_id or row.moment_id)
+            ),
+            predicate_key="episode_%s" % (
+                str(request.frame_task_kind or request.frame_phase or "event")
+            ),
+            text=str(row.gist or "")[:1200],
+            visibility=row.visibility,
+            confidence="high",
+            lifecycle=row.episode_lifecycle,
+            authority=_AUTHORITY_RANK["moment_gist"],
+            lineage=roots,
+            observed_at=row.last_activity_at,
+            usage="episode_paraphrase",
+            score=88.0 + min(4, row.sequence_index),
+            revalidation_kind="episode",
+            revalidation_key=row.moment_id,
+            root_identities=roots,
+            occurrence_identities=occurrences,
+            point_identity=(
+                _point_identity(
+                    subject_key=participant_key,
+                    predicate_key="episode",
+                    text=row.gist,
+                )
+                if participant_key
+                else ""
+            ),
+            event_ref=row.moment_id,
+            episode_ref=row.episode_id,
+            event_relation=row.event_relation,
+            phase=str(request.frame_phase or ""),
+            uncertainty_status=row.uncertainty_status,
+        )
+        if not _route_allows_item(request, item):
+            diagnostics.visibility_exclusions += 1
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="episode",
+                reason="episode_visibility",
+                source_class=item.source_class,
+            )
+            continue
+        diagnostics.candidates_by_lane["episode"] = (
+            diagnostics.candidates_by_lane.get("episode", 0) + 1
+        )
+        items.append(item)
+    return items
+
+
 def _declared_items(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
@@ -3215,6 +3466,118 @@ def _living_claim_for_candidate(
     return claim, ""
 
 
+def _provisional_theme_candidate_valid(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    candidate: Mapping[str, Any],
+    roots: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Validate a single-occurrence theme for sealed uncertainty preview."""
+
+    if str(request.channel_policy or "").strip().lower() != "sealed_test":
+        return False
+    try:
+        proof = json.loads(str(candidate.get("recurrence_proof_json") or "{}"))
+        stored_occurrences = json.loads(
+            str(candidate.get("occurrence_ids_json") or "[]")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(proof, dict) or not isinstance(stored_occurrences, list):
+        return False
+    root_entry_ids = tuple(
+        sorted(
+            str(root.get("root_entry_id") or "")
+            for root in roots
+            if str(root.get("root_entry_id") or "")
+        )
+    )
+    authoritative_occurrences = tuple(
+        sorted(
+            {
+                identity
+                for identity in (
+                    knowledge_occurrence_identity(conn, entry_id)
+                    for entry_id in root_entry_ids
+                )
+                if identity
+            }
+        )
+    )
+    normalized_stored = tuple(
+        sorted(
+            str(identity or "").strip()
+            for identity in stored_occurrences
+            if str(identity or "").strip()
+        )
+    )
+    if (
+        str(candidate.get("candidate_type") or "") != "topic_or_motif"
+        or str(candidate.get("candidate_state") or "") != "provisional"
+        or str(candidate.get("lifecycle_reason") or "")
+        != "single_occurrence_provisional"
+        or str(candidate.get("recurrence_contract_version") or "")
+        != LIVING_CANON_RECURRENCE_VERSION
+        or str(candidate.get("grouping_signature_version") or "")
+        != LIVING_CANON_GROUPING_SIGNATURE_VERSION
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(candidate.get("grouping_identity") or ""),
+        )
+        or str(candidate.get("canon_domain") or "")
+        not in {"real_community", "lore", "hybrid"}
+        or str(candidate.get("canon_claim_kind") or "")
+        != "behavior_pattern"
+        or not bool(candidate.get("candidate_eligible"))
+        or bool(candidate.get("public_usable"))
+        or bool(candidate.get("live_eligible"))
+        or str(candidate.get("invalidated_reason") or "")
+        or str(candidate.get("lifecycle_schema_version") or "")
+        != ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION
+        or int(candidate.get("conflict_value_count") or 0) != 1
+        or int(candidate.get("reinforcement_count") or 0) != 1
+        or int(candidate.get("independent_occurrence_count") or 0) != 1
+        or int(candidate.get("eligible_independent_root_count") or 0)
+        != len(root_entry_ids)
+        or len(authoritative_occurrences) != 1
+        or normalized_stored != authoritative_occurrences
+        or proof.get("candidate_state") != "provisional"
+        or proof.get("candidate_eligible") is not True
+        or proof.get("source_eligible") is not True
+        or proof.get("roots_valid") is not True
+        or proof.get("occurrence_bounded") is not True
+        or proof.get("correction_fence_clear") is not True
+        or proof.get("contradiction_clear") is not True
+        or int(proof.get("independent_root_count") or 0)
+        != len(root_entry_ids)
+        or int(proof.get("independent_occurrence_count") or 0) != 1
+        or str(proof.get("root_digest") or "")
+        != str(candidate.get("root_digest") or "")
+        or str(proof.get("occurrence_digest") or "")
+        != str(candidate.get("occurrence_digest") or "")
+        or not roots
+        or not all(
+            _atomic_root_valid(request, candidate, root) for root in roots
+        )
+    ):
+        return False
+    return not any(
+        conn.execute(
+            """
+            SELECT 1 FROM main.memory_ledger_lineage
+            WHERE guild_id=? AND target_entry_id=?
+              AND lineage_type IN ('correction_of','supersedes','retracts')
+            LIMIT 1
+            """,
+            (
+                int(request.guild_id or 0),
+                str(root.get("root_entry_id") or ""),
+            ),
+        ).fetchone()
+        for root in roots
+    )
+
+
 def _atomic_member_fact_authorized(
     candidate: Mapping[str, Any],
     authority_class: str,
@@ -3252,6 +3615,11 @@ def _atomic_items(
 ) -> list[IntelligencePacketItem]:
     if int(request.subject_user_id or 0) <= 0:
         return []
+    theme_query = bool(
+        _RECURRING_THEME_QUERY_RE.search(str(request.user_text or ""))
+    )
+    if theme_query:
+        diagnostics.theme_query_status = "requested"
     subject = _request_subject_key(request)
     candidate_ids = tuple(
         str(row[0])
@@ -3282,6 +3650,7 @@ def _atomic_items(
         roots = _atomic_root_snapshot(conn, candidate_id)
         living_marked = _living_candidate_marked(candidate)
         living_claim = None
+        provisional_theme = False
         candidate_type = str(candidate.get("candidate_type") or "")
         authority_class = str(
             candidate.get("consolidated_authority_class")
@@ -3292,9 +3661,6 @@ def _atomic_items(
             "open_loop"
             if candidate_type == "open_loop_or_question"
             else "atomic_knowledge"
-        )
-        diagnostics.candidates_by_lane[lane] = (
-            diagnostics.candidates_by_lane.get(lane, 0) + 1
         )
         review_status = str(candidate.get("review_status") or "")
         review_due = _parse_time(candidate.get("review_due_at"))
@@ -3308,6 +3674,18 @@ def _atomic_items(
                 candidate,
                 roots,
             )
+            if (
+                reason
+                and theme_query
+                and _provisional_theme_candidate_valid(
+                    conn,
+                    request,
+                    candidate,
+                    roots,
+                )
+            ):
+                provisional_theme = True
+                reason = ""
             if reason:
                 diagnostics.candidates_by_canon_status[
                     CanonStatus.LIVING.value
@@ -3326,7 +3704,14 @@ def _atomic_items(
                         0,
                     ) + 1
             else:
-                authority_class = living_claim.source_class.value
+                lane = "recurring_theme" if theme_query else lane
+                if living_claim is not None:
+                    authority_class = living_claim.source_class.value
+                elif provisional_theme:
+                    authority_class = SourceClass.EVIDENCE_PROJECTION.value
+        diagnostics.candidates_by_lane[lane] = (
+            diagnostics.candidates_by_lane.get(lane, 0) + 1
+        )
         if not reason and candidate.get("lifecycle_schema_version") != (
             ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION
         ):
@@ -3370,6 +3755,8 @@ def _atomic_items(
         visibility = (
             living_claim.visibility.value
             if living_claim is not None
+            else "sealed_test"
+            if provisional_theme
             else str(candidate.get("visibility") or "unknown")
         )
         if not reason and _public_route(request) and visibility not in _PUBLIC_VISIBILITIES:
@@ -3434,7 +3821,7 @@ def _atomic_items(
         text = str(candidate.get("normalized_value") or "").strip()
         if not reason and not _relevant(
             request_terms=request_terms,
-            broad=broad,
+            broad=broad or (theme_query and lane == "recurring_theme"),
             lane=lane,
             text=text,
             predicate_key=str(candidate.get("predicate_key") or ""),
@@ -3444,7 +3831,7 @@ def _atomic_items(
         source_digest = (
             (
                 _living_atomic_candidate_digest(conn, candidate_id)
-                if living_claim is not None
+                if living_claim is not None or provisional_theme
                 else _atomic_candidate_digest(conn, candidate_id)
             )
             if not reason
@@ -3469,6 +3856,8 @@ def _atomic_items(
         confidence = (
             living_claim.confidence.value
             if living_claim is not None
+            else Confidence.LOW.value
+            if provisional_theme
             else str(
                 candidate.get("consolidated_confidence_class")
                 or candidate.get("confidence_class")
@@ -3535,6 +3924,21 @@ def _atomic_items(
                 source_class=authority_class,
             )
             continue
+        if lane == "recurring_theme":
+            diagnostics.theme_independent_root_count = max(
+                diagnostics.theme_independent_root_count,
+                len(root_identities),
+            )
+            diagnostics.theme_independent_occurrence_count = max(
+                diagnostics.theme_independent_occurrence_count,
+                len(occurrence_identities),
+            )
+            if not provisional_theme:
+                diagnostics.theme_query_status = "established"
+            elif diagnostics.theme_query_status != "established":
+                diagnostics.theme_query_status = (
+                    "provisional_single_occurrence"
+                )
         items.append(
             IntelligencePacketItem(
                 lane=lane,
@@ -3552,7 +3956,15 @@ def _atomic_items(
                 participants=participants,
                 lineage=root_entry_ids,
                 observed_at=str(candidate.get("last_seen_at") or ""),
-                usage="tentative" if state == "provisional" else "content",
+                usage=(
+                    "provisional_single_occurrence"
+                    if provisional_theme
+                    else "established_recurrence"
+                    if lane == "recurring_theme"
+                    else "tentative"
+                    if state == "provisional"
+                    else "content"
+                ),
                 score=base_score
                 + 0.4
                 * len(
@@ -3563,7 +3975,11 @@ def _atomic_items(
                         | set(tags)
                     )
                 ),
-                revalidation_kind="atomic",
+                revalidation_kind=(
+                    "recurring_theme"
+                    if lane == "recurring_theme"
+                    else "atomic"
+                ),
                 revalidation_key=candidate_id,
                 root_identities=root_identities,
                 occurrence_identities=occurrence_identities,
@@ -3590,8 +4006,17 @@ def _atomic_items(
                     if living_claim is not None
                     else ""
                 ),
+                uncertainty_status=(
+                    "single_occurrence_not_recurrence"
+                    if provisional_theme
+                    else "independent_recurrence_established"
+                    if lane == "recurring_theme"
+                    else ""
+                ),
             )
         )
+    if theme_query and diagnostics.theme_query_status == "requested":
+        diagnostics.theme_query_status = "no_authoritative_theme"
     return items
 
 
@@ -4020,9 +4445,23 @@ def _apply_current_turn_precedence(
                 source_class=item.source_class,
             )
             continue
+        if item.lane == "recurring_theme" and item.subject_key == subject:
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane=item.lane,
+                reason="current_turn_correction_precedence",
+                source_class=item.source_class,
+            )
+            continue
         if (
             item.lane
-            in {"approved_fact", "atomic_knowledge", "open_loop"}
+            in {
+                "approved_fact",
+                "atomic_knowledge",
+                "recurring_theme",
+                "open_loop",
+            }
             and item.subject_key == subject
             and predicate_terms
             and current_terms & predicate_terms
@@ -4126,7 +4565,9 @@ def _filter_frame_applicable_candidates(
         "assessment_observation",
         "approved_fact",
         "moment",
+        "episode",
         "atomic_knowledge",
+        "recurring_theme",
         "open_loop",
         "canon",
         "relationship_posture",
@@ -4163,10 +4604,20 @@ def _filter_frame_applicable_candidates(
         ):
             exclude(item, "current_operational_source_precedence")
             continue
-        if item.lane == "moment" and frame_event_ref:
-            item_event_ref = str(item.revalidation_key or "").strip()
+        if item.lane in {"moment", "episode"} and frame_event_ref:
+            item_event_ref = str(
+                item.event_ref or item.revalidation_key or ""
+            ).strip()
             if event_relation in {"same_event", "same_event_new_phase", "resume"}:
-                if item_event_ref != frame_event_ref:
+                if (
+                    item_event_ref != frame_event_ref
+                    and not (
+                        item.lane == "episode"
+                        and item.episode_ref
+                        and item.event_relation
+                        in {"same_event", "same_event_new_phase", "resume"}
+                    )
+                ):
                     exclude(item, "frame_event_mismatch")
                     continue
             elif event_relation in {
@@ -4272,11 +4723,13 @@ def _select_items(
     broad_lane_priority = {
         "current_intent": 0,
         "approved_fact": 1,
-        "atomic_knowledge": 2,
+        "recurring_theme": 2,
+        "atomic_knowledge": 3,
         "conversation_context": 3,
         "assessment_observation": 4,
-        "moment": 5,
-        "open_loop": 6,
+        "episode": 5,
+        "moment": 6,
+        "open_loop": 7,
         "canon": 8,
         "source_file": 9,
         "relationship_posture": 10,
@@ -4288,19 +4741,23 @@ def _select_items(
                 "conversation_context": 1,
                 "assessment_observation": 2,
                 "approved_fact": 3,
-                "atomic_knowledge": 4,
-                "moment": 5,
-                "open_loop": 6,
+                "recurring_theme": 4,
+                "atomic_knowledge": 5,
+                "episode": 6,
+                "moment": 7,
+                "open_loop": 8,
             }
         )
     governed_subject_priority = {
         "current_intent": 0,
         "approved_fact": 1,
         "atomic_knowledge": 1,
+        "recurring_theme": 1,
         "conversation_context": 1,
         "assessment_observation": 1,
         "open_loop": 1,
-        "moment": 2,
+        "episode": 2,
+        "moment": 3,
         "canon": 3,
         "relationship_posture": 4,
         "source_file": 5,
@@ -4765,6 +5222,60 @@ def _moment_version(
     return ""
 
 
+def _episode_version(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    item: IntelligencePacketItem,
+) -> str:
+    participant_key = (
+        item.subject_key
+        if item.source_type == "participant_episode_gist"
+        else ""
+    )
+    rows = select_situation_aware_episode_gists(
+        conn,
+        guild_id=int(packet.request.guild_id or 0),
+        participant_key=participant_key,
+        topic_text=str(packet.request.user_text or "")[:8000],
+        frame_event_ref=str(packet.request.frame_event_ref or ""),
+        frame_event_relation=str(
+            packet.request.frame_event_relation or "uncertain"
+        ),
+        frame_phase=str(packet.request.frame_phase or ""),
+        broad_recall=bool(packet.request.frame_event_ref),
+        allowed_channel_policies=("public_home", "public_context"),
+        max_results=4,
+    )
+    for row in rows:
+        source_ref = "episode:%s:moment:%s" % (
+            row.episode_id or "standalone",
+            row.moment_id,
+        )
+        if source_ref != item.source_ref:
+            continue
+        roots, occurrences = (
+            _moment_root_metadata(
+                conn,
+                moment_id=row.moment_id,
+                subject_key=participant_key,
+            )
+            if participant_key
+            else _moment_all_root_metadata(
+                conn,
+                moment_id=row.moment_id,
+            )
+        )
+        if (
+            roots != item.root_identities
+            or occurrences != item.occurrence_identities
+            or row.event_relation != item.event_relation
+            or row.uncertainty_status != item.uncertainty_status
+        ):
+            return ""
+        return _episode_projection_digest(row, roots, occurrences)
+    return ""
+
+
 def _canon_version(item: IntelligencePacketItem) -> str:
     for fact in CANON_FACTS:
         if _canon_digest(fact) == item.revalidation_key:
@@ -4854,6 +5365,61 @@ def _living_atomic_version(
         and item.canon_claim_kind == claim.claim_kind.value
         and item.root_identities == root_identities
         and item.occurrence_identities == occurrence_identities
+    ):
+        return ""
+    return _living_atomic_candidate_digest(conn, candidate_id)
+
+
+def _recurring_theme_version(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    item: IntelligencePacketItem,
+) -> str:
+    candidate_id = str(item.revalidation_key or "")
+    candidate = _atomic_candidate_row(conn, candidate_id)
+    roots = _atomic_root_snapshot(conn, candidate_id)
+    if item.canon_status == CanonStatus.LIVING.value:
+        return _living_atomic_version(conn, item)
+    if not (
+        item.usage == "provisional_single_occurrence"
+        and item.uncertainty_status == "single_occurrence_not_recurrence"
+        and _provisional_theme_candidate_valid(
+            conn,
+            packet.request,
+            candidate,
+            roots,
+        )
+    ):
+        return ""
+    root_entry_ids = tuple(
+        str(root.get("root_entry_id") or "")
+        for root in roots
+        if str(root.get("root_entry_id") or "")
+    )
+    root_identities = tuple(
+        dict.fromkeys(
+            identity
+            for identity in (
+                knowledge_root_identity(conn, entry_id)
+                for entry_id in root_entry_ids
+            )
+            if identity
+        )
+    )
+    occurrence_identities = tuple(
+        dict.fromkeys(
+            identity
+            for identity in (
+                knowledge_occurrence_identity(conn, entry_id)
+                for entry_id in root_entry_ids
+            )
+            if identity
+        )
+    )
+    if (
+        item.root_identities != root_identities
+        or item.occurrence_identities != occurrence_identities
+        or len(occurrence_identities) != 1
     ):
         return ""
     return _living_atomic_candidate_digest(conn, candidate_id)
@@ -5042,6 +5608,8 @@ def _revalidate_packet_in_snapshot(
                 current = _ledger_entry_digest(conn, item.revalidation_key)
             elif item.revalidation_kind == "moment":
                 current = _moment_version(conn, packet, item)
+            elif item.revalidation_kind == "episode":
+                current = _episode_version(conn, packet, item)
             elif item.revalidation_kind == "atomic":
                 current = (
                     _living_atomic_version(conn, item)
@@ -5050,6 +5618,12 @@ def _revalidate_packet_in_snapshot(
                         conn,
                         item.revalidation_key,
                     )
+                )
+            elif item.revalidation_kind == "recurring_theme":
+                current = _recurring_theme_version(
+                    conn,
+                    packet,
+                    item,
                 )
             elif item.revalidation_kind == "canon":
                 current = _canon_version(item)
@@ -5181,8 +5755,10 @@ def _packet_invariants(
                 "approved_fact",
                 "assessment_observation",
                 "atomic_knowledge",
+                "recurring_theme",
                 "open_loop",
                 "moment",
+                "episode",
                 "relationship_posture",
             }
             and subject_scope_enforced
@@ -5191,7 +5767,7 @@ def _packet_invariants(
             invalid.append("selected_subject_violation")
         if item.lane == "relationship_posture" and item.usage != "tone_only":
             invalid.append("relationship_fact_authority_violation")
-        if item.revalidation_kind == "atomic" and item.lifecycle not in {
+        if item.revalidation_kind in {"atomic", "recurring_theme"} and item.lifecycle not in {
             "established",
             "provisional",
         }:
@@ -5232,23 +5808,62 @@ def _packet_invariants(
         ):
             invalid.append("profile_item_root_lineage_violation")
         if item.supporting_observations and not (
-            item.lane == "atomic_knowledge"
+            item.lane in {"atomic_knowledge", "recurring_theme"}
             and item.source_type == "topic_or_motif"
             and item.subject_key == subject
         ):
             invalid.append("supporting_observation_scope_violation")
         if item.canon_status == CanonStatus.LIVING.value and not (
-            item.lane == "atomic_knowledge"
+            item.lane in {"atomic_knowledge", "recurring_theme"}
             and item.source_type == "topic_or_motif"
             and item.lifecycle == "established"
             and item.source_class == SourceClass.EVIDENCE_PROJECTION.value
-            and item.revalidation_kind == "atomic"
+            and item.revalidation_kind in {"atomic", "recurring_theme"}
             and item.canon_domain in {"real_community", "lore", "hybrid"}
             and item.canon_claim_kind == "behavior_pattern"
             and len(item.root_identities) >= 2
             and len(item.occurrence_identities) >= 2
         ):
             invalid.append("living_canon_contract_violation")
+        if item.lane == "recurring_theme" and not (
+            item.source_type == "topic_or_motif"
+            and item.revalidation_kind == "recurring_theme"
+            and item.subject_key == subject
+            and bool(item.root_identities)
+            and bool(item.occurrence_identities)
+            and (
+                (
+                    item.canon_status == CanonStatus.LIVING.value
+                    and item.usage == "established_recurrence"
+                    and item.uncertainty_status
+                    == "independent_recurrence_established"
+                    and len(item.root_identities) >= 2
+                    and len(item.occurrence_identities) >= 2
+                )
+                or (
+                    not item.canon_status
+                    and item.lifecycle == "provisional"
+                    and item.usage == "provisional_single_occurrence"
+                    and item.uncertainty_status
+                    == "single_occurrence_not_recurrence"
+                    and len(item.occurrence_identities) == 1
+                    and packet.request.channel_policy == "sealed_test"
+                )
+            )
+        ):
+            invalid.append("recurring_theme_contract_violation")
+        if item.lane == "episode" and not (
+            item.revalidation_kind == "episode"
+            and item.source_class == "moment_gist"
+            and item.source_type
+            in {"participant_episode_gist", "situation_episode_summary"}
+            and item.event_ref
+            and item.uncertainty_status
+            in {"source_backed_episode", "standalone_moment_only"}
+            and item.root_identities
+            and item.occurrence_identities
+        ):
+            invalid.append("episode_lane_contract_violation")
         if item.canon_status == CanonStatus.OPEN_SIGNAL.value and not (
             item.lane == "assessment_observation"
             and item.revalidation_kind == "public_assessment"
@@ -5383,6 +5998,15 @@ def build_packet(
                 diagnostics,
                 exclusions,
                 broad=broad,
+            )
+        )
+        candidates.extend(
+            _episode_items(
+                conn,
+                request,
+                subject_resolution,
+                diagnostics,
+                exclusions,
             )
         )
         candidates.extend(
@@ -5673,7 +6297,10 @@ def persist_packet_run(
             frame_revision=?,frame_input_digest=?,
             subject_resolution_status=?,subject_resolution_method=?,
             subject_resolution_candidate_count=?,
-            frame_applicability_exclusion_count=?,source_snapshot_digest=?
+            frame_applicability_exclusion_count=?,source_snapshot_digest=?,
+            episode_query_status=?,episode_candidate_count=?,
+            theme_query_status=?,theme_independent_root_count=?,
+            theme_independent_occurrence_count=?
         WHERE run_id=?
         """,
         (
@@ -5693,6 +6320,13 @@ def persist_packet_run(
                 packet.diagnostics.frame_applicability_exclusion_count or 0
             ),
             packet.source_snapshot_digest,
+            packet.diagnostics.episode_query_status,
+            int(packet.diagnostics.episode_candidate_count or 0),
+            packet.diagnostics.theme_query_status,
+            int(packet.diagnostics.theme_independent_root_count or 0),
+            int(
+                packet.diagnostics.theme_independent_occurrence_count or 0
+            ),
             run_id,
         ),
     )
@@ -5791,6 +6425,11 @@ def _empty_report() -> dict[str, Any]:
         "subjectResolutionStatusCounts": {},
         "subjectResolutionMethodCounts": {},
         "frameApplicabilityExclusions": 0,
+        "episodeQueryStatusCounts": {},
+        "episodeCandidateTotal": 0,
+        "themeQueryStatusCounts": {},
+        "themeIndependentRootTotal": 0,
+        "themeIndependentOccurrenceTotal": 0,
         "promptAppliedRuns": 0,
         "liveAppliedRuns": 0,
         "contentFieldsPresent": [],
@@ -5842,7 +6481,7 @@ def build_evaluation_report(
                processing_error_count,
                invalid_invariant_count,revalidation_status,
                revalidation_changed_count,prompt_applied,live_applied,
-               %s,%s,%s,
+               %s,%s,%s,%s,%s,%s,%s,%s,
                created_at
         FROM memory_governance_intelligence_packet_runs
         WHERE guild_id=?
@@ -5867,6 +6506,11 @@ def build_evaluation_report(
             column("subject_resolution_status", "'not_evaluated'"),
             column("subject_resolution_method", "'none'"),
             column("frame_applicability_exclusion_count", "0"),
+            column("episode_query_status", "'not_requested'"),
+            column("episode_candidate_count", "0"),
+            column("theme_query_status", "'not_requested'"),
+            column("theme_independent_root_count", "0"),
+            column("theme_independent_occurrence_count", "0"),
         ),
         (int(guild_id or 0), max(1, min(int(limit or 1000), 5000))),
     ).fetchall()
@@ -5881,11 +6525,14 @@ def build_evaluation_report(
     profile_reasons: Counter[str] = Counter()
     subject_statuses: Counter[str] = Counter()
     subject_methods: Counter[str] = Counter()
+    episode_statuses: Counter[str] = Counter()
+    theme_statuses: Counter[str] = Counter()
     item_total = validation_item_total = 0
     conflicts = visibility = budget = duplicates = 0
     root_collapses = shared_roots = profile_met = 0
     profile_points = profile_roots = profile_occurrences = 0
     errors = invalid = changed = prompt = live = frame_exclusions = 0
+    episode_candidates = theme_roots = theme_occurrences = 0
     for row in rows:
         (
             _schema,
@@ -5919,6 +6566,11 @@ def build_evaluation_report(
             subject_resolution_status,
             subject_resolution_method,
             frame_exclusion_count,
+            episode_query_status,
+            episode_candidate_count,
+            theme_query_status,
+            theme_root_count,
+            theme_occurrence_count,
             _created_at,
         ) = row
         item_total += int(item_count or 0)
@@ -5974,6 +6626,11 @@ def build_evaluation_report(
         ] += 1
         subject_methods[str(subject_resolution_method or "none")] += 1
         frame_exclusions += int(frame_exclusion_count or 0)
+        episode_statuses[str(episode_query_status or "not_requested")] += 1
+        episode_candidates += int(episode_candidate_count or 0)
+        theme_statuses[str(theme_query_status or "not_requested")] += 1
+        theme_roots += int(theme_root_count or 0)
+        theme_occurrences += int(theme_occurrence_count or 0)
     return {
         "tablePresent": True,
         "schemaVersion": str(rows[0][0]) if rows else SCHEMA_VERSION,
@@ -6011,6 +6668,11 @@ def build_evaluation_report(
             sorted(subject_methods.items())
         ),
         "frameApplicabilityExclusions": frame_exclusions,
+        "episodeQueryStatusCounts": dict(sorted(episode_statuses.items())),
+        "episodeCandidateTotal": episode_candidates,
+        "themeQueryStatusCounts": dict(sorted(theme_statuses.items())),
+        "themeIndependentRootTotal": theme_roots,
+        "themeIndependentOccurrenceTotal": theme_occurrences,
         "promptAppliedRuns": prompt,
         "liveAppliedRuns": live,
         "contentFieldsPresent": disallowed,

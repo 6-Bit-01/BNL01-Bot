@@ -245,6 +245,124 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             1,
         )
 
+    def test_situation_reader_selects_next_phase_and_closed_open_loop(self):
+        first_moment, _ = self.finalize_shared_moment(
+            120,
+            (
+                "Let's build the synth routing and test the chorus",
+                "The synth drum patch can answer the bass",
+                "Which synth layer remains open?",
+            ),
+            users=(1, 2, 3),
+        )
+        second_moment, _ = self.finalize_shared_moment(
+            130,
+            (
+                "The synth bass routing now uses the warmer patch",
+                "Let's test the synth chorus routing again",
+                "The synth routing test passed and this is complete",
+            ),
+            minutes=10,
+            users=(1, 2, 3),
+        )
+
+        rows = moments.select_situation_aware_episode_gists(
+            self.conn,
+            guild_id=1,
+            topic_text="What happened next with the synth chorus?",
+            frame_event_ref=first_moment,
+            frame_event_relation="same_event_new_phase",
+            frame_phase="diagnosis",
+            broad_recall=True,
+            allowed_channel_policies=("public_home",),
+            max_results=4,
+        )
+        self.assertEqual(tuple(row.moment_id for row in rows), (second_moment,))
+        self.assertEqual(rows[0].sequence_index, 1)
+        self.assertIn("retest", rows[0].semantic_types)
+        self.assertIn("outcome", rows[0].semantic_types)
+        self.assertEqual(rows[0].episode_lifecycle, "finalized")
+        self.assertEqual(rows[0].event_relation, "same_event_new_phase")
+
+        open_rows = moments.select_situation_aware_episode_gists(
+            self.conn,
+            guild_id=1,
+            topic_text="What remains open with the synth chorus?",
+            frame_event_ref=second_moment,
+            frame_event_relation="same_event",
+            frame_phase="diagnosis",
+            broad_recall=True,
+            allowed_channel_policies=("public_home",),
+            max_results=4,
+        )
+        self.assertEqual(open_rows, ())
+        new_event_rows = moments.select_situation_aware_episode_gists(
+            self.conn,
+            guild_id=1,
+            topic_text="This is a different synth failure.",
+            frame_event_ref=second_moment,
+            frame_event_relation="new_event_same_participant",
+            frame_phase="failure",
+            broad_recall=True,
+            allowed_channel_policies=("public_home",),
+            max_results=4,
+        )
+        self.assertEqual(new_event_rows, ())
+
+    def test_correction_retest_reader_uses_only_fresh_episode(self):
+        first_moment, _ = self.finalize_shared_moment(
+            140,
+            (
+                "Let's build the synth routing and test the chorus",
+                "The synth drum patch can answer the bass",
+                "Which synth layer remains open?",
+            ),
+            users=(1, 2, 3),
+        )
+        corrected_moment, _ = self.finalize_shared_moment(
+            150,
+            (
+                "Actually the synth bass routing uses the warmer patch",
+                "Let's test the synth chorus routing again",
+                "The synth routing test passed and this is done",
+            ),
+            minutes=10,
+            users=(1, 2, 3),
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT lifecycle_status FROM memory_moment_windows
+                WHERE moment_id=?
+                """,
+                (first_moment,),
+            ).fetchone()[0],
+            "needs_review",
+        )
+
+        for query, phase, semantic_type in (
+            ("What changed with the synth routing?", "correction", "correction"),
+            ("What was retested with the synth routing?", "retest", "retest"),
+            ("What was completed with the synth routing?", "completion", "outcome"),
+        ):
+            with self.subTest(query=query):
+                rows = moments.select_situation_aware_episode_gists(
+                    self.conn,
+                    guild_id=1,
+                    topic_text=query,
+                    frame_event_ref=corrected_moment,
+                    frame_event_relation="same_event_new_phase",
+                    frame_phase=phase,
+                    broad_recall=True,
+                    allowed_channel_policies=("public_home",),
+                    max_results=4,
+                )
+                self.assertEqual(
+                    tuple(row.moment_id for row in rows),
+                    (corrected_moment,),
+                )
+                self.assertIn(semantic_type, rows[0].semantic_types)
+
     def test_topic_change_splits_and_preserves_interruption_lineage(self):
         self.finalize_shared_moment(
             200,
@@ -424,6 +542,91 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
                 """
             ).fetchone()[0],
             1,
+        )
+
+    def test_delayed_and_explicit_cross_channel_resume_are_source_bounded(self):
+        moment_id, _ = self.finalize_shared_moment(
+            430,
+            (
+                "The synth routing should keep the chorus wide",
+                "The synth drum patch can answer the bass",
+                "Which synth layer should we revisit?",
+            ),
+        )
+        before = self.conn.total_changes
+        delayed = moments.recent_moment_situation_for_assessment(
+            self.conn,
+            guild_id=1,
+            channel_id=10,
+            channel_policy="public_home",
+            route_mode="normal_chat",
+            topic_text="Delayed reply: let's continue the synth routing.",
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(hours=48),
+        )
+        self.assertIsNotNone(delayed)
+        self.assertEqual(delayed.moment_id, moment_id)
+        self.assertEqual(delayed.selection_reason, "explicit_delayed_resume")
+        self.assertFalse(delayed.cross_channel_continuation)
+
+        cross_channel = moments.recent_moment_situation_for_assessment(
+            self.conn,
+            guild_id=1,
+            channel_id=99,
+            channel_policy="public_home",
+            route_mode="normal_chat",
+            topic_text="Let's continue the synth routing from <#10>.",
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(hours=48),
+        )
+        self.assertIsNotNone(cross_channel)
+        self.assertEqual(cross_channel.moment_id, moment_id)
+        self.assertEqual(cross_channel.source_channel_id, 10)
+        self.assertTrue(cross_channel.cross_channel_continuation)
+        self.assertEqual(
+            cross_channel.selection_reason,
+            "explicit_cross_channel_resume",
+        )
+        self.assertEqual(self.conn.total_changes, before)
+
+    def test_situation_reader_rejects_ambiguous_delayed_resume(self):
+        self.finalize_shared_moment(
+            470,
+            (
+                "The synth routing should keep the chorus wide",
+                "The synth drum patch can answer the bass",
+                "Which synth layer should we revisit?",
+            ),
+        )
+        moments.sweep_expired_episodes(
+            self.conn,
+            now=self.timestamp(hours=25),
+        )
+        self.finalize_shared_moment(
+            480,
+            (
+                "The synth routing has a warmer chorus shape",
+                "The synth drum patch follows the bass",
+                "The synth layer needs another test",
+            ),
+            hours=48,
+        )
+        moments.sweep_expired_episodes(
+            self.conn,
+            now=self.timestamp(hours=73),
+        )
+
+        self.assertIsNone(
+            moments.recent_moment_situation_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="public_home",
+                route_mode="normal_chat",
+                topic_text="Coming back to this: continue the synth routing.",
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(hours=96),
+            )
         )
 
     def test_explicit_unique_related_source_links_distinct_episodes(self):

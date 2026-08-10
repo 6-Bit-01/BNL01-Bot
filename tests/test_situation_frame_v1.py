@@ -169,6 +169,64 @@ class SituationFrameV1Tests(unittest.TestCase):
         self.assertEqual(blocked.status, "blocked")
         self.assertEqual(blocked.visibility_allowance, "blocked")
 
+    def test_scene_transition_language_is_typed_without_guessing(self):
+        base = {
+            "route_allowed": True,
+            "route_mode": "normal_chat",
+            "conversation_surface": "public_home",
+            "channel_policy": "public_home",
+            "current_speaker_user_ids": (101,),
+            "subject_user_ids": (101,),
+            "moment_id": "moment_test_01",
+            "moment_situation_state": "recent_active",
+            "moment_topic_coherent": True,
+            "moment_participant_overlap": True,
+            "response_act": "answer",
+        }
+        cases = (
+            (
+                "This is another failure, not the same incident.",
+                "new_event_same_participant",
+            ),
+            (
+                "Meanwhile, keep the synth retest running in parallel.",
+                "concurrent_activity",
+            ),
+            (
+                "A different participant is handling the synth retest.",
+                "comparison_or_participant_change",
+            ),
+            (
+                "Correction: use the warmer synth patch instead.",
+                "same_event_new_phase",
+            ),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    current_text=text,
+                    **base,
+                )
+                self.assertEqual(frame.event_relation, expected)
+
+        unresolved = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text="Coming back to this: continue the synth retest.",
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_situation_state="none",
+            moment_topic_coherent=False,
+            moment_participant_overlap=False,
+            response_act="answer",
+        )
+        self.assertEqual(unresolved.event_relation, "resume_unresolved")
+        self.assertEqual(unresolved.status, "ambiguous")
+        self.assertIn("resume_target_unresolved", unresolved.ambiguity_reasons)
+        self.assertIn("resume_episode_candidates", unresolved.competing_frames)
+
     def test_revalidation_is_separate_and_fails_closed_by_state(self):
         frame = build_situation_frame_v1(
             route_allowed=True,

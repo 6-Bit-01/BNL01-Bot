@@ -20,6 +20,7 @@ from bnl_shared_brain_synthesis import render_packet_context
 from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
     PacketConversationEvidence,
+    PacketFrameSubject,
     _safe_atomic_supporting_observation,
     build_evaluation_report,
     build_packet,
@@ -249,6 +250,57 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertIsNotNone(row)
         return str(row[0]), living_flags
 
+    def add_provisional_living(self, *, row_id=1101):
+        living_flags = dict(self.flags)
+        living_flags[ledger.LIVING_CANON_V1_FORMATION_ENV] = "true"
+        text = (
+            "I tune ceramic antennas with copper meshes during "
+            "field experiments."
+        )
+        observed_at = "2026-07-20T10:00:00+00:00"
+        self.conn.execute(
+            """
+            INSERT INTO conversations(
+                id,guild_id,user_id,user_name,role,content,channel_id,
+                channel_policy,route_mode,timestamp
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                row_id,
+                1,
+                7,
+                "Test Member",
+                "user",
+                text,
+                10,
+                "public_home",
+                "normal_chat",
+                observed_at,
+            ),
+        )
+        root = ledger.shadow_conversation_row(
+            self.conn,
+            row_id=row_id,
+            user_id=7,
+            user_name="Test Member",
+            guild_id=1,
+            role="user",
+            content=text,
+            channel_name="barcode-bot",
+            channel_policy="public_home",
+            channel_id=10,
+            route_mode="normal_chat",
+            observed_at=observed_at,
+            environ=living_flags,
+        ).entry_id
+        formed = ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            trigger_entry_id=root,
+            environ=living_flags,
+        )
+        self.assertEqual(len(formed), 1)
+        return formed[0].candidate_id, living_flags
+
     def add_public_moment(self):
         base = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
         messages = (
@@ -289,6 +341,58 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
         return row[0]
+
+    def add_followup_public_moment(self):
+        base = datetime(2026, 7, 25, 12, 4, tzinfo=timezone.utc)
+        messages = (
+            (
+                210,
+                8,
+                "Test Member Two",
+                "The synth chorus now uses the warmer bass patch.",
+            ),
+            (
+                211,
+                9,
+                "Test Member Three",
+                "We decided the drum response should stay narrow.",
+            ),
+            (
+                212,
+                8,
+                "Test Member Two",
+                "The final synth balance still needs a retest.",
+            ),
+        )
+        for offset, (row_id, user_id, name, text) in enumerate(messages):
+            result = ledger.shadow_conversation_row(
+                self.conn,
+                row_id=row_id,
+                user_id=user_id,
+                user_name=name,
+                guild_id=1,
+                role="user",
+                content=text,
+                channel_policy="public_home",
+                channel_id=10,
+                channel_name="barcode-bot",
+                route_mode="normal_chat",
+                observed_at=(base + timedelta(seconds=offset)).isoformat(),
+            )
+            moments.observe_ledger_entry(self.conn, result.entry_id)
+        moments.sweep_expired_windows(
+            self.conn,
+            now=(base + timedelta(minutes=3)).isoformat(),
+        )
+        row = self.conn.execute(
+            """
+            SELECT moment_id FROM memory_moment_windows
+            WHERE lifecycle_status='finalized'
+            ORDER BY last_activity_at DESC,moment_id LIMIT 1
+            """
+        ).fetchone()
+        self.assertIsNotNone(row)
+        return str(row[0])
 
     def add_relationship_state(self):
         event_id = relationships.observe_message(
@@ -1441,6 +1545,212 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         )
         self.assertEqual(packet.diagnostics.revalidation_status, "passed")
         self.assertFalse(packet.diagnostics.invalid_invariants)
+
+    def test_recurring_theme_lane_requires_independent_living_recurrence(self):
+        candidate_id, living_flags = self.add_established_living()
+        request = replace(
+            self.public_request(
+                text="BNL, what recurring themes keep coming up for me?"
+            ),
+            frame_schema_version="situation_frame_v1",
+            frame_revision="sf_theme_established",
+            frame_input_evidence_digest="a" * 64,
+            frame_status="resolved",
+            frame_subject_requirement="required",
+            frame_subjects=(
+                PacketFrameSubject(
+                    user_id=7,
+                    binding_method="existing_typed_target",
+                    confidence="high",
+                ),
+            ),
+        )
+
+        packet = build_packet(
+            self.conn,
+            request,
+            persist=True,
+            environ=living_flags,
+        )
+
+        item = next(
+            item
+            for item in packet.items
+            if item.source_ref == f"atomic:{candidate_id}"
+        )
+        self.assertEqual(item.lane, "recurring_theme")
+        self.assertEqual(item.usage, "established_recurrence")
+        self.assertEqual(
+            item.uncertainty_status,
+            "independent_recurrence_established",
+        )
+        self.assertGreaterEqual(len(item.root_identities), 2)
+        self.assertGreaterEqual(len(item.occurrence_identities), 2)
+        self.assertEqual(packet.diagnostics.theme_query_status, "established")
+        report = build_evaluation_report(self.conn, guild_id=1)
+        self.assertEqual(report["themeQueryStatusCounts"], {"established": 1})
+        self.assertGreaterEqual(report["themeIndependentRootTotal"], 2)
+        self.assertGreaterEqual(report["themeIndependentOccurrenceTotal"], 2)
+        self.assertEqual(report["contentFieldsPresent"], [])
+        rendered, _counts, _used, _digests = render_packet_context(packet)
+        self.assertIn(
+            "two or more independent roots and occurrences; "
+            "revisable pattern",
+            rendered,
+        )
+        self.assertEqual(
+            revalidate_packet(
+                self.conn,
+                packet,
+                environ=living_flags,
+            ).status,
+            "passed",
+        )
+
+        corrected = build_packet(
+            self.conn,
+            replace(
+                request,
+                user_text=(
+                    "Correction: ceramic antennas are not a recurring theme "
+                    "for me. What keeps recurring?"
+                ),
+            ),
+            persist=False,
+            environ=living_flags,
+        )
+        self.assertFalse(
+            any(item.lane == "recurring_theme" for item in corrected.items)
+        )
+        self.assertGreaterEqual(
+            corrected.diagnostics.excluded_by_reason.get(
+                "current_turn_correction_precedence",
+                0,
+            ),
+            1,
+        )
+
+    def test_single_occurrence_theme_is_uncertain_and_sealed_only(self):
+        candidate_id, living_flags = self.add_provisional_living()
+        frame = {
+            "frame_schema_version": "situation_frame_v1",
+            "frame_revision": "sf_theme_provisional",
+            "frame_input_evidence_digest": "b" * 64,
+            "frame_status": "resolved",
+            "frame_subject_requirement": "required",
+            "frame_subjects": (
+                PacketFrameSubject(
+                    user_id=7,
+                    binding_method="existing_typed_target",
+                    confidence="high",
+                ),
+            ),
+        }
+        sealed_request = replace(
+            self.public_request(
+                text="BNL, what recurring themes keep coming up for me?"
+            ),
+            channel_policy="sealed_test",
+            visibility_allowance="sealed_test",
+            **frame,
+        )
+        packet = build_packet(
+            self.conn,
+            sealed_request,
+            persist=False,
+            environ=living_flags,
+        )
+
+        item = next(
+            item
+            for item in packet.items
+            if item.source_ref == f"atomic:{candidate_id}"
+        )
+        self.assertEqual(item.lane, "recurring_theme")
+        self.assertEqual(item.usage, "provisional_single_occurrence")
+        self.assertEqual(item.uncertainty_status, "single_occurrence_not_recurrence")
+        self.assertEqual(len(item.occurrence_identities), 1)
+        self.assertFalse(item.canon_status)
+        rendered, _counts, _used, _digests = render_packet_context(packet)
+        self.assertIn(
+            "one occurrence only; not established recurrence",
+            rendered,
+        )
+
+        public_packet = build_packet(
+            self.conn,
+            replace(
+                sealed_request,
+                channel_policy="public_home",
+                visibility_allowance="public_safe",
+            ),
+            persist=False,
+            environ=living_flags,
+        )
+        self.assertFalse(
+            any(item.lane == "recurring_theme" for item in public_packet.items)
+        )
+        self.assertEqual(
+            public_packet.diagnostics.theme_query_status,
+            "no_authoritative_theme",
+        )
+
+    def test_frame_bound_episode_lane_selects_next_and_revalidates_sources(self):
+        first_moment = self.add_public_moment()
+        second_moment = self.add_followup_public_moment()
+        request = replace(
+            self.public_request(
+                text="BNL, what happened next with the synth chorus?"
+            ),
+            frame_schema_version="situation_frame_v1",
+            frame_revision="sf_episode_next",
+            frame_input_evidence_digest="c" * 64,
+            frame_status="resolved",
+            frame_subject_requirement="not_applicable",
+            frame_event_ref=first_moment,
+            frame_event_relation="same_event",
+            frame_task_kind="diagnosis",
+            frame_object_kind="moment",
+            frame_phase="diagnosis",
+        )
+        packet = build_packet(self.conn, request, environ=self.flags)
+
+        episodes = tuple(
+            item for item in packet.items if item.lane == "episode"
+        )
+        self.assertEqual(len(episodes), 1)
+        item = episodes[0]
+        self.assertEqual(item.event_ref, second_moment)
+        self.assertEqual(item.event_relation, "same_event_new_phase")
+        self.assertEqual(item.uncertainty_status, "source_backed_episode")
+        self.assertTrue(item.root_identities)
+        self.assertTrue(item.occurrence_identities)
+        self.assertEqual(packet.diagnostics.episode_query_status, "selected")
+        rendered, _counts, _used, _digests = render_packet_context(packet)
+        self.assertIn("frame-bound; paraphrase only", rendered)
+        report = build_evaluation_report(self.conn, guild_id=1)
+        self.assertEqual(report["episodeQueryStatusCounts"], {"selected": 1})
+        self.assertEqual(report["episodeCandidateTotal"], 1)
+        self.assertEqual(report["contentFieldsPresent"], [])
+
+        root = self.conn.execute(
+            """
+            SELECT ledger_entry_id FROM memory_moment_members
+            WHERE moment_id=? ORDER BY source_sequence LIMIT 1
+            """,
+            (second_moment,),
+        ).fetchone()[0]
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries SET lifecycle_status='retracted'
+            WHERE entry_id=?
+            """,
+            (root,),
+        )
+        result = revalidate_packet(self.conn, packet, environ=self.flags)
+        self.assertFalse(result.valid)
+        self.assertEqual(result.status, "source_changed")
+        self.assertGreaterEqual(result.changed_source_count, 1)
 
     def test_authorized_declared_member_claim_converges_as_subject_fact(self):
         self.add_conversation_context_row()

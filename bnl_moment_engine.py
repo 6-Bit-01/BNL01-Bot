@@ -42,6 +42,7 @@ EPISODE_INACTIVITY_SECONDS = 24 * 60 * 60
 EPISODE_REOPEN_SECONDS = 30 * 24 * 60 * 60
 TURN_SITUATION_RECENCY_SECONDS = 45 * 60
 CONTRIBUTION_GIST_VERSION = "moment_contribution_gist_v1"
+SITUATION_EPISODE_READ_VERSION = "situation_episode_read_v1"
 EPISODE_EVENT_TYPES = (
     "action",
     "reaction",
@@ -49,6 +50,8 @@ EPISODE_EVENT_TYPES = (
     "assignment",
     "outcome",
     "open_loop",
+    "correction",
+    "retest",
 )
 
 STOP = set("a an and are as at be but by for from how i in is it me my of on or our that the this to was we what when where who why with you your did do does about into can could would should just yep yes no ok okay hey hi hello thanks thank lol lmao got noted also ask asked".split())
@@ -122,6 +125,50 @@ _EPISODE_OPEN_LOOP_RE = re.compile(
     r"pending|waiting\s+on)\b",
     re.I,
 )
+_EPISODE_CORRECTION_RE = re.compile(
+    r"\b(?:correction|correct(?:ed|ion)?|actually|i\s+meant|"
+    r"not\s+that|that(?:'|’)s\s+wrong|instead|replace(?:d|ment)?)\b",
+    re.I,
+)
+_EPISODE_RETEST_RE = re.compile(
+    r"\b(?:retest|test\s+again|test\b.{0,80}\bagain|try\s+again|"
+    r"retry|rerun|re-run|"
+    r"second\s+pass|verify\s+again)\b",
+    re.I,
+)
+_DELAYED_CONTINUATION_RE = re.compile(
+    r"\b(?:late|delayed)\s+(?:reply|response)|"
+    r"\b(?:replying|responding|coming)\s+(?:back\s+)?(?:late|later)|"
+    r"\bcoming\s+back\s+to\s+this\b",
+    re.I,
+)
+_EXPLICIT_CROSS_CHANNEL_CONTINUATION_RE = re.compile(
+    r"\b(?:resume|continue|return(?:ing)?\s+to|back\s+to|"
+    r"pick\s+(?:this|that|it)\s+back\s+up|"
+    r"pick\s+up\s+where\s+we\s+left\s+off)\b"
+    r".{0,96}<#([1-9]\d*)>|"
+    r"<#([1-9]\d*)>.{0,96}"
+    r"\b(?:resume|continue|return(?:ing)?\s+to|back\s+to|"
+    r"pick\s+(?:this|that|it)\s+back\s+up|"
+    r"pick\s+up\s+where\s+we\s+left\s+off)\b",
+    re.I,
+)
+_EPISODE_NEXT_QUERY_RE = re.compile(
+    r"\b(?:what\s+happened\s+next|what\s+came\s+next|"
+    r"next\s+(?:step|phase|part)|after\s+that)\b",
+    re.I,
+)
+_EPISODE_OPEN_QUERY_RE = re.compile(
+    r"\b(?:what\s+(?:is|was|remains?)\s+(?:still\s+)?open|"
+    r"what\s+remains|unresolved|open\s+(?:question|loop)s?|"
+    r"still\s+(?:pending|needed?))\b",
+    re.I,
+)
+_EPISODE_CHANGE_QUERY_RE = re.compile(
+    r"\b(?:what\s+changed|what\s+was\s+corrected|"
+    r"what\s+did\s+we\s+correct|correction|revised?|amended?)\b",
+    re.I,
+)
 VIS_RANK = {"public": 0, "public_safe": 0, "reference_canon": 0, "internal": 2, "private": 3, "mod": 3, "sealed_test": 4, "protected": 4, "ai_image_tool": 4, "unknown": 5}
 PUBLIC_CROSS_CHANNEL_POLICIES = frozenset({"public_home", "public_context"})
 SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS = frozenset({"active", "review_only"})
@@ -150,6 +197,41 @@ class PublicParticipantMomentGist:
     salience: float
     visibility: str
     canonical_ledger_entry_id: str
+
+
+@dataclass(frozen=True)
+class PublicSituationMomentGist:
+    """One source-revalidated public Moment projection for an event query."""
+
+    moment_id: str
+    summary: str
+    last_activity_at: str
+    salience: float
+    visibility: str
+    canonical_ledger_entry_id: str
+
+
+@dataclass(frozen=True)
+class SituationAwareEpisodeGist:
+    """Read-only episode projection selected against one Situation Frame."""
+
+    schema_version: str
+    moment_id: str
+    episode_id: str
+    gist: str
+    frame_type: str
+    link_role: str
+    episode_lifecycle: str
+    sequence_index: int
+    moment_count: int
+    open_loop_count: int
+    semantic_types: tuple[str, ...]
+    last_activity_at: str
+    visibility: str
+    canonical_ledger_entry_id: str
+    subject_key: str
+    event_relation: str
+    uncertainty_status: str
 
 
 @dataclass(frozen=True)
@@ -186,6 +268,9 @@ class MomentSituationReference:
     participant_overlap: bool
     topic_coherent: bool
     last_activity_at: str
+    source_channel_id: int = 0
+    cross_channel_continuation: bool = False
+    selection_reason: str = "recent_match"
 
 
 @dataclass(frozen=True)
@@ -2856,6 +2941,13 @@ def _episode_event_types(source: SourceEntry) -> tuple[str, ...]:
         observed.add("outcome")
     if frame_type == "question" or _EPISODE_OPEN_LOOP_RE.search(value):
         observed.add("open_loop")
+    if (
+        frame_type in {"correction", "correction_replacement", "replacement"}
+        or _EPISODE_CORRECTION_RE.search(value)
+    ):
+        observed.add("correction")
+    if _EPISODE_RETEST_RE.search(value):
+        observed.add("retest")
     return tuple(
         event_type
         for event_type in EPISODE_EVENT_TYPES
@@ -4225,6 +4317,40 @@ def recent_moment_situation_for_assessment(
         or int(channel_id or 0) <= 0
     ):
         return None
+    continuation_match = _EXPLICIT_CROSS_CHANNEL_CONTINUATION_RE.search(
+        str(topic_text or "")
+    )
+    cross_channel_id = 0
+    if continuation_match:
+        cross_channel_id = int(
+            next(
+                (
+                    group
+                    for group in continuation_match.groups()
+                    if str(group or "").isdigit()
+                ),
+                0,
+            )
+            or 0
+        )
+    cross_channel = bool(
+        cross_channel_id > 0 and cross_channel_id != int(channel_id or 0)
+    )
+    delayed_continuation = bool(
+        _DELAYED_CONTINUATION_RE.search(str(topic_text or ""))
+    )
+    resume_requested = bool(
+        _EPISODE_RESUME_RE.search(str(topic_text or ""))
+        or delayed_continuation
+    )
+    source_channel_id = (
+        cross_channel_id if cross_channel else int(channel_id or 0)
+    )
+    effective_recency_seconds = (
+        max(int(recency_seconds or 0), EPISODE_REOPEN_SECONDS)
+        if resume_requested
+        else max(1, int(recency_seconds or 1))
+    )
     base = _parse_ts(now or _now())
     rows = conn.execute(
         """
@@ -4235,11 +4361,11 @@ def recent_moment_situation_for_assessment(
         WHERE guild_id=? AND channel_id=? AND channel_policy=? AND route_mode=?
           AND lifecycle_status IN ('open','finalized','rejected','needs_review')
         ORDER BY last_activity_at DESC,moment_id DESC
-        LIMIT 8
+        LIMIT 32
         """,
         (
             int(guild_id),
-            int(channel_id),
+            source_channel_id,
             str(channel_policy or "unknown"),
             str(route_mode or "unknown"),
         ),
@@ -4273,7 +4399,7 @@ def recent_moment_situation_for_assessment(
         except (TypeError, ValueError):
             continue
         age_seconds = (base - parsed_activity).total_seconds()
-        if age_seconds < 0 or age_seconds > max(1, int(recency_seconds or 1)):
+        if age_seconds < 0 or age_seconds > effective_recency_seconds:
             continue
         moment_id = str(row[0] or "")
         participant_overlap = False
@@ -4311,6 +4437,17 @@ def recent_moment_situation_for_assessment(
             participant_overlap=participant_overlap,
             topic_coherent=topic_coherent,
             last_activity_at=last_activity,
+            source_channel_id=source_channel_id,
+            cross_channel_continuation=cross_channel,
+            selection_reason=(
+                "explicit_cross_channel_resume"
+                if cross_channel
+                else "explicit_delayed_resume"
+                if delayed_continuation
+                else "explicit_resume"
+                if resume_requested
+                else "recent_match"
+            ),
         )
         candidates.append(
             (
@@ -4325,6 +4462,41 @@ def recent_moment_situation_for_assessment(
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
+    if resume_requested:
+        eligible = [
+            item
+            for item in candidates
+            if item[1].topic_coherent
+            and (
+                not scoped_participants
+                or item[1].participant_overlap
+            )
+        ]
+        episode_groups: dict[str, list[tuple[Any, MomentSituationReference]]] = {}
+        for item in eligible:
+            moment_id = item[1].moment_id
+            linked = conn.execute(
+                """
+                SELECT DISTINCT episode_id
+                FROM memory_moment_episode_moments
+                WHERE moment_id=?
+                ORDER BY episode_id
+                """,
+                (moment_id,),
+            ).fetchall()
+            if len(linked) > 1:
+                return None
+            occurrence_key = (
+                "episode:%s" % str(linked[0][0])
+                if linked
+                else "moment:%s" % moment_id
+            )
+            episode_groups.setdefault(occurrence_key, []).append(item)
+        if len(episode_groups) != 1:
+            return None
+        only_group = next(iter(episode_groups.values()))
+        only_group.sort(key=lambda item: item[0], reverse=True)
+        return only_group[0][1]
     return candidates[0][1]
 
 
@@ -5110,6 +5282,363 @@ def select_public_participant_moment_gists(
         if len(selected) >= max(1, int(max_results or 0)):
             break
     return tuple(selected)
+
+
+def select_public_situation_moment_gists(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    topic_text: str = "",
+    broad_recall: bool = False,
+    token_budget: int = 180,
+    freshness_days: int = 3650,
+    allowed_channel_policies: tuple[str, ...] = (),
+    max_results: int = 6,
+) -> tuple[PublicSituationMomentGist, ...]:
+    """Return bounded source-revalidated Moment summaries for event queries."""
+
+    ensure_moment_schema(conn)
+    policies = tuple(
+        sorted(
+            {
+                _canon(policy)
+                for policy in (allowed_channel_policies or ())
+                if _canon(policy) in PUBLIC_CROSS_CHANNEL_POLICIES
+            }
+        )
+    )
+    if not policies:
+        return ()
+    relevance_text = _recall_topic_focus(topic_text)
+    family = _topic_family(relevance_text, "conversation")
+    signature = _topic_signature(relevance_text, "conversation")
+    if not broad_recall and not signature:
+        return ()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=max(1, freshness_days))
+    ).isoformat()
+    placeholders = ",".join("?" for _ in policies)
+    rows = conn.execute(
+        f"""
+        SELECT moment_id,summary,topic_family,topic_signature,visibility,
+               last_activity_at,salience,channel_id,channel_policy,route_mode,
+               canonical_ledger_entry_id
+        FROM memory_moment_windows
+        WHERE guild_id=? AND channel_policy IN ({placeholders})
+          AND route_mode IN (
+              'normal_chat','direct_payload','direct_payload_task'
+          )
+          AND lifecycle_status='finalized' AND public_usable=1
+          AND last_activity_at>=?
+        ORDER BY salience DESC,last_activity_at DESC,moment_id
+        LIMIT 100
+        """,
+        (int(guild_id or 0), *policies, cutoff),
+    ).fetchall()
+    selected: list[PublicSituationMomentGist] = []
+    seen: set[str] = set()
+    used_words = 0
+    for row in rows:
+        moment_id = str(row[0] or "")
+        summary = re.sub(r"\s+", " ", str(row[1] or "")).strip()
+        visibility = str(row[4] or "unknown")
+        if (
+            not summary
+            or summary.casefold() in seen
+            or visibility not in {"public", "public_safe"}
+        ):
+            continue
+        if not broad_recall and not _coherent(
+            family,
+            signature,
+            str(row[2] or ""),
+            _load_sig(str(row[3] or "[]")),
+        ):
+            continue
+        if not _moment_is_renderable(
+            conn,
+            moment_id=moment_id,
+            summary=summary,
+            guild_id=int(guild_id or 0),
+            channel_id=int(row[7] or 0),
+            channel_policy=str(row[8] or ""),
+            route_mode=str(row[9] or "unknown"),
+            visibility=visibility,
+            canonical_ledger_entry_id=str(row[10] or ""),
+        ):
+            continue
+        words = summary.split()
+        if (
+            used_words + len(words) > max(1, int(token_budget or 0))
+            or len(selected) >= max(1, int(max_results or 0))
+        ):
+            continue
+        selected.append(
+            PublicSituationMomentGist(
+                moment_id=moment_id,
+                summary=summary,
+                last_activity_at=str(row[5] or ""),
+                salience=float(row[6] or 0),
+                visibility=visibility,
+                canonical_ledger_entry_id=str(row[10] or ""),
+            )
+        )
+        seen.add(summary.casefold())
+        used_words += len(words)
+    return tuple(selected)
+
+
+def _episode_projection_for_moment(
+    conn: sqlite3.Connection,
+    moment_id: str,
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        """
+        SELECT link.episode_id,link.link_role,episode.lifecycle_status,
+               episode.open_loop_count,episode.semantic_types_json,
+               episode.moment_count
+        FROM memory_moment_episode_moments link
+        JOIN memory_moment_episodes episode
+          ON episode.episode_id=link.episode_id
+        WHERE link.moment_id=?
+          AND episode.lifecycle_status IN ('active','finalized')
+        ORDER BY link.episode_id
+        """,
+        (str(moment_id or ""),),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    ordered_moments = tuple(
+        str(item[0])
+        for item in conn.execute(
+            """
+            SELECT link.moment_id
+            FROM memory_moment_episode_moments link
+            JOIN memory_moment_windows window
+              ON window.moment_id=link.moment_id
+            WHERE link.episode_id=? AND window.lifecycle_status='finalized'
+            ORDER BY window.window_started_at,window.last_activity_at,
+                     link.moment_id
+            """,
+            (str(row[0] or ""),),
+        ).fetchall()
+    )
+    if (
+        not ordered_moments
+        or str(moment_id or "") not in ordered_moments
+        or len(ordered_moments) != int(row[5] or 0)
+    ):
+        return None
+    try:
+        semantic_types = tuple(
+            event_type
+            for event_type in json.loads(str(row[4] or "[]"))
+            if event_type in EPISODE_EVENT_TYPES
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return {
+        "episode_id": str(row[0] or ""),
+        "link_role": str(row[1] or ""),
+        "lifecycle": str(row[2] or ""),
+        "open_loop_count": max(0, int(row[3] or 0)),
+        "semantic_types": semantic_types,
+        "moment_count": len(ordered_moments),
+        "sequence_index": ordered_moments.index(str(moment_id or "")),
+    }
+
+
+def select_situation_aware_episode_gists(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    participant_key: str = "",
+    topic_text: str = "",
+    frame_event_ref: str = "",
+    frame_event_relation: str = "uncertain",
+    frame_phase: str = "",
+    broad_recall: bool = False,
+    allowed_channel_policies: tuple[str, ...] = (),
+    max_results: int = 4,
+) -> tuple[SituationAwareEpisodeGist, ...]:
+    """Apply one frame to existing Moment/episode projections, read-only."""
+
+    typed_participant = (
+        str(participant_key or "")
+        if re.fullmatch(
+            r"discord_user:[1-9]\d*",
+            str(participant_key or ""),
+        )
+        else ""
+    )
+    source_rows: list[dict[str, Any]] = []
+    if typed_participant:
+        for gist in select_public_participant_moment_gists(
+            conn,
+            guild_id=int(guild_id or 0),
+            participant_key=typed_participant,
+            topic_text=topic_text,
+            broad_recall=broad_recall or bool(frame_event_ref),
+            token_budget=240,
+            freshness_days=3650,
+            allowed_channel_policies=allowed_channel_policies,
+            max_results=12,
+        ):
+            source_rows.append(
+                {
+                    "moment_id": gist.moment_id,
+                    "gist": gist.contribution_gist,
+                    "frame_type": gist.frame_type,
+                    "last_activity_at": gist.last_activity_at,
+                    "visibility": gist.visibility,
+                    "canonical_ledger_entry_id": (
+                        gist.canonical_ledger_entry_id
+                    ),
+                    "subject_key": typed_participant,
+                }
+            )
+    else:
+        for gist in select_public_situation_moment_gists(
+            conn,
+            guild_id=int(guild_id or 0),
+            topic_text=topic_text,
+            broad_recall=broad_recall or bool(frame_event_ref),
+            token_budget=240,
+            freshness_days=3650,
+            allowed_channel_policies=allowed_channel_policies,
+            max_results=12,
+        ):
+            source_rows.append(
+                {
+                    "moment_id": gist.moment_id,
+                    "gist": gist.summary,
+                    "frame_type": "shared_event_summary",
+                    "last_activity_at": gist.last_activity_at,
+                    "visibility": gist.visibility,
+                    "canonical_ledger_entry_id": (
+                        gist.canonical_ledger_entry_id
+                    ),
+                    "subject_key": "",
+                }
+            )
+    if not source_rows:
+        return ()
+
+    relation = str(frame_event_relation or "uncertain").strip().lower()
+    if relation in {"new_event_same_participant", "new_event_or_uncertain"}:
+        return ()
+    anchor = (
+        _episode_projection_for_moment(conn, str(frame_event_ref or ""))
+        if str(frame_event_ref or "")
+        else None
+    )
+    selected: list[SituationAwareEpisodeGist] = []
+    for source in source_rows:
+        moment_id = str(source["moment_id"])
+        episode = _episode_projection_for_moment(conn, moment_id)
+        if str(frame_event_ref or "") and anchor is None:
+            if moment_id != str(frame_event_ref):
+                continue
+        elif anchor is not None and relation in {
+            "same_event",
+            "same_event_new_phase",
+            "resume",
+        } and (
+            episode is None
+            or episode["episode_id"] != anchor["episode_id"]
+        ):
+            continue
+        if (
+            _EPISODE_NEXT_QUERY_RE.search(str(topic_text or ""))
+            and anchor is not None
+            and (
+                episode is None
+                or episode["episode_id"] != anchor["episode_id"]
+                or episode["sequence_index"] <= anchor["sequence_index"]
+            )
+        ):
+            continue
+        if (
+            _EPISODE_OPEN_QUERY_RE.search(str(topic_text or ""))
+            and (episode is None or episode["open_loop_count"] <= 0)
+        ):
+            continue
+        semantic_types = (
+            tuple(episode["semantic_types"]) if episode is not None else ()
+        )
+        frame_type = str(source["frame_type"] or "")
+        phase = str(frame_phase or "").strip().lower()
+        if (
+            (_EPISODE_CHANGE_QUERY_RE.search(str(topic_text or "")) or phase == "correction")
+            and "correction" not in semantic_types
+            and frame_type
+            not in {"correction", "correction_replacement", "replacement"}
+        ):
+            continue
+        if phase == "retest" and "retest" not in semantic_types:
+            continue
+        if phase == "completion" and "outcome" not in semantic_types:
+            continue
+        link_role = str(episode["link_role"] if episode else "standalone")
+        derived_relation = {
+            "opened": "new_event",
+            "extended": "same_event_new_phase",
+            "reopened": "resume",
+        }.get(link_role, relation)
+        selected.append(
+            SituationAwareEpisodeGist(
+                schema_version=SITUATION_EPISODE_READ_VERSION,
+                moment_id=moment_id,
+                episode_id=str(episode["episode_id"] if episode else ""),
+                gist=str(source["gist"] or ""),
+                frame_type=frame_type,
+                link_role=link_role,
+                episode_lifecycle=str(
+                    episode["lifecycle"] if episode else "finalized_moment"
+                ),
+                sequence_index=int(
+                    episode["sequence_index"] if episode else 0
+                ),
+                moment_count=int(episode["moment_count"] if episode else 1),
+                open_loop_count=int(
+                    episode["open_loop_count"] if episode else 0
+                ),
+                semantic_types=semantic_types,
+                last_activity_at=str(source["last_activity_at"] or ""),
+                visibility=str(source["visibility"] or "unknown"),
+                canonical_ledger_entry_id=str(
+                    source["canonical_ledger_entry_id"] or ""
+                ),
+                subject_key=str(source["subject_key"] or ""),
+                event_relation=derived_relation,
+                uncertainty_status=(
+                    "source_backed_episode"
+                    if episode is not None
+                    else "standalone_moment_only"
+                ),
+            )
+        )
+    if relation == "resume" and not anchor:
+        episode_ids = {
+            item.episode_id
+            for item in selected
+            if item.episode_id
+        }
+        if len(episode_ids) != 1:
+            return ()
+        selected = [
+            item for item in selected if item.episode_id in episode_ids
+        ]
+    selected.sort(
+        key=lambda item: (
+            item.last_activity_at,
+            item.sequence_index,
+            item.moment_id,
+        ),
+        reverse=not bool(_EPISODE_NEXT_QUERY_RE.search(str(topic_text or ""))),
+    )
+    return tuple(selected[: max(1, min(int(max_results or 1), 8))])
 
 
 def render_shadow_moment_context(

@@ -55,7 +55,7 @@ SCHEMA_VERSION = "shared_brain_synthesis_v7"
 CAPABILITY_NAME = "shared_brain_public_broad_recall"
 CAPABILITY_CONTRACT_VERSION = "hybrid_shared_brain_v1"
 CAPABILITY_RECEIPT_VERSION = "shared_brain_capability_receipt_v1"
-_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v6"
+_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v7"
 _EXPECTED_CLAIM_CONTRACT_VERSION = "hybrid_canon_claim_v1"
 _EXPECTED_ASSESSMENT_VERSION = "unified_response_assessment_v7"
 _EXPECTED_IDENTITY_CONTRACT_VERSION = "canon_entity_account_binding_v1"
@@ -91,7 +91,9 @@ _RENDERABLE_LANES = {
     "assessment_observation",
     "approved_fact",
     "moment",
+    "episode",
     "atomic_knowledge",
+    "recurring_theme",
     "open_loop",
     "canon",
     "source_file",
@@ -102,7 +104,9 @@ _PROFILE_MEMBER_LANES = frozenset(
         "assessment_observation",
         "conversation_context",
         "moment",
+        "episode",
         "atomic_knowledge",
+        "recurring_theme",
     }
 )
 _CLAIM_MEMBER_LANES = frozenset(
@@ -111,7 +115,9 @@ _CLAIM_MEMBER_LANES = frozenset(
         "assessment_observation",
         "approved_fact",
         "moment",
+        "episode",
         "atomic_knowledge",
+        "recurring_theme",
         "open_loop",
     }
 )
@@ -128,7 +134,9 @@ _LANE_LABELS = {
     "assessment_observation": "question-scoped public observation",
     "approved_fact": "approved direct fact",
     "moment": "episode gist",
+    "episode": "frame-bound episode",
     "atomic_knowledge": "durable observation",
+    "recurring_theme": "recurring-theme evidence",
     "open_loop": "unresolved thread",
     "canon": "approved canon",
     "source_file": "authorized source context",
@@ -182,12 +190,14 @@ _EVIDENCE_STOPWORDS = {
 _LANE_RENDER_PRIORITY = {
     "approved_fact": 0,
     "atomic_knowledge": 1,
-    "moment": 2,
-    "assessment_observation": 3,
-    "open_loop": 4,
-    "conversation_context": 5,
-    "canon": 6,
-    "source_file": 7,
+    "recurring_theme": 1,
+    "episode": 2,
+    "moment": 3,
+    "assessment_observation": 4,
+    "open_loop": 5,
+    "conversation_context": 6,
+    "canon": 7,
+    "source_file": 8,
 }
 _PROFILE_GENERIC_TERMS = frozenset(
     {
@@ -1766,6 +1776,8 @@ def render_packet_context(
         qualifier = ""
         if item.lane == "moment":
             qualifier = "; paraphrase only"
+        elif item.lane == "episode":
+            qualifier = "; frame-bound; paraphrase only"
         elif item.lane == "assessment_observation":
             qualifier = (
                 "; one public historical example; assessment only, "
@@ -1776,6 +1788,14 @@ def render_packet_context(
                 "; established"
                 if item.lifecycle == "established"
                 else "; tentative observation"
+            )
+        elif item.lane == "recurring_theme":
+            qualifier = (
+                "; two or more independent roots and occurrences; "
+                "revisable pattern"
+                if item.uncertainty_status
+                == "independent_recurrence_established"
+                else "; one occurrence only; not established recurrence"
             )
         elif item.lane == "open_loop":
             qualifier = "; unresolved, not settled fact"
@@ -3631,7 +3651,8 @@ def _item_predicate_grounded(
         return False
 
     if (
-        str(getattr(item, "lane", "") or "") == "atomic_knowledge"
+        str(getattr(item, "lane", "") or "")
+        in {"atomic_knowledge", "recurring_theme"}
         and str(getattr(item, "source_type", "") or "")
         == "topic_or_motif"
         and tuple(getattr(item, "supporting_observations", ()) or ())

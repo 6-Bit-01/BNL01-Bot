@@ -265,13 +265,62 @@ _TERM_FAMILIES = {
 }
 
 _SITUATION_PHASE_PATTERNS = (
-    ("correction", re.compile(r"\b(?:correction|i\s+meant|not\s+that|that(?:'|’)s\s+wrong|instead)\b", re.I)),
-    ("retest", re.compile(r"\b(?:retest|test\s+again|try\s+again|retry|rerun|re-run|second\s+pass)\b", re.I)),
-    ("failure", re.compile(r"\b(?:failed?|failure|broken|crash(?:ed)?|error|didn(?:'|’)t\s+work|not\s+working)\b", re.I)),
-    ("diagnosis", re.compile(r"\b(?:diagnos(?:e|is)|root\s+cause|why\s+did|what\s+happened|figure\s+out|investigate)\b", re.I)),
-    ("completion", re.compile(r"\b(?:complete|completed|finished|done|resolved|fixed|merged|landed)\b", re.I)),
-    ("execution", re.compile(r"\b(?:implement|build|fix|change|update|create|proceed|continue|start|run|deploy)\b", re.I)),
-    ("planning", re.compile(r"\b(?:plan|roadmap|propose|design|scope|next\s+steps?|how\s+should)\b", re.I)),
+    (
+        "correction",
+        re.compile(
+            r"\b(?:correction|i\s+meant|not\s+that|"
+            r"that(?:'|’)s\s+wrong|instead)\b",
+            re.I,
+        ),
+    ),
+    (
+        "retest",
+        re.compile(
+            r"\b(?:retest|test\s+again|test\b.{0,80}\bagain|"
+            r"try\s+again|retry|rerun|re-run|second\s+pass)\b",
+            re.I,
+        ),
+    ),
+    (
+        "failure",
+        re.compile(
+            r"\b(?:failed?|failure|broken|crash(?:ed)?|error|"
+            r"didn(?:'|’)t\s+work|not\s+working)\b",
+            re.I,
+        ),
+    ),
+    (
+        "diagnosis",
+        re.compile(
+            r"\b(?:diagnos(?:e|is)|root\s+cause|why\s+did|"
+            r"what\s+happened|figure\s+out|investigate)\b",
+            re.I,
+        ),
+    ),
+    (
+        "completion",
+        re.compile(
+            r"\b(?:complete|completed|finished|done|resolved|fixed|"
+            r"merged|landed)\b",
+            re.I,
+        ),
+    ),
+    (
+        "execution",
+        re.compile(
+            r"\b(?:implement|build|fix|change|update|create|proceed|"
+            r"continue|start|run|deploy)\b",
+            re.I,
+        ),
+    ),
+    (
+        "planning",
+        re.compile(
+            r"\b(?:plan|roadmap|propose|design|scope|next\s+steps?|"
+            r"how\s+should)\b",
+            re.I,
+        ),
+    ),
 )
 _SITUATION_OBJECT_PATTERNS = (
     ("journal", re.compile(r"\bjournal(?:s|\s+entry|\s+entries)?\b", re.I)),
@@ -302,11 +351,37 @@ _SELF_SUBJECT_CUE_RE = re.compile(
     r"\b(?:what\s+(?:am\s+i|do\s+you\s+(?:know|remember)\s+about\s+me)|"
     r"tell\s+me\s+(?:what|who)\s+i\s+am|about\s+me|my\s+(?:profile|"
     r"history|role|work|music|preferences?|goals?|memory|story)|"
-    r"remember\s+me)\b",
+    r"remember\s+me|what\s+(?:patterns?|themes?)\s+(?:keep\s+)?"
+    r"(?:recurring|coming\s+up)\s+for\s+me|"
+    r"what\s+keeps\s+(?:recurring|coming\s+up)\s+for\s+me)\b",
     re.I,
 )
 _CURRENT_TIME_RE = re.compile(r"\b(?:now|currently|today|tonight|this\s+(?:week|show|turn|time)|latest|current)\b", re.I)
 _HISTORICAL_TIME_RE = re.compile(r"\b(?:before|previously|earlier|last\s+(?:time|week|show)|used\s+to|histor(?:y|ical))\b", re.I)
+_SITUATION_EXPLICIT_RESUME_RE = re.compile(
+    r"\b(?:resume|continue|pick\s+(?:it|this|that)\s+back\s+up|"
+    r"pick\s+up\s+where\s+we\s+left\s+off|back\s+to|"
+    r"return(?:ing)?\s+to|get\s+back\s+to|reopen|"
+    r"late\s+(?:reply|response)|coming\s+back\s+to\s+this)\b",
+    re.I,
+)
+_SITUATION_EXPLICIT_NEW_EVENT_RE = re.compile(
+    r"\b(?:new|different|separate|another)\s+"
+    r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b|"
+    r"\bnot\s+(?:the\s+)?same\s+(?:event|incident|thread|case)\b",
+    re.I,
+)
+_SITUATION_CONCURRENT_RE = re.compile(
+    r"\b(?:meanwhile|at\s+the\s+same\s+time|in\s+parallel|"
+    r"concurrent(?:ly)?|separate\s+track|alongside)\b",
+    re.I,
+)
+_SITUATION_PARTICIPANT_CHANGE_RE = re.compile(
+    r"\b(?:different|new|another)\s+"
+    r"(?:person|people|participant|team|group)s?\b|"
+    r"\b(?:someone|somebody)\s+else\b",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -446,12 +521,30 @@ def _situation_temporal_scope(text: str) -> Tuple[str, str]:
 
 def _situation_event_relation(
     *,
+    current_text: str,
     moment_situation_state: str,
     moment_topic_coherent: bool,
     moment_participant_overlap: bool,
     phase: str,
 ) -> str:
     state = str(moment_situation_state or "none").strip().lower()
+    text = str(current_text or "")
+    if _SITUATION_EXPLICIT_NEW_EVENT_RE.search(text):
+        return (
+            "new_event_same_participant"
+            if moment_participant_overlap
+            else "new_event_or_uncertain"
+        )
+    if _SITUATION_CONCURRENT_RE.search(text):
+        return "concurrent_activity"
+    if _SITUATION_PARTICIPANT_CHANGE_RE.search(text):
+        return "comparison_or_participant_change"
+    if _SITUATION_EXPLICIT_RESUME_RE.search(text):
+        return (
+            "resume"
+            if state not in {"", "none"} and moment_topic_coherent
+            else "resume_unresolved"
+        )
     if state in {"", "none"}:
         return "uncertain"
     if "reopen" in state or "resume" in state:
@@ -600,11 +693,15 @@ def build_situation_frame_v1(
         competing.append("route_policy_block")
 
     event_relation = _situation_event_relation(
+        current_text=text,
         moment_situation_state=moment_situation_state,
         moment_topic_coherent=bool(moment_topic_coherent),
         moment_participant_overlap=bool(moment_participant_overlap),
         phase=phase,
     )
+    if event_relation == "resume_unresolved":
+        ambiguity.append("resume_target_unresolved")
+        competing.append("resume_episode_candidates")
     task_kind = _situation_task_kind(
         phase=phase,
         object_kind=object_kind,
