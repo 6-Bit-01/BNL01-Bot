@@ -74,6 +74,16 @@ _LIVING_CANON_AUTHORITY_TABLES = frozenset(
 )
 BNL_SUBJECT_KEY = "bnl_01"
 BNL_SELF_NAME_PREDICATE_PREFIX = "bnl_self_name:"
+BNL_SELF_NAME_VALIDATION_VERSION = "bnl_self_name_grammar_v2"
+BNL_SELF_NAME_ROUTING_EVIDENCE_KINDS = frozenset(
+    {
+        "explicit_proposal",
+        "explicit_correction",
+        "explicit_revocation",
+        "strong_greeting_vocative",
+        "target_supported_bare_vocative",
+    }
+)
 BNL_SELF_NAME_PUBLIC_POLICIES = frozenset(
     {"public_home", "public_context", "public_selective"}
 )
@@ -1188,6 +1198,11 @@ class BnlSelfNameRecord:
     decision: str
     entry_id: str
     observed_at: str = ""
+    validation_version: str = ""
+    evidence_kind: str = ""
+    routing_eligible: bool = False
+    validation_basis: str = "unvalidated"
+    quarantine_reason: str = "missing_validation_version"
 
 
 def shadow_enabled(environ: dict[str, str] | None = None) -> bool:
@@ -1260,14 +1275,20 @@ def subject_key_for_user(user_id: int | str | None) -> str:
 def normalize_bnl_self_name(value: Any) -> str:
     """Return one conservative comparison key without inventing aliases."""
 
-    cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n,.;:!?\"'“”‘’")
+    cleaned = unicodedata.normalize("NFKC", str(value or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(
+        " \t\r\n,.;:!?\"'“”‘’"
+    )
     if not cleaned or len(cleaned) > 48:
         return ""
     if len(cleaned.split()) > 4:
         return ""
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47}", cleaned):
+    if not cleaned[0].isalnum() or any(
+        not (character.isalnum() or character in " _.'’-")
+        for character in cleaned
+    ):
         return ""
-    return _canon(cleaned)
+    return cleaned.casefold()
 
 
 def current_bnl_self_name_records(
@@ -1455,6 +1476,23 @@ def current_bnl_self_name_records(
         normalized = normalize_bnl_self_name(payload.get("normalized"))
         display = re.sub(r"\s+", " ", str(payload.get("name") or "")).strip()[:48]
         decision = str(payload.get("decision") or "").strip().lower()
+        validation_version = str(
+            payload.get("validation_version") or ""
+        ).strip()
+        evidence_kind = str(payload.get("evidence_kind") or "").strip()
+        routing_eligible = bool(
+            validation_version == BNL_SELF_NAME_VALIDATION_VERSION
+            and evidence_kind in BNL_SELF_NAME_ROUTING_EVIDENCE_KINDS
+        )
+        quarantine_reason = ""
+        if not routing_eligible:
+            quarantine_reason = (
+                "missing_validation_version"
+                if not validation_version
+                else "stale_validation_version"
+                if validation_version != BNL_SELF_NAME_VALIDATION_VERSION
+                else "unsupported_evidence_kind"
+            )
         if (
             not normalized
             or not display
@@ -1478,6 +1516,15 @@ def current_bnl_self_name_records(
             decision=decision,
             entry_id=str(entry_id or ""),
             observed_at=str(observed_at or ""),
+            validation_version=validation_version,
+            evidence_kind=evidence_kind,
+            routing_eligible=routing_eligible,
+            validation_basis=(
+                "recorded_current_grammar"
+                if routing_eligible
+                else "unvalidated"
+            ),
+            quarantine_reason=quarantine_reason,
         )
     return tuple(selected[key] for key in sorted(selected))
 
@@ -1496,6 +1543,8 @@ def record_bnl_self_name_decision(
     channel_policy: str,
     route_mode: str,
     response_digest: str,
+    validation_version: str = "",
+    evidence_kind: str = "",
     observed_at: str = "",
 ) -> LedgerWriteResult:
     """Record BNL's explicit accept/deny/defer/revoke decision with lineage."""
@@ -1504,6 +1553,8 @@ def record_bnl_self_name_decision(
     normalized = normalize_bnl_self_name(name)
     clean_display = re.sub(r"\s+", " ", str(name or "")).strip()[:48]
     resolved_decision = str(decision or "").strip().lower()
+    resolved_validation_version = str(validation_version or "").strip()
+    resolved_evidence_kind = str(evidence_kind or "").strip()
     if (
         int(guild_id or 0) <= 0
         or not normalized
@@ -1609,12 +1660,17 @@ def record_bnl_self_name_decision(
                 f"{source_row_id}\x1f{decision_row_id}"
             ).encode("utf-8")
         ).hexdigest()
-    source_revision = f"{resolved_decision}:{digest}"
+    source_revision = (
+        f"{resolved_decision}:"
+        f"{resolved_validation_version or 'legacy_unvalidated'}:{digest}"
+    )
     value = json.dumps(
         {
             "decision": resolved_decision,
+            "evidence_kind": resolved_evidence_kind,
             "name": clean_display,
             "normalized": normalized,
+            "validation_version": resolved_validation_version,
         },
         sort_keys=True,
         separators=(",", ":"),

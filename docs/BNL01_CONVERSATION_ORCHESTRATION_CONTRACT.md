@@ -69,8 +69,18 @@ has decided the current packet.
 BNL self-names are learned decisions, not configured aliases.
 
 - A structurally valid vocative or explicit naming proposal may present a
-  candidate to BNL. Leading discourse words and generic commands are not name
-  proposals. No specific candidate is privileged in production code.
+  candidate to BNL. Punctuation alone never establishes both a candidate and
+  a BNL target. Leading/trailing discourse words, modifiers, generic commands,
+  quoted speech, code, titles, and discussion about a possible name are not
+  performed naming acts. This is a positive grammar contract, not a finite
+  discourse-word blacklist, and no specific candidate is privileged in
+  production code.
+- `Hey <candidate>, ...` is a strong greeting vocative when another-human and
+  quotation ambiguity are absent. A novel bare `<candidate>, ...` or
+  `..., <candidate>` requires independent BNL targeting from a Discord
+  mention/reply plus second-person address structure; the comma cannot create
+  that target. An already accepted governed name remains valid as a bare
+  vocative without proposing it again.
 - A known human display name remains a human target and cannot silently become
   a BNL name.
 - The typed lifecycle is propose, accept, reject, defer, correct, or revoke.
@@ -90,6 +100,15 @@ BNL self-names are learned decisions, not configured aliases.
 - Current routing state is freshly revalidated against both the member proposal
   and BNL's saved delivered response. A stale positive cache is never routing
   authority.
+- New decisions record `bnl_self_name_grammar_v2` and their positive evidence
+  kind in the existing Ledger value. Historical decisions remain append-only:
+  an owner-only, content-free read diagnostic counts current, revalidated, and
+  quarantined decisions without emitting names or message text. A historical
+  decision lacking the current validation revision may route only when its
+  original user root independently revalidates as an explicit naming act or
+  correction/revocation. Old greeting-only and weak comma-only history lacks
+  enough trusted target context, so it stays visible to the diagnostic but is
+  excluded from routing without mutation.
 - Decisions are scoped by guild and visibility. A sealed-test-only decision
   cannot become public routing state.
 - The existing member preferred-name system remains separate: it records what
@@ -155,7 +174,8 @@ Conversation Context v2 remains the only owner of raw nearby content.
   construction, regeneration, and the final pre-send check preserve the same
   typed reply source; a proven competing-source substitution fails closed.
 - A self-name decision is not persisted when generation fails, delivery fails,
-  parsing is ambiguous, or the source conversation cannot be linked.
+  parsing is ambiguous, the source grammar does not reproduce the claimed
+  positive evidence, or the source conversation cannot be linked.
 - A partial multi-chunk delivery writes no complete model conversation row and
   no false Discord reply identity.
 - Deterministic status and recall shortcuts cannot bypass a pending natural
@@ -171,7 +191,11 @@ Conversation Context v2 remains the only owner of raw nearby content.
 Regression coverage must include arbitrary self-name candidates, acceptance,
 denial, deferral, correction, revocation, restart persistence, deletion,
 forgetting, retraction, provenance loss, visibility boundaries, known-human
-collisions, direct and batched response obligations, resolved and unresolved
+collisions, punctuation-only discourse/modifier constructions, strong greeting
+vocatives, mention/reply-supported novel bare vocatives, quoted/discussed/code
+candidates, Unicode names, mixed-human ambiguity, validation-version history
+quarantine, content-free diagnostics, direct and batched response obligations,
+resolved and unresolved
 exact reply references, multiple replies, replies to BNL, partial sends,
 replies to another human while addressing BNL, competing newer same-room
 messages, explicit reply-scope expansion, cross-speaker structural references,

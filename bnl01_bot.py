@@ -47,6 +47,8 @@ from bnl_occasion import (
     store_prepared as store_prepared_occasion,
 )
 from bnl_memory_ledger import (
+    BNL_SELF_NAME_ROUTING_EVIDENCE_KINDS,
+    BNL_SELF_NAME_VALIDATION_VERSION,
     BnlSelfNameRecord,
     LedgerWriteResult,
     backfill_atomic_knowledge_candidates,
@@ -270,6 +272,7 @@ import calendar
 import time
 import threading
 import concurrent.futures
+import unicodedata
 
 from bnl_dossier_candidate_discovery import (
     DEFAULT_DISCOVERY_LANES,
@@ -11249,6 +11252,9 @@ class DiscordTurnAddressing:
     bnl_name_requires_decision: bool = False
     bnl_name_action: str = "none"
     bnl_name_prior_value: str = ""
+    bnl_name_classification: str = "none"
+    bnl_name_evidence_kind: str = ""
+    bnl_name_validation_version: str = BNL_SELF_NAME_VALIDATION_VERSION
     bnl_name_influence_mode: str = "off"
     source_message_id: int = 0
     reply_message_id: int = 0
@@ -11290,26 +11296,34 @@ _CANONICAL_BNL_NAME_RE = re.compile(
     r"\b(?:bnl|bnl-01|barcode bot)\b",
     re.I,
 )
+_SELF_NAME_VALUE_FRAGMENT = r"(?!_)\w[\w _.'’\-]{0,47}"
+_SELF_NAME_CAPTURE = rf"(?P<name>{_SELF_NAME_VALUE_FRAGMENT})"
 _SELF_NAME_EXPLICIT_PATTERNS = (
     re.compile(
         r"\b(?:can|could|may|should)\s+(?:i|we)\s+call\s+you\s+"
-        r"[\"“']?(?P<name>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})",
+        r"[\"“']?" + _SELF_NAME_CAPTURE,
         re.I,
     ),
     re.compile(
         r"\b(?:i(?:'|’)?ll|i\s+will|we(?:'|’)?ll|we\s+will|"
         r"i\s+want\s+to|we\s+want\s+to|let\s+me)\s+call\s+you\s+"
-        r"[\"“']?(?P<name>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})",
+        r"[\"“']?" + _SELF_NAME_CAPTURE,
         re.I,
     ),
     re.compile(
         r"\b(?:nickname|name)\s+you\s+"
-        r"[\"“']?(?P<name>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})",
+        r"[\"“']?" + _SELF_NAME_CAPTURE,
         re.I,
     ),
     re.compile(
         r"\byour\s+(?:nickname|name)\s+(?:is|should\s+be|can\s+be)\s+"
-        r"[\"“']?(?P<name>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})",
+        r"[\"“']?" + _SELF_NAME_CAPTURE,
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:do\s+you\s+still\s+(?:want|like)\s+to\s+be\s+called|"
+        r"are\s+you\s+still\s+(?:okay|ok|good|fine)\s+with)\s+"
+        r"[\"“']?" + _SELF_NAME_CAPTURE,
         re.I,
     ),
 )
@@ -11317,6 +11331,7 @@ _SELF_NAME_TRAILING_CLAUSE_RE = re.compile(
     r"\b(?:from\s+now\s+on|if\s+that(?:'|’)?s\s+okay|"
     r"if\s+you(?:'|’)?re\s+okay\s+with\s+it|when|while|because|"
     r"unless|during|around|please|okay|ok|today|tomorrow|tonight|"
+    r"here|"
     r"for\s+(?:short|now|tonight|today)|"
     r"in\s+(?:here|this\s+(?:room|channel|server|chat)))\b.*$",
     re.I,
@@ -11420,6 +11435,11 @@ class BnlSelfNameRequest:
     name: str = ""
     prior_name: str = ""
     explicit: bool = False
+    classification: str = "non_address"
+    evidence_kind: str = ""
+    candidate: str = ""
+    ambiguous: bool = False
+    validation_version: str = BNL_SELF_NAME_VALIDATION_VERSION
 
 
 def _known_guild_human_names(guild) -> set[str]:
@@ -11473,12 +11493,21 @@ def _load_bnl_self_name_records(
                 guild_id=guild_id,
                 channel_policies=policy_scope,
             )
+            records = _validated_bnl_self_name_records(
+                conn,
+                guild_id=guild_id,
+                records=records,
+            )
     except (OSError, sqlite3.DatabaseError):
         records = ()
     return records
 
 
-def _clean_self_name_candidate(raw: str) -> str:
+def _clean_self_name_candidate(
+    raw: str,
+    *,
+    reject_generic: bool = True,
+) -> str:
     value = re.sub(r"\s+", " ", str(raw or "")).strip()
     value = value.rstrip(" \t\r\n,.;:!?\"'“”‘’")
     value = _SELF_NAME_TRAILING_CLAUSE_RE.sub("", value).strip()
@@ -11490,7 +11519,10 @@ def _clean_self_name_candidate(raw: str) -> str:
     first_word = normalized.split()[0] if normalized else ""
     if (
         not normalized
-        or normalized in _SELF_NAME_STOPWORDS
+        or (
+            reject_generic
+            and normalized in _SELF_NAME_STOPWORDS
+        )
         or first_word in _SELF_NAME_ACTION_COMPLEMENT_LEADS
         or _CANONICAL_BNL_NAME_RE.fullmatch(value)
     ):
@@ -11498,8 +11530,72 @@ def _clean_self_name_candidate(raw: str) -> str:
     return value
 
 
-def classify_bnl_self_name_request(text: str) -> BnlSelfNameRequest:
-    """Classify explicit lifecycle actions and conservative vocative proposals."""
+def _performed_self_name_clause(value: str) -> str:
+    """Return only a plausible speaker-performed naming clause."""
+
+    performed = str(value or "").strip()
+    performed = re.sub(
+        r"^(?:hey\s+|yo\s+|hi\s+|hello\s+)?"
+        r"(?:bnl|bnl-01|barcode bot)\s*[,!?:\-—]\s*",
+        "",
+        performed,
+        count=1,
+        flags=re.I,
+    )
+    performed = re.sub(
+        r"^(?:please|okay|ok|so)\s*[,!?:\-—]?\s+",
+        "",
+        performed,
+        count=1,
+        flags=re.I,
+    )
+    return performed.strip()
+
+
+def _self_name_match_has_safe_boundary(value: str, match) -> bool:
+    suffix = str(value or "")[int(match.end() or 0) :].lstrip()
+    return not suffix or suffix[0] in "?!.,;:\"'“”‘’"
+
+
+def _bare_vocative_body_targets_bnl(body: str, *, trailing: bool) -> bool:
+    """Require positive second-person structure beyond comma punctuation."""
+
+    value = re.sub(r"\s+", " ", str(body or "")).strip()
+    if not value:
+        return False
+    if trailing:
+        return bool(
+            re.search(
+                r"\b(?:you|your|yourself)\b",
+                value[-120:],
+                re.I,
+            )
+        )
+    return bool(
+        re.match(
+            r"(?:you\b|please\b|"
+            r"(?:can|could|would|will|do|did|are|were|have|has|"
+            r"should|may|might)\s+you\b|"
+            r"(?:what|why|how|when|where|who)\b.{0,28}\byou\b|"
+            r"(?:tell|help|show|give|explain|check|look|listen|answer|"
+            r"remember|remind)\b)",
+            value,
+            re.I,
+        )
+    )
+
+
+def _looks_like_discourse_modifier(candidate: str) -> bool:
+    normalized = normalize_bnl_self_name(candidate)
+    return bool(normalized and normalized.replace("-", "").endswith("ly"))
+
+
+def classify_bnl_self_name_request(
+    text: str,
+    *,
+    independent_bnl_target: bool = False,
+) -> BnlSelfNameRequest:
+    """Classify naming acts using positive grammar rather than punctuation."""
 
     value = re.sub(
         r"<@!?\d+>",
@@ -11508,29 +11604,39 @@ def classify_bnl_self_name_request(text: str) -> BnlSelfNameRequest:
         flags=re.I,
     ).strip()
     value = re.sub(r"\s+", " ", value)
+    performed = _performed_self_name_clause(value)
 
     correction_patterns = (
         re.compile(
             r"\b(?:instead\s+of|replace)\s+"
-            r"[\"“']?(?P<old>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})"
+            rf"[\"“']?(?P<old>{_SELF_NAME_VALUE_FRAGMENT})"
             r"[\"”']?\s+(?:with|use)\s+"
-            r"[\"“']?(?P<new>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})",
+            rf"[\"“']?(?P<new>{_SELF_NAME_VALUE_FRAGMENT})",
             re.I,
         ),
         re.compile(
             r"\b(?:stop|quit)\s+(?:calling|using)\s+(?:you\s+)?"
-            r"[\"“']?(?P<old>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})"
+            rf"[\"“']?(?P<old>{_SELF_NAME_VALUE_FRAGMENT})"
             r"[\"”']?.{0,40}\b(?:call|use)\s+(?:you\s+)?"
-            r"[\"“']?(?P<new>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})",
+            rf"[\"“']?(?P<new>{_SELF_NAME_VALUE_FRAGMENT})",
             re.I,
         ),
     )
     for pattern in correction_patterns:
-        match = pattern.search(value)
-        if not match:
+        match = pattern.match(performed)
+        if not match or not _self_name_match_has_safe_boundary(
+            performed,
+            match,
+        ):
             continue
-        prior_name = _clean_self_name_candidate(match.group("old"))
-        new_name = _clean_self_name_candidate(match.group("new"))
+        prior_name = _clean_self_name_candidate(
+            match.group("old"),
+            reject_generic=False,
+        )
+        new_name = _clean_self_name_candidate(
+            match.group("new"),
+            reject_generic=False,
+        )
         if prior_name and new_name and (
             normalize_bnl_self_name(prior_name)
             != normalize_bnl_self_name(new_name)
@@ -11540,52 +11646,64 @@ def classify_bnl_self_name_request(text: str) -> BnlSelfNameRequest:
                 name=new_name,
                 prior_name=prior_name,
                 explicit=True,
+                classification="explicit_correction",
+                evidence_kind="explicit_correction",
             )
 
     revoke_patterns = (
         re.compile(
             r"\b(?:can|could|should|would)\s+we\s+"
             r"(?:stop|quit)\s+(?:calling|using)\s+(?:you\s+)?"
-            r"[\"“']?(?P<name>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})",
+            r"[\"“']?" + _SELF_NAME_CAPTURE,
             re.I,
         ),
         re.compile(
             r"\b(?:do\s+not|don(?:'|’)t|dont|never|stop|quit)\s+"
             r"(?:call|calling|use|using)\s+(?:you\s+)?"
-            r"[\"“']?(?P<name>[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47})",
+            r"[\"“']?" + _SELF_NAME_CAPTURE,
             re.I,
         ),
         re.compile(
-            r"\b(?P<name>[A-Za-z0-9][A-Za-z0-9.'’\-]{0,31})\s+"
+            rf"\b(?P<name>{_SELF_NAME_VALUE_FRAGMENT})\s+"
             r"(?:is|feels|seems)\s+(?:retired|done|not\s+working)\b",
             re.I,
         ),
     )
     for pattern in revoke_patterns:
-        match = pattern.search(value)
-        if match:
-            candidate = _clean_self_name_candidate(match.group("name"))
+        match = pattern.match(performed)
+        if match and _self_name_match_has_safe_boundary(performed, match):
+            candidate = _clean_self_name_candidate(
+                match.group("name"),
+                reject_generic=False,
+            )
             if candidate:
                 return BnlSelfNameRequest(
                     action="revoke",
                     name=candidate,
                     explicit=True,
+                    classification="explicit_revocation",
+                    evidence_kind="explicit_revocation",
                 )
 
     for pattern in _SELF_NAME_EXPLICIT_PATTERNS:
-        match = pattern.search(value)
-        if match:
-            candidate = _clean_self_name_candidate(match.group("name"))
+        match = pattern.match(performed)
+        if match and _self_name_match_has_safe_boundary(performed, match):
+            candidate = _clean_self_name_candidate(
+                match.group("name"),
+                reject_generic=False,
+            )
             if candidate:
                 return BnlSelfNameRequest(
                     action="propose",
                     name=candidate,
                     explicit=True,
+                    classification="explicit_proposal",
+                    evidence_kind="explicit_proposal",
                 )
+
     greeting = re.match(
         r"^\s*(?:hey|yo|hi|hello|sup)\s+"
-        r"(?P<name>[A-Za-z0-9][A-Za-z0-9.'’\-]{0,31})"
-        r"(?:\s*[,!?:-]|\s+)",
+        r"(?P<name>[^,!?:;\n]{1,48})\s*[,!?:;\-—]",
         value,
         re.I,
     )
@@ -11596,34 +11714,266 @@ def classify_bnl_self_name_request(text: str) -> BnlSelfNameRequest:
                 action="propose",
                 name=candidate,
                 explicit=False,
+                classification="strong_greeting_vocative",
+                evidence_kind="strong_greeting_vocative",
             )
-    leading = re.match(
-        r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9.'’\-]{0,31})\s*,",
-        value,
-        re.I,
-    )
-    if leading:
-        candidate = _clean_self_name_candidate(leading.group("name"))
-        if candidate:
-            return BnlSelfNameRequest(
-                action="propose",
-                name=candidate,
-                explicit=False,
-            )
+
     trailing = re.search(
-        r",\s*(?P<name>[A-Za-z0-9][A-Za-z0-9.'’\-]{0,31})\s*[?!.]*$",
+        r"(?P<body>.+?)[,，]\s*"
+        rf"(?P<name>{_SELF_NAME_VALUE_FRAGMENT})\s*[?!.…]*$",
         value,
         re.I,
     )
     if trailing:
+        raw_candidate = _clean_self_name_candidate(
+            trailing.group("name"),
+            reject_generic=False,
+        )
         candidate = _clean_self_name_candidate(trailing.group("name"))
-        if candidate:
+        trailing_targets_bnl = _bare_vocative_body_targets_bnl(
+            trailing.group("body"),
+            trailing=True,
+        )
+        if not independent_bnl_target and trailing_targets_bnl:
+            return BnlSelfNameRequest(
+                classification="discourse_or_ambiguous_non_address",
+                candidate=raw_candidate,
+                ambiguous=bool(raw_candidate),
+            )
+        if (
+            independent_bnl_target
+            and _looks_like_discourse_modifier(raw_candidate)
+        ):
+            return BnlSelfNameRequest(
+                classification="discourse_modifier",
+                candidate=raw_candidate,
+            )
+        if independent_bnl_target and candidate and trailing_targets_bnl:
             return BnlSelfNameRequest(
                 action="propose",
                 name=candidate,
                 explicit=False,
+                classification="target_supported_bare_vocative",
+                evidence_kind="target_supported_bare_vocative",
             )
+
+    leading = re.match(
+        rf"^\s*(?P<name>{_SELF_NAME_VALUE_FRAGMENT})\s*[,，]\s*"
+        r"(?P<body>.+)$",
+        value,
+        re.I,
+    )
+    if leading:
+        raw_candidate = _clean_self_name_candidate(
+            leading.group("name"),
+            reject_generic=False,
+        )
+        candidate = _clean_self_name_candidate(leading.group("name"))
+        if not independent_bnl_target:
+            return BnlSelfNameRequest(
+                classification="discourse_or_ambiguous_non_address",
+                candidate=raw_candidate,
+                ambiguous=bool(raw_candidate),
+            )
+        if _looks_like_discourse_modifier(raw_candidate):
+            return BnlSelfNameRequest(
+                classification="discourse_modifier",
+                candidate=raw_candidate,
+            )
+        if candidate and _bare_vocative_body_targets_bnl(
+            leading.group("body"),
+            trailing=False,
+        ):
+            return BnlSelfNameRequest(
+                action="propose",
+                name=candidate,
+                explicit=False,
+                classification="target_supported_bare_vocative",
+                evidence_kind="target_supported_bare_vocative",
+            )
+        return BnlSelfNameRequest(
+            classification="ambiguous_candidate",
+            candidate=raw_candidate,
+            ambiguous=bool(raw_candidate),
+        )
     return BnlSelfNameRequest()
+
+
+def _bnl_self_name_source_text(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    decision_entry_id: str,
+) -> str:
+    """Read one governed user root for validation without reporting content."""
+
+    tables = {
+        str(row[0] or "")
+        for row in conn.execute(
+            "SELECT name FROM main.sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if not {
+        "conversations",
+        "memory_ledger_entries",
+        "memory_ledger_lineage",
+    }.issubset(tables):
+        return ""
+    columns = {
+        str(row[1] or "")
+        for row in conn.execute("PRAGMA table_info(conversations)").fetchall()
+    }
+    if not {"id", "guild_id", "content"}.issubset(columns):
+        return ""
+    row = conn.execute(
+        """
+        SELECT conversation.content
+        FROM memory_ledger_lineage AS edge
+        JOIN memory_ledger_entries AS root
+          ON root.entry_id=edge.target_entry_id
+         AND root.guild_id=edge.guild_id
+        JOIN conversations AS conversation
+          ON conversation.id=CAST(root.source_row_id AS INTEGER)
+         AND conversation.guild_id=root.guild_id
+        WHERE edge.guild_id=? AND edge.entry_id=?
+          AND edge.lineage_type='derived_from'
+          AND root.source_table='conversations'
+          AND root.source_role='user'
+        ORDER BY root.entry_id
+        LIMIT 1
+        """,
+        (int(guild_id), str(decision_entry_id or "")),
+    ).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def _historical_self_name_request_supports_record(
+    source_text: str,
+    record: BnlSelfNameRecord,
+) -> tuple[bool, str]:
+    """Revalidate only strong source grammar; never infer old target state."""
+
+    request = classify_bnl_self_name_request(source_text)
+    if request.evidence_kind not in {
+        "explicit_proposal",
+        "explicit_correction",
+        "explicit_revocation",
+    }:
+        return False, "weak_or_ambiguous_historical_grammar"
+    record_name = normalize_bnl_self_name(record.display_name)
+    supported_names = {
+        normalize_bnl_self_name(request.name),
+        normalize_bnl_self_name(request.prior_name),
+    }
+    supported_names.discard("")
+    if not record_name or record_name not in supported_names:
+        return False, "historical_candidate_mismatch"
+    return True, request.evidence_kind
+
+
+def _validated_bnl_self_name_records(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    records: tuple[BnlSelfNameRecord, ...],
+) -> tuple[BnlSelfNameRecord, ...]:
+    """Apply the current grammar fence without rewriting append-only history."""
+
+    validated = []
+    for record in records:
+        if record.routing_eligible:
+            validated.append(record)
+            continue
+        if record.validation_version == BNL_SELF_NAME_VALIDATION_VERSION:
+            continue
+        source_text = _bnl_self_name_source_text(
+            conn,
+            guild_id=guild_id,
+            decision_entry_id=record.entry_id,
+        )
+        supported, evidence_kind = (
+            _historical_self_name_request_supports_record(
+                source_text,
+                record,
+            )
+        )
+        if supported:
+            validated.append(
+                replace(
+                    record,
+                    validation_version=BNL_SELF_NAME_VALIDATION_VERSION,
+                    evidence_kind=evidence_kind,
+                    routing_eligible=True,
+                    validation_basis="historical_positive_revalidation",
+                    quarantine_reason="",
+                )
+            )
+    return tuple(validated)
+
+
+def build_bnl_self_name_validation_report(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    channel_policies: tuple[str, ...] = (),
+) -> dict:
+    """Return a content-free, read-only grammar quarantine inventory."""
+
+    records = current_bnl_self_name_records(
+        conn,
+        guild_id=int(guild_id),
+        channel_policies=channel_policies,
+    )
+    validated = _validated_bnl_self_name_records(
+        conn,
+        guild_id=int(guild_id),
+        records=records,
+    )
+    validated_by_id = {record.entry_id: record for record in validated}
+    reason_counts: Counter[str] = Counter()
+    recorded_current = 0
+    historical_revalidated = 0
+    receipt_parts = []
+    for record in records:
+        routed = validated_by_id.get(record.entry_id)
+        if routed is None:
+            source_text = _bnl_self_name_source_text(
+                conn,
+                guild_id=int(guild_id),
+                decision_entry_id=record.entry_id,
+            )
+            _supported, reason = (
+                _historical_self_name_request_supports_record(
+                    source_text,
+                    record,
+                )
+                if record.validation_version
+                != BNL_SELF_NAME_VALIDATION_VERSION
+                else (False, record.quarantine_reason)
+            )
+            reason_counts[reason or "unvalidated"] += 1
+            status = "quarantined"
+        elif routed.validation_basis == "recorded_current_grammar":
+            recorded_current += 1
+            status = "recorded_current"
+        else:
+            historical_revalidated += 1
+            status = "historical_revalidated"
+        receipt_parts.append(f"{record.entry_id}:{status}")
+    snapshot_digest = hashlib.sha256(
+        "\x1f".join(sorted(receipt_parts)).encode("utf-8")
+    ).hexdigest()[:16]
+    return {
+        "validationVersion": BNL_SELF_NAME_VALIDATION_VERSION,
+        "activeDecisionCount": len(records),
+        "routingEligibleCount": len(validated),
+        "recordedCurrentGrammarCount": recorded_current,
+        "historicalRevalidatedCount": historical_revalidated,
+        "quarantinedCount": len(records) - len(validated),
+        "quarantineReasons": dict(sorted(reason_counts.items())),
+        "snapshotDigest": snapshot_digest,
+        "mutationCount": 0,
+    }
 
 
 def _extract_self_name_address_candidate(
@@ -11636,17 +11986,63 @@ def _extract_self_name_address_candidate(
 def _self_name_used_as_vocative(text: str, name: str) -> bool:
     """Match a governed name only in ordinary address positions."""
 
-    words = tuple(re.findall(r"[a-z0-9]+", str(name or "").lower()))
-    if not words:
+    normalized = normalize_bnl_self_name(name)
+    if not normalized:
         return False
-    name_pattern = r"\s+".join(re.escape(word) for word in words)
-    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    name_pattern = r"\s+".join(
+        re.escape(part) for part in normalized.split()
+    )
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    value = re.sub(r"\s+", " ", value).strip()
     patterns = (
-        rf"^(?:hey|yo|hi|hello|sup)\s+{name_pattern}(?:\s*[,!?:-]|\s+)",
-        rf"^{name_pattern}\s*(?:[,!?:-]|\s+(?:what|why|how|when|where|who|can|could|would|do|did|are|is|please|tell|help)\b)",
+        rf"^(?:hey|yo|hi|hello|sup)\s+{name_pattern}(?:\s*[,!?:;—-]|\s+)",
+        rf"^{name_pattern}\s*(?:[,!?:;—-]|\s+(?:what|why|how|when|where|who|can|could|would|do|did|are|is|please|tell|help)\b)",
+        rf"[,;:]\s*{name_pattern}\s*[,!?:;—-]",
         rf",\s*{name_pattern}\s*[?!.]*$",
     )
-    return any(re.search(pattern, value, re.I) for pattern in patterns)
+    return any(re.search(pattern, value) for pattern in patterns)
+
+
+def _known_human_vocative_present(
+    text: str,
+    known_humans: set[str],
+) -> bool:
+    """Compare bounded address-position candidates with known humans."""
+
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    value = re.sub(r"\s+", " ", value).strip()
+    candidates = []
+    patterns = (
+        re.compile(
+            r"^(?:hey|yo|hi|hello|sup)\s+"
+            r"(?P<name>[^,!?:;\n]{1,48})\s*[,!?:;—-]",
+            re.I,
+        ),
+        re.compile(
+            rf"^\s*(?P<name>{_SELF_NAME_VALUE_FRAGMENT})\s*[,，:]",
+            re.I,
+        ),
+        re.compile(
+            r"[,;:]\s*(?P<name>[^,!?:;\n]{1,48})\s*[,!?:;—-]",
+            re.I,
+        ),
+        re.compile(
+            rf"[,，]\s*(?P<name>{_SELF_NAME_VALUE_FRAGMENT})\s*[?!.…]*$",
+            re.I,
+        ),
+    )
+    for pattern in patterns:
+        candidates.extend(
+            match.group("name") for match in pattern.finditer(value)
+        )
+    return any(
+        normalized in known_humans
+        for normalized in (
+            normalize_bnl_self_name(candidate)
+            for candidate in candidates
+        )
+        if normalized
+    )
 
 
 def _resolve_bnl_self_name_address(
@@ -11655,6 +12051,9 @@ def _resolve_bnl_self_name_address(
     guild,
     channel_policy: str = "public_home",
     governed_state_enabled: bool = True,
+    independent_bnl_target: bool = False,
+    targets_other_human: bool = False,
+    known_humans: set[str] | None = None,
 ) -> tuple[bool, str, str, bool]:
     """Resolve canon/accepted/proposed/denied without inventing a name."""
 
@@ -11662,7 +12061,11 @@ def _resolve_bnl_self_name_address(
     canonical_match = _CANONICAL_BNL_NAME_RE.search(literal)
     if canonical_match:
         return True, "canonical", canonical_match.group(0), False
-    known_humans = _known_guild_human_names(guild)
+    known_humans = (
+        set(known_humans)
+        if known_humans is not None
+        else _known_guild_human_names(guild)
+    )
     records = {}
     if governed_state_enabled:
         records = {
@@ -11682,13 +12085,20 @@ def _resolve_bnl_self_name_address(
         if record.decision == "deferred":
             return True, "proposed", record.display_name, True
         return False, "denied", record.display_name, False
-    request = classify_bnl_self_name_request(literal)
+    request = classify_bnl_self_name_request(
+        literal,
+        independent_bnl_target=independent_bnl_target,
+    )
+    possible_candidate = request.name or request.candidate
+    possible_normalized = normalize_bnl_self_name(possible_candidate)
+    if possible_normalized and possible_normalized in known_humans:
+        return False, "other_human", possible_candidate, False
+    if request.action != "none" and targets_other_human:
+        return False, "ambiguous", "", False
     candidate = request.name
     explicit_proposal = request.explicit
     if candidate:
         normalized = normalize_bnl_self_name(candidate)
-        if normalized in known_humans:
-            return False, "other_human", candidate, False
         record = records.get(normalized)
         if request.action == "revoke":
             return True, "revocation", candidate, True
@@ -11838,6 +12248,14 @@ def persist_bnl_self_name_decision_after_send(
     ):
         return None
     request_action = str(addressing.bnl_name_action or "propose").lower()
+    if request_action not in {"propose", "revoke", "correct"}:
+        request_action = (
+            "correct"
+            if addressing.bnl_name_state == "correction"
+            else "revoke"
+            if addressing.bnl_name_state == "revocation"
+            else "propose"
+        )
     decisions: list[tuple[str, str]] = []
     if request_action == "correct":
         new_decision = infer_bnl_self_name_decision(
@@ -11879,7 +12297,7 @@ def persist_bnl_self_name_decision_after_send(
                 return None
             source_row = lookup_conn.execute(
                 """
-                SELECT id
+                SELECT id,content
                 FROM conversations
                 WHERE guild_id=? AND message_id=? AND role='user'
                 ORDER BY id DESC
@@ -11913,6 +12331,46 @@ def persist_bnl_self_name_decision_after_send(
                 name_digest,
             )
             return None
+        claimed_evidence_kind = str(
+            addressing.bnl_name_evidence_kind or ""
+        ).strip()
+        validation_request = classify_bnl_self_name_request(
+            str(source_row[1] or ""),
+            independent_bnl_target=(
+                claimed_evidence_kind == "target_supported_bare_vocative"
+            ),
+        )
+        expected_names = {
+            normalize_bnl_self_name(addressing.bnl_name_value),
+        }
+        if request_action == "correct":
+            expected_names.add(
+                normalize_bnl_self_name(
+                    addressing.bnl_name_prior_value
+                )
+            )
+        request_names = {
+            normalize_bnl_self_name(validation_request.name),
+            normalize_bnl_self_name(validation_request.prior_name),
+        }
+        expected_names.discard("")
+        request_names.discard("")
+        if (
+            validation_request.validation_version
+            != BNL_SELF_NAME_VALIDATION_VERSION
+            or validation_request.evidence_kind
+            not in BNL_SELF_NAME_ROUTING_EVIDENCE_KINDS
+            or not expected_names
+            or not expected_names.issubset(request_names)
+            or validation_request.action != request_action
+        ):
+            logging.info(
+                "bnl_self_name_decision_not_persisted "
+                "reason=source_grammar_not_authoritative name_digest=%s",
+                name_digest,
+            )
+            return None
+        validated_evidence_kind = validation_request.evidence_kind
         if not decision_row:
             logging.info(
                 "bnl_self_name_decision_not_persisted "
@@ -11950,6 +12408,8 @@ def persist_bnl_self_name_decision_after_send(
                     channel_policy=str(channel_policy or "unknown"),
                     route_mode=str(route_mode or ROUTE_MODE_NORMAL_CHAT),
                     response_digest=response_digest,
+                    validation_version=BNL_SELF_NAME_VALIDATION_VERSION,
+                    evidence_kind=validated_evidence_kind,
                 )
                 if result.outcome not in {"inserted", "deduplicated"}:
                     raise sqlite3.IntegrityError(
@@ -12190,6 +12650,20 @@ def resolve_discord_turn_addressing(
         )
     if direct_to_bnl is None:
         direct_to_bnl = bool(explicitly_mentions_bnl or reply_to_bnl)
+    independent_bnl_target = bool(
+        explicitly_mentions_bnl or reply_to_bnl
+    )
+    message_guild = getattr(message, "guild", None)
+    known_humans = _known_guild_human_names(message_guild)
+    explicit_other_human_target = bool(
+        any(not bot_id or user_id != bot_id for user_id in raw_ids)
+        or (reply_author and (not bot_id or reply_author_id != bot_id))
+        or reply_conversation_role == "user"
+        or _known_human_vocative_present(
+            getattr(message, "content", "") or "",
+            known_humans,
+        )
+    )
     channel_policy = resolve_channel_policy(
         getattr(message, "channel", None)
     )
@@ -12213,14 +12687,39 @@ def resolve_discord_turn_addressing(
         channel_policy=channel_policy,
         governed_state_enabled=bnl_name_influence_mode
         in {"live", "sealed_canary"},
+        independent_bnl_target=independent_bnl_target,
+        targets_other_human=explicit_other_human_target,
+        known_humans=known_humans,
     )
     self_name_request = classify_bnl_self_name_request(
-        getattr(message, "content", "") or ""
+        getattr(message, "content", "") or "",
+        independent_bnl_target=independent_bnl_target,
     )
+    if bnl_name_state == "canonical":
+        self_name_request = BnlSelfNameRequest(
+            classification="canonical_bnl_address",
+            candidate=bnl_name_value,
+        )
+    elif bnl_name_state == "accepted":
+        self_name_request = BnlSelfNameRequest(
+            classification="accepted_governed_vocative",
+            candidate=bnl_name_value,
+        )
+    elif bnl_name_state == "other_human":
+        self_name_request = BnlSelfNameRequest(
+            classification="another_human_address",
+            candidate=bnl_name_value,
+        )
+    elif bnl_name_state == "ambiguous":
+        self_name_request = BnlSelfNameRequest(
+            classification="mixed_human_ambiguous",
+            candidate=(
+                self_name_request.name or self_name_request.candidate
+            ),
+            ambiguous=True,
+        )
     targets_other_human = bool(
-        any(not bot_id or user_id != bot_id for user_id in raw_ids)
-        or (reply_author and (not bot_id or reply_author_id != bot_id))
-        or reply_conversation_role == "user"
+        explicit_other_human_target
         or bnl_name_state == "other_human"
     )
     return DiscordTurnAddressing(
@@ -12240,6 +12739,9 @@ def resolve_discord_turn_addressing(
         ),
         bnl_name_action=self_name_request.action,
         bnl_name_prior_value=self_name_request.prior_name,
+        bnl_name_classification=self_name_request.classification,
+        bnl_name_evidence_kind=self_name_request.evidence_kind,
+        bnl_name_validation_version=self_name_request.validation_version,
         bnl_name_influence_mode=bnl_name_influence_mode,
         source_message_id=int(getattr(message, "id", 0) or 0),
         reply_message_id=reply_message_id,
@@ -37556,9 +38058,33 @@ def _collect_bnl_memory_diagnostic_data(
         "claimContractVersion": "unavailable",
         "mutationCount": 0,
     }
+    self_name_validation = {
+        "validationVersion": BNL_SELF_NAME_VALIDATION_VERSION,
+        "activeDecisionCount": 0,
+        "routingEligibleCount": 0,
+        "recordedCurrentGrammarCount": 0,
+        "historicalRevalidatedCount": 0,
+        "quarantinedCount": 0,
+        "quarantineReasons": {},
+        "snapshotDigest": "unavailable",
+        "mutationCount": 0,
+    }
     try:
         diagnostic_conn = sqlite3.connect(DB_FILE)
         try:
+            try:
+                self_name_validation = (
+                    build_bnl_self_name_validation_report(
+                        diagnostic_conn,
+                        guild_id=guild_id,
+                        channel_policies=_bnl_self_name_policy_scope(policy),
+                    )
+                )
+            except Exception as exc:
+                logging.debug(
+                    "bnl_self_name_validation_report_failed error=%s",
+                    exc,
+                )
             try:
                 claim_contract_inventory = build_claim_contract_inventory(
                     diagnostic_conn,
@@ -37613,6 +38139,7 @@ def _collect_bnl_memory_diagnostic_data(
         shadow_acceptance,
         ledger_diag,
         claim_contract_inventory,
+        self_name_validation,
     )
 
 
@@ -38291,6 +38818,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
             shadow_acceptance,
             ledger_diag,
             claim_contract_inventory,
+            self_name_validation,
         ) = await asyncio.to_thread(
             _collect_bnl_memory_diagnostic_data,
             guild_id=guild.id,
@@ -38341,6 +38869,15 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- hybrid_claim_reconciliation_status: `{claim_contract_inventory.get('sourceReconciliationStatus')}`",
         f"- hybrid_claim_source_reconciled: `{'yes' if claim_contract_inventory.get('sourceAdaptedReconciled') else 'no'}`",
         f"- hybrid_claim_mutation_count: `{claim_contract_inventory.get('mutationCount', 0)}`",
+        f"- bnl_self_name_validation_version: `{self_name_validation.get('validationVersion')}`",
+        f"- bnl_self_name_active_decisions: `{self_name_validation.get('activeDecisionCount', 0)}`",
+        f"- bnl_self_name_routing_eligible: `{self_name_validation.get('routingEligibleCount', 0)}`",
+        f"- bnl_self_name_recorded_current_grammar: `{self_name_validation.get('recordedCurrentGrammarCount', 0)}`",
+        f"- bnl_self_name_historical_revalidated: `{self_name_validation.get('historicalRevalidatedCount', 0)}`",
+        f"- bnl_self_name_quarantined: `{self_name_validation.get('quarantinedCount', 0)}`",
+        f"- bnl_self_name_quarantine_reasons: `{self_name_validation.get('quarantineReasons') or {}}`",
+        f"- bnl_self_name_validation_snapshot: `{self_name_validation.get('snapshotDigest')}`",
+        f"- bnl_self_name_validation_mutation_count: `{self_name_validation.get('mutationCount', 0)}`",
         f"- conversation_context_contract: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('contract_version')}`",
         f"- conversation_context_enabled: `{'yes' if conversation_context_v2_enabled() else 'no'}`",
         f"- conversation_context_last_route_mode: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('route_mode')}`",
