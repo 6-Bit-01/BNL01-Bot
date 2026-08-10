@@ -81,6 +81,19 @@ def diagnostic_data():
             "sourceAdaptedReconciled": True,
             "mutationCount": 0,
         },
+        {
+            "validationVersion": "bnl_self_name_grammar_v2",
+            "activeDecisionCount": 2,
+            "routingEligibleCount": 1,
+            "recordedCurrentGrammarCount": 0,
+            "historicalRevalidatedCount": 1,
+            "quarantinedCount": 1,
+            "quarantineReasons": {
+                "weak_or_ambiguous_historical_grammar": 1
+            },
+            "snapshotDigest": "fixture-digest",
+            "mutationCount": 0,
+        },
     )
 
 
@@ -140,6 +153,23 @@ class MemoryDiagnosticCommandTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn(
                 "- hybrid_claim_truncated_sources: `()`",
+                text,
+            )
+            self.assertIn(
+                "- bnl_self_name_validation_version: "
+                "`bnl_self_name_grammar_v2`",
+                text,
+            )
+            self.assertIn(
+                "- bnl_self_name_historical_revalidated: `1`",
+                text,
+            )
+            self.assertIn(
+                "- bnl_self_name_quarantined: `1`",
+                text,
+            )
+            self.assertIn(
+                "- bnl_self_name_validation_mutation_count: `0`",
                 text,
             )
             self.assertEqual(limit, 1700)

@@ -226,6 +226,420 @@ class GovernedSelfNameTests(unittest.TestCase):
         self.assertEqual(temporal, (False, "none", "", False))
         self.assertEqual(discourse, (False, "none", "", False))
 
+    def test_punctuation_only_discourse_fails_closed_by_structure(self):
+        cases = (
+            "Personally, I think Friday works.",
+            "Apparently, the queue is moving.",
+            "Technically, that is correct.",
+            "Unfortunately, it failed.",
+            "Honestly, I am not sure.",
+            "Meanwhile, the room kept moving.",
+            "However, the queue kept moving.",
+            "But, I think Friday works.",
+            "Maybe, Friday still works.",
+            "In general, this seems fine.",
+            "In the room, the queue is moving.",
+            "HERE, the queue is moving.",
+            "Today, I finished the change.",
+            "I think Friday works, personally.",
+            "The queue is moving, apparently.",
+            "The queue is moving, in general.",
+            "Actually，I think Friday works.",
+        )
+        guild = SimpleNamespace(id=10, members=[])
+        with mock.patch.object(
+            bnl01_bot,
+            "_load_bnl_self_name_records",
+            return_value=(),
+        ):
+            baseline = {
+                text: bnl01_bot.classify_bnl_self_name_request(text)
+                for text in cases
+            }
+            for text, request in baseline.items():
+                with self.subTest(text=text):
+                    self.assertEqual(request.action, "none")
+                    self.assertEqual(request.evidence_kind, "")
+                    self.assertEqual(
+                        bnl01_bot._resolve_bnl_self_name_address(
+                            text,
+                            guild=guild,
+                        ),
+                        (False, "none", "", False),
+                    )
+            with mock.patch.object(
+                bnl01_bot,
+                "_SELF_NAME_STOPWORDS",
+                frozenset(),
+            ):
+                for text, original in baseline.items():
+                    with self.subTest(text=text, stopwords="removed"):
+                        changed = (
+                            bnl01_bot.classify_bnl_self_name_request(text)
+                        )
+                        self.assertEqual(changed.action, "none")
+                        self.assertEqual(
+                            changed.classification,
+                            original.classification,
+                        )
+
+        addressing = _addressing(bnl=False, state="none")
+        decision = bnl01_bot.build_live_conversation_orchestration_decision(
+            engagement_decision="observe",
+            engagement_reason="no_response_needed",
+            channel_policy="public_home",
+            addressings=(addressing,),
+            context_result=None,
+            moment_situation=None,
+            influence_mode="live",
+        )
+        self.assertFalse(decision.response_required)
+        self.assertEqual(decision.response_act, "observe")
+
+    def test_positive_vocative_grammar_requires_independent_targeting(self):
+        unsupported = bnl01_bot.classify_bnl_self_name_request(
+            "Blue, can you look at this?"
+        )
+        supported = bnl01_bot.classify_bnl_self_name_request(
+            "Blue, can you look at this?",
+            independent_bnl_target=True,
+        )
+        trailing = bnl01_bot.classify_bnl_self_name_request(
+            "What do you think, Blue?",
+            independent_bnl_target=True,
+        )
+        discourse_reply = bnl01_bot.classify_bnl_self_name_request(
+            "Personally, I think Friday works.",
+            independent_bnl_target=True,
+        )
+
+        self.assertEqual(unsupported.action, "none")
+        self.assertTrue(unsupported.ambiguous)
+        self.assertEqual(
+            (supported.action, supported.name, supported.evidence_kind),
+            ("propose", "Blue", "target_supported_bare_vocative"),
+        )
+        self.assertEqual(
+            (trailing.action, trailing.name, trailing.evidence_kind),
+            ("propose", "Blue", "target_supported_bare_vocative"),
+        )
+        self.assertEqual(discourse_reply.action, "none")
+        self.assertEqual(
+            discourse_reply.classification,
+            "discourse_modifier",
+        )
+
+        human = SimpleNamespace(
+            bot=False,
+            display_name="Chris",
+            global_name="",
+            name="chris-user",
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "_load_bnl_self_name_records",
+            return_value=(),
+        ):
+            self.assertEqual(
+                bnl01_bot._resolve_bnl_self_name_address(
+                    "What do you think, Chris?",
+                    guild=SimpleNamespace(id=10, members=[human]),
+                ),
+                (False, "other_human", "Chris", False),
+            )
+            self.assertEqual(
+                bnl01_bot._resolve_bnl_self_name_address(
+                    "Hey Blue, can you look at this?",
+                    guild=SimpleNamespace(id=10, members=[]),
+                    targets_other_human=True,
+                ),
+                (False, "ambiguous", "", False),
+            )
+            self.assertEqual(
+                bnl01_bot._resolve_bnl_self_name_address(
+                    "Blue, can you look at this?",
+                    guild=SimpleNamespace(id=10, members=[]),
+                    independent_bnl_target=True,
+                    targets_other_human=True,
+                ),
+                (False, "ambiguous", "", False),
+            )
+
+    def test_discord_reply_support_is_carried_into_typed_name_addressing(self):
+        author = SimpleNamespace(
+            id=44,
+            bot=False,
+            display_name="Member",
+            global_name="",
+            name="member",
+        )
+        guild = SimpleNamespace(id=10, members=[author])
+        channel = SimpleNamespace(id=700, name="home")
+        message = SimpleNamespace(
+            id=8001,
+            author=author,
+            guild=guild,
+            channel=channel,
+            content="Blue, can you look at this?",
+            raw_mentions=[],
+            mentions=[],
+            reference=None,
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "conversation_orchestration_influence_mode",
+                return_value="live",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_load_bnl_self_name_records",
+                return_value=(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_conversation_row_for_discord_message",
+                return_value=(0, "", ""),
+            ),
+        ):
+            unsupported = bnl01_bot.resolve_discord_turn_addressing(
+                message,
+                direct_to_bnl=False,
+                reply_to_bnl=False,
+            )
+            generic_direct = bnl01_bot.resolve_discord_turn_addressing(
+                message,
+                direct_to_bnl=True,
+                reply_to_bnl=False,
+            )
+            reply_supported = bnl01_bot.resolve_discord_turn_addressing(
+                message,
+                direct_to_bnl=True,
+                reply_to_bnl=True,
+            )
+
+        self.assertFalse(unsupported.plain_text_names_bnl)
+        self.assertEqual(unsupported.bnl_name_state, "none")
+        self.assertFalse(unsupported.bnl_name_requires_decision)
+        self.assertEqual(generic_direct.bnl_name_state, "none")
+        self.assertFalse(generic_direct.bnl_name_requires_decision)
+        self.assertTrue(reply_supported.plain_text_names_bnl)
+        self.assertEqual(reply_supported.bnl_name_state, "proposed")
+        self.assertTrue(reply_supported.bnl_name_requires_decision)
+        self.assertEqual(
+            reply_supported.bnl_name_evidence_kind,
+            "target_supported_bare_vocative",
+        )
+        self.assertEqual(
+            reply_supported.bnl_name_validation_version,
+            bnl01_bot.BNL_SELF_NAME_VALIDATION_VERSION,
+        )
+
+    def test_plain_text_human_vocatives_preserve_typed_ambiguity(self):
+        author = SimpleNamespace(
+            id=44,
+            bot=False,
+            display_name="Member",
+            global_name="",
+            name="member",
+        )
+        human = SimpleNamespace(
+            id=55,
+            bot=False,
+            display_name="Chris",
+            global_name="",
+            name="chris-user",
+        )
+        guild = SimpleNamespace(id=10, members=[author, human])
+        channel = SimpleNamespace(id=700, name="home")
+
+        def message(content, message_id):
+            return SimpleNamespace(
+                id=message_id,
+                author=author,
+                guild=guild,
+                channel=channel,
+                content=content,
+                raw_mentions=[],
+                mentions=[],
+                reference=None,
+            )
+
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "conversation_orchestration_influence_mode",
+                return_value="live",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_load_bnl_self_name_records",
+                return_value=(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_conversation_row_for_discord_message",
+                return_value=(0, "", ""),
+            ),
+        ):
+            human_only = bnl01_bot.resolve_discord_turn_addressing(
+                message("Hey Chris, what do you think?", 8003),
+                direct_to_bnl=False,
+                reply_to_bnl=False,
+            )
+            mixed = bnl01_bot.resolve_discord_turn_addressing(
+                message("Hey Blue, Chris, can you check this?", 8004),
+                direct_to_bnl=False,
+                reply_to_bnl=False,
+            )
+
+        self.assertTrue(human_only.targets_other_human)
+        self.assertEqual(human_only.bnl_name_state, "other_human")
+        self.assertEqual(
+            human_only.bnl_name_classification,
+            "another_human_address",
+        )
+        self.assertFalse(human_only.addresses_bnl)
+        self.assertTrue(mixed.targets_other_human)
+        self.assertEqual(mixed.bnl_name_state, "ambiguous")
+        self.assertEqual(
+            mixed.bnl_name_classification,
+            "mixed_human_ambiguous",
+        )
+        self.assertEqual(mixed.bnl_name_action, "none")
+        self.assertFalse(mixed.bnl_name_requires_decision)
+        self.assertFalse(mixed.addresses_bnl)
+
+    def test_accepted_unicode_multiword_name_routes_in_vocative_positions(self):
+        record = bnl01_bot.BnlSelfNameRecord(
+            normalized_name="módem azul",
+            display_name="Módem Azul",
+            decision="accepted",
+            entry_id="accepted-name-entry",
+            validation_version=(
+                bnl01_bot.BNL_SELF_NAME_VALIDATION_VERSION
+            ),
+            evidence_kind="explicit_proposal",
+            routing_eligible=True,
+            validation_basis="recorded_current_grammar",
+            quarantine_reason="",
+        )
+        guild = SimpleNamespace(id=10, members=[])
+        cases = (
+            "Hey MÓDEM AZUL—can you check this?",
+            "Módem Azul: can you check this?",
+            "Could you, Módem Azul, check this?",
+            "What do you think, Módem Azul?",
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "_load_bnl_self_name_records",
+            return_value=(record,),
+        ):
+            for text in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(
+                        bnl01_bot._resolve_bnl_self_name_address(
+                            text,
+                            guild=guild,
+                        ),
+                        (True, "accepted", "Módem Azul", False),
+                    )
+
+            author = SimpleNamespace(
+                id=44,
+                bot=False,
+                display_name="Member",
+                global_name="",
+                name="member",
+            )
+            message = SimpleNamespace(
+                id=8002,
+                author=author,
+                guild=guild,
+                channel=SimpleNamespace(id=700, name="home"),
+                content="Could you, Módem Azul, check this?",
+                raw_mentions=[],
+                mentions=[],
+                reference=None,
+            )
+            with (
+                mock.patch.object(
+                    bnl01_bot,
+                    "resolve_channel_policy",
+                    return_value="public_home",
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "conversation_orchestration_influence_mode",
+                    return_value="live",
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "_conversation_row_for_discord_message",
+                    return_value=(0, "", ""),
+                ),
+            ):
+                addressing = bnl01_bot.resolve_discord_turn_addressing(
+                    message,
+                    direct_to_bnl=False,
+                    reply_to_bnl=False,
+                )
+
+        self.assertEqual(addressing.bnl_name_state, "accepted")
+        self.assertEqual(
+            addressing.bnl_name_classification,
+            "accepted_governed_vocative",
+        )
+        self.assertEqual(addressing.bnl_name_action, "none")
+        self.assertFalse(addressing.bnl_name_requires_decision)
+
+    def test_explicit_and_greeting_grammar_is_unicode_and_quote_safe(self):
+        explicit_cases = {
+            "Can I call you Actually?": "Actually",
+            "BNL, can I call you Módem Azul?": "Módem Azul",
+            "Can I call you O’Clock-7?": "O’Clock-7",
+            "Your nickname should be Test Lantern.": "Test Lantern",
+        }
+        for text, name in explicit_cases.items():
+            with self.subTest(text=text):
+                request = bnl01_bot.classify_bnl_self_name_request(text)
+                self.assertEqual(
+                    (request.action, request.name, request.evidence_kind),
+                    ("propose", name, "explicit_proposal"),
+                )
+
+        greeting = bnl01_bot.classify_bnl_self_name_request(
+            "Hey Módem Azul, can you check this? 👋"
+        )
+        self.assertEqual(
+            (greeting.action, greeting.name, greeting.evidence_kind),
+            ("propose", "Módem Azul", "strong_greeting_vocative"),
+        )
+
+        for text in (
+            'She asked, "Can I call you Blue?"',
+            '"Can I call you Blue?"',
+            "`Can I call you Blue?` is the example.",
+            "The phrase 'your name is Blue' appears in the draft.",
+            "Can I call you Blue/Red?",
+            "Can I call you " + ("A" * 60) + "?",
+        ):
+            with self.subTest(text=text):
+                request = bnl01_bot.classify_bnl_self_name_request(text)
+                self.assertEqual(request.action, "none")
+                self.assertEqual(request.evidence_kind, "")
+
     def test_response_decision_parser_is_explicit_and_fail_closed(self):
         self.assertEqual(
             bnl01_bot.infer_bnl_self_name_decision(
@@ -352,6 +766,295 @@ class GovernedSelfNameTests(unittest.TestCase):
                 )
 
             self.assertEqual(routed, (True, "accepted", "Blue", False))
+
+    def test_historical_weak_grammar_is_reported_and_quarantined_read_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                ensure_memory_ledger_schema(conn)
+                _seed_conversation_source_rows(
+                    conn,
+                    (
+                        1,
+                        77,
+                        "user",
+                        700,
+                        "public_home",
+                        "Can I call you Blue?",
+                    ),
+                    (
+                        2,
+                        77,
+                        "model",
+                        700,
+                        "public_home",
+                        "People can call me Blue.",
+                    ),
+                    (
+                        3,
+                        77,
+                        "user",
+                        700,
+                        "public_home",
+                        "Personally, I think Friday works.",
+                    ),
+                    (
+                        4,
+                        77,
+                        "model",
+                        700,
+                        "public_home",
+                        "People can call me Personally.",
+                    ),
+                )
+                rows = (
+                    (1, "user", "Can I call you Blue?", 8001),
+                    (2, "model", "People can call me Blue.", 9001),
+                    (
+                        3,
+                        "user",
+                        "Personally, I think Friday works.",
+                        8003,
+                    ),
+                    (
+                        4,
+                        "model",
+                        "People can call me Personally.",
+                        9004,
+                    ),
+                )
+                for row_id, role, content, message_id in rows:
+                    shadow_conversation_row(
+                        conn,
+                        row_id=row_id,
+                        user_id=44 if role == "user" else 0,
+                        user_name=(
+                            "member" if role == "user" else "BNL-01"
+                        ),
+                        guild_id=77,
+                        role=role,
+                        content=content,
+                        channel_name="home",
+                        channel_policy="public_home",
+                        channel_id=700,
+                        message_id=message_id,
+                        route_mode="normal_chat",
+                        observed_at=(
+                            NOW + timedelta(seconds=row_id)
+                        ).isoformat(),
+                    )
+                for (
+                    name,
+                    source_row,
+                    decision_row,
+                    source_message,
+                    digest,
+                ) in (
+                    ("Blue", 1, 2, 8001, "a" * 64),
+                    ("Personally", 3, 4, 8003, "b" * 64),
+                ):
+                    record_bnl_self_name_decision(
+                        conn,
+                        guild_id=77,
+                        name=name,
+                        decision="accepted",
+                        source_conversation_row_id=source_row,
+                        decision_conversation_row_id=decision_row,
+                        source_message_id=source_message,
+                        channel_id=700,
+                        channel_name="home",
+                        channel_policy="public_home",
+                        route_mode="normal_chat",
+                        response_digest=digest,
+                        observed_at=(
+                            NOW + timedelta(seconds=decision_row)
+                        ).isoformat(),
+                    )
+                conn.commit()
+                before_count = conn.execute(
+                    "SELECT COUNT(*) FROM memory_ledger_entries"
+                ).fetchone()[0]
+                report = bnl01_bot.build_bnl_self_name_validation_report(
+                    conn,
+                    guild_id=77,
+                    channel_policies=("public_home",),
+                )
+                after_count = conn.execute(
+                    "SELECT COUNT(*) FROM memory_ledger_entries"
+                ).fetchone()[0]
+
+            self.assertEqual(before_count, after_count)
+            self.assertEqual(report["activeDecisionCount"], 2)
+            self.assertEqual(report["routingEligibleCount"], 1)
+            self.assertEqual(report["historicalRevalidatedCount"], 1)
+            self.assertEqual(report["quarantinedCount"], 1)
+            self.assertEqual(report["mutationCount"], 0)
+            self.assertEqual(
+                report["quarantineReasons"],
+                {"weak_or_ambiguous_historical_grammar": 1},
+            )
+            rendered_report = json.dumps(report, sort_keys=True)
+            self.assertNotIn("Blue", rendered_report)
+            self.assertNotIn("Personally", rendered_report)
+
+            with (
+                mock.patch.object(bnl01_bot, "DB_FILE", db_path),
+                mock.patch.object(
+                    bnl01_bot,
+                    "memory_ledger_shadow_enabled",
+                    return_value=True,
+                ),
+            ):
+                records = bnl01_bot._load_bnl_self_name_records(
+                    77,
+                    "public_home",
+                )
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].normalized_name, "blue")
+            self.assertEqual(
+                records[0].validation_basis,
+                "historical_positive_revalidation",
+            )
+
+            greeting_record = bnl01_bot.BnlSelfNameRecord(
+                normalized_name="beacon",
+                display_name="Beacon",
+                decision="accepted",
+                entry_id="legacy-greeting-entry",
+            )
+            self.assertEqual(
+                bnl01_bot._historical_self_name_request_supports_record(
+                    "Hey Beacon, can you check this?",
+                    greeting_record,
+                ),
+                (False, "weak_or_ambiguous_historical_grammar"),
+            )
+
+    def test_punctuation_only_source_cannot_persist_name_authority(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversations (
+                        id INTEGER PRIMARY KEY,
+                        guild_id INTEGER,
+                        message_id INTEGER,
+                        role TEXT,
+                        channel_id INTEGER,
+                        content TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO conversations (
+                        id,guild_id,message_id,role,channel_id,content
+                    ) VALUES (?,?,?,?,?,?)
+                    """,
+                    (
+                        (
+                            1,
+                            77,
+                            8001,
+                            "user",
+                            700,
+                            "Personally, I think Friday works.",
+                        ),
+                        (
+                            2,
+                            77,
+                            None,
+                            "model",
+                            700,
+                            "People can call me Personally.",
+                        ),
+                    ),
+                )
+                ensure_memory_ledger_schema(conn)
+                for row_id, role, content, message_id in (
+                    (
+                        1,
+                        "user",
+                        "Personally, I think Friday works.",
+                        8001,
+                    ),
+                    (
+                        2,
+                        "model",
+                        "People can call me Personally.",
+                        None,
+                    ),
+                ):
+                    shadow_conversation_row(
+                        conn,
+                        row_id=row_id,
+                        user_id=44 if role == "user" else 0,
+                        user_name=(
+                            "member" if role == "user" else "BNL-01"
+                        ),
+                        guild_id=77,
+                        role=role,
+                        content=content,
+                        channel_name="home",
+                        channel_policy="public_home",
+                        channel_id=700,
+                        message_id=message_id,
+                        route_mode="normal_chat",
+                        observed_at=NOW.isoformat(),
+                    )
+                conn.commit()
+
+            addressing = _addressing(
+                bnl=True,
+                state="proposed",
+                value="Personally",
+                requires_decision=True,
+            )
+            addressing = bnl01_bot.replace(
+                addressing,
+                source_message_id=8001,
+                bnl_name_action="propose",
+                bnl_name_classification="legacy_bare_comma",
+                bnl_name_evidence_kind="",
+            )
+            with (
+                mock.patch.object(bnl01_bot, "DB_FILE", db_path),
+                mock.patch.object(
+                    bnl01_bot,
+                    "memory_ledger_shadow_enabled",
+                    return_value=True,
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "1"
+                    },
+                    clear=False,
+                ),
+            ):
+                result = (
+                    bnl01_bot.persist_bnl_self_name_decision_after_send(
+                        guild_id=77,
+                        addressing=addressing,
+                        response="People can call me Personally.",
+                        channel_id=700,
+                        channel_name="home",
+                        channel_policy="public_home",
+                        route_mode="normal_chat",
+                    )
+                )
+            self.assertIsNone(result)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM memory_ledger_entries
+                        WHERE source_table='bnl_self_name_decisions'
+                        """
+                    ).fetchone()[0],
+                    0,
+                )
 
     def test_correction_supersedes_acceptance_and_reconsideration_stays_possible(self):
         with sqlite3.connect(":memory:") as conn:
@@ -606,6 +1309,12 @@ class GovernedSelfNameTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.outcome, "inserted")
         self.assertEqual(records[0].decision, "accepted")
+        self.assertTrue(records[0].routing_eligible)
+        self.assertEqual(
+            records[0].validation_version,
+            bnl01_bot.BNL_SELF_NAME_VALIDATION_VERSION,
+        )
+        self.assertEqual(records[0].evidence_kind, "explicit_proposal")
         self.assertEqual(participants, [("bnl_01",)])
 
     def test_sealed_only_name_decision_does_not_leak_to_public_routing(self):
@@ -1474,14 +2183,30 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
             ) VALUES (?,?,?,?,?,?,?)
             """,
             (
-                (1, 77, 8001, "user", 700, "public_home", "proposal"),
-                (2, 77, 9001, "model", 700, "public_home", "acceptance"),
+                (
+                    1,
+                    77,
+                    8001,
+                    "user",
+                    700,
+                    "public_home",
+                    "Can I call you Blue?",
+                ),
+                (
+                    2,
+                    77,
+                    9001,
+                    "model",
+                    700,
+                    "public_home",
+                    "People can call me Blue.",
+                ),
             ),
         )
         ensure_memory_ledger_schema(conn)
         for row_id, role, content, message_id in (
-            (1, "user", "proposal", 8001),
-            (2, "model", "acceptance", 9001),
+            (1, "user", "Can I call you Blue?", 8001),
+            (2, "model", "People can call me Blue.", 9001),
         ):
             shadow_conversation_row(
                 conn,
