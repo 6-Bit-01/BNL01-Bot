@@ -17,6 +17,7 @@ from bnl_memory_ledger import build_memory_ledger_evaluation
 from bnl_moment_engine import build_moment_evaluation_report
 from bnl_relationship_engine import build_evaluation_report as build_relationship_evaluation_report
 from bnl_unified_intelligence_packet import (
+    SCHEMA_VERSION as INTELLIGENCE_PACKET_SCHEMA_VERSION,
     build_evaluation_report as build_intelligence_packet_evaluation_report,
     shadow_configuration as intelligence_packet_shadow_configuration,
 )
@@ -759,7 +760,7 @@ def _read_intelligence_packet_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "unified_intelligence_packet_v5",
+                "schemaVersion": INTELLIGENCE_PACKET_SCHEMA_VERSION,
                 "runs": 0,
                 "itemTotal": 0,
                 "validationItemTotal": 0,
@@ -1921,7 +1922,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             intelligence_packet_state.get("reason", "disabled"),
             intelligence_packet.get(
                 "schemaVersion",
-                "unified_intelligence_packet_v5",
+                INTELLIGENCE_PACKET_SCHEMA_VERSION,
             ),
             intelligence_packet.get("runs", 0),
             intelligence_packet.get("itemTotal", 0),

@@ -35,6 +35,7 @@ from bnl_canon_source_contract import (
     adapt_legacy_canon_fact,
     adapt_living_atomic_claim,
     adapt_open_signal_claim,
+    matching_canon_entity_identities,
     matching_canon_member_identities,
     normalize_canon_identity_label,
     resolve_entity_identity,
@@ -43,7 +44,9 @@ from bnl_canon_source_contract import (
 )
 from bnl_canon_entity_binding import (
     BINDING_LIFECYCLE_VERSION,
+    CanonEntityBindingError,
     read_current_entity_account_bindings,
+    read_current_guild_entity_account_bindings,
 )
 from bnl_memory_governance import (
     APPROVED_MEMBER_SCALAR_PREDICATES,
@@ -70,7 +73,9 @@ from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import shadow_packet_posture
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v5"
+SCHEMA_VERSION = "unified_intelligence_packet_v6"
+SUBJECT_RESOLUTION_VERSION = "governed_packet_subject_resolution_v1"
+SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v1"
 TABLE_NAME = "memory_governance_intelligence_packet_runs"
 SHADOW_ENV = "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED"
 _SHADOW_PREREQUISITES = (
@@ -365,6 +370,19 @@ class PacketConversationEvidence:
 
 
 @dataclass(frozen=True)
+class PacketFrameSubject:
+    """Typed Situation Frame subject reference; labels remain hints only."""
+
+    user_id: int = 0
+    entity_ref: str = ""
+    label_hint: str = ""
+    binding_method: str = "unresolved"
+    confidence: str = "unknown"
+    role_hints: tuple[str, ...] = ()
+    domain_hints: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class IntelligencePacketRequest:
     guild_id: int
     subject_user_id: int
@@ -386,6 +404,42 @@ class IntelligencePacketRequest:
     now: str = ""
     declared_canon_authorized: bool = False
     broad_profile_intent: bool = False
+    subject_entity_ref: str = ""
+    frame_schema_version: str = ""
+    frame_revision: str = ""
+    frame_input_evidence_digest: str = ""
+    frame_status: str = "not_provided"
+    frame_subject_requirement: str = "legacy"
+    frame_subjects: tuple[PacketFrameSubject, ...] = ()
+    frame_role_hints: tuple[str, ...] = ()
+    frame_domain_hints: tuple[str, ...] = ()
+    frame_event_ref: str = ""
+    frame_event_relation: str = "uncertain"
+    frame_task_kind: str = ""
+    frame_object_kind: str = ""
+    frame_phase: str = ""
+    frame_temporal_scope: str = "unspecified"
+    frame_currentness: str = "unknown"
+
+
+@dataclass(frozen=True)
+class PacketSubjectResolution:
+    """One governed subject decision used by every packet adapter."""
+
+    schema_version: str = SUBJECT_RESOLUTION_VERSION
+    status: str = "unresolved"
+    subject_user_id: int = 0
+    subject_key: str = ""
+    entity_ref: str = ""
+    binding_method: str = "none"
+    confidence: str = "unknown"
+    candidate_count: int = 0
+    binding_digest: str = ""
+    reason_codes: tuple[str, ...] = ()
+
+    @property
+    def applicable(self) -> bool:
+        return self.status in {"resolved", "not_applicable", "legacy"}
 
 
 @dataclass(frozen=True)
@@ -451,6 +505,10 @@ class IntelligencePacketDiagnostics:
     shared_root_projection_count: int = 0
     canon_identity_status: str = "not_evaluated"
     canon_identity_stable_row_count: int = 0
+    subject_resolution_status: str = "not_evaluated"
+    subject_resolution_method: str = "none"
+    subject_resolution_candidate_count: int = 0
+    frame_applicability_exclusion_count: int = 0
     processing_errors: list[str] = field(default_factory=list)
     invalid_invariants: list[str] = field(default_factory=list)
     revalidation_status: str = "not_evaluated"
@@ -467,6 +525,7 @@ class PacketRevalidationResult:
     status: str
     changed_source_count: int = 0
     processing_error_count: int = 0
+    subject_resolution_status: str = "not_evaluated"
 
 
 @dataclass(frozen=True)
@@ -505,6 +564,8 @@ class UnifiedIntelligencePacket:
     items: tuple[IntelligencePacketItem, ...]
     exclusions: tuple[IntelligencePacketExclusion, ...]
     diagnostics: IntelligencePacketDiagnostics
+    subject_resolution: PacketSubjectResolution = PacketSubjectResolution()
+    source_snapshot_digest: str = ""
     profile_sufficiency: ProfileSufficiency = ProfileSufficiency()
     validation_items: tuple[IntelligencePacketItem, ...] = ()
 
@@ -658,6 +719,363 @@ def _stable_json(value: Any) -> str:
 def _digest(*values: Any) -> str:
     payload = "\x1f".join(_stable_json(value) for value in values)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+_CANON_ENTITY_BY_KEY = {
+    subject.key: subject for subject in CANON_ENTITY_IDENTITIES
+}
+
+
+def _request_subject_key(request: IntelligencePacketRequest) -> str:
+    user_id = int(request.subject_user_id or 0)
+    if user_id > 0:
+        return subject_key_for_user(user_id)
+    entity_ref = str(request.subject_entity_ref or "").strip()
+    return entity_ref if entity_ref in _CANON_ENTITY_BY_KEY else ""
+
+
+def _binding_read_digest(status: str, revisions: Sequence[Any]) -> str:
+    return _digest(
+        SUBJECT_RESOLUTION_VERSION,
+        str(status or ""),
+        tuple(
+            (
+                str(getattr(revision, "binding_revision_id", "") or ""),
+                str(getattr(revision, "binding_id", "") or ""),
+                int(getattr(revision, "revision_number", 0) or 0),
+                str(getattr(revision, "account_id", "") or ""),
+                str(getattr(revision, "entity_id", "") or ""),
+                bool(getattr(revision, "active", False)),
+                str(getattr(revision, "authority_receipt", "") or ""),
+            )
+            for revision in revisions
+        ),
+    )
+
+
+def _configured_owner_subject(
+    request: IntelligencePacketRequest,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, str]:
+    env = os.environ if environ is None else environ
+    try:
+        owner_user_id = int(env.get("BNL_OWNER_USER_ID", "0") or 0)
+        primary_guild_id = int(env.get("BNL_PRIMARY_GUILD_ID", "0") or 0)
+    except (TypeError, ValueError):
+        return "", ""
+    if not (
+        owner_user_id > 0
+        and primary_guild_id > 0
+        and int(request.subject_user_id or 0) == owner_user_id
+        and int(request.guild_id or 0) == primary_guild_id
+    ):
+        return "", ""
+    return SIX_BIT.key, _digest(
+        SUBJECT_RESOLUTION_VERSION,
+        "configured_owner_account_binding",
+        primary_guild_id,
+        owner_user_id,
+        SIX_BIT.key,
+    )
+
+
+def resolve_packet_subject(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> PacketSubjectResolution:
+    """Resolve one frame subject through existing binding/canon owners."""
+
+    frame_present = bool(
+        str(request.frame_revision or "").strip()
+        or str(request.frame_input_evidence_digest or "").strip()
+    )
+    if not frame_present:
+        user_id = int(request.subject_user_id or 0)
+        entity_ref = str(request.subject_entity_ref or "").strip()
+        subject_key = (
+            subject_key_for_user(user_id)
+            if user_id > 0
+            else entity_ref if entity_ref in _CANON_ENTITY_BY_KEY else ""
+        )
+        return PacketSubjectResolution(
+            status="legacy" if subject_key else "not_applicable",
+            subject_user_id=user_id if user_id > 0 else 0,
+            subject_key=subject_key,
+            entity_ref=entity_ref if entity_ref in _CANON_ENTITY_BY_KEY else "",
+            binding_method="legacy_request_subject" if subject_key else "none",
+            confidence="legacy" if subject_key else "not_applicable",
+            candidate_count=1 if subject_key else 0,
+            binding_digest=_digest(
+                SUBJECT_RESOLUTION_VERSION,
+                "legacy",
+                int(request.guild_id or 0),
+                subject_key,
+            ),
+            reason_codes=(
+                ("frame_not_provided",)
+                if subject_key
+                else ("subject_not_applicable",)
+            ),
+        )
+
+    frame_status = str(request.frame_status or "invalid").strip().lower()
+    candidates = tuple(
+        candidate
+        for candidate in request.frame_subjects
+        if isinstance(candidate, PacketFrameSubject)
+    )
+    if frame_status == "blocked":
+        return PacketSubjectResolution(
+            status="blocked",
+            candidate_count=len(candidates),
+            reason_codes=("frame_blocked",),
+        )
+    if frame_status == "ambiguous" or len(candidates) > 1:
+        return PacketSubjectResolution(
+            status="ambiguous",
+            candidate_count=len(candidates),
+            reason_codes=(
+                "frame_ambiguous"
+                if frame_status == "ambiguous"
+                else "multiple_frame_subjects",
+            ),
+        )
+    if not candidates:
+        required = (
+            str(request.frame_subject_requirement or "").strip().lower()
+            == "required"
+        )
+        return PacketSubjectResolution(
+            status="unresolved" if required else "not_applicable",
+            confidence="unknown" if required else "not_applicable",
+            reason_codes=(
+                ("required_frame_subject_missing",)
+                if required
+                else ("subject_not_applicable",)
+            ),
+        )
+
+    candidate = candidates[0]
+    user_id = int(candidate.user_id or 0)
+    entity_ref = str(candidate.entity_ref or "").strip()
+    if entity_ref and entity_ref not in _CANON_ENTITY_BY_KEY:
+        return PacketSubjectResolution(
+            status="invalid",
+            candidate_count=1,
+            binding_method=candidate.binding_method,
+            reason_codes=("frame_entity_unknown",),
+        )
+    if user_id > 0:
+        try:
+            binding_read = read_current_entity_account_bindings(
+                conn,
+                guild_id=int(request.guild_id or 0),
+                platform="discord",
+                account_id=str(user_id),
+            )
+        except (CanonEntityBindingError, sqlite3.DatabaseError, ValueError):
+            return PacketSubjectResolution(
+                status="invalid",
+                candidate_count=1,
+                binding_method="account_binding",
+                reason_codes=("account_binding_read_invalid",),
+            )
+        if binding_read.status == "active":
+            identity = resolve_entity_identity(
+                platform="discord",
+                account_id=str(user_id),
+                bindings=binding_read.bindings,
+            )
+            if identity.status == "ambiguous":
+                return PacketSubjectResolution(
+                    status="ambiguous",
+                    candidate_count=1,
+                    binding_method="account_binding",
+                    binding_digest=_binding_read_digest(
+                        binding_read.status,
+                        binding_read.revisions,
+                    ),
+                    reason_codes=("account_binding_collision",),
+                )
+            if identity.status != "resolved" or identity.subject is None:
+                return PacketSubjectResolution(
+                    status="invalid",
+                    candidate_count=1,
+                    binding_method="account_binding",
+                    binding_digest=_binding_read_digest(
+                        binding_read.status,
+                        binding_read.revisions,
+                    ),
+                    reason_codes=("account_binding_invalid",),
+                )
+            if entity_ref and identity.subject.key != entity_ref:
+                return PacketSubjectResolution(
+                    status="invalid",
+                    candidate_count=1,
+                    binding_method="account_binding",
+                    binding_digest=_binding_read_digest(
+                        binding_read.status,
+                        binding_read.revisions,
+                    ),
+                    reason_codes=("frame_binding_entity_mismatch",),
+                )
+            entity_ref = identity.subject.key
+            return PacketSubjectResolution(
+                status="resolved",
+                subject_user_id=user_id,
+                subject_key=subject_key_for_user(user_id),
+                entity_ref=entity_ref,
+                binding_method="account_binding",
+                confidence="authoritative",
+                candidate_count=1,
+                binding_digest=_binding_read_digest(
+                    binding_read.status,
+                    binding_read.revisions,
+                ),
+                reason_codes=("stable_account_binding",),
+            )
+        if binding_read.status == "retired_account_binding":
+            return PacketSubjectResolution(
+                status="invalid",
+                candidate_count=1,
+                binding_method="account_binding",
+                binding_digest=_binding_read_digest(
+                    binding_read.status,
+                    binding_read.revisions,
+                ),
+                reason_codes=("retired_account_binding",),
+            )
+        configured_entity, configured_digest = _configured_owner_subject(
+            replace(request, subject_user_id=user_id),
+            environ=environ,
+        )
+        if configured_entity:
+            if entity_ref and entity_ref != configured_entity:
+                return PacketSubjectResolution(
+                    status="invalid",
+                    candidate_count=1,
+                    binding_method="configured_owner_account_binding",
+                    binding_digest=configured_digest,
+                    reason_codes=("frame_binding_entity_mismatch",),
+                )
+            return PacketSubjectResolution(
+                status="resolved",
+                subject_user_id=user_id,
+                subject_key=subject_key_for_user(user_id),
+                entity_ref=configured_entity,
+                binding_method="configured_owner_account_binding",
+                confidence="authoritative",
+                candidate_count=1,
+                binding_digest=configured_digest,
+                reason_codes=("configured_owner_account_binding",),
+            )
+        if entity_ref:
+            return PacketSubjectResolution(
+                status="unresolved",
+                candidate_count=1,
+                binding_method=candidate.binding_method,
+                binding_digest=_binding_read_digest(
+                    binding_read.status,
+                    binding_read.revisions,
+                ),
+                reason_codes=("typed_entity_requires_account_binding",),
+            )
+        return PacketSubjectResolution(
+            status="resolved",
+            subject_user_id=user_id,
+            subject_key=subject_key_for_user(user_id),
+            binding_method="stable_discord_account",
+            confidence="authoritative",
+            candidate_count=1,
+            binding_digest=_digest(
+                SUBJECT_RESOLUTION_VERSION,
+                "unbound_discord_account",
+                int(request.guild_id or 0),
+                user_id,
+                binding_read.status,
+            ),
+            reason_codes=("ordinary_discord_account",),
+        )
+
+    if entity_ref:
+        try:
+            guild_bindings = read_current_guild_entity_account_bindings(
+                conn,
+                guild_id=int(request.guild_id or 0),
+            )
+        except (CanonEntityBindingError, sqlite3.DatabaseError, ValueError):
+            guild_bindings = None
+        if guild_bindings is None:
+            return PacketSubjectResolution(
+                status="invalid",
+                entity_ref=entity_ref,
+                candidate_count=1,
+                binding_method="typed_canon_entity",
+                reason_codes=("guild_binding_read_invalid",),
+            )
+        matching_accounts = tuple(
+            dict.fromkeys(
+                str(binding.account_id or "").strip()
+                for binding in guild_bindings.bindings
+                if str(binding.entity_id or "").strip() == entity_ref
+                and str(binding.account_id or "").strip().isdigit()
+            )
+        )
+        binding_digest = _binding_read_digest(
+            guild_bindings.status,
+            guild_bindings.revisions,
+        )
+        if len(matching_accounts) > 1:
+            return PacketSubjectResolution(
+                status="ambiguous",
+                entity_ref=entity_ref,
+                candidate_count=len(matching_accounts),
+                binding_method="reverse_account_binding",
+                binding_digest=binding_digest,
+                reason_codes=("entity_has_multiple_discord_accounts",),
+            )
+        resolved_user_id = (
+            int(matching_accounts[0]) if matching_accounts else 0
+        )
+        return PacketSubjectResolution(
+            status="resolved",
+            subject_user_id=resolved_user_id,
+            subject_key=(
+                subject_key_for_user(resolved_user_id)
+                if resolved_user_id > 0
+                else entity_ref
+            ),
+            entity_ref=entity_ref,
+            binding_method=(
+                "reverse_account_binding"
+                if resolved_user_id > 0
+                else "typed_canon_entity"
+            ),
+            confidence="authoritative",
+            candidate_count=1,
+            binding_digest=binding_digest,
+            reason_codes=(
+                "stable_reverse_account_binding"
+                if resolved_user_id > 0
+                else "typed_canon_entity_without_account"
+            ,),
+        )
+
+    label_matches = matching_canon_entity_identities((candidate.label_hint,))
+    return PacketSubjectResolution(
+        status="ambiguous" if len(label_matches) > 1 else "unresolved",
+        candidate_count=max(1, len(label_matches)),
+        binding_method="reversible_label_hint",
+        confidence="low",
+        reason_codes=(
+            "display_label_collision"
+            if len(label_matches) > 1
+            else "display_label_not_identity_authority",
+        ),
+    )
 
 
 def _table_columns(
@@ -883,6 +1301,26 @@ def _canon_identity_signal(
     Discord label, and every current label must resolve unambiguously.
     """
 
+    entity_ref = str(request.subject_entity_ref or "").strip()
+    if (
+        int(request.guild_id or 0) > 0
+        and int(request.subject_user_id or 0) <= 0
+        and entity_ref in _CANON_ENTITY_BY_KEY
+    ):
+        subject = _CANON_ENTITY_BY_KEY[entity_ref]
+        return _CanonIdentitySignal(
+            "recognized",
+            subject=subject,
+            stable_row_count=1,
+            evidence_digest=_digest(
+                SUBJECT_RESOLUTION_VERSION,
+                "typed_canon_entity",
+                int(request.guild_id or 0),
+                request.frame_revision,
+                request.frame_input_evidence_digest,
+                entity_ref,
+            ),
+        )
     if (
         int(request.guild_id or 0) <= 0
         or int(request.subject_user_id or 0) <= 0
@@ -1183,7 +1621,7 @@ def _profile_member_item(
 ) -> bool:
     base = bool(
         item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
-        and item.subject_key == subject_key_for_user(request.subject_user_id)
+        and item.subject_key == _request_subject_key(request)
         and item.point_identity
         and item.root_identities
         and item.occurrence_identities
@@ -1207,7 +1645,7 @@ def _root_bearing_member_item(
 ) -> bool:
     return bool(
         item.lane in _ROOT_COLLAPSE_MEMBER_LANES
-        and item.subject_key == subject_key_for_user(request.subject_user_id)
+        and item.subject_key == _request_subject_key(request)
         and item.root_identities
     )
 
@@ -1239,7 +1677,7 @@ def _profile_canon_anchor(
 
     if not _request_is_broad_profile(request):
         return None
-    subject = subject_key_for_user(request.subject_user_id)
+    subject = _request_subject_key(request)
     recognized = tuple(
         item
         for item in candidates
@@ -1458,6 +1896,22 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "INTEGER NOT NULL DEFAULT 0",
         ),
         ("profile_reason_codes_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("frame_revision", "TEXT NOT NULL DEFAULT ''"),
+        ("frame_input_digest", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "subject_resolution_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated'",
+        ),
+        (
+            "subject_resolution_method",
+            "TEXT NOT NULL DEFAULT 'none'",
+        ),
+        ("subject_resolution_candidate_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "frame_applicability_exclusion_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("source_snapshot_digest", "TEXT NOT NULL DEFAULT ''"),
     ):
         try:
             conn.execute(
@@ -1818,7 +2272,7 @@ def _assessment_observation_items_in_snapshot(
 
     if not broad or int(request.subject_user_id or 0) <= 0:
         return []
-    subject = subject_key_for_user(request.subject_user_id)
+    subject = _request_subject_key(request)
     selection = select_public_conversation_assessment_evidence(
         conn,
         guild_id=int(request.guild_id or 0),
@@ -2187,7 +2641,15 @@ def _declared_items(
 ) -> list[IntelligencePacketItem]:
     """Normalize current Declared claims only for the effective PR 5 owner."""
 
-    if not broad or not bool(request.declared_canon_authorized):
+    governed_subject_scope = bool(
+        str(request.frame_subject_requirement or "").strip().lower()
+        == "required"
+        and _request_subject_key(request)
+    )
+    if (
+        not (broad or governed_subject_scope)
+        or not bool(request.declared_canon_authorized)
+    ):
         return []
     selection = select_declared_canon_claims_for_packet(
         conn,
@@ -2215,7 +2677,7 @@ def _declared_items(
         ) + count
         return []
 
-    subject = subject_key_for_user(request.subject_user_id)
+    subject = _request_subject_key(request)
     binding_signal = _canon_identity_signal(
         conn,
         request,
@@ -2790,7 +3252,7 @@ def _atomic_items(
 ) -> list[IntelligencePacketItem]:
     if int(request.subject_user_id or 0) <= 0:
         return []
-    subject = subject_key_for_user(request.subject_user_id)
+    subject = _request_subject_key(request)
     candidate_ids = tuple(
         str(row[0])
         for row in conn.execute(
@@ -3180,14 +3642,23 @@ def _canon_items(
     items: list[IntelligencePacketItem] = []
     lowered = str(request.user_text or "").lower()
     broad = _request_is_broad_profile(request)
-    subject_key = subject_key_for_user(request.subject_user_id)
+    subject_key = _request_subject_key(request)
     signal = _canon_identity_signal(conn, request, environ=environ)
     diagnostics.canon_identity_status = signal.status
     diagnostics.canon_identity_stable_row_count = int(
         signal.stable_row_count or 0
     )
     recognized_fact_keys = set()
-    if broad and signal.recognized and signal.subject is not None:
+    governed_subject_scope = bool(
+        str(request.frame_subject_requirement or "").strip().lower()
+        == "required"
+        and subject_key
+    )
+    if (
+        (broad or governed_subject_scope)
+        and signal.recognized
+        and signal.subject is not None
+    ):
         for fact in CANON_FACTS:
             if fact.subject.key != signal.subject.key:
                 continue
@@ -3423,14 +3894,14 @@ def _relationship_items(
             source_type="relationship_v2_private_posture",
             source_ref=str(posture["source_ref"]),
             source_digest=str(posture["source_digest"]),
-            subject_key=subject_key_for_user(request.subject_user_id),
+            subject_key=_request_subject_key(request),
             predicate_key="relationship_posture",
             text=str(posture["posture"])[:500],
             visibility="private",
             confidence=Confidence.MEDIUM.value,
             lifecycle="shadow",
             authority=_AUTHORITY_RANK[SourceClass.DERIVED_SUMMARY.value],
-            participants=(subject_key_for_user(request.subject_user_id),),
+            participants=(_request_subject_key(request),),
             observed_at=str(posture.get("updated_at") or ""),
             usage="tone_only",
             score=65.0,
@@ -3532,7 +4003,7 @@ def _apply_current_turn_precedence(
     if not current_text or not correction_signal:
         return candidates
     current_normalized = re.sub(r"\W+", " ", current_text.lower()).strip()
-    subject = subject_key_for_user(request.subject_user_id)
+    subject = _request_subject_key(request)
     kept: list[IntelligencePacketItem] = []
     for item in candidates:
         predicate_terms = _terms(item.predicate_key.replace("_", " "))
@@ -3574,8 +4045,151 @@ def _apply_current_turn_precedence(
     return kept
 
 
+def _frame_allowed_canon_domains(
+    request: IntelligencePacketRequest,
+) -> set[str]:
+    hints = {
+        str(value or "").strip().lower()
+        for value in (*request.frame_domain_hints, *request.frame_role_hints)
+        if str(value or "").strip()
+    }
+    allowed = set(hints).intersection(
+        {"real_community", "broadcast_history", "operational", "lore", "hybrid"}
+    )
+    mapping = {
+        "artist": {"real_community", "broadcast_history"},
+        "music": {"real_community", "broadcast_history"},
+        "community_member": {"real_community"},
+        "real_community": {"real_community"},
+        "broadcast_participant": {"broadcast_history"},
+        "broadcast_history": {"broadcast_history"},
+        "operator": {"operational"},
+        "operational": {"operational"},
+        "system_subject": {"operational"},
+        "technical": {"operational"},
+        "in_world_entity": {"lore"},
+        "lore": {"lore"},
+    }
+    for hint in hints:
+        allowed.update(mapping.get(hint, ()))
+    if allowed:
+        allowed.add("hybrid")
+    return allowed
+
+
+def _filter_frame_applicable_candidates(
+    request: IntelligencePacketRequest,
+    subject_resolution: PacketSubjectResolution,
+    candidates: list[IntelligencePacketItem],
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+) -> list[IntelligencePacketItem]:
+    """Apply frame subject/role/domain/event/task/time before scoring."""
+
+    if not str(request.frame_revision or "").strip():
+        return candidates
+
+    def exclude(item: IntelligencePacketItem, reason: str) -> None:
+        diagnostics.frame_applicability_exclusion_count += 1
+        _add_exclusion(
+            diagnostics,
+            exclusions,
+            lane=item.lane,
+            reason=reason,
+            source_class=item.source_class,
+        )
+
+    if not subject_resolution.applicable:
+        kept = []
+        reason = "frame_subject_%s" % subject_resolution.status
+        for item in candidates:
+            if item.lane == "current_intent":
+                kept.append(item)
+            else:
+                exclude(item, reason)
+        return kept
+
+    subject_required = (
+        str(request.frame_subject_requirement or "").strip().lower()
+        == "required"
+    )
+    accepted_subject_keys = {
+        value
+        for value in (
+            subject_resolution.subject_key,
+            subject_resolution.entity_ref,
+        )
+        if value
+    }
+    subject_scoped_lanes = {
+        "conversation_context",
+        "assessment_observation",
+        "approved_fact",
+        "moment",
+        "atomic_knowledge",
+        "open_loop",
+        "canon",
+        "relationship_posture",
+    }
+    allowed_domains = _frame_allowed_canon_domains(request)
+    event_relation = str(request.frame_event_relation or "uncertain").lower()
+    frame_event_ref = str(request.frame_event_ref or "").strip()
+    operational_question = bool(
+        str(request.frame_object_kind or "").lower()
+        in {"queue", "website", "broadcast"}
+        and str(request.frame_phase or "").lower()
+        in {"failure", "diagnosis", "retest", "execution", "request"}
+    )
+    kept: list[IntelligencePacketItem] = []
+    for item in candidates:
+        if (
+            subject_required
+            and item.lane in subject_scoped_lanes
+            and item.subject_key not in accepted_subject_keys
+        ):
+            exclude(item, "frame_subject_mismatch")
+            continue
+        if (
+            item.canon_domain
+            and allowed_domains
+            and item.canon_domain not in allowed_domains
+        ):
+            exclude(item, "frame_domain_mismatch")
+            continue
+        if (
+            operational_question
+            and item.lane == "canon"
+            and item.canon_domain in {"lore", "broadcast_history"}
+        ):
+            exclude(item, "current_operational_source_precedence")
+            continue
+        if item.lane == "moment" and frame_event_ref:
+            item_event_ref = str(item.revalidation_key or "").strip()
+            if event_relation in {"same_event", "same_event_new_phase", "resume"}:
+                if item_event_ref != frame_event_ref:
+                    exclude(item, "frame_event_mismatch")
+                    continue
+            elif event_relation in {
+                "new_event_same_participant",
+                "new_event_or_uncertain",
+            }:
+                exclude(item, "frame_event_mismatch")
+                continue
+        if (
+            str(request.frame_currentness or "").lower() == "current"
+            and operational_question
+            and item.lane == "canon"
+            and item.canon_claim_kind == "current_state"
+        ):
+            exclude(item, "frame_currentness_mismatch")
+            continue
+        kept.append(item)
+    return kept
+
+
 def _select_items(
     request: IntelligencePacketRequest,
+    subject_resolution: PacketSubjectResolution,
     candidates: list[IntelligencePacketItem],
     diagnostics: IntelligencePacketDiagnostics,
     exclusions: list[IntelligencePacketExclusion],
@@ -3599,6 +4213,13 @@ def _select_items(
                     source_class=item.source_class,
                 )
         candidates = kept
+    candidates = _filter_frame_applicable_candidates(
+        request,
+        subject_resolution,
+        candidates,
+        diagnostics,
+        exclusions,
+    )
     candidates = _apply_current_turn_precedence(
         request,
         candidates,
@@ -3639,7 +4260,7 @@ def _select_items(
             enriched_candidates.append(item)
         candidates = enriched_candidates
     canon_anchor = _profile_canon_anchor(request, candidates)
-    subject_key = subject_key_for_user(request.subject_user_id)
+    subject_key = _request_subject_key(request)
     recognized_canon_signal = any(
         item.lane == "canon"
         and item.source_type
@@ -3672,9 +4293,31 @@ def _select_items(
                 "open_loop": 6,
             }
         )
+    governed_subject_priority = {
+        "current_intent": 0,
+        "approved_fact": 1,
+        "atomic_knowledge": 1,
+        "conversation_context": 1,
+        "assessment_observation": 1,
+        "open_loop": 1,
+        "moment": 2,
+        "canon": 3,
+        "relationship_posture": 4,
+        "source_file": 5,
+    }
+    frame_subject_required = bool(
+        str(request.frame_subject_requirement or "").strip().lower()
+        == "required"
+        and subject_resolution.status == "resolved"
+    )
     ordered = sorted(
         candidates,
         key=lambda item: (
+            (
+                governed_subject_priority.get(item.lane, 9)
+                if frame_subject_required
+                else 0
+            ),
             (
                 (
                     7
@@ -3981,7 +4624,7 @@ def _profile_sufficiency(
         and item.source_type
         in {"recognized_canon_fact", "recognized_declared_canon_claim"}
         and item.subject_key
-        == subject_key_for_user(request.subject_user_id)
+        == _request_subject_key(request)
         for item in selected
     )
     observation_only = bool(
@@ -4094,7 +4737,7 @@ def _moment_version(
     packet: UnifiedIntelligencePacket,
     item: IntelligencePacketItem,
 ) -> str:
-    subject = subject_key_for_user(packet.request.subject_user_id)
+    subject = _request_subject_key(packet.request)
     broad = _request_is_broad_profile(packet.request)
     moments = select_public_participant_moment_gists(
         conn,
@@ -4166,7 +4809,7 @@ def _recognized_canon_version(
     return _recognized_canon_digest(
         fact,
         signal,
-        subject_key_for_user(packet.request.subject_user_id),
+        _request_subject_key(packet.request),
     )
 
 
@@ -4270,7 +4913,7 @@ def _declared_version(
             )
         )
     expected_subject_key = (
-        subject_key_for_user(packet.request.subject_user_id)
+        _request_subject_key(packet.request)
         if bound_entity_claim
         else (claim.subject_id if claim is not None else "")
     )
@@ -4321,6 +4964,33 @@ def _revalidate_packet_in_snapshot(
     """Re-read every durable source without applying packet content live."""
     changed = 0
     errors = 0
+    current_subject_resolution = resolve_packet_subject(
+        conn,
+        packet.request,
+        environ=environ,
+    )
+    legacy_resolution_unspecified = bool(
+        not str(packet.request.frame_revision or "").strip()
+        and packet.subject_resolution.status == "unresolved"
+        and not packet.subject_resolution.binding_digest
+        and not packet.subject_resolution.subject_key
+    )
+    subject_changed = not legacy_resolution_unspecified and (
+        current_subject_resolution.status
+        != packet.subject_resolution.status
+        or current_subject_resolution.subject_user_id
+        != packet.subject_resolution.subject_user_id
+        or current_subject_resolution.subject_key
+        != packet.subject_resolution.subject_key
+        or current_subject_resolution.entity_ref
+        != packet.subject_resolution.entity_ref
+        or current_subject_resolution.binding_method
+        != packet.subject_resolution.binding_method
+        or current_subject_resolution.binding_digest
+        != packet.subject_resolution.binding_digest
+    )
+    if subject_changed:
+        changed += 1
     revalidation_items = tuple(
         {
             (item.lane, item.source_ref, item.source_digest): item
@@ -4414,6 +5084,10 @@ def _revalidate_packet_in_snapshot(
             errors += 1
     if errors:
         status = "processing_error"
+    elif subject_changed:
+        status = "subject_binding_changed"
+    elif not current_subject_resolution.applicable:
+        status = "subject_%s" % current_subject_resolution.status
     elif changed:
         status = "source_changed"
     elif any(
@@ -4428,6 +5102,7 @@ def _revalidate_packet_in_snapshot(
         status=status,
         changed_source_count=changed,
         processing_error_count=errors,
+        subject_resolution_status=current_subject_resolution.status,
     )
 
 
@@ -4460,7 +5135,42 @@ def _packet_invariants(
     packet: UnifiedIntelligencePacket,
 ) -> tuple[str, ...]:
     invalid = []
-    subject = subject_key_for_user(packet.request.subject_user_id)
+    subject = _request_subject_key(packet.request)
+    accepted_subject_keys = {
+        value
+        for value in (
+            packet.subject_resolution.subject_key,
+            packet.subject_resolution.entity_ref,
+        )
+        if value
+    }
+    governed_subject_required = bool(
+        str(packet.request.frame_subject_requirement or "").strip().lower()
+        == "required"
+    )
+    subject_scope_enforced = bool(
+        governed_subject_required
+        or (
+            not str(packet.request.frame_revision or "").strip()
+            and int(packet.request.subject_user_id or 0) > 0
+        )
+    )
+    if (
+        str(packet.request.frame_revision or "").strip()
+        and not packet.subject_resolution.applicable
+        and any(item.lane != "current_intent" for item in packet.items)
+    ):
+        invalid.append("unresolved_frame_subject_selected_content")
+    if str(packet.request.frame_revision or "").strip() and not (
+        packet.request.frame_input_evidence_digest
+        and packet.source_snapshot_digest
+    ):
+        invalid.append("frame_packet_digest_missing")
+    if (
+        packet.diagnostics.subject_resolution_status
+        != packet.subject_resolution.status
+    ):
+        invalid.append("subject_resolution_receipt_mismatch")
     broad = _request_is_broad_profile(packet.request)
     for item in packet.items:
         if not _route_allows_item(packet.request, item):
@@ -4475,8 +5185,8 @@ def _packet_invariants(
                 "moment",
                 "relationship_posture",
             }
-            and int(packet.request.subject_user_id or 0) > 0
-            and item.subject_key != subject
+            and subject_scope_enforced
+            and item.subject_key not in accepted_subject_keys
         ):
             invalid.append("selected_subject_violation")
         if item.lane == "relationship_posture" and item.usage != "tone_only":
@@ -4587,8 +5297,8 @@ def _packet_invariants(
             invalid.append("validation_support_visibility_violation")
         if (
             item.lane in _CLAIM_SUBJECT_SCOPED_LANES
-            and int(packet.request.subject_user_id or 0) > 0
-            and item.subject_key != subject
+            and subject_scope_enforced
+            and item.subject_key not in accepted_subject_keys
         ):
             invalid.append("validation_support_subject_violation")
         if (
@@ -4633,6 +5343,23 @@ def build_packet(
     ensure_schema(conn)
     diagnostics = IntelligencePacketDiagnostics()
     exclusions: list[IntelligencePacketExclusion] = []
+    subject_resolution = resolve_packet_subject(
+        conn,
+        request,
+        environ=environ,
+    )
+    diagnostics.subject_resolution_status = subject_resolution.status
+    diagnostics.subject_resolution_method = (
+        subject_resolution.binding_method
+    )
+    diagnostics.subject_resolution_candidate_count = int(
+        subject_resolution.candidate_count or 0
+    )
+    request = replace(
+        request,
+        subject_user_id=int(subject_resolution.subject_user_id or 0),
+        subject_entity_ref=str(subject_resolution.entity_ref or ""),
+    )
     broad = _request_is_broad_profile(request)
     request_terms = _terms(request.user_text)
     candidates: list[IntelligencePacketItem] = []
@@ -4721,6 +5448,7 @@ def build_packet(
             )
     selected, profile_candidates, validation_items = _select_items(
         request,
+        subject_resolution,
         candidates,
         diagnostics,
         exclusions,
@@ -4766,16 +5494,28 @@ def build_packet(
     )
     diagnostics.packet_digest = _digest(
         SCHEMA_VERSION,
+        request.frame_revision,
+        request.frame_input_evidence_digest,
+        subject_resolution,
         prompt_digest_payload,
         validation_digest_payload,
         profile_sufficiency,
     )
+    source_snapshot_digest = _digest(
+        SOURCE_SNAPSHOT_VERSION,
+        request.frame_revision,
+        request.frame_input_evidence_digest,
+        subject_resolution.binding_digest,
+        prompt_digest_payload,
+        validation_digest_payload,
+    )
     packet_id = "uip_" + _digest(
         SCHEMA_VERSION,
         request.guild_id,
-        request.subject_user_id,
+        subject_resolution.subject_key,
         request.route_mode,
         request.channel_policy,
+        request.frame_revision,
         diagnostics.packet_digest,
     )[:40]
     packet = UnifiedIntelligencePacket(
@@ -4785,6 +5525,8 @@ def build_packet(
         items=selected,
         exclusions=tuple(exclusions),
         diagnostics=diagnostics,
+        subject_resolution=subject_resolution,
+        source_snapshot_digest=source_snapshot_digest,
         profile_sufficiency=profile_sufficiency,
         validation_items=validation_items,
     )
@@ -4863,7 +5605,7 @@ def persist_packet_run(
             packet.packet_id,
             packet.schema_version,
             int(packet.request.guild_id or 0),
-            _digest(subject_key_for_user(packet.request.subject_user_id))[:16],
+            _digest(_request_subject_key(packet.request))[:16],
             str(packet.request.route_mode or "unknown")[:80],
             str(packet.request.channel_policy or "unknown")[:80],
             str(packet.request.visibility_allowance or "unknown")[:80],
@@ -4927,7 +5669,11 @@ def persist_packet_run(
     conn.execute(
         """
         UPDATE memory_governance_intelligence_packet_runs
-        SET validation_item_count=?,validation_lane_counts_json=?
+        SET validation_item_count=?,validation_lane_counts_json=?,
+            frame_revision=?,frame_input_digest=?,
+            subject_resolution_status=?,subject_resolution_method=?,
+            subject_resolution_candidate_count=?,
+            frame_applicability_exclusion_count=?,source_snapshot_digest=?
         WHERE run_id=?
         """,
         (
@@ -4936,6 +5682,17 @@ def persist_packet_run(
                 packet.diagnostics.validation_support_by_lane,
                 sort_keys=True,
             ),
+            str(packet.request.frame_revision or ""),
+            str(packet.request.frame_input_evidence_digest or ""),
+            packet.diagnostics.subject_resolution_status,
+            packet.diagnostics.subject_resolution_method,
+            int(
+                packet.diagnostics.subject_resolution_candidate_count or 0
+            ),
+            int(
+                packet.diagnostics.frame_applicability_exclusion_count or 0
+            ),
+            packet.source_snapshot_digest,
             run_id,
         ),
     )
@@ -5031,6 +5788,9 @@ def _empty_report() -> dict[str, Any]:
         "invalidInvariants": 0,
         "revalidationStatusCounts": {},
         "revalidationChangedRuns": 0,
+        "subjectResolutionStatusCounts": {},
+        "subjectResolutionMethodCounts": {},
+        "frameApplicabilityExclusions": 0,
         "promptAppliedRuns": 0,
         "liveAppliedRuns": 0,
         "contentFieldsPresent": [],
@@ -5082,6 +5842,7 @@ def build_evaluation_report(
                processing_error_count,
                invalid_invariant_count,revalidation_status,
                revalidation_changed_count,prompt_applied,live_applied,
+               %s,%s,%s,
                created_at
         FROM memory_governance_intelligence_packet_runs
         WHERE guild_id=?
@@ -5103,6 +5864,9 @@ def build_evaluation_report(
             column("profile_independent_occurrence_count", "0"),
             column("profile_reason_codes_json", "'[]'"),
             column("profile_candidate_point_count", "0"),
+            column("subject_resolution_status", "'not_evaluated'"),
+            column("subject_resolution_method", "'none'"),
+            column("frame_applicability_exclusion_count", "0"),
         ),
         (int(guild_id or 0), max(1, min(int(limit or 1000), 5000))),
     ).fetchall()
@@ -5115,11 +5879,13 @@ def build_evaluation_report(
     revalidation: Counter[str] = Counter()
     profile_statuses: Counter[str] = Counter()
     profile_reasons: Counter[str] = Counter()
+    subject_statuses: Counter[str] = Counter()
+    subject_methods: Counter[str] = Counter()
     item_total = validation_item_total = 0
     conflicts = visibility = budget = duplicates = 0
     root_collapses = shared_roots = profile_met = 0
     profile_points = profile_roots = profile_occurrences = 0
-    errors = invalid = changed = prompt = live = 0
+    errors = invalid = changed = prompt = live = frame_exclusions = 0
     for row in rows:
         (
             _schema,
@@ -5150,6 +5916,9 @@ def build_evaluation_report(
             changed_count,
             prompt_applied,
             live_applied,
+            subject_resolution_status,
+            subject_resolution_method,
+            frame_exclusion_count,
             _created_at,
         ) = row
         item_total += int(item_count or 0)
@@ -5200,6 +5969,11 @@ def build_evaluation_report(
         prompt += int(bool(prompt_applied))
         live += int(bool(live_applied))
         revalidation[str(revalidation_status or "unknown")] += 1
+        subject_statuses[
+            str(subject_resolution_status or "not_evaluated")
+        ] += 1
+        subject_methods[str(subject_resolution_method or "none")] += 1
+        frame_exclusions += int(frame_exclusion_count or 0)
     return {
         "tablePresent": True,
         "schemaVersion": str(rows[0][0]) if rows else SCHEMA_VERSION,
@@ -5230,6 +6004,13 @@ def build_evaluation_report(
         "invalidInvariants": invalid,
         "revalidationStatusCounts": dict(sorted(revalidation.items())),
         "revalidationChangedRuns": changed,
+        "subjectResolutionStatusCounts": dict(
+            sorted(subject_statuses.items())
+        ),
+        "subjectResolutionMethodCounts": dict(
+            sorted(subject_methods.items())
+        ),
+        "frameApplicabilityExclusions": frame_exclusions,
         "promptAppliedRuns": prompt,
         "liveAppliedRuns": live,
         "contentFieldsPresent": disallowed,

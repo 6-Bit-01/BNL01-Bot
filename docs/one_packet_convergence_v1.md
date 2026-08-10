@@ -1,7 +1,9 @@
 # One-Packet Convergence v1
 
-`unified_intelligence_packet_v5` is the single factual owner for gated broad
-self-profile synthesis. It normalizes four canon statuses without moving their
+`unified_intelligence_packet_v6` is the single factual owner for gated broad
+self-profile synthesis and shadow/private ordinary-turn preview. It consumes
+the immutable Situation Frame revision and resolves one governed subject
+before source scoring. It normalizes four canon statuses without moving their
 source authority:
 
 - Legacy facts use the static canon adapter.
@@ -18,6 +20,15 @@ before candidate use; a changed or invalid source forces the established
 response fallback. Broad-profile prompts have one factual packet owner, while
 current turn, exact reply context, persona, and bounded additive canon remain.
 Specialized operational routes stay outside this cutover.
+
+For frame-backed turns, a stable Discord account binding outranks typed canon
+aliases; exact approved aliases may identify canon-only subjects but display
+labels remain reversible hints and never merge accounts. Multiple candidates,
+unseen label-only subjects, retired bindings, binding collisions, and changed
+bindings fail closed. Role, domain, event, task, phase, and currentness filters
+run before scoring. Relationship remains private tone-only context, and Source
+File snapshots remain internal unless their existing route contract authorizes
+them.
 
 `shared_brain_capability_receipt_v1` binds the requested/effective state to the
 exact hashed scope, authority mode, packet, claim, assessment, identity, and
