@@ -298,6 +298,13 @@ _THIRD_PARTY_SUBJECT_CUE_RE = re.compile(
     r"what\s+happened\s+with|ask(?:ing)?\s+about)\b",
     re.I,
 )
+_SELF_SUBJECT_CUE_RE = re.compile(
+    r"\b(?:what\s+(?:am\s+i|do\s+you\s+(?:know|remember)\s+about\s+me)|"
+    r"tell\s+me\s+(?:what|who)\s+i\s+am|about\s+me|my\s+(?:profile|"
+    r"history|role|work|music|preferences?|goals?|memory|story)|"
+    r"remember\s+me)\b",
+    re.I,
+)
 _CURRENT_TIME_RE = re.compile(r"\b(?:now|currently|today|tonight|this\s+(?:week|show|turn|time)|latest|current)\b", re.I)
 _HISTORICAL_TIME_RE = re.compile(r"\b(?:before|previously|earlier|last\s+(?:time|week|show)|used\s+to|histor(?:y|ical))\b", re.I)
 
@@ -347,6 +354,7 @@ class SituationFrameV1:
     reply_message_ids: Tuple[int, ...]
     exact_source_row_ids: Tuple[int, ...]
     explicit_mention_count: int
+    subject_requirement: str
     subjects: Tuple[SituationSubjectReference, ...]
     event_ref: str
     event_relation: str
@@ -517,6 +525,7 @@ def build_situation_frame_v1(
         evidence_items=(evidence,),
     )
     third_party_cue = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(text))
+    self_subject_cue = bool(_SELF_SUBJECT_CUE_RE.search(text))
 
     subjects = []
     if subject_ids:
@@ -535,17 +544,24 @@ def build_situation_frame_v1(
     elif label_hints or entity_refs:
         count = max(len(label_hints), len(entity_refs))
         for index in range(count):
+            entity_ref = (
+                entity_refs[index] if index < len(entity_refs) else ""
+            )
             subjects.append(
                 SituationSubjectReference(
-                    entity_ref=(entity_refs[index] if index < len(entity_refs) else ""),
+                    entity_ref=entity_ref,
                     label_hint=(label_hints[index] if index < len(label_hints) else ""),
-                    binding_method="reversible_label_hint",
-                    confidence="low",
+                    binding_method=(
+                        "existing_typed_entity"
+                        if entity_ref
+                        else "reversible_label_hint"
+                    ),
+                    confidence="high" if entity_ref else "low",
                     role_hints=roles,
                     domain_hints=domains,
                 )
             )
-    elif len(speakers) == 1 and not third_party_cue:
+    elif len(speakers) == 1 and self_subject_cue and not third_party_cue:
         subjects.append(
             SituationSubjectReference(
                 user_id=speakers[0],
@@ -556,6 +572,12 @@ def build_situation_frame_v1(
                 domain_hints=domains,
             )
         )
+
+    subject_requirement = (
+        "required"
+        if subjects or third_party_cue or self_subject_cue or object_kind == "person"
+        else "not_applicable"
+    )
 
     ambiguity = []
     competing = []
@@ -569,6 +591,9 @@ def build_situation_frame_v1(
     if third_party_cue and not subjects:
         ambiguity.append("third_party_subject_unresolved")
         competing.append("speaker_fallback_rejected")
+    elif subject_requirement == "required" and not subjects:
+        ambiguity.append("required_subject_unresolved")
+        competing.append("subject_resolution_required")
     if len(domains) > 1 and subjects:
         competing.append("subject_role_domain_candidates")
     if not route_allowed:
@@ -601,6 +626,7 @@ def build_situation_frame_v1(
         "reply_messages": _unique_positive_ints(reply_message_ids),
         "source_rows": _unique_positive_ints(exact_source_row_ids),
         "mention_count": max(0, int(explicit_mention_count or 0)),
+        "subject_requirement": subject_requirement,
         "subjects": tuple(
             (
                 subject.user_id,
@@ -650,6 +676,7 @@ def build_situation_frame_v1(
         reply_message_ids=_unique_positive_ints(reply_message_ids),
         exact_source_row_ids=_unique_positive_ints(exact_source_row_ids),
         explicit_mention_count=max(0, int(explicit_mention_count or 0)),
+        subject_requirement=subject_requirement,
         subjects=tuple(subjects),
         event_ref=str(moment_id or "")[:120],
         event_relation=event_relation,
@@ -750,6 +777,7 @@ def render_situation_frame_receipt(
         "speakerCount": len(frame.current_speaker_user_ids),
         "addresseeCount": len(frame.addressee_user_ids),
         "subjectCount": len(frame.subjects),
+        "subjectRequirement": frame.subject_requirement,
         "sourceAnchorCount": (
             len(frame.source_message_ids)
             + len(frame.reply_message_ids)

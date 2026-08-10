@@ -17,6 +17,7 @@ from contextlib import nullcontext
 from typing import Any, Awaitable, Callable, Mapping, Union
 
 from bnl_canon_source_contract import (
+    CANON_ENTITY_IDENTITIES,
     CANON_SOURCE_CONTRACT_VERSION,
     build_claim_contract_inventory,
     diagnostics as canon_source_diagnostics,
@@ -136,6 +137,7 @@ from bnl_shadow_acceptance import (
 )
 from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
+    PacketFrameSubject,
     PacketConversationEvidence,
     UnifiedIntelligencePacket,
     build_packet as build_unified_intelligence_packet,
@@ -11264,6 +11266,10 @@ class DiscordTurnAddressing:
     source_message_id: int = 0
     reply_message_id: int = 0
     reply_conversation_row_id: int = 0
+    speaker_user_id: int = 0
+    explicit_tag_user_ids: tuple[int, ...] = ()
+    reply_target_user_id: int = 0
+    subject_user_ids: tuple[int, ...] = ()
 
     @property
     def third_party_only(self) -> bool:
@@ -12596,6 +12602,42 @@ def _conversation_row_for_discord_message(
     return 0, "", ""
 
 
+_RAW_GOVERNED_SUBJECT_MENTION_PATTERNS = (
+    re.compile(
+        r"\b(?:who\s+is|tell\s+me\s+about|what\s+do\s+you\s+"
+        r"(?:know|remember)\s+about|what\s+happened\s+with)\s+"
+        r"<@!?(\d+)>",
+        re.I,
+    ),
+    re.compile(
+        r"\bwhat\s+(?:did|does|was|is)\s+<@!?(\d+)>\s+"
+        r"(?:say|said|mean|meant|think|thinking|do|doing)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:quote|verify|remind\s+me\s+what)\s+"
+        r"(?:exact(?:ly)?\s+)?(?:what\s+)?<@!?(\d+)>",
+        re.I,
+    ),
+)
+
+
+def _typed_governed_subject_user_ids(message) -> tuple[int, ...]:
+    """Resolve only mentions occupying a supported factual-subject slot."""
+
+    raw_content = str(getattr(message, "content", "") or "")
+    return tuple(
+        sorted(
+            {
+                int(match.group(1))
+                for pattern in _RAW_GOVERNED_SUBJECT_MENTION_PATTERNS
+                for match in pattern.finditer(raw_content)
+                if int(match.group(1) or 0) > 0
+            }
+        )
+    )
+
+
 def resolve_discord_turn_addressing(
     message,
     *,
@@ -12751,6 +12793,16 @@ def resolve_discord_turn_addressing(
         source_message_id=int(getattr(message, "id", 0) or 0),
         reply_message_id=reply_message_id,
         reply_conversation_row_id=reply_conversation_row_id,
+        speaker_user_id=int(
+            getattr(getattr(message, "author", None), "id", 0) or 0
+        ),
+        explicit_tag_user_ids=tuple(dict.fromkeys(raw_ids)),
+        reply_target_user_id=(
+            reply_author_id
+            if reply_author_id > 0 and reply_author_id != bot_id
+            else 0
+        ),
+        subject_user_ids=_typed_governed_subject_user_ids(message),
     )
 
 
@@ -22979,6 +23031,39 @@ def conversation_turn_packet_revision(
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
+def _typed_canon_subject_references(
+    current_text: str,
+) -> tuple[tuple[str, str], ...]:
+    """Return exact approved canon aliases used in a factual subject slot."""
+
+    text = unicodedata.normalize("NFKC", str(current_text or ""))
+    text = text.replace("’", "'").casefold()
+    matches: dict[str, str] = {}
+    for subject in CANON_ENTITY_IDENTITIES:
+        for raw_alias in (subject.name, *subject.aliases):
+            alias = unicodedata.normalize("NFKC", str(raw_alias or ""))
+            alias = re.sub(r"\s+", " ", alias.replace("’", "'")).strip()
+            if not alias:
+                continue
+            escaped = re.escape(alias.casefold()).replace(r"\ ", r"\s+")
+            subject_patterns = (
+                r"\b(?:who|what)\s+(?:is|was)\s+(?:the\s+)?%s"
+                % escaped,
+                r"\b(?:tell\s+me\s+about|what\s+do\s+you\s+"
+                r"(?:know|remember)\s+about|what\s+happened\s+with)\s+%s"
+                % escaped,
+                r"(?<![a-z0-9])%s(?:'s)?\s+(?:identity|role|history|"
+                r"work|music|story|status|connection|relationship)\b"
+                % escaped,
+                r"\b(?:compare|difference\s+between|relationship\s+between)"
+                r".{0,80}(?<![a-z0-9])%s(?![a-z0-9])" % escaped,
+            )
+            if any(re.search(pattern, text, re.I) for pattern in subject_patterns):
+                matches[subject.key] = subject.name
+                break
+    return tuple(matches.items())
+
+
 def build_live_conversation_orchestration_decision(
     *,
     engagement_decision: str,
@@ -23045,6 +23130,50 @@ def build_live_conversation_orchestration_decision(
         )
     )
     route_allowed = str(channel_policy or "unknown") in CONVERSATIONAL_POLICIES
+    resolved_addressee_user_ids = tuple(
+        dict.fromkeys(
+            int(user_id or 0)
+            for user_id in (
+                *addressee_user_ids,
+                *(
+                    user_id
+                    for meta in addressings
+                    for user_id in meta.explicit_tag_user_ids
+                ),
+                *(
+                    meta.reply_target_user_id
+                    for meta in addressings
+                    if int(meta.reply_target_user_id or 0) > 0
+                ),
+            )
+            if int(user_id or 0) > 0
+        )
+    )
+    resolved_subject_user_ids = tuple(
+        dict.fromkeys(
+            int(user_id or 0)
+            for user_id in (
+                *subject_user_ids,
+                *(
+                    user_id
+                    for meta in addressings
+                    for user_id in meta.subject_user_ids
+                ),
+            )
+            if int(user_id or 0) > 0
+        )
+    )
+    typed_canon_subjects = _typed_canon_subject_references(current_text)
+    resolved_subject_entity_refs = tuple(
+        dict.fromkeys(
+            str(entity_ref or "").strip()
+            for entity_ref in (
+                *subject_entity_refs,
+                *(entity_ref for entity_ref, _label in typed_canon_subjects),
+            )
+            if str(entity_ref or "").strip()
+        )
+    )
     decision = coordinate_conversation_turn(
         ConversationOrchestrationInput(
             route_allowed=route_allowed,
@@ -23104,22 +23233,29 @@ def build_live_conversation_orchestration_decision(
             ),
         )
     )
+    subject_labels_by_user_id = {
+        int(user_id): str(label or "").lstrip("@").strip()[:72]
+        for meta in addressings
+        for user_id, label in zip(
+            meta.explicit_tag_user_ids,
+            meta.explicit_tag_recipients,
+        )
+        if int(user_id or 0) > 0 and str(label or "").strip()
+    }
     frame_subject_labels = tuple(
         dict.fromkeys(
             str(label or "").lstrip("@").strip()[:72]
             for label in (
                 *subject_label_hints,
                 *(
+                    subject_labels_by_user_id.get(user_id, "")
+                    for user_id in resolved_subject_user_ids
+                ),
+                *(label for _entity_ref, label in typed_canon_subjects),
+                *(
                     context_result.referent_candidate_labels
                     if context_result is not None
                     else ()
-                ),
-                *(
-                    recipient
-                    for meta in addressings
-                    for recipient in meta.explicit_tag_recipients
-                    if str(recipient or "").strip().casefold()
-                    not in {"@bnl-01", "bnl-01"}
                 ),
             )
             if str(label or "").strip()
@@ -23139,7 +23275,7 @@ def build_live_conversation_orchestration_decision(
         addressee_kinds=tuple(
             meta.address_kind for meta in addressed if meta.address_kind
         ),
-        addressee_user_ids=addressee_user_ids,
+        addressee_user_ids=resolved_addressee_user_ids,
         source_message_ids=tuple(
             meta.source_message_id
             for meta in addressings
@@ -23158,9 +23294,9 @@ def build_live_conversation_orchestration_decision(
         explicit_mention_count=sum(
             len(meta.explicit_tag_recipients) for meta in addressings
         ),
-        subject_user_ids=subject_user_ids,
+        subject_user_ids=resolved_subject_user_ids,
         subject_label_hints=frame_subject_labels,
-        subject_entity_refs=subject_entity_refs,
+        subject_entity_refs=resolved_subject_entity_refs,
         moment_id=(
             moment_situation.moment_id
             if moment_situation is not None
@@ -23260,7 +23396,27 @@ def _build_unified_intelligence_packet_shadow(
             if int(user_id or 0) > 0
         )
     )
-    if len(targets) == 1:
+    frame_subjects = (
+        tuple(
+            PacketFrameSubject(
+                user_id=int(subject.user_id or 0),
+                entity_ref=str(subject.entity_ref or ""),
+                label_hint=str(subject.label_hint or "")[:120],
+                binding_method=str(subject.binding_method or "unresolved"),
+                confidence=str(subject.confidence or "unknown"),
+                role_hints=tuple(subject.role_hints or ()),
+                domain_hints=tuple(subject.domain_hints or ()),
+            )
+            for subject in situation_frame.subjects
+        )
+        if isinstance(situation_frame, SituationFrameV1)
+        else ()
+    )
+    if isinstance(situation_frame, SituationFrameV1):
+        # Packet v6 resolves only the frozen frame candidates. A named or
+        # mentioned third party can never silently fall back to the speaker.
+        subject_user_id = 0
+    elif len(targets) == 1:
         subject_user_id = targets[0]
     elif len(current_speakers) == 1:
         subject_user_id = current_speakers[0]
@@ -23311,9 +23467,13 @@ def _build_unified_intelligence_packet_shadow(
         subject_user_id=int(subject_user_id or 0),
         route_mode=str(route_mode or "unknown"),
         conversation_surface=str(conversation_surface or "unknown"),
-        subject_display_name=speaker_labels_by_user_id.get(
-            int(subject_user_id or 0),
-            "",
+        subject_display_name=(
+            str(frame_subjects[0].label_hint or "")[:120]
+            if len(frame_subjects) == 1
+            else speaker_labels_by_user_id.get(
+                int(subject_user_id or 0),
+                "",
+            )
         ),
         channel_id=int(channel_id or 0),
         channel_policy=str(channel_policy or "unknown"),
@@ -23327,6 +23487,77 @@ def _build_unified_intelligence_packet_shadow(
         immediate_recap=immediate_room_recap_requested(current_text),
         declared_canon_authorized=bool(
             shared_brain_configuration.get("effective")
+        ),
+        frame_schema_version=(
+            situation_frame.schema_version
+            if isinstance(situation_frame, SituationFrameV1)
+            else ""
+        ),
+        frame_revision=(
+            situation_frame.frame_revision
+            if isinstance(situation_frame, SituationFrameV1)
+            else ""
+        ),
+        frame_input_evidence_digest=(
+            situation_frame.input_evidence_digest
+            if isinstance(situation_frame, SituationFrameV1)
+            else ""
+        ),
+        frame_status=(
+            situation_frame.status
+            if isinstance(situation_frame, SituationFrameV1)
+            else "not_provided"
+        ),
+        frame_subject_requirement=(
+            situation_frame.subject_requirement
+            if isinstance(situation_frame, SituationFrameV1)
+            else "legacy"
+        ),
+        frame_subjects=frame_subjects,
+        frame_role_hints=(
+            situation_frame.role_hints
+            if isinstance(situation_frame, SituationFrameV1)
+            else ()
+        ),
+        frame_domain_hints=(
+            situation_frame.domain_hints
+            if isinstance(situation_frame, SituationFrameV1)
+            else ()
+        ),
+        frame_event_ref=(
+            situation_frame.event_ref
+            if isinstance(situation_frame, SituationFrameV1)
+            else ""
+        ),
+        frame_event_relation=(
+            situation_frame.event_relation
+            if isinstance(situation_frame, SituationFrameV1)
+            else "uncertain"
+        ),
+        frame_task_kind=(
+            situation_frame.task_kind
+            if isinstance(situation_frame, SituationFrameV1)
+            else ""
+        ),
+        frame_object_kind=(
+            situation_frame.object_kind
+            if isinstance(situation_frame, SituationFrameV1)
+            else ""
+        ),
+        frame_phase=(
+            situation_frame.phase
+            if isinstance(situation_frame, SituationFrameV1)
+            else ""
+        ),
+        frame_temporal_scope=(
+            situation_frame.temporal_scope
+            if isinstance(situation_frame, SituationFrameV1)
+            else "unspecified"
+        ),
+        frame_currentness=(
+            situation_frame.currentness
+            if isinstance(situation_frame, SituationFrameV1)
+            else "unknown"
         ),
     )
     try:
@@ -23681,6 +23912,27 @@ def build_unified_response_assessment_shadow(
         packet_conflict_reasons=(
             (
                 *intelligence_packet.diagnostics.conflict_reasons,
+                *(
+                    (
+                        "subject_resolution:%s"
+                        % getattr(
+                            intelligence_packet.diagnostics,
+                            "subject_resolution_status",
+                            "not_applicable",
+                        ),
+                    )
+                    if getattr(
+                        intelligence_packet.diagnostics,
+                        "subject_resolution_status",
+                        "not_applicable",
+                    )
+                    not in {
+                        "resolved",
+                        "not_applicable",
+                        "legacy",
+                    }
+                    else ()
+                ),
                 *(
                     ("packet_processing_error",)
                     if intelligence_packet.diagnostics.processing_errors

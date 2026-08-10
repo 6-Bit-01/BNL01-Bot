@@ -12,6 +12,7 @@ from bnl_shared_brain_synthesis import (
     configuration,
     route_scope_decision,
 )
+from bnl_unified_intelligence_packet import SCHEMA_VERSION
 
 
 class GovernedBroadRecallRouteExpansionTests(unittest.TestCase):
@@ -232,7 +233,7 @@ class GovernedBroadRecallRouteExpansionTests(unittest.TestCase):
         self.assertTrue(receipt["requested"])
         self.assertTrue(receipt["effective"])
         self.assertTrue(receipt["prerequisites_ready"])
-        self.assertEqual(receipt["packet_version"], "unified_intelligence_packet_v5")
+        self.assertEqual(receipt["packet_version"], SCHEMA_VERSION)
         self.assertEqual(receipt["conflicts"], ())
         self.assertTrue(receipt["scope_digest"])
         self.assertEqual(receipt["scope"]["guild_count"], 1)
