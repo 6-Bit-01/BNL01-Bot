@@ -476,6 +476,21 @@ _UNSUPPORTED_FRAMED_CONCRETE_RE = re.compile(
     re.I,
 )
 _INTERNAL_PROPER_NOUN_RE = re.compile(r"(?<!^)(?<![.!?]\s)\b[A-Z][\w'-]{2,}\b")
+_PACKET_DOMAIN_BRAND_RE = re.compile(
+    r"\b(?:BARCODE(?:\s+(?:Network|Radio))?|BNL(?:-?01)?)\b",
+    re.I,
+)
+_PACKET_DOMAIN_TITLED_RE = re.compile(
+    r"\b(?:Journal|Relay|Moment|Source\s+File)\b"
+)
+_PACKET_DOMAIN_CONCRETE_ASSERTION_RE = re.compile(
+    r"\b(?:am|are|is|was|were|has|have|had|began|started|ended|"
+    r"works?|prefers?|likes?|loves?|owns?|runs?|hosts?|manages?|"
+    r"leads?|founds?|founded|joins?|joined|releases?|released|"
+    r"publishes?|published|creates?|created|builds?|built|"
+    r"originates?|originated|becomes?|became)\b",
+    re.I,
+)
 _CONCRETE_RELATION_GENERIC_NAMES = frozenset(
     {"barcode", "bnl", "discord", "network", "radio"}
 )
@@ -4572,6 +4587,152 @@ def candidate_profile_coverage(
     )
 
 
+def _ordinary_chat_packet_domain_labels(
+    basis: SharedBrainSynthesisBasis,
+) -> tuple[str, ...]:
+    """Return governed subject labels, never arbitrary evidence values."""
+
+    packet = basis.packet
+    request = packet.request
+    labels = {
+        str(request.subject_display_name or "").strip(),
+        *(
+            str(subject.label_hint or "").strip()
+            for subject in tuple(request.frame_subjects or ())
+        ),
+    }
+    resolution = packet.subject_resolution
+    for reference in (
+        str(resolution.entity_ref or ""),
+        str(resolution.subject_key or ""),
+    ):
+        prefix, separator, suffix = reference.partition(":")
+        if not separator or prefix not in {"barcode", "canon", "entity"}:
+            continue
+        labels.add(re.sub(r"[_-]+", " ", suffix).strip())
+    return tuple(
+        sorted(
+            label
+            for label in labels
+            if len(label) >= 3
+            and label.casefold()
+            not in {"member", "unknown", "user"}
+        )
+    )
+
+
+def _ordinary_chat_packet_domain_context_active(
+    basis: SharedBrainSynthesisBasis,
+) -> bool:
+    """Return whether the current request depends on governed BARCODE truth."""
+
+    packet = basis.packet
+    request = packet.request
+    resolution = packet.subject_resolution
+    if resolution.status == "resolved" and bool(
+        int(resolution.subject_user_id or 0)
+        or str(resolution.subject_key or "")
+        or str(resolution.entity_ref or "")
+    ):
+        return True
+    if any(
+        bool(int(subject.user_id or 0) or str(subject.entity_ref or ""))
+        and str(subject.binding_method or "").lower()
+        not in {"", "none", "unresolved", "label_only"}
+        for subject in tuple(request.frame_subjects or ())
+    ):
+        return True
+    if str(request.frame_event_ref or "").strip():
+        return True
+    request_text = str(request.user_text or "")
+    return bool(
+        _PACKET_DOMAIN_BRAND_RE.search(request_text)
+        or _PACKET_DOMAIN_TITLED_RE.search(request_text)
+    )
+
+
+def _ordinary_chat_claim_mentions_label(
+    claim: str,
+    labels: Sequence[str],
+) -> bool:
+    normalized = re.sub(r"\s+", " ", str(claim or "")).casefold()
+    return any(
+        re.search(
+            r"(?<![\w])%s(?![\w])"
+            % re.escape(re.sub(r"\s+", " ", label).casefold()),
+            normalized,
+        )
+        for label in labels
+        if label
+    )
+
+
+def audit_ordinary_chat_candidate_claims(
+    basis: SharedBrainSynthesisBasis,
+    response: str,
+    *,
+    coverage: CandidateProfileCoverage | None = None,
+) -> tuple[tuple[str, ...], int]:
+    """Separate unsupported packet claims from allowed external knowledge.
+
+    The packet is authoritative only for BARCODE/member/publication/history
+    facts. General external knowledge is deliberately outside that authority
+    and is therefore not rejected merely because it is absent from the
+    packet. No external claim is relabeled as verified here.
+    """
+
+    profile = coverage or candidate_profile_coverage(basis, response)
+    claims = _candidate_claim_units(response)
+    classifications = tuple(profile.claim_classifications)
+    packet_context = _ordinary_chat_packet_domain_context_active(basis)
+    labels = _ordinary_chat_packet_domain_labels(basis)
+    if len(claims) != len(classifications):
+        if packet_context and claims:
+            return (("unsupported_packet_domain",) * len(claims), len(claims))
+        return (classifications, 0)
+
+    audited: list[str] = []
+    unsupported_packet_domain = 0
+    supported = {
+        "member_supported",
+        "canon_supported",
+        "member_and_canon_supported",
+    }
+    for claim, classification in zip(claims, classifications):
+        if classification in supported or classification == "transient_expression":
+            audited.append(classification)
+            continue
+        explicit_domain = bool(
+            _PACKET_DOMAIN_BRAND_RE.search(claim)
+            or _PACKET_DOMAIN_TITLED_RE.search(claim)
+            or _ordinary_chat_claim_mentions_label(claim, labels)
+        )
+        personal_fact = bool(
+            _UNSUPPORTED_SCALAR_ASSERTION_RE.search(claim)
+            or _UNSUPPORTED_FRAMED_CONCRETE_RE.search(claim)
+        )
+        concrete_assertion = bool(
+            classification == "unsupported_factual"
+            or personal_fact
+            or (
+                (packet_context or explicit_domain)
+                and _PACKET_DOMAIN_CONCRETE_ASSERTION_RE.search(claim)
+            )
+        )
+        packet_unsupported = bool(
+            concrete_assertion
+            and (packet_context or explicit_domain or personal_fact)
+        )
+        if packet_unsupported:
+            audited.append("unsupported_packet_domain")
+            unsupported_packet_domain += 1
+        elif classification == "unsupported_factual":
+            audited.append("external_public_knowledge")
+        else:
+            audited.append(classification)
+    return tuple(audited), unsupported_packet_domain
+
+
 def candidate_evidence_coverage(
     basis: SharedBrainSynthesisBasis,
     response: str,
@@ -5125,6 +5286,15 @@ def evaluate_single_packet_response(
     )
     coherence = assess_response_coherence(run.basis.assessment, candidate)
     output_leak = response_exposes_controls(candidate)
+    coverage = candidate_profile_coverage(run.basis, candidate)
+    (
+        receipt_claim_classifications,
+        unsupported_packet_domain_claims,
+    ) = audit_ordinary_chat_candidate_claims(
+        run.basis,
+        candidate,
+        coverage=coverage,
+    )
     calls = max(0, int(provider_call_count or 0))
     corrective_calls = max(0, int(corrective_call_count or 0))
     fallback_reason = ""
@@ -5140,10 +5310,11 @@ def evaluate_single_packet_response(
         fallback_reason = "generation_failed"
     elif output_leak:
         fallback_reason = "control_marker_leak"
+    elif unsupported_packet_domain_claims:
+        fallback_reason = "unsupported_packet_domain_claim"
     elif coherence.status == "failed":
         fallback_reason = "coherence_failed"
     candidate_selected = not fallback_reason
-    coverage = candidate_profile_coverage(run.basis, candidate)
     conn.execute(
         """
         UPDATE memory_governance_shared_brain_synthesis_runs
@@ -5187,9 +5358,9 @@ def evaluate_single_packet_response(
             coverage.canon_supported_claim_count,
             coverage.opinion_claim_count,
             coverage.connective_claim_count,
-            coverage.unsupported_factual_claim_count,
+            unsupported_packet_domain_claims,
             json.dumps(
-                dict(Counter(coverage.claim_classifications)),
+                dict(Counter(receipt_claim_classifications)),
                 sort_keys=True,
             ),
             calls,
@@ -5237,9 +5408,9 @@ def evaluate_single_packet_response(
         candidate_opinion_claim_count=coverage.opinion_claim_count,
         candidate_connective_claim_count=coverage.connective_claim_count,
         candidate_unsupported_factual_claim_count=(
-            coverage.unsupported_factual_claim_count
+            unsupported_packet_domain_claims
         ),
-        candidate_claim_classifications=coverage.claim_classifications,
+        candidate_claim_classifications=receipt_claim_classifications,
     )
 
 

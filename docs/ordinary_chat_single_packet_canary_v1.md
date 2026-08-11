@@ -55,6 +55,17 @@ For an eligible turn:
 5. A generated candidate changed or suppressed by a guard is not sent and is
    never repaired by another provider call.
 
+Provider-call receipts increment only at the physical `generate_content`
+invocation boundary. Local quota refusal, budget-reservation failure, client
+construction failure, and other pre-provider exits remain zero-attempt runs;
+a provider invocation that starts and then fails remains one attempt.
+
+Before candidate selection, the response is audited against the frozen packet.
+Any unsupported BARCODE, member, identity, relationship, episode, publication,
+canon, or stored-history claim blocks the candidate. Ordinary external public
+knowledge remains permitted, but it is never relabeled as BARCODE memory or
+private packet evidence.
+
 Preflight ambiguity or invalid source state uses zero provider calls and a
 bounded clarification/block response. A failed generation or rejected
 candidate never falls back to the legacy generated response. Specialized
