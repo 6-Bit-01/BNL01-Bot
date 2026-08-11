@@ -203,6 +203,91 @@ class GeminiOffloadTests(unittest.IsolatedAsyncioTestCase):
             bnl01_bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
         )
 
+    async def test_tracked_generation_counts_zero_when_local_quota_blocks(self):
+        with mock.patch.object(bnl01_bot, "BNL_TYPING_INDICATOR_ENABLED", False), \
+             mock.patch.object(bnl01_bot, "check_quota_availability", return_value=False), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async") as generate:
+            result = await bnl01_bot.get_tracked_gemini_response_with_optional_typing(
+                None,
+                "packet-owned prompt",
+                7,
+                1,
+                bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+                source_context_available=True,
+            )
+
+        self.assertEqual(result.text, "")
+        self.assertEqual(result.provider_call_count, 0)
+        generate.assert_not_called()
+
+    async def test_provider_counter_marks_successful_physical_invocation(self):
+        counter = bnl01_bot.ProviderAttemptCounter()
+        fake_client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=mock.Mock(
+                    return_value=gemini_response("single packet", 5)
+                )
+            )
+        )
+        with mock.patch.object(bnl01_bot, "gemini_client", fake_client), \
+             mock.patch.object(bnl01_bot, "reserve_local_model_budget", return_value=17), \
+             mock.patch.object(bnl01_bot, "release_local_model_budget"), \
+             mock.patch.object(bnl01_bot, "record_generation_token_usage"):
+            response = await bnl01_bot._generate_gemini_content_with_fallback_async(
+                "packet-owned prompt",
+                bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+                attempt_counter=counter,
+            )
+
+        self.assertEqual(
+            bnl01_bot._extract_text_and_tokens(response),
+            ("single packet", 5),
+        )
+        self.assertEqual(counter.count, 1)
+        fake_client.models.generate_content.assert_called_once()
+
+    async def test_provider_counter_stays_zero_when_client_setup_fails(self):
+        counter = bnl01_bot.ProviderAttemptCounter()
+        with mock.patch.object(bnl01_bot, "reserve_local_model_budget", return_value=17), \
+             mock.patch.object(
+                 bnl01_bot,
+                 "get_gemini_client",
+                 side_effect=RuntimeError("client setup failed"),
+             ), \
+             mock.patch.object(bnl01_bot, "release_local_model_budget") as release:
+            with self.assertRaisesRegex(RuntimeError, "client setup failed"):
+                await bnl01_bot._generate_gemini_content_with_fallback_async(
+                    "packet-owned prompt",
+                    bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+                    attempt_counter=counter,
+                )
+
+        self.assertEqual(counter.count, 0)
+        release.assert_called_once_with(17)
+
+    async def test_provider_counter_marks_failed_physical_invocation(self):
+        counter = bnl01_bot.ProviderAttemptCounter()
+        fake_client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=mock.Mock(
+                    side_effect=Exception("503 service unavailable")
+                )
+            )
+        )
+        with mock.patch.object(bnl01_bot, "gemini_client", fake_client), \
+             mock.patch.object(bnl01_bot, "reserve_local_model_budget", return_value=17), \
+             mock.patch.object(bnl01_bot, "release_local_model_budget"), \
+             mock.patch.object(bnl01_bot, "record_failed_generation_attempt"):
+            with self.assertRaisesRegex(Exception, "503"):
+                await bnl01_bot._generate_gemini_content_with_fallback_async(
+                    "packet-owned prompt",
+                    bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+                    attempt_counter=counter,
+                )
+
+        self.assertEqual(counter.count, 1)
+        fake_client.models.generate_content.assert_called_once()
+
     async def test_glitch_rewrite_uses_offloaded_generation(self):
         responses = [gemini_response("base text", 11), gemini_response("glitched text", 2)]
 

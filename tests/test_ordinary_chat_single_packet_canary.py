@@ -11,10 +11,12 @@ import bnl_relationship_engine as relationships
 from bnl_shared_brain_synthesis import (
     ORDINARY_CHAT_AUTHORITY,
     ORDINARY_CHAT_ROUTE_FAMILY,
+    audit_ordinary_chat_candidate_claims,
     begin_single_packet_run,
     build_evaluation_report,
     build_ordinary_chat_basis,
     build_packet_owned_prompt,
+    candidate_profile_coverage,
     evaluate_single_packet_response,
     finalize_run,
     ordinary_chat_configuration,
@@ -25,6 +27,7 @@ from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
     PacketConversationEvidence,
     PacketFrameSubject,
+    PacketSubjectResolution,
     build_packet,
 )
 from bnl_unified_response_assessment import (
@@ -429,7 +432,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         decision = evaluate_single_packet_response(
             self.conn,
             run,
-            response="I can answer that directly from the current exchange.",
+            response="Your favorite movie is Arrival.",
             provider_call_count=1,
             corrective_call_count=0,
             generation_latency_ms=42,
@@ -492,6 +495,67 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(report["ordinaryCallCountViolationRuns"], 0)
         self.assertEqual(report["ordinaryCorrectiveCallViolationRuns"], 0)
         self.assertEqual(report["invalidScopeRuns"], 0)
+
+    def test_unsupported_packet_domain_claims_are_rejected_before_selection(self):
+        candidates = (
+            "Your favorite movie is Blade Runner.",
+            "You work as a network engineer.",
+            "He works as a network engineer.",
+            "You and Mac Modem are siblings.",
+            "BARCODE Radio started in 1999.",
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                decision = evaluate_single_packet_response(
+                    self.conn,
+                    self._begin(),
+                    response=candidate,
+                    provider_call_count=1,
+                    corrective_call_count=0,
+                    environ=self.flags,
+                )
+                self.assertFalse(decision.candidate_selected)
+                self.assertEqual(
+                    decision.fallback_reason,
+                    "unsupported_packet_domain_claim",
+                )
+                self.assertGreaterEqual(
+                    decision.candidate_unsupported_factual_claim_count,
+                    1,
+                )
+                self.assertIn(
+                    "unsupported_packet_domain",
+                    decision.candidate_claim_classifications,
+                )
+
+    def test_external_public_knowledge_is_not_made_packet_authority(self):
+        external_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text="Where is Seattle?",
+                frame_subject_requirement="not_required",
+                frame_subjects=(),
+                frame_event_ref="",
+                frame_event_relation="not_applicable",
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="not_applicable",
+                reason_codes=("subject_not_required",),
+            ),
+        )
+        external_basis = replace(self.basis, packet=external_packet)
+        response = "Seattle is in Washington."
+        coverage = candidate_profile_coverage(external_basis, response)
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            external_basis,
+            response,
+            coverage=coverage,
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(classifications, ("external_public_knowledge",))
 
     def test_invalid_call_counts_fail_closed_and_are_reported(self):
         run = self._begin()

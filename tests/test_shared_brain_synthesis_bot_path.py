@@ -1042,7 +1042,12 @@ class SharedBrainSynthesisBotPathTests(
             fallback_reason="",
             run=run,
         )
-        provider = mock.AsyncMock(return_value="One generated answer.")
+        provider = mock.AsyncMock(
+            return_value=bnl01_bot.TrackedGenerationResponse(
+                text="One generated answer.",
+                provider_call_count=1,
+            )
+        )
         evaluate = mock.Mock(return_value=decision)
         with (
             mock.patch.object(
@@ -1066,7 +1071,7 @@ class SharedBrainSynthesisBotPathTests(
             ),
             mock.patch.object(
                 bnl01_bot,
-                "get_gemini_response_with_optional_typing",
+                "get_tracked_gemini_response_with_optional_typing",
                 new=provider,
             ),
             mock.patch.object(
@@ -1110,6 +1115,84 @@ class SharedBrainSynthesisBotPathTests(
         self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 1)
         self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
 
+    async def test_single_packet_preprovider_exit_records_zero_calls(self):
+        basis = SimpleNamespace(
+            packet=SimpleNamespace(source_snapshot_digest="source-digest")
+        )
+        run = SimpleNamespace(
+            prompt_applied=True,
+            fallback_reason="",
+            revalidation_status="passed",
+            basis=basis,
+        )
+        decision = SimpleNamespace(
+            candidate_selected=False,
+            fallback_reason="provider_call_count_invalid",
+            run=run,
+        )
+        provider = mock.AsyncMock(
+            return_value=bnl01_bot.TrackedGenerationResponse(
+                text="",
+                provider_call_count=0,
+            )
+        )
+        evaluate = mock.Mock(return_value=decision)
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "build_packet_owned_prompt",
+                return_value=SimpleNamespace(
+                    ready=True,
+                    prompt="packet-owned prompt",
+                    reason="",
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "revalidate_situation_frame",
+                return_value=SimpleNamespace(status="valid"),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_begin_ordinary_chat_single_packet_receipt",
+                return_value=run,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_tracked_gemini_response_with_optional_typing",
+                new=provider,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_ordinary_chat_single_packet_receipt",
+                new=evaluate,
+            ),
+        ):
+            execution = (
+                await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
+                    channel=FakeChannel(),
+                    prompt="base prompt",
+                    basis=basis,
+                    scope_applied=True,
+                    preflight_block_reason="",
+                    situation_frame=SimpleNamespace(),
+                    situation_frame_current_text="Answer this.",
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_context",
+                    conversation_surface="mention_or_reply",
+                    user_id=7,
+                    guild_id=1,
+                    user_display_name="Test Member",
+                    source_context_available=True,
+                )
+            )
+
+        self.assertFalse(execution.candidate_active)
+        self.assertEqual(execution.provider_call_count, 0)
+        provider.assert_awaited_once()
+        self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 0)
+        self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
+
     async def test_single_packet_ambiguous_preflight_uses_zero_provider_calls(self):
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
@@ -1143,7 +1226,7 @@ class SharedBrainSynthesisBotPathTests(
             ) as begin,
             mock.patch.object(
                 bnl01_bot,
-                "get_gemini_response_with_optional_typing",
+                "get_tracked_gemini_response_with_optional_typing",
                 new=provider,
             ),
         ):

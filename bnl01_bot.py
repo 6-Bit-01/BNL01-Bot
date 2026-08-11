@@ -537,6 +537,22 @@ class GenerationResult:
     model: str = ""
 
 
+@dataclass
+class ProviderAttemptCounter:
+    """Count provider invocations only after all local preflight succeeds."""
+
+    count: int = 0
+
+    def mark_started(self) -> None:
+        self.count += 1
+
+
+@dataclass(frozen=True)
+class TrackedGenerationResponse:
+    text: str
+    provider_call_count: int
+
+
 @dataclass(frozen=True)
 class TokenUsageBreakdown:
     total_tokens: int = 0
@@ -25397,21 +25413,52 @@ def _generation_config_for_model(
     return genai.types.GenerateContentConfig(**config_kwargs)
 
 
-async def _generate_gemini_content_with_fallback_async(contents: str, route: str):
+async def _generate_gemini_content_with_fallback_async(
+    contents: str,
+    route: str,
+    *,
+    attempt_counter: ProviderAttemptCounter | None = None,
+):
     started = time.monotonic()
     logging.info(f"gemini_generation_offloaded route={route}")
     try:
-        return await asyncio.to_thread(_generate_gemini_content_with_fallback, contents, route)
+        if attempt_counter is None:
+            return await asyncio.to_thread(
+                _generate_gemini_content_with_fallback,
+                contents,
+                route,
+            )
+        return await asyncio.to_thread(
+            _generate_gemini_content_with_fallback,
+            contents,
+            route,
+            attempt_counter=attempt_counter,
+        )
     finally:
         elapsed = time.monotonic() - started
         logging.info(f"gemini_generation_completed route={route} elapsed_seconds={elapsed:.3f}")
 
 
-async def _generate_gemini_content_result_async(contents: str, route: str) -> GenerationResult:
+async def _generate_gemini_content_result_async(
+    contents: str,
+    route: str,
+    *,
+    attempt_counter: ProviderAttemptCounter | None = None,
+) -> GenerationResult:
     started = time.monotonic()
     model = GEMINI_MODEL
     try:
-        response = await _generate_gemini_content_with_fallback_async(contents, route)
+        if attempt_counter is None:
+            response = await _generate_gemini_content_with_fallback_async(
+                contents,
+                route,
+            )
+        else:
+            response = await _generate_gemini_content_with_fallback_async(
+                contents,
+                route,
+                attempt_counter=attempt_counter,
+            )
         model = getattr(response, "model_name", GEMINI_MODEL)
         text, _tokens = _extract_text_and_tokens(response)
         elapsed = time.monotonic() - started
@@ -25439,6 +25486,7 @@ def _generate_model_with_retry(
     contents: str,
     route: str,
     policy,
+    attempt_counter: ProviderAttemptCounter | None = None,
 ):
     last_error = None
     for attempt_index in range(policy.provider_retries + 1):
@@ -25449,10 +25497,18 @@ def _generate_model_with_retry(
             attempt_index + 1,
         )
         try:
-            response = client.models.generate_content(
-                model=_gemini_model_resource_name(model_name),
+            generate_content = client.models.generate_content
+            model_resource = _gemini_model_resource_name(model_name)
+            generation_config = _generation_config_for_model(
+                model_name,
+                route,
+            )
+            if attempt_counter is not None:
+                attempt_counter.mark_started()
+            response = generate_content(
+                model=model_resource,
                 contents=contents,
-                config=_generation_config_for_model(model_name, route),
+                config=generation_config,
             )
             record_generation_token_usage(
                 response,
@@ -25485,11 +25541,16 @@ def _generate_model_with_retry(
     raise last_error or RuntimeError("provider_generation_failed")
 
 
-def _generate_gemini_content_with_fallback(contents: str, route: str):
+def _generate_gemini_content_with_fallback(
+    contents: str,
+    route: str,
+    *,
+    attempt_counter: ProviderAttemptCounter | None = None,
+):
     policy = policy_for_route(route)
     reservation = reserve_local_model_budget(contents, route)
-    client = get_gemini_client()
     try:
+        client = get_gemini_client()
         try:
             response = _generate_model_with_retry(
                 client,
@@ -25497,6 +25558,7 @@ def _generate_gemini_content_with_fallback(contents: str, route: str):
                 contents=contents,
                 route=route,
                 policy=policy,
+                attempt_counter=attempt_counter,
             )
             return RoutedGenerationResponse(
                 raw_response=response,
@@ -25528,6 +25590,7 @@ def _generate_gemini_content_with_fallback(contents: str, route: str):
                     contents=contents,
                     route=route,
                     policy=policy,
+                    attempt_counter=attempt_counter,
                 )
             except Exception as fallback_error:
                 logging.error(
@@ -26358,6 +26421,7 @@ async def get_gemini_response(
     route: str = "get_gemini_response",
     *,
     source_context_available: bool = False,
+    attempt_counter: ProviderAttemptCounter | None = None,
 ):
     try:
         one_call_packet_route = (
@@ -26448,7 +26512,17 @@ async def get_gemini_response(
 
         User: {prompt}
         BNL-01:"""
-        generation_result = await _generate_gemini_content_result_async(request_contents, route)
+        if attempt_counter is None:
+            generation_result = await _generate_gemini_content_result_async(
+                request_contents,
+                route,
+            )
+        else:
+            generation_result = await _generate_gemini_content_result_async(
+                request_contents,
+                route,
+                attempt_counter=attempt_counter,
+            )
         if not generation_result.success:
             return ""
         text = generation_result.text
@@ -28672,31 +28746,39 @@ async def get_gemini_response_with_optional_typing(
     route: str = "get_gemini_response",
     *,
     source_context_available: bool = False,
+    attempt_counter: ProviderAttemptCounter | None = None,
 ):
     """Run Gemini generation with an optional, cooldown-protected Discord typing indicator."""
-    if not BNL_TYPING_INDICATOR_ENABLED or channel is None:
-        if not BNL_TYPING_INDICATOR_ENABLED:
-            logging.info("typing_indicator_skipped reason=disabled")
+
+    async def generate():
+        if attempt_counter is None:
+            return await get_gemini_response(
+                prompt,
+                user_id,
+                guild_id,
+                route=route,
+                source_context_available=source_context_available,
+            )
         return await get_gemini_response(
             prompt,
             user_id,
             guild_id,
             route=route,
             source_context_available=source_context_available,
+            attempt_counter=attempt_counter,
         )
+
+    if not BNL_TYPING_INDICATOR_ENABLED or channel is None:
+        if not BNL_TYPING_INDICATOR_ENABLED:
+            logging.info("typing_indicator_skipped reason=disabled")
+        return await generate()
 
     channel_id = int(getattr(channel, "id", 0) or 0)
     now = datetime.now(timezone.utc)
     last_at = _channel_typing_indicator_last_at.get(channel_id)
     if last_at and (now - last_at).total_seconds() < BNL_TYPING_INDICATOR_COOLDOWN_SECONDS:
         logging.info(f"typing_indicator_skipped reason=cooldown channel={channel_id}")
-        return await get_gemini_response(
-            prompt,
-            user_id,
-            guild_id,
-            route=route,
-            source_context_available=source_context_available,
-        )
+        return await generate()
 
     typing_cm = None
     typing_started = False
@@ -28712,13 +28794,7 @@ async def get_gemini_response_with_optional_typing(
         logging.info(f"typing_indicator_failed reason={type(exc).__name__} channel={channel_id}")
 
     try:
-        return await get_gemini_response(
-            prompt,
-            user_id,
-            guild_id,
-            route=route,
-            source_context_available=source_context_available,
-        )
+        return await generate()
     finally:
         if typing_started and typing_cm is not None:
             try:
@@ -28727,6 +28803,35 @@ async def get_gemini_response_with_optional_typing(
                 logging.info(f"typing_indicator_failed reason=exit_http_exception status={getattr(exc, 'status', 'unknown')} channel={channel_id}")
             except Exception as exc:
                 logging.info(f"typing_indicator_failed reason=exit_{type(exc).__name__} channel={channel_id}")
+
+
+async def get_tracked_gemini_response_with_optional_typing(
+    channel,
+    prompt: str,
+    user_id: int,
+    guild_id: int,
+    route: str,
+    *,
+    source_context_available: bool = False,
+) -> TrackedGenerationResponse:
+    """Return text plus physical provider attempts for acceptance receipts."""
+
+    attempt_counter = ProviderAttemptCounter()
+    text = await get_gemini_response_with_optional_typing(
+        channel,
+        prompt,
+        user_id,
+        guild_id,
+        route=route,
+        source_context_available=source_context_available,
+        attempt_counter=attempt_counter,
+    )
+    return TrackedGenerationResponse(
+        text=str(text or ""),
+        provider_call_count=max(0, int(attempt_counter.count or 0)),
+    )
+
+
 SHOW_STATE_TOPIC_TTL_SECONDS = 300
 
 TYPING_RECENT_WINDOW_SECONDS = 5
@@ -36044,9 +36149,9 @@ async def maybe_generate_ordinary_chat_single_packet(
         )
 
     generation_started = time.monotonic()
-    provider_call_count = 1
+    provider_call_count = 0
     try:
-        candidate = await get_gemini_response_with_optional_typing(
+        tracked_generation = await get_tracked_gemini_response_with_optional_typing(
             channel,
             packet_prompt.prompt,
             user_id,
@@ -36054,6 +36159,8 @@ async def maybe_generate_ordinary_chat_single_packet(
             route=ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
             source_context_available=source_context_available,
         )
+        candidate = tracked_generation.text
+        provider_call_count = tracked_generation.provider_call_count
     except Exception as exc:
         logging.warning(
             "ordinary_chat_single_packet_generation_failed error=%s",
