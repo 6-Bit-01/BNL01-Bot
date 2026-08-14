@@ -107,6 +107,45 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(stored, [(created.cleaned_summary,)])
 
+    def test_read_snapshot_uses_legacy_compatible_catalog_name(self):
+        class LegacyCatalogConnection:
+            def __init__(self, connection):
+                self.connection = connection
+                self.statements = []
+
+            @property
+            def in_transaction(self):
+                return self.connection.in_transaction
+
+            @property
+            def total_changes(self):
+                return self.connection.total_changes
+
+            def execute(self, statement, params=()):
+                self.statements.append(statement)
+                if "sqlite_schema" in statement.casefold():
+                    raise sqlite3.OperationalError(
+                        "no such table: main.sqlite_schema"
+                    )
+                return self.connection.execute(statement, params)
+
+            def commit(self):
+                return self.connection.commit()
+
+            def rollback(self):
+                return self.connection.rollback()
+
+        guarded = LegacyCatalogConnection(self.conn)
+        with declared._read_snapshot(guarded):
+            self.assertTrue(guarded.in_transaction)
+            self.assertEqual(guarded.execute("SELECT 1").fetchone(), (1,))
+
+        self.assertFalse(guarded.in_transaction)
+        self.assertEqual(
+            guarded.statements[:2],
+            ["BEGIN", "SELECT 1 FROM main.sqlite_master LIMIT 1"],
+        )
+
     def test_all_sqlite_replace_and_upsert_forms_are_blocked(self):
         created = self.add("replace-matrix1").primary
         replacement = asdict(created)
