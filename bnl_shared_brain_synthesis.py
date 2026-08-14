@@ -20,6 +20,7 @@ import uuid
 from typing import Any, Mapping, Sequence
 
 from bnl_canon_source_contract import (
+    CANON_ENTITY_IDENTITIES,
     ENTITY_ACCOUNT_BINDING_CONTRACT_VERSION,
     HYBRID_CANON_CLAIM_CONTRACT_VERSION,
 )
@@ -445,6 +446,33 @@ _DERIVED_ASSESSMENT_RE = re.compile(
     r"the\s+combination|the\s+throughline)\b",
     re.I,
 )
+_MEMBER_ASSESSMENT_BACKWARD_SUBJECT_RE = re.compile(
+    r"^(?:(?:based\s+on\s+my\s+observations?|my\s+(?:assessment|read|"
+    r"take|view)\s+is\s+that|overall|put\s+together|together)"
+    r"\s*[,;:—–]?\s+)?"
+    r"(?:(?:both|that|these|this|those)\s+"
+    r"(?:choice|choices|combination|part|preference|preferences)|"
+    r"the\s+(?:choice|choices|combination|part|preference|preferences|"
+    r"throughline))\s+"
+    r"(?:create|creates|form|forms|give|gives|keep|keeps|make|makes|"
+    r"read|reads|signal|signals|strike|strikes)\s+"
+    r"(?:(?:a|an|the|as|like|me|us|you)\s+)?"
+    r"(?:(?:vivid|strong|clear|distinctive|creative|iterative|"
+    r"recognizable|familiar|coherent|consistent|recurring|playful|"
+    r"careful|deliberate|thoughtful|curious|focused|adaptive)\s+){0,3}"
+    r"(?:approach|combination|connection|frequency|pattern|process|"
+    r"signal|style|throughline|vibe)\b"
+    r"(?:\s+(?:i|we)\s+(?:notice|recognize|see))?$",
+    re.I,
+)
+_MEMBER_ASSESSMENT_BACKWARD_OBJECT_RE = re.compile(
+    r"^(?:that|this)\s+(?:is|reads?\s+as)\s+(?:the\s+)?"
+    r"(?:familiar\s+|recognizable\s+|recurring\s+)?"
+    r"(?:part|pattern|signal|throughline)\b"
+    r"(?:\s+of\s+your\s+frequency)?"
+    r"(?:\s+(?:i|we)\s+(?:notice|recognize|see))?$",
+    re.I,
+)
 _DIRECT_MEMBER_ASSERTION_RE = re.compile(
     r"\b(?:you(?:'re|\s+are|\s+were|\s+have|\s+had|\s+keep|\s+kept|"
     r"\s+make|\s+made|\s+build|\s+built|\s+create|\s+created|"
@@ -459,6 +487,347 @@ _UNSUPPORTED_SCALAR_ASSERTION_RE = re.compile(
     r"you\s+(?:live|reside|work)\s+(?:at|in|near|for)\b|"
     r"you\s+(?:prefer|like|love|own|have)\b)",
     re.I,
+)
+_CLAIM_LEADING_CONCESSIVE_RE = re.compile(
+    r"^(?:although|because|even\s+though|since|though|while|whereas)\s+",
+    re.I,
+)
+_CLAIM_CONTEXT_LEADING_MODIFIER_RE = re.compile(
+    r"^(?:according\s+to|after|as\s+of|at|before|during|from|in|on)\s+"
+    r"(?P<context>[^,]{1,160}),\s*",
+    re.I,
+)
+_CLAIM_SIMPLE_LEADING_MODIFIER_RE = re.compile(
+    r"^(?:apparently|actually|also|always|never|often|perhaps|maybe|"
+    r"sometimes|still|now|personally|supposedly|allegedly|reportedly|"
+    r"today|yesterday|currently|recently|later|then|at\s+the\s+time|"
+    r"in\s+\d{4}|(?:last|this|next)\s+(?:year|month|week))\s*,?\s+",
+    re.I,
+)
+_CLAIM_LEADING_DIRECT_PACKET_SUBJECT_RE = re.compile(
+    r"^(?:i|i'm|i've|i'd|my|me|we|we're|we've|we'd|our|ours|"
+    r"you|you're|you've|you'd|your|yours|"
+    r"the\s+(?:member|requester|user|selected\s+member)|"
+    r"this\s+member|that\s+member|<@!?\d+>)(?!\w)",
+    re.I,
+)
+_CLAIM_LEADING_GUIDANCE_RE = re.compile(
+    r"^you\s+(?:can|could|may|might|should|would)\s+"
+    r"(?:ask|check|compare|consult|contact|download|explore|find|"
+    r"follow|help|look\s+(?:at|for|up)|open|read|refer|respond|"
+    r"review|search|see\s+(?:the|more|details|public)|summarize|"
+    r"try|use|visit|work\s+with)\b(?P<target>.{1,240})$",
+    re.I,
+)
+_GUIDANCE_PUBLIC_TARGET_RE = re.compile(
+    r"\b(?:external|official|open|public|published|reference)\b|"
+    r"https?://|www\.|\b(?:documentation|docs|manual|source|"
+    r"website)\b",
+    re.I,
+)
+_GUIDANCE_PRIVATE_TARGET_RE = re.compile(
+    r"\b(?:archive|birthday|database|dossier|history|internal|memory|"
+    r"message|messages|packet|private|profile|record|records|secret|"
+    r"stored)\b",
+    re.I,
+)
+_PACKET_REFERENT_RE = re.compile(
+    r"(?:<@!?\d+>|\b(?:i|me|mine|my|we|us|our|ours|"
+    r"you|your|yours)\b|"
+    r"\b(?:he|she|they|him|his|her|hers|it|its|them|their|theirs)\b|"
+    r"\b(?:the|this|that)\s+(?:event|member|project|requester|user)\b)",
+    re.I,
+)
+_PACKET_CLAUSE_TAIL_BOUNDARY_RE = re.compile(
+    r"(?:[,;:—–]|\b(?:although|and|because|but|since|though|while|"
+    r"whereas|yet)\b)\s+",
+    re.I,
+)
+_AMBIGUOUS_PACKET_SUBJECT_RE = re.compile(
+    r"^(?:(?:an?|the|this|that|these|those)\s+)?"
+    r"(?:(?:archival|assistant|cached|confidential|conversation|current|"
+    r"encrypted|episodic|"
+    r"evidence|governance|hidden|intelligence|internal|known|live|local|"
+    r"long[- ]term|moment|personal|persistent|private|production|public|"
+    r"request|retrieval|runtime|secret|selected|semantic|session|shared[- ]"
+    r"brain|situation[- ]frame|stored|working)\s+|BNL(?:'s)?\s+)*"
+    r"(?:ai|analytics|answer|archive|archives|assessment|bot|brain|broadcast|"
+    r"cache|candidate|canary|collective|column|context|database|databases|"
+    r"dossier|engine|entity|environment|event|facts?|feature\s+flags?|flags?|"
+    r"employment\s+history|founder|frame|gate|history|hobbies|interests|"
+    r"ledger|marital\s+status|member|memories|"
+    r"memory|model|network|packets?|preferences|profile|profiles|project|"
+    r"preference|prompt|provider|radio|receipt|relationship|requester|"
+    r"response|row|run|runtime|"
+    r"shared\s+brain|situation\s+frame|source|status|store|synthesis|system|"
+    r"evidence|table|traits?|user|vector\s+database)\b|"
+    r"^(?:(?:one|another)\s+member|(?:this|that)\s+person|the\s+individual)\b",
+    re.I,
+)
+_CLARIFICATION_QUESTION_RE = re.compile(
+    r"^(?:(?:do|does|did)\s+(?:you|the\s+(?:member|requester|user))\s+"
+    r"(?:mean|need|prefer|recognize|refer|remember|use|want|work)\b|"
+    r"(?:are|were)\s+(?:you|the\s+(?:member|requester|user))\s+"
+    r"(?:asking|available|comfortable|interested|looking|ready|"
+    r"referring|talking|working)\b|"
+    r"(?:can|could|will|would)\s+(?:you|the\s+(?:member|requester|"
+    r"user))\s+(?:clarify|confirm|explain|specify|tell)\b|"
+    r"(?:what|which)\s+(?:do|does|did|are|is|was|were)\s+"
+    r"(?:you|the\s+(?:member|requester|user))\s+"
+    r"(?:mean|need|prefer|refer|remember|use|want)\b)"
+    r"[^,;:—–?]{0,240}\?$",
+    re.I,
+)
+_CLARIFICATION_UNSAFE_TAIL_RE = re.compile(
+    r"\b(?:abuse|abused|cheat|cheated|crime|criminal|fraud|fraudulent|"
+    r"illegal|kill|killed|lie|lied|murder|murdered|secretly|steal|"
+    r"stealing|stole|stop|stopped)\b|"
+    r"\b(?:although|and|because|but|since|though|while|whereas|yet)\b",
+    re.I,
+)
+_HONEST_INSUFFICIENCY_RE = re.compile(
+    r"^(?:i|we)\s+(?:(?:do\s+not|don't|cannot|can't|could\s+not|"
+    r"couldn't|am\s+not\s+able\s+to|are\s+not\s+able\s+to)\s+"
+    r"(?:claim|confirm|corroborate|determine|establish|find|know|"
+    r"remember|say|support|tell|validate|verify)\b|"
+    r"(?:do\s+not|don't)\s+have\s+(?:enough|any)\s+(?:reliable\s+)?"
+    r"(?:public\s+)?"
+    r"(?:context|evidence|history|information|record|support)\b|"
+    r"have\s+no\s+(?:reliable\s+)?(?:context|evidence|information|"
+    r"record|support)\b)",
+    re.I,
+)
+_HONEST_THIN_CONTEXT_RE = re.compile(
+    r"^(?:the\s+)?(?:longer[- ]term\s+)?"
+    r"(?:context|evidence|history|record|signal|support)\s+"
+    r"(?:is|remains)\s+(?:still\s+)?(?:too\s+)?"
+    r"(?:limited|sparse|thin|unclear|unknown|unreliable)"
+    r"(?:\s+for\s+a\s+grounded\s+profile)?\b",
+    re.I,
+)
+_HONEST_INSUFFICIENCY_TAIL_RE = re.compile(
+    r"\b(?:and|because|but|except|however|nevertheless|since|though|"
+    r"although|yet)\b",
+    re.I,
+)
+_HONEST_INSUFFICIENCY_SAFE_REMAINDER_RE = re.compile(
+    r"^(?:(?:about|for|from|on|regarding)\s+)?"
+    r"(?:you|your\s+(?:address|age|birthday|email|employer|history|home|"
+    r"job|name|profile|pronouns?|role|site|work|workplace)|BARCODE|"
+    r"BNL(?:[- ]?0?1)?|the\s+(?:member|requester|user))$|"
+    r"^(?:to\s+say\s+)?(?:if|that|whether|where|when|who|what|which|"
+    r"why|how)\s+[^,;/\[\]():—–]{1,180}$",
+    re.I,
+)
+_HONEST_EMPTY_PROFILE_REMAINDER_RE = re.compile(
+    r"^(?:to\s+)?(?:summarize|profile)\s+"
+    r"(?:you|the\s+(?:member|requester|user))\s+without\s+guessing$",
+    re.I,
+)
+_EXTERNAL_TITLE_PREDICATE_RE = re.compile(
+    r"^(?P<title>.+?)\s+"
+    r"(?:(?:is|was)\s+(?:(?:a|an|the)\s+)?(?:\d{4}\s+)?"
+    r"(?:album|book|film|novel|play|series|song|title|work)"
+    r"(?:\s+(?:from|in)\s+\d{4})?|"
+    r"(?:was\s+)?(?:composed|premiered|published|released|written)"
+    r"(?:\s+(?:by\s+[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*){0,3}|"
+    r"in\s+\d{4}))?)$",
+)
+_EXTERNAL_TITLE_TYPE_RE = re.compile(
+    r"^(?:(?:the\s+)?(?:album|book|film|novel|play|series|song|title|"
+    r"work)\s+)",
+    re.I,
+)
+_EXTERNAL_TITLE_CONNECTORS = frozenset(
+    {
+        "a",
+        "about",
+        "and",
+        "at",
+        "before",
+        "for",
+        "in",
+        "of",
+        "on",
+        "the",
+        "to",
+    }
+)
+_EXTERNAL_TITLE_PERSONAL_STARTS = frozenset(
+    {
+        "he",
+        "her",
+        "his",
+        "i",
+        "it",
+        "me",
+        "my",
+        "our",
+        "she",
+        "they",
+        "you",
+        "your",
+        "we",
+    }
+)
+_SAFE_CONVERSATIONAL_RE = re.compile(
+    r"^(?:alright|okay|sounds\s+good|that\s+makes\s+sense|thank\s+you|"
+    r"thanks|i\s+(?:agree|can\s+explain|can\s+help|hear\s+you|"
+    r"think\s+so|understand)|i\s+can\s+respond\s+to\s+what\s+you\s+"
+    r"say\s+here|we\s+can\s+do\s+that|you\s+got\s+it|"
+    r"you(?:'re|\s+are)\s+welcome)$",
+    re.I,
+)
+_EXTERNAL_OPINION_PREFIX_RE = re.compile(
+    r"^(?:i\s+(?:believe|figure|suspect|think)|"
+    r"my\s+(?:assessment|read|take|view)\s+is)\s+(?:that\s+)?"
+    r"(?P<subject>[^,;:—–]{3,240})$",
+    re.I,
+)
+_EXTERNAL_WORD_RE = re.compile(
+    r"https?://\S+|www\.\S+|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|"
+    r"\d+(?:-[A-Za-z0-9]+)?|[A-Za-z][A-Za-z0-9'’&.°-]*",
+    re.I,
+)
+_EXTERNAL_EXPLICIT_FINITE_VERBS = frozenset(
+    {
+        "am",
+        "are",
+        "became",
+        "become",
+        "becomes",
+        "began",
+        "begin",
+        "begins",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "flew",
+        "had",
+        "has",
+        "have",
+        "is",
+        "made",
+        "may",
+        "might",
+        "must",
+        "ran",
+        "shall",
+        "should",
+        "was",
+        "went",
+        "were",
+        "will",
+        "won",
+        "would",
+        "wrote",
+    }
+)
+_EXTERNAL_BARE_FINITE_VERBS = frozenset(
+    {
+        "bark",
+        "exist",
+        "fall",
+        "fly",
+        "freeze",
+        "grow",
+        "land",
+        "launch",
+        "live",
+        "migrate",
+        "orbit",
+        "power",
+        "publish",
+        "rise",
+        "run",
+        "stand",
+        "swim",
+        "travel",
+    }
+)
+_EXTERNAL_PREDICATE_FALSE_POSITIVES = frozenset(
+    {
+        "apps",
+        "details",
+        "feet",
+        "files",
+        "his",
+        "homes",
+        "its",
+        "kids",
+        "links",
+        "messages",
+        "ours",
+        "records",
+        "systems",
+        "theirs",
+        "this",
+        "times",
+        "users",
+        "values",
+        "years",
+        "yours",
+    }
+)
+_EXTERNAL_SUBJECT_FRAGMENT_STARTS = frozenset(
+    {
+        "address",
+        "aged",
+        "at",
+        "based",
+        "birthday",
+        "born",
+        "created",
+        "email",
+        "employed",
+        "engineer",
+        "favorite",
+        "from",
+        "home",
+        "job",
+        "lives",
+        "married",
+        "name",
+        "pronouns",
+        "artist",
+        "actor",
+        "admin",
+        "always",
+        "another",
+        "developer",
+        "director",
+        "doctor",
+        "employee",
+        "host",
+        "individual",
+        "manager",
+        "moderator",
+        "musician",
+        "never",
+        "now",
+        "often",
+        "one",
+        "owner",
+        "perhaps",
+        "person",
+        "producer",
+        "reporter",
+        "regularly",
+        "researcher",
+        "role",
+        "scientist",
+        "singer",
+        "someone",
+        "sometimes",
+        "started",
+        "still",
+        "teacher",
+        "website",
+        "works",
+        "writer",
+    }
 )
 _UNSUPPORTED_FRAMED_CONCRETE_RE = re.compile(
     r"(?:https?://|www\.|<@!?\d+>|"
@@ -476,19 +845,138 @@ _UNSUPPORTED_FRAMED_CONCRETE_RE = re.compile(
     re.I,
 )
 _INTERNAL_PROPER_NOUN_RE = re.compile(r"(?<!^)(?<![.!?]\s)\b[A-Z][\w'-]{2,}\b")
-_PACKET_DOMAIN_BRAND_RE = re.compile(
-    r"\b(?:BARCODE(?:\s+(?:Network|Radio))?|BNL(?:-?01)?)\b",
+_PACKET_DOMAIN_EXACT_CANON_RE = re.compile(
+    r"\bBARCODE\b|\b(?:6[\W_]*Bit|Six[\W_]*Bit)\b|"
+    r"\b(?:GALAK[\W_]*NOISE|Galak[\W_]*(?:noise|Noise))\b",
+)
+_PACKET_DOMAIN_BNL01_RE = re.compile(
+    r"\bB[\W_]*N[\W_]*L[\W_]*(?:0?1)\b",
     re.I,
 )
-_PACKET_DOMAIN_TITLED_RE = re.compile(
-    r"\b(?:Journal|Relay|Moment|Source\s+File)\b"
+_PACKET_DOMAIN_BRAND_COMPOUND_RE = re.compile(
+    r"\b(?:bar[\W_]*code[\W_]*(?:network|radio|collective)|"
+    r"bar[\W_]*code[\W_]*network[\W_]*liaison[\W_]*entity|"
+    r"d[\W_]*j[\W_]*floppy[\W_]*disc|mac[\W_]*mod(?:em|3m)|"
+    r"call[\W_]*em[\W_]*bini)\b",
+    re.I,
 )
-_PACKET_DOMAIN_CONCRETE_ASSERTION_RE = re.compile(
-    r"\b(?:am|are|is|was|were|has|have|had|began|started|ended|"
-    r"works?|prefers?|likes?|loves?|owns?|runs?|hosts?|manages?|"
-    r"leads?|founds?|founded|joins?|joined|releases?|released|"
-    r"publishes?|published|creates?|created|builds?|built|"
-    r"originates?|originated|becomes?|became)\b",
+_PACKET_DOMAIN_LINK_OR_ADDRESS_RE = re.compile(
+    r"(?:https?://\S+|www\.\S+|<@!?\d+>|"
+    r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b)",
+    re.I,
+)
+_PACKET_DOMAIN_PRESENTATION_RE = re.compile(
+    r"(?:\*\*|__|~~|`+|(?<!\w)[*_](?=\w)|(?<=\w)[*_](?!\w)|"
+    r"[\u200b-\u200d\ufeff])"
+)
+_PACKET_DOMAIN_HTML_TAG_RE = re.compile(r"</?[A-Za-z][^>]{0,80}>")
+_PACKET_DOMAIN_TITLED_PATTERNS = {
+    "journal": re.compile(
+        r"^(?:(?:the|this|that)\s+)?journal"
+        r"(?=(?:['’]s)?\s+(?!of\b))",
+        re.I,
+    ),
+    "relay": re.compile(
+        r"^(?:(?:the|this|that)\s+)?"
+        r"(?!(?-i:Relay\s+(?:AI|FM|Factory|Health|Labs|Magazine|"
+        r"Network|XR))\b)relay(?=(?:['’]s)?\s+)",
+        re.I,
+    ),
+    "moment": re.compile(
+        r"^(?:(?:the|this|that)\s+)?"
+        r"(?!(?-i:Moment\s+(?:AI|FM|Factory|Health|Labs|Magazine|"
+        r"Network|XR))\b)moment(?=(?:['’]s)?\s+)",
+        re.I,
+    ),
+    "source_file": re.compile(r"^(?:the\s+)?source\s+file\b", re.I),
+}
+_PACKET_DOMAIN_BARE_TITLE_RE = re.compile(
+    r"^(?:(?:the|this|that)\s+)?"
+    r"(?:journal(?:['’]s)?\s+(?!(?:of\b|is\s+(?:a|an|the)\s+\d{4}\s+(?:film|"
+    r"book|novel|series)|was\s+founded\b))|"
+    r"(?!(?-i:Relay\s+(?:AI|FM|Factory|Health|Labs|Magazine|Network|XR))\b)"
+    r"relay(?:['’]s)?\s+(?!is\s+(?:a|an|the)\s+\d{4}\s+"
+    r"(?:film|book|novel|series))|"
+    r"(?!(?-i:Moment\s+(?:AI|FM|Factory|Health|Labs|Magazine|Network|XR))\b)"
+    r"moment(?:['’]s)?\s+(?!magnitude\b))"
+    r"[A-Za-z0-9]",
+    re.I,
+)
+_PACKET_DOMAIN_LEADING_TITLE_RE = re.compile(
+    r"^(?:according\s+to|after|as\s+of|at|before|during|from|in|on)\s+"
+    r"(?:(?:the|this|that)\s+)?(?:"
+    r"journal(?!\s+of\b)|"
+    r"(?!(?-i:Relay\s+(?:AI|FM|Factory|Health|Labs|Magazine|Network|XR))\b)"
+    r"relay|"
+    r"(?!(?-i:Moment\s+(?:AI|FM|Factory|Health|Labs|Magazine|Network|XR))\b)"
+    r"moment"
+    r")(?:['’]s)?\b",
+    re.I,
+)
+_PACKET_DOMAIN_QUALIFIED_TITLE_RE = re.compile(
+    r"^(?:(?:(?:the|this|that)\s+)?(?:accepted|archived|current|governed|"
+    r"historical|internal|old|private|published|public|saved|selected|"
+    r"BNL(?:'s)?)\s+)+"
+    r"(?:journal|relay|moment)(?:['’]s)?\b",
+    re.I,
+)
+_PACKET_DOMAIN_CLAUSE_TITLE_SUBJECT_RE = re.compile(
+    r"^(?:(?:the|this|that)\s+)?"
+    r"(?:(?:(?:accepted|archived|current|governed|historical|internal|old|"
+    r"private|published|public|saved|selected|BNL(?:'s)?)\s+)+"
+    r"(?:journal|relay|moment)|"
+    r"journal(?!\s+of\b)|"
+    r"(?!(?-i:Relay\s+(?:AI|FM|Factory|Health|Labs|Magazine|Network|XR))\b)"
+    r"relay|"
+    r"(?!(?-i:Moment\s+(?:AI|FM|Factory|Health|Labs|Magazine|Network|XR))\b)"
+    r"moment"
+    r")(?:['’]s)?\b|"
+    r"^(?:the\s+)?source\s+file\b",
+    re.I,
+)
+_PACKET_DOMAIN_EXTERNAL_TITLE_NAME_RE = re.compile(
+    r"(?:\b(?:the\s+)?wall\s+street\s+journal\b|"
+    r"\b(?-i:(?:Relay|Moment)\s+(?:AI|FM|Factory|Health|Labs|Magazine|"
+    r"Network|XR))\b)",
+    re.I,
+)
+_PACKET_DOMAIN_EXTERNAL_TITLE_CONTEXT_RE = re.compile(
+    r"(?:(?:the|a|an|official)\s+)?(?:"
+    r"(?:the\s+)?wall\s+street\s+journal|"
+    r"(?-i:(?:Relay|Moment)\s+(?:AI|FM|Factory|Health|Labs|Magazine|"
+    r"Network|XR)))"
+    r"(?:(?:['’]s\s+|\s+)(?:article|publication|report))?|"
+    r"(?:(?:the|a|an|official)\s+)?(?:article|publication|report)\s+"
+    r"(?:by|from|of)\s+(?:(?:the\s+)?wall\s+street\s+journal|"
+    r"(?-i:(?:Relay|Moment)\s+(?:AI|FM|Factory|Health|Labs|Magazine|"
+    r"Network|XR)))",
+    re.I,
+)
+_PACKET_DOMAIN_ATTRIBUTIVE_MEMBER_RE = re.compile(
+    r"^(?:the\s+)?(?:latest\s+|recent\s+|public\s+)?"
+    r"(?:member|requester|user)\s+(?:study|survey)\b",
+    re.I,
+)
+_TRANSIENT_EXPRESSION_PACKET_ASSERTION_RE = re.compile(
+    r"(?:\b(?:i|my|we|our|you|your|he|his|she|her|they|their|it|its)\b|"
+    r"<@!?\d+>|\b(?:the|this|that|one|another)\s+"
+    r"(?:member|requester|user)\b|\b(?:BARCODE|BNL(?:[- ]?0?1)?)\b|"
+    r"\b(?:packet|database|memory|profile|dossier|archive|journal|relay|"
+    r"moment)\b).{0,180}\b(?:am|are|is|was|were|has|have|had|can|"
+    r"created|founded|joined|owns?|lives?|works?|served|attended|speaks?|"
+    r"uses?|voted|owes?|weighs?|abused|assaulted|robbed|kidnapped|"
+    r"harmed|threatened|harassed|committed|murdered|killed|lied|cheated|"
+    r"contains?|stores?|started|released|wrote)\b|"
+    r"\b(?:your|my|our|his|her|their|its)\s+"
+    r"(?:spouse|child|religion|race|diagnosis|income|credit\s+score|"
+    r"political\s+party|name|birthday|job|employer|favorite)\b",
+    re.I,
+)
+_TRANSIENT_EXPRESSION_GOVERNED_REFERENT_RE = re.compile(
+    r"(?:<@!?\d+>|\b(?:i|me|mine|my|we|us|our|ours|you|your|yours)\b|"
+    r"\b(?:he|she|they|him|his|her|hers|them|their|theirs)\b|"
+    r"\b(?:the|this|that|one|another)\s+"
+    r"(?:member|requester|user)\b)",
     re.I,
 )
 _CONCRETE_RELATION_GENERIC_NAMES = frozenset(
@@ -595,6 +1083,17 @@ _TRANSIENT_EXPRESSION_PRIVATE_RE = re.compile(
     r"\b(?:live|reside|work)\s+(?:at|in|near|for)\b|"
     r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|"
     r"<@!?\d+>)",
+    re.I,
+)
+_TRANSIENT_EXPRESSION_HARMFUL_MEMBER_RE = re.compile(
+    r"\b(?:you|the\s+(?:member|requester|user)|<@!?\d+>)\s+"
+    r"(?:are|were|have|had|committed|murdered|killed|stole|steal|"
+    r"lied|cheated)\b.{0,100}\b(?:abusive|addicted|autistic|bipolar|"
+    r"criminal|depressed|diabetic|dishonest|fraud|gay|homeless|"
+    r"infertile|married|murder|pregnant|stole|thief|undocumented|"
+    r"violent)\b|"
+    r"\b(?:you|the\s+(?:member|requester|user)|<@!?\d+>)\s+"
+    r"(?:committed|murdered|killed|stole|lied|cheated)\b",
     re.I,
 )
 _TRANSIENT_EXPRESSION_CORE_MARKERS = (
@@ -3457,6 +3956,33 @@ def _candidate_claim_units(response: str) -> tuple[str, ...]:
         return ()
     protected_expressions: dict[str, str] = {}
 
+    def protect_name_initials(match: re.Match[str]) -> str:
+        value = str(match.group("name") or "")
+        surname = str(match.groupdict().get("surname") or "")
+        predicate = str(match.group("predicate") or "")
+        following = str(match.groupdict().get("following") or "")
+        title_qualifier = (
+            r"(?:accepted|archived|current|governed|historical|internal|"
+            r"old|private|published|public|saved|selected|BNL(?:'s)?)"
+        )
+        if (
+            surname.casefold() in {"journal", "relay", "moment"}
+            or bool(re.fullmatch(title_qualifier, surname, re.I))
+            or (
+                bool(re.fullmatch(title_qualifier, predicate, re.I))
+                and following.casefold() in {"journal", "relay", "moment"}
+            )
+            or not _ordinary_chat_external_token_is_finite_predicate(
+                predicate
+            )
+        ):
+            return value
+        for _ in range(value.count(".")):
+            token = "BNLNAMEINITIAL%sTOKEN" % len(protected_expressions)
+            protected_expressions[token] = "."
+            value = value.replace(".", token, 1)
+        return value
+
     def protect_expression(match: re.Match[str]) -> str:
         value = str(match.group(0) or "")
         if not _claim_is_transient_expression(value):
@@ -3467,13 +3993,34 @@ def _candidate_claim_units(response: str) -> tuple[str, ...]:
         protected_expressions[token] = value
         return token
 
+    # Protect initials inside ordinary public names before sentence splitting.
+    # The replacement preserves only the period and is restored below.
+    cleaned = re.sub(
+        r"\b(?P<name>(?:[A-Z][A-Za-z'’\-]{1,30}\s+)?"
+        r"(?:[A-Z]\.\s*)+)"
+        r"(?=(?P<surname>[A-Z][A-Za-z'’\-]{1,30})\s+"
+        r"(?P<predicate>[A-Za-z]+)\b)",
+        protect_name_initials,
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"\b(?P<name>[A-Z][A-Za-z'’\-]{1,30}\s+[A-Z]\.)"
+        r"(?=\s+(?P<predicate>[A-Za-z]+)\b"
+        r"(?:\s+(?P<following>[A-Za-z]+)\b)?)",
+        protect_name_initials,
+        cleaned,
+    )
     cleaned = _TRANSIENT_EXPRESSION_BLOCK_RE.sub(
         protect_expression,
         cleaned,
     )
     units = []
     for value in _CLAIM_SPLIT_RE.split(cleaned):
-        for token, expression in protected_expressions.items():
+        # Expand outer transient wrappers before any initial placeholders
+        # captured inside them.
+        for token, expression in reversed(
+            tuple(protected_expressions.items())
+        ):
             value = str(value or "").replace(token, expression)
         claim = re.sub(
             r"^\s*(?:alongside|and|but|yet|while|whereas|which|so)\s+",
@@ -3500,6 +4047,7 @@ def _claim_is_transient_expression(claim: str) -> bool:
     if (
         _TRANSIENT_EXPRESSION_AUTHORITY_RE.search(value)
         or _TRANSIENT_EXPRESSION_PRIVATE_RE.search(value)
+        or _TRANSIENT_EXPRESSION_HARMFUL_MEMBER_RE.search(value)
     ):
         return False
     wrapper = _TRANSIENT_EXPRESSION_WRAPPER_RE.fullmatch(value)
@@ -4587,21 +5135,70 @@ def candidate_profile_coverage(
     )
 
 
+def _ordinary_chat_global_label_is_distinctive(label: str) -> bool:
+    value = re.sub(r"\s+", " ", str(label or "")).strip()
+    if not value or value.casefold() in {
+        "6 bit",
+        "six bit",
+        "bnl",
+        "barcode",
+        "cliff",
+        "sheila",
+    }:
+        return False
+    if len(value.split()) > 1:
+        return True
+    if re.fullmatch(r"[A-Z][A-Z0-9_-]{3,}", value):
+        return True
+    return bool(re.search(r"[A-Za-z]-?\d", value))
+
+
 def _ordinary_chat_packet_domain_labels(
     basis: SharedBrainSynthesisBasis,
-) -> tuple[str, ...]:
-    """Return governed subject labels, never arbitrary evidence values."""
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return selected labels and globally distinctive canon labels."""
 
     packet = basis.packet
     request = packet.request
-    labels = {
+    resolution = packet.subject_resolution
+    selected_labels = {
         str(request.subject_display_name or "").strip(),
         *(
             str(subject.label_hint or "").strip()
             for subject in tuple(request.frame_subjects or ())
         ),
     }
-    resolution = packet.subject_resolution
+    identities_by_key = {
+        str(identity.key or ""): identity
+        for identity in CANON_ENTITY_IDENTITIES
+    }
+    selected_entity_refs = {
+        str(resolution.entity_ref or "").strip(),
+        str(resolution.subject_key or "").strip(),
+        *(
+            str(subject.entity_ref or "").strip()
+            for subject in tuple(request.frame_subjects or ())
+        ),
+    }
+    for reference in tuple(selected_entity_refs):
+        prefix, separator, suffix = reference.partition(":")
+        candidate_key = suffix if separator and prefix in {
+            "barcode",
+            "canon",
+            "entity",
+        } else reference
+        identity = identities_by_key.get(candidate_key)
+        if identity is not None:
+            selected_labels.update((identity.name, *identity.aliases))
+
+    distinctive_canon_labels = {
+        *(
+            str(label or "").strip()
+            for identity in CANON_ENTITY_IDENTITIES
+            for label in (identity.name, *identity.aliases)
+            if _ordinary_chat_global_label_is_distinctive(label)
+        ),
+    }
     for reference in (
         str(resolution.entity_ref or ""),
         str(resolution.subject_key or ""),
@@ -4609,15 +5206,480 @@ def _ordinary_chat_packet_domain_labels(
         prefix, separator, suffix = reference.partition(":")
         if not separator or prefix not in {"barcode", "canon", "entity"}:
             continue
-        labels.add(re.sub(r"[_-]+", " ", suffix).strip())
-    return tuple(
-        sorted(
-            label
-            for label in labels
-            if len(label) >= 3
-            and label.casefold()
-            not in {"member", "unknown", "user"}
+        selected_labels.add(re.sub(r"[_-]+", " ", suffix).strip())
+    return (
+        tuple(
+            sorted(
+                label
+                for label in selected_labels
+                if len(label) >= 3
+                and label.casefold()
+                not in {"member", "unknown", "user"}
+            )
+        ),
+        tuple(sorted(distinctive_canon_labels)),
+    )
+
+
+def _ordinary_chat_claim_has_project_brand(value: str) -> bool:
+    claim = _ordinary_chat_plain_text(value)
+    return bool(
+        _PACKET_DOMAIN_EXACT_CANON_RE.search(claim)
+        or _PACKET_DOMAIN_BNL01_RE.search(claim)
+        or _PACKET_DOMAIN_BRAND_COMPOUND_RE.search(claim)
+    )
+
+
+def _ordinary_chat_plain_text(value: str) -> str:
+    """Normalize presentation-only markup before governed-token checks."""
+
+    without_html = _PACKET_DOMAIN_HTML_TAG_RE.sub(
+        "",
+        str(value or ""),
+    )
+    return _PACKET_DOMAIN_PRESENTATION_RE.sub(
+        "",
+        without_html,
+    ).replace("\u00a0", " ")
+
+
+def _ordinary_chat_claim_core(value: str) -> str:
+    """Remove presentation and bounded lead-ins before subject checks."""
+
+    return _ordinary_chat_claim_modifier_stack(value)[1]
+
+
+def _ordinary_chat_claim_governed_surface(value: str) -> str:
+    """Return presentation-normalized text without deleting attribution."""
+
+    return re.sub(
+        r"^\s*(?:(?:[-*•▪◦]+|\d+[.)])\s+|>\s*)+",
+        "",
+        _ordinary_chat_plain_text(value),
+    ).strip()
+
+
+def _ordinary_chat_claim_modifier_stack(
+    value: str,
+) -> tuple[tuple[str, ...], str]:
+    """Parse one shared leading stack into contexts and semantic remainder."""
+
+    remaining = _ordinary_chat_claim_governed_surface(value)
+    remaining = _CLAIM_LEADING_CONCESSIVE_RE.sub(
+        "",
+        remaining,
+        count=1,
+    ).strip()
+    contexts: list[str] = []
+    while remaining:
+        context_match = _CLAIM_CONTEXT_LEADING_MODIFIER_RE.match(remaining)
+        if context_match is not None:
+            contexts.append(
+                str(context_match.group("context") or "").strip()
+            )
+            remaining = remaining[context_match.end() :].lstrip()
+            continue
+        simple_match = _CLAIM_SIMPLE_LEADING_MODIFIER_RE.match(remaining)
+        if simple_match is None:
+            break
+        remaining = remaining[simple_match.end() :].lstrip()
+    return (
+        tuple(context for context in contexts if context),
+        remaining.strip(),
+    )
+
+
+def _ordinary_chat_claim_leading_contexts(value: str) -> tuple[str, ...]:
+    """Return every contextual modifier in the leading modifier stack."""
+
+    return _ordinary_chat_claim_modifier_stack(value)[0]
+
+
+def _ordinary_chat_claim_has_scoped_title(
+    basis: SharedBrainSynthesisBasis,
+    value: str,
+) -> bool:
+    object_kind = str(
+        basis.packet.request.frame_object_kind or ""
+    ).strip().lower()
+    pattern = _PACKET_DOMAIN_TITLED_PATTERNS.get(object_kind)
+    core = _ordinary_chat_claim_governed_surface(value)
+    semantic_core = _ordinary_chat_claim_core(value)
+    return bool(
+        _PACKET_DOMAIN_BARE_TITLE_RE.search(core)
+        or _PACKET_DOMAIN_BARE_TITLE_RE.search(semantic_core)
+        or _PACKET_DOMAIN_LEADING_TITLE_RE.search(core)
+        or _PACKET_DOMAIN_QUALIFIED_TITLE_RE.search(semantic_core)
+        or (pattern and pattern.search(semantic_core))
+    )
+
+
+def _ordinary_chat_leading_context_has_scoped_title(
+    context: str,
+) -> bool:
+    """Recognize project titles without claiming qualified external names."""
+
+    core = _ordinary_chat_claim_governed_surface(context)
+    return bool(
+        _PACKET_DOMAIN_LEADING_TITLE_RE.search(f"According to {core},")
+        or _PACKET_DOMAIN_QUALIFIED_TITLE_RE.search(core)
+    )
+
+
+def _ordinary_chat_claim_is_honest_nonassertion(value: str) -> bool:
+    """Recognize one clarification or one bounded insufficiency clause."""
+
+    core = re.sub(
+        r"^\s*(?:(?:[-*•▪◦]+|\d+[.)])\s+|>\s*)+",
+        "",
+        str(value or ""),
+    ).strip()
+    if (
+        _CLARIFICATION_QUESTION_RE.fullmatch(core)
+        and not _CLARIFICATION_UNSAFE_TAIL_RE.search(core)
+    ):
+        return True
+    if re.search(r"[,;:—–]", core):
+        return False
+    if _HONEST_INSUFFICIENCY_TAIL_RE.search(core):
+        return False
+    match = _HONEST_INSUFFICIENCY_RE.match(core)
+    if match is None:
+        return bool(_HONEST_THIN_CONTEXT_RE.fullmatch(core))
+    remainder = core[match.end() :].strip()
+    return bool(
+        not remainder
+        or _HONEST_INSUFFICIENCY_SAFE_REMAINDER_RE.fullmatch(remainder)
+        or _HONEST_EMPTY_PROFILE_REMAINDER_RE.fullmatch(remainder)
+    )
+
+
+def _ordinary_chat_claim_is_guidance(
+    basis: SharedBrainSynthesisBasis,
+    value: str,
+    *,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> bool:
+    """Allow only one complete, public/external guidance clause."""
+
+    core = _ordinary_chat_claim_core(value)
+    match = _CLAIM_LEADING_GUIDANCE_RE.fullmatch(core)
+    if match is None:
+        return False
+    target = str(match.group("target") or "").strip()
+    target_without_links = _PACKET_DOMAIN_LINK_OR_ADDRESS_RE.sub(
+        " ",
+        target,
+    )
+    return bool(
+        target
+        and _GUIDANCE_PUBLIC_TARGET_RE.search(target)
+        and not re.search(r"[,;:—–]", target_without_links)
+        and not _GUIDANCE_PRIVATE_TARGET_RE.search(target)
+        and not _ordinary_chat_claim_has_project_brand(target)
+        and not _ordinary_chat_claim_has_scoped_title(basis, target)
+        and not _ordinary_chat_claim_mentions_label(
+            target,
+            selected_labels,
         )
+        and not _ordinary_chat_claim_mentions_label(
+            target,
+            global_labels,
+            case_sensitive=True,
+        )
+        and not _PACKET_REFERENT_RE.search(target_without_links)
+    )
+
+
+def _ordinary_chat_claim_is_safe_conversation(value: str) -> bool:
+    return bool(
+        _SAFE_CONVERSATIONAL_RE.fullmatch(
+            _ordinary_chat_claim_core(value)
+        )
+    )
+
+
+def _ordinary_chat_leading_context_is_governed(
+    context: str,
+    *,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> bool:
+    """Fail closed when an external-title context carries extra authority."""
+
+    hard_governed = bool(
+        _ordinary_chat_claim_has_project_brand(context)
+        or _ordinary_chat_claim_mentions_label(context, selected_labels)
+        or _ordinary_chat_claim_mentions_label(
+            context,
+            global_labels,
+            case_sensitive=True,
+        )
+        or _PACKET_REFERENT_RE.search(context)
+    )
+    if hard_governed:
+        return True
+    if _PACKET_DOMAIN_EXTERNAL_TITLE_NAME_RE.search(context):
+        return not bool(
+            _PACKET_DOMAIN_EXTERNAL_TITLE_CONTEXT_RE.fullmatch(context)
+        )
+    return bool(
+        _ordinary_chat_leading_context_has_scoped_title(context)
+        or _AMBIGUOUS_PACKET_SUBJECT_RE.search(context)
+    )
+
+
+def _ordinary_chat_claim_has_governed_lead_in(
+    basis: SharedBrainSynthesisBasis,
+    value: str,
+    *,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> bool:
+    """Reject a benign-looking tail when its lead-in asserts packet truth."""
+
+    return any(
+        _ordinary_chat_leading_context_is_governed(
+            context,
+            selected_labels=selected_labels,
+            global_labels=global_labels,
+        )
+        for context in _ordinary_chat_claim_leading_contexts(value)
+    )
+
+
+def _ordinary_chat_claim_is_external_personal_title(value: str) -> bool:
+    core = _ordinary_chat_claim_core(value)
+    match = _EXTERNAL_TITLE_PREDICATE_RE.fullmatch(core)
+    if match is None:
+        return False
+    raw_title = str(match.group("title") or "").strip()
+    explicitly_typed = bool(_EXTERNAL_TITLE_TYPE_RE.match(raw_title))
+    explicitly_quoted = bool(
+        re.match(r"^[\"'“‘]", raw_title)
+        and re.search(r"[\"'”’]\s*$", raw_title)
+    )
+    explicitly_typed = explicitly_typed or bool(
+        re.search(
+            r"\s+(?:is|was)\s+(?:(?:a|an|the)\s+)?"
+            r"(?:\d{4}\s+)?(?:album|book|film|novel|play|series|"
+            r"song|title|work)(?:\s|$)",
+            core,
+            re.I,
+        )
+    )
+    title = _EXTERNAL_TITLE_TYPE_RE.sub(
+        "",
+        raw_title,
+        count=1,
+    ).strip(" \t\"'“”‘’")
+    words = tuple(re.findall(r"[A-Za-z][A-Za-z'’.-]*", title))
+    if not words or words[0].casefold() not in _EXTERNAL_TITLE_PERSONAL_STARTS:
+        return False
+    # A bare pronoun-led phrase is indistinguishable from a member/system
+    # assertion here. Only explicit work syntax or a sufficiently specific
+    # multiword title may take the external-title lane.
+    if not explicitly_typed and not explicitly_quoted:
+        return False
+    return all(
+        word.casefold() in _EXTERNAL_TITLE_CONNECTORS
+        or word[:1].isupper()
+        for word in words
+    )
+
+
+def _ordinary_chat_external_token_is_finite_predicate(value: str) -> bool:
+    token = str(value or "").strip(" \t.,:;!?\"'“”‘’").casefold()
+    if not token or token in _EXTERNAL_PREDICATE_FALSE_POSITIVES:
+        return False
+    if (
+        token in _EXTERNAL_EXPLICIT_FINITE_VERBS
+        or token in _EXTERNAL_BARE_FINITE_VERBS
+    ):
+        return True
+    return bool(
+        len(token) >= 4
+        and re.fullmatch(r"[a-z]+", token)
+        and token.endswith(("ed", "es", "s"))
+    )
+
+
+def _ordinary_chat_external_subject_is_positive(
+    subject: str,
+    tokens: Sequence[str],
+) -> bool:
+    value = str(subject or "").strip(" \t\"'“”‘’()")
+    if not value or not tokens:
+        return False
+    first = str(tokens[0] or "").strip(" \t.,:;!?\"'“”‘’")
+    lowered = first.casefold()
+    if re.match(
+        r"^(?:https?://|www\.|[a-z0-9._%+-]+@)",
+        first,
+        re.I,
+    ):
+        return True
+    if (
+        not first
+        or re.search(r"[,;:—–]", value)
+        or lowered in {"a", "an"}
+        or lowered in _EXTERNAL_SUBJECT_FRAGMENT_STARTS
+        or lowered.endswith("ly")
+        or (
+            _AMBIGUOUS_PACKET_SUBJECT_RE.search(value)
+            and not _PACKET_DOMAIN_EXTERNAL_TITLE_NAME_RE.match(value)
+            and not _PACKET_DOMAIN_ATTRIBUTIVE_MEMBER_RE.match(value)
+        )
+    ):
+        return False
+    if lowered == "the":
+        return len(tokens) >= 2
+    if first[:1].isdigit():
+        return bool(re.search(r"\bbit\b", value, re.I))
+    return bool(first[:1].isupper())
+
+
+def _ordinary_chat_claim_has_external_subject(value: str) -> bool:
+    """Require a noun-phrase subject followed by a finite predicate."""
+
+    core = _ordinary_chat_claim_core(value)
+    if _ordinary_chat_claim_is_external_personal_title(core):
+        return True
+    matches = tuple(_EXTERNAL_WORD_RE.finditer(core))
+    if len(matches) < 2:
+        return False
+    for index, match in enumerate(matches[1:], start=1):
+        if not _ordinary_chat_external_token_is_finite_predicate(
+            match.group(0)
+        ):
+            continue
+        subject = core[: match.start()].strip()
+        subject_tokens = tuple(
+            item.group(0) for item in matches[:index]
+        )
+        if _ordinary_chat_external_subject_is_positive(
+            subject,
+            subject_tokens,
+        ):
+            return True
+    return False
+
+
+def _ordinary_chat_claim_has_embedded_packet_clause(
+    basis: SharedBrainSynthesisBasis,
+    value: str,
+) -> bool:
+    """Fail closed on an embedded governed head in an external-looking claim.
+
+    A full external-language parser is outside this canary's authority. In a
+    packet-scoped request, an embedded packet/internal/publication head is
+    therefore ambiguous unless syntax makes it an external proper name or an
+    external proper possessive. This deliberately conservative rule closes
+    finite, irregular, nonfinite, compound, and modifier variants together.
+    """
+
+    core = _ordinary_chat_claim_core(value)
+    words = tuple(_EXTERNAL_WORD_RE.finditer(core))
+    external_title_names = tuple(
+        _PACKET_DOMAIN_EXTERNAL_TITLE_NAME_RE.finditer(core)
+    )
+    attributive_member = _PACKET_DOMAIN_ATTRIBUTIVE_MEMBER_RE.match(core)
+    for index, word in enumerate(words[1:], start=1):
+        suffix = core[word.start() :]
+        ambiguous_match = _AMBIGUOUS_PACKET_SUBJECT_RE.match(suffix)
+        title_match = _PACKET_DOMAIN_CLAUSE_TITLE_SUBJECT_RE.match(suffix)
+        subject_matches = tuple(
+            match
+            for match in (ambiguous_match, title_match)
+            if match is not None
+        )
+        if not subject_matches:
+            continue
+        external_name = next(
+            (
+                name
+                for name in external_title_names
+                if name.start() <= word.start() < name.end()
+            ),
+            None,
+        )
+        if external_name is not None:
+            continue
+        previous = str(words[index - 1].group(0) or "")
+        title_is_packet_qualified = bool(
+            title_match is not None
+            and _PACKET_DOMAIN_QUALIFIED_TITLE_RE.match(
+                str(title_match.group(0) or "")
+            )
+        )
+        if (
+            previous.casefold() in {"her", "his", "its", "their"}
+            or previous.endswith(("'s", "’s"))
+        ):
+            continue
+        subject_match = max(subject_matches, key=lambda match: match.end())
+        if (
+            attributive_member is not None
+            and attributive_member.start() <= word.start()
+            and word.end() <= attributive_member.end()
+        ):
+            continue
+        if not suffix[subject_match.end() :].strip(" \t,;:—–-()[]{}.!?"):
+            continue
+        matched_subject = str(subject_match.group(0) or "").strip().casefold()
+        prefix = core[: word.start()].rstrip(" \t,;:—–-")
+        prefix_words = tuple(_EXTERNAL_WORD_RE.finditer(prefix))
+        if not prefix_words:
+            continue
+        # A single possessive/proper-name qualifier belongs to the subject
+        # ("NASA's database" / "its database"), not to an outer clause.
+        if len(prefix_words) == 1:
+            qualifier = str(prefix_words[0].group(0) or "")
+            if (
+                qualifier.casefold() in {"her", "his", "its", "their"}
+                or qualifier.endswith(("'s", "’s"))
+            ):
+                continue
+        if _ordinary_chat_claim_has_external_subject(core):
+            return True
+    return False
+
+
+def _ordinary_chat_claim_is_external_opinion(
+    basis: SharedBrainSynthesisBasis,
+    value: str,
+    *,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> bool:
+    """Allow a bounded first-person opinion about an external subject."""
+
+    match = _EXTERNAL_OPINION_PREFIX_RE.fullmatch(
+        _ordinary_chat_claim_core(value)
+    )
+    if match is None:
+        return False
+    subject = str(match.group("subject") or "").strip()
+    without_links = _PACKET_DOMAIN_LINK_OR_ADDRESS_RE.sub(" ", subject)
+    return bool(
+        _ordinary_chat_claim_has_external_subject(subject)
+        and not _ordinary_chat_claim_has_embedded_packet_clause(
+            basis,
+            subject,
+        )
+        and not _ordinary_chat_claim_has_project_brand(without_links)
+        and not _ordinary_chat_claim_has_scoped_title(basis, without_links)
+        and not _ordinary_chat_claim_mentions_label(
+            without_links,
+            selected_labels,
+        )
+        and not _ordinary_chat_claim_mentions_label(
+            without_links,
+            global_labels,
+            case_sensitive=True,
+        )
+        and not _PACKET_REFERENT_RE.search(without_links)
     )
 
 
@@ -4646,24 +5708,162 @@ def _ordinary_chat_packet_domain_context_active(
         return True
     request_text = str(request.user_text or "")
     return bool(
-        _PACKET_DOMAIN_BRAND_RE.search(request_text)
-        or _PACKET_DOMAIN_TITLED_RE.search(request_text)
+        _ordinary_chat_claim_has_project_brand(request_text)
+        or _ordinary_chat_claim_has_scoped_title(basis, request_text)
     )
 
 
 def _ordinary_chat_claim_mentions_label(
     claim: str,
     labels: Sequence[str],
+    *,
+    case_sensitive: bool = False,
 ) -> bool:
-    normalized = re.sub(r"\s+", " ", str(claim or "")).casefold()
-    return any(
-        re.search(
-            r"(?<![\w])%s(?![\w])"
-            % re.escape(re.sub(r"\s+", " ", label).casefold()),
+    without_links = _PACKET_DOMAIN_LINK_OR_ADDRESS_RE.sub(
+        " ",
+        str(claim or ""),
+    )
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        _ordinary_chat_plain_text(without_links),
+    ).replace("’", "'")
+    if not case_sensitive:
+        normalized = normalized.casefold()
+    for label in labels:
+        label_value = re.sub(
+            r"\s+",
+            " ",
+            _ordinary_chat_plain_text(label),
+        ).replace("’", "'").strip()
+        if not label_value:
+            continue
+        if not case_sensitive:
+            label_value = label_value.casefold()
+        if re.search(
+            r"(?<![\w])%s(?![\w])" % re.escape(label_value),
             normalized,
+        ):
+            return True
+        token_class = "A-Za-z0-9" if case_sensitive else "a-z0-9"
+        label_tokens = re.findall(
+            r"[A-Za-z0-9]+" if case_sensitive else r"[a-z0-9]+",
+            label_value,
         )
-        for label in labels
-        if label
+        if len(label_tokens) == 1:
+            token = label_tokens[0]
+            if len(token) < 3:
+                continue
+            punctuated_pattern = r"(?<![%s])" % token_class + (
+                r"[^%s\s]*" % token_class
+            ).join(re.escape(char) for char in token) + (
+                r"(?![%s])" % token_class
+            )
+            if re.search(punctuated_pattern, normalized):
+                return True
+            continue
+        compact_pattern = r"(?<![%s])" % token_class + (
+            r"[^%s]*" % token_class
+        ).join(
+            re.escape(token) for token in label_tokens
+        ) + r"(?![%s])" % token_class
+        if re.search(compact_pattern, normalized):
+            return True
+    return False
+
+
+def _ordinary_chat_claim_has_packet_subject(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+    *,
+    packet_context: bool,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> bool:
+    governed_surface = _ordinary_chat_claim_governed_surface(claim)
+    core = _ordinary_chat_claim_core(claim)
+    without_links = _PACKET_DOMAIN_LINK_OR_ADDRESS_RE.sub(" ", core)
+    governed_without_links = _PACKET_DOMAIN_LINK_OR_ADDRESS_RE.sub(
+        " ",
+        governed_surface,
+    )
+    governed_lead_ins = _ordinary_chat_claim_leading_contexts(
+        governed_without_links
+    )
+    external_title_at_start = bool(
+        _PACKET_DOMAIN_EXTERNAL_TITLE_NAME_RE.match(core)
+    )
+    attributive_member_at_start = bool(
+        _PACKET_DOMAIN_ATTRIBUTIVE_MEMBER_RE.match(core)
+    )
+    return bool(
+        _ordinary_chat_claim_has_project_brand(governed_without_links)
+        or _ordinary_chat_claim_has_scoped_title(basis, governed_without_links)
+        or _ordinary_chat_claim_mentions_label(
+            governed_without_links,
+            selected_labels,
+        )
+        or _ordinary_chat_claim_mentions_label(
+            governed_without_links,
+            global_labels,
+            case_sensitive=True,
+        )
+        or any(
+            _ordinary_chat_leading_context_is_governed(
+                governed_lead_in,
+                selected_labels=selected_labels,
+                global_labels=global_labels,
+            )
+            for governed_lead_in in governed_lead_ins
+        )
+        or _ordinary_chat_claim_has_embedded_packet_clause(basis, core)
+        or _CLAIM_LEADING_DIRECT_PACKET_SUBJECT_RE.search(core)
+        or re.search(r"<@!?\d+>", core)
+        or re.search(
+            r"(?:<@!?\d+>|\b(?:you|your|yours)\b)",
+            governed_without_links,
+            re.I,
+        )
+        or re.match(
+            r"^about\s+(?:you|your|the\s+(?:member|requester|user)|"
+            r"this\s+member|that\s+member|<@!?\d+>)(?!\w)",
+            core,
+            re.I,
+        )
+        or (
+            packet_context
+            and (
+                _PACKET_REFERENT_RE.search(without_links)
+                or (
+                    _AMBIGUOUS_PACKET_SUBJECT_RE.search(without_links)
+                    and not external_title_at_start
+                    and not attributive_member_at_start
+                )
+            )
+        )
+    )
+
+
+def _ordinary_chat_supported_claim_has_packet_tail(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+    *,
+    packet_context: bool,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> bool:
+    """Reject a supported clause carrying a second unproved packet clause."""
+
+    core = _ordinary_chat_claim_core(claim)
+    return any(
+        _ordinary_chat_claim_has_packet_subject(
+            basis,
+            core[boundary.end() :],
+            packet_context=packet_context,
+            selected_labels=selected_labels,
+            global_labels=global_labels,
+        )
+        for boundary in _PACKET_CLAUSE_TAIL_BOUNDARY_RE.finditer(core)
     )
 
 
@@ -4685,10 +5885,15 @@ def audit_ordinary_chat_candidate_claims(
     claims = _candidate_claim_units(response)
     classifications = tuple(profile.claim_classifications)
     packet_context = _ordinary_chat_packet_domain_context_active(basis)
-    labels = _ordinary_chat_packet_domain_labels(basis)
+    selected_labels, global_labels = _ordinary_chat_packet_domain_labels(
+        basis
+    )
     if len(claims) != len(classifications):
-        if packet_context and claims:
-            return (("unsupported_packet_domain",) * len(claims), len(claims))
+        if claims:
+            return (
+                ("claim_audit_alignment_invalid",) * len(claims),
+                len(claims),
+            )
         return (classifications, 0)
 
     audited: list[str] = []
@@ -4699,37 +5904,192 @@ def audit_ordinary_chat_candidate_claims(
         "member_and_canon_supported",
     }
     for claim, classification in zip(claims, classifications):
-        if classification in supported or classification == "transient_expression":
-            audited.append(classification)
+        if classification in supported:
+            if _ordinary_chat_supported_claim_has_packet_tail(
+                basis,
+                claim,
+                packet_context=packet_context,
+                selected_labels=selected_labels,
+                global_labels=global_labels,
+            ):
+                audited.append("unsupported_packet_domain")
+                unsupported_packet_domain += 1
+            else:
+                audited.append(classification)
             continue
-        explicit_domain = bool(
-            _PACKET_DOMAIN_BRAND_RE.search(claim)
-            or _PACKET_DOMAIN_TITLED_RE.search(claim)
-            or _ordinary_chat_claim_mentions_label(claim, labels)
+        transient_surface = _ordinary_chat_plain_text(claim)
+        transient_wrapper = _TRANSIENT_EXPRESSION_WRAPPER_RE.fullmatch(
+            transient_surface
         )
-        personal_fact = bool(
-            _UNSUPPORTED_SCALAR_ASSERTION_RE.search(claim)
-            or _UNSUPPORTED_FRAMED_CONCRETE_RE.search(claim)
+        transient_body = str(
+            transient_wrapper.group("body")
+            if transient_wrapper is not None
+            else transient_surface
         )
-        concrete_assertion = bool(
-            classification == "unsupported_factual"
-            or personal_fact
+        transient_compressed = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            transient_body.casefold(),
+        )
+        transient_shape = bool(
+            classification == "transient_expression"
+            or _TRANSIENT_EXPRESSION_FRAME_RE.search(transient_surface)
             or (
-                (packet_context or explicit_domain)
-                and _PACKET_DOMAIN_CONCRETE_ASSERTION_RE.search(claim)
+                transient_wrapper is not None
+                and any(
+                    marker in transient_compressed
+                    for marker in _TRANSIENT_EXPRESSION_CORE_MARKERS
+                )
+                and (
+                    "//" in transient_body
+                    or "_" in transient_body
+                    or any(
+                        marker in transient_compressed
+                        for marker in _TRANSIENT_EXPRESSION_EVENT_MARKERS
+                    )
+                )
             )
         )
-        packet_unsupported = bool(
-            concrete_assertion
-            and (packet_context or explicit_domain or personal_fact)
+        if transient_shape:
+            transient_inner = re.sub(
+                r"^[^A-Za-z0-9]*(?:SIGNAL|BROADCAST|ARCHIVE)?"
+                r"(?:[_\s-]*(?:GLITCH|BLEED|FRAGMENT))?\s*[:/]*",
+                "",
+                transient_body,
+                count=1,
+                flags=re.I,
+            ).strip(" []~/")
+            transient_core = _ordinary_chat_claim_core(transient_inner)
+            transient_packet_owned = bool(
+                _TRANSIENT_EXPRESSION_PACKET_ASSERTION_RE.search(
+                    transient_surface
+                )
+                or _ordinary_chat_claim_has_project_brand(transient_surface)
+                or _ordinary_chat_claim_has_scoped_title(
+                    basis,
+                    transient_surface,
+                )
+                or _ordinary_chat_claim_has_scoped_title(
+                    basis,
+                    transient_inner,
+                )
+                or _ordinary_chat_claim_mentions_label(
+                    transient_surface,
+                    selected_labels,
+                )
+                or _ordinary_chat_claim_mentions_label(
+                    transient_surface,
+                    global_labels,
+                    case_sensitive=True,
+                )
+                or _TRANSIENT_EXPRESSION_GOVERNED_REFERENT_RE.search(
+                    transient_inner
+                )
+                or _AMBIGUOUS_PACKET_SUBJECT_RE.search(transient_core)
+                or _TRANSIENT_EXPRESSION_AUTHORITY_RE.search(
+                    transient_surface
+                )
+                or _TRANSIENT_EXPRESSION_PRIVATE_RE.search(
+                    transient_surface
+                )
+            )
+            if transient_packet_owned:
+                audited.append("unsupported_packet_domain")
+                unsupported_packet_domain += 1
+                continue
+            if classification == "transient_expression":
+                audited.append(classification)
+                continue
+        if classification in {"framed_opinion", "linked_assessment"}:
+            assessment_core = re.sub(
+                r"^\s*(?:(?:[-*•▪◦]+|\d+[.)])\s+|>\s*)+",
+                "",
+                str(claim or ""),
+            ).strip()
+            if (
+                _MEMBER_ASSESSMENT_BACKWARD_SUBJECT_RE.search(
+                    assessment_core
+                )
+                or _MEMBER_ASSESSMENT_BACKWARD_OBJECT_RE.search(
+                    assessment_core
+                )
+            ):
+                audited.append(classification)
+            else:
+                audited.append("unsupported_packet_domain")
+                unsupported_packet_domain += 1
+            continue
+        governed_lead_in = _ordinary_chat_claim_has_governed_lead_in(
+            basis,
+            claim,
+            selected_labels=selected_labels,
+            global_labels=global_labels,
         )
-        if packet_unsupported:
+        if (
+            not governed_lead_in
+            and _ordinary_chat_claim_is_safe_conversation(claim)
+        ):
+            audited.append(
+                "ordinary_guidance"
+                if re.fullmatch(
+                    r"i\s+can\s+respond\s+to\s+what\s+you\s+say\s+here",
+                    _ordinary_chat_claim_core(claim),
+                    re.I,
+                )
+                else "connective_flavor"
+            )
+            continue
+        if (
+            not governed_lead_in
+            and _ordinary_chat_claim_is_honest_nonassertion(claim)
+        ):
+            audited.append("honest_nonassertion")
+            continue
+        if not governed_lead_in and _ordinary_chat_claim_is_guidance(
+            basis,
+            claim,
+            selected_labels=selected_labels,
+            global_labels=global_labels,
+        ):
+            audited.append("ordinary_guidance")
+            continue
+        if (
+            not governed_lead_in
+            and _ordinary_chat_claim_is_external_personal_title(claim)
+        ):
+            audited.append("external_public_knowledge")
+            continue
+        if (
+            not governed_lead_in
+            and _ordinary_chat_claim_is_external_opinion(
+                basis,
+                claim,
+                selected_labels=selected_labels,
+                global_labels=global_labels,
+            )
+        ):
+            audited.append("external_public_knowledge")
+            continue
+        packet_subject = _ordinary_chat_claim_has_packet_subject(
+            basis,
+            claim,
+            packet_context=packet_context,
+            selected_labels=selected_labels,
+            global_labels=global_labels,
+        )
+        if packet_subject:
             audited.append("unsupported_packet_domain")
             unsupported_packet_domain += 1
-        elif classification == "unsupported_factual":
+        elif not packet_context:
+            if classification == "unsupported_factual":
+                audited.append("external_public_knowledge")
+            else:
+                audited.append(classification)
+        elif _ordinary_chat_claim_has_external_subject(claim):
             audited.append("external_public_knowledge")
         else:
-            audited.append(classification)
+            audited.append("unsupported_packet_domain")
+            unsupported_packet_domain += 1
     return tuple(audited), unsupported_packet_domain
 
 
