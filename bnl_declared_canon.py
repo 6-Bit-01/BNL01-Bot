@@ -685,7 +685,7 @@ def _read_snapshot(conn: sqlite3.Connection):
         # BEGIN is deferred in SQLite. This read pins the snapshot before any
         # validator query so a WAL writer cannot splice a newer revision/source
         # row into the remainder of the validation sequence.
-        conn.execute("SELECT 1 FROM main.sqlite_schema LIMIT 1").fetchone()
+        conn.execute("SELECT 1 FROM main.sqlite_master LIMIT 1").fetchone()
     try:
         yield
         if int(conn.total_changes or 0) != before:
