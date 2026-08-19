@@ -988,7 +988,7 @@ class SharedBrainSynthesisBotPathTests(
         self.assertNotIn("Conversation history:", request_contents)
         self.assertNotIn("THE FORBIDDEN REFERENCE", request_contents)
 
-    async def test_single_packet_unsafe_output_is_suppressed_not_regenerated(self):
+    async def test_single_packet_provider_returns_raw_envelope_for_typed_validation(self):
         generated = mock.AsyncMock(
             return_value=SimpleNamespace(
                 success=True,
@@ -1023,7 +1023,7 @@ class SharedBrainSynthesisBotPathTests(
                 source_context_available=True,
             )
 
-        self.assertEqual(response, "")
+        self.assertEqual(response, "Network archives yielded no results.")
         generated.assert_awaited_once()
         strict_repair.assert_not_awaited()
 
@@ -1044,7 +1044,11 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text="One generated answer.",
+                text=(
+                    '{"tasks":[{"taskId":"T1","text":"One generated '
+                    'answer.","supportKind":"external_public",'
+                    '"evidenceIds":["PUBLIC"]}]}'
+                ),
                 provider_call_count=1,
             )
         )
@@ -1105,6 +1109,7 @@ class SharedBrainSynthesisBotPathTests(
             )
 
         self.assertTrue(execution.candidate_active)
+        self.assertEqual(execution.response, "One generated answer.")
         self.assertEqual(execution.provider_call_count, 1)
         self.assertEqual(execution.corrective_call_count, 0)
         provider.assert_awaited_once()
@@ -1114,6 +1119,7 @@ class SharedBrainSynthesisBotPathTests(
         )
         self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 1)
         self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
+        self.assertTrue(evaluate.call_args.kwargs["typed_contract_required"])
 
     async def test_single_packet_preprovider_exit_records_zero_calls(self):
         basis = SimpleNamespace(
@@ -1258,6 +1264,68 @@ class SharedBrainSynthesisBotPathTests(
             "ambiguous",
         )
 
+    async def test_single_packet_deterministic_clarification_bypasses_factual_guard_and_sends(self):
+        message = FakeMessage()
+        reason = "candidate_prompt_frame_ambiguous"
+        run = SimpleNamespace(run_id="single-block-run")
+        decision = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason=reason,
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response=bnl01_bot._ordinary_chat_single_packet_block_response(
+                reason
+            ),
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=False,
+            provider_call_count=0,
+            corrective_call_count=0,
+            block_reason=reason,
+        )
+        guard = mock.AsyncMock(
+            side_effect=AssertionError(
+                "deterministic clarification reached factual guard"
+            )
+        )
+        finalize = mock.AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalize,
+                )
+            )
+
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "ignored baseline",
+                self.plan(),
+                prompt="ignored baseline prompt",
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+                ordinary_chat_single_packet_execution=execution,
+            )
+
+        self.assertEqual(message.replies, [execution.response])
+        guard.assert_not_awaited()
+        finalize.assert_awaited_once()
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+
     async def test_single_packet_guard_modification_suppresses_send(self):
         message = FakeMessage()
         message.author.display_name = "Test Member"
@@ -1335,6 +1403,65 @@ class SharedBrainSynthesisBotPathTests(
         finalize.assert_awaited_once()
         self.assertFalse(finalize.await_args.kwargs["response_sent"])
         self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+
+    async def test_typed_single_packet_candidate_is_not_semantically_rejudged(self):
+        message = FakeMessage()
+        run = SimpleNamespace(run_id="typed-single-run")
+        decision = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+            typed_contract_status="valid",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Packet-supported answer.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        guard = mock.AsyncMock(
+            side_effect=AssertionError(
+                "typed selection reached legacy semantic guard"
+            )
+        )
+        finalize = mock.AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalize,
+                )
+            )
+
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "ignored baseline",
+                self.plan(),
+                prompt="ignored baseline prompt",
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+                ordinary_chat_single_packet_execution=execution,
+            )
+
+        self.assertEqual(message.replies, [execution.response])
+        guard.assert_not_awaited()
+        finalize.assert_awaited_once()
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
+        self.assertTrue(finalize.await_args.kwargs["candidate_live"])
 
 
 if __name__ == "__main__":

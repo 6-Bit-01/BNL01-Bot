@@ -21,11 +21,14 @@ from bnl_shared_brain_synthesis import (
     finalize_run,
     ordinary_chat_configuration,
     ordinary_chat_route_scope_decision,
+    parse_ordinary_chat_response_contract,
     record_single_packet_block,
+    validate_ordinary_chat_response_contract,
 )
 from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
     PacketConversationEvidence,
+    PacketFrameTask,
     PacketFrameSubject,
     PacketSubjectResolution,
     build_packet,
@@ -274,6 +277,21 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             frame_status=self.frame.status,
             frame_subject_requirement=self.frame.subject_requirement,
             frame_subjects=frame_subjects,
+            frame_tasks=tuple(
+                PacketFrameTask(
+                    task_id=task.task_id,
+                    text_digest=task.text_digest,
+                    task_kind=task.task_kind,
+                    object_kind=task.object_kind,
+                    authority_scope=task.authority_scope,
+                    temporal_scope=task.temporal_scope,
+                    currentness=task.currentness,
+                    required_response_act=task.required_response_act,
+                    subject_requirement=task.subject_requirement,
+                    subject_indexes=task.subject_indexes,
+                )
+                for task in self.frame.tasks
+            ),
             frame_role_hints=self.frame.role_hints,
             frame_domain_hints=self.frame.domain_hints,
             frame_event_ref=self.frame.event_ref,
@@ -421,6 +439,8 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         owned = build_packet_owned_prompt(base_prompt, self.basis)
         self.assertTrue(owned.ready)
         self.assertIn("PACKET-OWNED RESPONSE CONTRACT", owned.prompt)
+        self.assertIn("TYPED TURN TASK CONTRACT", owned.prompt)
+        self.assertIn("PROVIDER OUTPUT CONTRACT", owned.prompt)
         self.assertIn(self.basis.rendered_context, owned.prompt)
         self.assertEqual(owned.prompt.count(self.basis.rendered_context), 1)
         self.assertNotIn("Durable memory context:", owned.prompt)
@@ -456,13 +476,192 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertFalse(blocked.ready)
         self.assertEqual(blocked.reason, "nonpacket_factual_owner_selected")
 
+    def test_typed_response_contract_accepts_only_applicable_packet_refs(self):
+        evidence_id = next(
+            evidence_id
+            for evidence_id, lane, _digest in self.basis.rendered_evidence_refs
+            if lane == "approved_fact"
+        )
+        contract = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"Your favorite movie is '
+            'Arrival.","supportKind":"packet","evidenceIds":["%s"]}]}'
+            % evidence_id
+        )
+        validation = validate_ordinary_chat_response_contract(
+            self.basis,
+            contract,
+        )
+        self.assertTrue(validation.valid)
+        self.assertEqual(validation.task_count, 1)
+        self.assertEqual(validation.covered_task_count, 1)
+        self.assertEqual(contract.response, "Your favorite movie is Arrival.")
+
+        decision = evaluate_single_packet_response(
+            self.conn,
+            self._begin(),
+            response=contract.response,
+            response_contract=contract,
+            typed_contract_required=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+            environ=self.flags,
+        )
+        self.assertTrue(decision.candidate_selected)
+        self.assertEqual(decision.typed_contract_status, "valid")
+        self.assertEqual(decision.typed_task_coverage_count, 1)
+
+    def test_typed_response_contract_rejects_unknown_or_wrong_authority_refs(self):
+        cases = (
+            (
+                '{"tasks":[{"taskId":"T1","text":"You live in Seattle.",'
+                '"supportKind":"packet","evidenceIds":["E99"]}]}',
+                "packet_support_invalid",
+            ),
+            (
+                '{"tasks":[{"taskId":"T1","text":"Seattle is in '
+                'Washington.","supportKind":"external_public",'
+                '"evidenceIds":["PUBLIC"]}]}',
+                "packet_support_invalid",
+            ),
+        )
+        for raw, expected in cases:
+            with self.subTest(expected=expected):
+                contract = parse_ordinary_chat_response_contract(raw)
+                validation = validate_ordinary_chat_response_contract(
+                    self.basis,
+                    contract,
+                )
+                self.assertEqual(validation.status, expected)
+                decision = evaluate_single_packet_response(
+                    self.conn,
+                    self._begin(),
+                    response=contract.response,
+                    response_contract=contract,
+                    typed_contract_required=True,
+                    provider_call_count=1,
+                    corrective_call_count=0,
+                    environ=self.flags,
+                )
+                self.assertFalse(decision.candidate_selected)
+                self.assertEqual(
+                    decision.fallback_reason,
+                    "typed_contract_%s" % expected,
+                )
+
+    def test_typed_external_task_uses_public_not_packet_authority(self):
+        external_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text="Where is Seattle?",
+                frame_subject_requirement="not_applicable",
+                frame_subjects=(),
+                frame_tasks=(
+                    PacketFrameTask(
+                        task_id="T1",
+                        text_digest="b" * 64,
+                        task_kind="answer",
+                        object_kind="unknown",
+                        authority_scope="external_public",
+                        temporal_scope="unspecified",
+                        currentness="unknown",
+                        required_response_act="answer",
+                        subject_requirement="not_applicable",
+                    ),
+                ),
+                frame_event_ref="",
+                frame_event_relation="not_applicable",
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="not_applicable",
+                reason_codes=("subject_not_required",),
+            ),
+        )
+        external_basis = replace(self.basis, packet=external_packet)
+        contract = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"Seattle is in '
+            'Washington.","supportKind":"external_public",'
+            '"evidenceIds":["PUBLIC"]}]}'
+        )
+        validation = validate_ordinary_chat_response_contract(
+            external_basis,
+            contract,
+        )
+        self.assertTrue(validation.valid)
+
+    def test_typed_current_external_task_must_hold(self):
+        current_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text="What is Seattle's weather today?",
+                frame_subject_requirement="not_applicable",
+                frame_subjects=(),
+                frame_tasks=(
+                    PacketFrameTask(
+                        task_id="T1",
+                        text_digest="c" * 64,
+                        task_kind="answer",
+                        object_kind="unknown",
+                        authority_scope="external_current",
+                        temporal_scope="current",
+                        currentness="current",
+                        required_response_act="hold",
+                        subject_requirement="not_applicable",
+                    ),
+                ),
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="not_applicable",
+                reason_codes=("subject_not_required",),
+            ),
+        )
+        current_basis = replace(self.basis, packet=current_packet)
+        held = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"I cannot verify the live '
+            'weather right now.","supportKind":"hold","evidenceIds":[]}]}'
+        )
+        answered = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"It is raining.",'
+            '"supportKind":"external_public","evidenceIds":["PUBLIC"]}]}'
+        )
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                current_basis,
+                held,
+            ).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                current_basis,
+                answered,
+            ).status,
+            "current_fact_not_held",
+        )
+
     def test_receipt_is_content_free_and_counts_one_call(self):
         run = self._begin()
         self.assertTrue(run.prompt_applied)
+        evidence_id = next(
+            evidence_id
+            for evidence_id, lane, _digest in self.basis.rendered_evidence_refs
+            if lane == "approved_fact"
+        )
+        contract = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"Your favorite movie is '
+            'Arrival.","supportKind":"packet","evidenceIds":["%s"]}]}'
+            % evidence_id
+        )
         decision = evaluate_single_packet_response(
             self.conn,
             run,
-            response="Your favorite movie is Arrival.",
+            response=contract.response,
+            response_contract=contract,
+            typed_contract_required=True,
             provider_call_count=1,
             corrective_call_count=0,
             generation_latency_ms=42,
@@ -524,6 +723,10 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(report["correctiveCallTotal"], 0)
         self.assertEqual(report["ordinaryCallCountViolationRuns"], 0)
         self.assertEqual(report["ordinaryCorrectiveCallViolationRuns"], 0)
+        self.assertEqual(report["ordinaryTypedContractViolationRuns"], 0)
+        self.assertEqual(report["typedTaskTotal"], 1)
+        self.assertEqual(report["typedTaskCoverageTotal"], 1)
+        self.assertEqual(report["typedSupportReferenceTotal"], 1)
         self.assertEqual(report["invalidScopeRuns"], 0)
 
     def test_unsupported_packet_domain_claims_are_rejected_before_selection(self):

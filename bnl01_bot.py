@@ -137,6 +137,7 @@ from bnl_shadow_acceptance import (
 )
 from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
+    PacketFrameTask,
     PacketFrameSubject,
     PacketConversationEvidence,
     UnifiedIntelligencePacket,
@@ -161,7 +162,9 @@ from bnl_shared_brain_synthesis import (
     finalize_run as finalize_shared_brain_synthesis_run,
     honest_empty_profile_response,
     ordinary_chat_configuration,
+    ordinary_chat_deterministic_response_act,
     ordinary_chat_route_scope_decision,
+    parse_ordinary_chat_response_contract,
     record_fallback as record_shared_brain_synthesis_fallback,
     record_single_packet_block,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
@@ -23504,8 +23507,34 @@ def _build_unified_intelligence_packet_shadow(
         if isinstance(situation_frame, SituationFrameV1)
         else ()
     )
+    frame_tasks = (
+        tuple(
+            PacketFrameTask(
+                task_id=str(task.task_id or "")[:24],
+                text_digest=str(task.text_digest or "")[:128],
+                task_kind=str(task.task_kind or "")[:80],
+                object_kind=str(task.object_kind or "")[:80],
+                authority_scope=str(task.authority_scope or "")[:80],
+                temporal_scope=str(task.temporal_scope or "")[:80],
+                currentness=str(task.currentness or "")[:80],
+                required_response_act=str(
+                    task.required_response_act or ""
+                )[:80],
+                subject_requirement=str(
+                    task.subject_requirement or ""
+                )[:80],
+                subject_indexes=tuple(
+                    max(0, int(subject_index or 0))
+                    for subject_index in task.subject_indexes
+                ),
+            )
+            for task in situation_frame.tasks
+        )
+        if isinstance(situation_frame, SituationFrameV1)
+        else ()
+    )
     if isinstance(situation_frame, SituationFrameV1):
-        # Packet v7 resolves only the frozen frame candidates. A named or
+        # Packet v9 resolves only the frozen frame candidates. A named or
         # mentioned third party can never silently fall back to the speaker.
         subject_user_id = 0
     elif len(targets) == 1:
@@ -23617,6 +23646,7 @@ def _build_unified_intelligence_packet_shadow(
             else "legacy"
         ),
         frame_subjects=frame_subjects,
+        frame_tasks=frame_tasks,
         frame_role_hints=(
             situation_frame.role_hints
             if isinstance(situation_frame, SituationFrameV1)
@@ -26526,6 +26556,14 @@ async def get_gemini_response(
         if not generation_result.success:
             return ""
         text = generation_result.text
+
+        if one_call_packet_route:
+            # Preserve the provider envelope byte-for-byte for the typed task
+            # validator.  Legacy prose heuristics cannot safely classify JSON
+            # support metadata and are not the factual authority on this path.
+            # The parsed visible text still passes typed selection,
+            # control-leak, source/frame, exact-quote, and delivery checks.
+            return text
 
         # -------- AI Generated Glitch Event --------
         if (
@@ -35587,6 +35625,16 @@ class OrdinaryChatSinglePacketExecution:
 
 def _ordinary_chat_single_packet_block_response(reason: str) -> str:
     value = str(reason or "").lower()
+    if "deterministic_task_hold" in value or "current_fact" in value:
+        return (
+            "I can’t verify that live or current fact from an authoritative "
+            "source right now, so I’m holding it instead of guessing."
+        )
+    if "deterministic_task_clarify" in value:
+        return (
+            "I’m missing one exact target for that question. Name the person, "
+            "event, or thread once and I’ll answer from that scope."
+        )
     if "frame_ambiguous" in value or "ambiguous" in value:
         return (
             "I’m not certain which person, event, or thread you mean. "
@@ -35634,6 +35682,8 @@ def _evaluate_ordinary_chat_single_packet_receipt(
     provider_call_count: int,
     corrective_call_count: int,
     generation_latency_ms: int,
+    response_contract=None,
+    typed_contract_required: bool = False,
 ) -> SynthesisCanaryDecision:
     snapshot, snapshot_provided = (
         _shared_brain_journal_revalidation_snapshot(run.basis)
@@ -35646,6 +35696,8 @@ def _evaluate_ordinary_chat_single_packet_receipt(
             provider_call_count=provider_call_count,
             corrective_call_count=corrective_call_count,
             generation_latency_ms=generation_latency_ms,
+            response_contract=response_contract,
+            typed_contract_required=typed_contract_required,
             journal_control_snapshot=snapshot,
             journal_control_snapshot_provided=snapshot_provided,
         )
@@ -36104,10 +36156,20 @@ async def maybe_generate_ordinary_chat_single_packet(
             basis.packet.source_snapshot_digest
         ),
     )
+    deterministic_act = ordinary_chat_deterministic_response_act(basis)
     preflight_reason = str(preflight_block_reason or "")
-    prompt_ready = bool(packet_prompt.ready and not preflight_reason)
+    prompt_ready = bool(
+        packet_prompt.ready
+        and not preflight_reason
+        and not deterministic_act
+    )
     prompt_failure = (
         preflight_reason
+        or (
+            "deterministic_task_%s" % deterministic_act
+            if deterministic_act
+            else ""
+        )
         or packet_prompt.reason
         or "single_packet_preflight_failed"
     )
@@ -36159,7 +36221,10 @@ async def maybe_generate_ordinary_chat_single_packet(
             route=ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
             source_context_available=source_context_available,
         )
-        candidate = tracked_generation.text
+        response_contract = parse_ordinary_chat_response_contract(
+            tracked_generation.text
+        )
+        candidate = response_contract.response
         provider_call_count = tracked_generation.provider_call_count
     except Exception as exc:
         logging.warning(
@@ -36167,11 +36232,7 @@ async def maybe_generate_ordinary_chat_single_packet(
             type(exc).__name__,
         )
         candidate = ""
-    candidate = bound_identity_comparison_response(
-        candidate or "",
-        situation_frame_current_text,
-        basis=basis,
-    )
+        response_contract = parse_ordinary_chat_response_contract("")
     generation_latency_ms = max(
         0,
         int(round((time.monotonic() - generation_started) * 1000)),
@@ -36184,6 +36245,8 @@ async def maybe_generate_ordinary_chat_single_packet(
             provider_call_count=provider_call_count,
             corrective_call_count=0,
             generation_latency_ms=generation_latency_ms,
+            response_contract=response_contract,
+            typed_contract_required=True,
         )
     except Exception as exc:
         logging.warning(
@@ -36431,14 +36494,63 @@ async def send_planned_conversation_response(
     single_packet_selected_response = (
         str(response or "") if single_packet_cutover else ""
     )
-    response, guard_diagnostics = await _run_response_guard(
-        response or "",
-        prompt,
-        tuple(prompt_source_bases or ()),
-        regeneration_allowed=bool(
-            not synthesis_candidate_active and not single_packet_cutover
-        ),
+    deterministic_single_packet_block = bool(
+        single_packet_cutover
+        and ordinary_chat_single_packet_execution is not None
+        and not synthesis_candidate_active
+        and ordinary_chat_single_packet_execution.provider_call_count == 0
+        and ordinary_chat_single_packet_execution.block_reason
+        and str(response or "")
+        == _ordinary_chat_single_packet_block_response(
+            ordinary_chat_single_packet_execution.block_reason
+        )
     )
+    typed_single_packet_candidate = bool(
+        single_packet_cutover
+        and synthesis_candidate_active
+        and synthesis_decision is not None
+        and str(
+            getattr(synthesis_decision, "typed_contract_status", "")
+            or ""
+        )
+        == "valid"
+    )
+    if deterministic_single_packet_block:
+        # This text is selected from local fixed templates after typed
+        # preflight.  It contains no factual candidate to regenerate or
+        # reclassify.  Source, frame, exact-quote, delivery, and final receipt
+        # checks below still run before the one Discord send.
+        guard_diagnostics = {
+            "suppressed": False,
+            "deterministic_single_packet_block": True,
+            "_revalidated_prompt_source_bases": tuple(
+                prompt_source_bases or ()
+            ),
+        }
+    elif typed_single_packet_candidate:
+        # The single-packet evaluator has already validated exact task
+        # coverage, typed support references, packet/source revalidation,
+        # output-control leakage, and coherence.  Do not feed the selected
+        # visible text back through the legacy prose classifier and create a
+        # second semantic verdict.  The independent source, frame,
+        # exact-quote, Discord-delivery, and final-receipt checks below remain
+        # mandatory.
+        guard_diagnostics = {
+            "suppressed": False,
+            "typed_single_packet_selection_boundary": True,
+            "_revalidated_prompt_source_bases": tuple(
+                prompt_source_bases or ()
+            ),
+        }
+    else:
+        response, guard_diagnostics = await _run_response_guard(
+            response or "",
+            prompt,
+            tuple(prompt_source_bases or ()),
+            regeneration_allowed=bool(
+                not synthesis_candidate_active and not single_packet_cutover
+            ),
+        )
     if (
         single_packet_cutover
         and synthesis_candidate_active

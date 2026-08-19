@@ -29,7 +29,7 @@ switch is `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED`.
 
 ## One factual owner and one call
 
-The immutable Situation Frame and `unified_intelligence_packet_v8` are frozen
+The immutable Situation Frame and `unified_intelligence_packet_v9` are frozen
 before generation. The packet renderer supplies the sole BARCODE, member,
 identity, relationship, episode, publication, canon, and stored-history
 factual view. The current request and verified exact-reply/referent text remain
@@ -52,19 +52,27 @@ For an eligible turn:
    grounding repairs, and other corrective provider calls are disabled.
 4. The packet and frame are independently revalidated after generation and
    immediately before send.
-5. A generated candidate changed or suppressed by a guard is not sent and is
-   never repaired by another provider call.
+5. The provider must return one typed task/result envelope. Every task must
+   appear exactly once and in order, with packet evidence identifiers, the
+   stable-public `PUBLIC` marker, the current-request `REQUEST` marker, or an
+   explicit hold/clarify act as required by the frozen task.
+6. A candidate is selected once at that typed boundary. It is not
+   semantically reclassified by the legacy prose guard; independent packet,
+   source, frame, control-leak, exact-quote, and delivery checks can still
+   block it without another provider call.
 
 Provider-call receipts increment only at the physical `generate_content`
 invocation boundary. Local quota refusal, budget-reservation failure, client
 construction failure, and other pre-provider exits remain zero-attempt runs;
 a provider invocation that starts and then fails remains one attempt.
 
-Before candidate selection, the response is audited against the frozen packet.
-Any unsupported BARCODE, member, identity, relationship, episode, publication,
-canon, or stored-history claim blocks the candidate. Ordinary external public
-knowledge remains permitted, but it is never relabeled as BARCODE memory or
-private packet evidence.
+Before candidate selection, the response contract is validated against the
+frozen task list and the exact rendered packet evidence map. Packet-owned
+tasks require applicable selected evidence identifiers. Stable external
+public knowledge requires `PUBLIC`; volatile/current external facts must be
+held; non-factual current-request responses require `REQUEST`. Missing,
+duplicate, reordered, malformed, cross-lane, or unsupported references block
+the entire candidate.
 
 Preflight ambiguity or invalid source state uses zero provider calls and a
 bounded clarification/block response. A failed generation or rejected
@@ -73,17 +81,19 @@ owners are excluded before cutover rather than treated as a fallback.
 
 ## Content-free receipts
 
-`shared_brain_synthesis_v9` receipts retain only hashes, counts, bounded
+`shared_brain_synthesis_v10` receipts retain only hashes, counts, bounded
 statuses, and timing. Ordinary-chat rows include the frame revision and input
 digest, packet/source snapshot digests, selected lane/status/domain counts,
 prompt-applied state, provider and corrective call counts, candidate-selected
 state, separate frame/source revalidation statuses, guard/fallback reason,
-response-sent state, and live-application state.
+response-sent state, live-application state, typed-contract status, task
+coverage counts, and support-reference counts.
 
 No prompt, packet text, source text, response text, participant IDs, or source
 references are stored. Aggregate diagnostics expose ordinary-run totals,
-provider/corrective call totals, call-count violations, revalidation statuses,
-and the independent kill switch.
+provider/corrective call totals, call-count violations, typed-contract
+violations, typed task/support totals, revalidation statuses, and the
+independent kill switch.
 
 ## Rollback and acceptance order
 

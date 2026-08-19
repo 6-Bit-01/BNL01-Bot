@@ -53,11 +53,11 @@ from bnl_unified_response_assessment import (
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_v9"
+SCHEMA_VERSION = "shared_brain_synthesis_v10"
 CAPABILITY_NAME = "shared_brain_public_broad_recall"
 CAPABILITY_CONTRACT_VERSION = "hybrid_shared_brain_v1"
 CAPABILITY_RECEIPT_VERSION = "shared_brain_capability_receipt_v1"
-_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v8"
+_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v9"
 _EXPECTED_CLAIM_CONTRACT_VERSION = "hybrid_canon_claim_v1"
 _EXPECTED_ASSESSMENT_VERSION = "unified_response_assessment_v7"
 _EXPECTED_IDENTITY_CONTRACT_VERSION = "canon_entity_account_binding_v1"
@@ -77,7 +77,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v1"
+    "ordinary_chat_single_packet_v2"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_GUILD_IDS_ENV = (
@@ -1188,6 +1188,7 @@ class SharedBrainSynthesisBasis:
     profile_recognized_canon_identity: bool = False
     identity_canon_only: bool = False
     honest_empty_profile_fallback: bool = False
+    rendered_evidence_refs: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1227,6 +1228,10 @@ class SynthesisCanaryDecision:
     candidate_unsupported_factual_claim_count: int = 0
     candidate_claim_classifications: tuple[str, ...] = ()
     supported_coverage_regressed: bool = False
+    typed_contract_status: str = "not_evaluated"
+    typed_task_count: int = 0
+    typed_task_coverage_count: int = 0
+    typed_support_reference_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1246,6 +1251,42 @@ class PacketOwnedPrompt:
     ready: bool
     reason: str = ""
     replaced_factual_context_count: int = 0
+
+
+@dataclass(frozen=True)
+class OrdinaryChatTaskResult:
+    """One visible task answer paired with non-visible support metadata."""
+
+    task_id: str
+    text: str
+    support_kind: str
+    evidence_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class OrdinaryChatResponseContract:
+    """Parsed one-call provider result; never persisted with response text."""
+
+    status: str
+    tasks: tuple[OrdinaryChatTaskResult, ...] = ()
+
+    @property
+    def response(self) -> str:
+        return "\n\n".join(
+            task.text.strip() for task in self.tasks if task.text.strip()
+        ).strip()
+
+
+@dataclass(frozen=True)
+class OrdinaryChatContractValidation:
+    status: str
+    task_count: int = 0
+    covered_task_count: int = 0
+    support_reference_count: int = 0
+
+    @property
+    def valid(self) -> bool:
+        return self.status == "valid"
 
 
 @dataclass(frozen=True)
@@ -1381,7 +1422,7 @@ def _configuration_details(
         "claim_contract_version": _EXPECTED_CLAIM_CONTRACT_VERSION,
         "assessment_version": _EXPECTED_ASSESSMENT_VERSION,
         "identity_contract_version": _EXPECTED_IDENTITY_CONTRACT_VERSION,
-        "synthesis_version": "shared_brain_synthesis_v9",
+        "synthesis_version": SCHEMA_VERSION,
     }
     version_conflicts = tuple(
         sorted(
@@ -1584,7 +1625,7 @@ def _ordinary_chat_configuration_details(
         "claim_contract_version": _EXPECTED_CLAIM_CONTRACT_VERSION,
         "assessment_version": _EXPECTED_ASSESSMENT_VERSION,
         "identity_contract_version": _EXPECTED_IDENTITY_CONTRACT_VERSION,
-        "synthesis_version": "shared_brain_synthesis_v9",
+        "synthesis_version": SCHEMA_VERSION,
     }
     version_conflicts = tuple(
         sorted(
@@ -2827,6 +2868,309 @@ def _ordinary_packet_context(
     )
 
 
+def _ordinary_rendered_evidence_refs(
+    packet: UnifiedIntelligencePacket,
+    source_digests: Sequence[str],
+) -> tuple[tuple[str, str, str], ...]:
+    """Bind rendered E-identifiers to lanes without exposing source IDs."""
+
+    remaining = list(packet.items)
+    refs = []
+    for index, source_digest in enumerate(source_digests, start=1):
+        match_index = next(
+            (
+                item_index
+                for item_index, item in enumerate(remaining)
+                if str(item.source_digest or "") == str(source_digest or "")
+            ),
+            -1,
+        )
+        if match_index < 0:
+            return ()
+        item = remaining.pop(match_index)
+        refs.append(("E%s" % index, item.lane, item.source_digest))
+    return tuple(refs)
+
+
+def _ordinary_frame_tasks(
+    basis: SharedBrainSynthesisBasis,
+) -> tuple[Any, ...]:
+    request = getattr(getattr(basis, "packet", None), "request", None)
+    return tuple(
+        task
+        for task in getattr(request, "frame_tasks", ())
+        if str(getattr(task, "task_id", "") or "").strip()
+    )
+
+
+def _ordinary_task_allowed_lanes(task: Any) -> frozenset[str]:
+    object_kind = str(getattr(task, "object_kind", "") or "").lower()
+    if object_kind == "journal":
+        return frozenset({"journal_publication"})
+    if object_kind == "relay":
+        return frozenset({"relay_publication"})
+    if object_kind == "moment":
+        return frozenset({"moment", "episode", "recurring_theme"})
+    if object_kind == "canon":
+        return frozenset({"canon"})
+    if object_kind == "source_file":
+        return frozenset({"source_file"})
+    if object_kind == "person" or str(
+        getattr(task, "subject_requirement", "") or ""
+    ).lower() == "required":
+        return frozenset(
+            {
+                "conversation_context",
+                "assessment_observation",
+                "approved_fact",
+                "moment",
+                "episode",
+                "atomic_knowledge",
+                "recurring_theme",
+                "open_loop",
+                "canon",
+                "journal_publication",
+                "relay_publication",
+                "source_file",
+            }
+        )
+    return frozenset(_RENDERABLE_LANES)
+
+
+def render_ordinary_chat_task_contract(
+    basis: SharedBrainSynthesisBasis,
+) -> str:
+    """Render ordered task/support instructions for the one provider call."""
+
+    tasks = _ordinary_frame_tasks(basis)
+    if not tasks:
+        return ""
+    task_lines = [
+        "- %s | authority=%s | object=%s | currentness=%s | response=%s"
+        % (
+            str(getattr(task, "task_id", "") or ""),
+            str(getattr(task, "authority_scope", "") or "unknown"),
+            str(getattr(task, "object_kind", "") or "unknown"),
+            str(getattr(task, "currentness", "") or "unknown"),
+            str(getattr(task, "required_response_act", "") or "answer"),
+        )
+        for task in tasks
+    ]
+    evidence_lines = [
+        "- %s | lane=%s" % (evidence_id, lane)
+        for evidence_id, lane, _digest_value in basis.rendered_evidence_refs
+    ]
+    return (
+        "TYPED TURN TASK CONTRACT:\n"
+        + "\n".join(task_lines)
+        + "\nSUPPORT REFERENCES:\n"
+        + ("\n".join(evidence_lines) if evidence_lines else "- none")
+        + "\n- PUBLIC may support stable general public knowledge only.\n"
+        + "- REQUEST may support a non-factual conversational response only.\n"
+        + "PROVIDER OUTPUT CONTRACT:\n"
+        + "Return only one JSON object with exactly this shape: "
+        + '{"tasks":[{"taskId":"T1","text":"visible answer",'
+        + '"supportKind":"packet","evidenceIds":["E1"]}]}.\n'
+        + "Return every task exactly once and in order. Use supportKind packet "
+        + "with applicable E-identifiers for stored/BARCODE claims; "
+        + "external_public with PUBLIC for stable general knowledge; "
+        + "current_request with REQUEST for non-factual conversation; hold "
+        + "with no identifiers when current or selected evidence cannot be "
+        + "verified; clarify with no identifiers only when the typed task "
+        + "requires clarification. The text fields become the visible reply. "
+        + "Do not include Markdown fences, task labels, citations, internal "
+        + "terms, or any text outside the JSON object."
+    )
+
+
+def parse_ordinary_chat_response_contract(
+    response: str,
+) -> OrdinaryChatResponseContract:
+    """Parse the one-call JSON envelope without accepting hidden prose."""
+
+    raw = str(response or "").strip()
+    if raw.startswith("```") and raw.endswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 3:
+            raw = "\n".join(lines[1:-1]).strip()
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return OrdinaryChatResponseContract(status="invalid_json")
+    if not isinstance(payload, dict) or set(payload) != {"tasks"}:
+        return OrdinaryChatResponseContract(status="invalid_shape")
+    raw_tasks = payload.get("tasks")
+    if not isinstance(raw_tasks, list) or not 1 <= len(raw_tasks) <= 12:
+        return OrdinaryChatResponseContract(status="invalid_task_list")
+    parsed = []
+    for raw_task in raw_tasks:
+        if not isinstance(raw_task, dict) or set(raw_task) != {
+            "taskId",
+            "text",
+            "supportKind",
+            "evidenceIds",
+        }:
+            return OrdinaryChatResponseContract(status="invalid_task_shape")
+        task_id = str(raw_task.get("taskId") or "").strip()
+        text = str(raw_task.get("text") or "").strip()
+        support_kind = str(raw_task.get("supportKind") or "").strip().lower()
+        evidence_ids_raw = raw_task.get("evidenceIds")
+        if not re.fullmatch(r"T[1-9][0-9]?", task_id):
+            return OrdinaryChatResponseContract(status="invalid_task_id")
+        if not text or len(text) > 2000:
+            return OrdinaryChatResponseContract(status="invalid_task_text")
+        if support_kind not in {
+            "packet",
+            "external_public",
+            "current_request",
+            "hold",
+            "clarify",
+        }:
+            return OrdinaryChatResponseContract(status="invalid_support_kind")
+        if not isinstance(evidence_ids_raw, list) or len(evidence_ids_raw) > 8:
+            return OrdinaryChatResponseContract(status="invalid_evidence_ids")
+        evidence_ids = tuple(
+            str(evidence_id or "").strip().upper()
+            for evidence_id in evidence_ids_raw
+        )
+        if any(
+            not re.fullmatch(r"(?:E[1-9][0-9]?|PUBLIC|REQUEST)", evidence_id)
+            for evidence_id in evidence_ids
+        ):
+            return OrdinaryChatResponseContract(status="invalid_evidence_id")
+        if len(set(evidence_ids)) != len(evidence_ids):
+            return OrdinaryChatResponseContract(status="duplicate_evidence_id")
+        parsed.append(
+            OrdinaryChatTaskResult(
+                task_id=task_id,
+                text=text,
+                support_kind=support_kind,
+                evidence_ids=evidence_ids,
+            )
+        )
+    if len({task.task_id for task in parsed}) != len(parsed):
+        return OrdinaryChatResponseContract(status="duplicate_task_id")
+    return OrdinaryChatResponseContract(status="parsed", tasks=tuple(parsed))
+
+
+def validate_ordinary_chat_response_contract(
+    basis: SharedBrainSynthesisBasis,
+    contract: OrdinaryChatResponseContract | None,
+) -> OrdinaryChatContractValidation:
+    """Validate task coverage and typed references against the frozen packet."""
+
+    tasks = _ordinary_frame_tasks(basis)
+    if not isinstance(contract, OrdinaryChatResponseContract):
+        return OrdinaryChatContractValidation(status="missing")
+    if contract.status != "parsed":
+        return OrdinaryChatContractValidation(status=contract.status)
+    if not tasks:
+        return OrdinaryChatContractValidation(status="tasks_unavailable")
+    expected_ids = tuple(
+        str(getattr(task, "task_id", "") or "") for task in tasks
+    )
+    actual_ids = tuple(result.task_id for result in contract.tasks)
+    if actual_ids != expected_ids:
+        return OrdinaryChatContractValidation(
+            status="task_coverage_mismatch",
+            task_count=len(tasks),
+        )
+    evidence_lanes = {
+        evidence_id: lane
+        for evidence_id, lane, _digest_value in basis.rendered_evidence_refs
+    }
+    support_count = 0
+    for task, result in zip(tasks, contract.tasks):
+        authority = str(getattr(task, "authority_scope", "") or "")
+        required_act = str(
+            getattr(task, "required_response_act", "") or "answer"
+        )
+        if required_act == "clarify":
+            if result.support_kind != "clarify" or result.evidence_ids:
+                return OrdinaryChatContractValidation(
+                    status="clarification_contract_mismatch",
+                    task_count=len(tasks),
+                )
+            continue
+        if required_act == "hold" or authority == "external_current":
+            if result.support_kind != "hold" or result.evidence_ids:
+                return OrdinaryChatContractValidation(
+                    status="current_fact_not_held",
+                    task_count=len(tasks),
+                )
+            continue
+        if authority == "packet":
+            allowed_lanes = _ordinary_task_allowed_lanes(task)
+            allowed_ids = {
+                evidence_id
+                for evidence_id, lane in evidence_lanes.items()
+                if lane in allowed_lanes
+            }
+            if result.support_kind == "hold" and not allowed_ids:
+                if result.evidence_ids:
+                    return OrdinaryChatContractValidation(
+                        status="hold_has_support_reference",
+                        task_count=len(tasks),
+                    )
+                continue
+            if (
+                result.support_kind != "packet"
+                or not result.evidence_ids
+                or not set(result.evidence_ids).issubset(allowed_ids)
+            ):
+                return OrdinaryChatContractValidation(
+                    status="packet_support_invalid",
+                    task_count=len(tasks),
+                )
+        elif authority == "external_public":
+            if (
+                result.support_kind != "external_public"
+                or result.evidence_ids != ("PUBLIC",)
+            ):
+                return OrdinaryChatContractValidation(
+                    status="external_support_invalid",
+                    task_count=len(tasks),
+                )
+        elif authority == "current_request":
+            if (
+                result.support_kind != "current_request"
+                or result.evidence_ids != ("REQUEST",)
+            ):
+                return OrdinaryChatContractValidation(
+                    status="request_support_invalid",
+                    task_count=len(tasks),
+                )
+        else:
+            return OrdinaryChatContractValidation(
+                status="authority_scope_invalid",
+                task_count=len(tasks),
+            )
+        support_count += len(result.evidence_ids)
+    return OrdinaryChatContractValidation(
+        status="valid",
+        task_count=len(tasks),
+        covered_task_count=len(tasks),
+        support_reference_count=support_count,
+    )
+
+
+def ordinary_chat_deterministic_response_act(
+    basis: SharedBrainSynthesisBasis,
+) -> str:
+    """Return hold/clarify only when every task is deterministic."""
+
+    tasks = _ordinary_frame_tasks(basis)
+    if not tasks:
+        return ""
+    acts = tuple(
+        str(getattr(task, "required_response_act", "") or "answer")
+        for task in tasks
+    )
+    if any(act == "answer" for act in acts):
+        return ""
+    return "clarify" if "clarify" in acts else "hold"
+
+
 def build_ordinary_chat_basis(
     *,
     guild_id: int,
@@ -2871,6 +3215,12 @@ def build_ordinary_chat_basis(
         )
     )
     profile = getattr(packet, "profile_sufficiency", None)
+    rendered_evidence_refs = _ordinary_rendered_evidence_refs(
+        packet,
+        source_digests,
+    )
+    if source_digests and not rendered_evidence_refs:
+        return None
     return SharedBrainSynthesisBasis(
         packet=packet,
         assessment=assessment,
@@ -2893,6 +3243,7 @@ def build_ordinary_chat_basis(
             getattr(profile, "status", "not_applicable")
             or "not_applicable"
         ).strip().lower(),
+        rendered_evidence_refs=rendered_evidence_refs,
     )
 
 
@@ -3067,6 +3418,10 @@ def revalidate_basis(
         fresh_rendered, fresh_lane_counts, fresh_item_count, fresh_digests = (
             _ordinary_packet_context(basis.packet)
         )
+        fresh_evidence_refs = _ordinary_rendered_evidence_refs(
+            basis.packet,
+            fresh_digests,
+        )
         if (
             not config["effective"]
             or basis.authority_mode != ORDINARY_CHAT_AUTHORITY
@@ -3093,6 +3448,7 @@ def revalidate_basis(
             or fresh_lane_counts != basis.rendered_lane_counts
             or fresh_item_count != basis.rendered_item_count
             or fresh_digests != basis.rendered_source_digests
+            or fresh_evidence_refs != basis.rendered_evidence_refs
             or basis.competing_factual_contexts
             or basis.blocking_factual_owner_lanes
             or tuple(
@@ -3220,6 +3576,7 @@ def build_packet_owned_prompt(
 
     updated = str(prompt or "")
     if basis.ordinary_chat_single_packet:
+        task_contract = render_ordinary_chat_task_contract(basis)
         if not updated.strip():
             return PacketOwnedPrompt(
                 prompt=updated,
@@ -3258,6 +3615,12 @@ def build_packet_owned_prompt(
                 ready=False,
                 reason="packet_context_unavailable",
             )
+        if not task_contract:
+            return PacketOwnedPrompt(
+                prompt=updated,
+                ready=False,
+                reason="typed_task_contract_unavailable",
+            )
         if basis.rendered_context in updated:
             return PacketOwnedPrompt(
                 prompt=updated,
@@ -3271,6 +3634,8 @@ def build_packet_owned_prompt(
                 + _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT
                 + "\n\n"
                 + basis.rendered_context
+                + "\n\n"
+                + task_contract
             ),
             ready=True,
             replaced_factual_context_count=0,
@@ -6215,6 +6580,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             corrective_call_count INTEGER NOT NULL DEFAULT 0,
             frame_revalidation_status TEXT NOT NULL DEFAULT 'not_evaluated',
             source_revalidation_status TEXT NOT NULL DEFAULT 'not_evaluated',
+            typed_contract_status TEXT NOT NULL DEFAULT 'not_evaluated',
+            typed_task_count INTEGER NOT NULL DEFAULT 0,
+            typed_task_coverage_count INTEGER NOT NULL DEFAULT 0,
+            typed_support_reference_count INTEGER NOT NULL DEFAULT 0,
             processing_error_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -6352,6 +6721,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         (
             "source_revalidation_status",
             "TEXT NOT NULL DEFAULT 'not_evaluated'",
+        ),
+        (
+            "typed_contract_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated'",
+        ),
+        ("typed_task_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "typed_task_coverage_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "typed_support_reference_count",
+            "INTEGER NOT NULL DEFAULT 0",
         ),
     ):
         if column in columns:
@@ -6628,6 +7010,8 @@ def evaluate_single_packet_response(
     provider_call_count: int,
     corrective_call_count: int = 0,
     generation_latency_ms: int | None = None,
+    response_contract: OrdinaryChatResponseContract | None = None,
+    typed_contract_required: bool = False,
     environ: Mapping[str, str] | None = None,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
@@ -6647,14 +7031,33 @@ def evaluate_single_packet_response(
     coherence = assess_response_coherence(run.basis.assessment, candidate)
     output_leak = response_exposes_controls(candidate)
     coverage = candidate_profile_coverage(run.basis, candidate)
-    (
-        receipt_claim_classifications,
-        unsupported_packet_domain_claims,
-    ) = audit_ordinary_chat_candidate_claims(
-        run.basis,
-        candidate,
-        coverage=coverage,
+    contract_validation = (
+        validate_ordinary_chat_response_contract(
+            run.basis,
+            response_contract,
+        )
+        if typed_contract_required
+        else OrdinaryChatContractValidation(status="not_required")
     )
+    if typed_contract_required:
+        receipt_claim_classifications = tuple(
+            "typed_%s" % result.support_kind
+            for result in (
+                response_contract.tasks
+                if isinstance(response_contract, OrdinaryChatResponseContract)
+                else ()
+            )
+        )
+        unsupported_packet_domain_claims = 0
+    else:
+        (
+            receipt_claim_classifications,
+            unsupported_packet_domain_claims,
+        ) = audit_ordinary_chat_candidate_claims(
+            run.basis,
+            candidate,
+            coverage=coverage,
+        )
     calls = max(0, int(provider_call_count or 0))
     corrective_calls = max(0, int(corrective_call_count or 0))
     fallback_reason = ""
@@ -6666,6 +7069,8 @@ def evaluate_single_packet_response(
         fallback_reason = "corrective_provider_call_forbidden"
     elif not valid:
         fallback_reason = "post_generation_%s" % source_status
+    elif typed_contract_required and not contract_validation.valid:
+        fallback_reason = "typed_contract_%s" % contract_validation.status
     elif not candidate:
         fallback_reason = "generation_failed"
     elif output_leak:
@@ -6695,6 +7100,8 @@ def evaluate_single_packet_response(
             candidate_connective_claim_count=?,
             candidate_unsupported_factual_claim_count=?,
             candidate_claim_classification_counts_json=?,
+            typed_contract_status=?,typed_task_count=?,
+            typed_task_coverage_count=?,typed_support_reference_count=?,
             provider_call_count=?,corrective_call_count=?,
             revalidation_status=?,source_revalidation_status=?,
             candidate_selected=?,fallback_reason=?,updated_at=?
@@ -6723,6 +7130,10 @@ def evaluate_single_packet_response(
                 dict(Counter(receipt_claim_classifications)),
                 sort_keys=True,
             ),
+            contract_validation.status,
+            contract_validation.task_count,
+            contract_validation.covered_task_count,
+            contract_validation.support_reference_count,
             calls,
             corrective_calls,
             source_status,
@@ -6771,6 +7182,12 @@ def evaluate_single_packet_response(
             unsupported_packet_domain_claims
         ),
         candidate_claim_classifications=receipt_claim_classifications,
+        typed_contract_status=contract_validation.status,
+        typed_task_count=contract_validation.task_count,
+        typed_task_coverage_count=contract_validation.covered_task_count,
+        typed_support_reference_count=(
+            contract_validation.support_reference_count
+        ),
     )
 
 
@@ -7269,6 +7686,11 @@ def _empty_report() -> dict[str, Any]:
         "correctiveCallTotal": 0,
         "ordinaryCallCountViolationRuns": 0,
         "ordinaryCorrectiveCallViolationRuns": 0,
+        "ordinaryTypedContractViolationRuns": 0,
+        "typedContractStatusCounts": {},
+        "typedTaskTotal": 0,
+        "typedTaskCoverageTotal": 0,
+        "typedSupportReferenceTotal": 0,
         "frameRevalidationStatusCounts": {},
         "sourceRevalidationStatusCounts": {},
         "candidateGenerationLatencyMs": {
@@ -7453,6 +7875,24 @@ def build_evaluation_report(
         "source_revalidation_status"
         if "source_revalidation_status" in columns
         else "'not_evaluated'"
+    )
+    typed_contract_status_expr = (
+        "typed_contract_status"
+        if "typed_contract_status" in columns
+        else "'not_evaluated'"
+    )
+    typed_task_count_expr = (
+        "typed_task_count" if "typed_task_count" in columns else "0"
+    )
+    typed_task_coverage_expr = (
+        "typed_task_coverage_count"
+        if "typed_task_coverage_count" in columns
+        else "0"
+    )
+    typed_support_reference_expr = (
+        "typed_support_reference_count"
+        if "typed_support_reference_count" in columns
+        else "0"
     )
     invalid_scope_runs = int(
         conn.execute(
@@ -7694,6 +8134,8 @@ def build_evaluation_report(
                {supported_coverage_regressed_expr},
                {provider_call_expr},{corrective_call_expr},
                {frame_revalidation_expr},{source_revalidation_expr},
+               {typed_contract_status_expr},{typed_task_count_expr},
+               {typed_task_coverage_expr},{typed_support_reference_expr},
                created_at
         FROM memory_governance_shared_brain_synthesis_runs
         WHERE guild_id=?
@@ -7725,6 +8167,10 @@ def build_evaluation_report(
             corrective_call_expr=corrective_call_expr,
             frame_revalidation_expr=frame_revalidation_expr,
             source_revalidation_expr=source_revalidation_expr,
+            typed_contract_status_expr=typed_contract_status_expr,
+            typed_task_count_expr=typed_task_count_expr,
+            typed_task_coverage_expr=typed_task_coverage_expr,
+            typed_support_reference_expr=typed_support_reference_expr,
         ),
         (int(guild_id or 0), max(1, min(int(limit or 500), 2000))),
     ).fetchall()
@@ -7737,6 +8183,7 @@ def build_evaluation_report(
     authority_modes: Counter[str] = Counter()
     frame_revalidation: Counter[str] = Counter()
     source_revalidation: Counter[str] = Counter()
+    typed_contract_statuses: Counter[str] = Counter()
     latency_values: list[int] = []
     prompt = live = selected = coverage = leaks = errors = sent = 0
     validation_items = 0
@@ -7749,6 +8196,9 @@ def build_evaluation_report(
     supported_coverage_regressions = 0
     ordinary_chat_runs = provider_call_total = corrective_call_total = 0
     ordinary_call_violations = ordinary_corrective_violations = 0
+    ordinary_typed_contract_violations = 0
+    typed_task_total = typed_task_coverage_total = 0
+    typed_support_reference_total = 0
     for row in rows:
         (
             _schema,
@@ -7787,6 +8237,10 @@ def build_evaluation_report(
             corrective_call_count,
             frame_revalidation_status,
             source_revalidation_status,
+            typed_contract_status,
+            typed_task_count,
+            typed_task_coverage_count,
+            typed_support_reference_count,
             _created_at,
         ) = row
         prompt += int(bool(prompt_applied))
@@ -7838,12 +8292,28 @@ def build_evaluation_report(
         source_revalidation[
             str(source_revalidation_status or "not_evaluated")
         ] += 1
+        typed_contract_statuses[
+            str(typed_contract_status or "not_evaluated")
+        ] += 1
+        typed_task_total += max(0, int(typed_task_count or 0))
+        typed_task_coverage_total += max(
+            0,
+            int(typed_task_coverage_count or 0),
+        )
+        typed_support_reference_total += max(
+            0,
+            int(typed_support_reference_count or 0),
+        )
         if str(authority_mode or "") == ORDINARY_CHAT_AUTHORITY:
             ordinary_chat_runs += 1
             ordinary_call_violations += int(
                 calls > 1 or (bool(prompt_applied) and calls != 1)
             )
             ordinary_corrective_violations += int(corrective_calls > 0)
+            ordinary_typed_contract_violations += int(
+                bool(candidate_selected)
+                and str(typed_contract_status or "") != "valid"
+            )
         latency = max(0, int(candidate_latency_ms or 0))
         if latency:
             latency_values.append(latency)
@@ -7895,6 +8365,15 @@ def build_evaluation_report(
         "ordinaryCorrectiveCallViolationRuns": (
             ordinary_corrective_violations
         ),
+        "ordinaryTypedContractViolationRuns": (
+            ordinary_typed_contract_violations
+        ),
+        "typedContractStatusCounts": dict(
+            sorted(typed_contract_statuses.items())
+        ),
+        "typedTaskTotal": typed_task_total,
+        "typedTaskCoverageTotal": typed_task_coverage_total,
+        "typedSupportReferenceTotal": typed_support_reference_total,
         "frameRevalidationStatusCounts": dict(
             sorted(frame_revalidation.items())
         ),

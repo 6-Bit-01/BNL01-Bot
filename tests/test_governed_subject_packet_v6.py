@@ -134,8 +134,8 @@ class GovernedSubjectPacketV6Tests(unittest.TestCase):
             reason="governed subject test binding",
         )
 
-    def test_packet_schema_is_v7_and_alias_matrix_stays_distinct(self):
-        self.assertEqual(SCHEMA_VERSION, "unified_intelligence_packet_v8")
+    def test_packet_schema_is_v9_and_alias_matrix_stays_distinct(self):
+        self.assertEqual(SCHEMA_VERSION, "unified_intelligence_packet_v9")
         cases = {
             "Who is Mac Mod3m?": ("mac_modem",),
             "Tell me about DJ Floppy Disc.": ("dj_floppydisc",),
@@ -196,6 +196,27 @@ class GovernedSubjectPacketV6Tests(unittest.TestCase):
         self.assertEqual(frame.subject_requirement, "required")
         self.assertEqual(tuple(item.user_id for item in frame.subjects), (222,))
         self.assertNotIn(111, tuple(item.user_id for item in frame.subjects))
+
+    def test_bnl_self_frame_resolves_through_the_existing_canon_subject(self):
+        request = self.request(
+            subjects=(
+                PacketFrameSubject(
+                    entity_ref="bnl_01",
+                    binding_method="existing_typed_entity",
+                ),
+            ),
+            text="Who are you?",
+        )
+
+        resolution = resolve_packet_subject(self.conn, request)
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertEqual(resolution.subject_key, "bnl_01")
+        self.assertEqual(resolution.entity_ref, "bnl_01")
+        self.assertEqual(
+            resolution.binding_method,
+            "typed_canon_entity",
+        )
 
     def test_unseen_label_and_multiple_subjects_fail_closed(self):
         unseen = self.request(
