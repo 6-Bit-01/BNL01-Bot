@@ -91,7 +91,7 @@ from bnl_website_relay_state import (
 )
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v8"
+SCHEMA_VERSION = "unified_intelligence_packet_v9"
 SUBJECT_RESOLUTION_VERSION = "governed_packet_subject_resolution_v1"
 SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v2"
 JOURNAL_PUBLICATION_SOURCE_CLASS = "journal_publication_projection"
@@ -435,6 +435,22 @@ class PacketFrameSubject:
 
 
 @dataclass(frozen=True)
+class PacketFrameTask:
+    """Content-free ordered task copied from the frozen Situation Frame."""
+
+    task_id: str
+    text_digest: str
+    task_kind: str
+    object_kind: str
+    authority_scope: str
+    temporal_scope: str
+    currentness: str
+    required_response_act: str
+    subject_requirement: str
+    subject_indexes: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class IntelligencePacketRequest:
     guild_id: int
     subject_user_id: int
@@ -463,6 +479,7 @@ class IntelligencePacketRequest:
     frame_status: str = "not_provided"
     frame_subject_requirement: str = "legacy"
     frame_subjects: tuple[PacketFrameSubject, ...] = ()
+    frame_tasks: tuple[PacketFrameTask, ...] = ()
     frame_role_hints: tuple[str, ...] = ()
     frame_domain_hints: tuple[str, ...] = ()
     frame_event_ref: str = ""

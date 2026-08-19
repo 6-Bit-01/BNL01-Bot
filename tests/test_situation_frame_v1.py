@@ -112,6 +112,135 @@ class SituationFrameV1Tests(unittest.TestCase):
         self.assertIn("third_party_subject_unresolved", frame.ambiguity_reasons)
         self.assertIn("speaker_fallback_rejected", frame.competing_frames)
 
+    def test_self_target_precedence_binds_the_current_speaker(self):
+        cases = (
+            "What do you remember about me?",
+            "What do you know about me?",
+            "Tell me who I am.",
+            "What patterns keep recurring for me?",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="public_home",
+                    channel_policy="public_home",
+                    current_text=text,
+                    current_speaker_user_ids=(101,),
+                    current_speaker_labels=("Test Member",),
+                    response_act="answer",
+                )
+
+                self.assertEqual(frame.status, "resolved")
+                self.assertEqual(len(frame.subjects), 1)
+                self.assertEqual(frame.subjects[0].user_id, 101)
+                self.assertEqual(
+                    frame.subjects[0].binding_method,
+                    "current_speaker_context",
+                )
+                self.assertNotIn(
+                    "third_party_subject_unresolved",
+                    frame.ambiguity_reasons,
+                )
+
+    def test_bnl_self_questions_bind_the_existing_canon_entity(self):
+        cases = (
+            "Who are you?",
+            "What are you?",
+            "Tell me about yourself.",
+            "What do you remember about yourself?",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="public_home",
+                    channel_policy="public_home",
+                    current_text=text,
+                    current_speaker_user_ids=(101,),
+                    current_speaker_labels=("Test Member",),
+                    response_act="answer",
+                )
+
+                self.assertEqual(frame.status, "resolved")
+                self.assertEqual(len(frame.subjects), 1)
+                self.assertEqual(frame.subjects[0].entity_ref, "bnl_01")
+                self.assertEqual(
+                    frame.subjects[0].binding_method,
+                    "existing_typed_entity",
+                )
+
+    def test_publication_owner_qualifies_the_subject_of_the_question(self):
+        cases = (
+            "What did the Journal say about the last show?",
+            "What did the Relay say about the broadcast?",
+            "Summarize the Journal entry about the queue.",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="public_home",
+                    channel_policy="public_home",
+                    current_text=text,
+                    current_speaker_user_ids=(101,),
+                    response_act="answer",
+                )
+
+                expected = "relay" if "Relay" in text else "journal"
+                self.assertEqual(frame.object_kind, expected)
+                self.assertEqual(frame.task_kind, "retrieve_publication")
+                self.assertEqual(frame.status, "resolved")
+
+    def test_mixed_request_is_split_into_ordered_authority_tasks(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text=(
+                "What do you remember about me, and where is Seattle?"
+            ),
+            current_speaker_user_ids=(101,),
+            current_speaker_labels=("Test Member",),
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(tuple(task.task_id for task in frame.tasks), ("T1", "T2"))
+        self.assertEqual(
+            tuple(task.authority_scope for task in frame.tasks),
+            ("packet", "external_public"),
+        )
+        self.assertEqual(frame.tasks[0].subject_indexes, (0,))
+        self.assertEqual(frame.tasks[1].subject_indexes, ())
+        self.assertEqual(frame.task_kind, "multi_task")
+        self.assertEqual(frame.object_kind, "multiple")
+
+    def test_current_external_task_is_held_without_blocking_packet_task(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text=(
+                "What do you remember about me, and what is Seattle's "
+                "weather today?"
+            ),
+            current_speaker_user_ids=(101,),
+            current_speaker_labels=("Test Member",),
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(len(frame.tasks), 2)
+        self.assertEqual(frame.tasks[0].required_response_act, "answer")
+        self.assertEqual(frame.tasks[1].authority_scope, "external_current")
+        self.assertEqual(frame.tasks[1].required_response_act, "hold")
+
     def test_role_domain_event_and_visibility_matrix(self):
         cases = (
             (

@@ -22,12 +22,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+from bnl_canon_source_contract import BNL01
 from bnl_conversation_context_v2 import assess_payload_grounding
 
 
 ASSESSMENT_VERSION = "unified_response_assessment_v7"
 CONVERSATION_TURN_PACKET_VERSION = "conversation_turn_evidence_v3"
-SITUATION_FRAME_VERSION = "situation_frame_v1"
+SITUATION_FRAME_VERSION = "situation_frame_v2"
 FRAME_SOURCE_REVALIDATION_VERSION = "frame_source_revalidation_v1"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
@@ -356,6 +357,54 @@ _SELF_SUBJECT_CUE_RE = re.compile(
     r"what\s+keeps\s+(?:recurring|coming\s+up)\s+for\s+me)\b",
     re.I,
 )
+_BNL_SELF_SUBJECT_CUE_RE = re.compile(
+    r"\b(?:who|what)\s+are\s+you\b|"
+    r"\btell\s+me\s+about\s+yourself\b|"
+    r"\bwhat\s+do\s+you\s+(?:know|remember)\s+about\s+yourself\b|"
+    r"\bdescribe\s+yourself\b",
+    re.I,
+)
+_TASK_LEAD_RE = re.compile(
+    r"(?:what|which|who|where|when|why|how|tell|explain|summari[sz]e|"
+    r"compare|describe|give|show|help|check|find|is|are|do|does|did|can|"
+    r"could|would|should)\b",
+    re.I,
+)
+_VOLATILE_EXTERNAL_RE = re.compile(
+    r"\b(?:weather|forecast|temperature|traffic|score|standings?|price|"
+    r"stock|market|exchange\s+rate|news|headline|election|polls?|"
+    r"president|prime\s+minister|governor|mayor|ceo|schedule|"
+    r"availability|open\s+now|live\s+status)\b",
+    re.I,
+)
+_EXTERNAL_ROLE_QUERY_RE = re.compile(
+    r"\bwho\s+is\s+(?:the\s+)?(?:(?:current|latest|new)\s+)?"
+    r"(?:president|prime\s+minister|governor|mayor|ceo|chief\s+executive|"
+    r"senator|representative|secretary|minister|director|coach|"
+    r"commissioner|chancellor)\b",
+    re.I,
+)
+_CURRENT_REQUEST_TASK_RE = re.compile(
+    r"\b(?:how\s+are\s+you|what\s+do\s+you\s+think|your\s+opinion|"
+    r"do\s+you\s+(?:like|prefer|want)|can\s+you\s+(?:help|write|make|"
+    r"create|explain)|please\s+(?:help|write|make|create)|"
+    r"thank\s+you|thanks|hello|hey)\b",
+    re.I,
+)
+_PACKET_AUTHORITY_OBJECTS = frozenset(
+    {
+        "journal",
+        "relay",
+        "moment",
+        "memory",
+        "queue",
+        "broadcast",
+        "website",
+        "source_file",
+        "canon",
+        "person",
+    }
+)
 _CURRENT_TIME_RE = re.compile(r"\b(?:now|currently|today|tonight|this\s+(?:week|show|turn|time)|latest|current)\b", re.I)
 _HISTORICAL_TIME_RE = re.compile(r"\b(?:before|previously|earlier|last\s+(?:time|week|show)|used\s+to|histor(?:y|ical))\b", re.I)
 _SITUATION_EXPLICIT_RESUME_RE = re.compile(
@@ -403,6 +452,22 @@ class SituationSubjectReference:
 
 
 @dataclass(frozen=True)
+class SituationTaskReference:
+    """One ordered task inside the current turn, without retaining its text."""
+
+    task_id: str
+    text_digest: str
+    task_kind: str
+    object_kind: str
+    authority_scope: str
+    temporal_scope: str
+    currentness: str
+    required_response_act: str
+    subject_requirement: str
+    subject_indexes: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class SituationFrameV1:
     """Immutable, response-scoped applicability decision.
 
@@ -434,6 +499,7 @@ class SituationFrameV1:
     event_ref: str
     event_relation: str
     task_kind: str
+    tasks: Tuple[SituationTaskReference, ...]
     object_kind: str
     phase: str
     role_hints: Tuple[str, ...]
@@ -492,7 +558,143 @@ def _situation_object(text: str) -> str:
         for object_kind, pattern in _SITUATION_OBJECT_PATTERNS
         if pattern.search(text or "")
     )
-    return matches[0] if len(matches) == 1 else "multiple" if matches else "unknown"
+    if len(matches) == 1:
+        return matches[0]
+    publication_owners = tuple(
+        match for match in matches if match in {"journal", "relay"}
+    )
+    if len(publication_owners) == 1:
+        # Journal/Relay qualify the source being asked about.  A referenced
+        # show, queue, person, or topic is the publication's subject, not a
+        # competing factual owner.
+        return publication_owners[0]
+    return "multiple" if matches else "unknown"
+
+
+def _situation_task_segments(text: str) -> Tuple[str, ...]:
+    """Split only explicit ordered requests; never split ordinary noun lists."""
+
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not value:
+        return ()
+    value = re.sub(
+        r"[?!]+\s+(?=%s)" % _TASK_LEAD_RE.pattern,
+        "\n",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(
+        r",?\s+(?:and|also|plus|then)\s+(?=%s)" % _TASK_LEAD_RE.pattern,
+        "\n",
+        value,
+        flags=re.I,
+    )
+    parts = tuple(part.strip(" ,;.!?") for part in value.split("\n"))
+    return tuple(part for part in parts if part) or (str(text or ""),)
+
+
+def _task_subject_indexes(
+    segment: str,
+    subjects: Sequence[SituationSubjectReference],
+) -> Tuple[int, ...]:
+    bnl_self = bool(_BNL_SELF_SUBJECT_CUE_RE.search(segment or ""))
+    self_subject = bool(_SELF_SUBJECT_CUE_RE.search(segment or ""))
+    third_party = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(segment or ""))
+    matches = []
+    for index, subject in enumerate(subjects):
+        if bnl_self and subject.entity_ref == BNL01.key:
+            matches.append(index)
+            continue
+        if self_subject and subject.binding_method == "current_speaker_context":
+            matches.append(index)
+            continue
+        label = str(subject.label_hint or "").strip()
+        if label and re.search(
+            r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(label),
+            segment or "",
+            re.I,
+        ):
+            matches.append(index)
+    if not matches and third_party and len(subjects) == 1:
+        matches.append(0)
+    return tuple(dict.fromkeys(matches))
+
+
+def _situation_tasks(
+    text: str,
+    *,
+    subjects: Sequence[SituationSubjectReference],
+    response_act: str,
+) -> Tuple[SituationTaskReference, ...]:
+    tasks = []
+    for index, segment in enumerate(_situation_task_segments(text), start=1):
+        phase = _situation_phase(segment)
+        object_kind = _situation_object(segment)
+        temporal_scope, currentness = _situation_temporal_scope(segment)
+        evidence = build_conversation_evidence_item(
+            text=segment,
+            current_turn=True,
+        )
+        objective_kind = _objective_kind(
+            objective=_current_objective(segment),
+            current_options=_extract_option_anchors(segment),
+            immediate_recap=False,
+            exact_quote_requested=False,
+            evidence_items=(evidence,),
+        )
+        task_kind = _situation_task_kind(
+            phase=phase,
+            object_kind=object_kind,
+            objective_kind=objective_kind,
+        )
+        subject_indexes = _task_subject_indexes(segment, subjects)
+        external_role_query = bool(_EXTERNAL_ROLE_QUERY_RE.search(segment))
+        subject_cue = bool(
+            _BNL_SELF_SUBJECT_CUE_RE.search(segment)
+            or _SELF_SUBJECT_CUE_RE.search(segment)
+            or (
+                _THIRD_PARTY_SUBJECT_CUE_RE.search(segment)
+                and not external_role_query
+            )
+            or (object_kind == "person" and not external_role_query)
+        )
+        subject_requirement = (
+            "required" if subject_indexes or subject_cue else "not_applicable"
+        )
+        if subject_requirement == "required" or (
+            object_kind in _PACKET_AUTHORITY_OBJECTS
+            and not external_role_query
+        ):
+            authority_scope = "packet"
+        elif _CURRENT_REQUEST_TASK_RE.search(segment):
+            authority_scope = "current_request"
+        else:
+            authority_scope = "external_public"
+        required_act = str(response_act or "observe")
+        if subject_requirement == "required" and not subject_indexes:
+            required_act = "clarify"
+        elif (
+            authority_scope == "external_public"
+            and currentness == "current"
+            and _VOLATILE_EXTERNAL_RE.search(segment)
+        ):
+            authority_scope = "external_current"
+            required_act = "hold"
+        tasks.append(
+            SituationTaskReference(
+                task_id="T%s" % index,
+                text_digest=_situation_digest(segment),
+                task_kind=task_kind,
+                object_kind=object_kind,
+                authority_scope=authority_scope,
+                temporal_scope=temporal_scope,
+                currentness=currentness,
+                required_response_act=required_act,
+                subject_requirement=subject_requirement,
+                subject_indexes=subject_indexes,
+            )
+        )
+    return tuple(tasks)
 
 
 def _situation_roles_domains(text: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
@@ -619,6 +821,8 @@ def build_situation_frame_v1(
     )
     third_party_cue = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(text))
     self_subject_cue = bool(_SELF_SUBJECT_CUE_RE.search(text))
+    bnl_self_subject_cue = bool(_BNL_SELF_SUBJECT_CUE_RE.search(text))
+    external_role_query = bool(_EXTERNAL_ROLE_QUERY_RE.search(text))
 
     subjects = []
     if subject_ids:
@@ -654,7 +858,18 @@ def build_situation_frame_v1(
                     domain_hints=domains,
                 )
             )
-    elif len(speakers) == 1 and self_subject_cue and not third_party_cue:
+    elif bnl_self_subject_cue:
+        subjects.append(
+            SituationSubjectReference(
+                entity_ref=BNL01.key,
+                label_hint=BNL01.name,
+                binding_method="existing_typed_entity",
+                confidence="high",
+                role_hints=("system_subject",),
+                domain_hints=("lore", "technical"),
+            )
+        )
+    elif len(speakers) == 1 and self_subject_cue:
         subjects.append(
             SituationSubjectReference(
                 user_id=speakers[0],
@@ -668,8 +883,18 @@ def build_situation_frame_v1(
 
     subject_requirement = (
         "required"
-        if subjects or third_party_cue or self_subject_cue or object_kind == "person"
+        if subjects
+        or (third_party_cue and not external_role_query)
+        or self_subject_cue
+        or bnl_self_subject_cue
+        or (object_kind == "person" and not external_role_query)
         else "not_applicable"
+    )
+
+    tasks = _situation_tasks(
+        text,
+        subjects=subjects,
+        response_act=str(response_act or "observe"),
     )
 
     ambiguity = []
@@ -681,7 +906,13 @@ def build_situation_frame_v1(
     if len(subject_ids) > 1 or len(subjects) > 1:
         ambiguity.append("multiple_subject_candidates")
         competing.append("subject_candidates")
-    if third_party_cue and not subjects:
+    if (
+        third_party_cue
+        and not external_role_query
+        and not self_subject_cue
+        and not bnl_self_subject_cue
+        and not subjects
+    ):
         ambiguity.append("third_party_subject_unresolved")
         competing.append("speaker_fallback_rejected")
     elif subject_requirement == "required" and not subjects:
@@ -702,11 +933,35 @@ def build_situation_frame_v1(
     if event_relation == "resume_unresolved":
         ambiguity.append("resume_target_unresolved")
         competing.append("resume_episode_candidates")
-    task_kind = _situation_task_kind(
-        phase=phase,
-        object_kind=object_kind,
-        objective_kind=objective_kind,
+    task_kind = (
+        tasks[0].task_kind
+        if len(tasks) == 1
+        else "multi_task"
+        if tasks
+        else _situation_task_kind(
+            phase=phase,
+            object_kind=object_kind,
+            objective_kind=objective_kind,
+        )
     )
+    if len(tasks) > 1:
+        object_kind = (
+            tasks[0].object_kind
+            if len({task.object_kind for task in tasks}) == 1
+            else "multiple"
+        )
+        temporal_values = {task.temporal_scope for task in tasks}
+        currentness_values = {task.currentness for task in tasks}
+        temporal_scope = (
+            next(iter(temporal_values))
+            if len(temporal_values) == 1
+            else "mixed"
+        )
+        currentness = (
+            next(iter(currentness_values))
+            if len(currentness_values) == 1
+            else "mixed"
+        )
     digest_payload = {
         "schema": SITUATION_FRAME_VERSION,
         "packet_revision": str(packet_revision or ""),
@@ -739,6 +994,21 @@ def build_situation_frame_v1(
         "event_ref": str(moment_id or ""),
         "event_relation": event_relation,
         "task": task_kind,
+        "tasks": tuple(
+            (
+                task.task_id,
+                task.text_digest,
+                task.task_kind,
+                task.object_kind,
+                task.authority_scope,
+                task.temporal_scope,
+                task.currentness,
+                task.required_response_act,
+                task.subject_requirement,
+                task.subject_indexes,
+            )
+            for task in tasks
+        ),
         "object": object_kind,
         "phase": phase,
         "temporal": temporal_scope,
@@ -778,6 +1048,7 @@ def build_situation_frame_v1(
         event_ref=str(moment_id or "")[:120],
         event_relation=event_relation,
         task_kind=task_kind,
+        tasks=tasks,
         object_kind=object_kind,
         phase=phase,
         role_hints=roles,
@@ -875,6 +1146,16 @@ def render_situation_frame_receipt(
         "addresseeCount": len(frame.addressee_user_ids),
         "subjectCount": len(frame.subjects),
         "subjectRequirement": frame.subject_requirement,
+        "taskCount": len(frame.tasks),
+        "answerTaskCount": sum(
+            task.required_response_act == "answer" for task in frame.tasks
+        ),
+        "clarifyTaskCount": sum(
+            task.required_response_act == "clarify" for task in frame.tasks
+        ),
+        "holdTaskCount": sum(
+            task.required_response_act == "hold" for task in frame.tasks
+        ),
         "sourceAnchorCount": (
             len(frame.source_message_ids)
             + len(frame.reply_message_ids)

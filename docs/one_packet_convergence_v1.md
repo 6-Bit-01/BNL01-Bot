@@ -1,6 +1,6 @@
 # One-Packet Convergence v1
 
-`unified_intelligence_packet_v8` is the single factual owner for gated broad
+`unified_intelligence_packet_v9` is the single factual owner for gated broad
 self-profile synthesis and the separately gated ordinary-chat cutover. It consumes
 the immutable Situation Frame revision and resolves one governed subject
 before source scoring. It normalizes four canon statuses without moving their
@@ -70,9 +70,12 @@ synthesis versions, prerequisites, conflicts, reason, and one kill switch. A
 scope, prerequisite, or version conflict fails closed. The owner-only preview
 adds content-free candidate/selected counts by canon status and domain plus the
 existing exclusion and root-collapse reasons. The independent ordinary-chat
-capability uses `shared_brain_synthesis_v9` content-free receipts with frame,
+capability uses `shared_brain_synthesis_v10` content-free receipts with frame,
 packet/source, selected lane/status/domain, provider/corrective call, guard,
-revalidation, send, and fallback/block diagnostics.
+revalidation, typed task/support coverage, send, and fallback/block
+diagnostics. Its typed task contract is the single response-selection
+boundary; later checks can block changed source, frame, control, quote, or
+delivery state but do not reclassify the selected prose.
 
 All gates remain default-off. The ordinary-chat route permits one provider
 attempt, zero retries, no model fallback, and no corrective generation. This
