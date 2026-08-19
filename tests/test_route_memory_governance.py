@@ -1131,6 +1131,38 @@ class MemoryPolicyGovernanceTests(unittest.TestCase):
 
 
 class MemoryInjectionGovernanceTests(unittest.TestCase):
+    def test_broadcast_owner_requires_explicit_broadcast_intent(self):
+        ordinary_identity_requests = (
+            (
+                "What do you know about Mac Modem, and what do you know "
+                "about DJ Floppy Disc?"
+            ),
+            "Compare 6 Bit and Mac Modem.",
+            "What is the difference between Sheila and Cliff?",
+            "Who is Cache Back? Who is Mac Modem?",
+        )
+        for text in ordinary_identity_requests:
+            with self.subTest(text=text):
+                self.assertFalse(
+                    bnl01_bot._broadcast_memory_requires_specialized_owner(
+                        text
+                    )
+                )
+
+        explicit_broadcast_requests = (
+            "What happened on the last BARCODE Radio episode?",
+            "What does broadcast memory say about DJ Floppy Disc?",
+            "Is the show schedule still active?",
+            "Is the track submission queue open?",
+        )
+        for text in explicit_broadcast_requests:
+            with self.subTest(text=text):
+                self.assertTrue(
+                    bnl01_bot._broadcast_memory_requires_specialized_owner(
+                        text
+                    )
+                )
+
     def test_simple_greeting_memory_context_is_skipped(self):
         context = bnl01_bot.build_user_memory_context(1, 1, route_mode=bnl01_bot.ROUTE_MODE_SIMPLE_GREETING, channel_policy="sealed_test")
         self.assertIn("skipped", context.lower())

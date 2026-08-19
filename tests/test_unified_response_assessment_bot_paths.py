@@ -269,6 +269,129 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             assessment.excluded_lanes,
         )
 
+    def test_incidental_broadcast_entity_match_keeps_ordinary_packet_owner(self):
+        text = (
+            "What do you know about Mac Modem, and what do you know "
+            "about DJ Floppy Disc?"
+        )
+        flags = {
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+            "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "101",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "303",
+            "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+            "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+            "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+        }
+        packet = object()
+        assessment = SimpleNamespace()
+        ordinary_basis = object()
+        visual_basis = SimpleNamespace(status="not_requested")
+        assessment_calls = []
+
+        def assessment_builder(**kwargs):
+            assessment_calls.append(kwargs)
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        broadcast_builder = mock.Mock(
+            return_value=(
+                "Broadcast memory entity match:\n"
+                "- 2026-08-01 broadcast_memory_note: DJ Floppy Disc"
+            )
+        )
+        with (
+            mock.patch.dict(os.environ, flags, clear=False),
+            mock.patch.object(
+                bnl01_bot,
+                "get_user_profile",
+                return_value=("Member 1", ""),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "should_allow_greeting",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "choose_response_style",
+                return_value=("balanced", "Respond naturally."),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_conversation_prompt_source_basis",
+                return_value=None,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_broadcast_memory_context",
+                new=broadcast_builder,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_community_visual_basis",
+                return_value=visual_basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "render_community_visual_basis_for_prompt",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=assessment_builder,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=ordinary_basis,
+            ),
+        ):
+            metadata = {}
+            prompt, *_ = bnl01_bot.build_user_aware_prompt(
+                101,
+                1,
+                "Member 1",
+                text,
+                channel_name="bnl-testing",
+                channel_id=303,
+                channel_policy="sealed_test",
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                is_direct_interaction=True,
+                prompt_metadata=metadata,
+            )
+
+        broadcast_builder.assert_not_called()
+        self.assertEqual(len(assessment_calls), 1)
+        self.assertFalse(
+            assessment_calls[0]["broadcast_memory_present"]
+        )
+        self.assertNotIn(
+            "broadcast_memory",
+            assessment_calls[0]["prompt_lanes"],
+        )
+        self.assertTrue(
+            metadata["ordinary_chat_single_packet_applied"]
+        )
+        self.assertIs(
+            metadata["ordinary_chat_single_packet_basis"],
+            ordinary_basis,
+        )
+        self.assertEqual(
+            metadata["ordinary_chat_single_packet_scope"].reason,
+            "eligible",
+        )
+        self.assertNotIn("Broadcast memory context:", prompt)
+
     def test_bot_recorder_persists_only_aggregate_receipt(self):
         with mock.patch.object(
             bnl01_bot,

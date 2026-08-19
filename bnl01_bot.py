@@ -18018,6 +18018,51 @@ def _is_broadcast_memory_relevant(text: str) -> bool:
         "maintenance", "running joke", "status", "happening"
     ))
 
+
+def _broadcast_memory_requires_specialized_owner(text: str) -> bool:
+    """Keep explicit broadcast requests on the specialized owner.
+
+    Generic questions about a BARCODE person can still produce an entity match
+    in broadcast memory.  That match is supporting evidence, not user intent to
+    leave the ordinary-chat packet route.  Only language that actually asks
+    about the show, an episode, a broadcast, or its queue claims the specialized
+    broadcast owner.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return False
+    if any(
+        phrase in normalized
+        for phrase in (
+            "barcode radio",
+            "broadcast memory",
+            "running joke",
+            "show status",
+            "show schedule",
+            "queue status",
+            "queue open",
+            "queue closed",
+            "submissions open",
+            "submissions closed",
+        )
+    ):
+        return True
+    if re.search(r"\b(?:broadcast|episode)\b", normalized):
+        return True
+    if re.search(r"\bshow\b", normalized) and not re.search(
+        r"\bshow\s+me\b",
+        normalized,
+    ):
+        return True
+    return bool(
+        re.search(r"\bqueue\b", normalized)
+        and re.search(
+            r"\b(?:radio|track|song|submission|open|closed|status)\b",
+            normalized,
+        )
+    )
+
 def _is_show_state_status_query(text: str) -> bool:
     t = (text or "").lower().strip()
     if not t:
@@ -32522,12 +32567,27 @@ def build_user_aware_prompt(
             "or claim exact wording. A Moment gist, memory tier, relationship note, "
             "summary, or prior BNL reply is never quote authority.\n"
         )
-    broadcast_context = build_broadcast_memory_context(
-        guild_id,
-        clean_content,
-        channel_policy,
-        is_owner_or_mod=prompt_operator_authority,
+    broadcast_specialized_owner = bool(
+        _broadcast_memory_requires_specialized_owner(clean_content)
     )
+    if ordinary_chat_single_packet and not broadcast_specialized_owner:
+        broadcast_context = ""
+        broadcast_entity_terms = extract_broadcast_memory_query_terms(
+            clean_content
+        )
+        if broadcast_entity_terms:
+            logging.info(
+                "broadcast_memory_context_skipped "
+                "reason=ordinary_chat_packet_owner terms=%s",
+                len(broadcast_entity_terms),
+            )
+    else:
+        broadcast_context = build_broadcast_memory_context(
+            guild_id,
+            clean_content,
+            channel_policy,
+            is_owner_or_mod=prompt_operator_authority,
+        )
     broadcast_prompt_block = ""
     if broadcast_context:
         broadcast_prompt_block = (
@@ -32557,7 +32617,7 @@ def build_user_aware_prompt(
     if community_visual_prompt_block:
         community_visual_prompt_block += "\n"
     specialized_owner_present = bool(
-        broadcast_context
+        (broadcast_context and broadcast_specialized_owner)
         or show_state_context
         or website_read_model_context
         or community_visual_prompt_block
