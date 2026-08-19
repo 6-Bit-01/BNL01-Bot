@@ -80,6 +80,14 @@ diagnostics. Its typed task contract is the single response-selection
 boundary; later checks can block changed source, frame, control, quote, or
 delivery state but do not reclassify the selected prose.
 
+The ordinary-chat contract defaults to the accepted one-guild, one-user,
+one-channel private scope. Multi-user or multi-channel rollout requires the
+independent scoped-expansion gate and remains capped at one guild, eight
+explicit users, and four explicit channels. Additional IDs without that gate,
+missing allowlists, or any over-limit scope fail closed before prompt
+construction. The scope digest binds both the authorization mode and exact
+allowlists without exposing their IDs.
+
 All gates remain default-off. The ordinary-chat route permits one provider
 attempt, zero retries, no model fallback, and no corrective generation. This
 version performs no deployment, historical

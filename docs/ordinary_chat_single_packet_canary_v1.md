@@ -1,11 +1,13 @@
-# Ordinary-Chat Single-Packet Canary v1
+# Ordinary-Chat Single-Packet Canary and Scoped Expansion
 
-This capability cuts one exact ordinary-chat scope over to a single factual
-prompt owner and a single provider attempt. It is disabled by default and is
-separate from the broad-profile comparison canary and public-home recall
-owner.
+This capability cuts an explicitly bounded ordinary-chat scope over to a
+single factual prompt owner and a single provider attempt. It is disabled by
+default and is separate from the broad-profile comparison canary and
+public-home recall owner. The default remains the original private acceptance
+scope; contract v4 adds a second gate for controlled multi-user or
+multi-channel expansion.
 
-## Exact default-off scope
+## Default-off private acceptance scope
 
 All four values are required:
 
@@ -14,18 +16,47 @@ All four values are required:
 - `BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS=<one user id>`
 - `BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS=<one channel id>`
 
-The three allowlists must each contain exactly one positive ID. The route is
-limited to direct, text-only `normal_chat` turns in `sealed_test`,
-`public_home`, or `public_context`. Direct-payload tasks, simple greetings,
-show/status answers, media turns, commands, Journal/Relay controls, website
-read-model answers, Broadcast-memory answers, and community-visual owners
-stay on their established routes.
+Without the scoped-expansion gate, the three allowlists must each contain
+exactly one positive ID. Additional user or channel IDs fail closed with
+`scoped_expansion_not_enabled`; deploying contract v4 without changing the
+environment therefore preserves the accepted private routing and prompt-owner
+behavior.
+
+The route is limited to direct, text-only `normal_chat` turns in
+`sealed_test`, `public_home`, or `public_context`. Direct-payload tasks, simple
+greetings, show/status answers, media turns, commands, Journal/Relay controls,
+website read-model answers, Broadcast-memory answers, and community-visual
+owners stay on their established routes.
 
 The capability fails closed when packet or response-assessment shadows are
 unavailable, a prerequisite schema version differs, a global Memory
 Governance/Relationship/Active Engagement live gate is active, or either
 older shared-brain synthesis authority is requested. Its independent rollback
 switch is `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED`.
+
+## Separately gated bounded expansion
+
+Expanding beyond the private acceptance scope additionally requires:
+
+- `BNL_ORDINARY_CHAT_SINGLE_PACKET_SCOPED_EXPANSION_ENABLED=true`
+
+The expanded contract remains limited to:
+
+- exactly one guild;
+- one to eight explicitly allowlisted users; and
+- one to four explicitly allowlisted channels.
+
+The expansion gate never supplies or infers IDs. An empty allowlist remains
+incomplete, more than one guild or an over-limit user/channel list fails with
+`scope_limit_exceeded`, and a non-allowlisted request still fails before prompt
+construction or provider use. The primary ordinary-chat kill switch, global
+live-gate conflicts, specialized-owner exclusions, one-provider-call limit,
+and zero-corrective-call limit are unchanged.
+
+Content-free configuration diagnostics expose the private or
+`bounded_expansion` scope mode, allowlist counts, hard caps, expansion-gate
+state, expansion-effective state, and a scope digest that changes when either
+the allowlists or expansion authorization changes. IDs are not exposed.
 
 ## One factual owner and one call
 
@@ -106,14 +137,32 @@ independent kill switch.
 
 ## Rollback and acceptance order
 
-Rollback requires no database deletion:
+Full rollback requires no database deletion:
 
 1. Set `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED=false` or remove it.
 2. Restart the bot.
 3. Confirm the ordinary-chat capability is requested/effective `off`.
+
+Expansion-only rollback keeps the accepted private canary available:
+
+1. Restore exactly one approved user and one approved channel in the
+   allowlists.
+2. Set
+   `BNL_ORDINARY_CHAT_SINGLE_PACKET_SCOPED_EXPANSION_ENABLED=false` or remove
+   it in the same environment edit.
+3. Restart the bot and confirm `scope_mode=private_acceptance`,
+   `scoped_expansion_effective=false`, and ordinary-chat effective `on`.
 
 With the switch off, ordinary-chat prompt bytes and established generation
 behavior remain unchanged. Deployment and private live acceptance are separate
 operations: merge the complete PR sequence first, run the combined automated
 suite and 60-case acceptance matrix, then enable only the exact private scope
 for the approved provider-shadow and owner acceptance runs.
+
+After private acceptance passes, deploy contract v4 with the expansion gate
+absent or false and confirm the existing private scope remains effective. Then
+enable expansion for one additional approved user in the already accepted
+channel. Validate one ordinary multi-subject turn and one explicit specialized
+Broadcast-memory turn before adding another user or any channel. Expand one
+dimension at a time; do not enable the global Memory Governance, Relationship,
+or Active Engagement live gates during this rollout.
