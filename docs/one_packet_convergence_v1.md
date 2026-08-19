@@ -1,10 +1,12 @@
 # One-Packet Convergence v1
 
-`unified_intelligence_packet_v9` is the single factual owner for gated broad
-self-profile synthesis and the separately gated ordinary-chat cutover. It consumes
-the immutable Situation Frame revision and resolves one governed subject
-before source scoring. It normalizes four canon statuses without moving their
-source authority:
+`unified_intelligence_packet_v10` is the single factual owner for gated broad
+self-profile synthesis and the separately gated ordinary-chat cutover. It
+consumes the immutable Situation Frame revision and resolves each governed
+task subject before source scoring. A true multi-subject ordinary request runs
+the existing single-subject path once per scoped subject and freezes those
+components into one composite packet. It normalizes four canon statuses
+without moving their source authority:
 
 - Legacy facts use the static canon adapter.
 - Declared claims require the effective broad-recall capability and a current
@@ -57,12 +59,13 @@ Specialized operational routes stay outside this cutover.
 
 For frame-backed turns, a stable Discord account binding outranks typed canon
 aliases; exact approved aliases may identify canon-only subjects but display
-labels remain reversible hints and never merge accounts. Multiple candidates,
-unseen label-only subjects, retired bindings, binding collisions, and changed
-bindings fail closed. Role, domain, event, task, phase, and currentness filters
-run before scoring. Relationship remains private tone-only context, and Source
-File snapshots remain internal unless their existing route contract authorizes
-them.
+labels remain reversible hints and never merge accounts. Multiple explicit
+subjects are accepted only when every candidate is bound to a frozen task;
+unscoped candidates, unseen label-only subjects, retired bindings, binding
+collisions, and changed bindings fail closed. Role, domain, event, task, phase,
+and currentness filters run before scoring. Relationship remains private
+tone-only context, and Source File snapshots remain internal unless their
+existing route contract authorizes them.
 
 `shared_brain_capability_receipt_v1` binds the broad-recall requested/effective state to the
 exact hashed scope, authority mode, packet, claim, assessment, identity, and
@@ -70,7 +73,7 @@ synthesis versions, prerequisites, conflicts, reason, and one kill switch. A
 scope, prerequisite, or version conflict fails closed. The owner-only preview
 adds content-free candidate/selected counts by canon status and domain plus the
 existing exclusion and root-collapse reasons. The independent ordinary-chat
-capability uses `shared_brain_synthesis_v10` content-free receipts with frame,
+capability uses `shared_brain_synthesis_v11` content-free receipts with frame,
 packet/source, selected lane/status/domain, provider/corrective call, guard,
 revalidation, typed task/support coverage, send, and fallback/block
 diagnostics. Its typed task contract is the single response-selection

@@ -827,7 +827,7 @@ def _read_shared_brain_synthesis_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "shared_brain_synthesis_v10",
+                "schemaVersion": "shared_brain_synthesis_v11",
                 "runs": 0,
                 "promptAppliedRuns": 0,
                 "liveAppliedRuns": 0,
@@ -2116,7 +2116,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             _on(shared_brain_synthesis_state.get("fullyScoped")),
             shared_brain_synthesis.get(
                 "schemaVersion",
-                "shared_brain_synthesis_v10",
+                "shared_brain_synthesis_v11",
             ),
             shared_brain_synthesis.get("runs", 0),
             json.dumps(

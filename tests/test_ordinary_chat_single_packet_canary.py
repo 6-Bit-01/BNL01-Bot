@@ -23,6 +23,7 @@ from bnl_shared_brain_synthesis import (
     ordinary_chat_route_scope_decision,
     parse_ordinary_chat_response_contract,
     record_single_packet_block,
+    render_packet_context,
     validate_ordinary_chat_response_contract,
 )
 from bnl_unified_intelligence_packet import (
@@ -319,6 +320,152 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             environ=self.flags,
         )
 
+    def _multi_subject_basis(self, text, subjects):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            channel_policy="public_context",
+            current_text=text,
+            current_speaker_user_ids=(7,),
+            current_speaker_labels=("Test Member",),
+            addressee_kinds=("discord_mention",),
+            source_message_ids=(401,),
+            explicit_mention_count=1,
+            subject_label_hints=tuple(label for _key, label in subjects),
+            subject_entity_refs=tuple(key for key, _label in subjects),
+            referent_status="resolved",
+            response_act="answer",
+            packet_revision="turn_multi_subject_01",
+        )
+        self.assertEqual(frame.status, "resolved")
+        request = IntelligencePacketRequest(
+            guild_id=1,
+            subject_user_id=0,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            channel_id=10,
+            channel_name="bnl-testing",
+            channel_policy="public_context",
+            visibility_allowance="public_safe",
+            user_text=text,
+            participant_user_ids=(7,),
+            direct_state="direct",
+            budget_chars=5000,
+            conversation_evidence=(
+                PacketConversationEvidence(
+                    text=text,
+                    speaker_user_id=7,
+                    speaker_label="Test Member",
+                    current_turn=True,
+                ),
+            ),
+            declared_canon_authorized=True,
+            frame_schema_version=frame.schema_version,
+            frame_revision=frame.frame_revision,
+            frame_input_evidence_digest=frame.input_evidence_digest,
+            frame_status=frame.status,
+            frame_subject_requirement=frame.subject_requirement,
+            frame_subjects=tuple(
+                PacketFrameSubject(
+                    user_id=subject.user_id,
+                    entity_ref=subject.entity_ref,
+                    label_hint=subject.label_hint,
+                    binding_method=subject.binding_method,
+                    confidence=subject.confidence,
+                    role_hints=subject.role_hints,
+                    domain_hints=subject.domain_hints,
+                )
+                for subject in frame.subjects
+            ),
+            frame_tasks=tuple(
+                PacketFrameTask(
+                    task_id=task.task_id,
+                    text_digest=task.text_digest,
+                    task_kind=task.task_kind,
+                    object_kind=task.object_kind,
+                    authority_scope=task.authority_scope,
+                    temporal_scope=task.temporal_scope,
+                    currentness=task.currentness,
+                    required_response_act=task.required_response_act,
+                    subject_requirement=task.subject_requirement,
+                    subject_indexes=task.subject_indexes,
+                )
+                for task in frame.tasks
+            ),
+            frame_role_hints=frame.role_hints,
+            frame_domain_hints=frame.domain_hints,
+            frame_event_ref=frame.event_ref,
+            frame_event_relation=frame.event_relation,
+            frame_task_kind=frame.task_kind,
+            frame_object_kind=frame.object_kind,
+            frame_phase=frame.phase,
+            frame_temporal_scope=frame.temporal_scope,
+            frame_currentness=frame.currentness,
+            now="2026-08-10T12:02:00+00:00",
+        )
+        packet = build_packet(
+            self.conn,
+            request,
+            persist=True,
+            environ=self.flags,
+        )
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet.subject_resolution.status, "multi_resolved")
+        frame_revalidation = revalidate_situation_frame(
+            frame,
+            current_text=text,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            channel_policy="public_context",
+            packet_source_snapshot_digest=packet.source_snapshot_digest,
+        )
+        profile = packet.profile_sufficiency
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="public_context",
+            conversation_surface="mention_or_reply",
+            current_speaker_user_ids=(7,),
+            participant_user_ids=(7,),
+            speaker_labels=("Test Member",),
+            current_exchange_source_ids=(),
+            governed_entry_ids=packet.governed_refs,
+            canon_refs=packet.canon_refs,
+            prompt_lanes=("current_exchange",),
+            current_text=text,
+            packet_selected_lanes=packet.assessment_lanes,
+            packet_excluded_lanes=packet.assessment_exclusions,
+            packet_conflict_reasons=packet.diagnostics.conflict_reasons,
+            packet_missing_lanes=packet.assessment_missing_lanes,
+            packet_revalidation_status=packet.diagnostics.revalidation_status,
+            profile_sufficiency_status=profile.status,
+            profile_sufficiency_met=profile.satisfied,
+            profile_required_point_count=profile.required_point_count,
+            profile_selected_point_count=profile.selected_point_count,
+            profile_independent_root_count=profile.independent_root_count,
+            profile_independent_occurrence_count=(
+                profile.independent_occurrence_count
+            ),
+            profile_sufficiency_reasons=profile.reason_codes,
+            situation_frame=frame,
+            frame_revalidation=frame_revalidation,
+        )
+        basis = build_ordinary_chat_basis(
+            guild_id=1,
+            user_id=7,
+            channel_id=10,
+            route_mode="normal_chat",
+            channel_policy="public_context",
+            current_direct=True,
+            user_text=text,
+            packet=packet,
+            assessment=assessment,
+            environ=self.flags,
+        )
+        self.assertIsNotNone(basis)
+        return basis
+
     def _basis_for_canon_entity(self, entity_key, label):
         entity_ref = "canon:%s" % entity_key
         packet = replace(
@@ -479,7 +626,12 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
     def test_typed_response_contract_accepts_only_applicable_packet_refs(self):
         evidence_id = next(
             evidence_id
-            for evidence_id, lane, _digest in self.basis.rendered_evidence_refs
+            for (
+                evidence_id,
+                lane,
+                _digest,
+                _subject_indexes,
+            ) in self.basis.rendered_evidence_refs
             if lane == "approved_fact"
         )
         contract = parse_ordinary_chat_response_contract(
@@ -547,6 +699,156 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     decision.fallback_reason,
                     "typed_contract_%s" % expected,
                 )
+
+    def test_multi_subject_comparison_requires_support_for_every_subject(self):
+        basis = self._multi_subject_basis(
+            "Compare Cache Back and Mac Modem.",
+            (("cache_back", "Cache Back"), ("mac_modem", "Mac Modem")),
+        )
+        evidence_by_subject = {
+            subject_indexes: evidence_id
+            for (
+                evidence_id,
+                lane,
+                _digest,
+                subject_indexes,
+            ) in basis.rendered_evidence_refs
+            if lane == "canon" and len(subject_indexes) == 1
+        }
+        cache_evidence = evidence_by_subject[(0,)]
+        mac_evidence = evidence_by_subject[(1,)]
+        valid = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"Cache Back protects '
+            'archive continuity, while Mac Modem introduces unstable '
+            'distortions.","supportKind":"packet","evidenceIds":["%s",'
+            '"%s"]}]}' % (cache_evidence, mac_evidence)
+        )
+        incomplete = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"They differ.",'
+            '"supportKind":"packet","evidenceIds":["%s"]}]}'
+            % cache_evidence
+        )
+
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(basis, valid).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                basis,
+                incomplete,
+            ).status,
+            "packet_support_invalid",
+        )
+        prompt = build_packet_owned_prompt("Current request.", basis)
+        self.assertTrue(prompt.ready)
+        self.assertIn("subjects=S1,S2", prompt.prompt)
+
+    def test_multi_subject_render_reserves_evidence_for_each_subject(self):
+        basis = self._multi_subject_basis(
+            "Compare Cache Back and Mac Modem.",
+            (("cache_back", "Cache Back"), ("mac_modem", "Mac Modem")),
+        )
+        cache_item = next(
+            item
+            for item in basis.packet.items
+            if item.lane == "canon" and item.subject_key == "cache_back"
+        )
+        mac_item = next(
+            item
+            for item in basis.packet.items
+            if item.lane == "canon" and item.subject_key == "mac_modem"
+        )
+        dense_cache = tuple(
+            replace(
+                cache_item,
+                source_ref="dense-cache-%s" % index,
+                source_digest="%064x" % (index + 1),
+            )
+            for index in range(8)
+        )
+        dense_packet = replace(
+            basis.packet,
+            items=(*dense_cache, mac_item),
+        )
+
+        _rendered, _lanes, _count, source_digests = render_packet_context(
+            dense_packet,
+            max_items=4,
+        )
+
+        self.assertIn(mac_item.source_digest, source_digests)
+
+    def test_separate_subject_tasks_reject_cross_task_evidence(self):
+        basis = self._multi_subject_basis(
+            "Who is Cache Back? Who is Mac Modem?",
+            (("cache_back", "Cache Back"), ("mac_modem", "Mac Modem")),
+        )
+        evidence_by_subject = {
+            subject_indexes: evidence_id
+            for (
+                evidence_id,
+                lane,
+                _digest,
+                subject_indexes,
+            ) in basis.rendered_evidence_refs
+            if lane == "canon" and len(subject_indexes) == 1
+        }
+        crossed = parse_ordinary_chat_response_contract(
+            '{"tasks":['
+            '{"taskId":"T1","text":"Cache answer.","supportKind":'
+            '"packet","evidenceIds":["%s"]},'
+            '{"taskId":"T2","text":"Mac answer.","supportKind":'
+            '"packet","evidenceIds":["%s"]}'
+            ']}' % (evidence_by_subject[(1,)], evidence_by_subject[(0,)])
+        )
+
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                basis,
+                crossed,
+            ).status,
+            "packet_support_invalid",
+        )
+
+    def test_missing_one_comparison_subject_requires_a_hold(self):
+        basis = self._multi_subject_basis(
+            "Compare Cache Back and Call'em Bini.",
+            (
+                ("cache_back", "Cache Back"),
+                ("call_em_bini", "Call'em Bini"),
+            ),
+        )
+        cache_evidence = next(
+            evidence_id
+            for (
+                evidence_id,
+                lane,
+                _digest,
+                subject_indexes,
+            ) in basis.rendered_evidence_refs
+            if lane == "canon" and subject_indexes == (0,)
+        )
+        held = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"I do not have enough '
+            'selected evidence for both sides of that comparison.",'
+            '"supportKind":"hold","evidenceIds":[]}]}'
+        )
+        partial = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"They differ.",'
+            '"supportKind":"packet","evidenceIds":["%s"]}]}'
+            % cache_evidence
+        )
+
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(basis, held).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                basis,
+                partial,
+            ).status,
+            "packet_support_invalid",
+        )
 
     def test_typed_external_task_uses_public_not_packet_authority(self):
         external_packet = replace(
@@ -648,7 +950,12 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(run.prompt_applied)
         evidence_id = next(
             evidence_id
-            for evidence_id, lane, _digest in self.basis.rendered_evidence_refs
+            for (
+                evidence_id,
+                lane,
+                _digest,
+                _subject_indexes,
+            ) in self.basis.rendered_evidence_refs
             if lane == "approved_fact"
         )
         contract = parse_ordinary_chat_response_contract(

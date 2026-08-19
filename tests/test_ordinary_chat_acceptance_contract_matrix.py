@@ -131,6 +131,100 @@ class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
                         )
                     )
 
+    def test_12_true_multi_subject_cases_bind_each_task_scope(self):
+        # name, request, ordered task subject entity keys
+        cases = (
+            (
+                "compare_cache_mac",
+                "Compare Cache Back and Mac Modem.",
+                (("cache_back", "mac_modem"),),
+            ),
+            (
+                "compare_dj_mac",
+                "Compare DJ Floppy Disc and Mac Mod3m.",
+                (("dj_floppydisc", "mac_modem"),),
+            ),
+            (
+                "cache_then_mac",
+                "Tell me about Cache Back, and tell me about Mac Modem.",
+                (("cache_back",), ("mac_modem",)),
+            ),
+            (
+                "cache_role_mac_role",
+                "What is Cache Back's role, and what is Mac Modem's role?",
+                (("cache_back",), ("mac_modem",)),
+            ),
+            (
+                "cache_who_mac_who",
+                "Who is Cache Back? Who is Mac Modem?",
+                (("cache_back",), ("mac_modem",)),
+            ),
+            (
+                "mac_then_dj",
+                "What do you know about Mac Modem, and what do you know "
+                "about DJ Floppy Disc?",
+                (("mac_modem",), ("dj_floppydisc",)),
+            ),
+            (
+                "six_bit_mac",
+                "Compare 6 Bit and Mac Modem.",
+                (("6_bit", "mac_modem"),),
+            ),
+            (
+                "bnl_six_bit",
+                "Compare BNL-01 and 6 Bit.",
+                (("6_bit", "bnl_01"),),
+            ),
+            (
+                "sheila_cliff",
+                "What is the difference between Sheila and Cliff?",
+                (("sheila", "cliff"),),
+            ),
+            (
+                "cache_six_bit",
+                "What is the relationship between Cache Back and 6 Bit?",
+                (("6_bit", "cache_back"),),
+            ),
+            (
+                "three_way",
+                "Compare Cache Back, Call'em Bini, and Mac Modem.",
+                (("cache_back", "mac_modem", "call_em_bini"),),
+            ),
+            (
+                "one_then_pair",
+                "Who is Cache Back? Compare Call'em Bini and Mac Modem.",
+                (("cache_back",), ("mac_modem", "call_em_bini")),
+            ),
+        )
+        self.assertEqual(len(cases), 12)
+
+        for name, text, expected_task_subjects in cases:
+            with self.subTest(name=name, text=text):
+                frame = _frame(text)
+                subject_keys = tuple(
+                    subject.entity_ref for subject in frame.subjects
+                )
+                actual_task_subjects = tuple(
+                    tuple(
+                        subject_keys[index]
+                        for index in task.subject_indexes
+                    )
+                    for task in frame.tasks
+                )
+
+                self.assertEqual(frame.status, "resolved")
+                self.assertEqual(
+                    actual_task_subjects,
+                    expected_task_subjects,
+                )
+                self.assertTrue(
+                    all(
+                        task.subject_requirement == "required"
+                        and task.required_response_act == "answer"
+                        for task in frame.tasks
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

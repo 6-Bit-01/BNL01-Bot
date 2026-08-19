@@ -24068,6 +24068,7 @@ def build_unified_response_assessment_shadow(
                     )
                     not in {
                         "resolved",
+                        "multi_resolved",
                         "not_applicable",
                         "legacy",
                     }

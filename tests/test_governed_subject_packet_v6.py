@@ -19,6 +19,7 @@ from bnl_unified_intelligence_packet import (
     IntelligencePacketItem,
     IntelligencePacketRequest,
     PacketConversationEvidence,
+    PacketFrameTask,
     PacketFrameSubject,
     PacketSubjectResolution,
     SCHEMA_VERSION,
@@ -91,6 +92,7 @@ class GovernedSubjectPacketV6Tests(unittest.TestCase):
         object_kind="person",
         phase="request",
         evidence=(),
+        tasks=(),
         budget_chars=2400,
     ):
         return IntelligencePacketRequest(
@@ -106,12 +108,13 @@ class GovernedSubjectPacketV6Tests(unittest.TestCase):
             direct_state="direct",
             budget_chars=budget_chars,
             conversation_evidence=tuple(evidence),
-            frame_schema_version="situation_frame_v1",
+            frame_schema_version="situation_frame_v3",
             frame_revision="sf_test_subject_01",
             frame_input_evidence_digest="a" * 64,
             frame_status=frame_status,
             frame_subject_requirement=requirement,
             frame_subjects=tuple(subjects),
+            frame_tasks=tuple(tasks),
             frame_role_hints=tuple(role_hints),
             frame_domain_hints=tuple(domain_hints),
             frame_event_relation="uncertain",
@@ -134,8 +137,8 @@ class GovernedSubjectPacketV6Tests(unittest.TestCase):
             reason="governed subject test binding",
         )
 
-    def test_packet_schema_is_v9_and_alias_matrix_stays_distinct(self):
-        self.assertEqual(SCHEMA_VERSION, "unified_intelligence_packet_v9")
+    def test_packet_schema_is_v10_and_alias_matrix_stays_distinct(self):
+        self.assertEqual(SCHEMA_VERSION, "unified_intelligence_packet_v10")
         cases = {
             "Who is Mac Mod3m?": ("mac_modem",),
             "Tell me about DJ Floppy Disc.": ("dj_floppydisc",),
@@ -217,6 +220,111 @@ class GovernedSubjectPacketV6Tests(unittest.TestCase):
             resolution.binding_method,
             "typed_canon_entity",
         )
+
+    def test_task_scoped_multi_subject_packet_resolves_each_subject_once(self):
+        request = self.request(
+            subjects=(
+                PacketFrameSubject(
+                    entity_ref="cache_back",
+                    label_hint="Cache Back",
+                    binding_method="existing_typed_entity",
+                ),
+                PacketFrameSubject(
+                    entity_ref="mac_modem",
+                    label_hint="Mac Modem",
+                    binding_method="existing_typed_entity",
+                ),
+            ),
+            tasks=(
+                PacketFrameTask(
+                    task_id="T1",
+                    text_digest="1" * 64,
+                    task_kind="answer",
+                    object_kind="person",
+                    authority_scope="packet",
+                    temporal_scope="unspecified",
+                    currentness="unknown",
+                    required_response_act="answer",
+                    subject_requirement="required",
+                    subject_indexes=(0, 1),
+                ),
+            ),
+            text="Compare Cache Back and Mac Modem.",
+            object_kind="person",
+        )
+
+        packet = build_packet(self.conn, request, environ=self.flags)
+
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet.subject_resolution.status, "multi_resolved")
+        self.assertEqual(
+            tuple(
+                resolution.entity_ref
+                for resolution in packet.subject_resolutions
+            ),
+            ("cache_back", "mac_modem"),
+        )
+        self.assertEqual(len(packet.component_packets), 2)
+        selected_subjects = {
+            item.subject_key for item in packet.items if item.lane == "canon"
+        }
+        self.assertTrue({"cache_back", "mac_modem"}.issubset(selected_subjects))
+        self.assertEqual(packet.diagnostics.invalid_invariants, [])
+        self.assertTrue(
+            packet.diagnostics.revalidation_status.startswith("passed")
+        )
+
+        revalidation = revalidate_packet(
+            self.conn,
+            packet,
+            environ=self.flags,
+        )
+        self.assertTrue(revalidation.valid)
+        self.assertEqual(
+            revalidation.subject_resolution_status,
+            "multi_resolved",
+        )
+
+    def test_multi_subject_packet_rejects_duplicate_resolved_identity(self):
+        self.bind(222, "mac_modem", "subject-bind-nonce-multi-0001")
+        self.bind(223, "mac_modem", "subject-bind-nonce-multi-0002")
+        request = self.request(
+            subjects=(
+                PacketFrameSubject(
+                    user_id=222,
+                    binding_method="existing_typed_target",
+                ),
+                PacketFrameSubject(
+                    user_id=223,
+                    binding_method="existing_typed_target",
+                ),
+            ),
+            tasks=(
+                PacketFrameTask(
+                    task_id="T1",
+                    text_digest="2" * 64,
+                    task_kind="compare",
+                    object_kind="person",
+                    authority_scope="packet",
+                    temporal_scope="unspecified",
+                    currentness="unknown",
+                    required_response_act="answer",
+                    subject_requirement="required",
+                    subject_indexes=(0, 1),
+                ),
+            ),
+            text="Compare <@222> and <@223>.",
+        )
+
+        packet = build_packet(self.conn, request, environ=self.flags)
+
+        self.assertIsNotNone(packet)
+        self.assertNotEqual(
+            packet.subject_resolution.status,
+            "multi_resolved",
+        )
+        self.assertFalse(packet.component_packets)
+        self.assertFalse(packet.diagnostics.revalidation_status.startswith("passed"))
 
     def test_unseen_label_and_multiple_subjects_fail_closed(self):
         unseen = self.request(
