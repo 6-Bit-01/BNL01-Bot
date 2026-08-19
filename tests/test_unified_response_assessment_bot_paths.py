@@ -269,7 +269,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             assessment.excluded_lanes,
         )
 
-    def test_incidental_broadcast_entity_match_keeps_ordinary_packet_owner(self):
+    def test_expanded_second_user_keeps_ordinary_packet_owner(self):
         text = (
             "What do you know about Mac Modem, and what do you know "
             "about DJ Floppy Disc?"
@@ -284,8 +284,12 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
             "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            (
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_"
+                "SCOPED_EXPANSION_ENABLED"
+            ): "true",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
-            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "101",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "101,202",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "303",
             "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
             "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
@@ -358,9 +362,9 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         ):
             metadata = {}
             prompt, *_ = bnl01_bot.build_user_aware_prompt(
-                101,
+                202,
                 1,
-                "Member 1",
+                "Member 2",
                 text,
                 channel_name="bnl-testing",
                 channel_id=303,

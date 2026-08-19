@@ -11,6 +11,7 @@ import bnl_relationship_engine as relationships
 from bnl_shared_brain_synthesis import (
     ORDINARY_CHAT_AUTHORITY,
     ORDINARY_CHAT_ROUTE_FAMILY,
+    ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV,
     audit_ordinary_chat_candidate_claims,
     begin_single_packet_run,
     build_evaluation_report,
@@ -496,7 +497,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         return replace(self.basis, packet=packet)
 
-    def test_configuration_is_default_off_exact_scope_and_conflict_closed(self):
+    def test_configuration_is_default_off_private_scope_and_conflict_closed(self):
         disabled = ordinary_chat_configuration(
             {
                 **self.flags,
@@ -508,6 +509,21 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
 
         configured = ordinary_chat_configuration(self.flags)
         self.assertTrue(configured["effective"])
+        self.assertEqual(
+            configured["contract_version"],
+            "ordinary_chat_single_packet_v4",
+        )
+        self.assertEqual(configured["scope_mode"], "private_acceptance")
+        self.assertFalse(
+            configured["scoped_expansion_configured_enabled"]
+        )
+        self.assertFalse(configured["scoped_expansion_effective"])
+        self.assertFalse(configured["expanded_scope_present"])
+        self.assertEqual(configured["max_scoped_guilds"], 1)
+        self.assertEqual(configured["private_user_count"], 1)
+        self.assertEqual(configured["private_channel_count"], 1)
+        self.assertEqual(configured["max_scoped_users"], 8)
+        self.assertEqual(configured["max_scoped_channels"], 4)
         self.assertEqual(configured["provider_call_limit"], 1)
         self.assertEqual(configured["corrective_call_limit"], 0)
         self.assertEqual(
@@ -515,14 +531,36 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED",
         )
 
-        expanded = ordinary_chat_configuration(
+        expanded_without_gate = ordinary_chat_configuration(
             {
                 **self.flags,
                 "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7,8",
             }
         )
-        self.assertFalse(expanded["effective"])
-        self.assertEqual(expanded["reason"], "scope_limit_exceeded")
+        self.assertFalse(expanded_without_gate["effective"])
+        self.assertTrue(expanded_without_gate["expanded_scope_present"])
+        self.assertEqual(
+            expanded_without_gate["reason"],
+            "scoped_expansion_not_enabled",
+        )
+        blocked_expansion = ordinary_chat_route_scope_decision(
+            guild_id=1,
+            user_id=8,
+            channel_id=10,
+            route_mode="normal_chat",
+            channel_policy="public_context",
+            current_direct=True,
+            user_text=self.text,
+            environ={
+                **self.flags,
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7,8",
+            },
+        )
+        self.assertFalse(blocked_expansion.eligible)
+        self.assertEqual(
+            blocked_expansion.reason,
+            "configuration_scoped_expansion_not_enabled",
+        )
 
         conflicting = ordinary_chat_configuration(
             {
@@ -534,6 +572,158 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(
             conflicting["reason"],
             "comparison_authority_conflict",
+        )
+
+    def test_bounded_expansion_requires_its_gate_and_stays_capped(self):
+        expanded_flags = {
+            **self.flags,
+            ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV: "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7,8",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10,11",
+        }
+        expanded = ordinary_chat_configuration(expanded_flags)
+
+        self.assertTrue(expanded["effective"])
+        self.assertEqual(expanded["reason"], ORDINARY_CHAT_AUTHORITY)
+        self.assertEqual(expanded["scope_mode"], "bounded_expansion")
+        self.assertTrue(expanded["scoped_expansion_configured_enabled"])
+        self.assertTrue(expanded["scoped_expansion_effective"])
+        self.assertTrue(expanded["expanded_scope_present"])
+        self.assertEqual(expanded["guild_allowlist_count"], 1)
+        self.assertEqual(expanded["user_allowlist_count"], 2)
+        self.assertEqual(expanded["channel_allowlist_count"], 2)
+        self.assertEqual(
+            expanded["expansion_gate_env"],
+            ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV,
+        )
+        reordered = ordinary_chat_configuration(
+            {
+                **expanded_flags,
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "8,7",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "11,10",
+            }
+        )
+        self.assertEqual(reordered["scope_digest"], expanded["scope_digest"])
+
+        for user_id in (7, 8):
+            for channel_id in (10, 11):
+                with self.subTest(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                ):
+                    decision = ordinary_chat_route_scope_decision(
+                        guild_id=1,
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        route_mode="normal_chat",
+                        channel_policy="public_context",
+                        current_direct=True,
+                        user_text=self.text,
+                        environ=expanded_flags,
+                    )
+                    self.assertTrue(decision.eligible)
+
+        for override, reason in (
+            ({"user_id": 9}, "user_not_allowlisted"),
+            ({"channel_id": 12}, "channel_not_allowlisted"),
+            ({"guild_id": 2}, "guild_not_allowlisted"),
+        ):
+            with self.subTest(reason=reason):
+                common = {
+                    "guild_id": 1,
+                    "user_id": 7,
+                    "channel_id": 10,
+                    "route_mode": "normal_chat",
+                    "channel_policy": "public_context",
+                    "current_direct": True,
+                    "user_text": self.text,
+                    "environ": expanded_flags,
+                }
+                decision = ordinary_chat_route_scope_decision(
+                    **{**common, **override}
+                )
+                self.assertFalse(decision.eligible)
+                self.assertEqual(decision.reason, reason)
+
+        oversized_users = ordinary_chat_configuration(
+            {
+                **expanded_flags,
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": ",".join(
+                    str(value) for value in range(1, 10)
+                ),
+            }
+        )
+        self.assertFalse(oversized_users["effective"])
+        self.assertEqual(
+            oversized_users["reason"],
+            "scope_limit_exceeded",
+        )
+
+        oversized_channels = ordinary_chat_configuration(
+            {
+                **expanded_flags,
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": (
+                    "10,11,12,13,14"
+                ),
+            }
+        )
+        self.assertFalse(oversized_channels["effective"])
+        self.assertEqual(
+            oversized_channels["reason"],
+            "scope_limit_exceeded",
+        )
+
+        oversized_guilds = ordinary_chat_configuration(
+            {
+                **expanded_flags,
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1,2",
+            }
+        )
+        self.assertFalse(oversized_guilds["effective"])
+        self.assertEqual(
+            oversized_guilds["reason"],
+            "scope_limit_exceeded",
+        )
+
+        maximum_scope = ordinary_chat_configuration(
+            {
+                **expanded_flags,
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": ",".join(
+                    str(value) for value in range(1, 9)
+                ),
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": (
+                    "10,11,12,13"
+                ),
+            }
+        )
+        self.assertTrue(maximum_scope["effective"])
+        self.assertEqual(maximum_scope["user_allowlist_count"], 8)
+        self.assertEqual(maximum_scope["channel_allowlist_count"], 4)
+
+    def test_expansion_gate_alone_does_not_expand_private_scope(self):
+        expanded_gate_only = ordinary_chat_configuration(
+            {
+                **self.flags,
+                ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV: "true",
+            }
+        )
+        private = ordinary_chat_configuration(self.flags)
+
+        self.assertTrue(expanded_gate_only["effective"])
+        self.assertEqual(
+            expanded_gate_only["scope_mode"],
+            "private_acceptance",
+        )
+        self.assertTrue(
+            expanded_gate_only["scoped_expansion_configured_enabled"]
+        )
+        self.assertFalse(
+            expanded_gate_only["scoped_expansion_effective"]
+        )
+        self.assertFalse(expanded_gate_only["expanded_scope_present"])
+        self.assertNotEqual(
+            expanded_gate_only["scope_digest"],
+            private["scope_digest"],
         )
 
     def test_scope_excludes_wrong_identity_media_and_specialized_routes(self):

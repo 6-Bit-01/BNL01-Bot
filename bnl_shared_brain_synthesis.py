@@ -78,9 +78,12 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v3"
+    "ordinary_chat_single_packet_v4"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
+ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV = (
+    "BNL_ORDINARY_CHAT_SINGLE_PACKET_SCOPED_EXPANSION_ENABLED"
+)
 ORDINARY_CHAT_GUILD_IDS_ENV = (
     "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS"
 )
@@ -104,8 +107,10 @@ _MAX_SCOPED_USERS = 8
 _MAX_SCOPED_CHANNELS = 4
 _MAX_PUBLIC_HOME_OWNER_CHANNELS = 1
 _MAX_ORDINARY_CHAT_GUILDS = 1
-_MAX_ORDINARY_CHAT_USERS = 1
-_MAX_ORDINARY_CHAT_CHANNELS = 1
+_PRIVATE_ORDINARY_CHAT_USERS = 1
+_PRIVATE_ORDINARY_CHAT_CHANNELS = 1
+_MAX_ORDINARY_CHAT_SCOPED_USERS = 8
+_MAX_ORDINARY_CHAT_SCOPED_CHANNELS = 4
 _LIVE_GATES = (
     "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED",
     "BNL_RELATIONSHIP_V2_LIVE_ENABLED",
@@ -1594,9 +1599,12 @@ def configuration(
 def _ordinary_chat_configuration_details(
     environ: Mapping[str, str],
 ) -> dict[str, Any]:
-    """Resolve the exact one-guild/user/channel ordinary-chat authority."""
+    """Resolve private or explicitly expanded ordinary-chat authority."""
 
     requested = _flag(environ.get(ORDINARY_CHAT_ENABLED_ENV, ""))
+    scoped_expansion_requested = _flag(
+        environ.get(ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV, "")
+    )
     guilds = _positive_ids(environ.get(ORDINARY_CHAT_GUILD_IDS_ENV, ""))
     users = _positive_ids(environ.get(ORDINARY_CHAT_USER_IDS_ENV, ""))
     channels = _positive_ids(
@@ -1607,10 +1615,22 @@ def _ordinary_chat_configuration_details(
         or _flag(environ.get(PUBLIC_HOME_OWNER_ENABLED_ENV, ""))
     )
     scope_present = bool(guilds and users and channels)
+    expanded_scope_present = bool(
+        len(users) > _PRIVATE_ORDINARY_CHAT_USERS
+        or len(channels) > _PRIVATE_ORDINARY_CHAT_CHANNELS
+    )
     scope_within_limits = bool(
         len(guilds) == _MAX_ORDINARY_CHAT_GUILDS
-        and len(users) == _MAX_ORDINARY_CHAT_USERS
-        and len(channels) == _MAX_ORDINARY_CHAT_CHANNELS
+        and 1 <= len(users) <= _MAX_ORDINARY_CHAT_SCOPED_USERS
+        and 1 <= len(channels) <= _MAX_ORDINARY_CHAT_SCOPED_CHANNELS
+    )
+    expansion_authorized = bool(
+        not expanded_scope_present or scoped_expansion_requested
+    )
+    scope_mode = (
+        "bounded_expansion"
+        if expanded_scope_present
+        else "private_acceptance"
     )
     packet_ready = packet_shadow_enabled(environ)
     assessment_ready = assessment_shadow_enabled(environ)
@@ -1643,7 +1663,12 @@ def _ordinary_chat_configuration_details(
     prerequisites_ready = bool(
         packet_ready and assessment_ready and not version_conflicts
     )
-    fully_scoped = bool(requested and scope_present and scope_within_limits)
+    fully_scoped = bool(
+        requested
+        and scope_present
+        and scope_within_limits
+        and expansion_authorized
+    )
     effective = bool(
         fully_scoped
         and prerequisites_ready
@@ -1654,6 +1679,12 @@ def _ordinary_chat_configuration_details(
         reason = "disabled"
     elif scope_present and not scope_within_limits:
         reason = "scope_limit_exceeded"
+    elif (
+        scope_present
+        and expanded_scope_present
+        and not scoped_expansion_requested
+    ):
+        reason = "scoped_expansion_not_enabled"
     elif not fully_scoped:
         reason = "scope_incomplete"
     elif comparison_authority_requested:
@@ -1668,6 +1699,14 @@ def _ordinary_chat_configuration_details(
         reason = ORDINARY_CHAT_AUTHORITY
     return {
         "requested": requested,
+        "scoped_expansion_requested": scoped_expansion_requested,
+        "scoped_expansion_effective": bool(
+            effective
+            and expanded_scope_present
+            and scoped_expansion_requested
+        ),
+        "expanded_scope_present": expanded_scope_present,
+        "scope_mode": scope_mode,
         "effective": effective,
         "reason": reason,
         "authority_mode": ORDINARY_CHAT_AUTHORITY,
@@ -1676,6 +1715,7 @@ def _ordinary_chat_configuration_details(
         "channels": channels,
         "channel_policies": _ORDINARY_CHAT_CHANNEL_POLICIES,
         "scope_present": scope_present,
+        "scope_within_limits": scope_within_limits,
         "fully_scoped": fully_scoped,
         "packet_ready": packet_ready,
         "assessment_ready": assessment_ready,
@@ -1686,7 +1726,9 @@ def _ordinary_chat_configuration_details(
         "comparison_authority_requested": comparison_authority_requested,
         "scope_digest": (
             _digest(
-                "ordinary_chat_single_packet_scope_v1",
+                "ordinary_chat_single_packet_scope_v2",
+                scope_mode,
+                scoped_expansion_requested,
                 tuple(sorted(guilds)),
                 tuple(sorted(users)),
                 tuple(sorted(channels)),
@@ -1723,6 +1765,14 @@ def ordinary_chat_configuration(
         "capability": ORDINARY_CHAT_CAPABILITY_NAME,
         "contract_version": ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION,
         "configured_enabled": details["requested"],
+        "scoped_expansion_configured_enabled": details[
+            "scoped_expansion_requested"
+        ],
+        "scoped_expansion_effective": details[
+            "scoped_expansion_effective"
+        ],
+        "expanded_scope_present": details["expanded_scope_present"],
+        "scope_mode": details["scope_mode"],
         "effective": details["effective"],
         "reason": details["reason"],
         "authority_mode": ORDINARY_CHAT_AUTHORITY,
@@ -1739,6 +1789,14 @@ def ordinary_chat_configuration(
         "conflicts": conflicts,
         "scope_digest": details["scope_digest"],
         "kill_switch_env": ORDINARY_CHAT_ENABLED_ENV,
+        "expansion_gate_env": (
+            ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV
+        ),
+        "max_scoped_guilds": _MAX_ORDINARY_CHAT_GUILDS,
+        "private_user_count": _PRIVATE_ORDINARY_CHAT_USERS,
+        "private_channel_count": _PRIVATE_ORDINARY_CHAT_CHANNELS,
+        "max_scoped_users": _MAX_ORDINARY_CHAT_SCOPED_USERS,
+        "max_scoped_channels": _MAX_ORDINARY_CHAT_SCOPED_CHANNELS,
         "provider_call_limit": 1,
         "corrective_call_limit": 0,
     }
