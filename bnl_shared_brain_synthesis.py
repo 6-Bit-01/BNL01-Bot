@@ -42,6 +42,7 @@ from bnl_unified_intelligence_packet import (
     SCHEMA_VERSION as PACKET_SCHEMA_VERSION,
     UnifiedIntelligencePacket,
     mark_packet_application,
+    packet_subject_resolutions,
     revalidate_packet,
     shadow_enabled as packet_shadow_enabled,
 )
@@ -53,11 +54,11 @@ from bnl_unified_response_assessment import (
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_v10"
+SCHEMA_VERSION = "shared_brain_synthesis_v11"
 CAPABILITY_NAME = "shared_brain_public_broad_recall"
 CAPABILITY_CONTRACT_VERSION = "hybrid_shared_brain_v1"
 CAPABILITY_RECEIPT_VERSION = "shared_brain_capability_receipt_v1"
-_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v9"
+_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v10"
 _EXPECTED_CLAIM_CONTRACT_VERSION = "hybrid_canon_claim_v1"
 _EXPECTED_ASSESSMENT_VERSION = "unified_response_assessment_v7"
 _EXPECTED_IDENTITY_CONTRACT_VERSION = "canon_entity_account_binding_v1"
@@ -77,7 +78,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v2"
+    "ordinary_chat_single_packet_v3"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_GUILD_IDS_ENV = (
@@ -1188,7 +1189,9 @@ class SharedBrainSynthesisBasis:
     profile_recognized_canon_identity: bool = False
     identity_canon_only: bool = False
     honest_empty_profile_fallback: bool = False
-    rendered_evidence_refs: tuple[tuple[str, str, str], ...] = ()
+    rendered_evidence_refs: tuple[
+        tuple[str, str, str, tuple[int, ...]], ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -2537,6 +2540,27 @@ def render_packet_context(
             ),
         )
     )
+    resolutions = packet_subject_resolutions(packet)
+    if len(resolutions) > 1:
+        first_by_subject = []
+        for resolution in resolutions:
+            accepted_keys = {
+                str(resolution.subject_key or ""),
+                str(resolution.entity_ref or ""),
+            } - {""}
+            first_item = next(
+                (
+                    item
+                    for item in ordered_items
+                    if str(item.subject_key or "") in accepted_keys
+                ),
+                None,
+            )
+            if first_item is not None and first_item not in first_by_subject:
+                first_by_subject.append(first_item)
+        ordered_items = tuple(first_by_subject) + tuple(
+            item for item in ordered_items if item not in first_by_subject
+        )
     adaptive_support = _adaptive_supporting_observation_map(
         packet,
         ordered_items,
@@ -2871,7 +2895,7 @@ def _ordinary_packet_context(
 def _ordinary_rendered_evidence_refs(
     packet: UnifiedIntelligencePacket,
     source_digests: Sequence[str],
-) -> tuple[tuple[str, str, str], ...]:
+) -> tuple[tuple[str, str, str, tuple[int, ...]], ...]:
     """Bind rendered E-identifiers to lanes without exposing source IDs."""
 
     remaining = list(packet.items)
@@ -2888,7 +2912,25 @@ def _ordinary_rendered_evidence_refs(
         if match_index < 0:
             return ()
         item = remaining.pop(match_index)
-        refs.append(("E%s" % index, item.lane, item.source_digest))
+        subject_indexes = tuple(
+            subject_index
+            for subject_index, resolution in enumerate(
+                packet_subject_resolutions(packet)
+            )
+            if item.subject_key
+            in {
+                str(resolution.subject_key or ""),
+                str(resolution.entity_ref or ""),
+            }
+        )
+        refs.append(
+            (
+                "E%s" % index,
+                item.lane,
+                item.source_digest,
+                subject_indexes,
+            )
+        )
     return tuple(refs)
 
 
@@ -2946,19 +2988,39 @@ def render_ordinary_chat_task_contract(
     if not tasks:
         return ""
     task_lines = [
-        "- %s | authority=%s | object=%s | currentness=%s | response=%s"
+        "- %s | authority=%s | object=%s | currentness=%s | response=%s "
+        "| subjects=%s"
         % (
             str(getattr(task, "task_id", "") or ""),
             str(getattr(task, "authority_scope", "") or "unknown"),
             str(getattr(task, "object_kind", "") or "unknown"),
             str(getattr(task, "currentness", "") or "unknown"),
             str(getattr(task, "required_response_act", "") or "answer"),
+            ",".join(
+                "S%s" % (int(subject_index) + 1)
+                for subject_index in getattr(task, "subject_indexes", ())
+            )
+            or "none",
         )
         for task in tasks
     ]
     evidence_lines = [
-        "- %s | lane=%s" % (evidence_id, lane)
-        for evidence_id, lane, _digest_value in basis.rendered_evidence_refs
+        "- %s | lane=%s | subjects=%s"
+        % (
+            evidence_id,
+            lane,
+            ",".join(
+                "S%s" % (int(subject_index) + 1)
+                for subject_index in subject_indexes
+            )
+            or "none",
+        )
+        for (
+            evidence_id,
+            lane,
+            _digest_value,
+            subject_indexes,
+        ) in basis.rendered_evidence_refs
     ]
     return (
         "TYPED TURN TASK CONTRACT:\n"
@@ -3075,9 +3137,14 @@ def validate_ordinary_chat_response_contract(
             status="task_coverage_mismatch",
             task_count=len(tasks),
         )
-    evidence_lanes = {
-        evidence_id: lane
-        for evidence_id, lane, _digest_value in basis.rendered_evidence_refs
+    evidence_scope = {
+        evidence_id: (lane, tuple(subject_indexes))
+        for (
+            evidence_id,
+            lane,
+            _digest_value,
+            subject_indexes,
+        ) in basis.rendered_evidence_refs
     }
     support_count = 0
     for task, result in zip(tasks, contract.tasks):
@@ -3101,12 +3168,34 @@ def validate_ordinary_chat_response_contract(
             continue
         if authority == "packet":
             allowed_lanes = _ordinary_task_allowed_lanes(task)
+            required_subject_indexes = set(
+                int(subject_index)
+                for subject_index in getattr(task, "subject_indexes", ())
+            )
             allowed_ids = {
                 evidence_id
-                for evidence_id, lane in evidence_lanes.items()
+                for evidence_id, (
+                    lane,
+                    subject_indexes,
+                ) in evidence_scope.items()
                 if lane in allowed_lanes
+                and (
+                    not required_subject_indexes
+                    or required_subject_indexes.intersection(subject_indexes)
+                )
             }
-            if result.support_kind == "hold" and not allowed_ids:
+            covered_subject_indexes = {
+                subject_index
+                for evidence_id in allowed_ids
+                for subject_index in evidence_scope[evidence_id][1]
+                if subject_index in required_subject_indexes
+            }
+            missing_subject_evidence = bool(
+                required_subject_indexes - covered_subject_indexes
+            )
+            if result.support_kind == "hold" and (
+                not allowed_ids or missing_subject_evidence
+            ):
                 if result.evidence_ids:
                     return OrdinaryChatContractValidation(
                         status="hold_has_support_reference",
@@ -3117,6 +3206,14 @@ def validate_ordinary_chat_response_contract(
                 result.support_kind != "packet"
                 or not result.evidence_ids
                 or not set(result.evidence_ids).issubset(allowed_ids)
+                or missing_subject_evidence
+                or required_subject_indexes
+                - {
+                    subject_index
+                    for evidence_id in result.evidence_ids
+                    for subject_index in evidence_scope[evidence_id][1]
+                    if subject_index in required_subject_indexes
+                }
             ):
                 return OrdinaryChatContractValidation(
                     status="packet_support_invalid",

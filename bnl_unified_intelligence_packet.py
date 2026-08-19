@@ -91,7 +91,7 @@ from bnl_website_relay_state import (
 )
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v9"
+SCHEMA_VERSION = "unified_intelligence_packet_v10"
 SUBJECT_RESOLUTION_VERSION = "governed_packet_subject_resolution_v1"
 SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v2"
 JOURNAL_PUBLICATION_SOURCE_CLASS = "journal_publication_projection"
@@ -510,7 +510,12 @@ class PacketSubjectResolution:
 
     @property
     def applicable(self) -> bool:
-        return self.status in {"resolved", "not_applicable", "legacy"}
+        return self.status in {
+            "resolved",
+            "multi_resolved",
+            "not_applicable",
+            "legacy",
+        }
 
 
 @dataclass(frozen=True)
@@ -655,6 +660,8 @@ class UnifiedIntelligencePacket:
     source_snapshot_digest: str = ""
     profile_sufficiency: ProfileSufficiency = ProfileSufficiency()
     validation_items: tuple[IntelligencePacketItem, ...] = ()
+    subject_resolutions: tuple[PacketSubjectResolution, ...] = ()
+    component_packets: tuple["UnifiedIntelligencePacket", ...] = ()
 
     @property
     def detailed_lanes(self) -> tuple[str, ...]:
@@ -741,6 +748,31 @@ class UnifiedIntelligencePacket:
                 for lane in self.diagnostics.missing_lanes
             )
         )
+
+
+def packet_subject_resolutions(
+    packet: UnifiedIntelligencePacket,
+) -> tuple[PacketSubjectResolution, ...]:
+    """Return every independently governed packet subject in frame order."""
+
+    if packet.subject_resolutions:
+        return packet.subject_resolutions
+    if packet.subject_resolution.status in {"resolved", "legacy"}:
+        return (packet.subject_resolution,)
+    return ()
+
+
+def packet_subject_keys(
+    packet: UnifiedIntelligencePacket,
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            value
+            for resolution in packet_subject_resolutions(packet)
+            for value in (resolution.subject_key, resolution.entity_ref)
+            if str(value or "").strip()
+        )
+    )
 
 
 def _flag(value: Any) -> bool:
@@ -5785,6 +5817,83 @@ def _publication_revalidation_payload(item: IntelligencePacketItem) -> dict[str,
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _merge_packet_items(
+    packets: Sequence[UnifiedIntelligencePacket],
+    *,
+    validation: bool = False,
+) -> tuple[IntelligencePacketItem, ...]:
+    merged = []
+    seen = set()
+    for packet in packets:
+        source = packet.validation_items if validation else packet.items
+        for item in source:
+            key = (
+                item.lane,
+                item.source_ref,
+                item.source_digest,
+                item.subject_key,
+                item.predicate_key,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return tuple(merged)
+
+
+def _revalidate_multi_packet_in_snapshot(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    *,
+    environ: Mapping[str, str] | None = None,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
+) -> PacketRevalidationResult:
+    components = tuple(packet.component_packets)
+    changed = 0
+    errors = 0
+    statuses = []
+    if (
+        packet.subject_resolution.status != "multi_resolved"
+        or packet.subject_resolutions
+        != tuple(component.subject_resolution for component in components)
+        or packet.items != _merge_packet_items(components)
+        or packet.validation_items
+        != _merge_packet_items(components, validation=True)
+    ):
+        changed += 1
+    for component in components:
+        result = _revalidate_packet_in_snapshot(
+            conn,
+            component,
+            environ=environ,
+            journal_control_snapshot=journal_control_snapshot,
+            journal_control_snapshot_provided=(
+                journal_control_snapshot_provided
+            ),
+        )
+        changed += int(result.changed_source_count or 0)
+        errors += int(result.processing_error_count or 0)
+        statuses.append(result.status)
+    if errors:
+        status = "processing_error"
+    elif "subject_binding_changed" in statuses:
+        status = "subject_binding_changed"
+    elif changed:
+        status = "source_changed"
+    elif "passed_with_provider_snapshot" in statuses:
+        status = "passed_with_provider_snapshot"
+    else:
+        status = "passed"
+    return PacketRevalidationResult(
+        valid=not errors and not changed,
+        status=status,
+        changed_source_count=changed,
+        processing_error_count=errors,
+        subject_resolution_status="multi_resolved",
+    )
+
+
 def _revalidate_packet_in_snapshot(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
@@ -5794,6 +5903,16 @@ def _revalidate_packet_in_snapshot(
     journal_control_snapshot_provided: bool = False,
 ) -> PacketRevalidationResult:
     """Re-read every durable source without applying packet content live."""
+    if packet.component_packets:
+        return _revalidate_multi_packet_in_snapshot(
+            conn,
+            packet,
+            environ=environ,
+            journal_control_snapshot=journal_control_snapshot,
+            journal_control_snapshot_provided=(
+                journal_control_snapshot_provided
+            ),
+        )
     changed = 0
     errors = 0
     current_subject_resolution = resolve_packet_subject(
@@ -6023,15 +6142,44 @@ def _packet_invariants(
     packet: UnifiedIntelligencePacket,
 ) -> tuple[str, ...]:
     invalid = []
-    subject = _request_subject_key(packet.request)
     accepted_subject_keys = {
-        value
-        for value in (
-            packet.subject_resolution.subject_key,
-            packet.subject_resolution.entity_ref,
-        )
-        if value
+        value for value in packet_subject_keys(packet) if value
     }
+    if packet.component_packets:
+        if packet.subject_resolution.status != "multi_resolved":
+            invalid.append("multi_subject_summary_status_invalid")
+        if packet.subject_resolutions != tuple(
+            component.subject_resolution
+            for component in packet.component_packets
+        ):
+            invalid.append("multi_subject_resolution_mismatch")
+        if any(
+            resolution.status != "resolved"
+            for resolution in packet.subject_resolutions
+        ):
+            invalid.append("multi_subject_component_unresolved")
+        if packet.items != _merge_packet_items(packet.component_packets):
+            invalid.append("multi_subject_item_merge_mismatch")
+        if packet.validation_items != _merge_packet_items(
+            packet.component_packets,
+            validation=True,
+        ):
+            invalid.append("multi_subject_validation_merge_mismatch")
+        referenced_indexes = {
+            subject_index
+            for task in packet.request.frame_tasks
+            for subject_index in task.subject_indexes
+        }
+        if (
+            referenced_indexes != set(range(len(packet.subject_resolutions)))
+            or any(
+                subject_index < 0
+                or subject_index >= len(packet.subject_resolutions)
+                for task in packet.request.frame_tasks
+                for subject_index in task.subject_indexes
+            )
+        ):
+            invalid.append("multi_subject_task_scope_invalid")
     governed_subject_required = bool(
         str(packet.request.frame_subject_requirement or "").strip().lower()
         == "required"
@@ -6130,7 +6278,7 @@ def _packet_invariants(
         if item.revalidation_kind == "recognized_canon" and not (
             item.lane == "canon"
             and item.source_type == "recognized_canon_fact"
-            and item.subject_key == subject
+            and item.subject_key in accepted_subject_keys
             and item.source_class == SourceClass.APPROVED_CANON.value
         ):
             invalid.append("recognized_canon_scope_violation")
@@ -6165,7 +6313,7 @@ def _packet_invariants(
         if item.supporting_observations and not (
             item.lane in {"atomic_knowledge", "recurring_theme"}
             and item.source_type == "topic_or_motif"
-            and item.subject_key == subject
+            and item.subject_key in accepted_subject_keys
         ):
             invalid.append("supporting_observation_scope_violation")
         if item.canon_status == CanonStatus.LIVING.value and not (
@@ -6183,7 +6331,7 @@ def _packet_invariants(
         if item.lane == "recurring_theme" and not (
             item.source_type == "topic_or_motif"
             and item.revalidation_kind == "recurring_theme"
-            and item.subject_key == subject
+            and item.subject_key in accepted_subject_keys
             and bool(item.root_identities)
             and bool(item.occurrence_identities)
             and (
@@ -6239,13 +6387,13 @@ def _packet_invariants(
             and bool(item.occurrence_identities)
             and (
                 item.lane != "approved_fact"
-                or item.subject_key == subject
+                or item.subject_key in accepted_subject_keys
             )
             and (
                 item.source_type != "recognized_declared_canon_claim"
                 or (
                     item.lane == "canon"
-                    and item.subject_key == subject
+                    and item.subject_key in accepted_subject_keys
                 )
             )
         ):
@@ -6285,7 +6433,7 @@ def _packet_invariants(
         if item.revalidation_kind == "recognized_canon" and not (
             item.lane == "canon"
             and item.source_type == "recognized_canon_fact"
-            and item.subject_key == subject
+            and item.subject_key in accepted_subject_keys
             and item.source_class == SourceClass.APPROVED_CANON.value
         ):
             invalid.append("validation_support_canon_scope_violation")
@@ -6300,17 +6448,434 @@ def _packet_invariants(
     return tuple(dict.fromkeys(invalid))
 
 
+def _task_scoped_multi_subject_requested(
+    request: IntelligencePacketRequest,
+) -> bool:
+    subjects = tuple(request.frame_subjects)
+    tasks = tuple(request.frame_tasks)
+    if (
+        str(request.frame_status or "").lower() != "resolved"
+        or len(subjects) < 2
+        or not tasks
+    ):
+        return False
+    referenced = {
+        subject_index
+        for task in tasks
+        for subject_index in task.subject_indexes
+    }
+    return bool(
+        referenced == set(range(len(subjects)))
+        and all(
+            0 <= subject_index < len(subjects)
+            for task in tasks
+            for subject_index in task.subject_indexes
+        )
+        and all(
+            task.subject_requirement != "required"
+            or bool(task.subject_indexes)
+            for task in tasks
+        )
+    )
+
+
+def _sum_component_counter(
+    components: Sequence[UnifiedIntelligencePacket],
+    attribute: str,
+) -> dict[str, int]:
+    result: Counter[str] = Counter()
+    for component in components:
+        result.update(
+            {
+                str(key): int(value or 0)
+                for key, value in dict(
+                    getattr(component.diagnostics, attribute, {}) or {}
+                ).items()
+            }
+        )
+    return dict(sorted(result.items()))
+
+
+def _component_query_status(
+    components: Sequence[UnifiedIntelligencePacket],
+    attribute: str,
+) -> str:
+    statuses = tuple(
+        str(getattr(component.diagnostics, attribute, "not_requested") or "")
+        for component in components
+    )
+    active = tuple(status for status in statuses if status != "not_requested")
+    if not active:
+        return "not_requested"
+    return active[0] if len(set(active)) == 1 else "component_conflict"
+
+
+def _build_task_scoped_multi_subject_packet(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    *,
+    persist: bool,
+    environ: Mapping[str, str] | None,
+) -> UnifiedIntelligencePacket | None:
+    subjects = tuple(request.frame_subjects)
+    component_budget = max(
+        400,
+        min(max(int(request.budget_chars or 2400), 400), 6000)
+        // len(subjects),
+    )
+    components = []
+    for subject_index, subject in enumerate(subjects):
+        component_tasks = tuple(
+            replace(task, subject_indexes=(0,))
+            for task in request.frame_tasks
+            if subject_index in task.subject_indexes
+        )
+        component_request = replace(
+            request,
+            subject_user_id=0,
+            subject_entity_ref="",
+            budget_chars=component_budget,
+            frame_status="resolved",
+            frame_subject_requirement="required",
+            frame_subjects=(subject,),
+            frame_tasks=component_tasks,
+        )
+        component = build_packet(
+            conn,
+            component_request,
+            persist=False,
+            environ=environ,
+            _component_build=True,
+        )
+        if (
+            component is None
+            or component.subject_resolution.status != "resolved"
+            or component.diagnostics.processing_errors
+            or component.diagnostics.invalid_invariants
+            or not component.diagnostics.revalidation_status.startswith(
+                "passed"
+            )
+        ):
+            return build_packet(
+                conn,
+                request,
+                persist=persist,
+                environ=environ,
+                _component_build=True,
+            )
+        components.append(component)
+    components_tuple = tuple(components)
+    resolutions = tuple(
+        component.subject_resolution for component in components_tuple
+    )
+    resolution_identities = tuple(
+        str(resolution.entity_ref or resolution.subject_key or "")
+        for resolution in resolutions
+    )
+    if (
+        any(not identity for identity in resolution_identities)
+        or len(set(resolution_identities)) != len(resolution_identities)
+    ):
+        return build_packet(
+            conn,
+            request,
+            persist=persist,
+            environ=environ,
+            _component_build=True,
+        )
+    summary_resolution = PacketSubjectResolution(
+        status="multi_resolved",
+        binding_method="task_scoped_components",
+        confidence="authoritative",
+        candidate_count=len(resolutions),
+        binding_digest=_digest(
+            SUBJECT_RESOLUTION_VERSION,
+            "task_scoped_components",
+            tuple(
+                (
+                    resolution.subject_user_id,
+                    resolution.subject_key,
+                    resolution.entity_ref,
+                    resolution.binding_method,
+                    resolution.binding_digest,
+                )
+                for resolution in resolutions
+            ),
+        ),
+        reason_codes=("task_scoped_subjects_resolved",),
+    )
+    items = _merge_packet_items(components_tuple)
+    validation_items = _merge_packet_items(
+        components_tuple,
+        validation=True,
+    )
+    exclusions = tuple(
+        exclusion
+        for component in components_tuple
+        for exclusion in component.exclusions
+    )
+    diagnostics = IntelligencePacketDiagnostics(
+        candidates_by_lane=_sum_component_counter(
+            components_tuple,
+            "candidates_by_lane",
+        ),
+        selected_by_lane=dict(
+            sorted(Counter(item.lane for item in items).items())
+        ),
+        selected_by_source_class=dict(
+            sorted(Counter(item.source_class for item in items).items())
+        ),
+        candidates_by_canon_status=_sum_component_counter(
+            components_tuple,
+            "candidates_by_canon_status",
+        ),
+        selected_by_canon_status=dict(
+            sorted(
+                Counter(
+                    item.canon_status for item in items if item.canon_status
+                ).items()
+            )
+        ),
+        candidates_by_canon_domain=_sum_component_counter(
+            components_tuple,
+            "candidates_by_canon_domain",
+        ),
+        selected_by_canon_domain=dict(
+            sorted(
+                Counter(
+                    item.canon_domain for item in items if item.canon_domain
+                ).items()
+            )
+        ),
+        selected_atomic_states=_sum_component_counter(
+            components_tuple,
+            "selected_atomic_states",
+        ),
+        validation_support_by_lane=dict(
+            sorted(Counter(item.lane for item in validation_items).items())
+        ),
+        excluded_by_reason=_sum_component_counter(
+            components_tuple,
+            "excluded_by_reason",
+        ),
+        missing_lanes=list(
+            dict.fromkeys(
+                lane
+                for component in components_tuple
+                for lane in component.diagnostics.missing_lanes
+            )
+        ),
+        conflict_reasons=list(
+            dict.fromkeys(
+                reason
+                for component in components_tuple
+                for reason in component.diagnostics.conflict_reasons
+            )
+        ),
+        visibility_exclusions=sum(
+            component.diagnostics.visibility_exclusions
+            for component in components_tuple
+        ),
+        budget_exclusions=sum(
+            component.diagnostics.budget_exclusions
+            for component in components_tuple
+        ),
+        duplicate_suppression=sum(
+            component.diagnostics.duplicate_suppression
+            for component in components_tuple
+        ),
+        root_collapse_suppression=sum(
+            component.diagnostics.root_collapse_suppression
+            for component in components_tuple
+        ),
+        shared_root_projection_count=sum(
+            component.diagnostics.shared_root_projection_count
+            for component in components_tuple
+        ),
+        canon_identity_status="task_scoped_multi",
+        canon_identity_stable_row_count=sum(
+            component.diagnostics.canon_identity_stable_row_count
+            for component in components_tuple
+        ),
+        subject_resolution_status="multi_resolved",
+        subject_resolution_method="task_scoped_components",
+        subject_resolution_candidate_count=len(resolutions),
+        frame_applicability_exclusion_count=sum(
+            component.diagnostics.frame_applicability_exclusion_count
+            for component in components_tuple
+        ),
+        episode_query_status=_component_query_status(
+            components_tuple,
+            "episode_query_status",
+        ),
+        episode_candidate_count=sum(
+            component.diagnostics.episode_candidate_count
+            for component in components_tuple
+        ),
+        theme_query_status=_component_query_status(
+            components_tuple,
+            "theme_query_status",
+        ),
+        theme_independent_root_count=sum(
+            component.diagnostics.theme_independent_root_count
+            for component in components_tuple
+        ),
+        theme_independent_occurrence_count=sum(
+            component.diagnostics.theme_independent_occurrence_count
+            for component in components_tuple
+        ),
+        journal_query_status=_component_query_status(
+            components_tuple,
+            "journal_query_status",
+        ),
+        journal_control_status=_component_query_status(
+            components_tuple,
+            "journal_control_status",
+        ),
+        journal_candidate_count=sum(
+            component.diagnostics.journal_candidate_count
+            for component in components_tuple
+        ),
+        relay_query_status=_component_query_status(
+            components_tuple,
+            "relay_query_status",
+        ),
+        relay_candidate_count=sum(
+            component.diagnostics.relay_candidate_count
+            for component in components_tuple
+        ),
+        publication_projection_count=sum(
+            item.lane in {"journal_publication", "relay_publication"}
+            for item in items
+        ),
+    )
+    prompt_digest_payload = tuple(
+        (
+            item.lane,
+            item.source_class,
+            item.source_ref,
+            item.source_digest,
+            item.lifecycle,
+            item.usage,
+            item.root_identities,
+            item.occurrence_identities,
+            item.point_identity,
+            item.canon_status,
+            item.canon_domain,
+            item.canon_claim_kind,
+        )
+        for item in items
+    )
+    validation_digest_payload = tuple(
+        (
+            item.lane,
+            item.source_class,
+            item.source_ref,
+            item.source_digest,
+            item.lifecycle,
+            item.usage,
+            item.root_identities,
+            item.occurrence_identities,
+            item.point_identity,
+            item.canon_status,
+            item.canon_domain,
+            item.canon_claim_kind,
+        )
+        for item in validation_items
+    )
+    diagnostics.packet_digest = _digest(
+        SCHEMA_VERSION,
+        request.frame_revision,
+        request.frame_input_evidence_digest,
+        summary_resolution,
+        resolutions,
+        prompt_digest_payload,
+        validation_digest_payload,
+    )
+    source_snapshot_digest = _digest(
+        SOURCE_SNAPSHOT_VERSION,
+        request.frame_revision,
+        request.frame_input_evidence_digest,
+        summary_resolution.binding_digest,
+        tuple(
+            component.source_snapshot_digest
+            for component in components_tuple
+        ),
+        prompt_digest_payload,
+        validation_digest_payload,
+    )
+    packet = UnifiedIntelligencePacket(
+        schema_version=SCHEMA_VERSION,
+        packet_id="uip_"
+        + _digest(
+            SCHEMA_VERSION,
+            request.guild_id,
+            tuple(resolution.subject_key for resolution in resolutions),
+            request.route_mode,
+            request.channel_policy,
+            request.frame_revision,
+            diagnostics.packet_digest,
+        )[:40],
+        request=request,
+        items=items,
+        exclusions=exclusions,
+        diagnostics=diagnostics,
+        subject_resolution=summary_resolution,
+        subject_resolutions=resolutions,
+        component_packets=components_tuple,
+        source_snapshot_digest=source_snapshot_digest,
+        profile_sufficiency=ProfileSufficiency(),
+        validation_items=validation_items,
+    )
+    diagnostics.invalid_invariants.extend(_packet_invariants(packet))
+    revalidation = revalidate_packet(conn, packet, environ=environ)
+    diagnostics.revalidation_status = revalidation.status
+    diagnostics.revalidation_changed_count = (
+        revalidation.changed_source_count
+    )
+    if revalidation.processing_error_count:
+        diagnostics.processing_errors.extend(
+            "revalidation_error"
+            for _ in range(revalidation.processing_error_count)
+        )
+    if not revalidation.valid:
+        diagnostics.invalid_invariants.append(
+            "packet_source_revalidation_failed"
+        )
+    diagnostics.invalid_invariants = list(
+        dict.fromkeys(diagnostics.invalid_invariants)
+    )
+    if persist:
+        diagnostics.receipt_run_id = persist_packet_run(
+            conn,
+            packet,
+            created_at=request.now or "",
+        )
+    return packet
+
+
 def build_packet(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
     *,
     persist: bool = True,
     environ: Mapping[str, str] | None = None,
+    _component_build: bool = False,
 ) -> UnifiedIntelligencePacket | None:
     """Build one deterministic shadow packet from existing source owners."""
     if not shadow_enabled(environ):
         return None
     ensure_schema(conn)
+    if (
+        not _component_build
+        and _task_scoped_multi_subject_requested(request)
+    ):
+        return _build_task_scoped_multi_subject_packet(
+            conn,
+            request,
+            persist=persist,
+            environ=environ,
+        )
     diagnostics = IntelligencePacketDiagnostics()
     exclusions: list[IntelligencePacketExclusion] = []
     subject_resolution = resolve_packet_subject(
@@ -6607,7 +7172,7 @@ def persist_packet_run(
             packet.packet_id,
             packet.schema_version,
             int(packet.request.guild_id or 0),
-            _digest(_request_subject_key(packet.request))[:16],
+            _digest(packet_subject_keys(packet))[:16],
             str(packet.request.route_mode or "unknown")[:80],
             str(packet.request.channel_policy or "unknown")[:80],
             str(packet.request.visibility_allowance or "unknown")[:80],

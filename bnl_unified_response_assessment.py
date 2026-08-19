@@ -22,13 +22,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from bnl_canon_source_contract import BNL01
+from bnl_canon_source_contract import BNL01, CANON_ENTITY_IDENTITIES
 from bnl_conversation_context_v2 import assess_payload_grounding
 
 
 ASSESSMENT_VERSION = "unified_response_assessment_v7"
 CONVERSATION_TURN_PACKET_VERSION = "conversation_turn_evidence_v3"
-SITUATION_FRAME_VERSION = "situation_frame_v2"
+SITUATION_FRAME_VERSION = "situation_frame_v3"
 FRAME_SOURCE_REVALIDATION_VERSION = "frame_source_revalidation_v1"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
@@ -602,17 +602,48 @@ def _task_subject_indexes(
     third_party = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(segment or ""))
     matches = []
     for index, subject in enumerate(subjects):
+        if int(subject.user_id or 0) > 0 and re.search(
+            r"<@!?%s>" % int(subject.user_id),
+            segment or "",
+        ):
+            matches.append(index)
+            continue
         if bnl_self and subject.entity_ref == BNL01.key:
             matches.append(index)
             continue
         if self_subject and subject.binding_method == "current_speaker_context":
             matches.append(index)
             continue
-        label = str(subject.label_hint or "").strip()
-        if label and re.search(
-            r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(label),
-            segment or "",
-            re.I,
+        canon_subject = next(
+            (
+                candidate
+                for candidate in CANON_ENTITY_IDENTITIES
+                if candidate.key == subject.entity_ref
+            ),
+            None,
+        )
+        labels = tuple(
+            dict.fromkeys(
+                str(label or "").strip()
+                for label in (
+                    subject.label_hint,
+                    canon_subject.name if canon_subject is not None else "",
+                    *(
+                        canon_subject.aliases
+                        if canon_subject is not None
+                        else ()
+                    ),
+                )
+                if str(label or "").strip()
+            )
+        )
+        if any(
+            re.search(
+                r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(label),
+                segment or "",
+                re.I,
+            )
+            for label in labels
         ):
             matches.append(index)
     if not matches and third_party and len(subjects) == 1:
@@ -830,35 +861,53 @@ def build_situation_frame_v1(
             subjects.append(
                 SituationSubjectReference(
                     user_id=user_id,
-                    entity_ref=(entity_refs[index] if index < len(entity_refs) else ""),
+                    entity_ref="",
                     label_hint=(label_hints[index] if index < len(label_hints) else ""),
                     binding_method="existing_typed_target",
-                    confidence="high" if len(subject_ids) == 1 else "ambiguous",
+                    confidence="high",
                     role_hints=roles,
                     domain_hints=domains,
                 )
             )
-    elif label_hints or entity_refs:
-        count = max(len(label_hints), len(entity_refs))
-        for index in range(count):
-            entity_ref = (
-                entity_refs[index] if index < len(entity_refs) else ""
+    if entity_refs:
+        for entity_ref in entity_refs:
+            canon_subject = next(
+                (
+                    candidate
+                    for candidate in CANON_ENTITY_IDENTITIES
+                    if candidate.key == entity_ref
+                ),
+                None,
             )
             subjects.append(
                 SituationSubjectReference(
                     entity_ref=entity_ref,
-                    label_hint=(label_hints[index] if index < len(label_hints) else ""),
-                    binding_method=(
-                        "existing_typed_entity"
-                        if entity_ref
-                        else "reversible_label_hint"
+                    label_hint=(
+                        canon_subject.name
+                        if canon_subject is not None
+                        else entity_ref
                     ),
-                    confidence="high" if entity_ref else "low",
+                    binding_method="existing_typed_entity",
+                    confidence="high",
                     role_hints=roles,
                     domain_hints=domains,
                 )
             )
-    elif bnl_self_subject_cue:
+    elif not subject_ids and label_hints:
+        for label_hint in label_hints:
+            subjects.append(
+                SituationSubjectReference(
+                    label_hint=label_hint,
+                    binding_method="reversible_label_hint",
+                    confidence="low",
+                    role_hints=roles,
+                    domain_hints=domains,
+                )
+            )
+    if (
+        bnl_self_subject_cue
+        and not any(subject.entity_ref == BNL01.key for subject in subjects)
+    ):
         subjects.append(
             SituationSubjectReference(
                 entity_ref=BNL01.key,
@@ -869,7 +918,11 @@ def build_situation_frame_v1(
                 domain_hints=("lore", "technical"),
             )
         )
-    elif len(speakers) == 1 and self_subject_cue:
+    if (
+        len(speakers) == 1
+        and self_subject_cue
+        and not any(subject.user_id == speakers[0] for subject in subjects)
+    ):
         subjects.append(
             SituationSubjectReference(
                 user_id=speakers[0],
@@ -903,7 +956,26 @@ def build_situation_frame_v1(
     if normalized_referent in {"ambiguous", "unresolved"}:
         ambiguity.append("referent_%s" % normalized_referent)
         competing.append("nearby_referent_candidates")
-    if len(subject_ids) > 1 or len(subjects) > 1:
+    referenced_subject_indexes = {
+        subject_index
+        for task in tasks
+        for subject_index in task.subject_indexes
+    }
+    incomplete_task_subject_scope = any(
+        task.subject_requirement == "required"
+        and not task.subject_indexes
+        for task in tasks
+    )
+    unscoped_subject_candidates = bool(
+        subjects
+        and set(range(len(subjects))) - referenced_subject_indexes
+    )
+    if len(subjects) > 8:
+        ambiguity.append("subject_candidate_limit_exceeded")
+        competing.append("subject_candidates")
+    if len(subjects) > 1 and (
+        incomplete_task_subject_scope or unscoped_subject_candidates
+    ):
         ambiguity.append("multiple_subject_candidates")
         competing.append("subject_candidates")
     if (

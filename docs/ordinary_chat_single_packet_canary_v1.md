@@ -29,12 +29,19 @@ switch is `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED`.
 
 ## One factual owner and one call
 
-The immutable Situation Frame and `unified_intelligence_packet_v9` are frozen
-before generation. The packet renderer supplies the sole BARCODE, member,
-identity, relationship, episode, publication, canon, and stored-history
-factual view. The current request and verified exact-reply/referent text remain
-task evidence. Persona, style, route behavior, and safety remain expression
-owners but cannot create facts.
+The immutable Situation Frame v3 and `unified_intelligence_packet_v10` are
+frozen before generation. The packet renderer supplies the sole BARCODE,
+member, identity, relationship, episode, publication, canon, and
+stored-history factual view. The current request and verified exact-reply or
+referent text remain task evidence. Persona, style, route behavior, and safety
+remain expression owners but cannot create facts.
+
+A true multi-subject request is still one governed packet and one provider
+attempt. Each frozen task names its required subject indexes. The packet runs
+the existing single-subject resolution and selection path once per referenced
+subject, then merges those immutable component packets into a task-scoped
+composite. An extra unscoped candidate, unresolved component, changed binding,
+or incomplete task-to-subject map fails closed before generation.
 
 The cutover prompt omits legacy conversation history, durable memory tiers,
 Relationship facts/counters, duplicate Broadcast/show/site/source blocks,
@@ -55,7 +62,9 @@ For an eligible turn:
 5. The provider must return one typed task/result envelope. Every task must
    appear exactly once and in order, with packet evidence identifiers, the
    stable-public `PUBLIC` marker, the current-request `REQUEST` marker, or an
-   explicit hold/clarify act as required by the frozen task.
+   explicit hold/clarify act as required by the frozen task. Packet answers
+   must cover every subject required by that task and cannot borrow another
+   task's subject evidence.
 6. A candidate is selected once at that typed boundary. It is not
    semantically reclassified by the legacy prose guard; independent packet,
    source, frame, control-leak, exact-quote, and delivery checks can still
@@ -81,7 +90,7 @@ owners are excluded before cutover rather than treated as a fallback.
 
 ## Content-free receipts
 
-`shared_brain_synthesis_v10` receipts retain only hashes, counts, bounded
+`shared_brain_synthesis_v11` receipts retain only hashes, counts, bounded
 statuses, and timing. Ordinary-chat rows include the frame revision and input
 digest, packet/source snapshot digests, selected lane/status/domain counts,
 prompt-applied state, provider and corrective call counts, candidate-selected
@@ -106,5 +115,5 @@ Rollback requires no database deletion:
 With the switch off, ordinary-chat prompt bytes and established generation
 behavior remain unchanged. Deployment and private live acceptance are separate
 operations: merge the complete PR sequence first, run the combined automated
-suite, then enable only the exact private scope for the approved acceptance
-matrix.
+suite and 60-case acceptance matrix, then enable only the exact private scope
+for the approved provider-shadow and owner acceptance runs.

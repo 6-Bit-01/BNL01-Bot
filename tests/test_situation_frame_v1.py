@@ -172,6 +172,89 @@ class SituationFrameV1Tests(unittest.TestCase):
                     "existing_typed_entity",
                 )
 
+    def test_multiple_explicit_mentions_bind_to_one_task_without_ambiguity(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text="Compare <@202> and <@303>.",
+            current_speaker_user_ids=(101,),
+            current_speaker_labels=("Test Member",),
+            subject_user_ids=(202, 303),
+            subject_label_hints=("First Member", "Second Member"),
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(
+            tuple(subject.user_id for subject in frame.subjects),
+            (202, 303),
+        )
+        self.assertEqual(frame.tasks[0].subject_indexes, (0, 1))
+
+    def test_unscoped_second_candidate_still_fails_closed(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text="Tell me about <@202>.",
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(202, 303),
+            subject_label_hints=("First Member", "Second Member"),
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.status, "ambiguous")
+        self.assertIn("multiple_subject_candidates", frame.ambiguity_reasons)
+
+    def test_more_than_eight_scoped_subjects_fails_closed(self):
+        subject_ids = tuple(range(201, 210))
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text="Compare %s."
+            % " and ".join("<@%s>" % user_id for user_id in subject_ids),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=subject_ids,
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.status, "ambiguous")
+        self.assertIn(
+            "subject_candidate_limit_exceeded",
+            frame.ambiguity_reasons,
+        )
+
+    def test_self_and_explicit_subjects_are_scoped_to_separate_tasks(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text=(
+                "What do you remember about me, and who is <@202>?"
+            ),
+            current_speaker_user_ids=(101,),
+            current_speaker_labels=("Test Member",),
+            subject_user_ids=(202,),
+            subject_label_hints=("Other Member",),
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(
+            tuple(subject.user_id for subject in frame.subjects),
+            (202, 101),
+        )
+        self.assertEqual(
+            tuple(task.subject_indexes for task in frame.tasks),
+            ((1,), (0,)),
+        )
+
     def test_publication_owner_qualifies_the_subject_of_the_question(self):
         cases = (
             "What did the Journal say about the last show?",
