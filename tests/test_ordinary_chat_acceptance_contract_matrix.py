@@ -334,6 +334,86 @@ class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
         self.assertEqual(frame.tasks[0].authority_scope, "packet")
         self.assertEqual(frame.tasks[0].subject_indexes, (0, 1))
 
+    def test_exact_bnl_reply_excludes_explicit_relationship_object(self):
+        reply_text = (
+            "Cache Back is a founding BARCODE member and BARCODE Archive "
+            "specialist. They emerged when a laptop cache containing "
+            "Call'em Bini's music and project files was cleared, though "
+            "the two remain distinct entities."
+        )
+        context = bnl01_bot.ConversationContextResult(
+            rendered_context=(
+                "BNL-01 (exact Discord reply source): " + reply_text
+            ),
+            selected_row_ids=(77,),
+            same_room_paired_turn_count=0,
+            unpaired_row_count=1,
+            cross_channel_paired_turn_count=0,
+            current_message_duplicates_removed=0,
+            visibility_policy_exclusions=0,
+            selection_reasons=("discord_reply_source",),
+            final_char_count=len(reply_text),
+            referent_status="resolved",
+            referent_candidate_count=1,
+            referent_selected_row_ids=(77,),
+            referent_reason="discord_reply_source",
+        )
+        question = "How is he connected to Call'em Bini?"
+
+        identity_subjects, identity_status = (
+            bnl01_bot._exact_reply_canon_subject_references(
+                context,
+                question,
+            )
+        )
+
+        self.assertEqual(identity_status, "resolved")
+        self.assertEqual(
+            identity_subjects,
+            (("cache_back", "Cache Back"),),
+        )
+
+        addressing = bnl01_bot.DiscordTurnAddressing(
+            speaker="Test Member",
+            explicit_tag_recipients=("@BNL-01",),
+            reply_target="BNL-01",
+            explicitly_mentions_bnl=False,
+            reply_targets_bnl=True,
+            directly_targets_bnl=True,
+            targets_other_human=False,
+            plain_text_names_bnl=False,
+            speaker_user_id=101,
+            source_message_id=302,
+            reply_message_id=701,
+            reply_conversation_row_id=77,
+        )
+        decision = bnl01_bot.build_live_conversation_orchestration_decision(
+            engagement_decision="answer",
+            engagement_reason="direct_request",
+            channel_policy="sealed_test",
+            addressings=(addressing,),
+            context_result=context,
+            moment_situation=None,
+            guild_id=1,
+            channel_id=10,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            current_text=question,
+            current_speaker_user_ids=(101,),
+            current_speaker_labels=("Test Member",),
+            influence_mode="live",
+            packet_revision="turn_exact_reply_relation_object",
+        )
+
+        frame = decision.situation_frame
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(
+            tuple(subject.entity_ref for subject in frame.subjects),
+            ("call_em_bini", "cache_back"),
+        )
+        self.assertEqual(frame.tasks[0].authority_scope, "packet")
+        self.assertEqual(frame.tasks[0].subject_indexes, (0, 1))
+
     def test_exact_bnl_reply_pronoun_identity_ambiguity_fails_closed(self):
         question = "How is he connected to Call'em Bini?"
         cases = (
@@ -428,6 +508,54 @@ class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
                     "mac_modem",
                     tuple(subject.entity_ref for subject in frame.subjects),
                 )
+
+    def test_exact_bnl_reply_does_not_treat_pre_copula_alias_as_subject(self):
+        cases = (
+            (
+                "According to Cache Back, the person in question is "
+                "Call'em Bini.",
+                "Who is he?",
+            ),
+            (
+                "Call'em Bini's music is the material Cache Back "
+                "emerged from.",
+                "Who is he?",
+            ),
+            (
+                "Call'em Bini is a founding BARCODE member.",
+                "How is he connected to Call'em Bini?",
+            ),
+        )
+
+        for reply_text, question in cases:
+            with self.subTest(reply_text=reply_text, question=question):
+                context = bnl01_bot.ConversationContextResult(
+                    rendered_context=(
+                        "BNL-01 (exact Discord reply source): " + reply_text
+                    ),
+                    selected_row_ids=(77,),
+                    same_room_paired_turn_count=0,
+                    unpaired_row_count=1,
+                    cross_channel_paired_turn_count=0,
+                    current_message_duplicates_removed=0,
+                    visibility_policy_exclusions=0,
+                    selection_reasons=("discord_reply_source",),
+                    final_char_count=len(reply_text),
+                    referent_status="resolved",
+                    referent_candidate_count=1,
+                    referent_selected_row_ids=(77,),
+                    referent_reason="discord_reply_source",
+                )
+
+                identity_subjects, identity_status = (
+                    bnl01_bot._exact_reply_canon_subject_references(
+                        context,
+                        question,
+                    )
+                )
+
+                self.assertEqual(identity_subjects, ())
+                self.assertEqual(identity_status, "ambiguous")
 
     def test_exact_bnl_reply_without_canon_alias_keeps_ordinary_continuity(self):
         reply_text = "I compared the two options and preferred the first."
