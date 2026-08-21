@@ -1754,6 +1754,38 @@ class SharedBrainSynthesisBotPathTests(
             "single_packet_legacy_baseline_sent",
         )
 
+    def test_route_debug_renders_legacy_baseline_evidence(self):
+        with mock.patch.dict(
+            bnl01_bot.LAST_ROUTE_DEBUG,
+            {
+                "ordinary_chat_single_packet_applied": True,
+                "ordinary_chat_legacy_baseline_fallback": True,
+                "ordinary_chat_single_packet_provider_call_count": 0,
+                "ordinary_chat_single_packet_corrective_call_count": 0,
+                "ordinary_chat_single_packet_block_reason": (
+                    "packet_or_assessment_unavailable"
+                ),
+                (
+                    "ordinary_chat_legacy_baseline_generation_"
+                    "provider_call_count"
+                ): 1,
+            },
+            clear=True,
+        ):
+            rendered = bnl01_bot.format_last_route_debug()
+
+        self.assertIn("ordinary-chat baseline fallback: `True`", rendered)
+        self.assertIn("ordinary-chat packet provider calls: `0`", rendered)
+        self.assertIn(
+            "ordinary-chat packet block reason: "
+            "`packet_or_assessment_unavailable`",
+            rendered,
+        )
+        self.assertIn(
+            "ordinary-chat baseline generation provider calls: `1`",
+            rendered,
+        )
+
     async def test_single_packet_deterministic_clarification_bypasses_factual_guard_and_sends(self):
         message = FakeMessage()
         message.content = "Tell me about Jordan."

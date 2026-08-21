@@ -9855,6 +9855,30 @@ def format_last_route_debug() -> str:
         ("canned_ack_suppressed", "canned ack suppressed"),
         ("ack_converted_to_observe", "ack converted to observe"),
         ("ack_escalated_to_generation", "ack escalated to generation"),
+        (
+            "ordinary_chat_single_packet_applied",
+            "ordinary-chat packet receipt present",
+        ),
+        (
+            "ordinary_chat_legacy_baseline_fallback",
+            "ordinary-chat baseline fallback",
+        ),
+        (
+            "ordinary_chat_single_packet_provider_call_count",
+            "ordinary-chat packet provider calls",
+        ),
+        (
+            "ordinary_chat_single_packet_corrective_call_count",
+            "ordinary-chat packet corrective calls",
+        ),
+        (
+            "ordinary_chat_single_packet_block_reason",
+            "ordinary-chat packet block reason",
+        ),
+        (
+            "ordinary_chat_legacy_baseline_generation_provider_call_count",
+            "ordinary-chat baseline generation provider calls",
+        ),
         ("save_policy_reason", "save policy reason"),
     ]
     lines = ["**BNL route debug (last conversational reply)**"]
