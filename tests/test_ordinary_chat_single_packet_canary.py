@@ -5,6 +5,7 @@ from dataclasses import replace
 from unittest import mock
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
+import bnl_declared_canon as declared_canon
 import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
@@ -21,6 +22,7 @@ from bnl_shared_brain_synthesis import (
     evaluate_single_packet_response,
     finalize_run,
     ordinary_chat_configuration,
+    ordinary_chat_deterministic_response_act,
     ordinary_chat_route_scope_decision,
     parse_ordinary_chat_response_contract,
     record_single_packet_block,
@@ -412,7 +414,13 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             environ=self.flags,
         )
         self.assertIsNotNone(packet)
-        self.assertEqual(packet.subject_resolution.status, "multi_resolved")
+        expected_resolution_status = (
+            "resolved" if len(subjects) == 1 else "multi_resolved"
+        )
+        self.assertEqual(
+            packet.subject_resolution.status,
+            expected_resolution_status,
+        )
         frame_revalidation = revalidate_situation_frame(
             frame,
             current_text=text,
@@ -813,6 +821,41 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertFalse(blocked.ready)
         self.assertEqual(blocked.reason, "nonpacket_factual_owner_selected")
 
+    def test_bnl_self_identity_prompt_keeps_subject_scoped_canon(self):
+        basis = self._multi_subject_basis(
+            "Who are you?",
+            (("bnl_01", "BNL-01"),),
+        )
+        self.assertEqual(basis.packet.subject_resolution.status, "resolved")
+
+        bnl_canon_digests = {
+            source_digest
+            for (
+                _evidence_id,
+                lane,
+                source_digest,
+                subject_indexes,
+            ) in basis.rendered_evidence_refs
+            if lane == "canon" and subject_indexes == (0,)
+        }
+        self.assertTrue(bnl_canon_digests)
+        self.assertTrue(
+            any(
+                item.lane == "canon"
+                and item.subject_key == "bnl_01"
+                and item.source_digest in bnl_canon_digests
+                for item in basis.packet.items
+            )
+        )
+
+        owned = build_packet_owned_prompt(
+            "Current user request: Who are you?",
+            basis,
+        )
+        self.assertTrue(owned.ready, owned.reason)
+        self.assertIn("BARCODE Network Liaison Entity", owned.prompt)
+        self.assertIn("one shared mind with filtered surfaces", owned.prompt)
+
     def test_typed_response_contract_accepts_only_applicable_packet_refs(self):
         evidence_id = next(
             evidence_id
@@ -1039,6 +1082,109 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             ).status,
             "packet_support_invalid",
         )
+
+    def test_owner_declared_cache_bini_relationship_supports_live_three_way_packet(self):
+        authority = {
+            "BNL_OWNER_USER_ID": "61",
+            "BNL_PRIMARY_GUILD_ID": "1",
+            declared_canon.DECLARED_CANON_AUTHORITY_SECRET_ENV: (
+                "ordinary-three-way-authority-secret-0001"
+            ),
+        }
+        with mock.patch.dict(os.environ, authority, clear=False):
+            self.conn.commit()
+            declared_canon.ensure_declared_canon_schema(self.conn)
+            revision = declared_canon.add_declared_canon(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="ordinary-three-way-relationship-0001",
+                guild_id=1,
+                subject_type="entity",
+                subject_id="cache_back",
+                object_subject_type="entity",
+                object_subject_id="call_em_bini",
+                predicate="originated_from",
+                value=(
+                    "Cache Back emerged while a laptop cache containing "
+                    "Call'em Bini's music and project files was cleared; "
+                    "they remain distinct entities."
+                ),
+                raw_declaration=(
+                    "Cache Back originated from data left by Call'em Bini "
+                    "during a laptop-cache clearing, while remaining his "
+                    "own distinct entity."
+                ),
+                cleaned_summary=(
+                    "Cache Back originated from Call'em Bini's cached "
+                    "project data; they are distinct entities."
+                ),
+                domain="hybrid",
+                claim_kind="relationship",
+                visibility="reference_canon",
+                eligible_routes=(
+                    "sealed_test",
+                    "public_home",
+                    "public_context",
+                ),
+                valid_from="2026-08-01T00:00:00+00:00",
+                now="2026-08-01T00:00:00+00:00",
+            ).primary
+            basis = self._multi_subject_basis(
+                "Compare Cache Back, Call'em Bini, and Mac Modem.",
+                (
+                    ("cache_back", "Cache Back"),
+                    ("call_em_bini", "Call'em Bini"),
+                    ("mac_modem", "Mac Modem"),
+                ),
+            )
+
+        declared_refs = {
+            subject_indexes: evidence_id
+            for (
+                evidence_id,
+                lane,
+                _source_digest,
+                subject_indexes,
+            ) in basis.rendered_evidence_refs
+            if lane in {"approved_fact", "canon"}
+            and any(
+                item.source_digest == _source_digest
+                and (
+                    "declared_canon:%s" % revision.declaration_id
+                    in item.root_identities
+                )
+                for item in basis.packet.items
+            )
+        }
+        self.assertEqual(set(declared_refs), {(0,), (1,)})
+        mac_evidence = next(
+            evidence_id
+            for (
+                evidence_id,
+                lane,
+                _source_digest,
+                subject_indexes,
+            ) in basis.rendered_evidence_refs
+            if lane == "canon" and subject_indexes == (2,)
+        )
+        contract = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"Cache Back has an '
+            "established canon origin connection to Call'em Bini while Mac "
+            'Modem has a different established role.","supportKind":'
+            '"packet","evidenceIds":["%s","%s","%s"]}]}'
+            % (
+                declared_refs[(0,)],
+                declared_refs[(1,)],
+                mac_evidence,
+            )
+        )
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                basis,
+                contract,
+            ).valid
+        )
+        self.assertEqual(ordinary_chat_deterministic_response_act(basis), "")
 
     def test_typed_external_task_uses_public_not_packet_authority(self):
         external_packet = replace(

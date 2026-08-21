@@ -2463,10 +2463,12 @@ def select_declared_canon_claims_for_packet(
 
     if not strict_contract_bool(capability_authorized):
         return DeclaredCanonPacketSelection(reason="capability_disabled")
+    packet_channel_policy = str(channel_policy or "").strip().lower()
     if (
         int(guild_id or 0) <= 0
         or str(route_mode or "") != "normal_chat"
-        or str(channel_policy or "") != "public_home"
+        or packet_channel_policy
+        not in {"sealed_test", "public_home", "public_context"}
     ):
         return DeclaredCanonPacketSelection(reason="route_scope_ineligible")
     safe_limit = max(1, min(int(limit or 1), 200))
@@ -2530,7 +2532,7 @@ def select_declared_canon_claims_for_packet(
                 Visibility.PUBLIC_SAFE,
                 Visibility.REFERENCE_CANON,
             }
-            and "public_home" in claim.eligible_routes
+            and packet_channel_policy in claim.eligible_routes
         )
         mutation_count = max(
             0,

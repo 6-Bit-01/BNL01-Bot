@@ -172,6 +172,60 @@ class SituationFrameV1Tests(unittest.TestCase):
                     "existing_typed_entity",
                 )
 
+    def test_exact_discord_reply_uses_packet_authority_without_weakening_live_holds(self):
+        exact_reply = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            channel_policy="sealed_test",
+            current_text="what test code did i give you?",
+            current_speaker_user_ids=(101,),
+            reply_message_ids=(700,),
+            exact_source_row_ids=(77,),
+            referent_status="resolved",
+            response_act="answer",
+        )
+        live_weather = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            channel_policy="sealed_test",
+            current_text="what is Seattle's weather right now?",
+            current_speaker_user_ids=(101,),
+            reply_message_ids=(700,),
+            exact_source_row_ids=(77,),
+            referent_status="resolved",
+            response_act="answer",
+        )
+
+        self.assertEqual(exact_reply.tasks[0].authority_scope, "packet")
+        self.assertEqual(exact_reply.tasks[0].required_response_act, "answer")
+        self.assertEqual(live_weather.tasks[0].authority_scope, "external_current")
+        self.assertEqual(live_weather.tasks[0].required_response_act, "hold")
+
+    def test_barcode_radio_queue_is_one_packet_owned_queue_task(self):
+        questions = (
+            "is the Barcode Radio queue open right now?",
+            "Can I submit a track right now?",
+            "Is the intake open for tracks?",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="mention_or_reply",
+                    channel_policy="sealed_test",
+                    current_text=question,
+                    current_speaker_user_ids=(101,),
+                    response_act="answer",
+                )
+
+                self.assertEqual(frame.object_kind, "queue")
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].object_kind, "queue")
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+
     def test_multiple_explicit_mentions_bind_to_one_task_without_ambiguity(self):
         frame = build_situation_frame_v1(
             route_allowed=True,

@@ -42,6 +42,7 @@ from bnl_unified_intelligence_packet import (
     SCHEMA_VERSION as PACKET_SCHEMA_VERSION,
     UnifiedIntelligencePacket,
     mark_packet_application,
+    packet_subject_keys,
     packet_subject_resolutions,
     revalidate_packet,
     shadow_enabled as packet_shadow_enabled,
@@ -2442,12 +2443,18 @@ def _profile_has_recognized_canon_identity(
 ) -> bool:
     """Return recognition independently of sparse/rich profile status."""
 
+    if len(packet_subject_resolutions(packet)) != 1:
+        return False
+    selected_subject_keys = set(packet_subject_keys(packet))
+    if not selected_subject_keys:
+        selected_subject_keys.add(
+            subject_key_for_user(packet.request.subject_user_id)
+        )
     return any(
         item.lane == "canon"
         and item.source_type
         in {"recognized_canon_fact", "recognized_declared_canon_claim"}
-        and item.subject_key
-        == subject_key_for_user(packet.request.subject_user_id)
+        and item.subject_key in selected_subject_keys
         for item in packet.items
     )
 
@@ -2456,9 +2463,12 @@ def _canon_relevant_to_profile_request(
     packet: UnifiedIntelligencePacket,
     item: Any,
 ) -> bool:
-    if item.subject_key == subject_key_for_user(
-        packet.request.subject_user_id
-    ):
+    selected_subject_keys = set(packet_subject_keys(packet))
+    if not selected_subject_keys:
+        selected_subject_keys.add(
+            subject_key_for_user(packet.request.subject_user_id)
+        )
+    if item.subject_key in selected_subject_keys:
         return True
     query = re.sub(
         r"^\s*(?:hey\s+|yo\s+|hi\s+)?"
@@ -3005,6 +3015,11 @@ def _ordinary_frame_tasks(
 
 def _ordinary_task_allowed_lanes(task: Any) -> frozenset[str]:
     object_kind = str(getattr(task, "object_kind", "") or "").lower()
+    if object_kind == "queue":
+        # A usable native queue read model is a specialized owner and never
+        # reaches this packet-only path.  With that owner unavailable, no
+        # unrelated packet lane may be cited as current queue-state evidence.
+        return frozenset()
     if object_kind == "journal":
         return frozenset({"journal_publication"})
     if object_kind == "relay":
@@ -3317,10 +3332,53 @@ def ordinary_chat_deterministic_response_act(
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
         return ""
-    acts = tuple(
-        str(getattr(task, "required_response_act", "") or "answer")
-        for task in tasks
-    )
+    evidence_scope = {
+        evidence_id: (lane, tuple(subject_indexes))
+        for (
+            evidence_id,
+            lane,
+            _digest_value,
+            subject_indexes,
+        ) in basis.rendered_evidence_refs
+    }
+    acts = []
+    for task in tasks:
+        act = str(
+            getattr(task, "required_response_act", "") or "answer"
+        )
+        if (
+            act == "answer"
+            and str(getattr(task, "authority_scope", "") or "")
+            == "packet"
+        ):
+            allowed_lanes = _ordinary_task_allowed_lanes(task)
+            required_subject_indexes = set(
+                int(subject_index)
+                for subject_index in getattr(task, "subject_indexes", ())
+            )
+            allowed_ids = {
+                evidence_id
+                for evidence_id, (lane, subject_indexes) in (
+                    evidence_scope.items()
+                )
+                if lane in allowed_lanes
+                and (
+                    not required_subject_indexes
+                    or required_subject_indexes.intersection(subject_indexes)
+                )
+            }
+            covered_subject_indexes = {
+                subject_index
+                for evidence_id in allowed_ids
+                for subject_index in evidence_scope[evidence_id][1]
+                if subject_index in required_subject_indexes
+            }
+            if not allowed_ids or (
+                required_subject_indexes - covered_subject_indexes
+            ):
+                act = "hold"
+        acts.append(act)
+    acts = tuple(acts)
     if any(act == "answer" for act in acts):
         return ""
     return "clarify" if "clarify" in acts else "hold"

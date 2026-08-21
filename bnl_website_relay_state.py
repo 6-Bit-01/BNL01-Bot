@@ -255,6 +255,10 @@ _RELAY_QUERY_ACTION_RE = re.compile(
     r"said|show|signal|status|what)\b",
     re.IGNORECASE,
 )
+_RELAY_LATEST_RE = re.compile(
+    r"\b(?:latest|newest|most\s+recent|current)\b",
+    re.IGNORECASE,
+)
 _RELAY_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 _RELAY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,159}$")
 _RELAY_QUERY_STOPWORDS = {
@@ -346,6 +350,8 @@ def relay_publication_query_mode(user_text: str) -> str:
         return "not_requested"
     if _RELAY_DATE_RE.search(text):
         return "date"
+    if _RELAY_LATEST_RE.search(text):
+        return "latest"
     return "requested"
 
 
@@ -597,7 +603,9 @@ def select_accepted_relay_publications_on_connection(
             limit=max(8, limit),
         )
     else:
-        query_mode = "topic"
+        query_mode = (
+            "latest" if requested_mode == "latest" else "topic"
+        )
         rows = _relay_publication_rows(
             conn,
             guild_id=guild_id,
@@ -631,7 +639,14 @@ def select_accepted_relay_publications_on_connection(
                             row,
                         )
                     )
-            scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            scored.sort(
+                key=(
+                    (lambda item: (item[1], item[0]))
+                    if query_mode == "latest"
+                    else (lambda item: (item[0], item[1]))
+                ),
+                reverse=True,
+            )
             rows = [row for _score, _timestamp, row in scored]
     candidate_count = len(rows)
     selected: list[AcceptedRelayPublication] = []
@@ -653,7 +668,11 @@ def select_accepted_relay_publications_on_connection(
                 provenance_excluded += 1
             continue
         selected.append(publication)
-        if len(selected) >= max(1, min(int(limit or 1), 8)):
+        result_limit = 1 if query_mode == "latest" else max(
+            1,
+            min(int(limit or 1), 8),
+        )
+        if len(selected) >= result_limit:
             break
     if selected:
         status = "eligible"
@@ -681,7 +700,27 @@ def revalidate_accepted_relay_publication_on_connection(
     guild_id: int,
     relay_id: str,
     query_mode: str,
+    user_text: str = "",
 ) -> str:
+    if query_mode == "latest":
+        if not str(user_text or "").strip():
+            return ""
+        selection = select_accepted_relay_publications_on_connection(
+            conn,
+            guild_id=guild_id,
+            user_text=user_text,
+            limit=1,
+        )
+        if (
+            selection.status != "eligible"
+            or selection.query_mode != "latest"
+            or len(selection.publications) != 1
+        ):
+            return ""
+        publication = selection.publications[0]
+        if publication.relay_id != relay_id:
+            return ""
+        return publication.source_digest
     rows = _relay_publication_rows(
         conn,
         guild_id=guild_id,

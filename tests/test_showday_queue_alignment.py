@@ -130,6 +130,76 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context, "")
         fetch.assert_not_called()
 
+    def test_current_queue_owner_fails_closed_until_both_production_gates_are_ready(self):
+        questions = (
+            "is the Barcode Radio queue open right now?",
+            "What's the status of the Barcode Radio queue?",
+            "What is the current state of the Barcode Radio queue?",
+            "Is Barcode Radio accepting submissions?",
+            "Can I submit a track right now?",
+            "Is the intake open for tracks?",
+        )
+        for question in questions:
+            with self.subTest(question=question), mock.patch.dict(
+                os.environ,
+                {"BNL_QUEUE_PRODUCTION_ENABLED": "false"},
+                clear=False,
+            ), mock.patch.object(
+                bnl01_bot,
+                "fetch_bnl_read_model",
+                return_value=read_model(True),
+            ):
+                local_off = bnl01_bot.maybe_build_bnl_read_model_context(
+                    question,
+                    "public_home",
+                )
+            with mock.patch.dict(
+                os.environ,
+                {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+                clear=False,
+            ), mock.patch.object(
+                bnl01_bot,
+                "fetch_bnl_read_model",
+                return_value=read_model(False),
+            ):
+                site_off = bnl01_bot.maybe_build_bnl_read_model_context(
+                    question,
+                    "public_home",
+                )
+
+            self.assertTrue(bnl01_bot._current_queue_state_query(question))
+            self.assertEqual(local_off, "")
+            self.assertEqual(site_off, "")
+            self.assertNotIn("auxchord", (local_off + site_off).lower())
+
+    def test_current_queue_owner_uses_only_gated_native_read_model_context(self):
+        questions = (
+            "is the Barcode Radio queue open right now?",
+            "What's the status of the Barcode Radio queue?",
+            "What is the current state of the Barcode Radio queue?",
+            "Is Barcode Radio accepting submissions?",
+            "Can I submit a track right now?",
+            "Is the intake open for tracks?",
+        )
+        for question in questions:
+            with self.subTest(question=question), mock.patch.dict(
+                os.environ,
+                {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+                clear=False,
+            ), mock.patch.object(
+                bnl01_bot,
+                "fetch_bnl_read_model",
+                return_value=read_model(True),
+            ):
+                context = bnl01_bot.maybe_build_bnl_read_model_context(
+                    question,
+                    "public_home",
+                )
+
+            self.assertIn("Queue:", context)
+            self.assertIn("PRIVATE_TEST_QUEUE_TITLE", context)
+            self.assertNotIn("auxchord", context.lower())
+
     async def test_auxchord_generation_is_rejected_for_native_intake(self):
         generated = (
             "Auxchord channels are accepting submissions now.\n"
