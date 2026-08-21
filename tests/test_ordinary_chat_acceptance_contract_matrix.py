@@ -44,6 +44,59 @@ def _frame(text):
 
 
 class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
+    def test_exact_name_seed_reply_chain_resolves_without_seed_facts(self):
+        cases = (
+            (
+                "reply with exactly these two names, and no other words: "
+                "cache back, call'em bini",
+                (
+                    "How is he connected to Call'em Bini?",
+                    "How are they related to Call'em Bini?",
+                ),
+                (("cache_back", "Cache Back"),),
+            ),
+            (
+                "reply with exactly this name and no other words: "
+                "DJ floppydisc",
+                ("What does he do?",),
+                (("dj_floppydisc", "DJ Floppydisc"),),
+            ),
+        )
+        for seed, questions, expected_subjects in cases:
+            with self.subTest(seed=seed):
+                exact_reply = (
+                    bnl01_bot.parse_exact_name_echo_instruction(seed)
+                )
+                self.assertIsNotNone(exact_reply)
+                context = bnl01_bot.ConversationContextResult(
+                    rendered_context=(
+                        "BNL-01 (exact Discord reply source): "
+                        + exact_reply
+                    ),
+                    selected_row_ids=(77,),
+                    same_room_paired_turn_count=0,
+                    unpaired_row_count=1,
+                    cross_channel_paired_turn_count=0,
+                    current_message_duplicates_removed=0,
+                    visibility_policy_exclusions=0,
+                    selection_reasons=("discord_reply_source",),
+                    final_char_count=len(exact_reply),
+                    referent_status="resolved",
+                    referent_candidate_count=1,
+                    referent_selected_row_ids=(77,),
+                    referent_reason="discord_reply_source",
+                )
+                for question in questions:
+                    with self.subTest(question=question):
+                        subjects, status = (
+                            bnl01_bot._exact_reply_canon_subject_references(
+                                context,
+                                question,
+                            )
+                        )
+                        self.assertEqual(status, "resolved")
+                        self.assertEqual(subjects, expected_subjects)
+
     def test_48_production_ingress_cases_have_one_early_typed_decision(self):
         # name, request, frame status, task authorities, task acts,
         # dominant object, bound subject kind

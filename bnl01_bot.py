@@ -8764,6 +8764,8 @@ def classify_route_mode(clean_content: str, channel_policy: str = "unknown", *, 
         return ROUTE_MODE_OPERATOR_COMMAND
     if (channel_policy or "").strip().lower() == "broadcast_memory":
         return ROUTE_MODE_BROADCAST_MEMORY
+    if parse_exact_name_echo_instruction(text) is not None:
+        return ROUTE_MODE_DIRECT_PAYLOAD
     if payload_expected:
         return ROUTE_MODE_DIRECT_PAYLOAD
     if show_state:
@@ -29708,10 +29710,90 @@ def _collapse_consecutive_batch_fragments(items):
 
 
 
+_EXACT_NAME_ECHO_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def _split_exact_name_echo_payload(payload: str) -> tuple[str, ...]:
+    return tuple(
+        part.strip()
+        for part in re.split(r"\s*,\s*|\s+and\s+", payload, flags=re.I)
+        if part.strip()
+    )
+
+
+def parse_exact_name_echo_instruction(text: str) -> str | None:
+    """Return a user-supplied literal name payload for a strict echo request.
+
+    This deliberately recognizes only the small, non-factual grammar used to
+    establish an exact Discord reply source.  It is not a general instruction
+    bypass: arbitrary text, multiline content, mentions, URLs, and malformed
+    name counts continue through the governed response pipeline.
+    """
+
+    raw = str(text or "").strip()
+    raw = re.sub(r"^[,;:\-]\s*", "", raw)
+    if not raw or len(raw) > 320:
+        return None
+    match = re.fullmatch(
+        r"(?:please\s+)?(?:reply|respond)\s+with\s+exactly\s+"
+        r"(?:(?P<single>this)\s+name|these(?:\s+(?P<count>[a-z]+|\d+))?\s+names)"
+        r"\s*,?\s*(?:and\s+)?no\s+other\s+words\s*:\s*"
+        r"(?P<payload>[^\r\n]+)",
+        raw,
+        flags=re.I,
+    )
+    if not match:
+        return None
+
+    payload = match.group("payload").strip()
+    if (
+        not payload
+        or len(payload) > 200
+        or any(token in payload for token in ("@", "<", ">", "`"))
+        or "://" in payload.lower()
+        or not re.fullmatch(r"[\w][\w .,'’&+\-]*[\w]", payload)
+    ):
+        return None
+
+    names = _split_exact_name_echo_payload(payload)
+    if not names:
+        return None
+    expected_count = 1 if match.group("single") else 0
+    count_token = str(match.group("count") or "").lower()
+    if count_token:
+        expected_count = (
+            int(count_token)
+            if count_token.isdigit()
+            else _EXACT_NAME_ECHO_COUNT_WORDS.get(count_token, 0)
+        )
+        if expected_count <= 0:
+            return None
+    if expected_count and len(names) != expected_count:
+        return None
+    if match.group("single") and len(names) != 1:
+        return None
+    if not match.group("single") and len(names) < 2:
+        return None
+    return payload
+
+
 def _detect_request_intent(text: str):
     t = (text or "").strip().lower()
     if not t:
         return False, "empty"
+    if parse_exact_name_echo_instruction(text) is not None:
+        return True, "exact_name_echo"
     if "?" in t:
         return True, "question_mark"
     patterns = [
@@ -29730,6 +29812,8 @@ def _detect_request_payload_expectation(text: str):
     t = (text or "").strip().lower()
     if not t:
         return False, "empty"
+    if parse_exact_name_echo_instruction(text) is not None:
+        return True, "exact_name_echo"
     # Payload completion is only for clear list-shaped requests. Do not treat
     # ordinary conversation using "about"/"for" as a payload task.
     patterns = [
@@ -33537,8 +33621,13 @@ def _is_deictic_payload_placeholder(text: str) -> bool:
 
 def _collect_inline_direct_payload_items(clean_content: str):
     payload_items = []
+    exact_name_echo = parse_exact_name_echo_instruction(clean_content)
+    if exact_name_echo is not None:
+        payload_items.extend(
+            _split_exact_name_echo_payload(exact_name_echo)
+        )
     multiline = _extract_multiline_request_payload(clean_content)
-    if multiline:
+    if multiline and not payload_items:
         payload_items.extend(multiline.get("payload_items", []))
     if not payload_items:
         payload_expected, _payload_reason = _detect_request_payload_expectation(clean_content)
@@ -38262,6 +38351,43 @@ async def on_message(message: discord.Message):
             logging.info("conversational_continuation_detected reason=same_user_recent_response")
     else:
         logging.info("response_route_decision route=policy_blocked reason=no_conversation_route")
+
+    exact_name_echo = parse_exact_name_echo_instruction(clean_content)
+    if exact_name_echo is not None and message_should_enter_conversation:
+        save_user_message(
+            message.author.id,
+            message.author.display_name,
+            message.guild.id,
+            conversation_content or clean_content,
+            channel_name=getattr(message.channel, "name", ""),
+            channel_policy=channel_policy,
+            channel_id=getattr(message.channel, "id", 0),
+            message_id=getattr(message, "id", None),
+            route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
+            directed_to_bnl=True,
+        )
+        await send_reply_then_save_model(
+            message,
+            exact_name_echo,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            channel_name=getattr(message.channel, "name", ""),
+            channel_policy=channel_policy,
+            channel_id=getattr(message.channel, "id", 0),
+            route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
+            reply_text=exact_name_echo,
+        )
+        _mark_recent_direct_response(
+            message.channel.id,
+            message.author.id,
+        )
+        logging.info(
+            "exact_name_echo_sent route_mode=%s name_count=%s "
+            "provider_call_count=0",
+            ROUTE_MODE_DIRECT_PAYLOAD,
+            len(_split_exact_name_echo_payload(exact_name_echo)),
+        )
+        return
 
     if clean_content and (is_active_channel or real_direct_target):
         if not is_sealed_test_channel:

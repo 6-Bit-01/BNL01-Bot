@@ -13,6 +13,77 @@ from bnl_source_file_enrichment import parse_source_enrichment_command
 
 
 class RouteModeGovernanceTests(unittest.TestCase):
+    def test_exact_name_echo_is_literal_direct_payload_not_factual_chat(self):
+        cases = (
+            (
+                "reply with exactly these two names, and no other words: "
+                "cache back, call'em bini",
+                "cache back, call'em bini",
+                ["cache back", "call'em bini"],
+            ),
+            (
+                "reply with exactly this name and no other words: "
+                "DJ floppydisc",
+                "DJ floppydisc",
+                ["DJ floppydisc"],
+            ),
+            (
+                ", reply with exactly this name and no other words: "
+                "DJ floppydisc",
+                "DJ floppydisc",
+                ["DJ floppydisc"],
+            ),
+        )
+        for text, expected_response, expected_items in cases:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    bnl01_bot.parse_exact_name_echo_instruction(text),
+                    expected_response,
+                )
+                self.assertEqual(
+                    bnl01_bot.classify_route_mode(
+                        text,
+                        "sealed_test",
+                        real_direct_target=True,
+                    ),
+                    bnl01_bot.ROUTE_MODE_DIRECT_PAYLOAD,
+                )
+                self.assertEqual(
+                    bnl01_bot._detect_request_intent(text),
+                    (True, "exact_name_echo"),
+                )
+                self.assertEqual(
+                    bnl01_bot._detect_request_payload_expectation(text),
+                    (True, "exact_name_echo"),
+                )
+                self.assertEqual(
+                    bnl01_bot._collect_inline_direct_payload_items(text),
+                    expected_items,
+                )
+
+    def test_exact_name_echo_rejects_malformed_or_unsafe_payloads(self):
+        cases = (
+            "reply with exactly these two names and no other words: Cache Back",
+            "reply with exactly this name and no other words: Cache Back, Mac Modem",
+            "reply with exactly this name and no other words: <@123>",
+            "reply with exactly this name and no other words: https://example.com",
+            "reply with exactly this sentence and no other words: Cache Back",
+            "tell me exactly who Cache Back is",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    bnl01_bot.parse_exact_name_echo_instruction(text)
+                )
+                self.assertEqual(
+                    bnl01_bot.classify_route_mode(
+                        text,
+                        "sealed_test",
+                        real_direct_target=True,
+                    ),
+                    bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                )
+
     def test_simple_greeting_maps_to_simple_greeting(self):
         for text in ("Hi BNL", "hey BNL", "yo BNL", "hello BNL", "good morning BNL", "BNL?"):
             self.assertTrue(bnl01_bot.is_simple_greeting_to_bnl(text), text)

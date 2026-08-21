@@ -1988,6 +1988,61 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, [])
         self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), [])
 
+    async def test_exact_name_echo_sends_and_saves_without_provider_call(self):
+        channel = self._channel(8110)
+        text = (
+            "reply with exactly these two names, and no other words: "
+            "cache back, call'em bini"
+        )
+        expected = "cache back, call'em bini"
+        message = FakeMessage(channel, text)
+
+        with (
+            self._on_message_runtime(
+                channel.id,
+                followup_candidate=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "is_direct_bnl_target",
+                return_value=True,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response",
+                new=mock.AsyncMock(),
+            ) as generate,
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=mock.AsyncMock(),
+            ) as generate_with_typing,
+            mock.patch.object(
+                bnl01_bot,
+                "save_model_message",
+                return_value=SimpleNamespace(
+                    save_conversation=True,
+                    reason="test_saved",
+                ),
+            ) as save_model,
+            mock.patch.object(
+                bnl01_bot,
+                "_mark_recent_direct_response",
+            ) as mark_recent,
+        ):
+            await bnl01_bot.on_message(message)
+
+        self.assertEqual(message.replies, [expected])
+        generate.assert_not_awaited()
+        generate_with_typing.assert_not_awaited()
+        save_model.assert_called_once()
+        self.assertEqual(save_model.call_args.args[2], expected)
+        self.assertEqual(
+            save_model.call_args.kwargs["route_mode"],
+            bnl01_bot.ROUTE_MODE_DIRECT_PAYLOAD,
+        )
+        mark_recent.assert_called_once_with(channel.id, message.author.id)
+
     async def test_paced_direct_reply_clears_preserved_interrupt_handoff(self):
         channel = self._channel(8114)
         message = FakeMessage(channel, "BNL, answer this now")
