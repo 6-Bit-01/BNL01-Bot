@@ -52,8 +52,12 @@ ranked before additive project canon. Render-equivalent projections collapse
 by original human or declaration roots. Every durable selection is re-read
 before candidate use. A changed or invalid source forces the established
 response fallback on comparison routes, and blocks or suppresses the
-separately gated ordinary-chat candidate without legacy generation fallback.
-Broad-profile prompts have one factual packet owner, while
+separately gated ordinary-chat candidate after packet generation without a
+second generation attempt. Before packet prompt application, an otherwise
+eligible stable and unambiguous turn may relinquish packet ownership and
+rebuild the established context-rich route; live-current and clarification
+tasks cannot use that handoff. Broad-profile prompts have one factual packet
+owner, while
 current turn, exact reply context, persona, and bounded additive canon remain.
 Specialized operational routes stay outside this cutover.
 
@@ -88,9 +92,11 @@ missing allowlists, or any over-limit scope fail closed before prompt
 construction. The scope digest binds both the authorization mode and exact
 allowlists without exposing their IDs.
 
-All gates remain default-off. The ordinary-chat route permits one provider
-attempt, zero retries, no model fallback, and no corrective generation. This
-version performs no deployment, historical
+All gates remain default-off. Once the ordinary-chat packet prompt is applied,
+the route permits one provider attempt, zero retries, no model fallback, and
+no corrective generation. A zero-packet-call baseline-preservation handoff is
+an established-route recovery, not a packet retry. This version performs no
+deployment, historical
 promotion, live activation, member-facing correction inference, or knowledge
 edit/delete function. It does not change Journal or Relay generation,
 publication, scheduling, or lifecycle behavior.

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sqlite3
 import tempfile
@@ -75,7 +76,7 @@ class ExactDiscordReplyPacketRegressionTests(unittest.TestCase):
                     channel_name TEXT NOT NULL,
                     channel_policy TEXT NOT NULL,
                     route_mode TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
+                    timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     message_id INTEGER
                 )
                 """
@@ -359,6 +360,160 @@ class ExactDiscordReplyPacketRegressionTests(unittest.TestCase):
                 serialized_receipts = repr(receipt_rows).casefold()
                 self.assertNotIn("cobalt", serialized_receipts)
                 self.assertNotIn("amber", serialized_receipts)
+
+    def test_exact_name_echo_delivery_becomes_pronoun_reply_source(self):
+        seed = (
+            "reply with exactly these two names, and no other words: "
+            "cache back, call'em bini"
+        )
+        exact_reply = bnl01_bot.parse_exact_name_echo_instruction(seed)
+        self.assertEqual(exact_reply, "cache back, call'em bini")
+
+        class ReplyMessage:
+            def __init__(self):
+                self.sent = []
+
+            async def reply(self, text, **_kwargs):
+                self.sent.append(text)
+                return type("Sent", (), {"id": 710})()
+
+        message = ReplyMessage()
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "calculate_adaptive_memory_limits",
+                return_value={"conversation_rows": 80},
+            ),
+            mock.patch.object(bnl01_bot, "prune_conversation_history"),
+            mock.patch.object(bnl01_bot, "update_relationship_state"),
+            mock.patch.object(bnl01_bot, "maybe_add_memory_trace"),
+        ):
+            decision = asyncio.run(
+                bnl01_bot.send_reply_then_save_model(
+                    message,
+                    exact_reply,
+                    user_id=7,
+                    guild_id=1,
+                    channel_name="bnl-testing",
+                    channel_policy="sealed_test",
+                    channel_id=10,
+                    route_mode=bnl01_bot.ROUTE_MODE_DIRECT_PAYLOAD,
+                    reply_text=exact_reply,
+                )
+            )
+        self.assertTrue(decision.save_conversation)
+        self.assertEqual(message.sent, [exact_reply])
+
+        with sqlite3.connect(self.db_path) as conn:
+            saved = conn.execute(
+                """
+                SELECT id,role,content,message_id,route_mode
+                FROM conversations
+                WHERE message_id=710
+                """
+            ).fetchone()
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved[1:], (
+            "model",
+            exact_reply,
+            710,
+            bnl01_bot.ROUTE_MODE_DIRECT_PAYLOAD,
+        ))
+
+        result_out = {}
+        rendered_context = (
+            bnl01_bot.build_conversation_context_v2_for_prompt(
+                guild_id=1,
+                current_user_id=7,
+                channel_id=10,
+                channel_name="bnl-testing",
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                conversation_surface="mention_or_reply",
+                current_texts=(
+                    "How is he connected to Call'em Bini?",
+                ),
+                current_participants={7},
+                is_direct_target=True,
+                referenced_message_ids={710},
+                referenced_conversation_row_ids={saved[0]},
+                now=self.now,
+                route_allowed_sources={"conversation_continuity"},
+                result_out=result_out,
+            )
+        )
+        context = result_out["result"]
+        self.assertEqual(context.referent_status, "resolved")
+        self.assertEqual(context.referent_reason, "discord_reply_source")
+        self.assertEqual(context.selected_row_ids, (saved[0],))
+        self.assertIn(exact_reply, rendered_context)
+
+        addressing = bnl01_bot.DiscordTurnAddressing(
+            speaker="Test Member A",
+            explicit_tag_recipients=(),
+            reply_target="BNL-01",
+            explicitly_mentions_bnl=False,
+            reply_targets_bnl=True,
+            directly_targets_bnl=True,
+            targets_other_human=False,
+            plain_text_names_bnl=False,
+            speaker_user_id=7,
+            source_message_id=711,
+            reply_message_id=710,
+            reply_conversation_row_id=saved[0],
+        )
+
+        for question in (
+            "How is he connected to Call'em Bini?",
+            "How are they related to Call'em Bini?",
+        ):
+            with self.subTest(question=question):
+                subjects, status = (
+                    bnl01_bot._exact_reply_canon_subject_references(
+                        context,
+                        question,
+                    )
+                )
+                self.assertEqual(status, "resolved")
+                self.assertEqual(
+                    subjects,
+                    (("cache_back", "Cache Back"),),
+                )
+                orchestration = (
+                    bnl01_bot.build_live_conversation_orchestration_decision(
+                        engagement_decision="answer",
+                        engagement_reason="direct_request",
+                        channel_policy="sealed_test",
+                        addressings=(addressing,),
+                        context_result=context,
+                        moment_situation=None,
+                        guild_id=1,
+                        channel_id=10,
+                        route_mode="normal_chat",
+                        conversation_surface="mention_or_reply",
+                        current_text=question,
+                        current_speaker_user_ids=(7,),
+                        current_speaker_labels=("Test Member A",),
+                        influence_mode="live",
+                        packet_revision="exact_name_echo_chain",
+                    )
+                )
+                frame = orchestration.situation_frame
+                self.assertEqual(frame.status, "resolved")
+                subject_keys = tuple(
+                    subject.entity_ref for subject in frame.subjects
+                )
+                self.assertEqual(
+                    set(subject_keys),
+                    {"cache_back", "call_em_bini"},
+                )
+                self.assertEqual(
+                    {
+                        subject_keys[index]
+                        for index in frame.tasks[0].subject_indexes
+                    },
+                    {"cache_back", "call_em_bini"},
+                )
 
 
 if __name__ == "__main__":

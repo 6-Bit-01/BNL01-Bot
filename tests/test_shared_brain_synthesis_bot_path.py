@@ -1345,6 +1345,447 @@ class SharedBrainSynthesisBotPathTests(
             "deterministic_task_hold",
         )
 
+    def test_low_risk_zero_call_packet_block_allows_legacy_baseline(self):
+        run = SimpleNamespace(prompt_applied=False)
+        decision = SimpleNamespace(run=run)
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="packet preflight block",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=False,
+            provider_call_count=0,
+            corrective_call_count=0,
+            block_reason="packet_or_assessment_unavailable",
+        )
+        frame = SimpleNamespace(
+            tasks=(
+                SimpleNamespace(
+                    authority_scope="packet",
+                    currentness="historical",
+                    required_response_act="answer",
+                ),
+            )
+        )
+
+        self.assertTrue(
+            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
+                execution,
+                situation_frame=frame,
+                request_text=(
+                    "Reply with exactly these names: Cache Back, "
+                    "Call'em Bini"
+                ),
+            )
+        )
+
+    def test_legacy_baseline_never_follows_live_or_started_packet(self):
+        live_frame = SimpleNamespace(
+            tasks=(
+                SimpleNamespace(
+                    authority_scope="external_current",
+                    currentness="current",
+                    required_response_act="hold",
+                ),
+            )
+        )
+        zero_call_execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=SimpleNamespace(
+                run=SimpleNamespace(prompt_applied=False)
+            ),
+            response="hold",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=False,
+            provider_call_count=0,
+            corrective_call_count=0,
+            block_reason="deterministic_task_hold",
+        )
+        started_execution = replace(
+            zero_call_execution,
+            decision=SimpleNamespace(
+                run=SimpleNamespace(prompt_applied=True)
+            ),
+            block_reason="candidate_rejected",
+        )
+        ambiguous_execution = replace(
+            zero_call_execution,
+            block_reason="candidate_prompt_frame_ambiguous",
+        )
+        changed_source_execution = replace(
+            zero_call_execution,
+            block_reason="pre_generation_source_changed",
+        )
+
+        self.assertFalse(
+            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
+                zero_call_execution,
+                situation_frame=live_frame,
+                request_text="Is the BARCODE Radio queue open right now?",
+            )
+        )
+        self.assertFalse(
+            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
+                started_execution,
+                situation_frame=SimpleNamespace(tasks=()),
+                request_text="Who is DJ Floppydisc?",
+            )
+        )
+        self.assertFalse(
+            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
+                replace(
+                    zero_call_execution,
+                    provider_call_count=1,
+                    block_reason="candidate_rejected",
+                ),
+                situation_frame=SimpleNamespace(tasks=()),
+                request_text="Who is DJ Floppydisc?",
+            )
+        )
+        self.assertFalse(
+            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
+                ambiguous_execution,
+                situation_frame=SimpleNamespace(
+                    status="ambiguous",
+                    tasks=(
+                        SimpleNamespace(
+                            authority_scope="packet",
+                            currentness="unknown",
+                            required_response_act="clarify",
+                        ),
+                    ),
+                ),
+                request_text="Tell me about Jordan.",
+            )
+        )
+        self.assertFalse(
+            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
+                changed_source_execution,
+                situation_frame=SimpleNamespace(tasks=()),
+                request_text="Who is DJ Floppydisc?",
+            )
+        )
+
+    async def test_zero_call_block_rebuilds_and_generates_legacy_baseline(self):
+        run = SimpleNamespace(prompt_applied=False, run_id="packet-run")
+        decision = SimpleNamespace(run=run, candidate_selected=False)
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="packet preflight block",
+            prompt="packet-owned prompt",
+            prompt_source_bases=("packet-basis",),
+            candidate_active=False,
+            provider_call_count=0,
+            corrective_call_count=0,
+            block_reason="packet_or_assessment_unavailable",
+        )
+        request = {
+            "user_id": 7,
+            "guild_id": 1,
+            "fallback_display_name": "Miss Bit",
+            "clean_content": "Who is DJ Floppydisc?",
+        }
+
+        def rebuild_prompt(**kwargs):
+            metadata = kwargs["prompt_metadata"]
+            metadata.update(
+                {
+                    "source_context_available": True,
+                    "prompt_source_bases": ("canon-basis", "room-basis"),
+                    "shared_brain_synthesis_canary_basis": object(),
+                }
+            )
+            return (
+                "Durable memory and BARCODE canon: DJ Floppydisc",
+                False,
+                "balanced",
+            )
+
+        provider = mock.AsyncMock(
+            return_value=bnl01_bot.TrackedGenerationResponse(
+                text=(
+                    "DJ Floppydisc is BARCODE's signal and audio engineer."
+                ),
+                provider_call_count=1,
+            )
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_aware_prompt",
+                side_effect=rebuild_prompt,
+            ) as builder,
+            mock.patch.object(
+                bnl01_bot,
+                "_build_direct_payload_prompt",
+                side_effect=lambda prompt, _items, _text: prompt,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "render_conversation_orchestration_prompt",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_tracked_gemini_response_with_optional_typing",
+                new=provider,
+            ),
+        ):
+            fallback = (
+                await bnl01_bot.maybe_generate_ordinary_chat_legacy_baseline(
+                    execution=execution,
+                    prompt_metadata={
+                        "ordinary_chat_legacy_baseline_request": request
+                    },
+                    channel=FakeChannel(),
+                    payload_items=[],
+                    request_text=request["clean_content"],
+                    conversation_orchestration=None,
+                    situation_frame=SimpleNamespace(
+                        tasks=(
+                            SimpleNamespace(
+                                authority_scope="packet",
+                                currentness="historical",
+                                required_response_act="answer",
+                            ),
+                        )
+                    ),
+                    user_id=7,
+                    guild_id=1,
+                )
+            )
+
+        self.assertIsNotNone(fallback)
+        self.assertEqual(
+            fallback.response,
+            "DJ Floppydisc is BARCODE's signal and audio engineer.",
+        )
+        self.assertTrue(fallback.packet_execution.legacy_baseline_active)
+        self.assertFalse(fallback.packet_execution.candidate_active)
+        self.assertEqual(
+            fallback.packet_execution.provider_call_count,
+            0,
+        )
+        self.assertEqual(
+            fallback.packet_execution.legacy_baseline_generation_provider_call_count,
+            1,
+        )
+        self.assertIs(fallback.packet_execution.decision, decision)
+        self.assertIsNone(
+            fallback.prompt_metadata["shared_brain_synthesis_canary_basis"]
+        )
+        self.assertEqual(
+            fallback.packet_execution.prompt_source_bases,
+            ("canon-basis", "room-basis"),
+        )
+        self.assertFalse(
+            builder.call_args.kwargs[
+                "_ordinary_chat_single_packet_enabled_override"
+            ]
+        )
+        provider.assert_awaited_once()
+        self.assertEqual(
+            provider.await_args.kwargs["route"],
+            bnl01_bot.ORDINARY_CHAT_LEGACY_BASELINE_ROUTE,
+        )
+
+    async def test_legacy_baseline_failure_returns_to_packet_block(self):
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=None,
+            response="packet preflight block",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=False,
+            provider_call_count=0,
+            corrective_call_count=0,
+            block_reason="packet_or_assessment_unavailable",
+        )
+        metadata = {
+            "ordinary_chat_legacy_baseline_request": {
+                "user_id": 7,
+                "guild_id": 1,
+                "fallback_display_name": "Miss Bit",
+                "clean_content": "Who is DJ Floppydisc?",
+            }
+        }
+        frame = SimpleNamespace(
+            tasks=(
+                SimpleNamespace(
+                    authority_scope="packet",
+                    currentness="historical",
+                    required_response_act="answer",
+                ),
+            )
+        )
+
+        with mock.patch.object(
+            bnl01_bot,
+            "_build_ordinary_chat_legacy_baseline_prompt",
+            side_effect=RuntimeError("rebuild failed"),
+        ):
+            rebuild_failure = (
+                await bnl01_bot.maybe_generate_ordinary_chat_legacy_baseline(
+                    execution=execution,
+                    prompt_metadata=metadata,
+                    channel=FakeChannel(),
+                    payload_items=[],
+                    request_text="Who is DJ Floppydisc?",
+                    conversation_orchestration=None,
+                    situation_frame=frame,
+                    user_id=7,
+                    guild_id=1,
+                )
+            )
+
+        provider = mock.AsyncMock(side_effect=RuntimeError("provider failed"))
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "_build_ordinary_chat_legacy_baseline_prompt",
+                return_value=(
+                    "context-rich prompt",
+                    False,
+                    "balanced",
+                    {"source_context_available": True},
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_tracked_gemini_response_with_optional_typing",
+                new=provider,
+            ),
+        ):
+            provider_failure = (
+                await bnl01_bot.maybe_generate_ordinary_chat_legacy_baseline(
+                    execution=execution,
+                    prompt_metadata=metadata,
+                    channel=FakeChannel(),
+                    payload_items=[],
+                    request_text="Who is DJ Floppydisc?",
+                    conversation_orchestration=None,
+                    situation_frame=frame,
+                    user_id=7,
+                    guild_id=1,
+                )
+            )
+
+        self.assertIsNone(rebuild_failure)
+        self.assertIsNone(provider_failure)
+        self.assertFalse(execution.legacy_baseline_active)
+
+    async def test_legacy_baseline_uses_normal_guard_and_finalizes_receipt(self):
+        message = FakeMessage()
+        message.content = "Who is DJ Floppydisc?"
+        run = SimpleNamespace(prompt_applied=False, run_id="packet-run")
+        decision = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="packet_or_assessment_unavailable",
+        )
+        response = "DJ Floppydisc is BARCODE's signal and audio engineer."
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response=response,
+            prompt="context-rich baseline prompt",
+            prompt_source_bases=("canon-basis",),
+            candidate_active=False,
+            provider_call_count=0,
+            corrective_call_count=0,
+            block_reason="packet_or_assessment_unavailable",
+            legacy_baseline_active=True,
+            legacy_baseline_generation_provider_call_count=1,
+            legacy_fallback_reason="packet_or_assessment_unavailable",
+        )
+        guard = mock.AsyncMock(
+            return_value=(response, {"suppressed": False})
+        )
+        older_canary = mock.AsyncMock(
+            side_effect=AssertionError(
+                "legacy fallback invoked the older synthesis canary"
+            )
+        )
+        finalize = mock.AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "maybe_generate_shared_brain_synthesis_canary",
+                    new=older_canary,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalize,
+                )
+            )
+
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                response,
+                self.plan(),
+                prompt="context-rich baseline prompt",
+                prompt_source_bases=("canon-basis",),
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+                ordinary_chat_single_packet_execution=execution,
+            )
+
+        self.assertEqual(message.replies, [response])
+        older_canary.assert_not_awaited()
+        guard.assert_awaited_once()
+        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
+        finalize.assert_awaited_once()
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+        self.assertEqual(
+            finalize.await_args.kwargs["guard_status"],
+            "single_packet_legacy_baseline_sent",
+        )
+
+    def test_route_debug_renders_legacy_baseline_evidence(self):
+        with mock.patch.dict(
+            bnl01_bot.LAST_ROUTE_DEBUG,
+            {
+                "ordinary_chat_single_packet_applied": True,
+                "ordinary_chat_legacy_baseline_fallback": True,
+                "ordinary_chat_single_packet_provider_call_count": 0,
+                "ordinary_chat_single_packet_corrective_call_count": 0,
+                "ordinary_chat_single_packet_block_reason": (
+                    "packet_or_assessment_unavailable"
+                ),
+                (
+                    "ordinary_chat_legacy_baseline_generation_"
+                    "provider_call_count"
+                ): 1,
+            },
+            clear=True,
+        ):
+            rendered = bnl01_bot.format_last_route_debug()
+
+        self.assertIn("ordinary-chat baseline fallback: `True`", rendered)
+        self.assertIn("ordinary-chat packet provider calls: `0`", rendered)
+        self.assertIn(
+            "ordinary-chat packet block reason: "
+            "`packet_or_assessment_unavailable`",
+            rendered,
+        )
+        self.assertIn(
+            "ordinary-chat baseline generation provider calls: `1`",
+            rendered,
+        )
+
     async def test_single_packet_deterministic_clarification_bypasses_factual_guard_and_sends(self):
         message = FakeMessage()
         message.content = "Tell me about Jordan."

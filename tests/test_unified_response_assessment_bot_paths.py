@@ -312,6 +312,12 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 "- 2026-08-01 broadcast_memory_note: DJ Floppy Disc"
             )
         )
+        memory_builder = mock.Mock(
+            return_value=(
+                "Approved direct self-reports:\n"
+                "- Established memory sentinel: DJ Floppy Disc"
+            )
+        )
         with (
             mock.patch.dict(os.environ, flags, clear=False),
             mock.patch.object(
@@ -333,6 +339,11 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 bnl01_bot,
                 "build_conversation_prompt_source_basis",
                 return_value=None,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                new=memory_builder,
             ),
             mock.patch.object(
                 bnl01_bot,
@@ -359,6 +370,11 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 "build_ordinary_chat_basis",
                 return_value=ordinary_basis,
             ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+                return_value=None,
+            ),
         ):
             metadata = {}
             prompt, *_ = bnl01_bot.build_user_aware_prompt(
@@ -374,27 +390,58 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 prompt_metadata=metadata,
             )
 
-        broadcast_builder.assert_not_called()
-        self.assertEqual(len(assessment_calls), 1)
+            broadcast_builder.assert_not_called()
+            memory_builder.assert_not_called()
+            self.assertEqual(len(assessment_calls), 1)
+            self.assertFalse(
+                assessment_calls[0]["broadcast_memory_present"]
+            )
+            self.assertNotIn(
+                "broadcast_memory",
+                assessment_calls[0]["prompt_lanes"],
+            )
+            self.assertTrue(
+                metadata["ordinary_chat_single_packet_applied"]
+            )
+            self.assertIs(
+                metadata["ordinary_chat_single_packet_basis"],
+                ordinary_basis,
+            )
+            self.assertEqual(
+                metadata["ordinary_chat_single_packet_scope"].reason,
+                "eligible",
+            )
+            baseline_request = metadata[
+                "ordinary_chat_legacy_baseline_request"
+            ]
+            self.assertEqual(baseline_request["clean_content"], text)
+            self.assertEqual(baseline_request["user_id"], 202)
+            self.assertEqual(baseline_request["guild_id"], 1)
+            self.assertEqual(baseline_request["channel_id"], 303)
+            self.assertTrue(baseline_request["is_direct_interaction"])
+            self.assertNotIn("Broadcast memory context:", prompt)
+
+            rebuilt = bnl01_bot._build_ordinary_chat_legacy_baseline_prompt(
+                metadata,
+                payload_items=[],
+                request_text=text,
+                conversation_orchestration=None,
+            )
+
+        self.assertIsNotNone(rebuilt)
+        rebuilt_prompt, _allow, _style, rebuilt_metadata = rebuilt
+        self.assertIn("Durable memory context:", rebuilt_prompt)
+        self.assertIn("Established memory sentinel", rebuilt_prompt)
+        self.assertIn("Broadcast memory context:", rebuilt_prompt)
+        self.assertIn("DJ Floppy Disc", rebuilt_prompt)
         self.assertFalse(
-            assessment_calls[0]["broadcast_memory_present"]
+            rebuilt_metadata["ordinary_chat_single_packet_applied"]
         )
-        self.assertNotIn(
-            "broadcast_memory",
-            assessment_calls[0]["prompt_lanes"],
+        self.assertIsNone(
+            rebuilt_metadata["shared_brain_synthesis_canary_basis"]
         )
-        self.assertTrue(
-            metadata["ordinary_chat_single_packet_applied"]
-        )
-        self.assertIs(
-            metadata["ordinary_chat_single_packet_basis"],
-            ordinary_basis,
-        )
-        self.assertEqual(
-            metadata["ordinary_chat_single_packet_scope"].reason,
-            "eligible",
-        )
-        self.assertNotIn("Broadcast memory context:", prompt)
+        memory_builder.assert_called_once()
+        broadcast_builder.assert_called_once()
 
     def test_bot_recorder_persists_only_aggregate_receipt(self):
         with mock.patch.object(
