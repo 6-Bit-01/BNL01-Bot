@@ -1347,8 +1347,32 @@ class SharedBrainSynthesisBotPathTests(
 
     async def test_single_packet_deterministic_clarification_bypasses_factual_guard_and_sends(self):
         message = FakeMessage()
+        message.content = "Tell me about Jordan."
+        situation_frame = bnl01_bot.build_situation_frame_v1(
+            route_allowed=True,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            conversation_surface=(
+                bnl01_bot.CONVERSATION_SURFACE_MENTION_OR_REPLY
+            ),
+            channel_policy="public_context",
+            current_text=message.content,
+            current_speaker_user_ids=(message.author.id,),
+            current_speaker_labels=(message.author.display_name,),
+            addressee_kinds=("discord_mention",),
+            explicit_mention_count=1,
+            referent_status="ambiguous",
+            response_act="clarify",
+            packet_revision="turn_ambiguous_clarification",
+        )
         reason = "candidate_prompt_frame_ambiguous"
-        run = SimpleNamespace(run_id="single-block-run")
+        run = SimpleNamespace(
+            run_id="single-block-run",
+            basis=SimpleNamespace(
+                packet=SimpleNamespace(
+                    source_snapshot_digest="source-digest"
+                )
+            ),
+        )
         decision = SimpleNamespace(
             run=run,
             candidate_selected=False,
@@ -1399,6 +1423,8 @@ class SharedBrainSynthesisBotPathTests(
                 allow_model_save=False,
                 mark_recent_direct=False,
                 ordinary_chat_single_packet_execution=execution,
+                situation_frame=situation_frame,
+                situation_frame_current_text=message.content,
             )
 
         self.assertEqual(message.replies, [execution.response])

@@ -23485,8 +23485,10 @@ def _exact_reply_canon_subject_references(
     """Use one exact BNL reply as identity-only pronoun binding.
 
     Prior model prose never becomes factual evidence here.  It may identify a
-    single approved canon subject for the current deictic/pronoun reference;
-    zero or multiple matches remain unresolved.
+    single approved canon subject for the current deictic/pronoun reference.
+    When the current relationship question explicitly names an object, that
+    object cannot also satisfy its pronoun slot.  One remaining source subject
+    may provide identity-only binding; otherwise ambiguity remains closed.
     """
 
     if (
@@ -23539,9 +23541,49 @@ def _exact_reply_canon_subject_references(
             if str(alias or "").strip()
         ):
             resolved.append((identity.key, identity.name))
-    if len(resolved) == 1:
-        return tuple(resolved), "resolved"
     if resolved:
+        relation_object = re.search(
+            r"\b(?:connected|related)\s+to\b(?P<object>[^?!;\n]*)",
+            unicodedata.normalize("NFKC", str(current_text or "")).replace(
+                "’",
+                "'",
+            ),
+            re.I,
+        )
+        if relation_object is not None:
+            object_text = relation_object.group("object")
+            resolved_by_key = dict(resolved)
+            object_keys = {
+                identity.key
+                for identity in eligible
+                if identity.key in resolved_by_key
+                and any(
+                    re.search(
+                        r"(?<![a-z0-9])%s(?![a-z0-9])"
+                        % re.escape(
+                            unicodedata.normalize("NFKC", alias).replace(
+                                "’",
+                                "'",
+                            )
+                        ),
+                        object_text,
+                        re.I,
+                    )
+                    for alias in (identity.name, *identity.aliases)
+                    if str(alias or "").strip()
+                )
+            }
+            remaining = tuple(
+                identity
+                for identity in resolved
+                if identity[0] not in object_keys
+            )
+            if object_keys:
+                if len(remaining) == 1:
+                    return remaining, "resolved"
+                return (), "ambiguous"
+        if len(resolved) == 1:
+            return tuple(resolved), "resolved"
         return (), "ambiguous"
     if _EXACT_REPLY_CANON_IDENTITY_QUERY_RE.search(current_text or ""):
         return (), "unresolved"
@@ -36950,6 +36992,11 @@ async def send_planned_conversation_response(
             ordinary_chat_single_packet_execution.block_reason
         )
     )
+    single_packet_block_reason = str(
+        ordinary_chat_single_packet_execution.block_reason
+        if ordinary_chat_single_packet_execution is not None
+        else ""
+    ).lower()
     typed_single_packet_candidate = bool(
         single_packet_cutover
         and synthesis_candidate_active
@@ -37382,9 +37429,19 @@ async def send_planned_conversation_response(
             final_frame_revalidation.status,
             len(final_frame_revalidation.reason_codes),
         )
+        deterministic_frame_clarification = bool(
+            deterministic_single_packet_block
+            and final_frame_revalidation.status == "ambiguous"
+            and (
+                "frame_ambiguous" in single_packet_block_reason
+                or "deterministic_task_clarify"
+                in single_packet_block_reason
+            )
+        )
         if (
             single_packet_cutover
             and final_frame_revalidation.status != "valid"
+            and not deterministic_frame_clarification
         ):
             if synthesis_decision is not None:
                 synthesis_decision = (
@@ -37412,6 +37469,15 @@ async def send_planned_conversation_response(
                 "frame_presend_failed",
             )
             return model_decision
+        if deterministic_frame_clarification:
+            guard_diagnostics[
+                "deterministic_frame_clarification"
+            ] = True
+            logging.info(
+                "situation_frame_clarification_send_allowed "
+                "revision=%s status=ambiguous",
+                situation_frame.frame_revision,
+            )
     sent_message_ids = []
     try:
         if len(response) <= 2000:
