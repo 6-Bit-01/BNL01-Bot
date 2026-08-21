@@ -1038,7 +1038,15 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             try:
                 self.create_pr2_broadcast_table(conn)
                 row_id = self.insert_pr2_broadcast(conn)
-                revision = self.classify_pr2_broadcast(conn, row_id)
+                revision = self.classify_pr2_broadcast(
+                    conn,
+                    row_id,
+                    eligible_routes=(
+                        "sealed_test",
+                        "public_home",
+                        "public_context",
+                    ),
+                )
                 disabled = canon.select_declared_canon_claims_for_packet(
                     conn,
                     guild_id=7,
@@ -1051,25 +1059,31 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                 self.assertEqual(disabled.claims, ())
 
                 before = conn.total_changes
-                selected = canon.select_declared_canon_claims_for_packet(
-                    conn,
-                    guild_id=7,
-                    route_mode="normal_chat",
-                    channel_policy="public_home",
-                    capability_authorized=True,
-                    now="2026-08-01T02:00:00+00:00",
-                )
-                self.assertEqual(conn.total_changes, before)
-                self.assertEqual(selected.reason, "eligible")
-                self.assertEqual(len(selected.claims), 1)
-                self.assertEqual(
-                    selected.claims[0].source_revision,
-                    revision.revision_id,
-                )
-                self.assertEqual(
-                    selected.claims[0].value,
-                    "A source-owned Broadcast summary.",
-                )
+                for channel_policy in (
+                    "sealed_test",
+                    "public_home",
+                    "public_context",
+                ):
+                    with self.subTest(channel_policy=channel_policy):
+                        selected = canon.select_declared_canon_claims_for_packet(
+                            conn,
+                            guild_id=7,
+                            route_mode="normal_chat",
+                            channel_policy=channel_policy,
+                            capability_authorized=True,
+                            now="2026-08-01T02:00:00+00:00",
+                        )
+                        self.assertEqual(conn.total_changes, before)
+                        self.assertEqual(selected.reason, "eligible")
+                        self.assertEqual(len(selected.claims), 1)
+                        self.assertEqual(
+                            selected.claims[0].source_revision,
+                            revision.revision_id,
+                        )
+                        self.assertEqual(
+                            selected.claims[0].value,
+                            "A source-owned Broadcast summary.",
+                        )
             finally:
                 conn.close()
 

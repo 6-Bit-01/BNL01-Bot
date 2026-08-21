@@ -244,6 +244,40 @@ class PublicationReadAdapterTests(unittest.TestCase):
         self.assertEqual("exact_date", by_date.query_mode)
         self.assertEqual(entry_id, by_date.publications[0].entry_id)
 
+    def test_explicit_latest_journal_prefers_publication_time_over_topic_density(self):
+        self.add_journal(
+            "journal_older_dense",
+            title="BARCODE Radio Broadcast Queue Audience",
+            excerpt="BARCODE Radio broadcast queue audience report.",
+            body="The broadcast queue and audience filled the report.",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        self.add_journal(
+            "journal_newer_light",
+            title="New BARCODE Radio Note",
+            excerpt="A newer BARCODE Radio note was published.",
+            body="The new note reached the public Journal.",
+            published_at="2026-08-05T01:00:00Z",
+        )
+        selected = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text=(
+                "what did the latest Journal say about BARCODE Radio "
+                "broadcast queue audience?"
+            ),
+            control_snapshot=control_snapshot(),
+            now=NOW,
+        )
+
+        self.assertEqual(selected.status, "eligible")
+        self.assertEqual(selected.query_mode, "latest")
+        self.assertEqual(len(selected.publications), 1)
+        self.assertEqual(
+            selected.publications[0].entry_id,
+            "journal_newer_light",
+        )
+
     def test_journal_public_visibility_and_reuse_are_independent(self):
         entry_id = "journal_visibility_case"
         self.add_journal(entry_id, title="Public Ceramic Log")
@@ -389,6 +423,38 @@ class PublicationReadAdapterTests(unittest.TestCase):
         self.assertEqual(
             "site_manual_owner_receipt",
             approved.publications[0].provenance_kind,
+        )
+
+    def test_explicit_latest_relay_prefers_publication_time_over_topic_density(self):
+        self.add_relay(
+            "bnl-relay-older-dense",
+            message=(
+                "BARCODE Radio broadcast queue audience report covered the "
+                "broadcast queue and audience."
+            ),
+            published_at="2026-08-04T01:00:00Z",
+        )
+        self.add_relay(
+            "bnl-relay-newer-light",
+            message="A newer BARCODE Radio signal reached the Relay.",
+            published_at="2026-08-05T01:00:00Z",
+        )
+
+        selected = relay.select_accepted_relay_publications_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text=(
+                "what did the latest Relay say about BARCODE Radio "
+                "broadcast queue audience?"
+            ),
+        )
+
+        self.assertEqual("eligible", selected.status)
+        self.assertEqual("latest", selected.query_mode)
+        self.assertEqual(1, len(selected.publications))
+        self.assertEqual(
+            "bnl-relay-newer-light",
+            selected.publications[0].relay_id,
         )
 
     def test_relay_attempts_and_presence_are_not_accepted_speech(self):
@@ -573,6 +639,89 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         )
         self.assertFalse(changed.valid)
         self.assertEqual("source_changed", changed.status)
+
+    def test_latest_journal_revalidation_rejects_newer_matching_publication(self):
+        snapshot = control_snapshot()
+        self.add_journal(
+            "journal_latest_old",
+            title="BARCODE Radio Old Signal",
+            excerpt="An older BARCODE Radio signal reached the Journal.",
+            body="The older radio signal was published first.",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        packet = build_packet(
+            self.conn,
+            self.request(
+                "what did the latest Journal say about BARCODE Radio?",
+                snapshot=snapshot,
+                control_status="valid",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        selected = next(
+            item
+            for item in packet.items
+            if item.lane == "journal_publication"
+        )
+        self.assertEqual("journal:journal_latest_old:1", selected.source_ref)
+
+        self.add_journal(
+            "journal_latest_new",
+            title="BARCODE Radio New Signal",
+            excerpt="A newer BARCODE Radio signal reached the Journal.",
+            body="The newer radio signal supersedes the latest selection.",
+            published_at="2026-08-05T01:00:00Z",
+        )
+        self.conn.commit()
+
+        changed = revalidate_packet(
+            self.conn,
+            packet,
+            environ=self.flags,
+            journal_control_snapshot=snapshot,
+            journal_control_snapshot_provided=True,
+        )
+        self.assertFalse(changed.valid)
+        self.assertEqual("source_changed", changed.status)
+        self.assertGreaterEqual(changed.changed_source_count, 1)
+
+    def test_latest_relay_revalidation_rejects_newer_matching_publication(self):
+        self.add_relay(
+            "bnl-latest-old",
+            message="An older BARCODE Radio signal reached the Relay.",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        packet = build_packet(
+            self.conn,
+            self.request(
+                "what did the latest Relay say about BARCODE Radio?"
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        selected = next(
+            item
+            for item in packet.items
+            if item.lane == "relay_publication"
+        )
+        self.assertEqual("relay:bnl-latest-old", selected.source_ref)
+
+        self.add_relay(
+            "bnl-latest-new",
+            message="A newer BARCODE Radio signal reached the Relay.",
+            published_at="2026-08-05T01:00:00Z",
+        )
+        self.conn.commit()
+
+        changed = revalidate_packet(
+            self.conn,
+            packet,
+            environ=self.flags,
+        )
+        self.assertFalse(changed.valid)
+        self.assertEqual("source_changed", changed.status)
+        self.assertGreaterEqual(changed.changed_source_count, 1)
 
     def test_missing_hidden_and_unapproved_publications_fail_packet_closed(self):
         missing = build_packet(

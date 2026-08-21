@@ -436,6 +436,7 @@ from bnl_website_relay_state import (
     save_pending_v2_publication as relay_save_pending_v2_publication,
     clear_pending_v2_publication as relay_clear_pending_v2_publication,
     normalize_text as relay_normalize_text,
+    relay_publication_query_mode,
     recent_history as relay_recent_history,
     reject_reason_for_candidate as relay_reject_reason_for_candidate,
     stock_directive_reason as relay_stock_directive_reason,
@@ -1958,6 +1959,8 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
     normalized = (text or "").lower()
     if not normalized.strip():
         return False
+    if _current_queue_state_query(normalized):
+        return True
 
     explicit_site_patterns = [
         r"\b(read model|website read model|public read model)\b",
@@ -2286,6 +2289,15 @@ def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> s
         return ""
     read_model = fetch_bnl_read_model()
     if not read_model:
+        return ""
+    if (
+        _current_queue_state_query(user_text)
+        and not queue_usability(read_model)["usable"]
+    ):
+        logging.info(
+            "bnl_read_model_context_skipped "
+            "reason=current_queue_owner_unavailable"
+        )
         return ""
     return build_bnl_read_model_context(read_model, user_text, channel_policy)
 
@@ -17849,6 +17861,89 @@ def get_latest_broadcast_episode_date(guild_id: int, public_only: bool = False, 
     return row[0] if row and row[0] else None
 
 
+def _broadcast_historical_recency_query(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    return bool(
+        re.search(
+            r"\b(?:last|latest|newest|most\s+recent)\s+"
+            r"(?:(?:barcode\s+radio|radio)\s+)?"
+            r"(?:show|episode|broadcast)\b",
+            normalized,
+        )
+    )
+
+
+def get_latest_eligible_broadcast_episode_entries(
+    guild_id: int,
+    *,
+    public_only: bool = True,
+    limit: int = 5,
+) -> list[dict]:
+    """Read eligible evidence from exactly one newest completed episode."""
+
+    today = datetime.now(PACIFIC_TZ).date().isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        newest_row = conn.execute(
+            """
+            SELECT date(episode_date)
+            FROM broadcast_memory
+            WHERE guild_id=?
+              AND TRIM(COALESCE(cleaned_summary,''))<>''
+              AND entry_type<>'show_state_override'
+              AND date(episode_date) IS NOT NULL
+              AND date(episode_date)<date(?)
+            ORDER BY date(episode_date) DESC,id DESC
+            LIMIT 1
+            """,
+            (int(guild_id or 0), today),
+        ).fetchone()
+        if not newest_row or not str(newest_row[0] or "").strip():
+            return []
+        selected_date = str(newest_row[0])
+        query = """
+            SELECT id, episode_date, cleaned_summary, entry_type,
+                   importance, public_safe, usage_scope
+            FROM broadcast_memory
+            WHERE guild_id=? AND status='active'
+              AND TRIM(COALESCE(cleaned_summary,''))<>''
+              AND entry_type<>'show_state_override'
+              AND COALESCE(superseded_by_id,0)=0
+              AND date(episode_date)=date(?)
+        """
+        params: list[Any] = [int(guild_id or 0), selected_date]
+        if public_only:
+            query += """
+              AND public_safe=1
+              AND (
+                instr(',' || ifnull(usage_scope,'') || ',', ',direct,')>0
+                OR instr(',' || ifnull(usage_scope,'') || ',', ',ambient,')>0
+              )
+            """
+        query += " ORDER BY id DESC LIMIT 100"
+        rows = conn.execute(query, tuple(params)).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return []
+    selected = []
+    for row in rows:
+        selected.append(
+            {
+                "id": int(row[0] or 0),
+                "episode_date": selected_date,
+                "cleaned_summary": str(row[2] or ""),
+                "entry_type": str(row[3] or "notable_moment"),
+                "importance": str(row[4] or "medium"),
+                "public_safe": bool(row[5]),
+                "usage_scope": str(row[6] or ""),
+            }
+        )
+        if len(selected) >= max(1, min(int(limit or 1), 8)):
+            break
+    return selected
+
+
 BROADCAST_MEMORY_ALLOWED_TYPES = {
     "episode_arc", "notable_moment", "running_joke", "technical_issue",
     "moderation_context", "show_state_override",
@@ -18019,6 +18114,45 @@ def _is_broadcast_memory_relevant(text: str) -> bool:
     ))
 
 
+def _publication_read_owner_requested(text: str) -> bool:
+    return bool(
+        journal_publication_query_mode(text) != "not_requested"
+        or relay_publication_query_mode(text) != "not_requested"
+    )
+
+
+def _current_queue_state_query(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return False
+    queue_signal = bool(
+        re.search(
+            r"\b(?:(?:barcode\s+radio\s+)?queue|"
+            r"(?:track\s+)?submissions?|wheel\s+spins?)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:submit(?:ting)?|intake)\b.{0,40}"
+            r"\b(?:tracks?|songs?|music)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:tracks?|songs?|music)\b.{0,40}"
+            r"\b(?:submit(?:ting)?|intake)\b",
+            normalized,
+        )
+    )
+    current_state_signal = bool(
+        re.search(
+            r"\b(?:open|closed|status|state|current|currently|"
+            r"right\s+now|now|available|active|accepting|intake)\b",
+            normalized,
+        )
+        or re.search(r"\b(?:can|could|may)\s+i\b", normalized)
+    )
+    return queue_signal and current_state_signal
+
+
 def _broadcast_memory_requires_specialized_owner(text: str) -> bool:
     """Keep explicit broadcast requests on the specialized owner.
 
@@ -18031,6 +18165,10 @@ def _broadcast_memory_requires_specialized_owner(text: str) -> bool:
 
     normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
     if not normalized:
+        return False
+    if _publication_read_owner_requested(normalized):
+        return False
+    if _current_queue_state_query(normalized):
         return False
     if any(
         phrase in normalized
@@ -18091,6 +18229,48 @@ def _is_show_state_status_query(text: str) -> bool:
 def build_broadcast_memory_context(guild_id: int, user_text: str, channel_policy: str, is_owner_or_mod: bool = False) -> str:
     include_internal = (channel_policy == "broadcast_memory") or bool(is_owner_or_mod)
     relevant = _is_broadcast_memory_relevant(user_text)
+    if _broadcast_historical_recency_query(user_text):
+        latest_entries = get_latest_eligible_broadcast_episode_entries(
+            guild_id,
+            public_only=not include_internal,
+            limit=5,
+        )
+        if not latest_entries:
+            logging.info(
+                "broadcast_memory_context_skipped "
+                "reason=latest_completed_episode_unavailable"
+            )
+            return ""
+        selected_date = latest_entries[0]["episode_date"]
+        lines = [
+            "- %s [%s] %s"
+            % (
+                selected_date,
+                entry["entry_type"],
+                _safe_truncate_summary(entry["cleaned_summary"], 180),
+            )
+            for entry in latest_entries
+            if entry.get("cleaned_summary")
+        ]
+        if not lines:
+            return ""
+        logging.info(
+            "broadcast_memory_context_loaded "
+            "reason=latest_completed_episode episode_date=%s count=%s",
+            selected_date,
+            len(lines),
+        )
+        return (
+            "Broadcast memory context for the newest completed episode "
+            f"({selected_date}):\n"
+            + "\n".join(lines)
+            + "\nLatest-episode rules:\n"
+            "- Every item above belongs to the one selected episode date.\n"
+            "- Treat that date as the latest completed show represented by "
+            "eligible Broadcast memory.\n"
+            "- Do not substitute an older episode, a future schedule, or a "
+            "show-state override."
+        )
     entity_terms = extract_broadcast_memory_query_terms(user_text)
     if entity_terms:
         logging.info(f"broadcast_memory_entity_terms terms={len(entity_terms)}")
@@ -23173,7 +23353,33 @@ def _typed_canon_subject_references(
 
     text = unicodedata.normalize("NFKC", str(current_text or ""))
     text = text.replace("’", "'").casefold()
-    matches: dict[str, str] = {}
+    factual_subject_cue_re = re.compile(
+        r"\b(?:tell\s+me\s+about|what\s+do\s+you\s+"
+        r"(?:know|remember)\s+about|what\s+happened\s+with|"
+        r"compare(?:s|d|ing)?|difference\s+between|"
+        r"relationship\s+between)\b",
+        re.I,
+    )
+    factual_subject_tail_spans = []
+    for cue in factual_subject_cue_re.finditer(text):
+        tail_start = cue.end()
+        tail_end = len(text)
+        for boundary in re.finditer(
+            r"[?!;\n]|\.(?=\s|$)",
+            text[tail_start:],
+        ):
+            boundary_start = tail_start + boundary.start()
+            if (
+                text[boundary_start : boundary_start + 1] == "."
+                and text[max(tail_start, boundary_start - 2) : boundary_start]
+                == "vs"
+            ):
+                continue
+            tail_end = boundary_start
+            break
+        factual_subject_tail_spans.append((tail_start, tail_end))
+
+    candidates: set[tuple[int, int, str, str]] = set()
     for subject in CANON_ENTITY_IDENTITIES:
         for raw_alias in (subject.name, *subject.aliases):
             alias = unicodedata.normalize("NFKC", str(raw_alias or ""))
@@ -23182,21 +23388,167 @@ def _typed_canon_subject_references(
                 continue
             escaped = re.escape(alias.casefold()).replace(r"\ ", r"\s+")
             subject_patterns = (
-                r"\b(?:who|what)\s+(?:is|was)\s+(?:the\s+)?%s"
+                r"\b(?:who|what)\s+(?:is|was)\s+(?:the\s+)?"
+                r"(?P<alias>%s)(?![a-z0-9])"
                 % escaped,
                 r"\b(?:tell\s+me\s+about|what\s+do\s+you\s+"
-                r"(?:know|remember)\s+about|what\s+happened\s+with)\s+%s"
+                r"(?:know|remember)\s+about|what\s+happened\s+with)\s+"
+                r"(?P<alias>%s)(?![a-z0-9])"
                 % escaped,
-                r"(?<![a-z0-9])%s(?:'s)?\s+(?:identity|role|history|"
+                r"(?<![a-z0-9])(?P<alias>%s)(?![a-z0-9])"
+                r"(?:'s)?\s+(?:identity|role|history|"
                 r"work|music|story|status|connection|relationship)\b"
                 % escaped,
-                r"\b(?:compare|difference\s+between|relationship\s+between)"
-                r".{0,80}(?<![a-z0-9])%s(?![a-z0-9])" % escaped,
+                r"(?<![a-z0-9])(?P<alias>%s)(?![a-z0-9])"
+                r"\s+(?:is\s+)?"
+                r"(?:connected|related)\s+to\b" % escaped,
+                r"\b(?:connected|related)\s+to\s+(?:the\s+)?"
+                r"(?P<alias>%s)(?![a-z0-9])" % escaped,
             )
-            if any(re.search(pattern, text, re.I) for pattern in subject_patterns):
-                matches[subject.key] = subject.name
-                break
-    return tuple(matches.items())
+            for pattern in subject_patterns:
+                for match in re.finditer(pattern, text, re.I):
+                    start, end = match.span("alias")
+                    candidates.add(
+                        (start, end, subject.key, subject.name)
+                    )
+            for tail_start, tail_end in factual_subject_tail_spans:
+                tail = text[tail_start:tail_end]
+                for match in re.finditer(
+                    r"(?:^[\s:—-]*|,\s*|\band\s+|"
+                    r"\b(?:vs\.?|versus)\s+)"
+                    r"\s*(?:the\s+)?(?P<alias>%s)(?![a-z0-9])"
+                    % escaped,
+                    tail,
+                    re.I,
+                ):
+                    start, end = match.span("alias")
+                    candidates.add(
+                        (
+                            tail_start + start,
+                            tail_start + end,
+                            subject.key,
+                            subject.name,
+                        )
+                    )
+
+    selected_spans: list[tuple[int, int]] = []
+    selected_keys = set()
+    for start, end, subject_key, _subject_name in sorted(
+        candidates,
+        key=lambda candidate: (
+            -(candidate[1] - candidate[0]),
+            candidate[0],
+            candidate[2],
+        ),
+    ):
+        if any(
+            start < selected_end and selected_start < end
+            for selected_start, selected_end in selected_spans
+        ):
+            continue
+        selected_spans.append((start, end))
+        selected_keys.add(subject_key)
+
+    return tuple(
+        (subject.key, subject.name)
+        for subject in CANON_ENTITY_IDENTITIES
+        if subject.key in selected_keys
+    )
+
+
+_EXACT_REPLY_PRONOUN_SUBJECT_RE = re.compile(
+    r"\b(?:he|him|his|she|her|hers|they|them|their|theirs|"
+    r"that\s+person|that\s+member|that\s+character|that\s+entity)\b",
+    re.I,
+)
+_EXACT_REPLY_CANON_IDENTITY_QUERY_RE = re.compile(
+    r"\b(?:"
+    r"who\s+(?:is|are)\s+(?:he|she|they|that\s+(?:person|member|"
+    r"character|entity))|"
+    r"(?:what\s+do\s+you\s+(?:know|remember)\s+about|tell\s+me\s+"
+    r"about|describe)\s+(?:him|her|them|that\s+(?:person|member|"
+    r"character|entity))|"
+    r"how\s+(?:is|are)\s+(?:he|she|they|that\s+(?:person|member|"
+    r"character|entity))\s+(?:connected|related)|"
+    r"(?:he|she|they|that\s+(?:person|member|character|entity))\s+"
+    r"(?:connected|related)\s+to|"
+    r"(?:his|her|their)\s+(?:role|history|story|identity|relationship|"
+    r"connection))\b",
+    re.I,
+)
+
+
+def _exact_reply_canon_subject_references(
+    context_result: ConversationContextResult | None,
+    current_text: str,
+) -> tuple[tuple[tuple[str, str], ...], str]:
+    """Use one exact BNL reply as identity-only pronoun binding.
+
+    Prior model prose never becomes factual evidence here.  It may identify a
+    single approved canon subject for the current deictic/pronoun reference;
+    zero or multiple matches remain unresolved.
+    """
+
+    if (
+        context_result is None
+        or str(context_result.referent_status or "").lower() != "resolved"
+        or str(context_result.referent_reason or "").lower()
+        != "discord_reply_source"
+        or not _EXACT_REPLY_PRONOUN_SUBJECT_RE.search(current_text or "")
+    ):
+        return (), "not_requested"
+    prefix = "BNL-01 (exact Discord reply source):"
+    exact_lines = tuple(
+        line.split(":", 1)[1].strip()
+        for line in str(context_result.rendered_context or "").splitlines()
+        if line.startswith(prefix) and ":" in line
+    )
+    if not exact_lines:
+        # An exact human reply is still valid conversation evidence, but its
+        # display label is not identity authority for canon pronouns.
+        return (), "not_requested"
+    if len(exact_lines) != 1:
+        return (), "ambiguous"
+    reply_text = unicodedata.normalize("NFKC", exact_lines[0]).replace(
+        "’",
+        "'",
+    )
+    eligible = tuple(
+        identity
+        for identity in CANON_ENTITY_IDENTITIES
+        if identity.key
+        not in {
+            "barcode",
+            "barcode_network",
+            "barcode_radio",
+            "bnl_01",
+        }
+    )
+    resolved = []
+    for identity in eligible:
+        if any(
+            re.search(
+                r"(?<![a-z0-9])%s(?![a-z0-9])"
+                % re.escape(
+                    unicodedata.normalize("NFKC", alias).replace("’", "'")
+                ),
+                reply_text,
+                re.I,
+            )
+            for alias in (identity.name, *identity.aliases)
+            if str(alias or "").strip()
+        ):
+            resolved.append((identity.key, identity.name))
+    if len(resolved) == 1:
+        return tuple(resolved), "resolved"
+    if resolved:
+        return (), "ambiguous"
+    if _EXACT_REPLY_CANON_IDENTITY_QUERY_RE.search(current_text or ""):
+        return (), "unresolved"
+    # A resolved Discord reply can carry ordinary conversational continuity
+    # without naming a canon identity.  Do not replace that exact referent
+    # with an identity failure merely because the current turn uses a pronoun.
+    return (), "not_requested"
 
 
 def build_live_conversation_orchestration_decision(
@@ -23304,12 +23656,30 @@ def build_live_conversation_orchestration_decision(
         )
     )
     typed_canon_subjects = _typed_canon_subject_references(current_text)
+    (
+        exact_reply_canon_subjects,
+        exact_reply_identity_status,
+    ) = _exact_reply_canon_subject_references(context_result, current_text)
+    if exact_reply_canon_subjects:
+        logging.info(
+            "exact_reply_canon_subject_bound count=%s method=identity_only",
+            len(exact_reply_canon_subjects),
+        )
+    frame_referent_status = (
+        exact_reply_identity_status
+        if exact_reply_identity_status in {"ambiguous", "unresolved"}
+        else referent_status
+    )
     resolved_subject_entity_refs = tuple(
         dict.fromkeys(
             str(entity_ref or "").strip()
             for entity_ref in (
                 *subject_entity_refs,
                 *(entity_ref for entity_ref, _label in typed_canon_subjects),
+                *(
+                    entity_ref
+                    for entity_ref, _label in exact_reply_canon_subjects
+                ),
             )
             if str(entity_ref or "").strip()
         )
@@ -23393,8 +23763,22 @@ def build_live_conversation_orchestration_decision(
                 ),
                 *(label for _entity_ref, label in typed_canon_subjects),
                 *(
+                    label
+                    for _entity_ref, label in exact_reply_canon_subjects
+                ),
+                *(
                     context_result.referent_candidate_labels
-                    if context_result is not None
+                    if (
+                        context_result is not None
+                        and not (
+                            str(context_result.referent_status or "").lower()
+                            == "resolved"
+                            and str(
+                                context_result.referent_reason or ""
+                            ).lower()
+                            == "discord_reply_source"
+                        )
+                    )
                     else ()
                 ),
             )
@@ -23449,7 +23833,7 @@ def build_live_conversation_orchestration_decision(
         moment_participant_overlap=bool(
             moment_situation and moment_situation.participant_overlap
         ),
-        referent_status=referent_status,
+        referent_status=frame_referent_status,
         response_act=decision.response_act,
         packet_revision=str(packet_revision or decision.packet_revision),
     )

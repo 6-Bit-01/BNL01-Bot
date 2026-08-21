@@ -91,13 +91,13 @@ _VISIBLE_CONTROL_MARKER_RE = re.compile(
 _SEMANTIC_WORD_RE = re.compile(r"[a-z0-9][a-z0-9'’-]*", re.I)
 _OBJECTIVE_RE = re.compile(
     r"\?|"
-    r"\b(?:choose|pick|select|compare|decide|explain|tell|show|give|help|"
+    r"\b(?:choose|pick|select|compare(?:s|d)?|decide|explain|tell|show|give|help|"
     r"recap|summari[sz]e|continue|resume|combine|fix|build|make|write|"
     r"what|which|why|how|where|when|who)\b",
     re.I,
 )
 _CHOICE_OBJECTIVE_RE = re.compile(
-    r"\b(?:choose|pick|select|compare|decide\s+between|which)\b"
+    r"\b(?:choose|pick|select|compare(?:s|d)?|decide\s+between|which)\b"
     r"|\b(?:better|best|fits?|works?|prefer)\b",
     re.I,
 )
@@ -328,7 +328,17 @@ _SITUATION_OBJECT_PATTERNS = (
     ("relay", re.compile(r"\brelay(?:s)?\b", re.I)),
     ("moment", re.compile(r"\bmoment(?:s)?\b|\bepisode(?:s)?\b", re.I)),
     ("memory", re.compile(r"\bmemory\b|\bshared\s+brain\b|\brecall\b", re.I)),
-    ("queue", re.compile(r"\bqueue\b|\bsubmission(?:s)?\b|\bwheel\s+spin(?:s)?\b", re.I)),
+    (
+        "queue",
+        re.compile(
+            r"\bqueue\b|\bsubmission(?:s)?\b|\bwheel\s+spin(?:s)?\b|"
+            r"\b(?:submit(?:ting)?|intake)\b.{0,40}"
+            r"\b(?:tracks?|songs?|music)\b|"
+            r"\b(?:tracks?|songs?|music)\b.{0,40}"
+            r"\b(?:submit(?:ting)?|intake)\b",
+            re.I,
+        ),
+    ),
     ("broadcast", re.compile(r"\bbarcode\s+radio\b|\bshow\b|\bbroadcast\b", re.I)),
     ("website", re.compile(r"\bwebsite\b|\bsite\b|\bterminal\b", re.I)),
     ("source_file", re.compile(r"\bsource\s+files?\b|\bdossier(?:s)?\b", re.I)),
@@ -366,7 +376,7 @@ _BNL_SELF_SUBJECT_CUE_RE = re.compile(
 )
 _TASK_LEAD_RE = re.compile(
     r"(?:what|which|who|where|when|why|how|tell|explain|summari[sz]e|"
-    r"compare|describe|give|show|help|check|find|is|are|do|does|did|can|"
+    r"compare(?:s|d)?|describe|give|show|help|check|find|is|are|do|does|did|can|"
     r"could|would|should)\b",
     re.I,
 )
@@ -375,6 +385,21 @@ _VOLATILE_EXTERNAL_RE = re.compile(
     r"stock|market|exchange\s+rate|news|headline|election|polls?|"
     r"president|prime\s+minister|governor|mayor|ceo|schedule|"
     r"availability|open\s+now|live\s+status)\b",
+    re.I,
+)
+_EXACT_REPLY_DEICTIC_SUBJECT_RE = re.compile(
+    r"\b(?:he|him|his|she|her|hers|they|them|their|theirs|"
+    r"that\s+person|that\s+member|that\s+character|that\s+entity)\b",
+    re.I,
+)
+_EXACT_REPLY_CONTINUITY_RE = re.compile(
+    r"\b(?:"
+    r"he|him|his|she|her|hers|they|them|their|theirs|"
+    r"that\s+(?:person|member|character|entity)|"
+    r"(?:what|which)(?:\s+[a-z0-9'-]+){0,4}\s+did\s+(?:i|you|we)\b|"
+    r"(?:why|how)\s+did\s+(?:i|you|we)\b|"
+    r"(?:i|you|we)\s+(?:said|told|gave|asked|meant|called|chose|"
+    r"preferred|compared)\b)",
     re.I,
 )
 _EXTERNAL_ROLE_QUERY_RE = re.compile(
@@ -560,6 +585,12 @@ def _situation_object(text: str) -> str:
     )
     if len(matches) == 1:
         return matches[0]
+    if "queue" in matches and set(matches).issubset(
+        {"queue", "broadcast", "website"}
+    ):
+        # BARCODE Radio and website language qualify the queue source.  They
+        # do not turn one current queue-state request into competing owners.
+        return "queue"
     publication_owners = tuple(
         match for match in matches if match in {"journal", "relay"}
     )
@@ -656,6 +687,7 @@ def _situation_tasks(
     *,
     subjects: Sequence[SituationSubjectReference],
     response_act: str,
+    exact_reply_resolved: bool = False,
 ) -> Tuple[SituationTaskReference, ...]:
     tasks = []
     for index, segment in enumerate(_situation_task_segments(text), start=1):
@@ -679,6 +711,21 @@ def _situation_tasks(
             objective_kind=objective_kind,
         )
         subject_indexes = _task_subject_indexes(segment, subjects)
+        if (
+            exact_reply_resolved
+            and _EXACT_REPLY_DEICTIC_SUBJECT_RE.search(segment)
+        ):
+            unmatched_subject_indexes = tuple(
+                subject_index
+                for subject_index in range(len(subjects))
+                if subject_index not in subject_indexes
+            )
+            if len(unmatched_subject_indexes) == 1:
+                subject_indexes = tuple(
+                    dict.fromkeys(
+                        (*subject_indexes, unmatched_subject_indexes[0])
+                    )
+                )
         external_role_query = bool(_EXTERNAL_ROLE_QUERY_RE.search(segment))
         subject_cue = bool(
             _BNL_SELF_SUBJECT_CUE_RE.search(segment)
@@ -699,6 +746,12 @@ def _situation_tasks(
             authority_scope = "packet"
         elif _CURRENT_REQUEST_TASK_RE.search(segment):
             authority_scope = "current_request"
+        elif (
+            exact_reply_resolved
+            and _EXACT_REPLY_CONTINUITY_RE.search(segment)
+            and not _VOLATILE_EXTERNAL_RE.search(segment)
+        ):
+            authority_scope = "packet"
         else:
             authority_scope = "external_public"
         required_act = str(response_act or "observe")
@@ -944,15 +997,25 @@ def build_situation_frame_v1(
         else "not_applicable"
     )
 
+    normalized_referent = str(
+        referent_status or "not_requested"
+    ).strip().lower()
+    exact_reply_resolved = bool(
+        normalized_referent == "resolved"
+        and (
+            _unique_positive_ints(reply_message_ids)
+            or _unique_positive_ints(exact_source_row_ids)
+        )
+    )
     tasks = _situation_tasks(
         text,
         subjects=subjects,
         response_act=str(response_act or "observe"),
+        exact_reply_resolved=exact_reply_resolved,
     )
 
     ambiguity = []
     competing = []
-    normalized_referent = str(referent_status or "not_requested").strip().lower()
     if normalized_referent in {"ambiguous", "unresolved"}:
         ambiguity.append("referent_%s" % normalized_referent)
         competing.append("nearby_referent_candidates")

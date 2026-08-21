@@ -1153,11 +1153,29 @@ class MemoryInjectionGovernanceTests(unittest.TestCase):
             "What happened on the last BARCODE Radio episode?",
             "What does broadcast memory say about DJ Floppy Disc?",
             "Is the show schedule still active?",
-            "Is the track submission queue open?",
         )
         for text in explicit_broadcast_requests:
             with self.subTest(text=text):
                 self.assertTrue(
+                    bnl01_bot._broadcast_memory_requires_specialized_owner(
+                        text
+                    )
+                )
+
+        canonical_non_broadcast_owners = (
+            "Is the track submission queue open?",
+            "is the Barcode Radio queue open right now?",
+            "What's the status of the Barcode Radio queue?",
+            "What is the current state of the Barcode Radio queue?",
+            "Is Barcode Radio accepting submissions?",
+            "Can I submit a track right now?",
+            "Is the intake open for tracks?",
+            "what did the latest Journal say about Barcode Radio?",
+            "what did the latest Relay say about Barcode Radio?",
+        )
+        for text in canonical_non_broadcast_owners:
+            with self.subTest(text=text):
+                self.assertFalse(
                     bnl01_bot._broadcast_memory_requires_specialized_owner(
                         text
                     )

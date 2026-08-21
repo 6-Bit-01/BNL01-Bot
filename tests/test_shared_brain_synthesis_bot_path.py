@@ -1264,6 +1264,87 @@ class SharedBrainSynthesisBotPathTests(
             "ambiguous",
         )
 
+    async def test_unavailable_current_queue_holds_with_zero_provider_calls(self):
+        task = SimpleNamespace(
+            task_id="T1",
+            required_response_act="answer",
+            authority_scope="packet",
+            object_kind="queue",
+            subject_indexes=(),
+        )
+        basis = SimpleNamespace(
+            packet=SimpleNamespace(
+                source_snapshot_digest="source-digest",
+                request=SimpleNamespace(frame_tasks=(task,)),
+            ),
+            # Unrelated canon evidence must not support live queue state.
+            rendered_evidence_refs=(("E1", "canon", "digest", ()),),
+        )
+        run = SimpleNamespace(
+            prompt_applied=False,
+            fallback_reason="deterministic_task_hold",
+            revalidation_status="passed",
+            basis=basis,
+        )
+        provider = mock.AsyncMock()
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "build_packet_owned_prompt",
+                return_value=SimpleNamespace(
+                    ready=True,
+                    prompt="packet-owned prompt",
+                    reason="",
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "revalidate_situation_frame",
+                return_value=SimpleNamespace(status="valid"),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_begin_ordinary_chat_single_packet_receipt",
+                return_value=run,
+            ) as begin,
+            mock.patch.object(
+                bnl01_bot,
+                "get_tracked_gemini_response_with_optional_typing",
+                new=provider,
+            ),
+        ):
+            execution = (
+                await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
+                    channel=FakeChannel(),
+                    prompt="base prompt",
+                    basis=basis,
+                    scope_applied=True,
+                    preflight_block_reason="",
+                    situation_frame=SimpleNamespace(),
+                    situation_frame_current_text=(
+                        "Can I submit a track right now?"
+                    ),
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_context",
+                    conversation_surface="mention_or_reply",
+                    user_id=7,
+                    guild_id=1,
+                    user_display_name="Test Member",
+                    source_context_available=False,
+                )
+            )
+
+        self.assertFalse(execution.candidate_active)
+        self.assertEqual(execution.provider_call_count, 0)
+        self.assertEqual(execution.corrective_call_count, 0)
+        self.assertEqual(execution.block_reason, "deterministic_task_hold")
+        provider.assert_not_awaited()
+        self.assertFalse(begin.call_args.kwargs["prompt_ready"])
+        self.assertEqual(
+            begin.call_args.kwargs["prompt_failure_reason"],
+            "deterministic_task_hold",
+        )
+
     async def test_single_packet_deterministic_clarification_bypasses_factual_guard_and_sends(self):
         message = FakeMessage()
         reason = "candidate_prompt_frame_ambiguous"

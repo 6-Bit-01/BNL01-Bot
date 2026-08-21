@@ -356,6 +356,10 @@ _JOURNAL_QUERY_CUE_RE = re.compile(
     r"\b(?:journal|daily\s+entry|weekly\s+entry)\b",
     re.IGNORECASE,
 )
+_JOURNAL_LATEST_RE = re.compile(
+    r"\b(?:latest|newest|most\s+recent|current)\b",
+    re.IGNORECASE,
+)
 _JOURNAL_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 _JOURNAL_QUERY_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
     "article",
@@ -522,6 +526,8 @@ def journal_publication_query_mode(user_text: str) -> str:
         return "not_requested"
     if _JOURNAL_DATE_RE.search(text):
         return "date"
+    if _JOURNAL_LATEST_RE.search(text):
+        return "latest"
     return "requested"
 
 
@@ -797,11 +803,15 @@ def select_published_journal_entries_on_connection(
             limit=max(1, limit),
         )
     else:
-        title_rows = _latest_published_journal_rows(
-            conn,
-            guild_id=guild_id,
-            containing_title_in=str(user_text or ""),
-            limit=max(8, limit),
+        title_rows = (
+            []
+            if requested_mode == "latest"
+            else _latest_published_journal_rows(
+                conn,
+                guild_id=guild_id,
+                containing_title_in=str(user_text or ""),
+                limit=max(8, limit),
+            )
         )
         if title_rows:
             query_mode = "exact_title"
@@ -815,7 +825,9 @@ def select_published_journal_entries_on_connection(
                 limit=max(8, limit),
             )
         else:
-            query_mode = "topic"
+            query_mode = (
+                "latest" if requested_mode == "latest" else "topic"
+            )
             rows = _latest_published_journal_rows(
                 conn,
                 guild_id=guild_id,
@@ -844,7 +856,14 @@ def select_published_journal_entries_on_connection(
                                 row,
                             )
                         )
-                scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                scored.sort(
+                    key=(
+                        (lambda item: (item[1], item[0]))
+                        if query_mode == "latest"
+                        else (lambda item: (item[0], item[1]))
+                    ),
+                    reverse=True,
+                )
                 rows = [row for _score, _timestamp, row in scored]
 
     candidate_count = len(rows)
@@ -858,7 +877,7 @@ def select_published_journal_entries_on_connection(
         if entry_id in public_excluded:
             hidden_count += 1
             continue
-        if query_mode == "topic" and entry_id in memory_excluded:
+        if query_mode in {"topic", "latest"} and entry_id in memory_excluded:
             memory_ineligible_count += 1
             continue
         publication = _journal_publication_from_row(
@@ -868,7 +887,11 @@ def select_published_journal_entries_on_connection(
         )
         if publication is not None:
             selected.append(publication)
-        if len(selected) >= max(1, min(int(limit or 1), 8)):
+        result_limit = 1 if query_mode == "latest" else max(
+            1,
+            min(int(limit or 1), 8),
+        )
+        if len(selected) >= result_limit:
             break
     if selected:
         status = "eligible"
@@ -898,6 +921,7 @@ def revalidate_published_journal_entry_on_connection(
     revision: int,
     query_mode: str,
     control_snapshot: JournalControlSnapshot | None,
+    user_text: str = "",
     now: Any = None,
 ) -> str:
     if (
@@ -908,10 +932,34 @@ def revalidate_published_journal_entry_on_connection(
     if entry_id in set(control_snapshot.public_excluded_entry_ids):
         return ""
     if (
-        query_mode == "topic"
+        query_mode in {"topic", "latest"}
         and entry_id in set(control_snapshot.memory_excluded_entry_ids)
     ):
         return ""
+    if query_mode == "latest":
+        if not str(user_text or "").strip():
+            return ""
+        selection = select_published_journal_entries_on_connection(
+            conn,
+            guild_id=guild_id,
+            user_text=user_text,
+            control_snapshot=control_snapshot,
+            now=now,
+            limit=1,
+        )
+        if (
+            selection.status != "eligible"
+            or selection.query_mode != "latest"
+            or len(selection.publications) != 1
+        ):
+            return ""
+        publication = selection.publications[0]
+        if (
+            publication.entry_id != entry_id
+            or publication.revision != int(revision)
+        ):
+            return ""
+        return publication.source_digest
     rows = _latest_published_journal_rows(
         conn,
         guild_id=guild_id,

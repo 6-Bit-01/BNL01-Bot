@@ -3054,6 +3054,9 @@ def _declared_items(
                 )
             )
         )
+        recognized_bound_entity_claim = bool(
+            bound_entity_claim and not member_claim
+        )
         lane = "approved_fact" if member_claim else "canon"
         text = _declared_claim_text(claim).strip()
         diagnostics.candidates_by_lane[lane] = (
@@ -3092,12 +3095,16 @@ def _declared_items(
             source_class=claim.source_class.value,
             source_type=(
                 "recognized_declared_canon_claim"
-                if bound_entity_claim
+                if recognized_bound_entity_claim
                 else "declared_canon_claim"
             ),
             source_ref=claim.source_refs[0],
             source_digest=claim.revision_id,
-            subject_key=(subject if bound_entity_claim else claim.subject_id),
+            subject_key=(
+                subject
+                if recognized_bound_entity_claim
+                else claim.subject_id
+            ),
             predicate_key=claim.predicate,
             text=text[:1000],
             visibility=claim.visibility.value,
@@ -4679,6 +4686,7 @@ def _journal_publication_items(
         "exact_identity": 160.0,
         "exact_title": 155.0,
         "exact_date": 150.0,
+        "latest": 145.0,
         "topic": 135.0,
     }
     for publication in selection.publications:
@@ -4757,6 +4765,7 @@ def _relay_publication_items(
     score_by_mode = {
         "exact_identity": 160.0,
         "exact_date": 150.0,
+        "latest": 145.0,
         "topic": 135.0,
     }
     for publication in selection.publications:
@@ -6065,6 +6074,7 @@ def _revalidate_packet_in_snapshot(
                     revision=int(payload.get("revision") or 0),
                     query_mode=str(payload.get("queryMode") or ""),
                     control_snapshot=current_journal_control,
+                    user_text=packet.request.user_text,
                     now=packet.request.now or None,
                 )
             elif item.revalidation_kind == "relay_publication":
@@ -6074,6 +6084,7 @@ def _revalidate_packet_in_snapshot(
                     guild_id=int(packet.request.guild_id or 0),
                     relay_id=str(payload.get("relayId") or ""),
                     query_mode=str(payload.get("queryMode") or ""),
+                    user_text=packet.request.user_text,
                 )
             elif item.revalidation_kind in {"current", "snapshot"}:
                 current = item.revalidation_key
