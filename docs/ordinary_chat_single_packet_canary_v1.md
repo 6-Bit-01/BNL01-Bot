@@ -5,7 +5,10 @@ single factual prompt owner and a single provider attempt. It is disabled by
 default and is separate from the broad-profile comparison canary and
 public-home recall owner. The default remains the original private acceptance
 scope; contract v4 adds a second gate for controlled multi-user or
-multi-channel expansion.
+multi-channel expansion. A bounded pre-provider recovery boundary preserves
+the established context-rich route when the replacement packet cannot be
+constructed locally; it does not turn a rejected packet answer into a second
+generation attempt.
 
 ## Default-off private acceptance scope
 
@@ -115,9 +118,40 @@ duplicate, reordered, malformed, cross-lane, or unsupported references block
 the entire candidate.
 
 Preflight ambiguity or invalid source state uses zero provider calls and a
-bounded clarification/block response. A failed generation or rejected
-candidate never falls back to the legacy generated response. Specialized
-owners are excluded before cutover rather than treated as a fallback.
+bounded clarification/block response. Deliberate ambiguity and volatile or
+live-current tasks retain that fail-closed behavior. A failed generation or
+rejected candidate never falls back to a second generated response.
+Specialized owners are excluded before cutover rather than treated as a
+fallback.
+
+## Established-baseline preservation boundary
+
+The packet cutover must not erase working context before it has a usable
+replacement. If an otherwise eligible, non-ambiguous, non-live turn fails
+locally before any packet provider invocation—for example because the packet,
+assessment, prompt, or receipt cannot be assembled—the route relinquishes
+factual ownership and rebuilds the same established prompt that would have
+been used with the cutover disabled. That rebuild restores eligible room
+context, durable memory, Relationship tone, canon/lore, Broadcast memory, and
+authorized source blocks under their existing route rules.
+
+This is a route handoff, not a packet correction:
+
+- the packet provider and corrective-call counts remain zero;
+- the established path performs its normal generation and existing guards;
+- the older comparison canary is not run on top of that recovery generation;
+- the original packet receipt, when one exists, is finalized as
+  `single_packet_legacy_baseline_sent` with the local block reason and a
+  separate initial baseline-generation provider count; and
+- debug state identifies the handoff as
+  `ordinary_chat_legacy_baseline_fallback`.
+
+The handoff is prohibited after packet prompt application or any packet
+provider/corrective call. It is also prohibited for an ambiguous/clarify task,
+an `external_current` task, a current task requiring `hold`, or a recognizable
+live-current request when no typed frame tasks are available. Those turns keep
+their deterministic clarification or current-fact hold and cannot revive a
+stale baseline answer.
 
 ## Content-free receipts
 

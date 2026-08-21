@@ -1667,6 +1667,9 @@ You are BNL-01. The BARCODE Network is watching. You are functioning as intended
 ORDINARY_CHAT_SINGLE_PACKET_ROUTE = (
     "ordinary_chat_single_packet_canary"
 )
+ORDINARY_CHAT_LEGACY_BASELINE_ROUTE = (
+    "ordinary_chat_legacy_baseline_fallback"
+)
 BNL01_PACKET_OWNED_SYSTEM_PROMPT = """You are BNL-01, the BARCODE Network Liaison Entity.
 
 Voice: calm, concise, observant, friendly, lightly corporate, with restrained
@@ -32903,6 +32906,7 @@ def build_user_aware_prompt(
     verified_exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
     conversation_context_result: ConversationContextResult | None = None,
     conversation_orchestration: ConversationOrchestrationDecision | None = None,
+    _ordinary_chat_single_packet_enabled_override: bool | None = None,
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -32921,6 +32925,11 @@ def build_user_aware_prompt(
         has_media=_prompt_has_current_message_media_context(clean_content),
     )
     ordinary_chat_single_packet = bool(ordinary_chat_scope.eligible)
+    if _ordinary_chat_single_packet_enabled_override is not None:
+        ordinary_chat_single_packet = bool(
+            ordinary_chat_single_packet
+            and _ordinary_chat_single_packet_enabled_override
+        )
     recall_current_direct = bool(
         is_direct_interaction
         or is_broad_personal_recall_request(clean_content)
@@ -33378,6 +33387,38 @@ def build_user_aware_prompt(
             if ordinary_chat_single_packet
             and ordinary_chat_single_packet_basis is None
             else ""
+        )
+        prompt_metadata["ordinary_chat_legacy_baseline_request"] = (
+            {
+                "user_id": user_id,
+                "guild_id": guild_id,
+                "fallback_display_name": fallback_display_name,
+                "clean_content": clean_content,
+                "show_state_context": show_state_context,
+                "room_context": room_context,
+                "channel_name": channel_name,
+                "message_count": message_count,
+                "privileged": privileged,
+                "channel_policy": channel_policy,
+                "website_read_model_context": website_read_model_context,
+                "source_context_block": source_context_block,
+                "route_mode": route_mode,
+                "is_direct_interaction": is_direct_interaction,
+                "current_turn_context": current_turn_context,
+                "channel_id": channel_id,
+                "moment_attribution_target_user_id": (
+                    moment_attribution_target_user_id
+                ),
+                "verified_exact_quote_authority": (
+                    verified_exact_quote_authority
+                ),
+                "conversation_context_result": (
+                    conversation_context_result
+                ),
+                "conversation_orchestration": conversation_orchestration,
+            }
+            if ordinary_chat_single_packet
+            else None
         )
         prompt_metadata["unified_moment_canary_applied"] = bool(
             unified_moment_canary_basis is not None
@@ -36197,6 +36238,21 @@ class OrdinaryChatSinglePacketExecution:
     provider_call_count: int
     corrective_call_count: int
     block_reason: str = ""
+    legacy_baseline_active: bool = False
+    legacy_baseline_generation_provider_call_count: int = 0
+    legacy_fallback_reason: str = ""
+
+
+@dataclass(frozen=True)
+class OrdinaryChatLegacyBaselineExecution:
+    packet_execution: OrdinaryChatSinglePacketExecution
+    response: str
+    prompt: str
+    prompt_metadata: dict
+    allow_greeting: bool
+    style_key: str
+    source_context_available: bool
+    provider_call_count: int
 
 
 def _ordinary_chat_single_packet_block_response(reason: str) -> str:
@@ -36875,6 +36931,217 @@ async def maybe_generate_ordinary_chat_single_packet(
     )
 
 
+_ORDINARY_CHAT_VOLATILE_FALLBACK_RE = re.compile(
+    r"\b(?:right\s+now|currently|current|today|tonight|live|weather|"
+    r"queue\s+(?:open|status)|can\s+i\s+submit|latest\s+(?:price|score))\b",
+    re.I,
+)
+
+
+def ordinary_chat_legacy_baseline_fallback_allowed(
+    execution: OrdinaryChatSinglePacketExecution | None,
+    *,
+    situation_frame: SituationFrameV1 | None,
+    request_text: str = "",
+) -> bool:
+    """Allow the established prompt only before a low-risk packet call.
+
+    The packet route remains authoritative whenever it generated a candidate or
+    actually entered provider generation.  The legacy prompt is available only
+    for local packet/preflight failures, and never for typed live/current holds.
+    """
+
+    if execution is None or execution.candidate_active:
+        return False
+    if execution.provider_call_count or execution.corrective_call_count:
+        return False
+    decision = execution.decision
+    run = getattr(decision, "run", None) if decision is not None else None
+    if bool(getattr(run, "prompt_applied", False)):
+        return False
+
+    block_reason = str(execution.block_reason or "").strip().lower()
+    if (
+        "current_fact" in block_reason
+        or block_reason.startswith("pre_generation_")
+    ):
+        return False
+    if (
+        "ambiguous" in block_reason
+        or "deterministic_task_clarify" in block_reason
+    ):
+        return False
+    if str(getattr(situation_frame, "status", "") or "").lower() == (
+        "ambiguous"
+    ):
+        return False
+
+    tasks = tuple(getattr(situation_frame, "tasks", ()) or ())
+    for task in tasks:
+        authority_scope = str(
+            getattr(task, "authority_scope", "") or ""
+        ).strip().lower()
+        currentness = str(
+            getattr(task, "currentness", "") or ""
+        ).strip().lower()
+        required_act = str(
+            getattr(task, "required_response_act", "") or ""
+        ).strip().lower()
+        if authority_scope == "external_current":
+            return False
+        if currentness == "current" and required_act == "hold":
+            return False
+        if required_act == "clarify":
+            return False
+
+    if not tasks and _ORDINARY_CHAT_VOLATILE_FALLBACK_RE.search(
+        request_text or ""
+    ):
+        return False
+    return True
+
+
+def _build_ordinary_chat_legacy_baseline_prompt(
+    prompt_metadata: Mapping[str, Any],
+    *,
+    payload_items,
+    request_text: str,
+    conversation_orchestration: ConversationOrchestrationDecision | None,
+) -> tuple[str, bool, str, dict] | None:
+    request = prompt_metadata.get(
+        "ordinary_chat_legacy_baseline_request"
+    )
+    if not isinstance(request, Mapping):
+        return None
+
+    legacy_metadata: dict[str, Any] = {}
+    legacy_prompt, allow_greeting, style_key = build_user_aware_prompt(
+        **dict(request),
+        prompt_metadata=legacy_metadata,
+        _ordinary_chat_single_packet_enabled_override=False,
+    )
+    legacy_prompt = _build_direct_payload_prompt(
+        legacy_prompt,
+        payload_items,
+        request_text,
+    )
+    orchestration_prompt = render_conversation_orchestration_prompt(
+        conversation_orchestration
+    )
+    if orchestration_prompt:
+        legacy_prompt += "\n\n" + orchestration_prompt
+
+    # The baseline itself is the recovery answer.  Do not spend a second model
+    # call on the older synthesis canary after the packet already declined.
+    legacy_metadata["shared_brain_synthesis_canary_basis"] = None
+    legacy_metadata["ordinary_chat_legacy_baseline_fallback"] = True
+    return (
+        legacy_prompt,
+        allow_greeting,
+        style_key,
+        legacy_metadata,
+    )
+
+
+async def maybe_generate_ordinary_chat_legacy_baseline(
+    *,
+    execution: OrdinaryChatSinglePacketExecution | None,
+    prompt_metadata: Mapping[str, Any],
+    channel,
+    payload_items,
+    request_text: str,
+    conversation_orchestration: ConversationOrchestrationDecision | None,
+    situation_frame: SituationFrameV1 | None,
+    user_id: int,
+    guild_id: int,
+) -> OrdinaryChatLegacyBaselineExecution | None:
+    """Recover the established context-rich path after a zero-call block."""
+
+    if not ordinary_chat_legacy_baseline_fallback_allowed(
+        execution,
+        situation_frame=situation_frame,
+        request_text=request_text,
+    ):
+        return None
+    try:
+        rebuilt = _build_ordinary_chat_legacy_baseline_prompt(
+            prompt_metadata,
+            payload_items=payload_items,
+            request_text=request_text,
+            conversation_orchestration=conversation_orchestration,
+        )
+    except Exception as exc:
+        logging.warning(
+            "ordinary_chat_legacy_baseline_failed reason=rebuild_error "
+            "error=%s",
+            type(exc).__name__,
+        )
+        return None
+    if rebuilt is None or execution is None:
+        return None
+    legacy_prompt, allow_greeting, style_key, legacy_metadata = rebuilt
+    source_context_available = bool(
+        legacy_metadata.get("source_context_available")
+    )
+    try:
+        tracked = await get_tracked_gemini_response_with_optional_typing(
+            channel,
+            legacy_prompt,
+            user_id,
+            guild_id,
+            route=ORDINARY_CHAT_LEGACY_BASELINE_ROUTE,
+            source_context_available=source_context_available,
+        )
+    except Exception as exc:
+        logging.warning(
+            "ordinary_chat_legacy_baseline_failed reason=generation_error "
+            "error=%s",
+            type(exc).__name__,
+        )
+        return None
+    response = str(tracked.text or "").strip()
+    if not response:
+        logging.warning(
+            "ordinary_chat_legacy_baseline_failed reason=empty_response "
+            "packet_block_reason=%s provider_calls=%s",
+            execution.block_reason or "unknown",
+            tracked.provider_call_count,
+        )
+        return None
+
+    fallback_reason = str(execution.block_reason or "preflight_block")
+    packet_execution = replace(
+        execution,
+        response=response,
+        prompt=legacy_prompt,
+        prompt_source_bases=tuple(
+            legacy_metadata.get("prompt_source_bases") or ()
+        ),
+        candidate_active=False,
+        legacy_baseline_active=True,
+        legacy_baseline_generation_provider_call_count=(
+            tracked.provider_call_count
+        ),
+        legacy_fallback_reason=fallback_reason,
+    )
+    logging.info(
+        "ordinary_chat_legacy_baseline_selected packet_block_reason=%s "
+        "provider_calls=%s",
+        fallback_reason,
+        tracked.provider_call_count,
+    )
+    return OrdinaryChatLegacyBaselineExecution(
+        packet_execution=packet_execution,
+        response=response,
+        prompt=legacy_prompt,
+        prompt_metadata=legacy_metadata,
+        allow_greeting=allow_greeting,
+        style_key=style_key,
+        source_context_available=source_context_available,
+        provider_call_count=tracked.provider_call_count,
+    )
+
+
 async def send_planned_conversation_response(
     message: discord.Message,
     response: str,
@@ -36952,11 +37219,19 @@ async def send_planned_conversation_response(
     baseline_prompt = prompt
     baseline_prompt_source_bases = tuple(prompt_source_bases or ())
     media_context = build_message_media_context(message)
-    single_packet_cutover = bool(
+    single_packet_receipt_present = bool(
         ordinary_chat_single_packet_execution is not None
     )
+    ordinary_chat_legacy_fallback_active = bool(
+        ordinary_chat_single_packet_execution is not None
+        and ordinary_chat_single_packet_execution.legacy_baseline_active
+    )
+    single_packet_cutover = bool(
+        single_packet_receipt_present
+        and not ordinary_chat_legacy_fallback_active
+    )
     synthesis_execution = None
-    if not single_packet_cutover:
+    if not single_packet_receipt_present:
         synthesis_execution = (
             await maybe_generate_shared_brain_synthesis_canary(
                 channel=getattr(message, "channel", None),
@@ -36987,7 +37262,10 @@ async def send_planned_conversation_response(
         else synthesis_execution is not None
         and synthesis_execution.candidate_active
     )
-    if ordinary_chat_single_packet_execution is not None:
+    if (
+        ordinary_chat_single_packet_execution is not None
+        and not ordinary_chat_legacy_fallback_active
+    ):
         response = ordinary_chat_single_packet_execution.response
         prompt = ordinary_chat_single_packet_execution.prompt
         prompt_source_bases = (
@@ -37306,7 +37584,7 @@ async def send_planned_conversation_response(
         durable_memory_write=getattr(model_decision, "write_memory_tier", False),
         scripted_mode_leak_guard_triggered=guard_triggered,
         leak_guard_result="regenerated" if regenerated_for_mode_leak else ("suppressed" if guard_diagnostics.get("suppressed") else "clear"),
-        fallback_used=False,
+        fallback_used=ordinary_chat_legacy_fallback_active,
         regenerated_for_mode_leak=regenerated_for_mode_leak,
         media_present=bool(media_context.get("present", False)),
         media_context_included=bool(media_context.get("included", False)),
@@ -37317,7 +37595,10 @@ async def send_planned_conversation_response(
         canned_ack_suppressed=False,
         ack_converted_to_observe=False,
         ack_escalated_to_generation=False,
-        ordinary_chat_single_packet_applied=single_packet_cutover,
+        ordinary_chat_single_packet_applied=single_packet_receipt_present,
+        ordinary_chat_legacy_baseline_fallback=(
+            ordinary_chat_legacy_fallback_active
+        ),
         ordinary_chat_single_packet_provider_call_count=(
             ordinary_chat_single_packet_execution.provider_call_count
             if ordinary_chat_single_packet_execution is not None
@@ -37332,6 +37613,11 @@ async def send_planned_conversation_response(
             ordinary_chat_single_packet_execution.block_reason
             if ordinary_chat_single_packet_execution is not None
             else ""
+        ),
+        ordinary_chat_legacy_baseline_generation_provider_call_count=(
+            ordinary_chat_single_packet_execution.legacy_baseline_generation_provider_call_count
+            if ordinary_chat_single_packet_execution is not None
+            else 0
         ),
     )
     if _abort_stale_direct_repair_generation(direct_repair_generation, "before_send_commit"):
@@ -37621,6 +37907,8 @@ async def send_planned_conversation_response(
             if single_packet_cutover and synthesis_candidate_active
             else "single_packet_deterministic_block_sent"
             if single_packet_cutover
+            else "single_packet_legacy_baseline_sent"
+            if ordinary_chat_legacy_fallback_active
             else "candidate_sent"
             if synthesis_candidate_active
             else "established_path_sent"
@@ -38830,7 +39118,42 @@ async def on_message(message: discord.Message):
                     source_context_available=source_context_available,
                 )
             )
-            if ordinary_chat_execution is not None:
+            ordinary_chat_legacy_fallback = (
+                await maybe_generate_ordinary_chat_legacy_baseline(
+                    execution=ordinary_chat_execution,
+                    prompt_metadata=prompt_metadata,
+                    channel=message.channel,
+                    payload_items=direct_payload_items,
+                    request_text=direct_content,
+                    conversation_orchestration=direct_orchestration,
+                    situation_frame=direct_orchestration.situation_frame,
+                    user_id=message.author.id,
+                    guild_id=message.guild.id,
+                )
+            )
+            if ordinary_chat_legacy_fallback is not None:
+                ordinary_chat_execution = (
+                    ordinary_chat_legacy_fallback.packet_execution
+                )
+                response = ordinary_chat_legacy_fallback.response
+                prompt = ordinary_chat_legacy_fallback.prompt
+                prompt_metadata = (
+                    ordinary_chat_legacy_fallback.prompt_metadata
+                )
+                allow_greeting = (
+                    ordinary_chat_legacy_fallback.allow_greeting
+                )
+                style_key = ordinary_chat_legacy_fallback.style_key
+                source_context_available = (
+                    ordinary_chat_legacy_fallback.source_context_available
+                )
+                show_state_route = ORDINARY_CHAT_LEGACY_BASELINE_ROUTE
+                log_response_style(
+                    message.guild.id,
+                    message.author.id,
+                    style_key,
+                )
+            elif ordinary_chat_execution is not None:
                 response = ordinary_chat_execution.response
                 prompt = ordinary_chat_execution.prompt
                 show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
@@ -38844,10 +39167,14 @@ async def on_message(message: discord.Message):
                     route=show_state_route,
                     source_context_available=source_context_available,
                 )
+            ordinary_chat_packet_controls_response = bool(
+                ordinary_chat_execution is not None
+                and not ordinary_chat_execution.legacy_baseline_active
+            )
             if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
                 return
             if (
-                ordinary_chat_execution is None
+                not ordinary_chat_packet_controls_response
                 and response
                 and direct_payload_items
             ):
@@ -38877,7 +39204,7 @@ async def on_message(message: discord.Message):
                         logging.info(f"payload_completion_incomplete_unpatched missing_count={len(missing_items)} route=direct_conversation")
             logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
-            if ordinary_chat_execution is None:
+            if not ordinary_chat_packet_controls_response:
                 response = suppress_stale_media_fallback(
                     response,
                     current_text=direct_content,
@@ -39342,7 +39669,38 @@ async def on_message(message: discord.Message):
                 source_context_available=source_context_available,
             )
         )
-        if ordinary_chat_execution is not None:
+        ordinary_chat_legacy_fallback = (
+            await maybe_generate_ordinary_chat_legacy_baseline(
+                execution=ordinary_chat_execution,
+                prompt_metadata=prompt_metadata,
+                channel=message.channel,
+                payload_items=direct_payload_items,
+                request_text=direct_content,
+                conversation_orchestration=direct_orchestration,
+                situation_frame=direct_orchestration.situation_frame,
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+            )
+        )
+        if ordinary_chat_legacy_fallback is not None:
+            ordinary_chat_execution = (
+                ordinary_chat_legacy_fallback.packet_execution
+            )
+            response = ordinary_chat_legacy_fallback.response
+            prompt = ordinary_chat_legacy_fallback.prompt
+            prompt_metadata = ordinary_chat_legacy_fallback.prompt_metadata
+            allow_greeting = ordinary_chat_legacy_fallback.allow_greeting
+            style_key = ordinary_chat_legacy_fallback.style_key
+            source_context_available = (
+                ordinary_chat_legacy_fallback.source_context_available
+            )
+            show_state_route = ORDINARY_CHAT_LEGACY_BASELINE_ROUTE
+            log_response_style(
+                message.guild.id,
+                message.author.id,
+                style_key,
+            )
+        elif ordinary_chat_execution is not None:
             response = ordinary_chat_execution.response
             prompt = ordinary_chat_execution.prompt
             show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
@@ -39356,10 +39714,14 @@ async def on_message(message: discord.Message):
                 route=show_state_route,
                 source_context_available=source_context_available,
             )
+        ordinary_chat_packet_controls_response = bool(
+            ordinary_chat_execution is not None
+            and not ordinary_chat_execution.legacy_baseline_active
+        )
         if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
             return
         if (
-            ordinary_chat_execution is None
+            not ordinary_chat_packet_controls_response
             and response
             and direct_payload_items
         ):
@@ -39389,7 +39751,7 @@ async def on_message(message: discord.Message):
                     logging.info(f"payload_completion_incomplete_unpatched missing_count={len(missing_items)} route=direct_conversation")
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
-        if ordinary_chat_execution is None:
+        if not ordinary_chat_packet_controls_response:
             response = suppress_stale_media_fallback(
                 response,
                 current_text=direct_content,
@@ -39797,7 +40159,38 @@ async def on_message(message: discord.Message):
                 source_context_available=source_context_available,
             )
         )
-        if ordinary_chat_execution is not None:
+        ordinary_chat_legacy_fallback = (
+            await maybe_generate_ordinary_chat_legacy_baseline(
+                execution=ordinary_chat_execution,
+                prompt_metadata=prompt_metadata,
+                channel=message.channel,
+                payload_items=direct_payload_items,
+                request_text=direct_content,
+                conversation_orchestration=direct_orchestration,
+                situation_frame=direct_orchestration.situation_frame,
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+            )
+        )
+        if ordinary_chat_legacy_fallback is not None:
+            ordinary_chat_execution = (
+                ordinary_chat_legacy_fallback.packet_execution
+            )
+            response = ordinary_chat_legacy_fallback.response
+            prompt = ordinary_chat_legacy_fallback.prompt
+            prompt_metadata = ordinary_chat_legacy_fallback.prompt_metadata
+            allow_greeting = ordinary_chat_legacy_fallback.allow_greeting
+            style_key = ordinary_chat_legacy_fallback.style_key
+            source_context_available = (
+                ordinary_chat_legacy_fallback.source_context_available
+            )
+            show_state_route = ORDINARY_CHAT_LEGACY_BASELINE_ROUTE
+            log_response_style(
+                message.guild.id,
+                message.author.id,
+                style_key,
+            )
+        elif ordinary_chat_execution is not None:
             response = ordinary_chat_execution.response
             prompt = ordinary_chat_execution.prompt
             show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
@@ -39811,10 +40204,14 @@ async def on_message(message: discord.Message):
                 route=show_state_route,
                 source_context_available=source_context_available,
             )
+        ordinary_chat_packet_controls_response = bool(
+            ordinary_chat_execution is not None
+            and not ordinary_chat_execution.legacy_baseline_active
+        )
         if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
             return
         if (
-            ordinary_chat_execution is None
+            not ordinary_chat_packet_controls_response
             and response
             and direct_payload_items
         ):
@@ -39844,7 +40241,7 @@ async def on_message(message: discord.Message):
                     logging.info(f"payload_completion_incomplete_unpatched missing_count={len(missing_items)} route=direct_conversation")
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
-        if ordinary_chat_execution is None:
+        if not ordinary_chat_packet_controls_response:
             response = suppress_stale_media_fallback(
                 response,
                 current_text=direct_content,
