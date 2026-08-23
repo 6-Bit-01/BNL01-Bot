@@ -73,6 +73,26 @@ def _route_lane(route: str) -> str:
     normalized = re.sub(r"[^a-z0-9_:-]+", "_", str(route or "").lower())
     if normalized == "bnl_journal_generation" or "journal" in normalized:
         return "journal"
+    background_markers = (
+        "website",
+        "relay",
+        "ambient",
+        "occasion",
+        "community_scouting",
+        "curiosity",
+        "heartbeat",
+        "showday",
+        "background",
+    )
+    automatic_background_work = bool(
+        "automatic" in normalized
+        and any(
+            marker in normalized
+            for marker in ("enrichment", "source_file_refresh", "source_refresh")
+        )
+    )
+    if automatic_background_work:
+        return "background"
     protected_markers = (
         "memory_preview",
         "memory_governance",
@@ -88,15 +108,6 @@ def _route_lane(route: str) -> str:
     )
     if any(marker in normalized for marker in protected_markers):
         return "protected"
-    background_markers = (
-        "website",
-        "relay",
-        "ambient",
-        "occasion",
-        "community_scouting",
-        "curiosity",
-        "heartbeat",
-    )
     if any(marker in normalized for marker in background_markers):
         return "background"
     return "conversation"
@@ -185,7 +196,7 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             lane=lane,
             max_output_tokens=_bounded_env_int(
                 "BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS",
-                4_096,
+                1_024,
                 minimum=1_024,
                 maximum=16_384,
             ),
@@ -195,8 +206,12 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
                 minimum=0,
                 maximum=8_192,
             ),
-            provider_retries=retries,
-            allow_fallback=True,
+            # Optional scheduled work skips cleanly when the provider is
+            # unavailable. It must not amplify one background job into retry
+            # or fallback-model spend, regardless of the interactive retry
+            # policy.
+            provider_retries=0,
+            allow_fallback=False,
             relay_protected="relay" in normalized_route,
         )
     return GeminiRoutePolicy(

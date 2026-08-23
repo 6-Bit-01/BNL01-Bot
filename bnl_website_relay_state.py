@@ -12,6 +12,7 @@ from bnl_journal_source_store import record_source_event, timestamp_to_epoch_ms
 
 MAX_HISTORY = 25
 MAX_ATTEMPTS_PER_GUILD = 100
+MAX_SCHEDULE_CLAIMS_PER_GUILD = 4096
 RELAY_PUBLICATION_READ_VERSION = "accepted_relay_publication_read_v1"
 RELAY_PUBLICATION_TOPIC_SCAN_LIMIT = 200
 RELAY_PUBLICATION_RESULT_LIMIT = 4
@@ -140,6 +141,19 @@ def ensure_schema(db_path: str) -> None:
         }.items():
             if name not in cols:
                 conn.execute(ddl)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS website_relay_schedule_claims (
+            guild_id INTEGER NOT NULL,
+            period_key TEXT NOT NULL,
+            claimed_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, period_key)
+        )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_website_relay_schedule_claims_guild_time "
+            "ON website_relay_schedule_claims(guild_id, claimed_at DESC)"
+        )
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS website_relay_pending_v2 (
@@ -981,6 +995,49 @@ def _prune_attempts(conn: sqlite3.Connection, guild_id: int) -> None:
     ).fetchall()
     if old:
         conn.executemany("DELETE FROM website_relay_attempts WHERE attempt_id=?", [(r[0],) for r in old])
+
+
+def _prune_schedule_claims(conn: sqlite3.Connection, guild_id: int) -> None:
+    old = conn.execute(
+        "SELECT period_key FROM website_relay_schedule_claims "
+        "WHERE guild_id=? ORDER BY claimed_at DESC, period_key DESC "
+        "LIMIT -1 OFFSET ?",
+        (guild_id, MAX_SCHEDULE_CLAIMS_PER_GUILD),
+    ).fetchall()
+    if old:
+        conn.executemany(
+            "DELETE FROM website_relay_schedule_claims "
+            "WHERE guild_id=? AND period_key=?",
+            [(guild_id, row[0]) for row in old],
+        )
+
+
+def claim_scheduled_relay_period(
+    db_path: str,
+    guild_id: int,
+    period_key: str,
+    *,
+    claimed_at: str = "",
+) -> bool:
+    """Atomically claim one scheduled Relay period across bot workers."""
+    normalized_period = str(period_key or "").strip()
+    if not normalized_period:
+        raise ValueError("period_key_required")
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("BEGIN IMMEDIATE")
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO website_relay_schedule_claims("
+            "guild_id,period_key,claimed_at) VALUES(?,?,?)",
+            (
+                int(guild_id),
+                normalized_period,
+                str(claimed_at or utc_now_iso()),
+            ),
+        ).rowcount == 1
+        _prune_schedule_claims(conn, int(guild_id))
+    return inserted
 
 
 def begin_attempt(db_path: str, attempt_id: str, guild_id: int, trigger: str, source_class: str = "pending", *, cursor: int = 0, highest_eligible_conversation_id: int = 0, aggregate_source_counts: dict[str, int] | None = None) -> None:

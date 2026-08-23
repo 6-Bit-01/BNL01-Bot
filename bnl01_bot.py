@@ -293,6 +293,7 @@ import time
 import threading
 import concurrent.futures
 import unicodedata
+from decimal import Decimal
 
 from bnl_dossier_candidate_discovery import (
     DEFAULT_DISCOVERY_LANES,
@@ -418,12 +419,21 @@ from bnl_gemini_routing import (
     retryable_failure,
     single_attempt_reservation,
 )
+from bnl_gemini_cost import (
+    PRICING_VERSION,
+    calculate_monthly_budget_pace,
+    conservative_unpriced_guardrail_cost_nanos,
+    estimate_gemini_cost,
+    load_budget_config,
+    pacific_budget_clock,
+)
 
 from bnl_website_relay_state import (
     RelaySourceDecision,
     WebsiteRelayDecision,
     accepted_publication_count as relay_accepted_publication_count,
     begin_attempt as relay_begin_attempt,
+    claim_scheduled_relay_period as relay_claim_scheduled_period,
     complete_attempt as relay_complete_attempt,
     get_attempt as relay_get_attempt,
     last_attempt as relay_last_attempt,
@@ -483,6 +493,16 @@ try:
 except (TypeError, ValueError):
     DORMANT_ECHO_SELECTION_CHANCE = 0.05
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
+try:
+    _configured_quiet_relay_interval = int(
+        os.getenv("BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES", "60") or 60
+    )
+except (TypeError, ValueError):
+    _configured_quiet_relay_interval = 60
+BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES = max(
+    BNL_WEBSITE_RELAY_INTERVAL_MINUTES,
+    _configured_quiet_relay_interval,
+)
 BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS", "25") or 25))
 BNL_WEBSITE_RELAY_FRESHNESS_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_FRESHNESS_MINUTES", "120") or 120))
 BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES", "5") or 5))
@@ -502,15 +522,37 @@ GENERATION_ERROR_LOCAL_MODEL_BUDGET = "local_model_budget_exhausted"
 
 
 class LocalModelBudgetExhausted(RuntimeError):
-    """Raised when BNL's own daily API-token safety budget is exhausted."""
+    """Raised when BNL's local token or dollar safety budget is exhausted."""
+
+
+class BackgroundGenerationUnavailable(RuntimeError):
+    """Signals that optional work should stop instead of logically retrying."""
+
+    def __init__(self, result: "GenerationResult"):
+        self.result = result
+        super().__init__(
+            result.error_category or GENERATION_ERROR_PROVIDER_UNKNOWN
+        )
 
 
 class LocalBudgetReservation(int):
     """Integer-compatible reservation that remembers its protected lane."""
 
-    def __new__(cls, amount: int, lane: str):
+    def __new__(
+        cls,
+        amount: int,
+        lane: str,
+        *,
+        cost_reservation_id: str = "",
+        estimated_cost_nanos: int = 0,
+    ):
         instance = int.__new__(cls, int(amount))
         instance.lane = str(lane or "conversation")
+        instance.cost_reservation_id = str(cost_reservation_id or "")
+        instance.estimated_cost_nanos = max(
+            0,
+            int(estimated_cost_nanos or 0),
+        )
         return instance
 
 
@@ -549,6 +591,16 @@ class ProviderAttemptCounter:
 
     def mark_started(self) -> None:
         self.count += 1
+
+
+@dataclass
+class GenerationAccountingState:
+    """Retain the conservative dollar lease when provider usage is unrecorded."""
+
+    failed: bool = False
+
+    def mark_failed(self) -> None:
+        self.failed = True
 
 
 @dataclass(frozen=True)
@@ -648,7 +700,29 @@ def get_gemini_client():
     if gemini_client is None:
         with _gemini_client_lock:
             if gemini_client is None:
-                gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+                try:
+                    timeout_seconds = int(
+                        os.getenv(
+                            "BNL_GEMINI_PROVIDER_TIMEOUT_SECONDS",
+                            "120",
+                        )
+                        or 120
+                    )
+                except (TypeError, ValueError):
+                    timeout_seconds = 120
+                # The shortest budget lease is thirty minutes. Keep a provider
+                # request strictly below it so an in-flight call cannot lose
+                # its cross-worker cost reservation before returning.
+                timeout_seconds = min(240, max(10, timeout_seconds))
+                gemini_client = genai.Client(
+                    api_key=GEMINI_API_KEY,
+                    http_options=genai.types.HttpOptions(
+                        timeout=timeout_seconds * 1000,
+                        retry_options=genai.types.HttpRetryOptions(
+                            attempts=1
+                        ),
+                    ),
+                )
     return gemini_client
 
 # ======== BATCHED REPLY CONFIG (ACTIVE CHANNEL) ========
@@ -4672,7 +4746,15 @@ def _get_website_relay_transaction_lock(guild_id: int) -> asyncio.Lock:
     return lock
 
 
-async def _execute_website_relay_transaction(guild_id: int, *, force: bool = False, source: str = "relay", admin_note_source: str = "relay", attempt_id: str = "") -> WebsiteRelayDecision:
+async def _execute_website_relay_transaction(
+    guild_id: int,
+    *,
+    force: bool = False,
+    source: str = "relay",
+    admin_note_source: str = "relay",
+    attempt_id: str = "",
+    allow_quiet_sources: bool | None = None,
+) -> WebsiteRelayDecision:
     """Serialize the full per-guild relay transaction from cursor read through durable publication."""
     lock = _get_website_relay_transaction_lock(guild_id)
     trigger = "forcePull" if source == "forcePull" else ("manual" if force else "scheduled")
@@ -4719,7 +4801,16 @@ async def _execute_website_relay_transaction(guild_id: int, *, force: bool = Fal
                 _remember_relay_source(guild_id, pending_decision.eventType)
                 return pending_decision
 
-        decision = await _generate_website_relay_guarded(guild_id, allow_quiet_sources=True)
+        # Manual/force requests retain the established quiet-source cascade.
+        # Scheduled callers explicitly opt in only on the configured quiet
+        # cadence; fresh public signal remains eligible on every normal tick.
+        quiet_sources_enabled = (
+            True if allow_quiet_sources is None else bool(allow_quiet_sources)
+        )
+        decision = await _generate_website_relay_guarded(
+            guild_id,
+            allow_quiet_sources=quiet_sources_enabled,
+        )
         if decision is None:
             decision = WebsiteRelayDecision(False, skipReason="relay_generation_inflight", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_inflight"})
         source_class = decision.metadata.get("source_class") or decision.eventType or "none"
@@ -5026,6 +5117,30 @@ def _try_alter(cursor, sql: str):
     except sqlite3.OperationalError:
         pass
 
+
+def _add_column_if_missing(
+    cursor: sqlite3.Cursor,
+    table: str,
+    column: str,
+    ddl: str,
+) -> None:
+    """Apply an additive migration safely across simultaneous workers."""
+
+    columns = {
+        row[1]
+        for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column in columns:
+        return
+    try:
+        cursor.execute(ddl)
+    except sqlite3.OperationalError as exc:
+        # Another worker may have completed the same migration after our
+        # PRAGMA read. Suppress only that benign race; surface every other DB
+        # error instead of leaving a partially migrated schema unnoticed.
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     ensure_journal_schema(DB_FILE)
@@ -5157,6 +5272,26 @@ def init_db():
         ON token_usage_events (usage_date, route)
         """
     )
+    for column, ddl in {
+        "estimated_cost_nanos": (
+            "ALTER TABLE token_usage_events "
+            "ADD COLUMN estimated_cost_nanos INTEGER"
+        ),
+        "cost_priced": (
+            "ALTER TABLE token_usage_events "
+            "ADD COLUMN cost_priced INTEGER NOT NULL DEFAULT 0"
+        ),
+        "pricing_version": (
+            "ALTER TABLE token_usage_events "
+            "ADD COLUMN pricing_version TEXT NOT NULL DEFAULT ''"
+        ),
+    }.items():
+        _add_column_if_missing(
+            cursor,
+            "token_usage_events",
+            column,
+            ddl,
+        )
 
     cursor.execute(
         """
@@ -5347,6 +5482,17 @@ def init_db():
             discord_message TEXT,
             website_message TEXT,
             fired_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, show_date, phase_key)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS friday_show_update_claims (
+            guild_id INTEGER NOT NULL,
+            show_date TEXT NOT NULL,
+            phase_key TEXT NOT NULL,
+            claimed_at TEXT NOT NULL,
             PRIMARY KEY (guild_id, show_date, phase_key)
         )
         """
@@ -8620,7 +8766,7 @@ def classify_generation_error(exc: Exception | None = None, *, empty_response: b
         return (
             GENERATION_ERROR_LOCAL_MODEL_BUDGET,
             GENERATION_ERROR_LOCAL_MODEL_BUDGET,
-            "BNL's local daily model budget is exhausted.",
+            "BNL's local model budget is exhausted.",
         )
     provider_kind = provider_failure_kind(exc)
     status_code = provider_status_code(exc)
@@ -16153,9 +16299,62 @@ def already_fired_show_update(guild_id: int, show_date: str, phase_key: str) -> 
     conn.close()
     return bool(row)
 
+
+def claim_show_update_period(
+    guild_id: int,
+    show_date: str,
+    phase_key: str,
+) -> bool:
+    """Atomically claim one show phase before any provider work begins."""
+
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        if cursor.execute(
+            """
+            SELECT 1 FROM friday_show_updates
+            WHERE guild_id=? AND show_date=? AND phase_key=?
+            """,
+            (guild_id, show_date, phase_key),
+        ).fetchone():
+            conn.commit()
+            return False
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO friday_show_update_claims
+            (guild_id, show_date, phase_key, claimed_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                show_date,
+                phase_key,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        claimed = cursor.rowcount == 1
+        conn.commit()
+        return claimed
+
+
+def release_show_update_claim(
+    guild_id: int,
+    show_date: str,
+    phase_key: str,
+) -> None:
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        conn.execute(
+            """
+            DELETE FROM friday_show_update_claims
+            WHERE guild_id=? AND show_date=? AND phase_key=?
+            """,
+            (guild_id, show_date, phase_key),
+        )
+
 def mark_show_update_fired(guild_id: int, show_date: str, phase_key: str, discord_message: str, website_message: str):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     cursor = conn.cursor()
+    cursor.execute("BEGIN IMMEDIATE")
     cursor.execute(
         """
         INSERT OR REPLACE INTO friday_show_updates
@@ -16163,6 +16362,13 @@ def mark_show_update_fired(guild_id: int, show_date: str, phase_key: str, discor
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (guild_id, show_date, phase_key, discord_message[:280], website_message[:240], datetime.now(PACIFIC_TZ).isoformat()),
+    )
+    cursor.execute(
+        """
+        DELETE FROM friday_show_update_claims
+        WHERE guild_id=? AND show_date=? AND phase_key=?
+        """,
+        (guild_id, show_date, phase_key),
     )
     conn.commit()
     conn.close()
@@ -19555,8 +19761,12 @@ _token_budget_reserved_tokens = 0
 _token_budget_reserved_by_lane: dict[str, int] = {}
 
 
+def _pacific_now() -> datetime:
+    return datetime.now(PACIFIC_TZ)
+
+
 def _pacific_usage_date() -> str:
-    return datetime.now(PACIFIC_TZ).date().isoformat()
+    return _pacific_now().date().isoformat()
 
 
 def _ensure_token_usage_schema(cursor: sqlite3.Cursor) -> None:
@@ -19591,6 +19801,26 @@ def _ensure_token_usage_schema(cursor: sqlite3.Cursor) -> None:
         ON token_usage_events (usage_date, route)
         """
     )
+    for column, ddl in {
+        "estimated_cost_nanos": (
+            "ALTER TABLE token_usage_events "
+            "ADD COLUMN estimated_cost_nanos INTEGER"
+        ),
+        "cost_priced": (
+            "ALTER TABLE token_usage_events "
+            "ADD COLUMN cost_priced INTEGER NOT NULL DEFAULT 0"
+        ),
+        "pricing_version": (
+            "ALTER TABLE token_usage_events "
+            "ADD COLUMN pricing_version TEXT NOT NULL DEFAULT ''"
+        ),
+    }.items():
+        _add_column_if_missing(
+            cursor,
+            "token_usage_events",
+            column,
+            ddl,
+        )
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS model_generation_attempts (
@@ -19614,6 +19844,58 @@ def _ensure_token_usage_schema(cursor: sqlite3.Cursor) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_model_generation_attempts_date_route
         ON model_generation_attempts (usage_date, route)
+        """
+    )
+    for column, ddl in {
+        "attempt_number": (
+            "ALTER TABLE model_generation_attempts "
+            "ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1"
+        ),
+        "is_retry": (
+            "ALTER TABLE model_generation_attempts "
+            "ADD COLUMN is_retry INTEGER NOT NULL DEFAULT 0"
+        ),
+        "is_fallback": (
+            "ALTER TABLE model_generation_attempts "
+            "ADD COLUMN is_fallback INTEGER NOT NULL DEFAULT 0"
+        ),
+        "estimated_cost_nanos": (
+            "ALTER TABLE model_generation_attempts "
+            "ADD COLUMN estimated_cost_nanos INTEGER"
+        ),
+        "cost_priced": (
+            "ALTER TABLE model_generation_attempts "
+            "ADD COLUMN cost_priced INTEGER NOT NULL DEFAULT 0"
+        ),
+        "pricing_version": (
+            "ALTER TABLE model_generation_attempts "
+            "ADD COLUMN pricing_version TEXT NOT NULL DEFAULT ''"
+        ),
+    }.items():
+        _add_column_if_missing(
+            cursor,
+            "model_generation_attempts",
+            column,
+            ddl,
+        )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gemini_budget_reservations (
+            reservation_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            usage_month TEXT NOT NULL,
+            route TEXT NOT NULL,
+            lane TEXT NOT NULL,
+            estimated_cost_nanos INTEGER NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gemini_budget_reservations_month
+        ON gemini_budget_reservations (usage_month, expires_at)
         """
     )
     cursor.execute("INSERT OR IGNORE INTO token_usage (id) VALUES (1)")
@@ -19724,11 +20006,32 @@ def _extract_token_usage_breakdown(response) -> TokenUsageBreakdown:
     )
 
 
+def _estimate_breakdown_cost(
+    breakdown: TokenUsageBreakdown,
+    model: str,
+    usage_date: str,
+):
+    try:
+        pricing_date = date.fromisoformat(str(usage_date))
+    except (TypeError, ValueError):
+        pricing_date = datetime.now(PACIFIC_TZ).date()
+    return estimate_gemini_cost(
+        model,
+        prompt_tokens=_usage_int(breakdown.prompt_tokens),
+        candidate_tokens=_usage_int(breakdown.candidate_tokens),
+        thought_tokens=_usage_int(breakdown.thought_tokens),
+        cached_tokens=_usage_int(breakdown.cached_tokens),
+        total_tokens=_usage_int(breakdown.total_tokens),
+        at=pricing_date,
+    )
+
+
 def record_token_usage(
     breakdown: TokenUsageBreakdown,
     *,
     route: str,
     model: str,
+    reservation_id: str = "",
 ) -> int:
     total_tokens = _usage_int(breakdown.total_tokens)
     if not total_tokens:
@@ -19744,6 +20047,11 @@ def record_token_usage(
         "_",
         str(model or "unknown"),
     )[:120] or "unknown"
+    cost_estimate = _estimate_breakdown_cost(
+        breakdown,
+        safe_model,
+        today_pacific,
+    )
     reset = False
     with sqlite3.connect(DB_FILE, timeout=30) as conn:
         cursor = conn.cursor()
@@ -19761,9 +20069,12 @@ def record_token_usage(
                 candidate_tokens,
                 thought_tokens,
                 cached_tokens,
-                total_tokens
+                total_tokens,
+                estimated_cost_nanos,
+                cost_priced,
+                pricing_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 today_pacific,
@@ -19775,6 +20086,9 @@ def record_token_usage(
                 _usage_int(breakdown.thought_tokens),
                 _usage_int(breakdown.cached_tokens),
                 total_tokens,
+                cost_estimate.estimated_cost_nanos,
+                1 if cost_estimate.priced else 0,
+                PRICING_VERSION,
             ),
         )
         cursor.execute(
@@ -19788,6 +20102,17 @@ def record_token_usage(
         daily_total_row = cursor.execute(
             "SELECT tokens_used_today FROM token_usage WHERE id = 1"
         ).fetchone()
+        cost_clock = pacific_budget_clock(date.fromisoformat(today_pacific))
+        daily_cost_rollup = _event_cost_rollup(
+            conn,
+            today_pacific,
+            (cost_clock.usage_date + timedelta(days=1)).isoformat(),
+        )
+        monthly_cost_rollup = _event_cost_rollup(
+            conn,
+            cost_clock.month_start.isoformat(),
+            cost_clock.next_month_start.isoformat(),
+        )
         conn.commit()
     if reset:
         logging.info(
@@ -19798,8 +20123,11 @@ def record_token_usage(
         daily_total_row[0] if daily_total_row else total_tokens
     )
     logging.info(
-        "model_token_usage route=%s model=%s total=%s prompt=%s "
-        "candidate=%s thoughts=%s cached=%s daily_total=%s daily_limit=%s",
+        "model_token_usage reservation_id=%s route=%s model=%s total=%s prompt=%s "
+        "candidate=%s thoughts=%s cached=%s estimated_cost_usd=%s "
+        "cost_priced=%s daily_total=%s daily_limit=%s "
+        "daily_cost_usd=%s monthly_cost_usd=%s",
+        str(reservation_id or "none"),
         safe_route,
         safe_model,
         total_tokens,
@@ -19807,8 +20135,16 @@ def record_token_usage(
         _usage_int(breakdown.candidate_tokens),
         _usage_int(breakdown.thought_tokens),
         _usage_int(breakdown.cached_tokens),
+        (
+            str(cost_estimate.estimated_cost_usd)
+            if cost_estimate.priced
+            else "unpriced"
+        ),
+        cost_estimate.priced,
         daily_total,
         DAILY_TOKEN_LIMIT,
+        _nanos_to_usd(daily_cost_rollup["estimated_cost_nanos"]),
+        _nanos_to_usd(monthly_cost_rollup["estimated_cost_nanos"]),
     )
     return daily_total
 
@@ -19819,6 +20155,10 @@ def record_generation_token_usage(
     route: str,
     model: str,
     fallback_total: int = 0,
+    attempt_number: int = 1,
+    is_retry: bool = False,
+    is_fallback: bool = False,
+    reservation_id: str = "",
 ) -> int:
     breakdown = _extract_token_usage_breakdown(response)
     accounting_route = route
@@ -19834,29 +20174,38 @@ def record_generation_token_usage(
             model,
             breakdown.total_tokens,
         )
-    return record_token_usage(
+    daily_total = record_token_usage(
         breakdown,
         route=accounting_route,
         model=model,
+        reservation_id=reservation_id,
     )
+    _record_model_generation_attempt(
+        breakdown,
+        route=route,
+        model=model,
+        outcome="success",
+        attempt_number=attempt_number,
+        is_retry=is_retry,
+        is_fallback=is_fallback,
+        reservation_id=reservation_id,
+    )
+    return daily_total
 
 
-def record_failed_generation_attempt(
-    exc: Exception,
+def _record_model_generation_attempt(
+    breakdown: TokenUsageBreakdown,
     *,
     route: str,
     model: str,
-) -> int:
-    kind = provider_failure_kind(exc)
-    status_code = provider_status_code(exc)
-    usage_carrier = getattr(exc, "response", None)
-    breakdown = _extract_token_usage_breakdown(usage_carrier)
-    if breakdown.total_tokens:
-        record_token_usage(
-            breakdown,
-            route=f"{route}.failed_{kind.value}",
-            model=model,
-        )
+    outcome: str,
+    error_category: str = "",
+    provider_status: int = 0,
+    attempt_number: int = 1,
+    is_retry: bool = False,
+    is_fallback: bool = False,
+    reservation_id: str = "",
+) -> None:
     today_pacific = _pacific_usage_date()
     safe_route = re.sub(
         r"[^a-zA-Z0-9_.:-]+",
@@ -19868,6 +20217,11 @@ def record_failed_generation_attempt(
         "_",
         str(model or "unknown"),
     )[:120] or "unknown"
+    cost_estimate = _estimate_breakdown_cost(
+        breakdown,
+        safe_model,
+        today_pacific,
+    )
     with sqlite3.connect(DB_FILE, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
@@ -19887,30 +20241,99 @@ def record_failed_generation_attempt(
                 candidate_tokens,
                 thought_tokens,
                 cached_tokens,
-                total_tokens
+                total_tokens,
+                attempt_number,
+                is_retry,
+                is_fallback,
+                estimated_cost_nanos,
+                cost_priced,
+                pricing_version
             )
-            VALUES (?, ?, ?, ?, 'failure', ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 today_pacific,
                 datetime.now(timezone.utc).isoformat(),
                 safe_route,
                 safe_model,
-                kind.value,
-                status_code,
+                str(outcome or "unknown")[:40],
+                str(error_category or "")[:80],
+                _usage_int(provider_status),
                 _usage_int(breakdown.prompt_tokens),
                 _usage_int(breakdown.candidate_tokens),
                 _usage_int(breakdown.thought_tokens),
                 _usage_int(breakdown.cached_tokens),
                 _usage_int(breakdown.total_tokens),
+                max(1, _usage_int(attempt_number)),
+                1 if is_retry else 0,
+                1 if is_fallback else 0,
+                cost_estimate.estimated_cost_nanos,
+                1 if cost_estimate.priced else 0,
+                PRICING_VERSION,
             ),
         )
         conn.commit()
-    logging.warning(
-        "model_generation_attempt_failed route=%s model=%s category=%s "
-        "status=%s total_tokens=%s",
+    logging.info(
+        "model_generation_attempt reservation_id=%s route=%s model=%s outcome=%s "
+        "attempt=%s retry=%s fallback=%s total_tokens=%s "
+        "estimated_cost_usd=%s cost_priced=%s",
+        str(reservation_id or "none"),
         safe_route,
         safe_model,
+        outcome,
+        max(1, _usage_int(attempt_number)),
+        bool(is_retry),
+        bool(is_fallback),
+        _usage_int(breakdown.total_tokens),
+        (
+            str(cost_estimate.estimated_cost_usd)
+            if cost_estimate.priced
+            else "unpriced"
+        ),
+        cost_estimate.priced,
+    )
+
+
+def record_failed_generation_attempt(
+    exc: Exception,
+    *,
+    route: str,
+    model: str,
+    attempt_number: int = 1,
+    is_retry: bool = False,
+    is_fallback: bool = False,
+    reservation_id: str = "",
+) -> int:
+    kind = provider_failure_kind(exc)
+    status_code = provider_status_code(exc)
+    usage_carrier = getattr(exc, "response", None)
+    breakdown = _extract_token_usage_breakdown(usage_carrier)
+    if breakdown.total_tokens:
+        record_token_usage(
+            breakdown,
+            route=f"{route}.failed_{kind.value}",
+            model=model,
+            reservation_id=reservation_id,
+        )
+    _record_model_generation_attempt(
+        breakdown,
+        route=route,
+        model=model,
+        outcome="failure",
+        error_category=kind.value,
+        provider_status=status_code,
+        attempt_number=attempt_number,
+        is_retry=is_retry,
+        is_fallback=is_fallback,
+        reservation_id=reservation_id,
+    )
+    logging.warning(
+        "model_generation_attempt_failed reservation_id=%s route=%s "
+        "model=%s category=%s "
+        "status=%s total_tokens=%s",
+        str(reservation_id or "none"),
+        route,
+        model,
         kind.value,
         status_code,
         _usage_int(breakdown.total_tokens),
@@ -19966,6 +20389,440 @@ def _generation_lane_usage_on_connection(
     return totals
 
 
+_NANODOLLARS_PER_USD = Decimal("1000000000")
+
+
+def _usd_to_nanos(value: Decimal) -> int:
+    return max(0, int(value * _NANODOLLARS_PER_USD))
+
+
+def _nanos_to_usd(value: int) -> Decimal:
+    return Decimal(max(0, int(value or 0))) / _NANODOLLARS_PER_USD
+
+
+def _budget_env_usd(name: str, default: str) -> Decimal:
+    try:
+        value = Decimal(str(os.getenv(name, default) or default))
+    except Exception:
+        value = Decimal(default)
+    if not value.is_finite() or value < 0:
+        return Decimal(default)
+    return value
+
+
+def _event_cost_rollup(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date_exclusive: str,
+) -> dict:
+    """Price ledger events, including rows written before cost columns existed."""
+    rows = conn.execute(
+        """
+        SELECT usage_date, route, model, prompt_tokens, candidate_tokens,
+               thought_tokens, cached_tokens, total_tokens,
+               estimated_cost_nanos, cost_priced
+        FROM token_usage_events
+        WHERE usage_date >= ? AND usage_date < ?
+        ORDER BY id
+        """,
+        (start_date, end_date_exclusive),
+    ).fetchall()
+    total_nanos = 0
+    unpriced_calls = 0
+    unpriced_tokens = 0
+    unpriced_guardrail_nanos = 0
+    unpriced_models: dict[str, dict[str, int | str]] = {}
+    route_totals: dict[str, dict] = {}
+    for row in rows:
+        (
+            usage_date,
+            route,
+            model,
+            prompt_tokens,
+            candidate_tokens,
+            thought_tokens,
+            cached_tokens,
+            total_tokens,
+            stored_nanos,
+            stored_priced,
+        ) = row
+        breakdown = TokenUsageBreakdown(
+            total_tokens=_usage_int(total_tokens),
+            prompt_tokens=_usage_int(prompt_tokens),
+            candidate_tokens=_usage_int(candidate_tokens),
+            thought_tokens=_usage_int(thought_tokens),
+            cached_tokens=_usage_int(cached_tokens),
+        )
+        event_nanos = None
+        if stored_priced and stored_nanos is not None:
+            event_nanos = _usage_int(stored_nanos)
+        else:
+            estimate = _estimate_breakdown_cost(
+                breakdown,
+                str(model or "unknown"),
+                str(usage_date or start_date),
+            )
+            event_nanos = estimate.estimated_cost_nanos
+        safe_route = str(route or "unknown")
+        aggregate = route_totals.setdefault(
+            safe_route,
+            {
+                "route": safe_route,
+                "calls": 0,
+                "prompt_tokens": 0,
+                "candidate_tokens": 0,
+                "thought_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost_nanos": 0,
+                "unpriced_calls": 0,
+            },
+        )
+        aggregate["calls"] += 1
+        aggregate["prompt_tokens"] += breakdown.prompt_tokens
+        aggregate["candidate_tokens"] += breakdown.candidate_tokens
+        aggregate["thought_tokens"] += breakdown.thought_tokens
+        aggregate["cached_tokens"] += breakdown.cached_tokens
+        aggregate["total_tokens"] += breakdown.total_tokens
+        if event_nanos is None:
+            unpriced_calls += 1
+            unpriced_tokens += breakdown.total_tokens
+            event_guardrail_nanos = (
+                conservative_unpriced_guardrail_cost_nanos(
+                    breakdown.total_tokens
+                )
+            )
+            unpriced_guardrail_nanos += event_guardrail_nanos
+            aggregate["unpriced_calls"] += 1
+            model_name = str(model or "unknown")
+            model_usage = unpriced_models.setdefault(
+                model_name,
+                {"model": model_name, "calls": 0, "total_tokens": 0},
+            )
+            model_usage["calls"] = int(model_usage["calls"]) + 1
+            model_usage["total_tokens"] = (
+                int(model_usage["total_tokens"]) + breakdown.total_tokens
+            )
+        else:
+            total_nanos += event_nanos
+            aggregate["estimated_cost_nanos"] += event_nanos
+    return {
+        "estimated_cost_nanos": total_nanos,
+        "unpriced_calls": unpriced_calls,
+        "unpriced_tokens": unpriced_tokens,
+        "unpriced_guardrail_nanos": unpriced_guardrail_nanos,
+        "unpriced_models": sorted(
+            unpriced_models.values(),
+            key=lambda item: (
+                -int(item["total_tokens"]),
+                str(item["model"]),
+            ),
+        ),
+        "routes": sorted(
+            route_totals.values(),
+            key=lambda item: (
+                -item["estimated_cost_nanos"],
+                -item["total_tokens"],
+                item["route"],
+            ),
+        ),
+    }
+
+
+def _provider_attempt_route_for_usage_route(route: str) -> str:
+    """Map accounting-only event suffixes back to their provider route."""
+
+    safe_route = str(route or "unknown")
+    if safe_route.endswith(".usage_estimated"):
+        return safe_route[: -len(".usage_estimated")]
+    if ".failed_" in safe_route:
+        return safe_route.split(".failed_", 1)[0]
+    return safe_route
+
+
+def _estimated_request_cost_nanos(contents: str, route: str) -> int | None:
+    policy = policy_for_route(route)
+    # UTF-8 bytes are a conservative, tokenizer-independent upper estimate
+    # for the prompt reservation. Actual provider metadata replaces it after
+    # the call, so this affects concurrency safety rather than billed totals.
+    prompt_tokens = max(1, len(str(contents or "").encode("utf-8")))
+    attempts = 1 + max(0, int(policy.provider_retries))
+    models = [GEMINI_MODEL]
+    if (
+        policy.allow_fallback
+        and GEMINI_FALLBACK_MODEL
+        and GEMINI_FALLBACK_MODEL != GEMINI_MODEL
+    ):
+        models.append(GEMINI_FALLBACK_MODEL)
+    total_nanos = 0
+    for model in models:
+        estimate = estimate_gemini_cost(
+            model,
+            prompt_tokens=prompt_tokens,
+            candidate_tokens=policy.max_output_tokens,
+            total_tokens=prompt_tokens + policy.max_output_tokens,
+            at=_pacific_now(),
+        )
+        if estimate.estimated_cost_nanos is None:
+            return None
+        total_nanos += estimate.estimated_cost_nanos * attempts
+    return total_nanos
+
+
+def _dollar_budget_decision(
+    *,
+    route: str,
+    request_nanos: int,
+    month_nanos: int,
+    today_nanos: int,
+    active_month_nanos: int,
+    active_today_nanos: int,
+    unpriced_calls: int,
+    unpriced_month_guardrail_nanos: int,
+    unpriced_today_guardrail_nanos: int,
+    now_pacific: datetime,
+) -> tuple[bool, str]:
+    config = load_budget_config()
+    if not config.enforcement_enabled:
+        return True, "enforcement_disabled"
+
+    billing_lag_buffer = _budget_env_usd(
+        "BNL_GEMINI_BILLING_LAG_BUFFER_USD",
+        "0.50",
+    )
+    journal_reserve = _budget_env_usd(
+        "BNL_GEMINI_JOURNAL_RESERVE_USD",
+        "1.00",
+    )
+    interactive_reserve = _budget_env_usd(
+        "BNL_GEMINI_INTERACTIVE_RESERVE_USD",
+        "2.00",
+    )
+    effective_hard = max(
+        Decimal("0"),
+        config.monthly_hard_limit_usd - billing_lag_buffer,
+    )
+    guarded_month_nanos = (
+        month_nanos
+        + unpriced_month_guardrail_nanos
+        + active_month_nanos
+    )
+    guarded_today_nanos = (
+        today_nanos
+        + unpriced_today_guardrail_nanos
+        + active_today_nanos
+    )
+    projected_month = guarded_month_nanos + request_nanos
+    hard_nanos = _usd_to_nanos(effective_hard)
+    if projected_month > hard_nanos:
+        return False, "monthly_hard_limit"
+
+    policy = policy_for_route(route)
+    if unpriced_calls and policy.lane == "background":
+        return False, "unpriced_monthly_usage"
+    if policy.journal_protected:
+        return True, "journal_protected"
+    if policy.lane != "background":
+        interactive_limit = max(
+            0,
+            hard_nanos - _usd_to_nanos(journal_reserve),
+        )
+        if projected_month > interactive_limit:
+            return False, "journal_reserve"
+        return True, "interactive_available"
+
+    background_limit = max(
+        0,
+        hard_nanos
+        - _usd_to_nanos(journal_reserve)
+        - _usd_to_nanos(interactive_reserve),
+    )
+    if projected_month > background_limit:
+        return False, "interactive_and_journal_reserve"
+
+    pace = calculate_monthly_budget_pace(
+        _nanos_to_usd(guarded_month_nanos),
+        _nanos_to_usd(guarded_today_nanos),
+        config=config,
+        at=now_pacific,
+    )
+    expected_nanos = _usd_to_nanos(pace.expected_cost_to_date_usd)
+    if guarded_month_nanos >= expected_nanos:
+        return False, "monthly_target_pace"
+
+    prior_days_nanos = max(0, guarded_month_nanos - guarded_today_nanos)
+    banked_daily_allowance = max(
+        _usd_to_nanos(config.daily_soft_limit_usd),
+        expected_nanos - prior_days_nanos,
+    )
+    projected_today = guarded_today_nanos + request_nanos
+    if projected_today > banked_daily_allowance:
+        return False, "daily_soft_limit"
+    return True, "background_available"
+
+
+def _reserve_dollar_budget(contents: str, route: str) -> tuple[str, int]:
+    request_nanos = _estimated_request_cost_nanos(contents, route)
+    if request_nanos is None:
+        logging.warning(
+            "gemini_budget_decision reservation_id=none route=%s model=%s allowed=false "
+            "reason=unpriced_request_model",
+            route,
+            GEMINI_MODEL,
+        )
+        if load_budget_config().enforcement_enabled:
+            raise LocalModelBudgetExhausted("unpriced_request_model")
+        return "", 0
+
+    now_pacific = _pacific_now()
+    clock = pacific_budget_clock(now_pacific)
+    now_utc = datetime.now(timezone.utc)
+    expires_utc = now_utc + timedelta(
+        minutes=_bounded_env_int(
+            "BNL_GEMINI_BUDGET_RESERVATION_TTL_MINUTES",
+            30,
+            # At the most permissive interactive policy, one logical request
+            # may make three primary plus three fallback attempts. The lease
+            # must outlive all bounded provider timeouts and retry delays.
+            minimum=30,
+            maximum=180,
+        )
+    )
+    reservation_id = uuid.uuid4().hex
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        _ensure_token_usage_schema(cursor)
+        cursor.execute(
+            "DELETE FROM gemini_budget_reservations WHERE expires_at <= ?",
+            (now_utc.isoformat(),),
+        )
+        month_rollup = _event_cost_rollup(
+            conn,
+            clock.month_start.isoformat(),
+            clock.next_month_start.isoformat(),
+        )
+        today_rollup = _event_cost_rollup(
+            conn,
+            clock.usage_date.isoformat(),
+            (clock.usage_date + timedelta(days=1)).isoformat(),
+        )
+        active = cursor.execute(
+            """
+            SELECT
+                COALESCE(SUM(estimated_cost_nanos), 0),
+                COALESCE(SUM(
+                    CASE WHEN usage_date=? THEN estimated_cost_nanos ELSE 0 END
+                ), 0)
+            FROM gemini_budget_reservations
+            WHERE usage_month=?
+            """,
+            (clock.usage_date.isoformat(), clock.month_key),
+        ).fetchone()
+        active_month_nanos = _usage_int(active[0] if active else 0)
+        active_today_nanos = _usage_int(active[1] if active else 0)
+        allowed, reason = _dollar_budget_decision(
+            route=route,
+            request_nanos=request_nanos,
+            month_nanos=month_rollup["estimated_cost_nanos"],
+            today_nanos=today_rollup["estimated_cost_nanos"],
+            active_month_nanos=active_month_nanos,
+            active_today_nanos=active_today_nanos,
+            unpriced_calls=month_rollup["unpriced_calls"],
+            unpriced_month_guardrail_nanos=month_rollup[
+                "unpriced_guardrail_nanos"
+            ],
+            unpriced_today_guardrail_nanos=today_rollup[
+                "unpriced_guardrail_nanos"
+            ],
+            now_pacific=now_pacific,
+        )
+        if not allowed:
+            conn.commit()
+            logging.warning(
+                "gemini_budget_decision reservation_id=none route=%s lane=%s allowed=false "
+                "reason=%s request_cost_usd=%s daily_total_usd=%s "
+                "monthly_total_usd=%s",
+                route,
+                policy_for_route(route).lane,
+                reason,
+                _nanos_to_usd(request_nanos),
+                _nanos_to_usd(today_rollup["estimated_cost_nanos"]),
+                _nanos_to_usd(month_rollup["estimated_cost_nanos"]),
+            )
+            raise LocalModelBudgetExhausted(reason)
+        cursor.execute(
+            """
+            INSERT INTO gemini_budget_reservations (
+                reservation_id, created_at, expires_at, usage_date,
+                usage_month, route, lane, estimated_cost_nanos
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                reservation_id,
+                now_utc.isoformat(),
+                expires_utc.isoformat(),
+                clock.usage_date.isoformat(),
+                clock.month_key,
+                str(route or "unknown")[:120],
+                policy_for_route(route).lane,
+                request_nanos,
+            ),
+        )
+        conn.commit()
+    logging.info(
+        "gemini_budget_decision reservation_id=%s route=%s lane=%s "
+        "allowed=true reason=%s "
+        "request_cost_usd=%s daily_total_usd=%s monthly_total_usd=%s",
+        reservation_id,
+        route,
+        policy_for_route(route).lane,
+        reason,
+        _nanos_to_usd(request_nanos),
+        _nanos_to_usd(today_rollup["estimated_cost_nanos"]),
+        _nanos_to_usd(month_rollup["estimated_cost_nanos"]),
+    )
+    return reservation_id, request_nanos
+
+
+def _release_dollar_budget(reservation_id: str) -> None:
+    if not reservation_id:
+        return
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        _ensure_token_usage_schema(conn.cursor())
+        conn.execute(
+            "DELETE FROM gemini_budget_reservations WHERE reservation_id=?",
+            (str(reservation_id),),
+        )
+
+
+def _retain_dollar_budget_through_month(reservation_id: str) -> None:
+    """Keep an unaccounted provider estimate active until Pacific month reset."""
+
+    if not reservation_id:
+        return
+    clock = pacific_budget_clock(_pacific_now())
+    month_end_utc = clock.next_monthly_reset_at.astimezone(
+        timezone.utc
+    ).isoformat()
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        updated = conn.execute(
+            """
+            UPDATE gemini_budget_reservations
+            SET expires_at = CASE
+                WHEN expires_at < ? THEN ?
+                ELSE expires_at
+            END
+            WHERE reservation_id=?
+            """,
+            (month_end_utc, month_end_utc, str(reservation_id)),
+        ).rowcount
+        conn.commit()
+    if not updated:
+        raise RuntimeError("gemini_budget_reservation_missing")
+
+
 def reserve_local_model_budget(
     contents: str,
     route: str = "",
@@ -20003,15 +20860,27 @@ def reserve_local_model_budget(
             raise LocalModelBudgetExhausted(
                 "local_model_budget_exhausted"
             )
+        cost_reservation_id, estimated_cost_nanos = (
+            _reserve_dollar_budget(contents, route)
+        )
         _token_budget_reserved_tokens += reservation
         _token_budget_reserved_by_lane[lane] = (
             _token_budget_reserved_by_lane.get(lane, 0)
             + reservation
         )
-    return LocalBudgetReservation(reservation, lane)
+    return LocalBudgetReservation(
+        reservation,
+        lane,
+        cost_reservation_id=cost_reservation_id,
+        estimated_cost_nanos=estimated_cost_nanos,
+    )
 
 
-def release_local_model_budget(reservation: int) -> None:
+def release_local_model_budget(
+    reservation: int,
+    *,
+    retain_cost_reservation: bool = False,
+) -> None:
     global _token_budget_reserved_tokens
     lane = str(
         getattr(reservation, "lane", "ordinary")
@@ -20031,6 +20900,38 @@ def release_local_model_budget(reservation: int) -> None:
             _token_budget_reserved_by_lane[lane] = remaining
         else:
             _token_budget_reserved_by_lane.pop(lane, None)
+    cost_reservation_id = str(
+        getattr(reservation, "cost_reservation_id", "") or ""
+    )
+    if retain_cost_reservation and cost_reservation_id:
+        try:
+            _retain_dollar_budget_through_month(cost_reservation_id)
+            logging.warning(
+                "gemini_budget_reservation_retained reservation_id=%s "
+                "reason=usage_accounting_failed expires=month_reset",
+                cost_reservation_id,
+            )
+        except Exception as exc:
+            # The original lease remains. A broader SQLite outage also makes
+            # subsequent pre-call reservations fail closed before generation.
+            logging.error(
+                "gemini_budget_reservation_retention_failed "
+                "reservation_id=%s error_type=%s",
+                cost_reservation_id,
+                type(exc).__name__,
+            )
+        return
+    try:
+        _release_dollar_budget(
+            cost_reservation_id
+        )
+    except Exception as exc:
+        # Reservations expire automatically. Never discard a completed model
+        # response because local release bookkeeping was temporarily blocked.
+        logging.error(
+            "gemini_budget_reservation_release_failed error_type=%s",
+            type(exc).__name__,
+        )
 
 def get_usage_stats():
     check_and_reset_daily_counters()
@@ -20049,6 +20950,11 @@ def get_usage_stats():
 
 def get_usage_breakdown() -> dict:
     tokens_used, last_reset = get_usage_stats()
+    try:
+        diagnostic_date = date.fromisoformat(str(last_reset))
+    except (TypeError, ValueError):
+        diagnostic_date = _pacific_now().date()
+    clock = pacific_budget_clock(diagnostic_date)
     with sqlite3.connect(DB_FILE) as conn:
         _ensure_token_usage_schema(conn.cursor())
         lane_usage = _generation_lane_usage_on_connection(
@@ -20079,7 +20985,183 @@ def get_usage_breakdown() -> dict:
             """,
             (last_reset,),
         ).fetchall()
+        models = conn.execute(
+            """
+            SELECT model, COUNT(*), COALESCE(SUM(total_tokens), 0)
+            FROM token_usage_events
+            WHERE usage_date = ?
+            GROUP BY model
+            ORDER BY SUM(total_tokens) DESC, model ASC
+            """,
+            (last_reset,),
+        ).fetchall()
+        month_rollup = _event_cost_rollup(
+            conn,
+            clock.month_start.isoformat(),
+            clock.next_month_start.isoformat(),
+        )
+        today_rollup = _event_cost_rollup(
+            conn,
+            clock.usage_date.isoformat(),
+            (clock.usage_date + timedelta(days=1)).isoformat(),
+        )
+        attempt_rows = conn.execute(
+            """
+            SELECT outcome, is_retry, is_fallback, model,
+                   prompt_tokens, candidate_tokens, thought_tokens,
+                   cached_tokens, total_tokens, estimated_cost_nanos,
+                   cost_priced, usage_date
+            FROM model_generation_attempts
+            WHERE usage_date >= ? AND usage_date < ?
+            """,
+            (
+                clock.month_start.isoformat(),
+                clock.next_month_start.isoformat(),
+            ),
+        ).fetchall()
+        attempt_route_rows = conn.execute(
+            """
+            SELECT route, COUNT(*)
+            FROM model_generation_attempts
+            WHERE usage_date >= ? AND usage_date < ?
+            GROUP BY route
+            ORDER BY COUNT(*) DESC, route ASC
+            """,
+            (
+                clock.month_start.isoformat(),
+                clock.next_month_start.isoformat(),
+            ),
+        ).fetchall()
+        active = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(estimated_cost_nanos), 0),
+                COALESCE(SUM(
+                    CASE WHEN usage_date=? THEN estimated_cost_nanos ELSE 0 END
+                ), 0)
+            FROM gemini_budget_reservations
+            WHERE usage_month=? AND expires_at>?
+            """,
+            (
+                clock.usage_date.isoformat(),
+                clock.month_key,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        ).fetchone()
+    active_month_nanos = _usage_int(active[0] if active else 0)
+    active_today_nanos = _usage_int(active[1] if active else 0)
+    failures = 0
+    retries = 0
+    fallbacks = 0
+    failed_cost_nanos = 0
+    unpriced_attempts = 0
+    unpriced_attempt_models: set[str] = set()
+    for attempt in attempt_rows:
+        outcome = str(attempt[0] or "")
+        failures += 1 if outcome == "failure" else 0
+        retries += 1 if attempt[1] else 0
+        fallbacks += 1 if attempt[2] else 0
+        if outcome != "failure":
+            continue
+        attempt_nanos = (
+            _usage_int(attempt[9])
+            if attempt[10] and attempt[9] is not None
+            else None
+        )
+        if attempt_nanos is None:
+            attempt_estimate = _estimate_breakdown_cost(
+                TokenUsageBreakdown(
+                    prompt_tokens=_usage_int(attempt[4]),
+                    candidate_tokens=_usage_int(attempt[5]),
+                    thought_tokens=_usage_int(attempt[6]),
+                    cached_tokens=_usage_int(attempt[7]),
+                    total_tokens=_usage_int(attempt[8]),
+                ),
+                str(attempt[3] or "unknown"),
+                str(attempt[11] or last_reset),
+            )
+            attempt_nanos = attempt_estimate.estimated_cost_nanos
+        if attempt_nanos is None:
+            unpriced_attempts += 1
+            unpriced_attempt_models.add(str(attempt[3] or "unknown"))
+        else:
+            failed_cost_nanos += attempt_nanos
+    config = load_budget_config()
+    month_cost = _nanos_to_usd(month_rollup["estimated_cost_nanos"])
+    today_cost = _nanos_to_usd(today_rollup["estimated_cost_nanos"])
+    guarded_month_nanos = (
+        month_rollup["estimated_cost_nanos"]
+        + month_rollup["unpriced_guardrail_nanos"]
+        + active_month_nanos
+    )
+    guarded_today_nanos = (
+        today_rollup["estimated_cost_nanos"]
+        + today_rollup["unpriced_guardrail_nanos"]
+        + active_today_nanos
+    )
+    billing_lag_buffer_usd = _budget_env_usd(
+        "BNL_GEMINI_BILLING_LAG_BUFFER_USD",
+        "0.50",
+    )
+    effective_hard_limit_usd = max(
+        Decimal("0"),
+        config.monthly_hard_limit_usd - billing_lag_buffer_usd,
+    )
+    remaining_effective_hard_usd = max(
+        Decimal("0"),
+        effective_hard_limit_usd - _nanos_to_usd(guarded_month_nanos),
+    )
+    pace = calculate_monthly_budget_pace(
+        _nanos_to_usd(guarded_month_nanos),
+        _nanos_to_usd(guarded_today_nanos),
+        config=config,
+        at=diagnostic_date,
+    )
+    restrictions = {}
+    for route_class, sample_route in (
+        ("background", "website_relay_event"),
+        ("ordinary", ORDINARY_CHAT_SINGLE_PACKET_ROUTE),
+        ("journal", JOURNAL_ROUTE),
+    ):
+        representative_request_nanos = _estimated_request_cost_nanos(
+            "usage diagnostic representative request",
+            sample_route,
+        )
+        if representative_request_nanos is None:
+            restrictions[route_class] = {
+                "restricted": True,
+                "reason": "unpriced_request_model",
+                "representative_request_cost_usd": None,
+            }
+            continue
+        allowed, reason = _dollar_budget_decision(
+            route=sample_route,
+            request_nanos=representative_request_nanos,
+            month_nanos=month_rollup["estimated_cost_nanos"],
+            today_nanos=today_rollup["estimated_cost_nanos"],
+            active_month_nanos=active_month_nanos,
+            active_today_nanos=active_today_nanos,
+            unpriced_calls=month_rollup["unpriced_calls"],
+            unpriced_month_guardrail_nanos=month_rollup[
+                "unpriced_guardrail_nanos"
+            ],
+            unpriced_today_guardrail_nanos=today_rollup[
+                "unpriced_guardrail_nanos"
+            ],
+            now_pacific=clock.at_pacific,
+        )
+        restrictions[route_class] = {
+            "restricted": not allowed,
+            "reason": reason,
+            "representative_request_cost_usd": _nanos_to_usd(
+                representative_request_nanos
+            ),
+        }
     tracked_total = _usage_int(totals[1] if totals else 0)
+    attempt_counts_by_route = {
+        str(row[0] or "unknown"): _usage_int(row[1])
+        for row in attempt_route_rows
+    }
     ordinary_route_ceiling = budget_ceiling_for_route(
         DAILY_TOKEN_LIMIT,
         "normal_chat",
@@ -20123,6 +21205,78 @@ def get_usage_breakdown() -> dict:
         "candidate_tokens": _usage_int(totals[3] if totals else 0),
         "thought_tokens": _usage_int(totals[4] if totals else 0),
         "cached_tokens": _usage_int(totals[5] if totals else 0),
+        "estimated_cost_today_usd": today_cost,
+        "estimated_cost_month_usd": month_cost,
+        "guarded_cost_today_usd": _nanos_to_usd(guarded_today_nanos),
+        "guarded_cost_month_usd": _nanos_to_usd(guarded_month_nanos),
+        "active_reservations_today_usd": _nanos_to_usd(
+            active_today_nanos
+        ),
+        "active_reservations_month_usd": _nanos_to_usd(
+            active_month_nanos
+        ),
+        "unpriced_guardrail_cost_usd": _nanos_to_usd(
+            month_rollup["unpriced_guardrail_nanos"]
+        ),
+        "monthly_target_usd": config.monthly_target_usd,
+        "monthly_hard_limit_usd": config.monthly_hard_limit_usd,
+        "billing_lag_buffer_usd": billing_lag_buffer_usd,
+        "effective_hard_limit_usd": effective_hard_limit_usd,
+        "remaining_effective_hard_usd": remaining_effective_hard_usd,
+        "daily_soft_limit_usd": config.daily_soft_limit_usd,
+        "budget_enforcement_enabled": config.enforcement_enabled,
+        "remaining_target_usd": pace.remaining_target_usd,
+        "remaining_hard_limit_usd": pace.remaining_hard_limit_usd,
+        "expected_cost_to_date_usd": pace.expected_cost_to_date_usd,
+        "average_cost_per_elapsed_day_usd": (
+            pace.average_cost_per_elapsed_day_usd
+        ),
+        "projected_month_end_cost_usd": pace.projected_month_end_cost_usd,
+        "days_in_month": clock.days_in_month,
+        "day_of_month": clock.day_of_month,
+        "next_daily_reset_at": clock.next_daily_reset_at.isoformat(),
+        "next_monthly_reset_at": clock.next_monthly_reset_at.isoformat(),
+        "retry_count_month": retries,
+        "fallback_count_month": fallbacks,
+        "failed_attempt_count_month": failures,
+        "failed_attempt_cost_usd": _nanos_to_usd(failed_cost_nanos),
+        "unpriced_attempts_month": unpriced_attempts,
+        "unpriced_calls_month": month_rollup["unpriced_calls"],
+        "unpriced_tokens_month": month_rollup["unpriced_tokens"],
+        "unpriced_models_month": month_rollup["unpriced_models"],
+        "unpriced_attempt_models_month": sorted(unpriced_attempt_models),
+        "physical_attempts_month": sum(
+            _usage_int(row[1]) for row in attempt_route_rows
+        ),
+        "attempt_routes": [
+            {
+                "route": str(row[0] or "unknown"),
+                "calls": _usage_int(row[1]),
+            }
+            for row in attempt_route_rows
+        ],
+        "route_restrictions": restrictions,
+        "cost_routes": [
+            {
+                **item,
+                "estimated_cost_usd": _nanos_to_usd(
+                    item["estimated_cost_nanos"]
+                ),
+                "provider_attempts": attempt_counts_by_route.get(
+                    _provider_attempt_route_for_usage_route(item["route"]),
+                    0,
+                ),
+            }
+            for item in month_rollup["routes"]
+        ],
+        "models": [
+            {
+                "model": str(row[0] or "unknown"),
+                "calls": _usage_int(row[1]),
+                "total_tokens": _usage_int(row[2]),
+            }
+            for row in models
+        ],
         "unattributed_tokens": max(
             0,
             _usage_int(tokens_used) - tracked_total,
@@ -26018,49 +27172,67 @@ def _generate_model_with_retry(
     route: str,
     policy,
     attempt_counter: ProviderAttemptCounter | None = None,
+    is_fallback: bool = False,
+    budget_reservation_id: str = "",
+    accounting_state: GenerationAccountingState | None = None,
 ):
     last_error = None
     for attempt_index in range(policy.provider_retries + 1):
         logging.info(
-            "gemini_model_attempt model=%s route=%s attempt=%s",
+            "gemini_model_attempt reservation_id=%s model=%s route=%s "
+            "attempt=%s retry=%s fallback=%s",
+            str(budget_reservation_id or "none"),
             model_name,
             route,
             attempt_index + 1,
+            attempt_index > 0,
+            is_fallback,
         )
+        generate_content = client.models.generate_content
+        model_resource = _gemini_model_resource_name(model_name)
+        generation_config = _generation_config_for_model(
+            model_name,
+            route,
+        )
+        if attempt_counter is not None:
+            attempt_counter.mark_started()
         try:
-            generate_content = client.models.generate_content
-            model_resource = _gemini_model_resource_name(model_name)
-            generation_config = _generation_config_for_model(
-                model_name,
-                route,
-            )
-            if attempt_counter is not None:
-                attempt_counter.mark_started()
             response = generate_content(
                 model=model_resource,
                 contents=contents,
                 config=generation_config,
             )
-            record_generation_token_usage(
-                response,
-                route=route,
-                model=model_name,
-                fallback_total=single_attempt_reservation(contents, policy),
-            )
-            return response
         except Exception as error:
             last_error = error
             kind = provider_failure_kind(error)
-            record_failed_generation_attempt(
-                error,
-                route=route,
-                model=model_name,
-            )
+            try:
+                record_failed_generation_attempt(
+                    error,
+                    route=route,
+                    model=model_name,
+                    attempt_number=attempt_index + 1,
+                    is_retry=attempt_index > 0,
+                    is_fallback=is_fallback,
+                    reservation_id=budget_reservation_id,
+                )
+            except Exception as accounting_error:
+                if accounting_state is not None:
+                    accounting_state.mark_failed()
+                logging.error(
+                    "model_failure_accounting_failed route=%s model=%s "
+                    "attempt=%s error_type=%s",
+                    route,
+                    model_name,
+                    attempt_index + 1,
+                    type(accounting_error).__name__,
+                )
             if attempt_index < policy.provider_retries and retryable_failure(kind):
                 delay = retry_delay_seconds(attempt_index)
                 logging.warning(
-                    "gemini_model_retry model=%s route=%s category=%s "
+                    "gemini_model_retry reservation_id=%s model=%s "
+                    "route=%s category=%s "
                     "delay_seconds=%s",
+                    str(budget_reservation_id or "none"),
                     model_name,
                     route,
                     kind.value,
@@ -26069,6 +27241,31 @@ def _generate_model_with_retry(
                 time.sleep(delay)
                 continue
             raise
+        try:
+            record_generation_token_usage(
+                response,
+                route=route,
+                model=model_name,
+                fallback_total=single_attempt_reservation(contents, policy),
+                attempt_number=attempt_index + 1,
+                is_retry=attempt_index > 0,
+                is_fallback=is_fallback,
+                reservation_id=budget_reservation_id,
+            )
+        except Exception as accounting_error:
+            # A successful provider response must never be discarded or sent
+            # through retry/fallback because local diagnostics storage failed.
+            if accounting_state is not None:
+                accounting_state.mark_failed()
+            logging.error(
+                "model_success_accounting_failed route=%s model=%s "
+                "attempt=%s error_type=%s",
+                route,
+                model_name,
+                attempt_index + 1,
+                type(accounting_error).__name__,
+            )
+        return response
     raise last_error or RuntimeError("provider_generation_failed")
 
 
@@ -26080,6 +27277,10 @@ def _generate_gemini_content_with_fallback(
 ):
     policy = policy_for_route(route)
     reservation = reserve_local_model_budget(contents, route)
+    budget_reservation_id = str(
+        getattr(reservation, "cost_reservation_id", "") or ""
+    )
+    accounting_state = GenerationAccountingState()
     try:
         client = get_gemini_client()
         try:
@@ -26090,6 +27291,8 @@ def _generate_gemini_content_with_fallback(
                 route=route,
                 policy=policy,
                 attempt_counter=attempt_counter,
+                budget_reservation_id=budget_reservation_id,
+                accounting_state=accounting_state,
             )
             return RoutedGenerationResponse(
                 raw_response=response,
@@ -26107,8 +27310,9 @@ def _generate_gemini_content_with_fallback(
             if not fallback_allowed:
                 raise
             logging.warning(
-                "gemini_primary_failed_trying_fallback primary=%s "
+                "gemini_primary_failed_trying_fallback reservation_id=%s primary=%s "
                 "fallback=%s route=%s category=%s same_project=true",
+                str(budget_reservation_id or "none"),
                 GEMINI_MODEL,
                 GEMINI_FALLBACK_MODEL,
                 route,
@@ -26122,17 +27326,24 @@ def _generate_gemini_content_with_fallback(
                     route=route,
                     policy=policy,
                     attempt_counter=attempt_counter,
+                    is_fallback=True,
+                    budget_reservation_id=budget_reservation_id,
+                    accounting_state=accounting_state,
                 )
             except Exception as fallback_error:
                 logging.error(
-                    "gemini_fallback_failed fallback=%s route=%s category=%s",
+                    "gemini_fallback_failed reservation_id=%s fallback=%s "
+                    "route=%s category=%s",
+                    str(budget_reservation_id or "none"),
                     GEMINI_FALLBACK_MODEL,
                     route,
                     provider_failure_kind(fallback_error).value,
                 )
                 raise
             logging.info(
-                "gemini_fallback_succeeded fallback=%s route=%s",
+                "gemini_fallback_succeeded reservation_id=%s fallback=%s "
+                "route=%s",
+                str(budget_reservation_id or "none"),
                 GEMINI_FALLBACK_MODEL,
                 route,
             )
@@ -26142,7 +27353,13 @@ def _generate_gemini_content_with_fallback(
                 fallback_used=True,
             )
     finally:
-        release_local_model_budget(reservation)
+        if accounting_state.failed:
+            release_local_model_budget(
+                reservation,
+                retain_cost_reservation=True,
+            )
+        else:
+            release_local_model_budget(reservation)
 
 
 FAKE_LOOKUP_CLAIM_PATTERNS = (
@@ -26633,6 +27850,38 @@ def fake_lookup_safety_prompt_rules() -> str:
     )
 
 
+def _generation_child_route(parent_route: str, child_route: str) -> str:
+    """Keep optional post-processing inside its parent's background policy."""
+
+    if policy_for_route(parent_route).lane == "background":
+        return f"{parent_route}.{child_route}"
+    return child_route
+
+
+def _raise_background_generation_failure(
+    route: str,
+    *,
+    exc: Exception | None = None,
+    empty_response: bool = False,
+) -> None:
+    category, code, safe_message = classify_generation_error(
+        exc,
+        empty_response=empty_response,
+    )
+    result = GenerationResult(
+        False,
+        "",
+        category,
+        code,
+        safe_message,
+        route,
+        0.0,
+        GEMINI_MODEL,
+    )
+    record_generation_result_status(result)
+    raise BackgroundGenerationUnavailable(result) from exc
+
+
 def _safe_current_room_media_grounding_response(prompt: str) -> str:
     logging.info(
         "canned_media_fallback_blocked route=internal channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s",
@@ -26650,6 +27899,7 @@ async def _repair_current_room_media_grounding_response(
     route: str = "get_gemini_response",
     *,
     source_context_available: bool = False,
+    raise_on_generation_failure: bool = False,
 ) -> str:
     repair_prompt = f"""{BNL01_SYSTEM_PROMPT}
 
@@ -26675,11 +27925,23 @@ Draft to repair:
 {text}
 
 Repaired response:"""
+    repair_route = _generation_child_route(
+        route,
+        "media_response_grounding_repair",
+    )
     try:
-        response = await _generate_gemini_content_with_fallback_async(repair_prompt, "media_response_grounding_repair")
+        response = await _generate_gemini_content_with_fallback_async(
+            repair_prompt,
+            repair_route,
+        )
         repaired, _tokens = _extract_text_and_tokens(response)
         repaired = (repaired or "").strip()
         if not repaired:
+            if raise_on_generation_failure:
+                _raise_background_generation_failure(
+                    repair_route,
+                    empty_response=True,
+                )
             return ""
         if contains_fake_lookup_claim(repaired):
             logging.info("media_grounding_repair_rejected reason=fake_lookup_claim route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
@@ -26699,8 +27961,12 @@ Repaired response:"""
             logging.info("media_grounding_repair_rejected reason=media_memory_recall_leak route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
             return ""
         return repaired
+    except BackgroundGenerationUnavailable:
+        raise
     except Exception as exc:
         logging.error("media_grounding_repair_failed route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s error=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)), exc)
+        if raise_on_generation_failure:
+            _raise_background_generation_failure(repair_route, exc=exc)
         return ""
 
 
@@ -26709,6 +27975,7 @@ async def _strict_regenerate_current_room_media_grounding_response(
     route: str = "get_gemini_response",
     *,
     source_context_available: bool = False,
+    raise_on_generation_failure: bool = False,
 ) -> str:
     strict_prompt = f"""{BNL01_SYSTEM_PROMPT}
 
@@ -26726,12 +27993,24 @@ Current prompt context:
 {prompt}
 
 BNL-01 response:"""
+    regeneration_route = _generation_child_route(
+        route,
+        "media_grounding_strict_regeneration",
+    )
     try:
-        response = await _generate_gemini_content_with_fallback_async(strict_prompt, "media_grounding_strict_regeneration")
+        response = await _generate_gemini_content_with_fallback_async(
+            strict_prompt,
+            regeneration_route,
+        )
         regenerated, _tokens = _extract_text_and_tokens(response)
         regenerated = (regenerated or "").strip()
         if not regenerated:
             logging.info("media_grounding_strict_regeneration_failed reason=empty route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
+            if raise_on_generation_failure:
+                _raise_background_generation_failure(
+                    regeneration_route,
+                    empty_response=True,
+                )
             return ""
         if contains_fake_lookup_claim(regenerated):
             logging.info("media_grounding_strict_regeneration_failed reason=fake_lookup_claim route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
@@ -26752,8 +28031,15 @@ BNL-01 response:"""
             return ""
         logging.info("media_grounding_strict_regeneration_succeeded route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
         return regenerated
+    except BackgroundGenerationUnavailable:
+        raise
     except Exception as exc:
         logging.error("media_grounding_strict_regeneration_failed route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s error=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)), exc)
+        if raise_on_generation_failure:
+            _raise_background_generation_failure(
+                regeneration_route,
+                exc=exc,
+            )
         return ""
 
 
@@ -26771,6 +28057,7 @@ async def _strict_regenerate_grounded_conversation_response(
     route: str = "get_gemini_response",
     *,
     source_context_available: bool = False,
+    raise_on_generation_failure: bool = False,
 ) -> str:
     """Retry an unsafe draft from the named live turn without policing BNL's voice."""
     strict_prompt = f"""{BNL01_SYSTEM_PROMPT}
@@ -26792,23 +28079,29 @@ Rules:
 
 BNL-01 response:"""
     try:
-        if not check_quota_availability():
+        regeneration_route = _generation_child_route(
+            route,
+            "conversation_grounding_regeneration",
+        )
+        if not check_quota_availability(regeneration_route):
             result = GenerationResult(
                 False,
                 "",
                 GENERATION_ERROR_LOCAL_MODEL_BUDGET,
                 GENERATION_ERROR_LOCAL_MODEL_BUDGET,
-                "BNL's local daily model budget is exhausted.",
-                "conversation_grounding_regeneration",
+                "BNL's local model budget is exhausted.",
+                regeneration_route,
                 0.0,
                 GEMINI_MODEL,
             )
             record_generation_result_status(result)
             logging.info("conversation_grounding_regeneration_failed reason=quota route=%s", route)
+            if raise_on_generation_failure:
+                raise BackgroundGenerationUnavailable(result)
             return ""
         result = await _generate_gemini_content_result_async(
             strict_prompt,
-            "conversation_grounding_regeneration",
+            regeneration_route,
         )
         if not result.success:
             logging.info(
@@ -26817,6 +28110,8 @@ BNL-01 response:"""
                 result.error_category,
                 result.provider_error_code,
             )
+            if raise_on_generation_failure:
+                raise BackgroundGenerationUnavailable(result)
             return ""
         regenerated = (result.text or "").strip()
         route_mode = _conversation_route_mode_from_prompt(prompt)
@@ -26842,8 +28137,15 @@ BNL-01 response:"""
             return ""
         logging.info("conversation_grounding_regeneration_succeeded route=%s", route)
         return regenerated
+    except BackgroundGenerationUnavailable:
+        raise
     except Exception as exc:
         logging.error("conversation_grounding_regeneration_failed route=%s error=%s", route, type(exc).__name__)
+        if raise_on_generation_failure:
+            _raise_background_generation_failure(
+                regeneration_route,
+                exc=exc,
+            )
         return ""
 
 
@@ -26895,7 +28197,7 @@ async def get_gemini_generation_result(prompt: str, user_id: int, guild_id: int,
                 "",
                 GENERATION_ERROR_LOCAL_MODEL_BUDGET,
                 GENERATION_ERROR_LOCAL_MODEL_BUDGET,
-                "BNL's local daily model budget is exhausted.",
+                "BNL's local model budget is exhausted.",
                 route,
                 time.monotonic() - started,
                 GEMINI_MODEL,
@@ -26953,6 +28255,7 @@ async def get_gemini_response(
     *,
     source_context_available: bool = False,
     attempt_counter: ProviderAttemptCounter | None = None,
+    raise_on_generation_failure: bool = False,
 ):
     try:
         one_call_packet_route = (
@@ -26964,12 +28267,14 @@ async def get_gemini_response(
                 "",
                 GENERATION_ERROR_LOCAL_MODEL_BUDGET,
                 GENERATION_ERROR_LOCAL_MODEL_BUDGET,
-                "BNL's local daily model budget is exhausted.",
+                "BNL's local model budget is exhausted.",
                 route,
                 0.0,
                 GEMINI_MODEL,
             )
             record_generation_result_status(result)
+            if raise_on_generation_failure:
+                raise BackgroundGenerationUnavailable(result)
             return ""
 
         history = (
@@ -27055,6 +28360,8 @@ async def get_gemini_response(
                 attempt_counter=attempt_counter,
             )
         if not generation_result.success:
+            if raise_on_generation_failure:
+                raise BackgroundGenerationUnavailable(generation_result)
             return ""
         text = generation_result.text
 
@@ -27107,7 +28414,10 @@ async def get_gemini_response(
         {text}
         """
 
-            glitch_response = await _generate_gemini_content_with_fallback_async(glitch_prompt, "glitch_rewrite")
+            glitch_response = await _generate_gemini_content_with_fallback_async(
+                glitch_prompt,
+                _generation_child_route(route, "glitch_rewrite"),
+            )
 
             glitch_text, _ = _extract_text_and_tokens(glitch_response)
 
@@ -27176,7 +28486,10 @@ async def get_gemini_response(
         {text}
         """
 
-            bleed_response = await _generate_gemini_content_with_fallback_async(bleed_prompt, "cross_universe_bleed")
+            bleed_response = await _generate_gemini_content_with_fallback_async(
+                bleed_prompt,
+                _generation_child_route(route, "cross_universe_bleed"),
+            )
             bleed_text, _ = _extract_text_and_tokens(bleed_response)
             if bleed_text:
                 if contains_fake_lookup_claim(bleed_text) and not contains_fake_lookup_claim(text):
@@ -27278,6 +28591,7 @@ async def get_gemini_response(
                 prompt,
                 route,
                 source_context_available=source_authority_context_present,
+                raise_on_generation_failure=raise_on_generation_failure,
             )
             if repaired:
                 if unsupported_source_authority and contains_unsupported_source_authority_claim(text):
@@ -27299,6 +28613,7 @@ async def get_gemini_response(
                 prompt,
                 route,
                 source_context_available=source_authority_context_present,
+                raise_on_generation_failure=raise_on_generation_failure,
             )
             if regenerated:
                 return regenerated
@@ -27318,6 +28633,7 @@ async def get_gemini_response(
                 prompt,
                 route,
                 source_context_available=source_authority_context_present,
+                raise_on_generation_failure=raise_on_generation_failure,
             )
             if regenerated:
                 return regenerated
@@ -27332,6 +28648,7 @@ async def get_gemini_response(
                 prompt,
                 route,
                 source_context_available=source_authority_context_present,
+                raise_on_generation_failure=raise_on_generation_failure,
             )
             if regenerated:
                 return regenerated
@@ -27343,14 +28660,29 @@ async def get_gemini_response(
                 prompt,
                 route,
                 source_context_available=source_authority_context_present,
+                raise_on_generation_failure=raise_on_generation_failure,
             )
             if regenerated:
                 return regenerated
             return ""
 
         return text
+    except BackgroundGenerationUnavailable:
+        raise
     except Exception as e:
         logging.error(f"❌ Gemini API error: {e}")
+        if raise_on_generation_failure:
+            result = GenerationResult(
+                False,
+                "",
+                GENERATION_ERROR_PROVIDER_UNKNOWN,
+                GENERATION_ERROR_PROVIDER_UNKNOWN,
+                type(e).__name__,
+                route,
+                0.0,
+                GEMINI_MODEL,
+            )
+            raise BackgroundGenerationUnavailable(result) from e
         return ""
 
 # ==================== DYNAMIC AMBIENT GENERATION ====================
@@ -27576,10 +28908,44 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         f"{avoid_block}\n"
     )
 
-    result = trim_to_complete_sentence(_sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id)), AMBIENT_MAX_CHARS)
+    try:
+        raw_result = await get_gemini_response(
+            prompt,
+            user_id=0,
+            guild_id=guild_id,
+            route="ambient_generation",
+            raise_on_generation_failure=True,
+        )
+    except BackgroundGenerationUnavailable as exc:
+        logging.info(
+            "ambient_generation_skipped reason=%s guild=%s",
+            exc.result.error_category or "provider_unavailable",
+            guild_id,
+        )
+        return ""
+    result = trim_to_complete_sentence(
+        _sanitize_ambient(raw_result),
+        AMBIENT_MAX_CHARS,
+    )
 
     if not result or is_incomplete_ambient_message(result) or _looks_like_internal_process_report(result):
-        retry_result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id))
+        try:
+            retry_result = _sanitize_ambient(
+                await get_gemini_response(
+                    prompt,
+                    user_id=0,
+                    guild_id=guild_id,
+                    route="ambient_generation",
+                    raise_on_generation_failure=True,
+                )
+            )
+        except BackgroundGenerationUnavailable as exc:
+            logging.info(
+                "ambient_generation_skipped reason=%s guild=%s",
+                exc.result.error_category or "provider_unavailable",
+                guild_id,
+            )
+            return ""
         if not retry_result or is_incomplete_ambient_message(retry_result) or _looks_like_internal_process_report(retry_result):
             logging.warning("Ambient skipped after retry (incomplete or internal-process shape)")
             return ""
@@ -27591,7 +28957,23 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     if _too_similar(result, recent_ambient) and AMBIENT_RETRY_ON_SIMILAR > 0:
         logging.info(f"📡 Ambient rejected for guild {guild_id}: duplicate/similar to recent history. Retrying once.")
         prompt2 = prompt + "\nRewrite to be clearly different from the avoid list while staying in character.\n"
-        result2 = _sanitize_ambient(await get_gemini_response(prompt2, user_id=0, guild_id=guild_id))
+        try:
+            result2 = _sanitize_ambient(
+                await get_gemini_response(
+                    prompt2,
+                    user_id=0,
+                    guild_id=guild_id,
+                    route="ambient_generation",
+                    raise_on_generation_failure=True,
+                )
+            )
+        except BackgroundGenerationUnavailable as exc:
+            logging.info(
+                "ambient_generation_skipped reason=%s guild=%s",
+                exc.result.error_category or "provider_unavailable",
+                guild_id,
+            )
+            return ""
         if result2 and not is_incomplete_ambient_message(result2) and not _too_similar(result2, recent_ambient):
             return result2
         logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (duplicate/similar).")
@@ -27762,13 +29144,19 @@ async def generate_dormant_echo(
             recent_automatic,
             retry_reason=reason if attempt else "",
         )
-        raw = await get_gemini_response(
-            prompt,
-            user_id=0,
-            guild_id=guild_id,
-            route="ambient_generation",
-            source_context_available=True,
-        )
+        try:
+            raw = await get_gemini_response(
+                prompt,
+                user_id=0,
+                guild_id=guild_id,
+                route="ambient_generation",
+                source_context_available=True,
+                raise_on_generation_failure=True,
+            )
+        except BackgroundGenerationUnavailable as exc:
+            return "", (
+                exc.result.error_category or "generation_unavailable"
+            )
         candidate_text = sanitize_dormant_echo(raw)
         reason = validate_dormant_echo(candidate_text, candidate)
         if not reason:
@@ -28288,13 +29676,19 @@ async def generate_occasion_reflection(guild_id: int, occasion, generation_conte
             generation_context,
             retry_reason=reason if attempt else "",
         )
-        raw = await get_gemini_response(
-            prompt,
-            user_id=0,
-            guild_id=guild_id,
-            route="occasion_generation",
-            source_context_available=True,
-        )
+        try:
+            raw = await get_gemini_response(
+                prompt,
+                user_id=0,
+                guild_id=guild_id,
+                route="occasion_generation",
+                source_context_available=True,
+                raise_on_generation_failure=True,
+            )
+        except BackgroundGenerationUnavailable as exc:
+            return "", (
+                exc.result.error_category or "generation_unavailable"
+            )
         candidate = sanitize_occasion_reflection(raw)
         reason = validate_occasion_reflection(candidate, occasion)
         if not reason:
@@ -28968,7 +30362,15 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
         "Do not quote users. No usernames. No emojis except optional one at start.\n"
         "Do not repeat generic stock wording. Keep it fresh.\n"
     )
-    text = (await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or "").strip()
+    text = (
+        await get_gemini_response(
+            prompt,
+            user_id=0,
+            guild_id=guild_id,
+            route="showday_generation",
+        )
+        or ""
+    ).strip()
     lines = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 2:
         discord_msg = lines[0][:320]
@@ -29076,23 +30478,48 @@ async def barcode_radio_queue_task():
             continue
         phase_key = phase["key"]
         for guild in iter_managed_guilds():
-            if already_fired_show_update(guild.id, show_date, phase_key):
+            claimed = await asyncio.to_thread(
+                claim_show_update_period,
+                guild.id,
+                show_date,
+                phase_key,
+            )
+            if not claimed:
                 continue
             active_override = get_active_show_state_override(guild.id, show_date=show_date)
             if active_override:
                 logging.warning(f"showday_update_blocked_by_override guild={guild.id} phase={phase_key} override_id={active_override[0]}")
                 mark_show_update_fired(guild.id, show_date, phase_key, "", f"Blocked by show_state_override: {active_override[2]}")
                 continue
+            flags = get_bnl_control_flags()
+            website_showday_delivery_enabled = bool(
+                flags.get("websiteRelayEnabled", True)
+                and BNL_WEBSITE_CONTRACT_VERSION == "1"
+                and BNL_API_KEY
+                and BNL_STATUS_URL
+            )
+            if not (
+                flags.get("showdayDiscordPostsEnabled", False)
+                or website_showday_delivery_enabled
+            ):
+                logging.info(
+                    "showday_generation_skipped_disabled guild=%s phase=%s",
+                    guild.id,
+                    phase_key,
+                )
+                mark_show_update_fired(
+                    guild.id,
+                    show_date,
+                    phase_key,
+                    "",
+                    "Disabled by show-day and website relay controls.",
+                )
+                continue
             channel_id = get_guild_config(guild.id)
             channel = guild.get_channel(channel_id) if channel_id else None
             last_ambient = (get_recent_ambient(guild.id, channel_id=channel_id, limit=1) or [""])[0]
-            discord_msg, website_msg = await generate_showday_messages(guild.id, phase_key)
-            if last_ambient and discord_msg.strip().lower() == last_ambient.strip().lower():
-                discord_msg = _pick_varied_fallback(phase_key, avoid=discord_msg)[:320]
-
             discord_post_count = get_showday_discord_post_count(guild.id, show_date)
             recently_posted = had_recent_showday_discord_post(guild.id, minutes=SHOWDAY_RECENT_POST_BLOCK_MINUTES)
-            flags = get_bnl_control_flags()
             should_post_discord = False
             if phase_key == "submissions_open":
                 should_post_discord = True
@@ -29108,6 +30535,55 @@ async def barcode_radio_queue_task():
                 should_post_discord = False
             if not flags.get("showdayDiscordPostsEnabled", False):
                 should_post_discord = False
+
+            if not (
+                (should_post_discord and channel is not None)
+                or website_showday_delivery_enabled
+            ):
+                logging.info(
+                    "showday_generation_skipped_no_delivery_surface "
+                    "guild=%s phase=%s",
+                    guild.id,
+                    phase_key,
+                )
+                mark_show_update_fired(
+                    guild.id,
+                    show_date,
+                    phase_key,
+                    "",
+                    "No enabled show-day delivery surface.",
+                )
+                continue
+
+            try:
+                discord_msg, website_msg = await generate_showday_messages(
+                    guild.id,
+                    phase_key,
+                )
+            except Exception as exc:
+                await asyncio.to_thread(
+                    release_show_update_claim,
+                    guild.id,
+                    show_date,
+                    phase_key,
+                )
+                logging.warning(
+                    "showday_generation_skipped guild=%s phase=%s "
+                    "error_type=%s",
+                    guild.id,
+                    phase_key,
+                    type(exc).__name__,
+                )
+                continue
+            if (
+                last_ambient
+                and discord_msg.strip().lower()
+                == last_ambient.strip().lower()
+            ):
+                discord_msg = _pick_varied_fallback(
+                    phase_key,
+                    avoid=discord_msg,
+                )[:320]
 
             discord_sent = ""
             if should_post_discord and channel:
@@ -29134,7 +30610,7 @@ async def barcode_radio_queue_task():
                         except Exception as e:
                             logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
             mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
-            if flags.get("websiteRelayEnabled", True):
+            if website_showday_delivery_enabled:
                 await update_website_status_controlled_async(mode=mode, message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)), status="ONLINE", force=True)
             mark_show_update_fired(guild.id, show_date, phase_key, discord_sent, website_msg)
 
@@ -29225,6 +30701,15 @@ async def website_presence_heartbeat_task():
         return
     await asyncio.to_thread(publish_website_presence_v2, source="heartbeat", status="ONLINE", mode="OBSERVATION")
 
+
+def _scheduled_quiet_relay_due(now_pacific: datetime) -> bool:
+    """Return whether this scheduled tick may use a non-fresh relay source."""
+    minutes_since_midnight = now_pacific.hour * 60 + now_pacific.minute
+    return (
+        minutes_since_midnight % BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES
+    ) == 0
+
+
 @tasks.loop(minutes=1)
 async def website_relay_task():
     if not BNL_WEBSITE_RELAY_ENABLED:
@@ -29238,6 +30723,23 @@ async def website_relay_task():
         return
 
     for guild in iter_managed_guilds():
+        period_key = now_pt.replace(second=0, microsecond=0).isoformat(
+            timespec="minutes"
+        )
+        claimed = await asyncio.to_thread(
+            relay_claim_scheduled_period,
+            DB_FILE,
+            guild.id,
+            period_key,
+        )
+        if not claimed:
+            logging.info(
+                "website_relay_scheduled_period_already_claimed "
+                "guild=%s period=%s",
+                guild.id,
+                period_key,
+            )
+            continue
         active_channel_id = get_guild_config(guild.id)
         if active_channel_id:
             active_channel = guild.get_channel(active_channel_id)
@@ -29246,7 +30748,13 @@ async def website_relay_task():
             if relay_eligibility == "no":
                 logging.info("website_relay_task_active_channel_not_eligible guild=%s policy=%s; quiet source cascade remains available", guild.id, active_policy)
         logging.info(f"⏲️ website_relay_task tick guild={guild.id} active_channel={active_channel_id or 'none'}.")
-        decision = await _execute_website_relay_transaction(guild.id, force=False, source="relay", admin_note_source="relay")
+        decision = await _execute_website_relay_transaction(
+            guild.id,
+            force=False,
+            source="relay",
+            admin_note_source="relay",
+            allow_quiet_sources=_scheduled_quiet_relay_due(now_pt),
+        )
         if not decision.publish:
             logging.info("website_relay_no_publish guild=%s reason=%s", guild.id, decision.skipReason)
             continue
@@ -40599,60 +42107,156 @@ async def usage(interaction: discord.Interaction):
     percentage = (tokens_used / DAILY_TOKEN_LIMIT) * 100
     remaining = max(0, DAILY_TOKEN_LIMIT - tokens_used)
 
-    status_indicator = "🟢" if percentage < 80 else "🟡" if percentage < 95 else "🔴"
+    hard_limit = diagnostics["monthly_hard_limit_usd"]
+    effective_hard_limit = diagnostics["effective_hard_limit_usd"]
+    month_cost = diagnostics["estimated_cost_month_usd"]
+    guarded_month_cost = diagnostics["guarded_cost_month_usd"]
+    cost_percentage = (
+        float(guarded_month_cost / effective_hard_limit * 100)
+        if effective_hard_limit
+        else 100.0
+    )
+    status_indicator = (
+        "🟢" if cost_percentage < 80 else "🟡" if cost_percentage < 95 else "🔴"
+    )
 
     embed = discord.Embed(
         title="📊 BNL-01 Local Model Budget",
         color=discord.Color.blue(),
     )
     embed.add_field(
-        name="Today's BNL API Usage",
+        name="Today",
         value=(
             f"{status_indicator} **{tokens_used:,} / {DAILY_TOKEN_LIMIT:,} tokens** ({percentage:.1f}%)\n"
-            f"{remaining:,} tokens remaining"
+            f"{remaining:,} tokens remaining\n"
+            f"Estimated cost: **${diagnostics['estimated_cost_today_usd']:.4f}**"
         ),
         inline=False,
     )
     embed.add_field(
-        name="Journal-Protected Capacity",
+        name="Protected Token Capacity",
         value=(
-            f"**{diagnostics['journal_protected_tokens']:,} tokens** held "
-            "for Journal generation before ordinary routes may use the "
-            "rest of the daily budget.\n"
+            f"Journal reserve: **{diagnostics['journal_protected_tokens']:,} tokens**\n"
             f"Ordinary-route capacity remaining: "
-            f"**{diagnostics['ordinary_route_remaining']:,}**"
+            f"**{diagnostics['ordinary_route_remaining']:,} tokens**"
         ),
         inline=False,
     )
-    route_lines = [
-        f"`{item['route']}` — {item['total_tokens']:,} "
-        f"tokens / {item['calls']:,} call(s)"
-        for item in diagnostics["routes"][:6]
-    ]
+    embed.add_field(
+        name="Monthly Dollar Guardrail",
+        value=(
+            f"Estimated: **${month_cost:.4f}** · target: "
+            f"**${diagnostics['monthly_target_usd']:.2f}** · hard: "
+            f"**${hard_limit:.2f}**\n"
+            f"Guarded (unpriced reserve + in-flight): "
+            f"**${guarded_month_cost:.4f}** · effective hard after "
+            f"${diagnostics['billing_lag_buffer_usd']:.2f} lag buffer: "
+            f"**${effective_hard_limit:.2f}**\n"
+            f"Target remaining: **${diagnostics['remaining_target_usd']:.4f}** · "
+            f"spendable hard headroom: "
+            f"**${diagnostics['remaining_effective_hard_usd']:.4f}**\n"
+            f"Daily soft floor: **${diagnostics['daily_soft_limit_usd']:.2f}** · "
+            f"Target pace to date: **${diagnostics['expected_cost_to_date_usd']:.4f}** · "
+            f"projected month end: **${diagnostics['projected_month_end_cost_usd']:.4f}**\n"
+            f"Average/day: **${diagnostics['average_cost_per_elapsed_day_usd']:.4f}** · "
+            f"day {diagnostics['day_of_month']}/{diagnostics['days_in_month']}"
+        ),
+        inline=False,
+    )
+    route_lines = []
+    for item in diagnostics["cost_routes"][:4]:
+        if item["unpriced_calls"]:
+            if item["estimated_cost_usd"]:
+                cost_label = (
+                    f"${item['estimated_cost_usd']:.4f} + "
+                    f"{item['unpriced_calls']:,} unpriced"
+                )
+            else:
+                cost_label = "unpriced"
+        else:
+            cost_label = f"${item['estimated_cost_usd']:.4f}"
+        route_lines.append(
+            f"`{item['route']}` — {cost_label} / "
+            f"{item['provider_attempts']:,} provider attempt(s) / "
+            f"{item['calls']:,} usage event(s)\n"
+            f"↳ in {item['prompt_tokens']:,} · out "
+            f"{item['candidate_tokens']:,} · "
+            f"think {item['thought_tokens']:,} · "
+            f"cache {item['cached_tokens']:,}"
+        )
     if diagnostics["unattributed_tokens"]:
         route_lines.append(
             "`pre-ledger/unattributed` — "
             f"{diagnostics['unattributed_tokens']:,} tokens"
         )
+    model_lines = [
+        f"`{item['model']}` — {item['calls']:,} call(s), "
+        f"{item['total_tokens']:,} tokens"
+        for item in diagnostics["models"][:4]
+    ]
     embed.add_field(
-        name="Provider Breakdown",
+        name="Provider Tokens Today",
         value=(
-            f"Tracked calls: **{diagnostics['tracked_calls']:,}**\n"
+            f"Tracked usage events: **{diagnostics['tracked_calls']:,}**\n"
             f"Input: **{diagnostics['prompt_tokens']:,}**\n"
             f"Visible output: **{diagnostics['candidate_tokens']:,}**\n"
             f"Thinking: **{diagnostics['thought_tokens']:,}**\n"
             f"Cached input (already included above): "
-            f"**{diagnostics['cached_tokens']:,}**"
+            f"**{diagnostics['cached_tokens']:,}**\n"
+            + ("\n".join(model_lines) if model_lines else "No model calls yet.")
         ),
         inline=False,
     )
     embed.add_field(
-        name="Highest-Use Routes",
+        name="Top Routes This Month",
         value="\n".join(route_lines) if route_lines else "No tracked calls yet.",
         inline=False,
     )
-    embed.add_field(name="Last Reset", value=last_reset, inline=True)
-    embed.add_field(name="Next Reset", value="Midnight Pacific Time", inline=True)
+    restriction_lines = [
+        f"`{name}`: "
+        + (
+            f"restricted ({value['reason']})"
+            if value["restricted"]
+            else "available"
+        )
+        for name, value in diagnostics["route_restrictions"].items()
+    ]
+    unpriced_model_names = sorted(
+        {
+            item["model"]
+            for item in diagnostics["unpriced_models_month"]
+        }
+        | set(diagnostics["unpriced_attempt_models_month"])
+    )
+    unpriced_summary = (
+        ", ".join(f"`{name}`" for name in unpriced_model_names[:4])
+        if unpriced_model_names
+        else "none"
+    )
+    embed.add_field(
+        name="Attempts and Restrictions",
+        value=(
+            f"Physical attempts: **{diagnostics['physical_attempts_month']:,}** · "
+            f"retries: **{diagnostics['retry_count_month']:,}** · fallback calls: "
+            f"**{diagnostics['fallback_count_month']:,}** · failed attempts: "
+            f"**{diagnostics['failed_attempt_count_month']:,}**\n"
+            f"Failed-attempt cost: **${diagnostics['failed_attempt_cost_usd']:.4f}** · "
+            f"unpriced calls: **{diagnostics['unpriced_calls_month']:,}** / "
+            f"**{diagnostics['unpriced_tokens_month']:,} tokens**\n"
+            f"Unpriced models: {unpriced_summary}\n"
+            + "\n".join(restriction_lines)
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Resets (Pacific)",
+        value=(
+            f"Last daily reset: `{last_reset}`\n"
+            f"Next daily: `{diagnostics['next_daily_reset_at']}`\n"
+            f"Next monthly: `{diagnostics['next_monthly_reset_at']}`"
+        ),
+        inline=False,
+    )
     embed.set_footer(
         text=(
             "This is BNL's own API safety budget, not a Gemini app "
