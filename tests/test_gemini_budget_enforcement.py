@@ -241,6 +241,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
             BNL_GEMINI_BILLING_LAG_BUFFER_USD="0",
             BNL_GEMINI_JOURNAL_RESERVE_USD="0",
             BNL_GEMINI_INTERACTIVE_RESERVE_USD="0",
+            BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS="1024",
         )
         barrier = threading.Barrier(2)
 

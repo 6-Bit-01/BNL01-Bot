@@ -87,6 +87,11 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
                     self.assertEqual(policy.provider_retries, 0)
                     self.assertFalse(policy.allow_fallback)
 
+    def test_background_default_preserves_observed_thinking_headroom(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            policy = routing.policy_for_route("website_relay_event")
+        self.assertEqual(policy.max_output_tokens, 4_096)
+
     def test_background_output_limit_remains_environment_configurable(self):
         with mock.patch.dict(
             "os.environ",

@@ -196,7 +196,7 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             lane=lane,
             max_output_tokens=_bounded_env_int(
                 "BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS",
-                1_024,
+                4_096,
                 minimum=1_024,
                 maximum=16_384,
             ),
