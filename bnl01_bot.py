@@ -16541,7 +16541,6 @@ async def revalidate_show_update_claim(
     phase_key: str,
     claim_token: str,
     ownership_lost: asyncio.Event | None = None,
-    release_on_uncertain: bool = True,
 ) -> bool:
     """Fail closed before an external delivery when claim ownership is unsure."""
 
@@ -16570,38 +16569,30 @@ async def revalidate_show_update_claim(
                     SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS * attempt
                 )
                 continue
-            if not release_on_uncertain:
+            try:
+                released = await asyncio.to_thread(
+                    release_show_update_claim,
+                    guild_id,
+                    show_date,
+                    phase_key,
+                    claim_token,
+                )
+            except Exception as release_exc:
                 logging.warning(
-                    "showday_update_claim_uncertain_preserved "
-                    "guild=%s phase=%s",
+                    "showday_update_claim_uncertain_release_failed "
+                    "guild=%s phase=%s error_type=%s",
                     guild_id,
                     phase_key,
+                    type(release_exc).__name__,
                 )
             else:
-                try:
-                    released = await asyncio.to_thread(
-                        release_show_update_claim,
-                        guild_id,
-                        show_date,
-                        phase_key,
-                        claim_token,
-                    )
-                except Exception as release_exc:
-                    logging.warning(
-                        "showday_update_claim_uncertain_release_failed "
-                        "guild=%s phase=%s error_type=%s",
-                        guild_id,
-                        phase_key,
-                        type(release_exc).__name__,
-                    )
-                else:
-                    logging.warning(
-                        "showday_update_claim_uncertain_released "
-                        "guild=%s phase=%s released=%s",
-                        guild_id,
-                        phase_key,
-                        int(released),
-                    )
+                logging.warning(
+                    "showday_update_claim_uncertain_released "
+                    "guild=%s phase=%s released=%s",
+                    guild_id,
+                    phase_key,
+                    int(released),
+                )
             return False
         if not renewed and ownership_lost is not None:
             ownership_lost.set()
@@ -16609,7 +16600,7 @@ async def revalidate_show_update_claim(
     return False
 
 
-async def complete_partially_published_show_update(
+async def commit_show_update_publication_fence(
     guild_id: int,
     show_date: str,
     phase_key: str,
@@ -16618,15 +16609,13 @@ async def complete_partially_published_show_update(
     website_message: str,
     ownership_lost: asyncio.Event | None = None,
 ) -> bool:
-    """Persist a fired row before an uncertain retry can duplicate a delivery."""
+    """Durably consume a phase before its first external publication attempt."""
 
-    attempt = 0
-    while True:
+    for attempt in range(1, SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS + 1):
         if ownership_lost is not None and ownership_lost.is_set():
             return False
-        attempt += 1
         try:
-            completed = await asyncio.to_thread(
+            fenced = await asyncio.to_thread(
                 mark_show_update_fired,
                 guild_id,
                 show_date,
@@ -16637,19 +16626,47 @@ async def complete_partially_published_show_update(
             )
         except Exception as exc:
             logging.warning(
-                "showday_partial_completion_retry guild=%s phase=%s "
+                "showday_publication_fence_retry guild=%s phase=%s "
                 "attempt=%s error_type=%s",
                 guild_id,
                 phase_key,
                 attempt,
                 type(exc).__name__,
             )
-            await asyncio.sleep(
-                SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS
-                * min(attempt, SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS)
-            )
-            continue
-        return completed
+            if attempt < SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS:
+                await asyncio.sleep(
+                    SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS * attempt
+                )
+                continue
+            try:
+                released = await asyncio.to_thread(
+                    release_show_update_claim,
+                    guild_id,
+                    show_date,
+                    phase_key,
+                    claim_token,
+                )
+            except Exception as release_exc:
+                logging.warning(
+                    "showday_publication_fence_release_failed "
+                    "guild=%s phase=%s error_type=%s",
+                    guild_id,
+                    phase_key,
+                    type(release_exc).__name__,
+                )
+            else:
+                logging.warning(
+                    "showday_publication_fence_released "
+                    "guild=%s phase=%s released=%s",
+                    guild_id,
+                    phase_key,
+                    int(released),
+                )
+            return False
+        if not fenced and ownership_lost is not None:
+            ownership_lost.set()
+        return fenced
+    return False
 
 
 def release_show_update_claim(
@@ -30959,7 +30976,10 @@ async def barcode_radio_queue_task():
                         avoid=discord_msg,
                     )[:320]
 
-                discord_sent = ""
+                publication_fenced = False
+                website_fence_message = (
+                    website_msg if website_showday_delivery_enabled else ""
+                )
                 if should_post_discord and channel:
                     async with _ambient_post_lock_for(guild.id):
                         capacity = ambient_capacity_decision(
@@ -30991,60 +31011,64 @@ async def barcode_radio_queue_task():
                                     phase_key,
                                 )
                                 continue
-                            try:
-                                await channel.send(discord_msg, allowed_mentions=discord.AllowedMentions.none())
-                                discord_sent = discord_msg
-                                log_ambient(guild.id, channel.id, discord_msg, source_type="showday")
-                            except Exception as e:
-                                logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
-                mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
-                website_sent = False
-                if website_showday_delivery_enabled:
-                    if not await revalidate_show_update_claim(
-                        guild.id,
-                        show_date,
-                        phase_key,
-                        claim_token,
-                        ownership_lost,
-                        release_on_uncertain=not bool(discord_sent),
-                    ):
-                        logging.warning(
-                            "showday_website_delivery_skipped_claim_lost "
-                            "guild=%s phase=%s",
-                            guild.id,
-                            phase_key,
-                        )
-                        if discord_sent:
-                            completed = await complete_partially_published_show_update(
+                            if not await commit_show_update_publication_fence(
                                 guild.id,
                                 show_date,
                                 phase_key,
                                 claim_token,
-                                discord_sent,
-                                "",
+                                discord_msg,
+                                website_fence_message,
                                 ownership_lost,
-                            )
+                            ):
+                                logging.warning(
+                                    "showday_discord_delivery_skipped_unfenced "
+                                    "guild=%s phase=%s",
+                                    guild.id,
+                                    phase_key,
+                                )
+                                continue
+                            publication_fenced = True
+                            try:
+                                await channel.send(discord_msg, allowed_mentions=discord.AllowedMentions.none())
+                                log_ambient(guild.id, channel.id, discord_msg, source_type="showday")
+                            except Exception as e:
+                                logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
+                mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
+                if website_showday_delivery_enabled:
+                    if not publication_fenced:
+                        if not await revalidate_show_update_claim(
+                            guild.id,
+                            show_date,
+                            phase_key,
+                            claim_token,
+                            ownership_lost,
+                        ):
                             logging.warning(
-                                "showday_partial_discord_completion "
-                                "guild=%s phase=%s completed=%s",
+                                "showday_website_delivery_skipped_claim_lost "
+                                "guild=%s phase=%s",
                                 guild.id,
                                 phase_key,
-                                int(completed),
                             )
-                        continue
+                            continue
+                        if not await commit_show_update_publication_fence(
+                            guild.id,
+                            show_date,
+                            phase_key,
+                            claim_token,
+                            "",
+                            website_msg,
+                            ownership_lost,
+                        ):
+                            logging.warning(
+                                "showday_website_delivery_skipped_unfenced "
+                                "guild=%s phase=%s",
+                                guild.id,
+                                phase_key,
+                            )
+                            continue
+                        publication_fenced = True
                     await update_website_status_controlled_async(mode=mode, message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)), status="ONLINE", force=True)
-                    website_sent = True
-                if discord_sent or website_sent:
-                    completed = await complete_partially_published_show_update(
-                        guild.id,
-                        show_date,
-                        phase_key,
-                        claim_token,
-                        discord_sent,
-                        website_msg if website_sent else "",
-                        ownership_lost,
-                    )
-                else:
+                if not publication_fenced:
                     completed = await asyncio.to_thread(
                         mark_show_update_fired,
                         guild.id,
@@ -31054,13 +31078,13 @@ async def barcode_radio_queue_task():
                         "",
                         "",
                     )
-                if not completed:
-                    logging.warning(
-                        "showday_update_completion_skipped_claim_lost "
-                        "guild=%s phase=%s",
-                        guild.id,
-                        phase_key,
-                    )
+                    if not completed:
+                        logging.warning(
+                            "showday_update_completion_skipped_claim_lost "
+                            "guild=%s phase=%s",
+                            guild.id,
+                            phase_key,
+                        )
             finally:
                 heartbeat_task.cancel()
                 try:

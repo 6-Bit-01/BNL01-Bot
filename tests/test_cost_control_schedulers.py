@@ -334,25 +334,42 @@ class CostControlSchedulerTests(unittest.IsolatedAsyncioTestCase):
         log_ambient.assert_not_called()
         mark.assert_not_called()
 
-    async def test_partial_discord_publish_is_completed_before_website_retry(self):
+    async def test_showday_publication_is_fenced_before_discord_send(self):
         at = bnl01_bot.PACIFIC_TZ.localize(datetime(2026, 8, 21, 18, 40))
         datetime_mock = mock.Mock(wraps=datetime)
         datetime_mock.now.return_value = at
+        inside_lock = {"value": False}
+        fence_committed = {"value": False}
 
         class DeliveryLock:
             async def __aenter__(self):
+                inside_lock["value"] = True
                 return self
 
             async def __aexit__(self, *_args):
+                inside_lock["value"] = False
                 return False
 
-        channel = SimpleNamespace(id=99, send=mock.AsyncMock())
+        async def send_after_fence(*_args, **_kwargs):
+            self.assertTrue(fence_committed["value"])
+
+        channel = SimpleNamespace(
+            id=99,
+            send=mock.AsyncMock(side_effect=send_after_fence),
+        )
         guild = SimpleNamespace(
             id=42,
             get_channel=lambda _channel_id: channel,
         )
-        revalidate = mock.AsyncMock(side_effect=(True, True, False))
-        complete_partial = mock.AsyncMock(return_value=True)
+        revalidate = mock.AsyncMock(return_value=True)
+
+        async def commit_fence(*_args):
+            self.assertTrue(inside_lock["value"])
+            channel.send.assert_not_awaited()
+            fence_committed["value"] = True
+            return True
+
+        fence = mock.AsyncMock(side_effect=commit_fence)
         website_delivery = mock.AsyncMock()
         generate = mock.AsyncMock(return_value=("discord copy", "website copy"))
         log_ambient = mock.Mock()
@@ -392,32 +409,97 @@ class CostControlSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 return_value={"allowed": True, "capacityUsed": 0, "cap": 2}
             ),
             log_ambient=log_ambient,
-            complete_partially_published_show_update=complete_partial,
+            commit_show_update_publication_fence=fence,
             update_website_status_controlled_async=website_delivery,
             mark_show_update_fired=mark,
         ):
             await bnl01_bot.barcode_radio_queue_task.coro()
 
         channel.send.assert_awaited_once()
-        self.assertEqual(revalidate.await_count, 3)
-        self.assertFalse(
-            revalidate.await_args_list[2].kwargs["release_on_uncertain"]
-        )
-        complete_partial.assert_awaited_once()
-        partial_args = complete_partial.await_args.args
+        self.assertEqual(revalidate.await_count, 2)
+        fence.assert_awaited_once()
         self.assertEqual(
-            partial_args[:6],
+            fence.await_args.args[:6],
             (
                 42,
                 "2026-08-21",
                 "submissions_open",
                 "claim-token",
                 "discord copy",
-                "",
+                "website copy",
             ),
         )
-        self.assertTrue(hasattr(partial_args[6], "is_set"))
-        website_delivery.assert_not_awaited()
+        self.assertTrue(hasattr(fence.await_args.args[6], "is_set"))
+        website_delivery.assert_awaited_once()
+        log_ambient.assert_called_once()
+        mark.assert_not_called()
+
+    async def test_showday_website_only_is_fenced_before_publish(self):
+        at = bnl01_bot.PACIFIC_TZ.localize(datetime(2026, 8, 21, 18, 40))
+        datetime_mock = mock.Mock(wraps=datetime)
+        datetime_mock.now.return_value = at
+        website_delivery = mock.AsyncMock()
+
+        async def commit_fence(*_args):
+            website_delivery.assert_not_awaited()
+            return True
+
+        fence = mock.AsyncMock(side_effect=commit_fence)
+        revalidate = mock.AsyncMock(return_value=True)
+        guild = SimpleNamespace(id=42, get_channel=lambda _channel_id: None)
+        mark = mock.Mock()
+        with mock.patch.multiple(
+            bnl01_bot,
+            datetime=datetime_mock,
+            FRIDAY_SHOW_PHASES=[
+                {
+                    "key": "submissions_open",
+                    "hour": 18,
+                    "minute": 40,
+                    "window_min": 5,
+                }
+            ],
+            iter_managed_guilds=mock.Mock(return_value=[guild]),
+            claim_show_update_period=mock.Mock(return_value="claim-token"),
+            get_active_show_state_override=mock.Mock(return_value=None),
+            get_bnl_control_flags=mock.Mock(
+                return_value={
+                    "showdayDiscordPostsEnabled": False,
+                    "websiteRelayEnabled": True,
+                }
+            ),
+            BNL_WEBSITE_CONTRACT_VERSION="1",
+            BNL_API_KEY="configured",
+            BNL_STATUS_URL="https://example.test",
+            get_guild_config=mock.Mock(return_value=None),
+            get_recent_ambient=mock.Mock(return_value=[]),
+            get_showday_discord_post_count=mock.Mock(return_value=0),
+            had_recent_showday_discord_post=mock.Mock(return_value=False),
+            generate_showday_messages=mock.AsyncMock(
+                return_value=("discord copy", "website copy")
+            ),
+            maintain_show_update_claim=mock.AsyncMock(),
+            revalidate_show_update_claim=revalidate,
+            commit_show_update_publication_fence=fence,
+            update_website_status_controlled_async=website_delivery,
+            mark_show_update_fired=mark,
+        ):
+            await bnl01_bot.barcode_radio_queue_task.coro()
+
+        self.assertEqual(revalidate.await_count, 2)
+        fence.assert_awaited_once()
+        self.assertEqual(
+            fence.await_args.args[:6],
+            (
+                42,
+                "2026-08-21",
+                "submissions_open",
+                "claim-token",
+                "",
+                "website copy",
+            ),
+        )
+        website_delivery.assert_awaited_once()
         mark.assert_not_called()
 
     async def test_showday_generation_is_labeled_as_background(self):
