@@ -39,7 +39,7 @@ Queue production remains disabled unless both gates are explicit: local `BNL_QUE
 - `private`: queue/history data is usable only in `sealed_test` and `internal_controlled`;
 - `public`: queue/history data is usable in public consumers.
 
-Missing, contradictory, or malformed scope/`publicOnly` combinations fail closed. Public and show-day consumers cannot receive private queue data, and Broadcast Memory, dossier, Source File, Relay, Journal, or any other persistence/publication path cannot retain it. An approved private channel may answer the owner/admin from private queue context, including a transient test recap, but the prompt carries an explicit instruction not to use that data in public output and remains non-persistent.
+Missing, contradictory, or malformed scope/`publicOnly` combinations fail closed. Public and show-day consumers cannot receive private queue data, and Broadcast Memory, dossier, Source File, Relay, Journal, or any other persistence/publication path cannot retain it. Membership in the permission-locked `sealed_test` and `internal_controlled` channels is the requester authorization boundary for this context; the bot does not impose a second owner-only check after Discord access has been granted. An approved private channel may answer an authorized channel member from private queue context, including a transient test recap, but the prompt carries an explicit instruction not to use that data in public output and remains non-persistent.
 
 The website's bounded `sections.sourceContext` list remains public site canon, not live queue state. BNL may load those public summaries for an explicit site/read-model question even while live queue context is disabled. Queue/session/track values are still removed before prompt assembly.
 
