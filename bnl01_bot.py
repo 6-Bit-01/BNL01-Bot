@@ -789,6 +789,7 @@ OCCASION_MIN_CHARS = AMBIENT_MAX_CHARS * 3
 OCCASION_MAX_CHARS = AMBIENT_MAX_CHARS * 6
 OCCASION_GENERATION_ATTEMPTS = 2
 SHOWDAY_WINDOW_MINUTES = 10
+SHOWDAY_UPDATE_CLAIM_LEASE_SECONDS = 6 * 60
 SHOWDAY_MAX_DISCORD_POSTS_PER_FRIDAY = 2
 SHOWDAY_RECENT_POST_BLOCK_MINUTES = 30
 SHOWDAY_SPONSOR_POST_CHANCE = 0.35
@@ -16366,6 +16367,29 @@ def already_fired_show_update(guild_id: int, show_date: str, phase_key: str) -> 
     return bool(row)
 
 
+def _show_update_claim_is_stale(
+    claimed_at: str,
+    now_utc: datetime,
+) -> bool:
+    """Fail stale or malformed claims open so the show-day window can recover."""
+
+    try:
+        claimed_text = str(claimed_at or "").strip()
+        if claimed_text.endswith("Z"):
+            claimed_text = f"{claimed_text[:-1]}+00:00"
+        claimed = datetime.fromisoformat(claimed_text)
+        if claimed.tzinfo is None:
+            claimed = claimed.replace(tzinfo=timezone.utc)
+        claimed = claimed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return True
+    age_seconds = (now_utc - claimed).total_seconds()
+    return bool(
+        age_seconds >= SHOWDAY_UPDATE_CLAIM_LEASE_SECONDS
+        or age_seconds < -60
+    )
+
+
 def claim_show_update_period(
     guild_id: int,
     show_date: str,
@@ -16385,9 +16409,36 @@ def claim_show_update_period(
         ).fetchone():
             conn.commit()
             return False
+        now_utc = datetime.now(timezone.utc)
+        existing_claim = cursor.execute(
+            """
+            SELECT claimed_at FROM friday_show_update_claims
+            WHERE guild_id=? AND show_date=? AND phase_key=?
+            """,
+            (guild_id, show_date, phase_key),
+        ).fetchone()
+        if existing_claim and not _show_update_claim_is_stale(
+            existing_claim[0],
+            now_utc,
+        ):
+            conn.commit()
+            return False
+        if existing_claim:
+            cursor.execute(
+                """
+                DELETE FROM friday_show_update_claims
+                WHERE guild_id=? AND show_date=? AND phase_key=?
+                """,
+                (guild_id, show_date, phase_key),
+            )
+            logging.warning(
+                "showday_update_stale_claim_recovered guild=%s phase=%s",
+                guild_id,
+                phase_key,
+            )
         cursor.execute(
             """
-            INSERT OR IGNORE INTO friday_show_update_claims
+            INSERT INTO friday_show_update_claims
             (guild_id, show_date, phase_key, claimed_at)
             VALUES (?, ?, ?, ?)
             """,
@@ -16395,12 +16446,11 @@ def claim_show_update_period(
                 guild_id,
                 show_date,
                 phase_key,
-                datetime.now(timezone.utc).isoformat(),
+                now_utc.isoformat(),
             ),
         )
-        claimed = cursor.rowcount == 1
         conn.commit()
-        return claimed
+        return True
 
 
 def release_show_update_claim(
