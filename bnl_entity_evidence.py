@@ -37,6 +37,7 @@ ALLOWED_EVIDENCE_KINDS = {
     "broadcast_memory_signal",
     "r_and_d_context_review_only",
     "community_presence_signal",
+    "queue_artist_catalog",
 }
 
 _DISCORD_MENTION_PATTERN = re.compile(r"<[@#!&]?[0-9]{5,}>")
@@ -341,6 +342,13 @@ def _maybe_mark_source_refresh_dirty(conn: sqlite3.Connection, values: dict[str,
     transcripts are logged or sent by the dirty marker. It writes through the
     existing connection so evidence creation and dirty marking stay atomic.
     """
+
+    if str(values.get("evidence_kind") or "") == "queue_artist_catalog":
+        logging.info(
+            "source_refresh_skipped subject_key=%s reason=queue_artist_catalog_is_not_dossier_authority",
+            values.get("subject_key"),
+        )
+        return
 
     try:
         from bnl_source_file_refresh import (

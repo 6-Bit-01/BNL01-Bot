@@ -329,6 +329,10 @@ from bnl_entity_activity_summary import (
     parse_entity_activity_summary_command,
     refresh_entity_evidence_for_subject,
 )
+from bnl_queue_artist_memory import (
+    build_queue_artist_memory_context,
+    sync_queue_artist_memory_read_model,
+)
 from bnl_entity_intelligence import (
     build_entity_context_for_rd_mod_ops,
     build_entity_intelligence_profile,
@@ -30822,6 +30826,58 @@ async def moment_engine_sweep_task():
         logging.debug("moment_engine_sweep_failed error_type=%s", type(exc).__name__)
 
 @tasks.loop(minutes=1)
+async def queue_artist_memory_sync_task():
+    """Sync only the site's explicitly authorized public artist-memory feed."""
+
+    if not BNL_QUEUE_PRODUCTION_ENABLED:
+        return
+    read_model = await asyncio.to_thread(fetch_bnl_read_model, True)
+    if not read_model:
+        logging.warning("queue_artist_memory_sync_skipped reason=read_model_unavailable")
+        return
+    guilds = list(iter_managed_guilds())
+    if not guilds:
+        logging.info("queue_artist_memory_sync_skipped reason=no_managed_guild")
+        return
+    for guild in guilds:
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if not guild_id:
+            continue
+        try:
+            result = await asyncio.to_thread(
+                sync_queue_artist_memory_read_model,
+                DB_FILE,
+                guild_id=guild_id,
+                read_model=read_model,
+                environ=os.environ,
+            )
+            logging.info(
+                "queue_artist_memory_sync guild=%s status=%s reason=%s "
+                "records=%s records_unchanged=%s rejected=%s evidence_created=%s "
+                "evidence_updated=%s evidence_retired=%s ledger_inserted=%s "
+                "ledger_deduplicated=%s ledger_superseded=%s",
+                guild_id,
+                result.get("status"),
+                result.get("reason"),
+                result.get("recordCount", 0),
+                result.get("recordUnchanged", 0),
+                result.get("rejectedRecordCount", 0),
+                result.get("evidenceCreated", 0),
+                result.get("evidenceUpdated", 0),
+                result.get("evidenceRetired", 0),
+                result.get("ledgerInserted", 0),
+                result.get("ledgerDeduplicated", 0),
+                result.get("ledgerSuperseded", 0),
+            )
+        except Exception as exc:
+            logging.exception(
+                "queue_artist_memory_sync_failed guild=%s error_type=%s",
+                guild_id,
+                type(exc).__name__,
+            )
+
+
+@tasks.loop(minutes=1)
 async def barcode_radio_queue_task():
     now = datetime.now(PACIFIC_TZ)
     if now.weekday() != 4:
@@ -34863,6 +34919,9 @@ async def on_ready():
     if not barcode_radio_queue_task.is_running():
         barcode_radio_queue_task.start()
 
+    if not queue_artist_memory_sync_task.is_running():
+        queue_artist_memory_sync_task.start()
+
     if not moment_engine_sweep_task.is_running():
         moment_engine_sweep_task.start()
 
@@ -35135,6 +35194,17 @@ def build_user_aware_prompt(
     source_context_prompt_block = ""
     if source_context_block:
         source_context_prompt_block = f"{source_context_block}\n"
+    queue_artist_memory_context = build_queue_artist_memory_context(
+        DB_FILE,
+        guild_id=guild_id,
+        user_text=clean_content,
+        environ=os.environ,
+    )
+    queue_artist_memory_prompt_block = (
+        f"{queue_artist_memory_context}\n"
+        if queue_artist_memory_context
+        else ""
+    )
     community_visual_basis = build_community_visual_basis(
         guild_id,
         clean_content,
@@ -35149,6 +35219,7 @@ def build_user_aware_prompt(
         (broadcast_context and broadcast_specialized_owner)
         or show_state_context
         or website_read_model_context
+        or queue_artist_memory_context
         or community_visual_prompt_block
     )
     if ordinary_chat_single_packet and specialized_owner_present:
@@ -35194,6 +35265,7 @@ def build_user_aware_prompt(
                     "website_read_model",
                     bool(website_read_model_context),
                 ),
+                ("queue_artist_memory", bool(queue_artist_memory_context)),
             )
             if present
         )
@@ -35230,6 +35302,7 @@ def build_user_aware_prompt(
                         "website_read_model",
                         bool(website_read_model_context),
                     ),
+                    ("queue_artist_memory", bool(queue_artist_memory_context)),
                     ("source_context", bool(source_context_block)),
                     ("canon", _canon_relevant_to_response(clean_content)),
                 )
@@ -35357,7 +35430,11 @@ def build_user_aware_prompt(
             or broadcast_context
             or show_state_context
             or website_read_model_context
+            or queue_artist_memory_context
             or source_context_block
+        )
+        prompt_metadata["queue_artist_memory_context_present"] = bool(
+            queue_artist_memory_context
         )
         prompt_metadata["community_visual_basis_status"] = (
             community_visual_basis.status
@@ -35589,6 +35666,7 @@ def build_user_aware_prompt(
         f"{broadcast_prompt_block}"
         f"{show_state_prompt_block}"
         f"{website_read_model_prompt_block}"
+        f"{queue_artist_memory_prompt_block}"
         f"{source_context_prompt_block}"
         f"{exact_quote_prompt_block}"
         f"User name to address (optional): {name_to_use}\n"
