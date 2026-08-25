@@ -1701,7 +1701,7 @@ QUEUE_KEYS = {
     "queuedTracks", "activeTracks", "completedTracks", "queueOpen", "activeCount", "completedCount", "removedCount",
     "capacity", "pressure", "broadcastPhase", "prioritySignal", "priority", "priorityUpgradesEnabled", "priorityUpgradeLabel",
     "wheelSpinsOwed", "artists", "queueStatus", "currentSession", "archive", "stats", "playbackTiming",
-    "wheelTiming", "playbackDiagnostics", "wheelEligibleArtists",
+    "wheelTiming", "playbackDiagnostics", "wheelEligibleArtists", "artistMemory",
 }
 _QUEUE_KEY_LOWER = {k.lower() for k in QUEUE_KEYS}
 _QUEUE_PROVENANCE_TERMS = ("queue", "queue_public_snapshot", "session", "track", "payment", "priority", "wheel", "now_playing", "up_next")

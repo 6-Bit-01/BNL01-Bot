@@ -241,9 +241,11 @@ class CanonSourceContractTests(unittest.TestCase):
         self.assertFalse(c.env_queue_production_enabled({"BNL_QUEUE_PRODUCTION_ENABLED": "1"}))
 
     def test_queue_blocked_when_local_false(self):
-        rm = {"capabilities": {"queueProduction": True}, "sections": {"queue": {"nowPlaying": {"title": "X"}}, "rules": ["ok"]}}
+        rm = {"capabilities": {"queueProduction": True}, "sections": {"queue": {"nowPlaying": {"title": "X"}}, "artistMemory": {"records": [{"title": "DURABLE_SECRET"}]}, "rules": ["ok"]}}
         self.assertFalse(c.queue_usability(rm, environ={})["usable"])
         self.assertNotIn("Queue:", build_bnl_read_model_context(rm, "queue status", "public_home"))
+        self.assertNotIn("artistMemory", c.strip_queue_sections(rm, environ={}).get("sections", {}))
+        self.assertNotIn("DURABLE_SECRET", str(c.strip_queue_sections(rm, environ={})))
 
     def test_queue_blocked_when_remote_missing_or_false(self):
         for rm in ({"capabilities": {}}, {"capabilities": {"queueProduction": False}}):
