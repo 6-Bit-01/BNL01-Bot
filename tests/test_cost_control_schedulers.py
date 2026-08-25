@@ -403,14 +403,20 @@ class CostControlSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             revalidate.await_args_list[2].kwargs["release_on_uncertain"]
         )
-        complete_partial.assert_awaited_once_with(
-            42,
-            "2026-08-21",
-            "submissions_open",
-            "claim-token",
-            "discord copy",
-            "",
+        complete_partial.assert_awaited_once()
+        partial_args = complete_partial.await_args.args
+        self.assertEqual(
+            partial_args[:6],
+            (
+                42,
+                "2026-08-21",
+                "submissions_open",
+                "claim-token",
+                "discord copy",
+                "",
+            ),
         )
+        self.assertTrue(hasattr(partial_args[6], "is_set"))
         website_delivery.assert_not_awaited()
         mark.assert_not_called()
 

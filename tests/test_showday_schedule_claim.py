@@ -589,6 +589,49 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
         self.assertEqual(fired, ("discord delivered", ""))
         self.assertEqual(claim_count, 0)
 
+    def test_partial_completion_keeps_retrying_while_claim_is_owned(self):
+        attempts = 0
+
+        def database_unavailable(*_args):
+            nonlocal attempts
+            attempts += 1
+            raise sqlite3.OperationalError("database unavailable")
+
+        async def exercise_completion():
+            ownership_lost = asyncio.Event()
+            with (
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS",
+                    0.01,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "mark_show_update_fired",
+                    side_effect=database_unavailable,
+                ),
+            ):
+                task = asyncio.create_task(
+                    bnl01_bot.complete_partially_published_show_update(
+                        42,
+                        "2026-08-21",
+                        "show_live",
+                        "current-worker",
+                        "discord delivered",
+                        "",
+                        ownership_lost,
+                    )
+                )
+                await asyncio.sleep(0.07)
+                self.assertFalse(task.done())
+                self.assertFalse(ownership_lost.is_set())
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(exercise_completion())
+        self.assertGreaterEqual(attempts, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
