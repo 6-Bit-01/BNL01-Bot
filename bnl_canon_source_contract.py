@@ -1700,7 +1700,8 @@ QUEUE_KEYS = {
     "queue", "session", "payment", "payments", "availability", "nowPlaying", "currentTrack", "upNext", "nextTrack",
     "queuedTracks", "activeTracks", "completedTracks", "queueOpen", "activeCount", "completedCount", "removedCount",
     "capacity", "pressure", "broadcastPhase", "prioritySignal", "priority", "priorityUpgradesEnabled", "priorityUpgradeLabel",
-    "wheelSpinsOwed", "artists", "queueStatus", "currentSession",
+    "wheelSpinsOwed", "artists", "queueStatus", "currentSession", "archive", "stats", "playbackTiming",
+    "wheelTiming", "playbackDiagnostics", "wheelEligibleArtists",
 }
 _QUEUE_KEY_LOWER = {k.lower() for k in QUEUE_KEYS}
 _QUEUE_PROVENANCE_TERMS = ("queue", "queue_public_snapshot", "session", "track", "payment", "priority", "wheel", "now_playing", "up_next")
@@ -3188,12 +3189,53 @@ def website_queue_production_capability(read_model: dict | None) -> bool | None:
     caps = (read_model or {}).get("capabilities") if isinstance(read_model, dict) else None
     return caps.get("queueProduction") if isinstance(caps, dict) and isinstance(caps.get("queueProduction"), bool) else None
 
-def queue_usability(read_model: dict | None, *, environ: dict[str, str] | None = None) -> dict[str, Any]:
+def website_queue_access_scope(read_model: dict | None) -> str:
+    """Return the validated queue access scope declared by the website read model."""
+
+    if not isinstance(read_model, dict):
+        return "none"
+    scope = str(read_model.get("accessScope") or "").strip().lower()
+    public_only = read_model.get("publicOnly")
+    if scope == "private" and public_only is False:
+        return "private"
+    if scope == "public" and public_only is True:
+        return "public"
+    if scope == "none":
+        return "none"
+    # Compatibility for the original public-only website contract.
+    if not scope and public_only is True:
+        return "public"
+    return "none"
+
+def queue_usability(
+    read_model: dict | None,
+    *,
+    environ: dict[str, str] | None = None,
+    allow_private: bool = False,
+) -> dict[str, Any]:
     local = env_queue_production_enabled(environ)
     remote = website_queue_production_capability(read_model)
-    usable = bool(local and remote is True)
-    reason = "eligible" if usable else ("local_gate_disabled" if not local else "website_capability_missing_or_false")
-    return {"usable": usable, "local": local, "website": remote, "reason": reason}
+    access_scope = website_queue_access_scope(read_model)
+    scope_allowed = access_scope == "public" or (access_scope == "private" and allow_private)
+    usable = bool(local and remote is True and scope_allowed)
+    if usable:
+        reason = "eligible"
+    elif not local:
+        reason = "local_gate_disabled"
+    elif remote is not True:
+        reason = "website_capability_missing_or_false"
+    elif access_scope == "private":
+        reason = "private_access_not_allowed"
+    else:
+        reason = "website_queue_access_none_or_invalid"
+    return {
+        "usable": usable,
+        "local": local,
+        "website": remote,
+        "accessScope": access_scope,
+        "privateAllowed": bool(allow_private),
+        "reason": reason,
+    }
 
 def _looks_queue_derived(value: Any) -> bool:
     if isinstance(value, dict):
@@ -3279,13 +3321,22 @@ def _strip_queue_recursive(value: Any, *, in_sections: bool = False) -> Any:
         return [_strip_queue_recursive(v) for v in value]
     return value
 
-def strip_queue_sections(read_model: dict | None, *, environ: dict[str, str] | None = None) -> dict:
+def strip_queue_sections(
+    read_model: dict | None,
+    *,
+    environ: dict[str, str] | None = None,
+    allow_private: bool = False,
+) -> dict:
     if not isinstance(read_model, dict):
         return {}
-    if queue_usability(read_model, environ=environ)["usable"]:
+    if queue_usability(
+        read_model,
+        environ=environ,
+        allow_private=allow_private,
+    )["usable"]:
         return read_model
     return _strip_queue_recursive(read_model)
 
 def diagnostics(read_model: dict | None = None, *, environ: dict[str, str] | None = None) -> dict[str, Any]:
     q = queue_usability(read_model, environ=environ)
-    return {"contractVersion": CANON_SOURCE_CONTRACT_VERSION, "compatibilityAdaptersActive": True, "localQueueProductionCapability": q["local"], "websiteQueueProductionCapability": q["website"], "effectiveQueueUsable": q["usable"], "queueReason": q["reason"]}
+    return {"contractVersion": CANON_SOURCE_CONTRACT_VERSION, "compatibilityAdaptersActive": True, "localQueueProductionCapability": q["local"], "websiteQueueProductionCapability": q["website"], "websiteQueueAccessScope": q["accessScope"], "effectiveQueueUsable": q["usable"], "queueReason": q["reason"]}

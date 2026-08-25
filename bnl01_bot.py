@@ -27,6 +27,7 @@ from bnl_canon_source_contract import (
     render_key_personnel_canon_block,
     render_prompt_canon_block,
     strip_queue_sections,
+    website_queue_access_scope,
 )
 from bnl_occasion import (
     OCCASION_CALENDAR_VERSION,
@@ -1986,7 +1987,11 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
 
 def fetch_bnl_read_model(force: bool = False) -> dict:
     """
-    Fetch the public website read model as temporary prompt context only.
+    Fetch the website read model as temporary prompt context only.
+
+    The existing BNL service key authenticates the private queue projection.
+    A private response is accepted only when that key is configured; public
+    responses remain compatible with the original public-only contract.
     This helper never writes to SQLite, broadcast memory, website relay, or site state.
     """
     global _bnl_read_model_cache, _bnl_read_model_cached_at
@@ -2000,7 +2005,10 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
         if age < BNL_READ_MODEL_TTL_SECONDS:
             return _bnl_read_model_cache
 
-    req = urllib.request.Request(BNL_READ_MODEL_URL, method="GET", headers={"Accept": "application/json"})
+    headers = {"Accept": "application/json"}
+    if BNL_API_KEY:
+        headers["x-api-key"] = BNL_API_KEY
+    req = urllib.request.Request(BNL_READ_MODEL_URL, method="GET", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=3) as response:
             code = getattr(response, "status", None) or response.getcode()
@@ -2016,19 +2024,46 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
     if not isinstance(data, dict):
         logging.warning("bnl_read_model_invalid_shape")
         return {}
-    if data.get("ok") is not True or data.get("version") != 1 or data.get("publicOnly") is not True or not isinstance(data.get("sections"), dict):
+    public_only = data.get("publicOnly")
+    access_scope = str(data.get("accessScope") or "").strip().lower()
+    public_response = public_only is True and access_scope in {"", "none", "public"}
+    private_response = bool(BNL_API_KEY) and public_only is False and access_scope == "private"
+    if (
+        data.get("ok") is not True
+        or data.get("version") != 1
+        or not isinstance(data.get("sections"), dict)
+        or not (public_response or private_response)
+    ):
         logging.warning("bnl_read_model_invalid_shape")
         return {}
 
     _bnl_read_model_cache = data
     _bnl_read_model_cached_at = now
-    logging.info(f"bnl_read_model_fetch_success sections={len(data.get('sections') or {})}")
+    logging.info(
+        "bnl_read_model_fetch_success sections=%s access_scope=%s",
+        len(data.get("sections") or {}),
+        website_queue_access_scope(data),
+    )
     return data
 
 
-def safe_bnl_read_model_for_consumption(read_model: dict) -> dict:
-    """Return the queue-gated read-model view for all normal consumers."""
-    return strip_queue_sections(read_model)
+_PRIVATE_BNL_QUEUE_POLICIES = frozenset({"sealed_test", "internal_controlled"})
+
+
+def _channel_allows_private_bnl_queue(channel_policy: str = "") -> bool:
+    return str(channel_policy or "").strip().lower() in _PRIVATE_BNL_QUEUE_POLICIES
+
+
+def safe_bnl_read_model_for_consumption(
+    read_model: dict,
+    channel_policy: str = "",
+) -> dict:
+    """Return the queue-gated view allowed for this exact channel policy."""
+
+    return strip_queue_sections(
+        read_model,
+        allow_private=_channel_allows_private_bnl_queue(channel_policy),
+    )
 
 
 def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
@@ -2185,8 +2220,11 @@ def _track_label(track: dict, include_lane: bool = True, include_source: bool = 
 
 
 def build_bnl_read_model_context(read_model: dict, user_text: str, channel_policy: str) -> str:
-    """Build a compact, public-only prompt block from a validated read model."""
-    read_model = safe_bnl_read_model_for_consumption(read_model)
+    """Build a compact prompt block from the channel-authorized read model."""
+
+    declared_access_scope = website_queue_access_scope(read_model)
+    private_queue_allowed = _channel_allows_private_bnl_queue(channel_policy)
+    read_model = safe_bnl_read_model_for_consumption(read_model, channel_policy)
     if not read_model:
         return ""
     sections = _read_model_sections(read_model)
@@ -2199,9 +2237,22 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
     source_context_items = _public_source_context_items(read_model)
 
+    # A private website response still contains independently public-safe site
+    # context. Once its queue/history sections have been stripped for a public
+    # consumer, label that prompt view as having no queue access rather than
+    # suppressing the unrelated public site material.
+    access_scope = (
+        "none"
+        if declared_access_scope == "private" and not private_queue_allowed
+        else website_queue_access_scope(read_model)
+    )
+    private_access = access_scope == "private"
     lines = [
-        "Website public read model context:",
-        f"Source: {_compact_public_text(read_model.get('source') or 'barcode-network-site', 80)} / publicOnly=true / version=1",
+        "Website private queue read model context:" if private_access else "Website public read model context:",
+        (
+            f"Source: {_compact_public_text(read_model.get('source') or 'barcode-network-site', 80)} "
+            f"/ publicOnly={'false' if private_access else 'true'} / accessScope={access_scope} / version=1"
+        ),
     ]
     schema_revision = _compact_public_text(read_model.get("schemaRevision"), 40)
     if schema_revision:
@@ -2349,14 +2400,26 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         lines.append("\nSite lane rules:")
         for rule in lane_rules[:5]:
             lines.append(f"- {rule}")
-    lines.extend([
-        "- This is public website context only.",
-        "- Do not treat this as durable memory.",
-        "- Do not write, merge, promote, or persist this context.",
-        "- Do not claim private account/payment/user data.",
-        "- Do not claim simulation/test tracks are present; the read model excludes them.",
-        "- Do not expose raw JSON directly; answer naturally from the compact public fields above.",
-    ])
+    if private_access:
+        lines.extend([
+            "- This is private owner/admin test and operator context only.",
+            "- Do not use this queue data in public output.",
+            "- Do not use it for public replies, public announcements, public recaps, the public Broadcast Deck, or the public Broadcast Archive.",
+            "- Simulation/test tracks may be present and must remain private test evidence.",
+            "- Do not treat this as durable memory.",
+            "- Do not write, merge, promote, or persist this context.",
+            "- Do not claim payment, checkout, contact, upload, legal-acceptance, private account, or admin-only data.",
+            "- Do not expose raw JSON directly; answer naturally from the compact operational fields above.",
+        ])
+    else:
+        lines.extend([
+            "- This is public website context only.",
+            "- Do not treat this as durable memory.",
+            "- Do not write, merge, promote, or persist this context.",
+            "- Do not claim private account/payment/user data.",
+            "- Do not claim simulation/test tracks are present; the read model excludes them.",
+            "- Do not expose raw JSON directly; answer naturally from the compact public fields above.",
+        ])
     logging.info(f"bnl_read_model_context_loaded reason=relevant_prompt channel_policy={channel_policy}")
     return "\n".join(lines[:80])
 
@@ -2369,7 +2432,10 @@ def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> s
         return ""
     if (
         _current_queue_state_query(user_text)
-        and not queue_usability(read_model)["usable"]
+        and not queue_usability(
+            read_model,
+            allow_private=_channel_allows_private_bnl_queue(channel_policy),
+        )["usable"]
     ):
         logging.info(
             "bnl_read_model_context_skipped "

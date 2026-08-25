@@ -29,11 +29,17 @@ owner, controller, admin, operator, or infrastructure facts.
 
 ## Central sanitized read-model boundary
 
-`fetch_bnl_read_model()` may retain the raw validated payload in its private cache for capability checks, cache metadata, and privacy-safe diagnostics. Normal consumers use the sanitized consumption view through the bot boundary before prompt assembly or intent dispatch.
+`fetch_bnl_read_model()` sends the existing `BNL_API_KEY` when configured and may retain the raw validated payload in its private cache for capability checks, cache metadata, and privacy-safe diagnostics. It accepts either the original/explicit public response (`publicOnly=true`, scope absent/`public`/`none`) or an authenticated private response (`publicOnly=false`, `accessScope=private`). A private response is rejected when the service key is not configured. Normal consumers use the channel-scoped sanitized consumption view before prompt assembly or intent dispatch.
 
 When queue production is disabled, the contract strips queue/session/payment/availability/now-playing/up-next/active/completed track/count/Priority/Wheel/queue-derived artist fields. It also filters `operatorLanes` by provenance: queue-public snapshots and queue/session/track/payment/priority/wheel-derived entries are removed from temporary runtime context, recap candidates, broadcast-memory candidates, dossier seed candidates, and public-safe copy candidates. Non-queue public dossier material and non-queue boundary/do-not-store rules remain available.
 
-Queue production remains disabled unless both gates are explicit: local `BNL_QUEUE_PRODUCTION_ENABLED=true` and website `capabilities.queueProduction=true`. Missing or malformed capability data fails closed.
+Queue production remains disabled unless both gates are explicit: local `BNL_QUEUE_PRODUCTION_ENABLED=true` and website `capabilities.queueProduction=true`. Queue use then follows exactly three website scopes:
+
+- `none`: no queue/history data is usable;
+- `private`: queue/history data is usable only in `sealed_test` and `internal_controlled`;
+- `public`: queue/history data is usable in public consumers.
+
+Missing, contradictory, or malformed scope/`publicOnly` combinations fail closed. Public and show-day consumers cannot receive private queue data, and Broadcast Memory, dossier, Source File, Relay, Journal, or any other persistence/publication path cannot retain it. An approved private channel may answer the owner/admin from private queue context, including a transient test recap, but the prompt carries an explicit instruction not to use that data in public output and remains non-persistent.
 
 The website's bounded `sections.sourceContext` list remains public site canon, not live queue state. BNL may load those public summaries for an explicit site/read-model question even while live queue context is disabled. Queue/session/track values are still removed before prompt assembly.
 
@@ -66,7 +72,7 @@ Static approved canon and schedule facts cannot prove live/open/current/now stat
 
 ## Native queue and show-day alignment
 
-Show-day announcement canon consumes the same two-gate decision without persisting queue data. The scheduled 6:40 PM Pacific intake message names the native BARCODE Radio queue only when the local bot gate and website capability are both true. Otherwise it uses provider-neutral public-intake wording; stock and generated announcements may not fall back to Auxchord-specific copy or imply BNL operates submissions.
+Show-day announcement canon consumes the same gate decision without persisting queue data. The scheduled 6:40 PM Pacific intake message names the native BARCODE Radio queue only when the local bot gate, website capability, and public queue access are all true. Private access is intentionally insufficient. Otherwise it uses provider-neutral public-intake wording; stock and generated announcements may not fall back to Auxchord-specific copy or imply BNL operates submissions.
 
 The 7:00 PM Pacific announcement is deliberately restrained: the schedule proves the broadcast window, not a current live/on-air state. The optional later-show sponsor reminder does not claim that a commercial break is active, due, required, or already called. Current state still requires fresh public runtime evidence and host control.
 

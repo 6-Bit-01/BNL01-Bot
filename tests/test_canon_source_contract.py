@@ -250,8 +250,52 @@ class CanonSourceContractTests(unittest.TestCase):
             self.assertFalse(c.queue_usability(rm, environ={"BNL_QUEUE_PRODUCTION_ENABLED": "true"})["usable"])
 
     def test_queue_eligible_only_when_both_true(self):
-        rm = {"capabilities": {"queueProduction": True}, "sections": {"queue": {"nowPlaying": {"title": "X"}}}}
+        rm = {
+            "publicOnly": True,
+            "accessScope": "public",
+            "capabilities": {"queueProduction": True},
+            "sections": {"queue": {"nowPlaying": {"title": "X"}}},
+        }
         self.assertTrue(c.queue_usability(rm, environ={"BNL_QUEUE_PRODUCTION_ENABLED": "TrUe"})["usable"])
+
+    def test_private_queue_scope_requires_explicit_private_consumer(self):
+        rm = {
+            "publicOnly": False,
+            "accessScope": "private",
+            "capabilities": {"queueProduction": True},
+            "sections": {
+                "queue": {"nowPlaying": {"title": SECRET_NOW}},
+                "archive": {"latestTitle": SECRET_RECAP},
+                "rules": ["Private operational context only."],
+            },
+        }
+        env = {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}
+
+        public_use = c.queue_usability(rm, environ=env)
+        private_use = c.queue_usability(rm, environ=env, allow_private=True)
+        public_view = c.strip_queue_sections(rm, environ=env)
+        private_view = c.strip_queue_sections(rm, environ=env, allow_private=True)
+
+        self.assertFalse(public_use["usable"])
+        self.assertEqual(public_use["reason"], "private_access_not_allowed")
+        self.assertTrue(private_use["usable"])
+        self.assertNotIn(SECRET_NOW, str(public_view))
+        self.assertNotIn(SECRET_RECAP, str(public_view))
+        self.assertIn(SECRET_NOW, str(private_view))
+        self.assertIn(SECRET_RECAP, str(private_view))
+
+    def test_malformed_queue_access_scope_fails_closed(self):
+        env = {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}
+        malformed = {
+            "publicOnly": False,
+            "accessScope": "public",
+            "capabilities": {"queueProduction": True},
+            "sections": {"queue": {"nowPlaying": {"title": SECRET_NOW}}},
+        }
+
+        self.assertEqual(c.website_queue_access_scope(malformed), "none")
+        self.assertFalse(c.queue_usability(malformed, environ=env, allow_private=True)["usable"])
+        self.assertNotIn(SECRET_NOW, str(c.strip_queue_sections(malformed, environ=env, allow_private=True)))
 
     def test_non_queue_context_remains(self):
         rm = {"capabilities": {"queueProduction": False}, "sections": {"rules": ["Public rule"]}, "sourceContext": {"source": "site"}}

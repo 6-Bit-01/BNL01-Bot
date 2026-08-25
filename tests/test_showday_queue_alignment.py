@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from unittest import mock
 
@@ -31,7 +32,152 @@ def read_model(queue_production: bool, *, radio_summary: str = "") -> dict:
     }
 
 
+def private_read_model() -> dict:
+    model = read_model(True)
+    model["publicOnly"] = False
+    model["accessScope"] = "private"
+    model["sections"]["sourceContext"] = [{
+        "id": "public_site_summary",
+        "title": "Public Site Summary",
+        "summary": "PUBLIC_SITE_CONTEXT_REMAINS_AVAILABLE",
+    }]
+    model["sections"]["queue"] = {
+        "available": True,
+        "accessScope": "private",
+        "nowPlaying": {"title": "PRIVATE_TEST_QUEUE_TITLE"},
+        "queue": [{"title": "PRIVATE_SIMULATION_TRACK", "isSimulation": True}],
+    }
+    model["sections"]["archive"] = {
+        "available": True,
+        "latestTitle": "PRIVATE_TEST_ARCHIVE_TITLE",
+    }
+    return model
+
+
 class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
+    def test_authenticated_private_read_model_is_accepted_and_sends_existing_api_key(self):
+        payload = private_read_model()
+        captured = {}
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return json.dumps(payload).encode("utf-8")
+
+        def open_request(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return Response()
+
+        with mock.patch.object(bnl01_bot, "BNL_READ_MODEL_ENABLED", True), \
+             mock.patch.object(bnl01_bot, "BNL_READ_MODEL_URL", "https://example.test/api/bnl/read-model"), \
+             mock.patch.object(bnl01_bot, "BNL_API_KEY", "shared-bnl-key"), \
+             mock.patch.object(bnl01_bot.urllib.request, "urlopen", side_effect=open_request), \
+             mock.patch.object(bnl01_bot, "_bnl_read_model_cache", None), \
+             mock.patch.object(bnl01_bot, "_bnl_read_model_cached_at", None):
+            result = bnl01_bot.fetch_bnl_read_model(force=True)
+
+        self.assertEqual(result["accessScope"], "private")
+        self.assertEqual(captured["request"].get_header("X-api-key"), "shared-bnl-key")
+        self.assertEqual(captured["timeout"], 3)
+
+    def test_private_read_model_is_rejected_without_service_key(self):
+        payload = private_read_model()
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return json.dumps(payload).encode("utf-8")
+
+        with mock.patch.object(bnl01_bot, "BNL_READ_MODEL_ENABLED", True), \
+             mock.patch.object(bnl01_bot, "BNL_READ_MODEL_URL", "https://example.test/api/bnl/read-model"), \
+             mock.patch.object(bnl01_bot, "BNL_API_KEY", ""), \
+             mock.patch.object(bnl01_bot.urllib.request, "urlopen", return_value=Response()), \
+             mock.patch.object(bnl01_bot, "_bnl_read_model_cache", None), \
+             mock.patch.object(bnl01_bot, "_bnl_read_model_cached_at", None):
+            result = bnl01_bot.fetch_bnl_read_model(force=True)
+
+        self.assertEqual(result, {})
+
+    def test_private_queue_data_is_visible_only_in_private_test_and_operator_channels(self):
+        model = private_read_model()
+        with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}, clear=False):
+            public_contexts = [
+                bnl01_bot.build_bnl_read_model_context(
+                    model,
+                    "what is playing right now?",
+                    policy,
+                )
+                for policy in (
+                    "public_home",
+                    "public_context",
+                    "public_selective",
+                    "broadcast_memory",
+                )
+            ]
+            sealed_context = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "what is playing right now?",
+                "sealed_test",
+            )
+            operator_context = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "what is playing right now?",
+                "internal_controlled",
+            )
+
+        for public_context in public_contexts:
+            self.assertNotIn("PRIVATE_TEST_QUEUE_TITLE", public_context)
+            self.assertNotIn("PRIVATE_SIMULATION_TRACK", public_context)
+            self.assertNotIn("PRIVATE_TEST_ARCHIVE_TITLE", public_context)
+            self.assertIn("PUBLIC_SITE_CONTEXT_REMAINS_AVAILABLE", public_context)
+        self.assertIn("PRIVATE_TEST_QUEUE_TITLE", sealed_context)
+        self.assertIn("PRIVATE_SIMULATION_TRACK", sealed_context)
+        self.assertIn("PRIVATE_TEST_QUEUE_TITLE", operator_context)
+        self.assertIn("private", operator_context.lower())
+        self.assertIn("Do not use this queue data in public output", operator_context)
+
+    def test_private_queue_cannot_drive_public_current_state_or_showday_output(self):
+        model = private_read_model()
+        with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}, clear=False), \
+             mock.patch.object(bnl01_bot, "fetch_bnl_read_model", return_value=model):
+            public_context = bnl01_bot.maybe_build_bnl_read_model_context(
+                "what is playing right now?",
+                "public_home",
+            )
+            operator_context = bnl01_bot.maybe_build_bnl_read_model_context(
+                "what is playing right now?",
+                "internal_controlled",
+            )
+            intake = bnl01_bot.showday_submission_canon(model)
+
+        self.assertNotIn("PRIVATE_TEST_QUEUE_TITLE", public_context)
+        self.assertNotIn("PRIVATE_SIMULATION_TRACK", public_context)
+        self.assertNotIn("PRIVATE_TEST_ARCHIVE_TITLE", public_context)
+        self.assertIn("PUBLIC_SITE_CONTEXT_REMAINS_AVAILABLE", public_context)
+        self.assertIn("PRIVATE_TEST_QUEUE_TITLE", operator_context)
+        self.assertEqual(intake["mode"], "public_intake")
+
     def test_native_announcement_canon_requires_local_and_site_gates(self):
         remote_true = read_model(True)
         remote_false = read_model(False)
