@@ -791,6 +791,8 @@ OCCASION_GENERATION_ATTEMPTS = 2
 SHOWDAY_WINDOW_MINUTES = 10
 SHOWDAY_UPDATE_CLAIM_LEASE_SECONDS = 6 * 60
 SHOWDAY_UPDATE_CLAIM_HEARTBEAT_SECONDS = 60
+SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS = 3
+SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS = 0.5
 SHOWDAY_MAX_DISCORD_POSTS_PER_FRIDAY = 2
 SHOWDAY_RECENT_POST_BLOCK_MINUTES = 30
 SHOWDAY_SPONSOR_POST_CHANCE = 0.35
@@ -16544,26 +16546,58 @@ async def revalidate_show_update_claim(
 
     if ownership_lost is not None and ownership_lost.is_set():
         return False
-    try:
-        renewed = await asyncio.to_thread(
-            renew_show_update_claim,
-            guild_id,
-            show_date,
-            phase_key,
-            claim_token,
-        )
-    except Exception as exc:
-        logging.warning(
-            "showday_update_claim_revalidation_failed guild=%s phase=%s "
-            "error_type=%s",
-            guild_id,
-            phase_key,
-            type(exc).__name__,
-        )
-        return False
-    if not renewed and ownership_lost is not None:
-        ownership_lost.set()
-    return renewed
+    for attempt in range(1, SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS + 1):
+        try:
+            renewed = await asyncio.to_thread(
+                renew_show_update_claim,
+                guild_id,
+                show_date,
+                phase_key,
+                claim_token,
+            )
+        except Exception as exc:
+            logging.warning(
+                "showday_update_claim_revalidation_retry guild=%s phase=%s "
+                "attempt=%s error_type=%s",
+                guild_id,
+                phase_key,
+                attempt,
+                type(exc).__name__,
+            )
+            if attempt < SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS:
+                await asyncio.sleep(
+                    SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS * attempt
+                )
+                continue
+            try:
+                released = await asyncio.to_thread(
+                    release_show_update_claim,
+                    guild_id,
+                    show_date,
+                    phase_key,
+                    claim_token,
+                )
+            except Exception as release_exc:
+                logging.warning(
+                    "showday_update_claim_uncertain_release_failed "
+                    "guild=%s phase=%s error_type=%s",
+                    guild_id,
+                    phase_key,
+                    type(release_exc).__name__,
+                )
+            else:
+                logging.warning(
+                    "showday_update_claim_uncertain_released "
+                    "guild=%s phase=%s released=%s",
+                    guild_id,
+                    phase_key,
+                    int(released),
+                )
+            return False
+        if not renewed and ownership_lost is not None:
+            ownership_lost.set()
+        return renewed
+    return False
 
 
 def release_show_update_claim(

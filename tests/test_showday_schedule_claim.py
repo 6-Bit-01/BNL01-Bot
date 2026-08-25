@@ -404,6 +404,89 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
 
         asyncio.run(exercise_heartbeat())
 
+    def test_revalidation_retries_transient_failure_before_delivery(self):
+        attempts = 0
+
+        def renew_after_transient_failure(*_args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("temporary lock")
+            return True
+
+        async def exercise_revalidation():
+            ownership_lost = asyncio.Event()
+            with (
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS",
+                    0,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "renew_show_update_claim",
+                    side_effect=renew_after_transient_failure,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "release_show_update_claim",
+                ) as release,
+            ):
+                renewed = await bnl01_bot.revalidate_show_update_claim(
+                    42,
+                    "2026-08-21",
+                    "show_live",
+                    "current-worker",
+                    ownership_lost,
+                )
+            self.assertTrue(renewed)
+            self.assertFalse(ownership_lost.is_set())
+            release.assert_not_called()
+
+        asyncio.run(exercise_revalidation())
+        self.assertEqual(attempts, 2)
+
+    def test_exhausted_revalidation_errors_release_still_owned_claim(self):
+        claim_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
+        )
+        self.assertTrue(claim_token)
+
+        async def exercise_revalidation():
+            with (
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS",
+                    2,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS",
+                    0,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "renew_show_update_claim",
+                    side_effect=sqlite3.OperationalError("temporary lock"),
+                ),
+            ):
+                return await bnl01_bot.revalidate_show_update_claim(
+                    42,
+                    "2026-08-21",
+                    "show_live",
+                    claim_token,
+                    asyncio.Event(),
+                )
+
+        self.assertFalse(asyncio.run(exercise_revalidation()))
+        with sqlite3.connect(self.db_path) as conn:
+            claims = conn.execute(
+                "SELECT COUNT(*) FROM friday_show_update_claims"
+            ).fetchone()[0]
+        self.assertEqual(claims, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
