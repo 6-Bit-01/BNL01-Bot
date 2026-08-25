@@ -16496,20 +16496,33 @@ async def maintain_show_update_claim(
     show_date: str,
     phase_key: str,
     claim_token: str,
+    ownership_lost: asyncio.Event | None = None,
 ) -> None:
     """Keep an actively processing phase leased until delivery completes."""
 
     try:
         while True:
             await asyncio.sleep(SHOWDAY_UPDATE_CLAIM_HEARTBEAT_SECONDS)
-            renewed = await asyncio.to_thread(
-                renew_show_update_claim,
-                guild_id,
-                show_date,
-                phase_key,
-                claim_token,
-            )
+            try:
+                renewed = await asyncio.to_thread(
+                    renew_show_update_claim,
+                    guild_id,
+                    show_date,
+                    phase_key,
+                    claim_token,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "showday_update_claim_heartbeat_retry guild=%s phase=%s "
+                    "error_type=%s",
+                    guild_id,
+                    phase_key,
+                    type(exc).__name__,
+                )
+                continue
             if not renewed:
+                if ownership_lost is not None:
+                    ownership_lost.set()
                 logging.warning(
                     "showday_update_claim_heartbeat_lost guild=%s phase=%s",
                     guild_id,
@@ -16518,14 +16531,39 @@ async def maintain_show_update_claim(
                 return
     except asyncio.CancelledError:
         raise
+
+
+async def revalidate_show_update_claim(
+    guild_id: int,
+    show_date: str,
+    phase_key: str,
+    claim_token: str,
+    ownership_lost: asyncio.Event | None = None,
+) -> bool:
+    """Fail closed before an external delivery when claim ownership is unsure."""
+
+    if ownership_lost is not None and ownership_lost.is_set():
+        return False
+    try:
+        renewed = await asyncio.to_thread(
+            renew_show_update_claim,
+            guild_id,
+            show_date,
+            phase_key,
+            claim_token,
+        )
     except Exception as exc:
         logging.warning(
-            "showday_update_claim_heartbeat_failed guild=%s phase=%s "
+            "showday_update_claim_revalidation_failed guild=%s phase=%s "
             "error_type=%s",
             guild_id,
             phase_key,
             type(exc).__name__,
         )
+        return False
+    if not renewed and ownership_lost is not None:
+        ownership_lost.set()
+    return renewed
 
 
 def release_show_update_claim(
@@ -30780,12 +30818,14 @@ async def barcode_radio_queue_task():
                 )
                 continue
 
+            ownership_lost = asyncio.Event()
             heartbeat_task = asyncio.create_task(
                 maintain_show_update_claim(
                     guild.id,
                     show_date,
                     phase_key,
                     claim_token,
+                    ownership_lost,
                 )
             )
             try:
@@ -30810,12 +30850,12 @@ async def barcode_radio_queue_task():
                         type(exc).__name__,
                     )
                     continue
-                if not await asyncio.to_thread(
-                    renew_show_update_claim,
+                if not await revalidate_show_update_claim(
                     guild.id,
                     show_date,
                     phase_key,
                     claim_token,
+                    ownership_lost,
                 ):
                     logging.warning(
                         "showday_delivery_skipped_claim_lost guild=%s phase=%s",
@@ -30851,6 +30891,20 @@ async def barcode_radio_queue_task():
                                 capacity["cap"],
                             )
                         else:
+                            if not await revalidate_show_update_claim(
+                                guild.id,
+                                show_date,
+                                phase_key,
+                                claim_token,
+                                ownership_lost,
+                            ):
+                                logging.warning(
+                                    "showday_discord_delivery_skipped_claim_lost "
+                                    "guild=%s phase=%s",
+                                    guild.id,
+                                    phase_key,
+                                )
+                                continue
                             try:
                                 await channel.send(discord_msg, allowed_mentions=discord.AllowedMentions.none())
                                 discord_sent = discord_msg
@@ -30859,12 +30913,12 @@ async def barcode_radio_queue_task():
                                 logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
                 mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
                 if website_showday_delivery_enabled:
-                    if not await asyncio.to_thread(
-                        renew_show_update_claim,
+                    if not await revalidate_show_update_claim(
                         guild.id,
                         show_date,
                         phase_key,
                         claim_token,
+                        ownership_lost,
                     ):
                         logging.warning(
                             "showday_website_delivery_skipped_claim_lost "

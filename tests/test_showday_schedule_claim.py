@@ -323,6 +323,87 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
         self.assertGreater(datetime.fromisoformat(renewed_at), older)
         self.assertEqual(persisted_token, claim_token)
 
+    def test_heartbeat_retries_transient_renewal_failure(self):
+        attempts = 0
+
+        def renew_after_transient_failure(*_args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is temporarily locked")
+            return True
+
+        async def exercise_heartbeat():
+            ownership_lost = asyncio.Event()
+            with (
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_HEARTBEAT_SECONDS",
+                    0.01,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "renew_show_update_claim",
+                    side_effect=renew_after_transient_failure,
+                ),
+            ):
+                task = asyncio.create_task(
+                    bnl01_bot.maintain_show_update_claim(
+                        42,
+                        "2026-08-21",
+                        "show_live",
+                        "current-worker",
+                        ownership_lost,
+                    )
+                )
+                await asyncio.sleep(0.04)
+                self.assertFalse(task.done())
+                self.assertFalse(ownership_lost.is_set())
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(exercise_heartbeat())
+        self.assertGreaterEqual(attempts, 2)
+
+    def test_heartbeat_signals_definitive_ownership_loss(self):
+        async def exercise_heartbeat():
+            ownership_lost = asyncio.Event()
+            with (
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_HEARTBEAT_SECONDS",
+                    0.01,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "renew_show_update_claim",
+                    return_value=False,
+                ),
+            ):
+                await asyncio.wait_for(
+                    bnl01_bot.maintain_show_update_claim(
+                        42,
+                        "2026-08-21",
+                        "show_live",
+                        "superseded-worker",
+                        ownership_lost,
+                    ),
+                    timeout=0.1,
+                )
+            self.assertTrue(ownership_lost.is_set())
+            self.assertFalse(
+                await bnl01_bot.revalidate_show_update_claim(
+                    42,
+                    "2026-08-21",
+                    "show_live",
+                    "superseded-worker",
+                    ownership_lost,
+                )
+            )
+
+        asyncio.run(exercise_heartbeat())
+
 
 if __name__ == "__main__":
     unittest.main()
