@@ -35,17 +35,48 @@ Configure secrets in the process environment; do not commit them. Core variables
 - `GEMINI_API_KEY`
 - BNL website URLs, API keys, Relay controls, and feature flags used by the deployed runtime
 
-BNL keeps its own 1,350,000-token daily API safety budget, independent of
-consumer Gemini subscriptions and Google project limits. Production defaults to
-`gemini-3.6-flash` with same-project `gemini-3.5-flash` fallback for ordinary
-conversation/background routes after bounded retry on 429/503 or an unavailable
-primary model. Governed memory, Source File/dossier, and Journal routes do not
-automatically downgrade. Route-specific output allowances preserve quality, and
-`BNL_GEMINI_JOURNAL_PROTECTED_TOKENS` (default 250,000) keeps daily capacity for
-the Journal. The pinned Python 3.9-compatible SDK leaves Gemini 3 reasoning
-provider-managed; it does not apply the obsolete global 1,024-token thinking cap.
-`/usage` reports provider-returned input, visible-output, thinking, cached, and
-total token counts by route. The local counter resets at midnight Pacific Time.
+BNL keeps its existing 1,350,000-token daily API safety budget as a secondary
+guard, independent of consumer Gemini subscriptions and Google project limits.
+Production defaults to `gemini-3.6-flash`; interactive conversation may use the
+same-project `gemini-3.5-flash` fallback after bounded transient-error retry.
+Each optional-background provider invocation uses one SDK attempt with no
+fallback; a provider outage or local budget refusal stops validator-guided
+follow-up calls for that job.
+Governed memory, Source File/dossier, the accepted ordinary-chat single-packet
+route, and Journal do not automatically downgrade. Route-specific output
+allowances preserve quality, and `BNL_GEMINI_JOURNAL_PROTECTED_TOKENS` (default
+250,000) keeps secondary token capacity for the Journal. The pinned Python
+3.9-compatible SDK leaves Gemini 3 reasoning provider-managed; it does not apply
+the obsolete global 1,024-token thinking cap.
+
+Dollar-aware budget controls default to:
+
+- `BNL_GEMINI_MONTHLY_TARGET_USD=20.00`
+- `BNL_GEMINI_MONTHLY_HARD_LIMIT_USD=24.00`
+- `BNL_GEMINI_DAILY_SOFT_LIMIT_USD=0.65`
+- `BNL_GEMINI_BUDGET_ENFORCEMENT_ENABLED=true`
+- `BNL_GEMINI_BILLING_LAG_BUFFER_USD=0.50`
+- `BNL_GEMINI_INTERACTIVE_RESERVE_USD=2.00`
+- `BNL_GEMINI_JOURNAL_RESERVE_USD=1.00`
+- `BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS=4096`
+- `BNL_GEMINI_PROVIDER_TIMEOUT_SECONDS=120` (clamped to 10–240 seconds)
+- `BNL_GEMINI_BUDGET_RESERVATION_TTL_MINUTES=30` (minimum 30 minutes)
+
+Pricing is centralized in `bnl_gemini_cost.py`; exact-model overrides can be
+supplied with `BNL_GEMINI_PRICING_OVERRIDES_JSON`. Unknown models remain
+explicitly unpriced: an active unknown request model fails closed, while
+historical unknown usage is conservatively reserved and stops optional work
+without automatically taking Journal or interactive conversation offline.
+The conservative historical reserve rate can be raised with
+`BNL_GEMINI_UNPRICED_GUARDRAIL_USD_PER_MILLION` (default 9.00). `/usage`
+reports provider-returned input, visible-output, thinking, cached, and total
+tokens; estimated daily/monthly cost; pace/projection; attempts; and route
+restrictions. Daily and monthly accounting boundaries use Pacific Time.
+
+The website Relay still inspects fresh public signal every
+`BNL_WEBSITE_RELAY_INTERVAL_MINUTES` (default 20). Non-fresh, approved quiet
+sources are generated at most every `BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES`
+(default 60); manual and force-pull requests retain the quiet-source cascade.
 
 Native queue context has two independent production gates. The local bot variable `BNL_QUEUE_PRODUCTION_ENABLED` defaults off and accepts only `true` (case-insensitive); the website read model must also report `capabilities.queueProduction=true`. Queue/session/track context is stripped unless both gates agree. Merging queue-aware code does not enable either gate.
 

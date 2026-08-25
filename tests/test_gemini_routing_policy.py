@@ -57,6 +57,60 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             routing.single_attempt_reservation("abc", policy),
         )
 
+    def test_background_routes_are_one_attempt_without_fallback(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "BNL_GEMINI_PROVIDER_RETRIES": "2",
+                "BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS": "1024",
+            },
+            clear=False,
+        ):
+            for route in (
+                "website_relay_event",
+                "ambient_generation",
+                "occasion_generation",
+                "community_scouting",
+                "curiosity_heartbeat",
+                "showday_generation",
+                "automatic_source_enrichment",
+                "source_enrichment_automatic",
+                "automatic-enrichment",
+                "automatic_source_file_refresh",
+                "source_file_refresh_automatic",
+                "income_generator_background_pull",
+            ):
+                with self.subTest(route=route):
+                    policy = routing.policy_for_route(route)
+                    self.assertEqual(policy.lane, "background")
+                    self.assertEqual(policy.max_output_tokens, 1_024)
+                    self.assertEqual(policy.provider_retries, 0)
+                    self.assertFalse(policy.allow_fallback)
+
+    def test_background_default_preserves_observed_thinking_headroom(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            policy = routing.policy_for_route("website_relay_event")
+        self.assertEqual(policy.max_output_tokens, 4_096)
+
+    def test_background_output_limit_remains_environment_configurable(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS": "1536"},
+            clear=False,
+        ):
+            self.assertEqual(
+                routing.policy_for_route("showday_generation").max_output_tokens,
+                1_536,
+            )
+
+    def test_interactive_source_enrichment_remains_protected(self):
+        policy = routing.policy_for_route("source_enrichment_manual")
+        self.assertEqual(policy.lane, "protected")
+        self.assertFalse(policy.allow_fallback)
+        memory = routing.policy_for_route("memory_preview_website_context")
+        self.assertEqual(memory.lane, "protected")
+        self.assertFalse(memory.allow_fallback)
+
     def test_journal_and_relay_reserves_are_mutual_and_released_as_used(self):
         with mock.patch.dict(
             "os.environ",

@@ -45,7 +45,11 @@ assert bnl01_bot.gemini_client is None
              mock.patch.object(bnl01_bot.genai, "Client", return_value=fake_client) as factory:
             self.assertIs(bnl01_bot.get_gemini_client(), fake_client)
             self.assertIs(bnl01_bot.get_gemini_client(), fake_client)
-        factory.assert_called_once_with(api_key=bnl01_bot.GEMINI_API_KEY)
+        factory.assert_called_once()
+        kwargs = factory.call_args.kwargs
+        self.assertEqual(kwargs["api_key"], bnl01_bot.GEMINI_API_KEY)
+        self.assertEqual(kwargs["http_options"].timeout, 120_000)
+        self.assertEqual(kwargs["http_options"].retry_options.attempts, 1)
 
 
 class GeminiOffloadTests(unittest.IsolatedAsyncioTestCase):
