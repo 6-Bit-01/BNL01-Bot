@@ -78,16 +78,19 @@ The website Relay still inspects fresh public signal every
 sources are generated at most every `BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES`
 (default 60); manual and force-pull requests retain the quiet-source cascade.
 
-Native queue context has two independent production gates. The local bot variable `BNL_QUEUE_PRODUCTION_ENABLED` defaults off and accepts only `true` (case-insensitive); the website read model must also report `capabilities.queueProduction=true`. Queue/session/track context is stripped unless both gates agree. Merging queue-aware code does not enable either gate.
+Native queue context has two independent production gates plus one website-owned access scope. The local bot variable `BNL_QUEUE_PRODUCTION_ENABLED` defaults off and accepts only `true` (case-insensitive); the website read model must also report `capabilities.queueProduction=true`. The website then declares `accessScope=none`, `private`, or `public`. `none` is always stripped. `private` is accepted only from an authenticated response obtained with the existing `BNL_API_KEY`, and only `sealed_test` and `internal_controlled` channel policies may retain its queue/history fields. `public` may support public queue context. Merging queue-aware code does not enable either production gate or change a site's session access choice.
+
+Private and public responses use the website's same explicit sanitized operational DTO. The bot does not receive payment/checkout, contact, raw upload, legal-acceptance, moderation, browser-capability, or admin-only fields, and it never gains queue mutation or playback control. Private data is temporary prompt context only: it may answer an owner/admin inside an approved private channel, but it cannot drive public/show-day output, public recaps, Broadcast Memory, dossiers, Source Files, Relay, Journal, or any persistence path.
 
 Activation order is site first, bot second:
 
 1. Keep the bot gate disabled while the website native-queue cutover is verified.
-2. Confirm the website capability is true and its public queue state is sanitized and accurate.
-3. Only after explicit owner approval, set `BNL_QUEUE_PRODUCTION_ENABLED=true` and restart the bot.
-4. Roll back the bot first by unsetting the variable or changing it away from `true`; the website can then be rolled back independently.
+2. Confirm the website capability is true and test all three session choices: no access, authenticated private access, and public access for a live broadcast.
+3. Confirm private queue data is visible only in private test/operator channels and cannot drive public or show-day output.
+4. Only after explicit owner approval, set `BNL_QUEUE_PRODUCTION_ENABLED=true` and restart the bot.
+5. Roll back the bot first by unsetting the variable or changing it away from `true`; the website can then be rolled back independently.
 
-Show-day copy follows the same boundary. The 6:40 PM Pacific intake message names the native queue only when both gates are usable; otherwise it uses provider-neutral public-intake wording. The 7:00 PM message describes the scheduled broadcast window without claiming unverified live state, and the later sponsor message remains optional and host-controlled.
+Show-day copy follows the same boundary and accepts only public queue scope. A private test response cannot drive an intake, live, sponsor, recap, or public-current-state message. The 6:40 PM Pacific intake message names the native queue only when both production gates and public access are usable; otherwise it uses provider-neutral public-intake wording. The 7:00 PM message describes the scheduled broadcast window without claiming unverified live state, and the later sponsor message remains optional and host-controlled.
 
 Holiday and occasion reflections extend the existing Ambient coordinator and
 active liaison channel. The maintained calendar targets 10:00 AM Pacific,
