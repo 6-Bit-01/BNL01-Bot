@@ -487,6 +487,108 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(claims, 0)
 
+    def test_exhausted_revalidation_preserves_claim_after_publication(self):
+        claim_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
+        )
+        self.assertTrue(claim_token)
+
+        async def exercise_revalidation():
+            with (
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS",
+                    2,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS",
+                    0,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "renew_show_update_claim",
+                    side_effect=sqlite3.OperationalError("temporary lock"),
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "release_show_update_claim",
+                ) as release,
+            ):
+                renewed = await bnl01_bot.revalidate_show_update_claim(
+                    42,
+                    "2026-08-21",
+                    "show_live",
+                    claim_token,
+                    asyncio.Event(),
+                    release_on_uncertain=False,
+                )
+            release.assert_not_called()
+            return renewed
+
+        self.assertFalse(asyncio.run(exercise_revalidation()))
+        with sqlite3.connect(self.db_path) as conn:
+            persisted_token = conn.execute(
+                "SELECT claim_token FROM friday_show_update_claims"
+            ).fetchone()[0]
+        self.assertEqual(persisted_token, claim_token)
+
+    def test_partial_publication_completion_retries_and_records_fired_phase(self):
+        claim_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
+        )
+        self.assertTrue(claim_token)
+        actual_mark = bnl01_bot.mark_show_update_fired
+        attempts = 0
+
+        def complete_after_transient_failure(*args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("temporary lock")
+            return actual_mark(*args)
+
+        async def exercise_completion():
+            with (
+                mock.patch.object(
+                    bnl01_bot,
+                    "SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS",
+                    0,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "mark_show_update_fired",
+                    side_effect=complete_after_transient_failure,
+                ),
+            ):
+                return await bnl01_bot.complete_partially_published_show_update(
+                    42,
+                    "2026-08-21",
+                    "show_live",
+                    claim_token,
+                    "discord delivered",
+                    "",
+                )
+
+        self.assertTrue(asyncio.run(exercise_completion()))
+        self.assertEqual(attempts, 2)
+        with sqlite3.connect(self.db_path) as conn:
+            fired = conn.execute(
+                """
+                SELECT discord_message, website_message
+                FROM friday_show_updates
+                """
+            ).fetchone()
+            claim_count = conn.execute(
+                "SELECT COUNT(*) FROM friday_show_update_claims"
+            ).fetchone()[0]
+        self.assertEqual(fired, ("discord delivered", ""))
+        self.assertEqual(claim_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

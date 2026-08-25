@@ -16541,6 +16541,7 @@ async def revalidate_show_update_claim(
     phase_key: str,
     claim_token: str,
     ownership_lost: asyncio.Event | None = None,
+    release_on_uncertain: bool = True,
 ) -> bool:
     """Fail closed before an external delivery when claim ownership is unsure."""
 
@@ -16569,34 +16570,82 @@ async def revalidate_show_update_claim(
                     SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS * attempt
                 )
                 continue
-            try:
-                released = await asyncio.to_thread(
-                    release_show_update_claim,
-                    guild_id,
-                    show_date,
-                    phase_key,
-                    claim_token,
-                )
-            except Exception as release_exc:
+            if not release_on_uncertain:
                 logging.warning(
-                    "showday_update_claim_uncertain_release_failed "
-                    "guild=%s phase=%s error_type=%s",
+                    "showday_update_claim_uncertain_preserved "
+                    "guild=%s phase=%s",
                     guild_id,
                     phase_key,
-                    type(release_exc).__name__,
                 )
             else:
-                logging.warning(
-                    "showday_update_claim_uncertain_released "
-                    "guild=%s phase=%s released=%s",
-                    guild_id,
-                    phase_key,
-                    int(released),
-                )
+                try:
+                    released = await asyncio.to_thread(
+                        release_show_update_claim,
+                        guild_id,
+                        show_date,
+                        phase_key,
+                        claim_token,
+                    )
+                except Exception as release_exc:
+                    logging.warning(
+                        "showday_update_claim_uncertain_release_failed "
+                        "guild=%s phase=%s error_type=%s",
+                        guild_id,
+                        phase_key,
+                        type(release_exc).__name__,
+                    )
+                else:
+                    logging.warning(
+                        "showday_update_claim_uncertain_released "
+                        "guild=%s phase=%s released=%s",
+                        guild_id,
+                        phase_key,
+                        int(released),
+                    )
             return False
         if not renewed and ownership_lost is not None:
             ownership_lost.set()
         return renewed
+    return False
+
+
+async def complete_partially_published_show_update(
+    guild_id: int,
+    show_date: str,
+    phase_key: str,
+    claim_token: str,
+    discord_message: str,
+    website_message: str,
+) -> bool:
+    """Persist a fired row before an uncertain retry can duplicate a delivery."""
+
+    for attempt in range(1, SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS + 1):
+        try:
+            completed = await asyncio.to_thread(
+                mark_show_update_fired,
+                guild_id,
+                show_date,
+                phase_key,
+                claim_token,
+                discord_message,
+                website_message,
+            )
+        except Exception as exc:
+            logging.warning(
+                "showday_partial_completion_retry guild=%s phase=%s "
+                "attempt=%s error_type=%s",
+                guild_id,
+                phase_key,
+                attempt,
+                type(exc).__name__,
+            )
+            if attempt < SHOWDAY_UPDATE_CLAIM_REVALIDATION_ATTEMPTS:
+                await asyncio.sleep(
+                    SHOWDAY_UPDATE_CLAIM_REVALIDATION_RETRY_SECONDS * attempt
+                )
+                continue
+            return False
+        return completed
     return False
 
 
@@ -30953,6 +31002,7 @@ async def barcode_radio_queue_task():
                         phase_key,
                         claim_token,
                         ownership_lost,
+                        release_on_uncertain=not bool(discord_sent),
                     ):
                         logging.warning(
                             "showday_website_delivery_skipped_claim_lost "
@@ -30960,6 +31010,22 @@ async def barcode_radio_queue_task():
                             guild.id,
                             phase_key,
                         )
+                        if discord_sent:
+                            completed = await complete_partially_published_show_update(
+                                guild.id,
+                                show_date,
+                                phase_key,
+                                claim_token,
+                                discord_sent,
+                                "",
+                            )
+                            logging.warning(
+                                "showday_partial_discord_completion "
+                                "guild=%s phase=%s completed=%s",
+                                guild.id,
+                                phase_key,
+                                int(completed),
+                            )
                         continue
                     await update_website_status_controlled_async(mode=mode, message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)), status="ONLINE", force=True)
                 if not await asyncio.to_thread(
