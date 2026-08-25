@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
 import os
@@ -6,6 +7,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
@@ -37,6 +39,7 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
                     show_date TEXT NOT NULL,
                     phase_key TEXT NOT NULL,
                     claimed_at TEXT NOT NULL,
+                    claim_token TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (guild_id, show_date, phase_key)
                 );
                 """
@@ -60,18 +63,17 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda _index: claim(), range(4)))
 
-        self.assertEqual(results.count(True), 1)
-        self.assertEqual(results.count(False), 3)
+        self.assertEqual(sum(bool(result) for result in results), 1)
+        self.assertEqual(results.count(None), 3)
 
     def test_fresh_claim_keeps_duplicate_worker_out(self):
-        self.assertTrue(
-            bnl01_bot.claim_show_update_period(
-                42,
-                "2026-08-21",
-                "show_live",
-            )
+        claim_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
         )
-        self.assertFalse(
+        self.assertTrue(claim_token)
+        self.assertIsNone(
             bnl01_bot.claim_show_update_period(
                 42,
                 "2026-08-21",
@@ -95,25 +97,30 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
         )
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO friday_show_update_claims VALUES (?, ?, ?, ?)",
-                (42, "2026-08-21", "show_live", stale_at.isoformat()),
+                """
+                INSERT INTO friday_show_update_claims
+                (guild_id, show_date, phase_key, claimed_at, claim_token)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (42, "2026-08-21", "show_live", stale_at.isoformat(), "old-worker"),
             )
 
-        self.assertTrue(
-            bnl01_bot.claim_show_update_period(
-                42,
-                "2026-08-21",
-                "show_live",
-            )
+        claim_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
         )
+        self.assertTrue(claim_token)
+        self.assertNotEqual(claim_token, "old-worker")
         with sqlite3.connect(self.db_path) as conn:
-            claimed_at = conn.execute(
-                "SELECT claimed_at FROM friday_show_update_claims"
-            ).fetchone()[0]
+            claimed_at, persisted_token = conn.execute(
+                "SELECT claimed_at, claim_token FROM friday_show_update_claims"
+            ).fetchone()
         self.assertGreater(
             datetime.fromisoformat(claimed_at),
             stale_at,
         )
+        self.assertEqual(persisted_token, claim_token)
 
     def test_malformed_or_materially_future_claim_is_recovered(self):
         for index, claimed_at in enumerate(
@@ -125,8 +132,12 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
             phase_key = f"phase-{index}"
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
-                    "INSERT INTO friday_show_update_claims VALUES (?, ?, ?, ?)",
-                    (42, "2026-08-21", phase_key, claimed_at),
+                    """
+                    INSERT INTO friday_show_update_claims
+                    (guild_id, show_date, phase_key, claimed_at, claim_token)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (42, "2026-08-21", phase_key, claimed_at, "old-worker"),
                 )
             self.assertTrue(
                 bnl01_bot.claim_show_update_period(
@@ -137,22 +148,22 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
             )
 
     def test_completed_phase_cannot_be_claimed_again(self):
-        self.assertTrue(
-            bnl01_bot.claim_show_update_period(
-                42,
-                "2026-08-21",
-                "show_live",
-            )
-        )
-        bnl01_bot.mark_show_update_fired(
+        claim_token = bnl01_bot.claim_show_update_period(
             42,
             "2026-08-21",
             "show_live",
+        )
+        self.assertTrue(claim_token)
+        self.assertTrue(bnl01_bot.mark_show_update_fired(
+            42,
+            "2026-08-21",
+            "show_live",
+            claim_token,
             "discord",
             "website",
-        )
+        ))
 
-        self.assertFalse(
+        self.assertIsNone(
             bnl01_bot.claim_show_update_period(
                 42,
                 "2026-08-21",
@@ -164,6 +175,153 @@ class ShowdayScheduleClaimTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM friday_show_update_claims"
             ).fetchone()[0]
         self.assertEqual(claims, 0)
+
+    def test_superseded_worker_cannot_release_or_complete_new_claim(self):
+        old_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
+        )
+        self.assertTrue(old_token)
+        stale_at = datetime.now(timezone.utc) - timedelta(
+            seconds=bnl01_bot.SHOWDAY_UPDATE_CLAIM_LEASE_SECONDS + 1
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE friday_show_update_claims SET claimed_at=?",
+                (stale_at.isoformat(),),
+            )
+
+        new_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
+        )
+        self.assertTrue(new_token)
+        self.assertNotEqual(new_token, old_token)
+        self.assertFalse(
+            bnl01_bot.release_show_update_claim(
+                42,
+                "2026-08-21",
+                "show_live",
+                old_token,
+            )
+        )
+        self.assertFalse(
+            bnl01_bot.mark_show_update_fired(
+                42,
+                "2026-08-21",
+                "show_live",
+                old_token,
+                "old discord",
+                "old website",
+            )
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            persisted_token = conn.execute(
+                "SELECT claim_token FROM friday_show_update_claims"
+            ).fetchone()[0]
+            fired_count = conn.execute(
+                "SELECT COUNT(*) FROM friday_show_updates"
+            ).fetchone()[0]
+        self.assertEqual(persisted_token, new_token)
+        self.assertEqual(fired_count, 0)
+        self.assertTrue(
+            bnl01_bot.mark_show_update_fired(
+                42,
+                "2026-08-21",
+                "show_live",
+                new_token,
+                "new discord",
+                "new website",
+            )
+        )
+
+    def test_current_worker_can_renew_but_superseded_token_cannot(self):
+        claim_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
+        )
+        self.assertTrue(claim_token)
+        with sqlite3.connect(self.db_path) as conn:
+            original = conn.execute(
+                "SELECT claimed_at FROM friday_show_update_claims"
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE friday_show_update_claims SET claimed_at=?",
+                ((datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),),
+            )
+
+        self.assertFalse(
+            bnl01_bot.renew_show_update_claim(
+                42,
+                "2026-08-21",
+                "show_live",
+                "not-the-owner",
+            )
+        )
+        self.assertTrue(
+            bnl01_bot.renew_show_update_claim(
+                42,
+                "2026-08-21",
+                "show_live",
+                claim_token,
+            )
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            renewed = conn.execute(
+                "SELECT claimed_at FROM friday_show_update_claims"
+            ).fetchone()[0]
+        self.assertGreaterEqual(
+            datetime.fromisoformat(renewed),
+            datetime.fromisoformat(original),
+        )
+        self.assertLess(
+            bnl01_bot.SHOWDAY_UPDATE_CLAIM_HEARTBEAT_SECONDS,
+            bnl01_bot.SHOWDAY_UPDATE_CLAIM_LEASE_SECONDS,
+        )
+
+    def test_active_worker_heartbeat_renews_claim_through_provider_work(self):
+        claim_token = bnl01_bot.claim_show_update_period(
+            42,
+            "2026-08-21",
+            "show_live",
+        )
+        self.assertTrue(claim_token)
+        older = datetime.now(timezone.utc) - timedelta(minutes=5)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE friday_show_update_claims SET claimed_at=?",
+                (older.isoformat(),),
+            )
+
+        async def exercise_heartbeat():
+            with mock.patch.object(
+                bnl01_bot,
+                "SHOWDAY_UPDATE_CLAIM_HEARTBEAT_SECONDS",
+                0.01,
+            ):
+                task = asyncio.create_task(
+                    bnl01_bot.maintain_show_update_claim(
+                        42,
+                        "2026-08-21",
+                        "show_live",
+                        claim_token,
+                    )
+                )
+                await asyncio.sleep(0.04)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(exercise_heartbeat())
+        with sqlite3.connect(self.db_path) as conn:
+            renewed_at, persisted_token = conn.execute(
+                "SELECT claimed_at, claim_token FROM friday_show_update_claims"
+            ).fetchone()
+        self.assertGreater(datetime.fromisoformat(renewed_at), older)
+        self.assertEqual(persisted_token, claim_token)
 
 
 if __name__ == "__main__":

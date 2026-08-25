@@ -92,7 +92,7 @@ Activation order is site first, bot second:
 
 Show-day copy follows the same boundary and accepts only public queue scope. A private test response cannot drive an intake, live, sponsor, recap, or public-current-state message. The 6:40 PM Pacific intake message names the native queue only when both production gates and public access are usable; otherwise it uses provider-neutral public-intake wording. The 7:00 PM message describes the scheduled broadcast window without claiming unverified live state, and the later sponsor message remains optional and host-controlled.
 
-Each scheduled show-day phase takes one atomic pre-generation claim. A fresh claim blocks duplicate workers; after six minutes it becomes recoverable so a crash, restart, malformed timestamp, or material clock error cannot suppress the phase for the rest of its ten-minute delivery window. A completed phase remains permanently idempotent through `friday_show_updates`.
+Each scheduled show-day phase takes one atomic pre-generation claim with a unique worker token. A fresh claim blocks duplicate workers, while an active worker renews its six-minute lease once a minute through generation and delivery. After six minutes without a heartbeat the claim becomes recoverable, so a crash, restart, malformed timestamp, or material clock error cannot suppress the phase for the rest of its ten-minute delivery window. Release and completion writes are fenced to the current token, preventing a superseded worker from deleting or completing a newer claim. A completed phase remains permanently idempotent through `friday_show_updates`.
 
 Holiday and occasion reflections extend the existing Ambient coordinator and
 active liaison channel. The maintained calendar targets 10:00 AM Pacific,
