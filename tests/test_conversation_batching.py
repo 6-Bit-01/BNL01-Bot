@@ -747,6 +747,51 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("and why do they blink?", prompts[0])
         self.assertEqual(channel.sent, ["One combined response."])
 
+    async def test_sealed_batch_queue_question_receives_private_read_model_context(self):
+        channel = self._channel(8150)
+        generation_calls = []
+        queue_context = (
+            "Website private queue read model context:\n"
+            "Queue:\n"
+            "- Session=Private rehearsal, queueOpen=False\n"
+            "Queued tracks:\n"
+            "- Rehearsal Artist — Waiting Track"
+        )
+
+        async def generate(prompt, **kwargs):
+            generation_calls.append((prompt, kwargs))
+            return "Submissions are closed. Rehearsal Artist — Waiting Track is waiting."
+
+        self._prime_flush(
+            channel,
+            "BNL, read the current BARCODE Radio rehearsal queue. "
+            "Is submissions access open or closed, and what tracks are currently waiting?",
+        )
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value=queue_context,
+            ) as context_builder,
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        context_builder.assert_called_once()
+        self.assertEqual(context_builder.call_args.args[1], "sealed_test")
+        self.assertEqual(len(generation_calls), 1)
+        prompt, kwargs = generation_calls[0]
+        self.assertIn(queue_context, prompt)
+        self.assertIn(
+            "Answer current queue questions directly from this context",
+            prompt,
+        )
+        self.assertTrue(kwargs["source_context_available"])
+        self.assertEqual(
+            channel.sent,
+            ["Submissions are closed. Rehearsal Artist — Waiting Track is waiting."],
+        )
+
     async def test_active_batch_guard_receives_typed_gist_attribution_contract(self):
         channel = self._channel(8136)
         prompts = []

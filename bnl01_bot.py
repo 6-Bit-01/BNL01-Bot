@@ -33343,6 +33343,30 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(collapsed_items, style_key, style_rule)
+            batch_website_read_model_context = maybe_build_bnl_read_model_context(
+                combined_text,
+                channel_policy,
+            )
+            batch_source_context_available = bool(
+                batch_website_read_model_context
+            )
+            if batch_website_read_model_context:
+                prompt += (
+                    "\n\nAuthoritative current website queue context for this "
+                    "request:\n"
+                    + batch_website_read_model_context
+                    + "\nAnswer current queue questions directly from this context. "
+                    "Do not replace the current readout with the normal Friday "
+                    "schedule or claim that the queue is unavailable.\n"
+                )
+                _log_batch_event(
+                    logging.INFO,
+                    "website_read_model_context_used",
+                    guild_id,
+                    channel_id,
+                    len(collapsed_items),
+                    f"channel_policy={channel_policy}",
+                )
             batch_attribution_contract = build_batch_attribution_contract(
                 collapsed_items,
                 guild_id=guild_id,
@@ -33570,6 +33594,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             "canon",
                             _canon_relevant_to_response(combined_text),
                         ),
+                        (
+                            "website_read_model",
+                            batch_source_context_available,
+                        ),
                     )
                     if present
                 )
@@ -33636,6 +33664,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     exact_quote_authority_present=(
                         batch_attribution_contract.exact_quote_authority
                         is not None
+                    ),
+                    website_read_model_present=(
+                        batch_source_context_available
                     ),
                     current_direct=bool(
                         active_packet.get("addressed_to_bot")
@@ -33824,6 +33855,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 user_id=first_uid,
                 guild_id=channel.guild.id,
                 route=generation_route,
+                source_context_available=batch_source_context_available,
             )
 
             response = suppress_stale_media_fallback(
@@ -33879,6 +33911,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             user_id=first_uid,
                             guild_id=channel.guild.id,
                             route=generation_route,
+                            source_context_available=(
+                                batch_source_context_available
+                            ),
                         )
                         if regenerated:
                             response = regenerated
@@ -34142,8 +34177,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             memory_context_source_count=1,
             memory_injection_decision="batch_prompt_public_safe",
             memory_write_decision=get_route_mode_contract(ROUTE_MODE_NORMAL_CHAT).save_behavior,
-            source_analysis_context_injected=False,
-            source_context_allowed=False,
+            source_analysis_context_injected=(
+                batch_source_context_available
+            ),
+            source_context_allowed=batch_source_context_available,
             community_scouting_ran=False,
             entity_subjects_detected_count=0,
             subject_extraction_ran=False,
@@ -34181,7 +34218,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 user_display_name=(
                     collapsed_items[-1][0] if collapsed_items else ""
                 ),
-                source_context_available=False,
+                source_context_available=batch_source_context_available,
             )
         )
         batch_synthesis_decision = (
@@ -34215,7 +34252,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             is_reply=False,
             generation_route=generation_route if 'generation_route' in locals() else "get_gemini_response",
             channel=channel,
-            source_context_available=False,
+            source_context_available=batch_source_context_available,
             batch_generation_id=local_generation_id,
             conversation_continuity_required=batch_continuity_required,
             community_visual_basis=community_visual_basis,
@@ -34290,7 +34327,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             else "get_gemini_response"
                         ),
                         channel=channel,
-                        source_context_available=False,
+                        source_context_available=(
+                            batch_source_context_available
+                        ),
                         batch_generation_id=local_generation_id,
                         conversation_continuity_required=(
                             batch_continuity_required
@@ -34476,7 +34515,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         else "get_gemini_response"
                     ),
                     channel=channel,
-                    source_context_available=False,
+                    source_context_available=(
+                        batch_source_context_available
+                    ),
                     batch_generation_id=local_generation_id,
                     conversation_continuity_required=(
                         batch_continuity_required
