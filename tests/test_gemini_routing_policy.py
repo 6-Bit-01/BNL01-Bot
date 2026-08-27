@@ -92,6 +92,17 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             policy = routing.policy_for_route("website_relay_event")
         self.assertEqual(policy.max_output_tokens, 4_096)
 
+    def test_relay_and_showday_keep_distinct_background_protection_flags(self):
+        relay = routing.policy_for_route("website_relay_event")
+        showday = routing.policy_for_route("showday_generation")
+        ambient = routing.policy_for_route("ambient_generation")
+        self.assertTrue(relay.relay_protected)
+        self.assertFalse(relay.showday_protected)
+        self.assertTrue(showday.showday_protected)
+        self.assertFalse(showday.relay_protected)
+        self.assertFalse(ambient.relay_protected)
+        self.assertFalse(ambient.showday_protected)
+
     def test_background_output_limit_remains_environment_configurable(self):
         with mock.patch.dict(
             "os.environ",

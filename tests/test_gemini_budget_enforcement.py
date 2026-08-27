@@ -75,6 +75,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
             "BNL_GEMINI_BILLING_LAG_BUFFER_USD": "0.50",
             "BNL_GEMINI_JOURNAL_RESERVE_USD": "1.00",
             "BNL_GEMINI_INTERACTIVE_RESERVE_USD": "2.00",
+            "BNL_GEMINI_RELAY_PACE_ALLOWANCE_USD": "5.50",
         }
         values.update(overrides)
         return values
@@ -117,7 +118,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
     def test_daily_soft_limit_stops_optional_background_work(self):
         with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
             allowed, reason = self.decision(
-                "website_relay_event",
+                "ambient_generation",
                 request="0.02",
                 month="19.99",
                 today="0.64",
@@ -141,6 +142,49 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
             )
         self.assertEqual(background, (False, "monthly_target_pace"))
         self.assertEqual(interactive, (True, "interactive_available"))
+
+    def test_relay_uses_bounded_pace_allowance_while_ambient_stays_restricted(self):
+        with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
+            relay = self.decision(
+                "website_relay_event",
+                request="0.01",
+                month="20.01",
+                today="0.70",
+            )
+            ambient = self.decision(
+                "ambient_generation",
+                request="0.01",
+                month="20.01",
+                today="0.70",
+            )
+        self.assertEqual(relay, (True, "relay_protected"))
+        self.assertEqual(ambient, (False, "monthly_target_pace"))
+
+    def test_relay_pace_allowance_cannot_expand_into_unreserved_hard_headroom(self):
+        env = self.default_budget_env(
+            BNL_GEMINI_MONTHLY_HARD_LIMIT_USD="30.00",
+            BNL_GEMINI_BILLING_LAG_BUFFER_USD="0",
+            BNL_GEMINI_JOURNAL_RESERVE_USD="0",
+            BNL_GEMINI_INTERACTIVE_RESERVE_USD="0",
+        )
+        with mock.patch.dict(os.environ, env, clear=False):
+            relay = self.decision(
+                "website_relay_event",
+                request="0.01",
+                month="25.50",
+                today="0.10",
+            )
+        self.assertEqual(relay, (False, "relay_pace_allowance"))
+
+    def test_showday_bypasses_soft_pace_but_not_harder_reserves(self):
+        with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
+            showday = self.decision(
+                "showday_generation",
+                request="0.01",
+                month="20.01",
+                today="0.70",
+            )
+        self.assertEqual(showday, (True, "showday_protected"))
 
     def test_background_yields_to_interactive_and_journal_reserves(self):
         with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
@@ -203,6 +247,16 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
                         ),
                         (False, "monthly_hard_limit"),
                     )
+
+    def test_budget_failure_classification_preserves_exact_guard_reason(self):
+        category, code, _message = bnl01_bot.classify_generation_error(
+            bnl01_bot.LocalModelBudgetExhausted("monthly_target_pace")
+        )
+        self.assertEqual(
+            category,
+            bnl01_bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+        )
+        self.assertEqual(code, "monthly_target_pace")
 
     def test_unpriced_history_restricts_background_without_monthlong_journal_outage(self):
         with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):

@@ -343,7 +343,8 @@ class ContractV2Tests(unittest.TestCase):
             self.assertFalse(bnl01_bot.update_website_status_controlled("OBSERVATION", "msg", source="relay"))
 
     def test_flags_gate_only_expected_tasks_and_cadence_constant(self):
-        self.assertEqual(bnl01_bot.BNL_WEBSITE_RELAY_INTERVAL_MINUTES, 20)
+        self.assertEqual(bnl01_bot.BNL_WEBSITE_RELAY_INTERVAL_MINUTES, 60)
+        self.assertEqual(bnl01_bot.BNL_WEBSITE_RELAY_MINUTE_OFFSET, 10)
         self.assertEqual(bnl01_bot.BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES, 5)
         self.assertTrue(hasattr(bnl01_bot, "website_presence_heartbeat_task"))
 
