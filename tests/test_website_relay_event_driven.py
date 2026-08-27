@@ -318,7 +318,7 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         self.add_row("Can BNL compare the public BARCODE Radio release notes with the Transmission topic people mentioned? #barcode", user="a")
         self.add_row("There is also a public dossier question about credits for that music release discussion?", user="b")
         prompts = []
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             prompts.append(prompt)
             return "Fresh Discord discussion connects BARCODE Radio, a release-credit question, a dossier angle, and a Transmission topic without confirming any live state.\nFollow the public thread for confirmed credits or links before treating the topic as indexed."
         with mock.patch.object(bnl01_bot, "fetch_bnl_read_model", side_effect=AssertionError("read model called")), \
@@ -341,7 +341,7 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
             post_count += 1
             await asyncio.sleep(0.02)
             return True
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             await asyncio.sleep(0.02)
             return "Two fresh Discord questions compare broadcast submissions with track context for tonight's show thread.\nFollow the public thread for confirmed submission details or links before indexing the answer."
         async def run_two():
@@ -366,7 +366,7 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
             nonlocal post_count
             post_count += 1
             return True
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             await asyncio.sleep(0.01)
             return "Two fresh Discord questions compare broadcast submissions with track context for tonight's show thread.\nFollow the public thread for confirmed submission details or links before indexing the answer."
         async def run_two():
@@ -385,7 +385,7 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         state.bootstrap_cursor(self.db, 42, 0)
         self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="a")
         self.add_row("I have a public question about the show and which track context matters?", user="b")
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             return "Two fresh Discord questions compare broadcast submissions with track context for tonight's show thread.\nFollow the public thread for confirmed submission details or links before indexing the answer."
         async def run_one():
             with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
@@ -536,6 +536,55 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         self.assertEqual(decision.skipReason, "provider_failure")
         self.assertEqual(state.stock_directive_reason("Continue monitoring."), "stock_directive_rejected")
 
+    def test_budget_restriction_is_not_misreported_as_invalid_output(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="a")
+        self.add_row("I have a public question about the show and which track context matters?", user="b")
+        failure = bnl01_bot.BackgroundGenerationUnavailable(
+            bnl01_bot.GenerationResult(
+                False,
+                error_category=bnl01_bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+                provider_error_code="monthly_target_pace",
+                route="website_relay_event",
+            )
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response",
+                side_effect=failure,
+            ) as generate,
+            mock.patch.object(
+                bnl01_bot,
+                "get_bnl_control_flags",
+                return_value={"websiteRelayEnabled": True},
+            ),
+        ):
+            decision = asyncio.run(
+                bnl01_bot._execute_website_relay_transaction(
+                    42,
+                    source="relay",
+                )
+            )
+        self.assertFalse(decision.publish)
+        self.assertEqual(
+            decision.skipReason,
+            "budget_restricted:monthly_target_pace",
+        )
+        self.assertEqual(
+            decision.metadata["reason"],
+            "budget_restricted:monthly_target_pace",
+        )
+        self.assertTrue(
+            generate.await_args.kwargs["raise_on_generation_failure"]
+        )
+        attempt = state.last_attempt(self.db, 42)
+        self.assertEqual(attempt["outcome"], "budget_restricted")
+        self.assertEqual(
+            attempt["reason"],
+            "budget_restricted:monthly_target_pace",
+        )
+
     def test_website_relay_route_bypasses_glitch_and_cross_universe_rewrites(self):
         async def base_result(contents, route):
             return bnl01_bot.GenerationResult(True, "Line one.\nLine two directive with enough detail.", route=route)
@@ -573,7 +622,7 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
             state.bootstrap_cursor(self.db, 42, 0)
             self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="a")
             self.add_row("I have a public question about the show and which track context matters?", user="b")
-            async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
                 return output
             async def run_one():
                 with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
@@ -594,7 +643,7 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         for i in range(30):
             self.add_row(f"Public row {i:02d} asks about broadcast track submissions and show context? #barcode", user=str(i % 3))
         prompts = []
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             prompts.append(prompt)
             return "Fresh Discord rows focus on broadcast track submissions across the newest selected context.\nFollow the public thread for confirmed submission details or links before indexing the answer."
         with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini):
@@ -614,7 +663,7 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
             self.add_row(f"weak prefix {i}", user="a")
         self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="b")
         self.add_row("I have a public question about the show and which track context matters?", user="c")
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             return "Newer Discord questions focus the relay on broadcast submissions despite the weak prefix.\nFollow the public thread for confirmed submission details or links before indexing the answer."
         with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini):
             decision = self.generate()
@@ -682,7 +731,7 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
 
     def test_quiet_manual_transaction_publishes_from_canon_without_cursor_advance(self):
         state.bootstrap_cursor(self.db, 42, 7)
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             self.assertIn("selected approved source class: canon", prompt)
             self.assertNotIn("queue counts", prompt.lower().split("approved source context:", 1)[-1])
             return ("BARCODE canon keeps the relay trained on the broadcast corridor and its unresolved archive questions without claiming fresh movement.\n"
@@ -701,7 +750,7 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
         state.bootstrap_cursor(self.db, 42, 0)
         self.add_row("Can BNL explain how public broadcast track submissions work? #barcode", user="a")
         self.add_row("I have a public question about the show and which track context matters?", user="b")
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             return ("Two fresh public questions compare broadcast submissions with track context in the public corridor.\n"
                     "Follow the public questions for confirmed submission details before indexing the answer.")
         with mock.patch.object(bnl01_bot, "BNL_API_KEY", "test-api-key"), \
@@ -717,7 +766,7 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
         state.bootstrap_cursor(self.db, 42, 0)
         self.add_row("Can BNL explain how public broadcast track submissions work? #barcode", user="a")
         self.add_row("I have a public question about the show and which track context matters?", user="b")
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             return ("Two fresh public questions compare broadcast submissions with track context in the public corridor.\n"
                     "Follow the public questions for confirmed submission details before indexing the answer.")
         with mock.patch.object(bnl01_bot, "BNL_API_KEY", "test-api-key"), \
@@ -875,7 +924,7 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
 
     def test_bootstrap_transaction_publishes_quiet_without_replaying_history(self):
         self.add_row("Old historical Discord row from ArchivistName should not be replayed as fresh current content.", user="ArchivistName")
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             self.assertIn("selected approved source class", prompt)
             self.assertNotIn("ArchivistName", prompt)
             self.assertNotIn("Old historical Discord row", prompt)
@@ -919,7 +968,7 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
     def test_weak_fresh_rows_quiet_fallback_preserves_cursor_until_strong_delivery(self):
         state.bootstrap_cursor(self.db, 42, 0)
         self.add_row("too small", user="weak")
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             return ("BARCODE canon gives BNL a stable archive question without consuming weak public chatter.\n"
                     "Ask which archive thread should be clarified before weak chatter becomes evidence.")
         with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
@@ -933,7 +982,7 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
 
     def test_canon_temporal_validation_rejects_unsupported_live_claim(self):
         source = state.RelaySourceDecision("canon", "[approved_barcode_canon:0] BNL-01 serves as the BARCODE Network liaison voice.", {"canon": 1}, source_cursor=0)
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             return ("BARCODE Radio is currently live and on-air tonight for the current show.\n"
                     "Ask listeners to join the live BARCODE Radio window right now.")
         with mock.patch.object(bnl01_bot, "_select_approved_quiet_relay_source", return_value=source), \
@@ -950,7 +999,7 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
 
     def test_timeless_barcode_radio_canon_fact_can_remain(self):
         source = state.RelaySourceDecision("canon", "[approved_barcode_canon:0] BARCODE Radio is the Network broadcast corridor.", {"canon": 1}, source_cursor=0)
-        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route="", **_kwargs):
             return ("BARCODE Radio remains the Network broadcast corridor for confirmed public transmissions and archive questions.\n"
                     "Ask which BARCODE archive question should be clarified for the public corridor next.")
         with mock.patch.object(bnl01_bot, "_select_approved_quiet_relay_source", return_value=source), \

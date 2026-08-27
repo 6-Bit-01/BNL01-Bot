@@ -45,25 +45,39 @@ class CostControlSchedulerTests(unittest.IsolatedAsyncioTestCase):
             "glitch_rewrite",
         )
 
-    def test_quiet_cadence_reduces_snapshot_periodic_slots_by_two_thirds(self):
-        with mock.patch.object(
+    def test_hourly_relay_and_quiet_cascade_share_the_ten_minute_offset(self):
+        with mock.patch.multiple(
             bnl01_bot,
-            "BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES",
-            60,
+            BNL_WEBSITE_RELAY_INTERVAL_MINUTES=60,
+            BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES=60,
+            BNL_WEBSITE_RELAY_MINUTE_OFFSET=10,
         ):
-            scheduled = [
+            at_ten = bnl01_bot.PACIFIC_TZ.localize(
+                datetime(2026, 8, 22, 17, 10)
+            )
+            at_hour = bnl01_bot.PACIFIC_TZ.localize(
+                datetime(2026, 8, 22, 18, 0)
+            )
+            self.assertTrue(bnl01_bot._scheduled_relay_due(at_ten))
+            self.assertTrue(bnl01_bot._scheduled_quiet_relay_due(at_ten))
+            self.assertFalse(bnl01_bot._scheduled_relay_due(at_hour))
+            self.assertFalse(bnl01_bot._scheduled_quiet_relay_due(at_hour))
+
+    def test_next_hourly_relay_is_reported_at_ten_past(self):
+        with mock.patch.multiple(
+            bnl01_bot,
+            BNL_WEBSITE_RELAY_INTERVAL_MINUTES=60,
+            BNL_WEBSITE_RELAY_MINUTE_OFFSET=10,
+        ):
+            now = bnl01_bot.PACIFIC_TZ.localize(
+                datetime(2026, 8, 22, 17, 40, 30)
+            )
+            self.assertEqual(
+                bnl01_bot._next_scheduled_relay_at(now),
                 bnl01_bot.PACIFIC_TZ.localize(
-                    datetime(2026, 8, 22, minute // 60, minute % 60)
-                )
-                for minute in range(0, 17 * 60 + 41, 20)
-            ]
-            quiet_eligible = [
-                at
-                for at in scheduled
-                if bnl01_bot._scheduled_quiet_relay_due(at)
-            ]
-        self.assertEqual(len(scheduled), 54)
-        self.assertEqual(len(quiet_eligible), 18)
+                    datetime(2026, 8, 22, 18, 10)
+                ),
+            )
 
     async def run_relay_tick(self, at, *, claimed=True):
         guild = SimpleNamespace(id=42, get_channel=lambda _channel_id: None)
@@ -101,7 +115,12 @@ class CostControlSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(
                 bnl01_bot,
                 "BNL_WEBSITE_RELAY_INTERVAL_MINUTES",
-                20,
+                60,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "BNL_WEBSITE_RELAY_MINUTE_OFFSET",
+                10,
             ),
             mock.patch.object(
                 bnl01_bot,
@@ -112,25 +131,25 @@ class CostControlSchedulerTests(unittest.IsolatedAsyncioTestCase):
             await bnl01_bot.website_relay_task.coro()
         return claim, execute
 
-    async def test_regular_tick_checks_fresh_signal_without_quiet_generation(self):
-        at = bnl01_bot.PACIFIC_TZ.localize(datetime(2026, 8, 22, 17, 40))
+    async def test_hourly_tick_checks_fresh_signal_and_quiet_cascade(self):
+        at = bnl01_bot.PACIFIC_TZ.localize(datetime(2026, 8, 22, 17, 10))
         claim, execute = await self.run_relay_tick(at)
         claim.assert_called_once_with(
             bnl01_bot.DB_FILE,
             42,
-            "2026-08-22T17:40-07:00",
+            "2026-08-22T17:10-07:00",
         )
-        execute.assert_awaited_once()
-        self.assertFalse(execute.await_args.kwargs["allow_quiet_sources"])
-
-    async def test_hourly_tick_retains_scheduled_quiet_relay_behavior(self):
-        at = bnl01_bot.PACIFIC_TZ.localize(datetime(2026, 8, 22, 18, 0))
-        _claim, execute = await self.run_relay_tick(at)
         execute.assert_awaited_once()
         self.assertTrue(execute.await_args.kwargs["allow_quiet_sources"])
 
+    async def test_top_of_hour_is_not_a_relay_tick(self):
+        at = bnl01_bot.PACIFIC_TZ.localize(datetime(2026, 8, 22, 18, 0))
+        claim, execute = await self.run_relay_tick(at)
+        claim.assert_not_called()
+        execute.assert_not_awaited()
+
     async def test_duplicate_worker_claim_makes_no_generation_call(self):
-        at = bnl01_bot.PACIFIC_TZ.localize(datetime(2026, 8, 22, 18, 20))
+        at = bnl01_bot.PACIFIC_TZ.localize(datetime(2026, 8, 22, 18, 10))
         _claim, execute = await self.run_relay_tick(at, claimed=False)
         execute.assert_not_awaited()
 
@@ -518,6 +537,11 @@ class CostControlSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             bnl01_bot.policy_for_route(seen[0]["route"]).lane,
             "background",
+        )
+        self.assertTrue(
+            bnl01_bot.policy_for_route(
+                seen[0]["route"]
+            ).showday_protected
         )
 
     async def test_ambient_generation_is_labeled_as_background(self):

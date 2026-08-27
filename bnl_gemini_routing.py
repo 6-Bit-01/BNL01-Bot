@@ -33,6 +33,7 @@ class GeminiRoutePolicy:
     allow_fallback: bool
     journal_protected: bool = False
     relay_protected: bool = False
+    showday_protected: bool = False
 
 
 def _bounded_env_int(
@@ -213,6 +214,7 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             provider_retries=0,
             allow_fallback=False,
             relay_protected="relay" in normalized_route,
+            showday_protected="showday" in normalized_route,
         )
     return GeminiRoutePolicy(
         lane=lane,

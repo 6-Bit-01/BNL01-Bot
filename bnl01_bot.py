@@ -497,7 +497,20 @@ try:
     )
 except (TypeError, ValueError):
     DORMANT_ECHO_SELECTION_CHANCE = 0.05
-BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
+BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(
+    60,
+    int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "60") or 60),
+)
+try:
+    _configured_relay_minute_offset = int(
+        os.getenv("BNL_WEBSITE_RELAY_MINUTE_OFFSET", "10") or 10
+    )
+except (TypeError, ValueError):
+    _configured_relay_minute_offset = 10
+BNL_WEBSITE_RELAY_MINUTE_OFFSET = max(
+    0,
+    min(59, _configured_relay_minute_offset),
+)
 try:
     _configured_quiet_relay_interval = int(
         os.getenv("BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES", "60") or 60
@@ -4679,6 +4692,22 @@ def _build_source_decision_prompt(decision: RelaySourceDecision, mode: str, guil
     )
 
 
+def _website_relay_generation_failure_reason(
+    exc: Exception,
+) -> str:
+    """Return an operator-safe, truthful reason for a failed Relay draft."""
+
+    if isinstance(exc, BackgroundGenerationUnavailable):
+        result = exc.result
+        if result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET:
+            reason = str(
+                result.provider_error_code
+                or GENERATION_ERROR_LOCAL_MODEL_BUDGET
+            ).strip()
+            return f"budget_restricted:{reason}"
+    return "provider_failure"
+
+
 async def _generate_quiet_website_relay(guild_id: int, *, source_cursor: int, highest: int, reason: str = "approved_quiet_source") -> WebsiteRelayDecision:
     quiet_source = _select_approved_quiet_relay_source(guild_id, source_cursor, highest, allow_continuity=(reason != "bootstrap_no_publish"))
     if quiet_source.skip_reason:
@@ -4688,7 +4717,21 @@ async def _generate_quiet_website_relay(guild_id: int, *, source_cursor: int, hi
     relay_lane = _select_quiet_relay_lane(guild_id, quiet_source.source_class)
     prompt = _build_source_decision_prompt(quiet_source, mode, guild_id, relay_lane)
     try:
-        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="website_relay_event") or ""
+        generated = await get_gemini_response(
+            prompt,
+            user_id=0,
+            guild_id=guild_id,
+            route="website_relay_event",
+            raise_on_generation_failure=True,
+        ) or ""
+    except BackgroundGenerationUnavailable as exc:
+        failure_reason = _website_relay_generation_failure_reason(exc)
+        logging.warning(
+            "website_relay_no_publish guild=%s reason=%s",
+            guild_id,
+            failure_reason,
+        )
+        return WebsiteRelayDecision(False, skipReason=failure_reason, sourceCursor=source_cursor, metadata={"reason": failure_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
     except Exception as exc:
         logging.warning("website_relay_no_publish guild=%s reason=provider_failure error=%s", guild_id, _safe_force_pull_error(exc))
         return WebsiteRelayDecision(False, skipReason="provider_failure", sourceCursor=source_cursor, metadata={"reason": "provider_failure", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
@@ -4776,7 +4819,21 @@ async def generate_dynamic_website_relay(guild_id: int, *, allow_quiet_sources: 
         f"Fresh public context:\n{relay_context}\n"
     )
     try:
-        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="website_relay_event") or ""
+        generated = await get_gemini_response(
+            prompt,
+            user_id=0,
+            guild_id=guild_id,
+            route="website_relay_event",
+            raise_on_generation_failure=True,
+        ) or ""
+    except BackgroundGenerationUnavailable as exc:
+        failure_reason = _website_relay_generation_failure_reason(exc)
+        logging.warning(
+            "website_relay_no_publish guild=%s reason=%s",
+            guild_id,
+            failure_reason,
+        )
+        return WebsiteRelayDecision(False, skipReason=failure_reason, sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": failure_reason, "source_class": "fresh_discord"})
     except Exception as exc:
         logging.warning("website_relay_no_publish guild=%s reason=provider_failure error=%s", guild_id, _safe_force_pull_error(exc))
         return WebsiteRelayDecision(False, skipReason="provider_failure", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "provider_failure"})
@@ -4892,7 +4949,22 @@ async def _execute_website_relay_transaction(
         highest = int(decision.metadata.get("highest_eligible_conversation_id") or max(decision.sourceConversationIds or [decision.sourceCursor or 0]))
         if not decision.publish:
             reason = decision.skipReason or "no_safe_source"
-            outcome = "disabled" if reason == "website_relay_disabled" else ("provider_failed" if reason in {"provider_failure", "relay_generation_timeout"} else ("no_safe_source" if reason in {"no_new_public_signal", "bootstrap_no_publish", "fresh_context_expired"} else "rejected"))
+            outcome = (
+                "disabled"
+                if reason == "website_relay_disabled"
+                else "budget_restricted"
+                if reason.startswith("budget_restricted:")
+                else "provider_failed"
+                if reason in {"provider_failure", "relay_generation_timeout"}
+                else "no_safe_source"
+                if reason
+                in {
+                    "no_new_public_signal",
+                    "bootstrap_no_publish",
+                    "fresh_context_expired",
+                }
+                else "rejected"
+            )
             relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome=outcome, reason=reason, aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest)
             return decision
         if BNL_WEBSITE_CONTRACT_VERSION == "1":
@@ -8843,9 +8915,14 @@ def classify_generation_error(exc: Exception | None = None, *, empty_response: b
     if empty_response:
         return GENERATION_ERROR_PROVIDER_EMPTY, "", ""
     if isinstance(exc, LocalModelBudgetExhausted):
+        budget_reason = re.sub(
+            r"[^a-z0-9_:-]+",
+            "_",
+            str(exc or GENERATION_ERROR_LOCAL_MODEL_BUDGET).strip().lower(),
+        ).strip("_")
         return (
             GENERATION_ERROR_LOCAL_MODEL_BUDGET,
-            GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+            budget_reason or GENERATION_ERROR_LOCAL_MODEL_BUDGET,
             "BNL's local model budget is exhausted.",
         )
     provider_kind = provider_failure_kind(exc)
@@ -20959,6 +21036,10 @@ def _dollar_budget_decision(
         "BNL_GEMINI_INTERACTIVE_RESERVE_USD",
         "2.00",
     )
+    relay_pace_allowance = _budget_env_usd(
+        "BNL_GEMINI_RELAY_PACE_ALLOWANCE_USD",
+        "5.50",
+    )
     effective_hard = max(
         Decimal("0"),
         config.monthly_hard_limit_usd - billing_lag_buffer,
@@ -21001,6 +21082,13 @@ def _dollar_budget_decision(
     if projected_month > background_limit:
         return False, "interactive_and_journal_reserve"
 
+    # Show-day generation is low-frequency, atomically claimed, and tied to a
+    # real broadcast window. Keep its background one-attempt/no-fallback
+    # provider policy while preventing the generic pace gate from suppressing
+    # time-sensitive copy. The hard limit and both dollar reserves still win.
+    if policy.showday_protected:
+        return True, "showday_protected"
+
     pace = calculate_monthly_budget_pace(
         _nanos_to_usd(guarded_month_nanos),
         _nanos_to_usd(guarded_today_nanos),
@@ -21008,6 +21096,19 @@ def _dollar_budget_decision(
         at=now_pacific,
     )
     expected_nanos = _usd_to_nanos(pace.expected_cost_to_date_usd)
+    if policy.relay_protected:
+        # Relay remains operational slightly ahead of the generic target pace,
+        # but only inside a small configured headroom and never at the expense
+        # of Journal/interactive reserves or the effective hard limit. Hourly
+        # cadence plus the existing one-attempt/no-fallback policy bounds the
+        # route itself without introducing another scheduler or budget owner.
+        relay_pace_limit = min(
+            background_limit,
+            expected_nanos + _usd_to_nanos(relay_pace_allowance),
+        )
+        if projected_month > relay_pace_limit:
+            return False, "relay_pace_allowance"
+        return True, "relay_protected"
     if guarded_month_nanos >= expected_nanos:
         return False, "monthly_target_pace"
 
@@ -21480,7 +21581,9 @@ def get_usage_breakdown() -> dict:
     )
     restrictions = {}
     for route_class, sample_route in (
-        ("background", "website_relay_event"),
+        ("background", "ambient_generation"),
+        ("relay", "website_relay_event"),
+        ("showday", "showday_generation"),
         ("ordinary", ORDINARY_CHAT_SINGLE_PACKET_ROUTE),
         ("journal", JOURNAL_ROUTE),
     ):
@@ -21585,6 +21688,10 @@ def get_usage_breakdown() -> dict:
         "effective_hard_limit_usd": effective_hard_limit_usd,
         "remaining_effective_hard_usd": remaining_effective_hard_usd,
         "daily_soft_limit_usd": config.daily_soft_limit_usd,
+        "relay_pace_allowance_usd": _budget_env_usd(
+            "BNL_GEMINI_RELAY_PACE_ALLOWANCE_USD",
+            "5.50",
+        ),
         "budget_enforcement_enabled": config.enforcement_enabled,
         "remaining_target_usd": pace.remaining_target_usd,
         "remaining_hard_limit_usd": pace.remaining_hard_limit_usd,
@@ -31236,12 +31343,52 @@ async def website_presence_heartbeat_task():
     await asyncio.to_thread(publish_website_presence_v2, source="heartbeat", status="ONLINE", mode="OBSERVATION")
 
 
+def _relay_schedule_minute_index(now_pacific: datetime) -> int:
+    return (
+        now_pacific.date().toordinal() * 24 * 60
+        + now_pacific.hour * 60
+        + now_pacific.minute
+    )
+
+
+def _scheduled_relay_due(
+    now_pacific: datetime,
+    *,
+    interval_minutes: int | None = None,
+) -> bool:
+    """Return whether a Pacific wall-clock minute owns a Relay period."""
+
+    interval = max(
+        1,
+        int(interval_minutes or BNL_WEBSITE_RELAY_INTERVAL_MINUTES),
+    )
+    offset = BNL_WEBSITE_RELAY_MINUTE_OFFSET % interval
+    return (
+        _relay_schedule_minute_index(now_pacific) - offset
+    ) % interval == 0
+
+
+def _next_scheduled_relay_at(now_pacific: datetime) -> datetime:
+    """Return the next scheduled Relay evaluation after ``now_pacific``."""
+
+    interval = max(1, BNL_WEBSITE_RELAY_INTERVAL_MINUTES)
+    candidate = now_pacific.replace(second=0, microsecond=0) + timedelta(
+        minutes=1
+    )
+    offset = BNL_WEBSITE_RELAY_MINUTE_OFFSET % interval
+    delta = (
+        offset - _relay_schedule_minute_index(candidate)
+    ) % interval
+    return candidate + timedelta(minutes=delta)
+
+
 def _scheduled_quiet_relay_due(now_pacific: datetime) -> bool:
     """Return whether this scheduled tick may use a non-fresh relay source."""
-    minutes_since_midnight = now_pacific.hour * 60 + now_pacific.minute
-    return (
-        minutes_since_midnight % BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES
-    ) == 0
+
+    return _scheduled_relay_due(
+        now_pacific,
+        interval_minutes=BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES,
+    )
 
 
 @tasks.loop(minutes=1)
@@ -31252,8 +31399,7 @@ async def website_relay_task():
     if not flags.get("websiteRelayEnabled", True):
         return
     now_pt = datetime.now(PACIFIC_TZ)
-    interval = max(1, BNL_WEBSITE_RELAY_INTERVAL_MINUTES)
-    if (now_pt.minute % interval) != 0:
+    if not _scheduled_relay_due(now_pt):
         return
 
     for guild in iter_managed_guilds():
@@ -42734,6 +42880,7 @@ async def usage(interaction: discord.Interaction):
         name="Protected Token Capacity",
         value=(
             f"Journal reserve: **{diagnostics['journal_protected_tokens']:,} tokens**\n"
+            f"Relay reserve: **{diagnostics['relay_protected_tokens']:,} tokens**\n"
             f"Ordinary-route capacity remaining: "
             f"**{diagnostics['ordinary_route_remaining']:,} tokens**"
         ),
@@ -42753,6 +42900,7 @@ async def usage(interaction: discord.Interaction):
             f"spendable hard headroom: "
             f"**${diagnostics['remaining_effective_hard_usd']:.4f}**\n"
             f"Daily soft floor: **${diagnostics['daily_soft_limit_usd']:.2f}** · "
+            f"Relay pace allowance: **${diagnostics['relay_pace_allowance_usd']:.2f}**\n"
             f"Target pace to date: **${diagnostics['expected_cost_to_date_usd']:.4f}** · "
             f"projected month end: **${diagnostics['projected_month_end_cost_usd']:.4f}**\n"
             f"Average/day: **${diagnostics['average_cost_per_elapsed_day_usd']:.4f}** · "
@@ -43012,7 +43160,8 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- community_presence_last_top_withheld_reason: `{dossier_diag['community_presence_last_top_withheld_reason']}`",
         f"- community_presence_last_error_status: `{dossier_diag['community_presence_last_error_status']}`",
         f"- _bnl_control_flags_last_source_url: `{flags_source}`",
-        f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
+        f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min at offset `:{BNL_WEBSITE_RELAY_MINUTE_OFFSET:02d}`",
+        f"- website_relay_next_scheduled_at: `{_next_scheduled_relay_at(datetime.now(PACIFIC_TZ)).isoformat(timespec='minutes')}`",
     ]
     await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
 
@@ -44192,7 +44341,9 @@ async def bnl_status(interaction: discord.Interaction):
         f"- occasion_next_name: `{occasion_next.get('occasionName', 'none')}`",
         f"- occasion_next_scheduled_for: `{occasion_next.get('scheduledFor', 'none')}`",
         f"- website_contract_version: `{BNL_WEBSITE_CONTRACT_VERSION}`",
-        f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` (interval `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}m`)",
+        f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` (interval `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}m`, offset `:{BNL_WEBSITE_RELAY_MINUTE_OFFSET:02d}`)",
+        f"- website_relay_quiet_interval: `{BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES}m`",
+        f"- website_relay_next_scheduled_at: `{_next_scheduled_relay_at(datetime.now(PACIFIC_TZ)).isoformat(timespec='minutes')}`",
         f"- website_heartbeat_interval: `{BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES}m`",
         f"- website_heartbeat_task_running: `{'yes' if website_presence_heartbeat_task.is_running() else 'no'}`",
         f"- website_presence_last: `{_last_website_presence_result}`",
