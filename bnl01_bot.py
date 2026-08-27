@@ -33879,6 +33879,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     ),
                 )
                 if len(unique_user_ids) == 1
+                and not batch_source_context_available
                 else None
             )
             continuity_contract = build_general_conversation_continuity_contract(
@@ -34322,7 +34323,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             memory_context_injected=True,
             memory_context_source_count=1,
             memory_injection_decision="batch_prompt_public_safe",
-            memory_write_decision=get_route_mode_contract(ROUTE_MODE_NORMAL_CHAT).save_behavior,
+            memory_write_decision=(
+                "none"
+                if batch_source_context_available
+                else get_route_mode_contract(
+                    ROUTE_MODE_NORMAL_CHAT
+                ).save_behavior
+            ),
             source_analysis_context_injected=(
                 batch_source_context_available
             ),
@@ -34330,7 +34337,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             community_scouting_ran=False,
             entity_subjects_detected_count=0,
             subject_extraction_ran=False,
-            save_policy_reason="batch_model_save_pending",
+            save_policy_reason=(
+                "website_read_model_no_store"
+                if batch_source_context_available
+                else "batch_model_save_pending"
+            ),
             durable_memory_write=False,
             scripted_mode_leak_guard_triggered=False,
             leak_guard_result="clear",
@@ -34366,6 +34377,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 ),
                 source_context_available=batch_source_context_available,
             )
+            if not batch_source_context_available
+            else None
         )
         batch_synthesis_decision = (
             batch_synthesis_execution.decision
@@ -34845,6 +34858,16 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 candidate_live=False,
                 guard_status="batch_discord_send_failed",
             )
+            return
+        if batch_source_context_available:
+            logging.info(
+                "batch_response_persistence_skipped "
+                "reason=website_read_model_no_store channel_policy=%s",
+                channel_policy,
+            )
+            _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
+            _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
         await safely_finalize_shared_brain_synthesis(
             batch_synthesis_decision,

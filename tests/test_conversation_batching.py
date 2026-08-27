@@ -723,6 +723,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_scheduler_flushes_two_fragments_with_one_generation_and_send(self):
         channel = self._channel(8103)
         prompts = []
+        save_model = mock.Mock()
 
         async def generate(prompt, **_kwargs):
             prompts.append(prompt)
@@ -736,8 +737,23 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "elapsed_seconds": 0,
             "request_anchor": False,
         }
-        with self._flush_runtime(channel.id, generate), mock.patch.object(
-            bnl01_bot, "_adaptive_batch_wait_seconds", return_value=wait_state
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "_adaptive_batch_wait_seconds",
+                return_value=wait_state,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "save_model_message",
+                new=save_model,
+            ),
         ):
             bnl01_bot._reset_debounce(channel)
             await asyncio.wait_for(bnl01_bot._channel_tasks[channel.id], timeout=0.5)
@@ -746,10 +762,22 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BNL, why are routers weird?", prompts[0])
         self.assertIn("and why do they blink?", prompts[0])
         self.assertEqual(channel.sent, ["One combined response."])
+        save_model.assert_called_once()
+        self.assertEqual(
+            save_model.call_args.args[2],
+            "One combined response.",
+        )
 
     async def test_sealed_batch_queue_question_receives_private_read_model_context(self):
         channel = self._channel(8150)
         generation_calls = []
+        save_model = mock.Mock()
+        persist_name_decision = mock.AsyncMock()
+        record_assessment = mock.AsyncMock()
+        finalize_synthesis = mock.AsyncMock()
+        generate_synthesis = mock.AsyncMock()
+        mark_continuation = mock.Mock()
+        consume_retransmission = mock.Mock()
         queue_context = (
             "Website private queue read model context:\n"
             "Queue:\n"
@@ -774,6 +802,41 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 "maybe_build_bnl_read_model_context",
                 return_value=queue_context,
             ) as context_builder,
+            mock.patch.object(
+                bnl01_bot,
+                "save_model_message",
+                new=save_model,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "persist_batch_bnl_self_name_decision_after_send_async",
+                new=persist_name_decision,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=record_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=finalize_synthesis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=generate_synthesis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_mark_conversation_continuation_state",
+                new=mark_continuation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_consume_awaiting_retransmission",
+                new=consume_retransmission,
+            ),
         ):
             await bnl01_bot._flush_channel_buffer(channel)
 
@@ -790,6 +853,21 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             channel.sent,
             ["Submissions are closed. Rehearsal Artist — Waiting Track is waiting."],
+        )
+        save_model.assert_not_called()
+        persist_name_decision.assert_not_awaited()
+        record_assessment.assert_not_awaited()
+        finalize_synthesis.assert_not_awaited()
+        generate_synthesis.assert_not_awaited()
+        mark_continuation.assert_not_called()
+        consume_retransmission.assert_not_called()
+        self.assertNotIn(
+            channel.id,
+            bnl01_bot._channel_pending_request_intent,
+        )
+        self.assertNotIn(
+            channel.id,
+            bnl01_bot._channel_pending_request_anchor,
         )
 
     async def test_active_batch_guard_receives_typed_gist_attribution_contract(self):
