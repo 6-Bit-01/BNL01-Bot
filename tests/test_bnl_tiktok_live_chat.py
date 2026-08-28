@@ -3,8 +3,11 @@ import unittest
 
 from bnl_tiktok_live_chat import (
     AUTHORITY,
+    COMMENT_AUTHORITY,
     IDENTITY_DEFAULT,
+    INTERACTION_AUTHORITY,
     MEMORY_DEFAULT,
+    METRIC_AUTHORITY,
     SOURCE,
     VISIBILITY,
     LiveChatAdapter,
@@ -29,6 +32,7 @@ def payload(**changes):
         "event_id": "message-1",
         "room_id": "room-1",
         "observed_at": 1_700_000_000.0,
+        "source_at": 1_700_000_000.0,
         "unique_id": "test.viewer",
         "display_name": "Test Viewer",
         "comment_text": "This track is wild.",
@@ -48,6 +52,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(record["source"], SOURCE)
         self.assertEqual(record["visibility"], VISIBILITY)
         self.assertEqual(record["authority"], AUTHORITY)
+        self.assertEqual(record["authority"], COMMENT_AUTHORITY)
         self.assertEqual(record["memory_default"], MEMORY_DEFAULT)
         self.assertEqual(record["identity_default"], IDENTITY_DEFAULT)
 
@@ -58,6 +63,35 @@ class ParseTests(unittest.TestCase):
         )
         self.assertTrue(event.comment_text.startswith("hello world"))
         self.assertLessEqual(len(event.comment_text), 1000)
+
+    def test_parses_all_shadow_telemetry_types(self):
+        cases = [
+            (payload(event_type="like", comment_text=None, like_count="25", like_total="500"), "like"),
+            (payload(event_type="viewer_snapshot", comment_text=None, unique_id="", display_name="", viewer_count="37"), "viewer_snapshot"),
+            (payload(event_type="share", comment_text=None, share_type="2"), "share"),
+            (payload(event_type="follow", comment_text=None), "follow"),
+            (payload(event_type="gift", comment_text=None, gift_id="10", gift_name="Rose", gift_count="3", diamond_count="1", diamond_total="3", combo=True, streak_over=True), "gift"),
+            (payload(event_type="question", comment_text=None, question_id="7", question_text="Where do I submit?", answer_status="0"), "question"),
+            (payload(event_type="join", comment_text=None, join_count="1"), "join"),
+        ]
+        parsed = [parse_line(json.dumps(value), now=1_700_000_000.0) for value, _ in cases]
+        self.assertEqual([event.event_type for event in parsed], [expected for _, expected in cases])
+        self.assertEqual(parsed[0].like_count, 25)
+        self.assertEqual(parsed[1].viewer_count, 37)
+        self.assertEqual(parsed[4].diamond_total, 3)
+        self.assertEqual(parsed[5].question_text, "Where do I submit?")
+        self.assertEqual(parsed[0].telemetry_record()["authority"], INTERACTION_AUTHORITY)
+        self.assertEqual(parsed[1].telemetry_record()["authority"], METRIC_AUTHORITY)
+        self.assertEqual(parsed[5].telemetry_record()["authority"], COMMENT_AUTHORITY)
+
+    def test_source_timestamp_is_preserved_separately_from_receipt_time(self):
+        event = parse_line(
+            json.dumps(payload(observed_at=1_700_000_010.0, source_at=1_700_000_000.0)),
+            now=1_700_000_010.0,
+        )
+        self.assertEqual(event.observed_at, 1_700_000_010.0)
+        self.assertEqual(event.source_at, 1_700_000_000.0)
+        self.assertEqual(event.event_time, 1_700_000_000.0)
 
     def test_failures_are_bounded(self):
         with self.assertRaises(ProtocolError) as invalid:
@@ -79,7 +113,7 @@ class ParseTests(unittest.TestCase):
 class BufferTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
-        self.buffer = LiveChatBuffer(2, 30, self.clock)
+        self.buffer = LiveChatBuffer(3, 30, self.clock)
         self.adapter = LiveChatAdapter(self.buffer, self.clock)
 
     def add(self, event_id, text="comment"):
@@ -89,6 +123,18 @@ class BufferTests(unittest.TestCase):
                     event_id=event_id,
                     comment_text=text,
                     observed_at=self.clock(),
+                    source_at=self.clock(),
+                )
+            )
+        )
+
+    def ingest(self, **changes):
+        return self.adapter.ingest_line(
+            json.dumps(
+                payload(
+                    observed_at=self.clock(),
+                    source_at=self.clock(),
+                    **changes,
                 )
             )
         )
@@ -98,14 +144,17 @@ class BufferTests(unittest.TestCase):
         self.assertIsNone(self.add("a", "replay"))
         self.add("b")
         self.add("c")
+        self.add("d")
         self.assertEqual(
-            [row["event_id"] for row in self.adapter.context_snapshot()], ["b", "c"]
+            [row["event_id"] for row in self.adapter.context_snapshot()],
+            ["b", "c", "d"],
         )
         health = self.adapter.health_snapshot()
         self.assertEqual(health["duplicate_count"], 1)
         self.assertEqual(health["overflow_count"], 1)
+        self.assertEqual(health["comments_accepted"], 4)
 
-    def test_seen_ids_are_bounded_separately_from_comment_buffer(self):
+    def test_seen_ids_are_bounded_separately_from_event_buffer(self):
         buffer = LiveChatBuffer(2, 300, self.clock, max_seen_events=3)
         adapter = LiveChatAdapter(buffer, self.clock)
         for event_id in ("a", "b", "c", "d"):
@@ -119,8 +168,37 @@ class BufferTests(unittest.TestCase):
                 )
             )
         health = adapter.health_snapshot()
-        self.assertEqual(health["comments_buffered"], 2)
+        self.assertEqual(health["events_buffered"], 2)
         self.assertEqual(health["seen_event_ids"], 3)
+
+    def test_metrics_are_deduped_and_aggregated_without_join_retention(self):
+        self.ingest(event_type="like", event_id="like-1", comment_text=None, like_count=100, like_total=1000)
+        self.assertIsNone(
+            self.ingest(event_type="like", event_id="like-1", comment_text=None, like_count=100, like_total=1000)
+        )
+        self.ingest(event_type="viewer_snapshot", event_id="view-1", comment_text=None, unique_id="", display_name="", viewer_count=25)
+        self.ingest(event_type="viewer_snapshot", event_id="view-2", comment_text=None, unique_id="", display_name="", viewer_count=41)
+        self.ingest(event_type="share", event_id="share-1", comment_text=None)
+        self.ingest(event_type="follow", event_id="follow-1", comment_text=None)
+        self.ingest(event_type="gift", event_id="gift-1", comment_text=None, gift_name="Rose", gift_count=3, diamond_total=3, streak_over=True)
+        self.ingest(event_type="question", event_id="question-1", comment_text=None, question_text="Where?", question_id="1")
+        self.ingest(event_type="join", event_id="join-1", comment_text=None, join_count=1)
+
+        health = self.adapter.health_snapshot()
+        self.assertEqual(health["taps_observed"], 100)
+        self.assertEqual(health["latest_like_total"], 1000)
+        self.assertEqual(health["viewer_count"], 41)
+        self.assertEqual(health["peak_viewers"], 41)
+        self.assertEqual(health["shares"], 1)
+        self.assertEqual(health["follows"], 1)
+        self.assertEqual(health["gift_events"], 1)
+        self.assertEqual(health["gift_units"], 3)
+        self.assertEqual(health["diamond_total"], 3)
+        self.assertEqual(health["questions"], 1)
+        self.assertEqual(health["joins"], 1)
+        self.assertEqual(health["duplicate_count"], 1)
+        self.assertFalse(any(row["event_type"] == "join" for row in self.adapter.telemetry_snapshot()))
+        self.assertEqual(self.adapter.context_snapshot(), [])
 
     def test_expires_and_clears_at_live_end(self):
         self.add("a")
