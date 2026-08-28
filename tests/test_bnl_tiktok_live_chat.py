@@ -94,8 +94,8 @@ class BufferTests(unittest.TestCase):
         )
 
     def test_dedupes_and_caps(self):
-        self.add("a")
-        self.add("a", "replay")
+        self.assertIsNotNone(self.add("a"))
+        self.assertIsNone(self.add("a", "replay"))
         self.add("b")
         self.add("c")
         self.assertEqual(
@@ -104,6 +104,23 @@ class BufferTests(unittest.TestCase):
         health = self.adapter.health_snapshot()
         self.assertEqual(health["duplicate_count"], 1)
         self.assertEqual(health["overflow_count"], 1)
+
+    def test_seen_ids_are_bounded_separately_from_comment_buffer(self):
+        buffer = LiveChatBuffer(2, 300, self.clock, max_seen_events=3)
+        adapter = LiveChatAdapter(buffer, self.clock)
+        for event_id in ("a", "b", "c", "d"):
+            adapter.ingest_line(
+                json.dumps(
+                    payload(
+                        event_id=event_id,
+                        comment_text=event_id,
+                        observed_at=self.clock(),
+                    )
+                )
+            )
+        health = adapter.health_snapshot()
+        self.assertEqual(health["comments_buffered"], 2)
+        self.assertEqual(health["seen_event_ids"], 3)
 
     def test_expires_and_clears_at_live_end(self):
         self.add("a")

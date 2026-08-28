@@ -16,6 +16,7 @@ import json
 import re
 import signal
 import sys
+from collections import OrderedDict
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -26,11 +27,35 @@ MAX_UNIQUE_ID_CHARS = 80
 MAX_DISPLAY_NAME_CHARS = 120
 MAX_COMMENT_CHARS = 1000
 MAX_ERROR_CODE_CHARS = 80
+DEFAULT_DEDUPE_CAPACITY = 20_000
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WHITESPACE_RE = re.compile(r"\s+")
 _SAFE_CODE_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]+$")
+
+
+class EventIdDeduper:
+    """Bound replay suppression without retaining comment text."""
+
+    def __init__(self, capacity: int = DEFAULT_DEDUPE_CAPACITY) -> None:
+        if capacity <= 0:
+            raise ValueError("dedupe capacity must be positive")
+        self.capacity = int(capacity)
+        self._event_ids: "OrderedDict[str, None]" = OrderedDict()
+        self.duplicates = 0
+
+    def accept(self, event_id: str) -> bool:
+        if not event_id:
+            return True
+        if event_id in self._event_ids:
+            self._event_ids.move_to_end(event_id)
+            self.duplicates += 1
+            return False
+        self._event_ids[event_id] = None
+        while len(self._event_ids) > self.capacity:
+            self._event_ids.popitem(last=False)
+        return True
 
 
 def _bounded_text(value: Any, max_chars: int) -> str:
@@ -113,6 +138,18 @@ def _event_message_id(data: Mapping) -> str:
     )
 
 
+def _event_source_time(data: Mapping) -> str:
+    common = _mapping(data.get("common"))
+    return _first_nonempty(
+        common.get("createTime"),
+        common.get("create_time"),
+        common.get("clientSendTime"),
+        common.get("client_send_time"),
+        data.get("createTime"),
+        data.get("create_time"),
+    )
+
+
 def _moderator_flag(user: Mapping) -> bool:
     identity = _mapping(user.get("identity"))
     user_attr = _mapping(user.get("userAttr"))
@@ -135,10 +172,10 @@ def _fallback_event_id(
     room_id: str,
     unique_id: str,
     comment_text: str,
-    observed_at: str,
+    source_marker: str,
 ) -> str:
     material = "\x1f".join(
-        [room_id, unique_id, comment_text, observed_at]
+        [room_id, unique_id, comment_text, source_marker]
     ).encode("utf-8", errors="replace")
     return "local:{}".format(hashlib.sha256(material).hexdigest()[:32])
 
@@ -164,7 +201,12 @@ def build_comment_payload(event: Any) -> Optional[Dict[str, Any]]:
     event_id = (
         "tiktok:{}:{}".format(room_id or "room", message_id)
         if message_id
-        else _fallback_event_id(room_id, unique_id, comment_text, observed_at)
+        else _fallback_event_id(
+            room_id,
+            unique_id,
+            comment_text,
+            _event_source_time(data) or observed_at,
+        )
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -245,31 +287,49 @@ def run_transport(args: argparse.Namespace) -> int:
     client.max_retries(args.max_retries)
     client.stale_timeout(args.stale_timeout)
 
+    comment_deduper = EventIdDeduper(args.dedupe_capacity)
+    stream_ended = False
+    disconnected_emitted = False
+
     @client.on(EventType.connected)
     def on_connected(event: Any) -> None:
-        emit_payload(build_lifecycle_payload("connected", event))
+        if not stream_ended:
+            emit_payload(build_lifecycle_payload("connected", event))
 
     @client.on(EventType.chat)
     def on_chat(event: Any) -> None:
+        if stream_ended:
+            return
         payload = build_comment_payload(event)
-        if payload is not None:
+        if payload is not None and comment_deduper.accept(payload["event_id"]):
             emit_payload(payload)
 
     @client.on(EventType.reconnecting)
     def on_reconnecting(event: Any) -> None:
-        emit_payload(build_lifecycle_payload("reconnecting", event))
+        if not stream_ended:
+            emit_payload(build_lifecycle_payload("reconnecting", event))
 
     @client.on(EventType.live_ended)
     def on_live_ended(event: Any) -> None:
+        nonlocal stream_ended
+        if stream_ended:
+            return
+        stream_ended = True
         emit_payload(build_lifecycle_payload("live_ended", event))
+        client.disconnect()
 
     @client.on(EventType.disconnected)
     def on_disconnected(event: Any) -> None:
+        nonlocal disconnected_emitted
+        if disconnected_emitted:
+            return
+        disconnected_emitted = True
         emit_payload(build_lifecycle_payload("disconnected", event))
 
     @client.on("error")
     def on_error(event: Any) -> None:
-        emit_payload(build_transport_error_payload(getattr(event, "data", event)))
+        if not stream_ended:
+            emit_payload(build_transport_error_payload(getattr(event, "data", event)))
 
     def request_stop(_signum: int, _frame: Any) -> None:
         emit_diagnostic("stop_requested")
@@ -306,6 +366,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--stale-timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--dedupe-capacity",
+        type=int,
+        default=DEFAULT_DEDUPE_CAPACITY,
+        help="Maximum recent TikTok message IDs retained for replay suppression",
+    )
     return parser
 
 
@@ -316,6 +382,8 @@ def main(argv: Optional[list] = None) -> int:
         parser.error("--max-retries must be between 0 and 100")
     if args.stale_timeout < 10 or args.stale_timeout > 600:
         parser.error("--stale-timeout must be between 10 and 600 seconds")
+    if args.dedupe_capacity < 100 or args.dedupe_capacity > 100_000:
+        parser.error("--dedupe-capacity must be between 100 and 100000")
     return run_transport(args)
 
 

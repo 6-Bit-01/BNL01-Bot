@@ -95,11 +95,14 @@ class LiveChatBuffer:
         max_events: int = 1000,
         max_age_seconds: float = 15 * 60,
         time_fn: Callable[[], float] = time.time,
+        max_seen_events: Optional[int] = None,
     ) -> None:
-        if max_events <= 0 or max_age_seconds <= 0:
+        resolved_max_seen = (int(max_events) * 4) if max_seen_events is None else int(max_seen_events)
+        if max_events <= 0 or max_age_seconds <= 0 or resolved_max_seen <= 0:
             raise ValueError("buffer limits must be positive")
         self.max_events = int(max_events)
         self.max_age_seconds = float(max_age_seconds)
+        self.max_seen_events = resolved_max_seen
         self.time_fn = time_fn
         self.events: Deque[LiveEvent] = deque()
         self.seen: "OrderedDict[str, float]" = OrderedDict()
@@ -129,6 +132,8 @@ class LiveChatBuffer:
             self.duplicates += 1
             return False
         self.seen[event.event_id] = current
+        while len(self.seen) > self.max_seen_events:
+            self.seen.popitem(last=False)
         self.events.append(event)
         while len(self.events) > self.max_events:
             self.events.popleft()
@@ -177,6 +182,12 @@ class LiveChatAdapter:
         }
 
     def ingest_line(self, line: Union[str, bytes]) -> Optional[LiveEvent]:
+        """Parse one transport line and return only accepted events.
+
+        Invalid lines and replayed comments return ``None``. Lifecycle events are
+        returned after their health state is applied.
+        """
+
         self.health["received_lines"] += 1
         try:
             event = parse_line(line, now=self.time_fn())
@@ -184,7 +195,9 @@ class LiveChatAdapter:
             self.health["invalid_lines"] += 1
             self.health["last_error_code"] = exc.code
             return None
-        self.ingest_event(event)
+        accepted = self.ingest_event(event)
+        if event.is_comment and not accepted:
+            return None
         return event
 
     def ingest_event(self, event: LiveEvent) -> bool:
@@ -230,6 +243,7 @@ class LiveChatAdapter:
         return {
             **self.health,
             "comments_buffered": len(self.buffer.events),
+            "seen_event_ids": len(self.buffer.seen),
             "duplicate_count": self.buffer.duplicates,
             "expired_count": self.buffer.expired,
             "overflow_count": self.buffer.overflow,
