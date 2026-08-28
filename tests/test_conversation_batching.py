@@ -870,6 +870,55 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             bnl01_bot._channel_pending_request_anchor,
         )
 
+    async def test_non_privileged_tester_queue_fragment_bypasses_reply_cooldown(self):
+        channel = self._channel(8151)
+        generation_calls = []
+        save_model = mock.Mock()
+        queue_context = (
+            "Website private queue read model context:\n"
+            "Queue:\n"
+            "- Session=Private rehearsal, status=open, activeCount=2\n"
+            "Queued tracks:\n"
+            "- Tester One — First Track\n"
+            "- Tester Two — Second Track"
+        )
+
+        async def generate(prompt, **kwargs):
+            generation_calls.append((prompt, kwargs))
+            return "The rehearsal queue is open with two active tracks."
+
+        # This is deliberately an unmentioned, non-owner fragment immediately
+        # after a prior reply. Channel admission, not Discord identity, is the
+        # authorization boundary for a read-only queue answer here.
+        self._prime_flush(channel, "queue status")
+        bnl01_bot._channel_last_reply_at[channel.id] = bnl01_bot.datetime.now(
+            bnl01_bot.PACIFIC_TZ
+        )
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value=queue_context,
+            ) as context_builder,
+            mock.patch.object(
+                bnl01_bot,
+                "save_model_message",
+                new=save_model,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        context_builder.assert_called_once_with("queue status", "sealed_test")
+        self.assertEqual(len(generation_calls), 1)
+        self.assertIn(queue_context, generation_calls[0][0])
+        self.assertTrue(generation_calls[0][1]["source_context_available"])
+        self.assertEqual(
+            channel.sent,
+            ["The rehearsal queue is open with two active tracks."],
+        )
+        save_model.assert_not_called()
+
     async def test_active_batch_guard_receives_typed_gist_attribution_contract(self):
         channel = self._channel(8136)
         prompts = []

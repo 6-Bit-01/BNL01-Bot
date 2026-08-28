@@ -155,6 +155,11 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("PRIVATE_SIMULATION_TRACK", sealed_context)
         self.assertIn("PRIVATE_TEST_QUEUE_TITLE", operator_context)
         self.assertIn("private", operator_context.lower())
+        self.assertIn(
+            "Answer queue-related questions from any participant who can speak here",
+            sealed_context,
+        )
+        self.assertNotIn("private owner/admin test", sealed_context)
         self.assertIn("Do not use this queue data in public output", operator_context)
 
     def test_private_queue_cannot_drive_public_current_state_or_showday_output(self):
