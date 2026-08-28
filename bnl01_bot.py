@@ -2027,6 +2027,8 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
             return _bnl_read_model_cache
 
     headers = {"Accept": "application/json"}
+    if force:
+        headers["Cache-Control"] = "no-cache"
     if BNL_API_KEY:
         headers["x-api-key"] = BNL_API_KEY
     req = urllib.request.Request(BNL_READ_MODEL_URL, method="GET", headers=headers)
@@ -2074,9 +2076,19 @@ _QUEUE_READ_MODEL_PATTERNS = (
     r"\bwho(?:['’]s| is) playing(?: (?:now|currently|right now))?\b",
     r"\bnow playing\b",
     r"\bwhat(?:['’]s| is) playing(?: (?:now|currently|right now))?\b",
+    r"\bwhats playing(?: (?:now|currently|right now))?\b",
+    r"\bwhat (?:song|track) is on\b",
+    r"\bwhat (?:are we|am i) listening to\b",
+    r"\bwhat(?:['’]s| is|s) (?:currently )?(?:pulled|loaded) up\b",
+    r"\bwhat (?:did|do|have) (?:you|we) (?:pull|pulled|load|loaded) up\b",
     r"\bwho(?:['’]s| is) up next\b",
+    r"\bwhat(?:['’]s| is|s) next\b",
     r"\bup next\b",
     r"\bnext (?:track|song)\b",
+    r"\b(?:full|whole|entire|complete) (?:current )?queue\b",
+    r"\b(?:list|show|give|send|read)(?: me)? (?:the )?(?:current )?queue\b",
+    r"\b(?:who|what)(?:['’]s| is| are) (?:in|on) (?:the )?queue\b",
+    r"\bis\b.{1,80}\bin (?:the )?queue\b",
     r"\b(?:current )?queue\b",
     r"\bque(?:ue)? status\b",
     r"\b(?:submissions?|queue) (?:open|closed)\b",
@@ -2087,6 +2099,12 @@ _QUEUE_READ_MODEL_PATTERNS = (
     r"\bpriority signal\b",
     r"\bwheel spins? owed\b",
     r"\bhow many wheel spins?\b",
+    r"\bwho won (?:the )?wheel\b",
+    r"\bwheel (?:winner|chosen|result|status)\b",
+    r"\bdid\b.{1,60}\bwin (?:the )?wheel\b",
+    r"\bwhat (?:changed|moved)\b.{0,60}\bqueue\b",
+    r"\bwhy did\b.{1,80}\bmove\b",
+    r"\bwhere did\b.{1,80}\bgo\b",
     r"\bhow many (?:tracks|songs|submissions)\b",
     r"\bhow many(?: (?:tracks|songs))?(?: are)?(?: left)? before\b",
     r"\bhow long\b.{0,60}\b(?:tracks?|songs?)\b",
@@ -2095,6 +2113,123 @@ _QUEUE_READ_MODEL_PATTERNS = (
     r"\b(?:my|our) (?:track|song|submission)\b.{0,45}"
     r"\b(?:queue|submit|accept|play|next|through|waiting|received|show(?:ed)? up|there)\b",
 )
+
+
+def _queue_query_focus(text: str) -> dict:
+    """Classify which slice of the complete queue snapshot this request needs."""
+
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    now_playing = bool(re.search(
+        r"\b(?:now playing|whats playing|what(?:['’]s| is) playing|"
+        r"what (?:song|track) is on|what (?:are we|am i) listening to|"
+        r"what(?:['’]s| is|s) (?:currently )?(?:pulled|loaded) up|"
+        r"what (?:did|do|have) (?:you|we) (?:pull|pulled|load|loaded) up)\b",
+        normalized,
+    ))
+    up_next = bool(re.search(
+        r"\b(?:up next|who(?:['’]s| is) up next|"
+        r"what(?:['’]s| is|s) next|next (?:track|song))\b",
+        normalized,
+    ))
+    full_lineup = bool(re.search(
+        r"\b(?:full|whole|entire|complete) (?:current )?queue\b|"
+        r"\b(?:list|show|give|send|read)(?: me)? (?:the )?(?:current )?queue\b|"
+        r"\b(?:who|what)(?:['’]s| is| are) (?:in|on) (?:the )?queue\b|"
+        r"\b(?:what|which) (?:tracks?|songs?|artists?) (?:are )?"
+        r"(?:queued|(?:in|on) (?:the )?queue)\b|"
+        r"\b(?:tracks|songs|artists) (?:are )?queued\b|"
+        r"\b(?:all|every) (?:queued )?(?:tracks?|songs?|artists?)\b",
+        normalized,
+    ))
+    wheel = "wheel" in normalized
+    movement = bool(re.search(
+        r"\b(?:changed|change|moved|move|reordered|reorder|position|"
+        r"where did|why did|returned|restored|signal hold)\b",
+        normalized,
+    ))
+    personal_lookup = bool(re.search(
+        r"\b(?:my|our) (?:track|song|submission)\b",
+        normalized,
+    ))
+    position_lookup = bool(re.search(
+        r"\b(?:where|when|position|before|ahead|behind)\b.{0,80}"
+        r"\b(?:track|song|submission|queue)\b|"
+        r"\b(?:track|song|submission)\b.{0,80}"
+        r"\b(?:where|when|position|before|ahead|behind|queue)\b|"
+        r"\bis\b.{1,80}\bin (?:the )?queue\b",
+        normalized,
+    ))
+    completed = bool(re.search(
+        r"\b(?:completed tracks?|who played|what played|already played)\b",
+        normalized,
+    ))
+    return {
+        "now_playing": now_playing,
+        "up_next": up_next,
+        "full_lineup": full_lineup,
+        "wheel": wheel,
+        "movement": movement,
+        "personal_lookup": personal_lookup,
+        "position_lookup": position_lookup,
+        "completed": completed,
+    }
+
+
+def _queue_search_text(value: object) -> str:
+    return re.sub(r"[^\w@]+", " ", str(value or "").casefold()).strip()
+
+
+def _queue_track_matches_query(track: dict, user_text: str) -> bool:
+    if not isinstance(track, dict):
+        return False
+    query = _queue_search_text(user_text)
+    if not query:
+        return False
+    for key in (
+        "detectedArtistName",
+        "submittedArtistName",
+        "artist",
+        "artistName",
+        "detectedSongTitle",
+        "submittedSongTitle",
+        "providerTitle",
+        "title",
+        "trackTitle",
+        "tiktokHandle",
+        "collaboratorNames",
+    ):
+        candidate = _queue_search_text(track.get(key))
+        if len(candidate) >= 3 and (
+            candidate in query
+            or candidate.lstrip("@") in query
+        ):
+            return True
+    return False
+
+
+def _queue_tracks_for_request(
+    tracks: list,
+    user_text: str,
+    focus: dict,
+) -> list:
+    """Search the full ordered list, then return only facts relevant to this request."""
+
+    if focus.get("full_lineup"):
+        return []
+    matches = [
+        track for track in tracks
+        if isinstance(track, dict) and _queue_track_matches_query(track, user_text)
+    ]
+    if matches:
+        return matches
+    if focus.get("personal_lookup") or focus.get("position_lookup"):
+        # "My song" needs the full temporary line so Gemini can compare the
+        # current speaker label from the batch prompt. This is request-scoped,
+        # read-only context and is never persisted.
+        return [track for track in tracks if isinstance(track, dict)]
+    if focus.get("completed"):
+        return [track for track in tracks if isinstance(track, dict)]
+    return []
 
 
 def _channel_allows_private_bnl_queue(channel_policy: str = "") -> bool:
@@ -2267,7 +2402,12 @@ def _track_label(
         label = _compact_public_text(track.get("label") or track.get("displayName"), 120)
     extras = []
     if include_lane:
-        lane = _compact_public_text(track.get("lane") or track.get("queueLane"), 40)
+        lane = _compact_public_text(
+            track.get("lane")
+            or track.get("queueLane")
+            or track.get("currentLane"),
+            40,
+        )
         if lane:
             extras.append(lane)
     if include_source:
@@ -2275,7 +2415,11 @@ def _track_label(
         if source_type:
             extras.append(source_type)
     if include_queue_details:
-        queue_position = track.get("queuePosition")
+        queue_position = (
+            track.get("queuePosition")
+            if track.get("queuePosition") is not None
+            else track.get("currentQueuePosition")
+        )
         if (
             isinstance(queue_position, int)
             and not isinstance(queue_position, bool)
@@ -2307,6 +2451,61 @@ def _track_label(
     return label
 
 
+def _queue_event_label(event: dict) -> str:
+    if not isinstance(event, dict):
+        return ""
+    event_type = _compact_public_text(event.get("eventType"), 60)
+    if not event_type:
+        return ""
+    occurred_at = _compact_public_text(event.get("occurredAt"), 40)
+    track = _first_mapping(event.get("track"))
+    track_label = _track_label(
+        track,
+        include_lane=True,
+        include_queue_details=True,
+    )
+    details = _first_mapping(event.get("details"))
+    detail_bits = []
+    for label, key in (
+        ("candidates", "wheelCandidateCount"),
+        ("spinsAdded", "wheelSpinsAdded"),
+        ("spinsOwed", "wheelSpinsOwed"),
+        ("previousLane", "signalHoldPreviousLane"),
+    ):
+        value = details.get(key)
+        if value is not None and value != "":
+            detail_bits.append(f"{label}={_compact_public_text(value, 30)}")
+    bits = [event_type]
+    if track_label:
+        bits.append(track_label)
+    if detail_bits:
+        bits.append(", ".join(detail_bits))
+    if occurred_at:
+        bits.append(occurred_at)
+    return " | ".join(bits)
+
+
+def _queue_request_focus_lines(focus: dict, queue_url: str) -> list:
+    lines = [
+        "- Response scope: answer only the queue fact(s) actually requested; do not dump unrelated counts, tracks, or show statistics.",
+    ]
+    if focus.get("full_lineup"):
+        destination = queue_url or "the BARCODE Radio queue page"
+        lines.append(
+            "- Full-lineup request: do not reproduce the complete lineup in Discord; "
+            f"direct the user to {destination}."
+        )
+    if focus.get("now_playing"):
+        lines.append("- Now-playing request: answer with the current loaded track and playback state only unless the user asks for more.")
+    if focus.get("up_next"):
+        lines.append("- Up-next request: answer with Up next only unless the user asks for more.")
+    if focus.get("position_lookup") or focus.get("personal_lookup"):
+        lines.append("- Position request: report the matched track's current queuePosition and only the useful immediate context.")
+    if focus.get("wheel"):
+        lines.append("- Wheel request: use the current Wheel state and the latest confirmed winner; do not treat an unconfirmed result as a winner.")
+    return lines
+
+
 def build_bnl_read_model_context(read_model: dict, user_text: str, channel_policy: str) -> str:
     """Build a compact prompt block from the channel-authorized read model."""
 
@@ -2324,6 +2523,8 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
     source_context_items = _public_source_context_items(read_model)
+    queue_query = _queue_read_model_query(user_text)
+    queue_focus = _queue_query_focus(user_text) if queue_query else {}
 
     # A private website response still contains independently public-safe site
     # context. Once its queue/history sections have been stripped for a public
@@ -2346,7 +2547,15 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     if schema_revision:
         lines[-1] += f" / schemaRevision={schema_revision}"
 
-    if source_context_items:
+    include_public_site_canon = bool(
+        source_context_items
+        and (
+            not queue_query
+            or not queue
+            or re.search(r"\b(?:site|website|dossier)\b", user_text or "", re.IGNORECASE)
+        )
+    )
+    if include_public_site_canon:
         lines.append("\nPublic site canon:")
         for item in source_context_items[:6]:
             title = _compact_public_text(item.get("title") or item.get("name") or item.get("id"), 80)
@@ -2362,7 +2571,15 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         priority_signal = _first_mapping(queue.get("prioritySignal"), queue.get("priority"))
         queued_tracks = _first_list(queue.get("queuedTracks"), queue.get("queue"), queue.get("activeTracks"), queue.get("tracks"))
         completed_tracks = _first_list(queue.get("completedTracks"), queue.get("completed"), queue.get("playedTracks"))
+        removed_tracks = _first_list(queue.get("removedTracks"), queue.get("removed"))
+        queue_url = _compact_public_text(queue.get("queueUrl"), 240)
+        wheel = _first_mapping(queue.get("wheel"))
+        wheel_timing = _first_mapping(queue.get("wheelTiming"), wheel.get("timing"))
+        playback_timing = _first_mapping(queue.get("playbackTiming"))
+        recent_events = _first_list(queue.get("recentEvents"))
         lines.append("\nQueue:")
+        if queue_query:
+            lines.extend(_queue_request_focus_lines(queue_focus, queue_url))
         session_bits = []
         session_field_specs = (
             ("Session", ("title",)),
@@ -2388,6 +2605,9 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                 status_bits.append(f"{key}={_compact_public_text(value, 40)}")
         if status_bits:
             lines.append("- Status: " + ", ".join(status_bits))
+        revision = _first_present_value(queue, ("revision",))
+        if revision is not None:
+            lines.append(f"- Queue revision: {_compact_public_text(revision, 30)}")
         now_label = _track_label(now_playing, include_queue_details=True)
         if now_label:
             lines.append(f"- Now playing: {now_label}")
@@ -2398,6 +2618,19 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             lines.append(f"- Up next: {next_label}")
         else:
             lines.append("- Up next: none")
+        if queue_focus.get("now_playing") and playback_timing:
+            playback_bits = []
+            for label, key in (
+                ("state", "playbackState"),
+                ("positionSeconds", "currentTimeSeconds"),
+                ("durationSeconds", "durationSeconds"),
+                ("observedAt", "observedAt"),
+            ):
+                value = playback_timing.get(key)
+                if value is not None and value != "":
+                    playback_bits.append(f"{label}={_compact_public_text(value, 40)}")
+            if playback_bits:
+                lines.append("- Playback: " + ", ".join(playback_bits))
         wheel_spins = _first_present_value(queue, ("wheelSpinsOwed",))
         if wheel_spins is None:
             wheel_spins = _first_present_value(status, ("wheelSpinsOwed",))
@@ -2405,6 +2638,28 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             wheel_spins = _first_present_value(session, ("wheelSpinsOwed",))
         if wheel_spins is not None:
             lines.append(f"- Wheel spins owed: {_compact_public_text(wheel_spins, 30)}")
+        if queue_focus.get("wheel") and wheel:
+            wheel_status = _compact_public_text(
+                _first_present_value(wheel, ("status",))
+                or _first_present_value(wheel_timing, ("status",)),
+                40,
+            )
+            if wheel_status:
+                lines.append(f"- Wheel ceremony status: {wheel_status}")
+            winner = _first_mapping(wheel.get("lastConfirmedWinner"))
+            winner_label = _track_label(
+                winner,
+                include_lane=True,
+                include_queue_details=True,
+            )
+            if winner_label:
+                occurred_at = _compact_public_text(winner.get("occurredAt"), 40)
+                lines.append(
+                    f"- Latest confirmed Wheel winner: {winner_label}"
+                    + (f" at {occurred_at}" if occurred_at else "")
+                )
+            else:
+                lines.append("- Latest confirmed Wheel winner: none recorded")
         priority_enabled = priority_signal.get("enabled") if priority_signal else None
         priority_label = _compact_public_text(
             _first_present_value(priority_signal, ("label", "name")) if priority_signal else None,
@@ -2416,9 +2671,14 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             priority_label = _compact_public_text(_first_present_value(session, ("priorityUpgradeLabel",)), 80)
         if priority_signal or priority_enabled is not None or priority_label:
             lines.append(f"- Priority Signal: enabled={priority_enabled if priority_enabled is not None else 'unknown'}" + (f", label={priority_label}" if priority_label else ""))
-        if queued_tracks:
-            lines.append("\nQueued tracks:")
-            for track in queued_tracks[:8]:
+        selected_queued_tracks = _queue_tracks_for_request(
+            queued_tracks,
+            user_text,
+            queue_focus,
+        ) if queue_query else queued_tracks[:8]
+        if selected_queued_tracks:
+            lines.append("\nRelevant queued tracks:")
+            for track in selected_queued_tracks:
                 label = _track_label(
                     track,
                     include_lane=True,
@@ -2427,16 +2687,49 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                 )
                 if label:
                     lines.append(f"- {label}")
-        if completed_tracks:
-            lines.append("\nCompleted public tracks:")
-            for track in completed_tracks[:5]:
+        matched_completed_tracks = [
+            track for track in completed_tracks
+            if isinstance(track, dict) and _queue_track_matches_query(track, user_text)
+        ]
+        if queue_focus.get("completed") and not matched_completed_tracks:
+            matched_completed_tracks = [
+                track for track in completed_tracks if isinstance(track, dict)
+            ]
+        if matched_completed_tracks:
+            lines.append("\nRelevant completed tracks:")
+            for track in matched_completed_tracks:
                 label = _track_label(track, include_lane=False)
                 if label:
                     lines.append(f"- {label}")
+        matched_removed_tracks = [
+            track for track in removed_tracks
+            if isinstance(track, dict) and _queue_track_matches_query(track, user_text)
+        ]
+        if matched_removed_tracks:
+            lines.append("\nRelevant removed tracks:")
+            for track in matched_removed_tracks:
+                label = _track_label(track, include_lane=True)
+                if label:
+                    lines.append(f"- {label}")
+        if queue_focus.get("wheel") or queue_focus.get("movement"):
+            event_source = (
+                _first_list(wheel.get("recentEvents"))
+                if queue_focus.get("wheel") and wheel
+                else recent_events
+            )
+            event_lines = [
+                _queue_event_label(event)
+                for event in event_source[-12:]
+                if isinstance(event, dict)
+            ]
+            event_lines = [line for line in event_lines if line]
+            if event_lines:
+                lines.append("\nRelevant recent queue events:")
+                lines.extend(f"- {line}" for line in event_lines)
 
     artists_section_map = artists_section if isinstance(artists_section, dict) else {}
     artists = _first_list(artists_section_map.get("items"), artists_section_map.get("artists"), artists_section if isinstance(artists_section, list) else [])
-    if artists:
+    if artists and not queue_query:
         lines.append("\nArtists:")
         for artist in artists[:8]:
             if not isinstance(artist, dict):
@@ -2477,7 +2770,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             text = _format_public_dossier_item(dossier, include_boundaries=True)
             if text:
                 lines.append(f"- {text}")
-    elif dossier_items and not dossier_question:
+    elif dossier_items and not dossier_question and not queue_query:
         lines.append("\nPublic dossiers:")
         for dossier in dossier_items[:4]:
             text = _format_public_dossier_item(dossier, include_boundaries=False)
@@ -2486,14 +2779,15 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
 
     rules_section_map = rules_section if isinstance(rules_section, dict) else {}
     read_model_rules = _first_list(rules_section_map.get("items"), rules_section_map.get("rules"), rules_section if isinstance(rules_section, list) else [])
-    lines.append("\nRead-model rules:")
-    for rule in read_model_rules[:5]:
-        rule_text = _compact_public_text(rule, 160)
-        if rule_text:
-            lines.append(f"- {rule_text}")
+    if not queue_query:
+        lines.append("\nRead-model rules:")
+        for rule in read_model_rules[:5]:
+            rule_text = _compact_public_text(rule, 160)
+            if rule_text:
+                lines.append(f"- {rule_text}")
     operator_lanes = _website_operator_lanes(read_model)
     lane_rules = _format_operator_lane_items(operator_lanes.get("doNotStore", []), limit=5) if operator_lanes else []
-    if lane_rules:
+    if lane_rules and not queue_query:
         lines.append("\nSite lane rules:")
         for rule in lane_rules[:5]:
             lines.append(f"- {rule}")
@@ -2502,6 +2796,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             "- This is private authorized testing-channel and operator context only.",
             "- Discord access to this private channel is the read-only queue authorization boundary. Answer queue-related questions from any participant who can speak here; do not require owner, admin, or mod identity.",
             "- This authorization permits queue readouts only; it does not grant admin actions or hidden account, payment, or contact access.",
+            "- BNL can read the authorized snapshot but cannot move tracks, choose winners, start playback, or operate the queue. Never deflect a readable fact question to the production team.",
             "- The compact queue snapshot above is the authoritative current readout. Answer its session status, open/closed state, counts, now playing, up next, order, queuePosition, and duration fields directly when asked.",
             "- Never claim the lineup is hidden, production-only, or unavailable when the compact fields above answer the question. A missing Now playing or Up next value means none, not that BNL lacks access.",
             "- queuePosition is upcoming queue order: position 1 is up next and position N has N-1 queued tracks ahead. Mention a separate Now playing track when it matters.",
@@ -2518,6 +2813,8 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     else:
         guardrail_lines = [
             "- This is public website context only.",
+            "- BNL can read the authorized snapshot but cannot move tracks, choose winners, start playback, or operate the queue. Never deflect a readable fact question to the production team.",
+            "- Answer only what was asked. For a full-lineup request, direct the user to the queue page instead of reproducing the entire queue in Discord.",
             "- Do not treat this as durable memory.",
             "- Do not write, merge, promote, or persist this context.",
             "- Do not claim private account/payment/user data.",
@@ -2535,7 +2832,8 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
 def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> str:
     if not is_bnl_read_model_relevant(user_text, channel_policy):
         return ""
-    read_model = fetch_bnl_read_model()
+    queue_query = _queue_read_model_query(user_text)
+    read_model = fetch_bnl_read_model(force=queue_query)
     if not read_model:
         return ""
     if (
@@ -33640,6 +33938,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "request:\n"
                     + batch_website_read_model_context
                     + "\nAnswer current queue questions directly from this context. "
+                    "Answer only what was asked; if the context marks a full-lineup "
+                    "request, send the queue-page link instead of listing every track. "
                     "Do not replace the current readout with the normal Friday "
                     "schedule or claim that the queue is unavailable.\n"
                 )

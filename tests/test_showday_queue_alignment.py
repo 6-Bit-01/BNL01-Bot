@@ -26,6 +26,7 @@ def read_model(queue_production: bool, *, radio_summary: str = "") -> dict:
         "sections": {
             "sourceContext": source_context,
             "queue": {
+                "queueUrl": "https://www.barcode-network.com/queue",
                 "nowPlaying": {"title": "PRIVATE_TEST_QUEUE_TITLE"},
             },
         },
@@ -44,6 +45,7 @@ def private_read_model() -> dict:
     model["sections"]["queue"] = {
         "available": True,
         "accessScope": "private",
+        "queueUrl": "https://www.barcode-network.com/queue",
         "nowPlaying": {"title": "PRIVATE_TEST_QUEUE_TITLE"},
         "queue": [{"title": "PRIVATE_SIMULATION_TRACK", "isSimulation": True}],
     }
@@ -89,6 +91,7 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["accessScope"], "private")
         self.assertEqual(captured["request"].get_header("X-api-key"), "shared-bnl-key")
+        self.assertEqual(captured["request"].get_header("Cache-control"), "no-cache")
         self.assertEqual(captured["timeout"], 3)
 
     def test_private_read_model_is_rejected_without_service_key(self):
@@ -125,7 +128,7 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
             public_contexts = [
                 bnl01_bot.build_bnl_read_model_context(
                     model,
-                    "what is playing right now?",
+                    "is PRIVATE_SIMULATION_TRACK in the queue?",
                     policy,
                 )
                 for policy in (
@@ -137,12 +140,12 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
             ]
             sealed_context = bnl01_bot.build_bnl_read_model_context(
                 model,
-                "what is playing right now?",
+                "is PRIVATE_SIMULATION_TRACK in the queue?",
                 "sealed_test",
             )
             operator_context = bnl01_bot.build_bnl_read_model_context(
                 model,
-                "what is playing right now?",
+                "is PRIVATE_SIMULATION_TRACK in the queue?",
                 "internal_controlled",
             )
 
@@ -282,6 +285,185 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(crowded_context.splitlines()), 80)
         self.assertIn("Do not write, merge, promote, or persist", crowded_context)
         self.assertIn("Never claim the lineup is hidden", crowded_context)
+
+    def test_natural_now_playing_and_wheel_phrases_activate_queue_context(self):
+        phrases = (
+            "whats playing right now",
+            "what song is on",
+            "what are we listening to",
+            "what did you pull up",
+            "what's pulled up in now playing",
+            "whats next",
+            "who won the wheel",
+        )
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(bnl01_bot._queue_read_model_query(phrase))
+
+    def test_complete_queue_is_searched_beyond_position_eight_without_dumping_it(self):
+        model = private_read_model()
+        model["sections"]["queue"] = {
+            "available": True,
+            "accessScope": "private",
+            "queueUrl": "https://www.barcode-network.com/queue",
+            "revision": 88,
+            "session": {
+                "title": "Deep queue rehearsal",
+                "status": "open",
+                "queueOpen": True,
+                "broadcastPhase": "broadcast_active",
+                "wheelSpinsOwed": 1,
+            },
+            "status": {"activeCount": 44, "capacity": 44, "pressure": "max"},
+            "nowPlaying": {
+                "submittedArtistName": "Loaded Artist",
+                "submittedSongTitle": "Loaded Track",
+            },
+            "upNext": {
+                "submittedArtistName": "Ordered Artist 1",
+                "submittedSongTitle": "Ordered Track 1",
+                "queuePosition": 1,
+            },
+            "queue": [
+                {
+                    "submittedArtistName": f"Ordered Artist {position}",
+                    "submittedSongTitle": f"Ordered Track {position}",
+                    "queuePosition": position,
+                    "lane": "regular",
+                }
+                for position in range(2, 45)
+            ],
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ):
+            lookup = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "Where is Ordered Artist 44 in the queue?",
+                "sealed_test",
+            )
+            full_lineup = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "Show me the whole queue",
+                "sealed_test",
+            )
+            natural_full_lineup = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "What tracks are queued?",
+                "sealed_test",
+            )
+
+        self.assertIn("Ordered Artist 44 — Ordered Track 44", lookup)
+        self.assertIn("queuePosition=44", lookup)
+        self.assertNotIn("Ordered Artist 8 — Ordered Track 8", lookup)
+        self.assertIn("Full-lineup request", full_lineup)
+        self.assertIn("https://www.barcode-network.com/queue", full_lineup)
+        self.assertNotIn("Ordered Artist 44 — Ordered Track 44", full_lineup)
+        self.assertIn("Full-lineup request", natural_full_lineup)
+        self.assertIn("https://www.barcode-network.com/queue", natural_full_lineup)
+        self.assertNotIn("Ordered Artist 44 — Ordered Track 44", natural_full_lineup)
+
+    def test_operational_queue_questions_force_a_fresh_snapshot_and_keep_answers_focused(self):
+        model = private_read_model()
+        model["sections"]["queue"] = {
+            "available": True,
+            "accessScope": "private",
+            "queueUrl": "https://www.barcode-network.com/queue",
+            "session": {"title": "Live test", "status": "open", "queueOpen": True},
+            "status": {"activeCount": 2, "capacity": 44, "pressure": "low"},
+            "nowPlaying": {
+                "submittedArtistName": "Current Artist",
+                "submittedSongTitle": "Current Track",
+            },
+            "upNext": {
+                "submittedArtistName": "Next Artist",
+                "submittedSongTitle": "Next Track",
+                "queuePosition": 1,
+            },
+            "queue": [{
+                "submittedArtistName": "Waiting Artist",
+                "submittedSongTitle": "Waiting Track",
+                "queuePosition": 2,
+            }],
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ), mock.patch.object(
+            bnl01_bot,
+            "fetch_bnl_read_model",
+            return_value=model,
+        ) as fetch:
+            context = bnl01_bot.maybe_build_bnl_read_model_context(
+                "whats playing right now",
+                "sealed_test",
+            )
+
+        fetch.assert_called_once_with(force=True)
+        self.assertIn("Current Artist — Current Track", context)
+        self.assertIn("Now-playing request", context)
+        self.assertNotIn("Waiting Artist — Waiting Track", context)
+        self.assertIn("cannot move tracks", context)
+        self.assertIn("Never deflect", context)
+
+    def test_wheel_question_uses_confirmed_winner_bound_to_current_position(self):
+        model = private_read_model()
+        model["sections"]["queue"] = {
+            "available": True,
+            "accessScope": "private",
+            "queueUrl": "https://www.barcode-network.com/queue",
+            "session": {"title": "Wheel test", "status": "open", "wheelSpinsOwed": 2},
+            "status": {"activeCount": 1, "capacity": 44, "pressure": "low"},
+            "nowPlaying": None,
+            "upNext": None,
+            "queue": [],
+            "wheel": {
+                "spinsOwed": 2,
+                "status": "confirmed",
+                "lastConfirmedWinner": {
+                    "trackId": "winner-track",
+                    "artist": "Wheel Artist",
+                    "title": "Wheel Track",
+                    "currentQueuePosition": 3,
+                    "currentLane": "wheel",
+                    "occurredAt": "2026-08-28T20:00:00.000Z",
+                },
+                "recentEvents": [{
+                    "eventType": "wheel_confirmed",
+                    "occurredAt": "2026-08-28T20:00:00.000Z",
+                    "track": {
+                        "trackId": "winner-track",
+                        "artist": "Wheel Artist",
+                        "title": "Wheel Track",
+                        "currentQueuePosition": 3,
+                        "currentLane": "wheel",
+                    },
+                    "details": {"wheelCandidateCount": 12},
+                }],
+            },
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ):
+            context = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "Who won the wheel?",
+                "sealed_test",
+            )
+
+        self.assertIn("Wheel ceremony status: confirmed", context)
+        self.assertIn("Latest confirmed Wheel winner: Wheel Artist — Wheel Track", context)
+        self.assertIn("queuePosition=3", context)
+        self.assertIn("wheel_confirmed", context)
+        self.assertIn("candidates=12", context)
 
     def test_private_queue_cannot_drive_public_current_state_or_showday_output(self):
         model = private_read_model()
