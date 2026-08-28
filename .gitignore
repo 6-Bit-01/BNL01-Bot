@@ -1,5 +1,6 @@
 venv/
 .venv/
+.venv-tiktok-live/
 venv_backup/
 __pycache__/
 *.db

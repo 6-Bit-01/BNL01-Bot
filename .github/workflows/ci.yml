@@ -37,3 +37,33 @@ jobs:
 
       - name: Verify source and tests
         run: make check PYTHON=python
+
+  tiktok-live-transport-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use isolated transport Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/tiktok-live-ingest/requirements.txt
+
+      - name: Install pinned signerless transport dependency
+        run: >-
+          python -m pip install --disable-pip-version-check
+          -r tools/tiktok-live-ingest/requirements.txt
+
+      - name: Verify upstream transport import contract
+        run: >-
+          python -c "from piratetok_live import EventType, TikTokLiveClient;
+          assert EventType.chat == 'chat'; assert callable(TikTokLiveClient)"
+
+      - name: Verify shadow transport and adapter tests
+        run: |
+          python -m compileall -q bnl_tiktok_live_chat.py scripts tests
+          python -m unittest discover -s tests -p 'test_*tiktok_live*.py'
