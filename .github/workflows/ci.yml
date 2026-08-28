@@ -67,3 +67,21 @@ jobs:
         run: |
           python -m compileall -q bnl_tiktok_live_chat.py scripts tests
           python -m unittest discover -s tests -p 'test_*tiktok_live*.py'
+
+      - name: Verify scheduler scripts and systemd units
+        run: |
+          bash -n \
+            scripts/run_tiktok_live_chat_shadow_window.sh \
+            scripts/tiktok_live_chat_shadow_service.sh
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          cp deploy/systemd/bnl-tiktok-chat-shadow.service "$tmpdir/"
+          cp deploy/systemd/bnl-tiktok-chat-shadow.timer "$tmpdir/"
+          sed -i "s#/home/ubuntu/bnl01#$PWD#g" \
+            "$tmpdir/bnl-tiktok-chat-shadow.service"
+          systemd-analyze verify \
+            "$tmpdir/bnl-tiktok-chat-shadow.service" \
+            "$tmpdir/bnl-tiktok-chat-shadow.timer"
+          systemd-analyze calendar \
+            'Fri *-*-* 18:50:00 America/Los_Angeles' \
+            | grep -F 'Normalized form: Fri *-*-* 18:50:00 America/Los_Angeles'

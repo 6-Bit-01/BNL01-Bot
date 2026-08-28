@@ -1,0 +1,11 @@
+[Unit]
+Description=Start BNL TikTok LIVE chat shadow reader before BARCODE Radio
+
+[Timer]
+OnCalendar=Fri *-*-* 18:50:00 America/Los_Angeles
+Persistent=true
+AccuracySec=1min
+Unit=bnl-tiktok-chat-shadow.service
+
+[Install]
+WantedBy=timers.target

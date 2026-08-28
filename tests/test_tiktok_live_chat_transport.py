@@ -42,6 +42,25 @@ class TransportPayloadTests(unittest.TestCase):
         event = SimpleNamespace(room_id="room", data={"content": "\u0000\n"})
         self.assertIsNone(transport.build_comment_payload(event))
 
+    def test_fallback_event_id_uses_stable_source_time(self):
+        event = SimpleNamespace(
+            room_id="room-1",
+            data={
+                "common": {"createTime": "1787931000000"},
+                "content": "same replayed comment",
+                "user": {"uniqueId": "viewer", "nickname": "Viewer"},
+            },
+        )
+        with mock.patch.object(
+            transport,
+            "_utc_now",
+            side_effect=["2026-08-28T23:30:00Z", "2026-08-28T23:31:00Z"],
+        ):
+            first = transport.build_comment_payload(event)
+            second = transport.build_comment_payload(event)
+        self.assertEqual(first["event_id"], second["event_id"])
+        self.assertNotEqual(first["observed_at"], second["observed_at"])
+
     def test_transport_error_uses_class_only(self):
         payload = transport.build_transport_error_payload(
             RuntimeError("https://example.invalid/?token=secret")
@@ -68,6 +87,15 @@ class TransportPayloadTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0])["event_type"], "connected")
 
+    def test_event_id_deduper_is_bounded(self):
+        deduper = transport.EventIdDeduper(capacity=2)
+        self.assertTrue(deduper.accept("one"))
+        self.assertFalse(deduper.accept("one"))
+        self.assertTrue(deduper.accept("two"))
+        self.assertTrue(deduper.accept("three"))
+        self.assertTrue(deduper.accept("one"))
+        self.assertEqual(deduper.duplicates, 1)
+
 
 class TransportCliTests(unittest.TestCase):
     def test_username_validation(self):
@@ -76,12 +104,12 @@ class TransportCliTests(unittest.TestCase):
             transport.normalize_username("six bit; rm -rf")
 
     def test_missing_dependency_returns_bounded_error(self):
-        # The dependency is intentionally absent from the main test environment.
         args = argparse.Namespace(
             username="six.bit",
             cdn="us",
             max_retries=0,
             stale_timeout=60.0,
+            dedupe_capacity=20_000,
         )
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -94,7 +122,7 @@ class TransportCliTests(unittest.TestCase):
         self.assertEqual(payload["error_code"], "missing_dependency")
         self.assertEqual(stderr.getvalue().strip(), "missing_dependency")
 
-    def test_run_transport_registers_read_only_callbacks(self):
+    def test_run_transport_stops_at_live_end_and_suppresses_replay(self):
         class FakeEventType:
             connected = "connected"
             chat = "chat"
@@ -136,26 +164,28 @@ class TransportCliTests(unittest.TestCase):
             def disconnect(self):
                 self.settings["disconnected"] = True
 
+            def emit(self, event_type, event):
+                for callback in self.listeners.get(event_type, []):
+                    callback(event)
+
             def run(self):
-                events = [
-                    ("connected", SimpleNamespace(room_id="room", data={"room_id": "room"})),
-                    (
-                        "chat",
-                        SimpleNamespace(
-                            room_id="room",
-                            data={
-                                "common": {"msgId": "1"},
-                                "content": "hello",
-                                "user": {"uniqueId": "viewer", "nickname": "Viewer"},
-                            },
-                        ),
-                    ),
-                    ("live_ended", SimpleNamespace(room_id="room", data={})),
-                    ("disconnected", SimpleNamespace(room_id="room", data={})),
-                ]
-                for event_type, event in events:
-                    for callback in self.listeners.get(event_type, []):
-                        callback(event)
+                connected = SimpleNamespace(room_id="room", data={"room_id": "room"})
+                comment = SimpleNamespace(
+                    room_id="room",
+                    data={
+                        "common": {"msgId": "1"},
+                        "content": "hello",
+                        "user": {"uniqueId": "viewer", "nickname": "Viewer"},
+                    },
+                )
+                self.emit("connected", connected)
+                self.emit("chat", comment)
+                self.emit("chat", comment)
+                self.emit("live_ended", SimpleNamespace(room_id="room", data={}))
+                # Simulate the upstream library trying to deliver a stale frame after end.
+                self.emit("reconnecting", SimpleNamespace(room_id="room", data={}))
+                self.emit("chat", comment)
+                self.emit("disconnected", SimpleNamespace(room_id="room", data={}))
 
         fake_module = ModuleType("piratetok_live")
         fake_module.EventType = FakeEventType
@@ -165,6 +195,7 @@ class TransportCliTests(unittest.TestCase):
             cdn="us",
             max_retries=4,
             stale_timeout=75.0,
+            dedupe_capacity=20_000,
         )
         stdout = io.StringIO()
         with mock.patch.dict(sys.modules, {"piratetok_live": fake_module}):
@@ -177,6 +208,7 @@ class TransportCliTests(unittest.TestCase):
             [event["event_type"] for event in emitted],
             ["connected", "comment", "live_ended", "disconnected"],
         )
+        self.assertTrue(FakeClient.last_instance.settings["disconnected"])
         self.assertEqual(FakeClient.last_instance.settings["cdn"], "us")
         self.assertEqual(FakeClient.last_instance.settings["max_retries"], 4)
         self.assertEqual(FakeClient.last_instance.settings["stale_timeout"], 75.0)
