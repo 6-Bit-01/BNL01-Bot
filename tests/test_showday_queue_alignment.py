@@ -162,6 +162,127 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private owner/admin test", sealed_context)
         self.assertIn("Do not use this queue data in public output", operator_context)
 
+    def test_private_queue_context_exposes_rehearsal_position_duration_and_empty_now_playing(self):
+        model = private_read_model()
+        model["sections"]["queue"] = {
+            "available": True,
+            "accessScope": "private",
+            "session": {
+                "title": "Friend rehearsal",
+                "status": "open",
+                "queueOpen": True,
+                "broadcastPhase": "submission_window",
+            },
+            "status": {"activeCount": 3, "capacity": 44, "pressure": "low"},
+            "nowPlaying": None,
+            "upNext": {
+                "submittedArtistName": "6 Bit",
+                "submittedSongTitle": "Node Link Established",
+                "lane": "regular",
+                "sourceType": "upload",
+                "queuePosition": 1,
+                "durationLabel": "3:11",
+                "durationIsEstimate": False,
+            },
+            "queue": [
+                {
+                    "submittedArtistName": "LostMarbles",
+                    "submittedSongTitle": "Still Me",
+                    "lane": "regular",
+                    "sourceType": "youtube",
+                    "queuePosition": 2,
+                    "durationLabel": "est. 4:02",
+                    "durationIsEstimate": True,
+                },
+                {
+                    "submittedArtistName": "WittyF0x",
+                    "submittedSongTitle": "The Man Inside the Tree",
+                    "lane": "regular",
+                    "sourceType": "youtube",
+                    "queuePosition": 3,
+                    "detectedDurationSeconds": 219,
+                    "durationIsEstimate": False,
+                },
+            ],
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ):
+            context = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "How many left before my song?",
+                "sealed_test",
+            )
+
+        self.assertIn("Now playing: none", context)
+        self.assertIn("6 Bit — Node Link Established", context)
+        self.assertIn("queuePosition=1", context)
+        self.assertIn("duration=3:11", context)
+        self.assertIn("LostMarbles — Still Me", context)
+        self.assertIn("queuePosition=2", context)
+        self.assertIn("duration=est. 4:02", context)
+        self.assertIn("duration=3:39", context)
+        self.assertIn("position N has N-1 queued tracks ahead", context)
+        self.assertIn("visible display name", context)
+        self.assertIn("Never claim the lineup is hidden", context)
+
+        crowded_model = json.loads(json.dumps(model))
+        crowded_model["sections"]["sourceContext"] = [
+            {
+                "id": f"source-{index}",
+                "title": f"Source {index}",
+                "summary": "Public source context",
+            }
+            for index in range(6)
+        ]
+        crowded_model["sections"]["queue"]["queue"] = [
+            {
+                "submittedArtistName": f"Queued Artist {index}",
+                "submittedSongTitle": f"Queued Track {index}",
+                "queuePosition": index + 2,
+                "durationLabel": "3:00",
+            }
+            for index in range(8)
+        ]
+        crowded_model["sections"]["queue"]["completed"] = [
+            {
+                "submittedArtistName": f"Completed Artist {index}",
+                "submittedSongTitle": f"Completed Track {index}",
+            }
+            for index in range(5)
+        ]
+        crowded_model["sections"]["artists"] = {
+            "items": [
+                {"name": f"Artist {index}", "tracks": [f"Track {index}"]}
+                for index in range(8)
+            ]
+        }
+        crowded_model["sections"]["dossiers"] = {
+            "items": [
+                {"name": f"Dossier {index}", "summary": "Public summary"}
+                for index in range(8)
+            ]
+        }
+        crowded_model["sections"]["operatorLanes"] = {
+            "doNotStore": [f"Guardrail {index}" for index in range(5)]
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ):
+            crowded_context = bnl01_bot.build_bnl_read_model_context(
+                crowded_model,
+                "queue status and list public dossiers",
+                "sealed_test",
+            )
+        self.assertLessEqual(len(crowded_context.splitlines()), 80)
+        self.assertIn("Do not write, merge, promote, or persist", crowded_context)
+        self.assertIn("Never claim the lineup is hidden", crowded_context)
+
     def test_private_queue_cannot_drive_public_current_state_or_showday_output(self):
         model = private_read_model()
         with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}, clear=False), \

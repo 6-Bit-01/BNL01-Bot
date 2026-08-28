@@ -627,6 +627,12 @@ class GovernedSelfNameTests(unittest.TestCase):
             ("propose", "Módem Azul", "strong_greeting_vocative"),
         )
 
+        queue_question = bnl01_bot.classify_bnl_self_name_request(
+            "Hey is the queue open?"
+        )
+        self.assertEqual(queue_question.action, "none")
+        self.assertEqual(queue_question.evidence_kind, "")
+
         for text in (
             'She asked, "Can I call you Blue?"',
             '"Can I call you Blue?"',
