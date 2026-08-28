@@ -24,6 +24,37 @@ class ReadModelRelevanceTests(unittest.TestCase):
         text = "I keep a dossier of favorite synth patches at home."
         self.assertFalse(bnl01_bot.is_bnl_read_model_relevant(text))
 
+    def test_rehearsal_tester_queue_phrasings_are_identity_neutral(self):
+        queue_examples = [
+            "queue status",
+            "where is my song?",
+            "did my track show up in the queue?",
+            "how many submissions are waiting?",
+            "what song is up next?",
+        ]
+        for text in queue_examples:
+            with self.subTest(text=text):
+                self.assertTrue(bnl01_bot.is_bnl_read_model_relevant(text))
+                self.assertTrue(
+                    bnl01_bot._sealed_test_queue_response_required(
+                        text,
+                        "sealed_test",
+                    )
+                )
+
+        self.assertFalse(
+            bnl01_bot._sealed_test_queue_response_required(
+                "queue status",
+                "public_home",
+            )
+        )
+        self.assertFalse(
+            bnl01_bot._sealed_test_queue_response_required(
+                "I love this song.",
+                "sealed_test",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2070,9 +2070,58 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
 
 _PRIVATE_BNL_QUEUE_POLICIES = frozenset({"sealed_test", "internal_controlled"})
 
+_QUEUE_READ_MODEL_PATTERNS = (
+    r"\bwho(?:'s| is) playing(?: now)?\b",
+    r"\bnow playing\b",
+    r"\bwhat(?:'s| is) playing\b",
+    r"\bwho(?:'s| is) up next\b",
+    r"\bup next\b",
+    r"\bnext (?:track|song)\b",
+    r"\b(?:current )?queue\b",
+    r"\bqueue status\b",
+    r"\b(?:submissions?|queue) (?:open|closed)\b",
+    r"\bartists? (?:are )?(?:in|on|queued)\b",
+    r"\btracks? (?:are )?queued\b",
+    r"\bcompleted tracks?\b",
+    r"\bwho played\b",
+    r"\bpriority signal\b",
+    r"\bwheel spins? owed\b",
+    r"\bhow many wheel spins?\b",
+    r"\bhow many (?:tracks|songs|submissions)\b",
+    r"\b(?:where|when)\b.{0,45}\b(?:my|our) (?:track|song|submission)\b",
+    r"\b(?:my|our) (?:track|song|submission)\b.{0,45}"
+    r"\b(?:queue|submit|accept|play|next|through|waiting|received|show(?:ed)? up|there)\b",
+)
+
 
 def _channel_allows_private_bnl_queue(channel_policy: str = "") -> bool:
     return str(channel_policy or "").strip().lower() in _PRIVATE_BNL_QUEUE_POLICIES
+
+
+def _queue_read_model_query(text: str) -> bool:
+    """Recognize read-only live queue questions without inspecting requester identity."""
+
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return False
+    if _current_queue_state_query(normalized):
+        return True
+    return any(
+        re.search(pattern, normalized)
+        for pattern in _QUEUE_READ_MODEL_PATTERNS
+    )
+
+
+def _sealed_test_queue_response_required(
+    text: str,
+    channel_policy: str = "",
+) -> bool:
+    """Treat access to the sealed test channel as the read-only queue boundary."""
+
+    return (
+        str(channel_policy or "").strip().lower() == "sealed_test"
+        and _queue_read_model_query(text)
+    )
 
 
 def safe_bnl_read_model_for_consumption(
@@ -2092,7 +2141,7 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
     normalized = (text or "").lower()
     if not normalized.strip():
         return False
-    if _current_queue_state_query(normalized):
+    if _queue_read_model_query(normalized):
         return True
 
     explicit_site_patterns = [
@@ -2111,31 +2160,13 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
         r"\bpublic dossier",
         r"\bbarcode network website\b",
     ]
-    queue_patterns = [
-        r"\bwho(?:'s| is) playing(?: now)?\b",
-        r"\bnow playing\b",
-        r"\bwhat(?:'s| is) playing\b",
-        r"\bwho(?:'s| is) up next\b",
-        r"\bup next\b",
-        r"\bnext track\b",
-        r"\b(?:current )?queue\b",
-        r"\bqueue status\b",
-        r"\b(?:submissions?|queue) (?:open|closed)\b",
-        r"\bartists? (?:are )?(?:in|on|queued)\b",
-        r"\btracks? (?:are )?queued\b",
-        r"\bcompleted tracks?\b",
-        r"\bwho played\b",
-        r"\bpriority signal\b",
-        r"\bwheel spins? owed\b",
-        r"\bhow many wheel spins?\b",
-    ]
     context_patterns = [
         r"\bwhat does (?:the )?site say about\b",
         r"\bwhat does (?:the )?website know about\b",
         r"\b(?:barcode radio|barcode network|bnl-?01)\b.*\b(?:site|website|read model|public context)\b",
         r"\b(?:site|website|read model|public context)\b.*\b(?:barcode radio|barcode network|bnl-?01)\b",
     ]
-    patterns = explicit_site_patterns + queue_patterns + context_patterns
+    patterns = explicit_site_patterns + context_patterns
     if any(re.search(pattern, normalized) for pattern in patterns):
         return True
 
@@ -2423,7 +2454,9 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             lines.append(f"- {rule}")
     if private_access:
         lines.extend([
-            "- This is private owner/admin test and operator context only.",
+            "- This is private authorized testing-channel and operator context only.",
+            "- Discord access to this private channel is the read-only queue authorization boundary. Answer queue-related questions from any participant who can speak here; do not require owner, admin, or mod identity.",
+            "- This authorization permits queue readouts only; it does not grant admin actions or hidden account, payment, or contact access.",
             "- Do not use this queue data in public output.",
             "- Do not use it for public replies, public announcements, public recaps, the public Broadcast Deck, or the public Broadcast Archive.",
             "- Simulation/test tracks may be present and must remain private test evidence.",
@@ -33107,7 +33140,18 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     buffered_items = list(buf)
     message_count = len(handoff_items or []) + len(buffered_items)
     pending_items = list(handoff_items or []) + buffered_items
-    response_obligation_pending = batch_has_response_obligation(pending_items)
+    pending_text = " ".join(
+        str(item[1] or "")
+        for item in pending_items
+    )
+    queue_response_obligation_pending = _sealed_test_queue_response_required(
+        pending_text,
+        channel_policy,
+    )
+    response_obligation_pending = bool(
+        batch_has_response_obligation(pending_items)
+        or queue_response_obligation_pending
+    )
 
     if handoff_items is None and not buf:
         _log_batch_event(logging.INFO, "skip", guild_id, channel_id, 0, "empty_buffer")
@@ -33436,6 +33480,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 elif orchestration_decision.response_act in {"observe", "blocked"}:
                     decision = "observe"
                     reason = "orchestration:%s" % orchestration_decision.reason
+            queue_response_required = _sealed_test_queue_response_required(
+                combined_text,
+                channel_policy,
+            )
+            if queue_response_required and decision != "answer":
+                _log_batch_event(
+                    logging.INFO,
+                    "sealed_test_queue_response_forced",
+                    guild_id,
+                    channel_id,
+                    len(collapsed_items),
+                    f"previous_decision={decision};previous_reason={reason}",
+                )
+                decision = "answer"
+                reason = "sealed_test_queue_response_required"
             _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, active_packet["collapsed_count"], f"decision={decision};reason={reason}")
             if (pending_state or pending_anchor) and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
                 _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
