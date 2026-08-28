@@ -1,0 +1,2 @@
+# Isolated Python 3.11+ transport dependency. Do not add this to the main bot venv.
+piratetok-live-py==0.2.0
