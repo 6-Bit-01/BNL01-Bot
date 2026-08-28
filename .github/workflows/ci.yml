@@ -61,7 +61,10 @@ jobs:
       - name: Verify upstream transport import contract
         run: >-
           python -c "from piratetok_live import EventType, TikTokLiveClient;
-          assert EventType.chat == 'chat'; assert callable(TikTokLiveClient)"
+          expected = ('chat', 'like', 'room_user_seq', 'share', 'follow',
+          'gift', 'question_new', 'join', 'live_ended');
+          assert all(getattr(EventType, name, None) == name for name in expected);
+          assert callable(TikTokLiveClient)"
 
       - name: Verify shadow transport and adapter tests
         run: |

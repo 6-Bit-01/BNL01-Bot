@@ -1,4 +1,4 @@
-# TikTok LIVE chat transport (shadow-only)
+# TikTok LIVE public telemetry transport (shadow-only)
 
 This directory documents the optional transport used by
 `scripts/tiktok_live_chat_transport.py`. It connects directly to TikTok's
@@ -13,25 +13,35 @@ Keep the transport in its own virtual environment.
 
 The transport and weekly shadow supervisor:
 
-- read public comments and stream lifecycle events only;
+- read public comments, taps/likes, viewer snapshots, shares, follows, gifts,
+  TikTok Q&A questions, joins, and stream lifecycle events;
 - do not use EulerStream, an API key, a signing service, or TikTok account
   cookies;
 - cannot post comments, gift, follow, moderate, or mutate the show;
-- emit no profile biography, avatar, follower count, gift, like, join, or
-  payment data;
+- emit no profile biography, avatar, follower count, private profile fields,
+  payment/customer data, or currency conversion;
+- treat TikTok gift diamonds only as platform-provided engagement units, not
+  BARCODE payment truth and not a cash value;
 - do not write a database or durable transcript;
 - do not call Gemini, Discord, the website, Relay, Journal, Moments,
   Relationship, Source Files, dossiers, queue actions, or payment owners.
 
-The BNL adapter hard-codes every accepted comment as:
+Every accepted event is hard-coded as:
 
 ```text
 source=tiktok_live_webcast
 visibility=public_observation
-authority=viewer_statement
 lifecycle=current_show_only
 memory_default=do_not_store
 identity_default=tiktok_only_unlinked
+```
+
+Authority varies by event type:
+
+```text
+comment/question=viewer_statement
+like/share/follow/gift/join=public_interaction_event
+viewer_snapshot=platform_room_metric
 ```
 
 A TikTok handle is not a Discord identity, website account, queue submitter,
@@ -60,17 +70,21 @@ Run the raw transport only for a short connection proof:
 
 Do not redirect stdout to a durable file.
 
-## Replay and LIVE-end handling
+## Replay, gift-streak, and LIVE-end handling
 
-TikTok can replay recent Webcast messages after a reconnect. The transport now
-retains only a bounded set of recent event IDs and suppresses duplicate comment
-IDs. When TikTok emits `live_ended`, the transport emits it once, blocks later
-stale-frame comments, and requests a clean disconnect instead of reconnecting
-to the ended room.
+TikTok can replay recent Webcast messages after a reconnect. The transport
+retains only a bounded set of recent event IDs and suppresses duplicates across
+all emitted telemetry types. The window supervisor adds a second deduplication
+boundary across fresh child processes.
 
-The window supervisor adds a second deduplication boundary across fresh child
-processes. It can therefore stop an ended connection and keep checking for a
-new LIVE without printing the same comments again.
+Combo-gift progress frames are not emitted as completed gifts. The transport
+waits for TikTok's streak-over signal and emits the final gift count/diamond
+total once, preventing intermediate combo frames from inflating analytics.
+
+When TikTok emits `live_ended`, the transport emits it once, blocks later stale
+frames, and requests a clean disconnect instead of reconnecting to the ended
+room. The weekly supervisor then keeps checking for a new LIVE until the show
+window closes.
 
 ## Weekly unattended shadow window
 
@@ -92,11 +106,15 @@ that window it:
 - connects automatically when the account becomes LIVE;
 - restarts after a connection failure;
 - keeps watching after a LIVE ends in case the stream restarts;
+- prints comments, batched tap events, changed viewer counts, shares, follows,
+  completed gifts, and TikTok Q&A questions;
+- counts joins without printing every join line;
+- prints a bounded end-of-window telemetry summary;
 - stops and destroys its terminal scrollback at 2:00 AM;
 - restarts the tmux terminal if the supervisor process crashes.
 
-Raw comments remain only in a dedicated tmux terminal. Routine systemd logs
-contain scheduler health, not the comment transcript.
+Raw public observations remain only in a dedicated tmux terminal. Routine
+systemd logs contain scheduler health, not the transcript or telemetry stream.
 
 After the unit files are installed and enabled, attach with:
 
@@ -116,23 +134,35 @@ systemctl list-timers bnl-tiktok-chat-shadow.timer --no-pager
 
 The service/timer are a shadow reliability tool only. Enabling them does not
 authorize BNL to consume, answer, store, summarize, publish, or act on TikTok
-comments.
+telemetry.
 
 ## NDJSON contract
 
 Each line is one JSON object with `schema_version=1`.
 
-Comment fields:
+Common fields:
 
 ```text
-event_type=comment
+event_type
 event_id
 room_id
-observed_at
-unique_id
-display_name
-comment_text
-moderator_flag
+observed_at      # VPS receipt time
+source_at        # TikTok source time when available
+```
+
+Public observation types:
+
+```text
+comment          unique_id, display_name, comment_text, moderator_flag
+like             unique_id/display_name when supplied, like_count, like_total
+viewer_snapshot  viewer_count
+share            unique_id, display_name, share_type
+follow           unique_id, display_name
+gift             unique_id, display_name, gift_id, gift_name, gift_count,
+                  diamond_count, diamond_total, combo, streak_over
+question         unique_id, display_name, question_id, question_text,
+                  answer_status
+join             unique_id, display_name, join_count
 ```
 
 Lifecycle types:
@@ -151,7 +181,11 @@ URLs, cookies, and request headers are not emitted.
 ## Current stop point
 
 The direct connection has been observed receiving real public LIVE comments,
-moderator status, and the LIVE-end event. This code hardens and automates the
-shadow collection window. It still does not wire TikTok comments into
-`bnl01_bot.py`, Gemini, Discord output, durable memory, or any public surface.
-Private BNL awareness remains a separate implementation and activation gate.
+moderator status, and the LIVE-end event. This phase expands the same shadow
+transport to additional public engagement telemetry so the next full show can
+validate availability, volume, timing, and replay behavior.
+
+It still does not wire any TikTok event into `bnl01_bot.py`, Gemini, Discord
+output, durable memory, the queue, the website, or a public surface. Private BNL
+awareness and queue/track correlation remain separate implementation and
+activation gates.
