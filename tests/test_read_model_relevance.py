@@ -27,9 +27,15 @@ class ReadModelRelevanceTests(unittest.TestCase):
     def test_rehearsal_tester_queue_phrasings_are_identity_neutral(self):
         queue_examples = [
             "queue status",
+            "Que status",
             "where is my song?",
             "did my track show up in the queue?",
             "how many submissions are waiting?",
+            "How many songs are left before my song",
+            "How many tracks before Still Me plays",
+            "How many left before my song",
+            "Can you tell me how long the songs are?",
+            "Who’s playing currently",
             "what song is up next?",
         ]
         for text in queue_examples:

@@ -2071,14 +2071,14 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
 _PRIVATE_BNL_QUEUE_POLICIES = frozenset({"sealed_test", "internal_controlled"})
 
 _QUEUE_READ_MODEL_PATTERNS = (
-    r"\bwho(?:'s| is) playing(?: now)?\b",
+    r"\bwho(?:['’]s| is) playing(?: (?:now|currently|right now))?\b",
     r"\bnow playing\b",
-    r"\bwhat(?:'s| is) playing\b",
-    r"\bwho(?:'s| is) up next\b",
+    r"\bwhat(?:['’]s| is) playing(?: (?:now|currently|right now))?\b",
+    r"\bwho(?:['’]s| is) up next\b",
     r"\bup next\b",
     r"\bnext (?:track|song)\b",
     r"\b(?:current )?queue\b",
-    r"\bqueue status\b",
+    r"\bque(?:ue)? status\b",
     r"\b(?:submissions?|queue) (?:open|closed)\b",
     r"\bartists? (?:are )?(?:in|on|queued)\b",
     r"\btracks? (?:are )?queued\b",
@@ -2088,6 +2088,9 @@ _QUEUE_READ_MODEL_PATTERNS = (
     r"\bwheel spins? owed\b",
     r"\bhow many wheel spins?\b",
     r"\bhow many (?:tracks|songs|submissions)\b",
+    r"\bhow many(?: (?:tracks|songs))?(?: are)?(?: left)? before\b",
+    r"\bhow long\b.{0,60}\b(?:tracks?|songs?)\b",
+    r"\b(?:tracks?|songs?)\b.{0,40}\b(?:duration|length|long)\b",
     r"\b(?:where|when)\b.{0,45}\b(?:my|our) (?:track|song|submission)\b",
     r"\b(?:my|our) (?:track|song|submission)\b.{0,45}"
     r"\b(?:queue|submit|accept|play|next|through|waiting|received|show(?:ed)? up|there)\b",
@@ -2234,7 +2237,12 @@ def _first_present_value(mapping: dict, keys) -> object:
     return None
 
 
-def _track_label(track: dict, include_lane: bool = True, include_source: bool = False) -> str:
+def _track_label(
+    track: dict,
+    include_lane: bool = True,
+    include_source: bool = False,
+    include_queue_details: bool = False,
+) -> str:
     if not isinstance(track, dict):
         return ""
     artist = _compact_public_text(_first_present_value(track, (
@@ -2266,6 +2274,34 @@ def _track_label(track: dict, include_lane: bool = True, include_source: bool = 
         source_type = _compact_public_text(track.get("sourceType") or track.get("source"), 40)
         if source_type:
             extras.append(source_type)
+    if include_queue_details:
+        queue_position = track.get("queuePosition")
+        if (
+            isinstance(queue_position, int)
+            and not isinstance(queue_position, bool)
+            and queue_position > 0
+        ):
+            extras.append(f"queuePosition={queue_position}")
+        duration_label = _compact_public_text(track.get("durationLabel"), 32)
+        if not duration_label:
+            duration_seconds = _first_present_value(
+                track,
+                ("detectedDurationSeconds", "estimatedDurationSeconds"),
+            )
+            if (
+                isinstance(duration_seconds, (int, float))
+                and not isinstance(duration_seconds, bool)
+                and duration_seconds > 0
+            ):
+                rounded_seconds = int(round(duration_seconds))
+                duration_label = (
+                    f"{rounded_seconds // 60}:"
+                    f"{rounded_seconds % 60:02d}"
+                )
+                if track.get("durationIsEstimate") is True:
+                    duration_label = f"est. {duration_label}"
+        if duration_label:
+            extras.append(f"duration={duration_label}")
     if label and extras:
         label = f"{label} ({', '.join(extras)})"
     return label
@@ -2352,12 +2388,16 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                 status_bits.append(f"{key}={_compact_public_text(value, 40)}")
         if status_bits:
             lines.append("- Status: " + ", ".join(status_bits))
-        now_label = _track_label(now_playing)
+        now_label = _track_label(now_playing, include_queue_details=True)
         if now_label:
             lines.append(f"- Now playing: {now_label}")
-        next_label = _track_label(up_next)
+        else:
+            lines.append("- Now playing: none")
+        next_label = _track_label(up_next, include_queue_details=True)
         if next_label:
             lines.append(f"- Up next: {next_label}")
+        else:
+            lines.append("- Up next: none")
         wheel_spins = _first_present_value(queue, ("wheelSpinsOwed",))
         if wheel_spins is None:
             wheel_spins = _first_present_value(status, ("wheelSpinsOwed",))
@@ -2379,7 +2419,12 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         if queued_tracks:
             lines.append("\nQueued tracks:")
             for track in queued_tracks[:8]:
-                label = _track_label(track, include_lane=True, include_source=True)
+                label = _track_label(
+                    track,
+                    include_lane=True,
+                    include_source=True,
+                    include_queue_details=True,
+                )
                 if label:
                     lines.append(f"- {label}")
         if completed_tracks:
@@ -2453,10 +2498,15 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         for rule in lane_rules[:5]:
             lines.append(f"- {rule}")
     if private_access:
-        lines.extend([
+        guardrail_lines = [
             "- This is private authorized testing-channel and operator context only.",
             "- Discord access to this private channel is the read-only queue authorization boundary. Answer queue-related questions from any participant who can speak here; do not require owner, admin, or mod identity.",
             "- This authorization permits queue readouts only; it does not grant admin actions or hidden account, payment, or contact access.",
+            "- The compact queue snapshot above is the authoritative current readout. Answer its session status, open/closed state, counts, now playing, up next, order, queuePosition, and duration fields directly when asked.",
+            "- Never claim the lineup is hidden, production-only, or unavailable when the compact fields above answer the question. A missing Now playing or Up next value means none, not that BNL lacks access.",
+            "- queuePosition is upcoming queue order: position 1 is up next and position N has N-1 queued tracks ahead. Mention a separate Now playing track when it matters.",
+            "- For 'my song,' match the current prompt speaker's visible display name to a queue artist only for this reply. This is not verified or durable identity. If there is no single clear match, ask for the track title.",
+            "- Keep simple queue answers concise and factual unless the participant asks for analysis.",
             "- Do not use this queue data in public output.",
             "- Do not use it for public replies, public announcements, public recaps, the public Broadcast Deck, or the public Broadcast Archive.",
             "- Simulation/test tracks may be present and must remain private test evidence.",
@@ -2464,18 +2514,22 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             "- Do not write, merge, promote, or persist this context.",
             "- Do not claim payment, checkout, contact, upload, legal-acceptance, private account, or admin-only data.",
             "- Do not expose raw JSON directly; answer naturally from the compact operational fields above.",
-        ])
+        ]
     else:
-        lines.extend([
+        guardrail_lines = [
             "- This is public website context only.",
             "- Do not treat this as durable memory.",
             "- Do not write, merge, promote, or persist this context.",
             "- Do not claim private account/payment/user data.",
             "- Do not claim simulation/test tracks are present; the read model excludes them.",
             "- Do not expose raw JSON directly; answer naturally from the compact public fields above.",
-        ])
+        ]
+    lines.extend(guardrail_lines)
     logging.info(f"bnl_read_model_context_loaded reason=relevant_prompt channel_policy={channel_policy}")
-    return "\n".join(lines[:80])
+    if len(lines) > 80:
+        content_limit = max(0, 80 - len(guardrail_lines))
+        lines = [*lines[:content_limit], *guardrail_lines]
+    return "\n".join(lines)
 
 
 def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> str:
@@ -11898,6 +11952,30 @@ _SELF_NAME_ACTION_COMPLEMENT_LEADS = frozenset(
         "when",
     }
 )
+_SELF_NAME_QUESTION_CLAUSE_LEADS = frozenset(
+    {
+        "are",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "has",
+        "have",
+        "how",
+        "is",
+        "may",
+        "might",
+        "should",
+        "what",
+        "when",
+        "where",
+        "who",
+        "why",
+        "will",
+        "would",
+    }
+)
 _bnl_self_name_cache: dict[
     tuple[int, tuple[str, ...]],
     tuple[float, tuple[BnlSelfNameRecord, ...]],
@@ -12002,6 +12080,7 @@ def _clean_self_name_candidate(
             and normalized in _SELF_NAME_STOPWORDS
         )
         or first_word in _SELF_NAME_ACTION_COMPLEMENT_LEADS
+        or first_word in _SELF_NAME_QUESTION_CLAUSE_LEADS
         or _CANONICAL_BNL_NAME_RE.fullmatch(value)
     ):
         return ""
