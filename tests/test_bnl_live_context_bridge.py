@@ -111,6 +111,30 @@ def public_read_model():
     }
 
 
+def public_read_model_with_show_archive():
+    model = public_read_model()
+    model["sections"]["archive"] = {
+        "available": True,
+        "currentShow": {
+            "sessionId": "show-1",
+            "title": "BARCODE Radio",
+            "showDate": "2026-08-28",
+            "status": "open",
+            "milestones": [
+                {"sequence": 1, "eventType": "broadcast_started", "occurredAt": "2026-08-29T00:00:00Z", "track": None},
+                {"sequence": 2, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:01:00Z", "track": {"projectLabel": "First Artist", "title": "First Track"}},
+                {"sequence": 3, "eventType": "track_finished", "occurredAt": "2026-08-29T00:04:00Z", "track": {"projectLabel": "First Artist", "title": "First Track"}},
+                {"sequence": 4, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:04:00Z", "track": {"projectLabel": "Winning Artist", "title": "Winning Track"}},
+                {"sequence": 5, "eventType": "track_finished", "occurredAt": "2026-08-29T00:08:00Z", "track": {"projectLabel": "Winning Artist", "title": "Winning Track"}},
+                {"sequence": 6, "eventType": "session_archived", "occurredAt": "2026-08-29T00:09:00Z", "track": None},
+            ],
+        },
+        "latestShow": None,
+        "shows": [],
+    }
+    return model
+
+
 class BNLLiveContextBridgeTests(unittest.TestCase):
     def make_adapter(self, clock):
         adapter = LiveChatAdapter(
@@ -196,6 +220,75 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
             )
         self.assertIn("Training Module One", context)
         live_context.assert_not_called()
+
+    def test_post_show_question_uses_durable_archive_not_expired_live_buffer(self):
+        question = "BNL, which songs tonight got the most TikTok chat engagement?"
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "bnl.db")
+            bnl01_bot.ensure_journal_source_schema(db_path)
+
+            def stamp(value):
+                return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+
+            messages = (
+                ("first-1", "2026-08-29T00:02:00Z", "one", "First reaction."),
+                ("win-1", "2026-08-29T00:04:30Z", "one", "Winning reaction one."),
+                ("win-2", "2026-08-29T00:05:30Z", "two", "Winning reaction two."),
+                ("win-3", "2026-08-29T00:06:30Z", "three", "Winning reaction three."),
+            )
+            for event_id, occurred_at, handle, text in messages:
+                result = bnl01_bot.record_journal_source_event(
+                    db_path,
+                    guild_id=77,
+                    source_kind="tiktok_live_chat",
+                    source_key=event_id,
+                    occurred_at_ms=stamp(occurred_at),
+                    raw_text=text,
+                    sanitized_summary=text,
+                    channel_policy="public_context",
+                    subject_ref=f"tiktok_handle:{handle}",
+                    private_display_name=f"@{handle}",
+                    public_usable=True,
+                    metadata={"eventType": "comment", "handle": handle},
+                )
+                self.assertTrue(result.ok)
+
+            with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}, clear=False), \
+                 mock.patch.object(bnl01_bot, "DB_FILE", db_path), \
+                 mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 77), \
+                 mock.patch.object(bnl01_bot, "BNL_TIKTOK_LIVE_CONTEXT_PATH", "/missing-live-context"):
+                context = bnl01_bot.build_bnl_read_model_context(
+                    public_read_model_with_show_archive(),
+                    question,
+                    "public_home",
+                )
+
+        self.assertIn("Durable TikTok show analysis context", context)
+        self.assertIn("1. Winning Artist — Winning Track: 3 messages", context)
+        self.assertIn("2. First Artist — First Track: 1 messages", context)
+        self.assertNotIn("snapshot_missing", context)
+        self.assertNotIn("live TikTok reaction data is not currently available", context)
+        self.assertTrue(
+            bnl01_bot.public_tiktok_interaction_memory_allowed(
+                question,
+                "public_home",
+                context,
+            )
+        )
+
+    def test_post_show_question_reports_durable_archive_read_failure_honestly(self):
+        question = "BNL, which songs tonight got the most TikTok chat engagement?"
+        with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}, clear=False), \
+             mock.patch.object(bnl01_bot, "DB_FILE", "/missing-bnl-archive.db"), \
+             mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 77):
+            context = bnl01_bot.build_bnl_read_model_context(
+                public_read_model_with_show_archive(),
+                question,
+                "public_home",
+            )
+        self.assertIn("durable TikTok event archive could not be read", context)
+        self.assertIn("Do not report zero engagement", context)
+        self.assertNotIn("No durable public TikTok comments", context)
 
     def test_public_tiktok_exchange_uses_normal_memory_but_queue_only_does_not(self):
         public_context = (

@@ -2,6 +2,7 @@ import json
 import stat
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from bnl_tiktok_live_chat import LiveChatAdapter, LiveChatBuffer
@@ -12,10 +13,14 @@ from bnl_tiktok_live_context import (
     SCHEMA_VERSION,
     SOURCE,
     LiveContextSnapshotWriter,
+    build_durable_show_prompt_context,
     build_live_prompt_context,
     is_live_show_reaction_query,
+    is_tiktok_show_analysis_query,
     live_context_diagnostics,
     load_live_context_snapshot,
+    select_show_for_tiktok_analysis,
+    show_timeline_bounds_ms,
 )
 from bnl_tiktok_live_memory import (
     TikTokPublicConversationSpoolWriter,
@@ -106,6 +111,121 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
                 self.assertTrue(is_live_show_reaction_query(value))
         self.assertFalse(is_live_show_reaction_query("What did people say in Discord yesterday?"))
         self.assertFalse(is_live_show_reaction_query("What's playing right now?"))
+
+    def test_show_analysis_detector_covers_exact_post_show_question(self):
+        positives = (
+            "BNL, which songs tonight got the most TikTok chat engagement?",
+            "Which tracks had the most chat engagement tonight?",
+            "What did TikTok chat say about Training Module One?",
+            "Give me the post-show TikTok reaction recap.",
+        )
+        for value in positives:
+            with self.subTest(value=value):
+                self.assertTrue(is_tiktok_show_analysis_query(value))
+        self.assertFalse(is_tiktok_show_analysis_query("What did TikTok chat just say?"))
+        self.assertFalse(is_tiktok_show_analysis_query("What's playing right now?"))
+
+    def test_durable_show_analysis_ranks_track_windows_without_live_snapshot(self):
+        show = {
+            "sessionId": "show-1",
+            "title": "BARCODE Radio",
+            "showDate": "2026-08-28",
+            "status": "open",
+            "milestones": [
+                {"sequence": 1, "eventType": "track_submitted", "occurredAt": "2026-08-27T12:00:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 2, "eventType": "broadcast_started", "occurredAt": "2026-08-29T00:00:00Z", "track": None},
+                {"sequence": 3, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:01:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 4, "eventType": "track_play_started", "occurredAt": "2026-08-29T00:02:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 5, "eventType": "track_finished", "occurredAt": "2026-08-29T00:05:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 6, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:05:00Z", "track": {"projectLabel": "Beta Artist", "title": "Beta Wave"}},
+                {"sequence": 7, "eventType": "track_finished", "occurredAt": "2026-08-29T00:09:00Z", "track": {"projectLabel": "Beta Artist", "title": "Beta Wave"}},
+                {"sequence": 8, "eventType": "session_archived", "occurredAt": "2026-08-29T00:10:00Z", "track": None},
+            ],
+        }
+        archive = {"currentShow": show, "latestShow": None, "shows": []}
+
+        def event(when, handle, text):
+            return {
+                "occurred_at_ms": int(when),
+                "subject_ref": f"tiktok_handle:{handle}",
+                "private_display_name": handle,
+                "raw_text": text,
+                "metadata": {"eventType": "comment", "handle": handle},
+            }
+
+        def stamp(value):
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+
+        events = [
+            event(stamp("2026-08-29T00:00:30Z"), "before", "Before the first track."),
+            event(stamp("2026-08-29T00:02:30Z"), "one", "Alpha one."),
+            event(stamp("2026-08-29T00:03:00Z"), "one", "Alpha two."),
+            event(stamp("2026-08-29T00:04:00Z"), "two", "Alpha three."),
+            event(stamp("2026-08-29T00:05:30Z"), "one", "Beta one."),
+            event(stamp("2026-08-29T00:06:00Z"), "two", "Beta two."),
+            event(stamp("2026-08-29T00:07:00Z"), "three", "Beta three."),
+            event(stamp("2026-08-29T00:08:00Z"), "four", "Beta four."),
+        ]
+
+        prompt = build_durable_show_prompt_context(
+            archive,
+            events,
+            "BNL, which songs tonight got the most TikTok chat engagement?",
+        )
+        target_prompt = build_durable_show_prompt_context(
+            archive,
+            events,
+            "What did TikTok chat say about Alpha Signal?",
+        )
+
+        self.assertIn("selectedFrom=currentShow", prompt)
+        self.assertIn("1. Beta Artist — Beta Wave: 4 messages, 4 unique chatters", prompt)
+        self.assertIn("2. Alpha Artist — Alpha Signal: 3 messages, 2 unique chatters", prompt)
+        self.assertIn("1 show-window messages were outside an active track window", prompt)
+        self.assertIn("does not contain a durable per-track tap", prompt)
+        self.assertNotIn("Beta one.", prompt)
+        self.assertIn("Bounded public comments for Alpha Artist — Alpha Signal", target_prompt)
+        self.assertIn("Alpha one.", target_prompt)
+        self.assertNotIn("Beta one.", target_prompt)
+        self.assertEqual(
+            show_timeline_bounds_ms(show),
+            (stamp("2026-08-29T00:00:00Z"), stamp("2026-08-29T00:10:00Z")),
+        )
+
+    def test_previous_show_request_selects_latest_archived_show(self):
+        archive = {
+            "currentShow": {"sessionId": "current", "showDate": "2026-08-29", "milestones": [{"occurredAt": "2026-08-29T01:00:00Z"}]},
+            "latestShow": {"sessionId": "latest", "showDate": "2026-08-28", "milestones": [{"occurredAt": "2026-08-28T01:00:00Z"}]},
+            "shows": [],
+        }
+        show, source = select_show_for_tiktok_analysis(
+            archive,
+            "Which tracks had the most TikTok chat engagement last show?",
+        )
+        self.assertEqual(show["sessionId"], "latest")
+        self.assertEqual(source, "latestShow")
+
+    def test_durable_show_analysis_does_not_turn_archive_failure_into_zero_engagement(self):
+        archive = {
+            "currentShow": {
+                "sessionId": "show-1",
+                "title": "BARCODE Radio",
+                "showDate": "2026-08-28",
+                "status": "archived",
+                "milestones": [
+                    {"sequence": 1, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:01:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                    {"sequence": 2, "eventType": "track_finished", "occurredAt": "2026-08-29T00:05:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                ],
+            }
+        }
+        prompt = build_durable_show_prompt_context(
+            archive,
+            None,
+            "Which song had the most TikTok engagement tonight?",
+        )
+        self.assertIn("durable TikTok event archive could not be read", prompt)
+        self.assertIn("Do not report zero engagement", prompt)
+        self.assertNotIn("No durable public TikTok comments", prompt)
 
     def test_writer_publishes_mode_0600_bounded_contract_and_reader_revalidates(self):
         clock = Clock()

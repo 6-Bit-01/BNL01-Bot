@@ -244,6 +244,37 @@ class BehaviorContractRouteTests(unittest.TestCase):
         self.assertIsNotNone(resolved)
         self.assertIn("procurement accord", resolved["text"])
 
+    def test_repair_resolution_skips_frustration_and_recovers_original_request(self):
+        original = "BNL, which songs tonight got the most TikTok chat engagement?"
+        repair = "BNL WE TALKED ABOUT THIS, THIS WAS SUPPOSED TO BE YOUR FUCKING MOMENT"
+        bnl01_bot.record_recent_room_event_from_message(
+            guild_id=11,
+            channel_id=21,
+            author_id=102,
+            author_display_name="6 Bit",
+            text=original,
+            channel_policy="public_home",
+            message_id=601,
+        )
+        bnl01_bot.record_recent_room_event_from_message(
+            guild_id=11,
+            channel_id=21,
+            author_id=102,
+            author_display_name="6 Bit",
+            text=repair,
+            channel_policy="public_home",
+            message_id=602,
+        )
+        resolved = bnl01_bot._get_recent_same_user_message_for_previous_request(
+            11,
+            21,
+            102,
+            "public_home",
+            current_message_id=602,
+        )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["text"], original)
+
     def test_final_fragment_anchoring_keeps_long_body_in_batch_prompt(self):
         article_14 = (
             "This is illegal according to Article 14, Section 8-C of the Interdimensional "
