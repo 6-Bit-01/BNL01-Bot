@@ -290,6 +290,112 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
         self.assertIn("Do not report zero engagement", context)
         self.assertNotIn("No durable public TikTok comments", context)
 
+    def test_contextual_followup_reloads_durable_chat_and_ignores_prior_bnl_claims(self):
+        initial_question = "BNL, which songs tonight got the most TikTok chat engagement?"
+        followup = "Awesome. Any recurring topics or anything of note?"
+        room_context = (
+            "Recent room context from this channel:\n"
+            f"User/member (display name “6 Bit”): {initial_question}\n"
+            "BNL-01: The room discussed imaginary mercury organs.\n"
+            f"User/member (current payload fragment): {followup}"
+        )
+        resolved = bnl01_bot.resolve_tiktok_show_analysis_request(
+            followup,
+            room_context,
+        )
+        self.assertIn(initial_question, resolved)
+        self.assertIn(f"Current follow-up: {followup}", resolved)
+        self.assertNotIn("mercury organs", resolved)
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "bnl.db")
+            bnl01_bot.ensure_journal_source_schema(db_path)
+
+            def stamp(value):
+                return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+
+            messages = (
+                ("topic-1", "2026-08-29T00:02:00Z", "one", "The green visuals are wild."),
+                ("topic-2", "2026-08-29T00:03:00Z", "two", "Those green visuals look incredible."),
+                ("topic-3", "2026-08-29T00:05:00Z", "three", "The green visuals changed again."),
+                ("isolated", "2026-08-29T00:06:00Z", "four", "Wheel chaos tonight."),
+            )
+            for event_id, occurred_at, handle, text in messages:
+                result = bnl01_bot.record_journal_source_event(
+                    db_path,
+                    guild_id=77,
+                    source_kind="tiktok_live_chat",
+                    source_key=event_id,
+                    occurred_at_ms=stamp(occurred_at),
+                    raw_text=text,
+                    sanitized_summary=text,
+                    channel_policy="public_context",
+                    subject_ref=f"tiktok_handle:{handle}",
+                    private_display_name=f"@{handle}",
+                    public_usable=True,
+                    metadata={"eventType": "comment", "handle": handle},
+                )
+                self.assertTrue(result.ok)
+
+            with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}, clear=False), \
+                 mock.patch.object(bnl01_bot, "DB_FILE", db_path), \
+                 mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 77), \
+                 mock.patch.object(
+                     bnl01_bot,
+                     "fetch_bnl_read_model",
+                     return_value=public_read_model_with_show_archive(),
+                 ):
+                context = bnl01_bot.maybe_build_bnl_read_model_context(
+                    followup,
+                    "public_home",
+                    conversation_context=room_context,
+                )
+
+        self.assertIn("Durable TikTok show analysis context", context)
+        self.assertIn('"green visuals": 3 messages / 3 unique chatters', context)
+        self.assertIn("The green visuals are wild.", context)
+        self.assertIn("Wheel chaos tonight.", context)
+        self.assertIn("BNL's earlier replies are not evidence", context)
+        self.assertNotIn("mercury organs", context)
+        self.assertTrue(
+            bnl01_bot.public_tiktok_interaction_memory_allowed(
+                followup,
+                "public_home",
+                context,
+            )
+        )
+
+    def test_contextual_followup_does_not_self_anchor_or_jump_unrelated_human_turn(self):
+        followup = "Why?"
+        self.assertEqual(
+            bnl01_bot.resolve_tiktok_show_analysis_request(
+                followup,
+                "BNL-01: TikTok chat was very active tonight.",
+            ),
+            "",
+        )
+        shifted_context = (
+            "User/member: Which tracks had the most TikTok chat engagement tonight?\n"
+            "BNL-01: The second track ranked first.\n"
+            "User/member: What is the queue capacity?\n"
+            "BNL-01: The capacity is 44."
+        )
+        self.assertEqual(
+            bnl01_bot.resolve_tiktok_show_analysis_request(
+                followup,
+                shifted_context,
+            ),
+            "",
+        )
+        with mock.patch.object(bnl01_bot, "fetch_bnl_read_model") as fetch:
+            context = bnl01_bot.maybe_build_bnl_read_model_context(
+                followup,
+                "public_home",
+                conversation_context="BNL-01: What TikTok viewers discussed.",
+            )
+        self.assertEqual(context, "")
+        fetch.assert_not_called()
+
     def test_public_tiktok_exchange_uses_normal_memory_but_queue_only_does_not(self):
         public_context = (
             "Website public read model context:\n"

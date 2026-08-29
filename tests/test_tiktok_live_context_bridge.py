@@ -16,6 +16,7 @@ from bnl_tiktok_live_context import (
     build_durable_show_prompt_context,
     build_live_prompt_context,
     is_live_show_reaction_query,
+    is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
     live_context_diagnostics,
     load_live_context_snapshot,
@@ -118,12 +119,28 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
             "Which tracks had the most chat engagement tonight?",
             "What did TikTok chat say about Training Module One?",
             "Give me the post-show TikTok reaction recap.",
+            "What did people talk about throughout the live?",
+            "What recurring topics came up in chat during the show?",
+            "How did the broadcast go?",
         )
         for value in positives:
             with self.subTest(value=value):
                 self.assertTrue(is_tiktok_show_analysis_query(value))
         self.assertFalse(is_tiktok_show_analysis_query("What did TikTok chat just say?"))
         self.assertFalse(is_tiktok_show_analysis_query("What's playing right now?"))
+
+    def test_show_analysis_followups_are_contextual_not_standalone_archive_queries(self):
+        followups = (
+            "Awesome. Any recurring topics or anything of note?",
+            "What else stood out?",
+            "What did people say?",
+            "Tell me more.",
+            "Why?",
+        )
+        for value in followups:
+            with self.subTest(value=value):
+                self.assertTrue(is_tiktok_show_analysis_followup(value))
+                self.assertFalse(is_tiktok_show_analysis_query(value))
 
     def test_durable_show_analysis_ranks_track_windows_without_live_snapshot(self):
         show = {
@@ -204,6 +221,136 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
         )
         self.assertEqual(show["sessionId"], "latest")
         self.assertEqual(source, "latestShow")
+
+    def test_whole_show_topics_receive_actual_chat_evidence_and_lexical_support(self):
+        show = {
+            "sessionId": "show-topic-evidence",
+            "title": "BARCODE Radio",
+            "showDate": "2026-08-28",
+            "status": "archived",
+            "milestones": [
+                {"sequence": 1, "eventType": "broadcast_started", "occurredAt": "2026-08-29T00:00:00Z", "track": None},
+                {"sequence": 2, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:01:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 3, "eventType": "track_finished", "occurredAt": "2026-08-29T00:05:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 4, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:06:00Z", "track": {"projectLabel": "Beta Artist", "title": "Beta Wave"}},
+                {"sequence": 5, "eventType": "track_finished", "occurredAt": "2026-08-29T00:09:00Z", "track": {"projectLabel": "Beta Artist", "title": "Beta Wave"}},
+                {"sequence": 6, "eventType": "session_archived", "occurredAt": "2026-08-29T00:10:00Z", "track": None},
+            ],
+        }
+        archive = {"currentShow": show, "latestShow": None, "shows": []}
+
+        def stamp(value):
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+
+        def event(when, handle, text):
+            return {
+                "occurred_at_ms": stamp(when),
+                "subject_ref": f"tiktok_handle:{handle}",
+                "private_display_name": handle,
+                "raw_text": text,
+                "metadata": {"eventType": "comment", "handle": handle},
+            }
+
+        events = [
+            event("2026-08-28T23:59:30Z", "preshow", "The green visuals are queued."),
+            event("2026-08-29T00:02:00Z", "one", "The green visuals are wild."),
+            event("2026-08-29T00:03:00Z", "two", "Those green visuals look incredible."),
+            event("2026-08-29T00:05:30Z", "three", "Wheel chaos is my favorite part."),
+            event("2026-08-29T00:07:00Z", "four", "The green visuals changed again."),
+            event("2026-08-29T00:08:00Z", "five", "That bass is heavy."),
+        ]
+
+        prompt = build_durable_show_prompt_context(
+            archive,
+            events,
+            "What did people talk about throughout the live?",
+        )
+
+        self.assertIn("Repeated-language signals", prompt)
+        self.assertIn('"green visuals": 3 messages / 3 unique chatters', prompt)
+        self.assertIn("Representative public chat evidence", prompt)
+        self.assertIn("The green visuals are wild.", prompt)
+        self.assertIn("Wheel chaos is my favorite part.", prompt)
+        self.assertIn("That bass is heavy.", prompt)
+        self.assertIn("show-level / between tracks", prompt)
+        self.assertNotIn("The green visuals are queued.", prompt)
+        self.assertIn("BNL's earlier replies are not evidence", prompt)
+        self.assertIn("Do not fill the gap with plausible music criticism", prompt)
+
+    def test_thin_topic_evidence_requires_an_honest_no_pattern_answer(self):
+        show = {
+            "sessionId": "show-thin-evidence",
+            "title": "BARCODE Radio",
+            "showDate": "2026-08-28",
+            "status": "archived",
+            "milestones": [
+                {"sequence": 1, "eventType": "broadcast_started", "occurredAt": "2026-08-29T00:00:00Z", "track": None},
+                {"sequence": 2, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:01:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 3, "eventType": "track_finished", "occurredAt": "2026-08-29T00:05:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 4, "eventType": "session_archived", "occurredAt": "2026-08-29T00:06:00Z", "track": None},
+            ],
+        }
+        archive = {"currentShow": show, "latestShow": None, "shows": []}
+        events = [
+            {
+                "occurred_at_ms": int(datetime.fromisoformat("2026-08-29T00:02:00+00:00").timestamp() * 1000),
+                "subject_ref": "tiktok_handle:one",
+                "private_display_name": "one",
+                "raw_text": "Purple doorway.",
+                "metadata": {"eventType": "comment", "handle": "one"},
+            },
+            {
+                "occurred_at_ms": int(datetime.fromisoformat("2026-08-29T00:03:00+00:00").timestamp() * 1000),
+                "subject_ref": "tiktok_handle:two",
+                "private_display_name": "two",
+                "raw_text": "Turn up the drums.",
+                "metadata": {"eventType": "comment", "handle": "two"},
+            },
+        ]
+        prompt = build_durable_show_prompt_context(
+            archive,
+            events,
+            "Any recurring topics or anything of note?",
+        )
+        self.assertIn("No nontrivial word or phrase recurred", prompt)
+        self.assertIn("Do not invent a recurring topic", prompt)
+
+    def test_unended_session_is_labeled_provisional_without_expanding_its_window(self):
+        show = {
+            "sessionId": "show-left-open",
+            "title": "BARCODE Radio",
+            "showDate": "2026-08-28",
+            "status": "open",
+            "milestones": [
+                {"sequence": 1, "eventType": "broadcast_started", "occurredAt": "2026-08-29T00:00:00Z", "track": None},
+                {"sequence": 2, "eventType": "track_loaded", "occurredAt": "2026-08-29T00:01:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+                {"sequence": 3, "eventType": "track_finished", "occurredAt": "2026-08-29T00:05:00Z", "track": {"projectLabel": "Alpha Artist", "title": "Alpha Signal"}},
+            ],
+        }
+        archive = {"currentShow": show, "latestShow": None, "shows": []}
+
+        def event(when, handle, text):
+            return {
+                "occurred_at_ms": int(datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp() * 1000),
+                "subject_ref": f"tiktok_handle:{handle}",
+                "private_display_name": handle,
+                "raw_text": text,
+                "metadata": {"eventType": "comment", "handle": handle},
+            }
+
+        prompt = build_durable_show_prompt_context(
+            archive,
+            [
+                event("2026-08-29T00:02:00Z", "one", "Inside the show window."),
+                event("2026-08-29T00:30:00Z", "later", "Unrelated much later."),
+            ],
+            "What did people talk about throughout the live?",
+        )
+
+        self.assertIn("Session-boundary warning", prompt)
+        self.assertIn("analysis is provisional", prompt)
+        self.assertIn("Inside the show window.", prompt)
+        self.assertNotIn("Unrelated much later.", prompt)
 
     def test_durable_show_analysis_does_not_turn_archive_failure_into_zero_engagement(self):
         archive = {
