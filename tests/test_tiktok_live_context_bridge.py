@@ -15,6 +15,7 @@ from bnl_tiktok_live_context import (
     LiveContextSnapshotWriter,
     build_durable_show_prompt_context,
     build_live_prompt_context,
+    classify_tiktok_show_analysis_intent,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
@@ -120,6 +121,7 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
             "What did TikTok chat say about Training Module One?",
             "Give me the post-show TikTok reaction recap.",
             "What did people talk about throughout the live?",
+            "Give me a quick rundown on what people talked about throughout the live",
             "What recurring topics came up in chat during the show?",
             "How did the broadcast go?",
         )
@@ -128,6 +130,17 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
                 self.assertTrue(is_tiktok_show_analysis_query(value))
         self.assertFalse(is_tiktok_show_analysis_query("What did TikTok chat just say?"))
         self.assertFalse(is_tiktok_show_analysis_query("What's playing right now?"))
+
+    def test_show_analysis_intent_uses_current_followup_not_prior_ranking(self):
+        request = (
+            "Which tracks had the most TikTok chat engagement tonight?\n"
+            "Current follow-up: Give me a quick rundown on what people "
+            "talked about throughout the live"
+        )
+        self.assertEqual(
+            classify_tiktok_show_analysis_intent(request),
+            "chat_topics",
+        )
 
     def test_show_analysis_followups_are_contextual_not_standalone_archive_queries(self):
         followups = (
@@ -267,7 +280,10 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
         )
 
         self.assertIn("Repeated-language signals", prompt)
+        self.assertIn("Analysis intent=chat_topics", prompt)
+        self.assertIn("Full-archive coverage: all 5 eligible messages", prompt)
         self.assertIn('"green visuals": 3 messages / 3 unique chatters', prompt)
+        self.assertIn("Support t+2.0m", prompt)
         self.assertIn("Representative public chat evidence", prompt)
         self.assertIn("The green visuals are wild.", prompt)
         self.assertIn("Wheel chaos is my favorite part.", prompt)
@@ -276,6 +292,7 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
         self.assertNotIn("The green visuals are queued.", prompt)
         self.assertIn("BNL's earlier replies are not evidence", prompt)
         self.assertIn("Do not fill the gap with plausible music criticism", prompt)
+        self.assertNotIn("Ranking by public chat messages", prompt)
 
     def test_thin_topic_evidence_requires_an_honest_no_pattern_answer(self):
         show = {

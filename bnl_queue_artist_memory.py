@@ -1262,6 +1262,74 @@ def _current_evidence_rows(rows: list[sqlite3.Row]) -> list[tuple[sqlite3.Row, d
     return current
 
 
+def build_queue_artist_tiktok_identity_index(
+    db_file: str,
+    *,
+    guild_id: int,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, tuple[dict[str, str], ...]]:
+    """Return exact public queue-attributed TikTok handles for show linking.
+
+    This is a source correlation index only. It exposes no Discord identifier
+    and grants no authority to merge account identities.
+    """
+
+    env = environ if environ is not None else os.environ
+    if str(env.get("BNL_QUEUE_PRODUCTION_ENABLED", "")).strip().lower() != "true":
+        return {}
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    try:
+        ensure_entity_evidence_schema(conn)
+        rows = conn.execute(
+            f"""
+            SELECT subject_name,raw_ref_json,updated_at
+            FROM {ENTITY_EVIDENCE_TABLE}
+            WHERE guild_id=? AND evidence_kind=?
+              AND public_safe_candidate=1 AND review_only=0
+            ORDER BY updated_at DESC,id DESC
+            LIMIT 5000
+            """,
+            (int(guild_id), QUEUE_ARTIST_MEMORY_EVIDENCE_KIND),
+        ).fetchall()
+    finally:
+        conn.close()
+    indexed: dict[str, list[dict[str, str]]] = defaultdict(list)
+    seen: set[tuple[str, str, str]] = set()
+    for row, raw in _current_evidence_rows(rows):
+        artist = raw.get("artist") if isinstance(raw.get("artist"), Mapping) else {}
+        handle = _normalize_handle(
+            artist.get("submittedTikTokHandle")
+        ).lstrip("@").casefold()
+        identity_key = _safe_identifier(raw.get("subjectIdentityKey"))
+        record_id = _safe_identifier(raw.get("recordId"))
+        artist_name = _safe_public_label(row["subject_name"], 160)
+        identity_basis = _safe_text(raw.get("subjectIdentityBasis"), 80)
+        key = (handle, identity_key, record_id)
+        if (
+            not handle
+            or not identity_key
+            or not record_id
+            or not artist_name
+            or key in seen
+        ):
+            continue
+        seen.add(key)
+        indexed[handle].append(
+            {
+                "artistName": artist_name,
+                "identityKey": identity_key,
+                "identityBasis": identity_basis,
+                "recordId": record_id,
+            }
+        )
+    return {
+        handle: tuple(records)
+        for handle, records in indexed.items()
+        if records
+    }
+
+
 def build_queue_artist_memory_context(
     db_file: str,
     *,
@@ -1420,6 +1488,7 @@ def build_queue_artist_memory_context(
 __all__ = [
     "QUEUE_ARTIST_MEMORY_EVIDENCE_KIND",
     "QUEUE_ARTIST_MEMORY_SCHEMA_VERSION",
+    "build_queue_artist_tiktok_identity_index",
     "build_queue_artist_memory_context",
     "sync_queue_artist_memory_read_model",
     "validate_queue_artist_memory_projection",

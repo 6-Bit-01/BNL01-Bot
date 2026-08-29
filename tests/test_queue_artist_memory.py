@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from bnl_queue_artist_memory import (
+    build_queue_artist_tiktok_identity_index,
     build_queue_artist_memory_context,
     sync_queue_artist_memory_read_model,
     validate_queue_artist_memory_projection,
@@ -359,6 +360,29 @@ class QueueArtistMemoryTests(unittest.TestCase):
         )
         self.assertEqual(stale["status"], "skipped")
         self.assertEqual(stale["reason"], "stale_source_revision")
+
+    def test_exact_tiktok_attribution_index_preserves_identity_boundary(self):
+        result = sync_queue_artist_memory_read_model(
+            self.db_file,
+            guild_id=42,
+            read_model=read_model(artist_memory_record()),
+            environ=self.enabled_env,
+        )
+        self.assertEqual(result["status"], "completed")
+
+        index = build_queue_artist_tiktok_identity_index(
+            self.db_file,
+            guild_id=42,
+            environ=self.enabled_env,
+        )
+
+        self.assertEqual(set(index), {"submitted.signal"})
+        self.assertEqual(index["submitted.signal"][0]["artistName"], "Provider Signal")
+        self.assertEqual(
+            index["submitted.signal"][0]["identityKey"],
+            "spotify:artist:artist-public",
+        )
+        self.assertNotIn("discord", json.dumps(index).lower())
 
     def test_exact_recall_groups_track_album_artist_and_preserves_conflicts(self):
         played = artist_memory_record()

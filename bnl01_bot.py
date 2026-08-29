@@ -34,17 +34,23 @@ from bnl_tiktok_live_context import (
     DEFAULT_MAX_AGE_SECONDS as DEFAULT_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
     build_durable_show_prompt_context,
     build_live_prompt_context,
+    classify_tiktok_show_analysis_intent,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
     live_context_diagnostics,
     select_show_for_tiktok_analysis,
-    show_timeline_bounds_ms,
 )
 from bnl_tiktok_live_memory import (
     DEFAULT_ARCHIVE_SPOOL_PATH as DEFAULT_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH,
     read_public_conversation_spool,
     resolve_tiktok_identity,
+)
+from bnl_tiktok_show_ledger import (
+    build_tiktok_show_evidence_context,
+    ensure_tiktok_show_evidence_schema,
+    load_tiktok_show_source_events,
+    sync_tiktok_show_evidence_ledgers,
 )
 from bnl_occasion import (
     OCCASION_CALENDAR_VERSION,
@@ -127,6 +133,7 @@ from bnl_moment_engine import (
 from bnl_relationship_engine import (
     active_engagement_live_enabled as relationship_v2_active_engagement_live_enabled,
     ensure_relationship_v2_schema,
+    get_member_settings as get_relationship_v2_member_settings,
     governed_summary as governed_relationship_v2_summary,
     live_enabled as relationship_v2_live_enabled,
     observe_message as observe_relationship_v2_message,
@@ -348,6 +355,7 @@ from bnl_entity_activity_summary import (
     refresh_entity_evidence_for_subject,
 )
 from bnl_queue_artist_memory import (
+    build_queue_artist_tiktok_identity_index,
     build_queue_artist_memory_context,
     sync_queue_artist_memory_read_model,
 )
@@ -2680,70 +2688,26 @@ def _load_durable_tiktok_show_events(
     """Read public TikTok conversation evidence for one selected show window."""
 
     show, _source_key = select_show_for_tiktok_analysis(archive, user_text)
-    start_ms, end_ms = show_timeline_bounds_ms(show)
     selected_guild_id = int(
         BNL_PRIMARY_GUILD_ID if guild_id is None else guild_id
     )
-    if (
-        start_ms is None
-        or end_ms is None
-        or end_ms < start_ms
-        or selected_guild_id <= 0
-        or DB_FILE == ":memory:"
-        or not os.path.exists(DB_FILE)
-    ):
+    if selected_guild_id <= 0:
         return None
-    safe_limit = max(1, min(50_000, int(limit or 20_000)))
     try:
-        with sqlite3.connect(
-            "file:%s?mode=ro" % DB_FILE,
-            uri=True,
-            timeout=0.2,
-        ) as conn:
-            rows = conn.execute(
-                """
-                SELECT occurred_at_ms, subject_ref, private_display_name,
-                       raw_text, metadata_json
-                FROM bnl_journal_source_events
-                WHERE guild_id=?
-                  AND source_kind='tiktok_live_chat'
-                  AND public_usable=1
-                  AND occurred_at_ms>=?
-                  AND occurred_at_ms<=?
-                ORDER BY occurred_at_ms, event_seq
-                LIMIT ?
-                """,
-                (
-                    selected_guild_id,
-                    int(start_ms),
-                    int(end_ms),
-                    safe_limit,
-                ),
-            ).fetchall()
+        events = load_tiktok_show_source_events(
+            DB_FILE,
+            guild_id=selected_guild_id,
+            show=show,
+            limit=max(1, min(50_000, int(limit or 20_000))),
+        )
     except (OSError, sqlite3.DatabaseError, ValueError, TypeError) as exc:
         logging.warning(
             "tiktok_show_analysis_archive_read_failed error=%s",
             type(exc).__name__,
         )
         return None
-
-    events = []
-    for occurred_at_ms, subject_ref, display_name, raw_text, metadata_json in rows:
-        try:
-            metadata = json.loads(metadata_json or "{}")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            metadata = {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        events.append(
-            {
-                "occurred_at_ms": int(occurred_at_ms or 0),
-                "subject_ref": str(subject_ref or "")[:160],
-                "private_display_name": str(display_name or "")[:120],
-                "raw_text": str(raw_text or "")[:1000],
-                "metadata": metadata,
-            }
-        )
+    if events is None:
+        return None
     logging.info(
         "tiktok_show_analysis_archive_loaded guild_id=%s show_date=%s events=%s",
         selected_guild_id,
@@ -2787,7 +2751,7 @@ def build_bnl_read_model_context(
     tiktok_context_query = live_reaction_query or show_analysis_query
     operational_query = queue_query or live_reaction_query or show_analysis_query
     queue_focus = _queue_query_focus(user_text) if operational_query else {}
-    if live_reaction_query or show_analysis_query:
+    if live_reaction_query:
         queue_focus["show_reaction"] = True
 
     # A private website response still contains independently public-safe site
@@ -2827,7 +2791,20 @@ def build_bnl_read_model_context(
             if title and summary:
                 lines.append(f"- {title}: {summary}")
 
-    if queue:
+    # Durable post-show analysis is owned by the archive/timeline block below.
+    # Rendering the current queue snapshot here adds unrelated current-state
+    # detail, crowds out comment evidence, and biases topic answers toward
+    # now-playing/ranking language. Preserve the queue owner for an actual
+    # queue or live-reaction request.
+    include_queue_context = bool(
+        queue
+        and (
+            not show_analysis_query
+            or queue_query
+            or live_reaction_query
+        )
+    )
+    if include_queue_context:
         session = _first_mapping(queue.get("session"), queue.get("currentSession"))
         status = _first_mapping(queue.get("status"), queue.get("queueStatus"), queue)
         now_playing = _first_mapping(queue.get("nowPlaying"), queue.get("currentTrack"))
@@ -3132,8 +3109,19 @@ def build_bnl_read_model_context(
             "- Do not expose raw JSON directly; answer naturally from the compact public fields above.",
         ]
     lines.extend(guardrail_lines)
-    logging.info(f"bnl_read_model_context_loaded reason=relevant_prompt channel_policy={channel_policy}")
-    if len(lines) > 80:
+    logging.info(
+        "bnl_read_model_context_loaded reason=relevant_prompt "
+        "channel_policy=%s show_analysis=%s items=%s chars=%s",
+        channel_policy,
+        int(show_analysis_query),
+        len(lines),
+        sum(len(line) + 1 for line in lines),
+    )
+    # The durable show-analysis owner already bounds raw evidence, signal
+    # count, excerpt count, and text length. The legacy generic 80-item clip
+    # must not evict that owner section or its grounding contract. Other
+    # website/read-model requests retain the established compact boundary.
+    if len(lines) > 80 and not show_analysis_query:
         content_limit = max(0, 80 - len(guardrail_lines))
         lines = [*lines[:content_limit], *guardrail_lines]
     return "\n".join(lines)
@@ -3145,10 +3133,36 @@ def maybe_build_bnl_read_model_context(
     *,
     conversation_context: str = "",
 ) -> str:
+    explicit_show_analysis = is_tiktok_show_analysis_query(user_text)
+    contextual_candidate = bool(
+        not explicit_show_analysis
+        and is_tiktok_show_analysis_followup(user_text)
+    )
     show_analysis_request = resolve_tiktok_show_analysis_request(
         user_text,
         conversation_context,
     )
+    if explicit_show_analysis or contextual_candidate:
+        resolution_mode = (
+            "explicit"
+            if explicit_show_analysis
+            else "contextual"
+            if show_analysis_request
+            else "unresolved"
+        )
+        logging.info(
+            "tiktok_show_analysis_request_resolved mode=%s intent=%s "
+            "conversation_context=%s",
+            resolution_mode,
+            (
+                classify_tiktok_show_analysis_intent(
+                    show_analysis_request or user_text
+                )
+                if show_analysis_request
+                else "none"
+            ),
+            int(bool(str(conversation_context or "").strip())),
+        )
     if not (
         is_bnl_read_model_relevant(user_text, channel_policy)
         or show_analysis_request
@@ -3208,6 +3222,62 @@ def public_tiktok_interaction_memory_allowed(
             or "Durable TikTok show analysis context:" in context
         )
     )
+
+
+def model_response_persistence_allowed_with_website_context(
+    user_text: str,
+    channel_policy: str,
+    website_read_model_context: str,
+) -> bool:
+    """Keep ordinary continuity while excluding injected website snapshots.
+
+    Website-backed operational answers normally remain no-store. Public
+    TikTok conversation is different: the member's request and BNL's delivered
+    natural-language reply are ordinary public conversation evidence, while
+    the injected archive/read-model block itself is never passed to the memory
+    writer.
+    """
+
+    context = str(website_read_model_context or "")
+    return bool(
+        not context
+        or public_tiktok_interaction_memory_allowed(
+            user_text,
+            channel_policy,
+            context,
+        )
+    )
+
+
+def build_tiktok_show_analysis_turn_contract(
+    website_read_model_context: str,
+) -> str:
+    """Lift the existing durable TikTok owner into the final turn contract."""
+
+    context = str(website_read_model_context or "")
+    if "Durable TikTok show analysis context:" not in context:
+        return ""
+    match = re.search(r"^- Analysis intent=([a-z_]+)\.$", context, re.MULTILINE)
+    intent = match.group(1) if match else "show_recap"
+    lines = [
+        "Durable TikTok synthesis priority:",
+        "- The durable TikTok show-analysis block is the factual owner for this request. It considered the full eligible archive; use its aggregates and bounded supporting excerpts together.",
+        "- Conversation Context, room continuity, memory, track names, and prior BNL replies may clarify what the member means, but they cannot supply claims about what TikTok viewers said.",
+        "- Begin with the requested findings in natural language. Do not begin with connection status, data-routing status, production escalation, or generic ambient-chatter filler.",
+    ]
+    if intent in {"chat_topics", "show_recap"}:
+        lines.append(
+            "- Topic/recap answer: synthesize the strongest three to five supported subjects when available; pair recurrence/speaker counts with what the grouped examples actually mean, and label isolated observations honestly."
+        )
+    elif intent == "track_ranking":
+        lines.append(
+            "- Ranking answer: report the supplied track-window ordering and its exact message, unique-chatter, rate, and duration distinctions without inventing topic explanations."
+        )
+    elif intent == "track_reaction":
+        lines.append(
+            "- Track-reaction answer: stay within the requested track's evidence and distinguish direct viewer remarks from BNL's cautious interpretation."
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _bnl_read_model_section_counts(read_model: dict) -> dict:
@@ -6471,6 +6541,7 @@ def init_db():
         ensure_canon_entity_binding_schema(evidence_conn)
         ensure_entity_evidence_schema(evidence_conn)
         ensure_memory_ledger_schema(evidence_conn)
+        ensure_tiktok_show_evidence_schema(evidence_conn)
         ensure_relationship_v2_schema(evidence_conn)
         ensure_unified_intelligence_packet_schema(evidence_conn)
         ensure_unified_response_assessment_schema(evidence_conn)
@@ -10250,6 +10321,174 @@ def build_generic_non_answer_correction_prompt(prompt: str) -> str:
         (prompt or "")
         + "\n\nCORRECTION REQUIRED: You failed to answer the current user message. "
         + "Answer the actual question directly. Do not say you are here. Do not ask what they need."
+    )
+
+
+_TIKTOK_SHOW_ANALYSIS_FILLER_PATTERNS = (
+    r"\bconnection (?:is|looks|seems|appears).{0,60}\b(?:clear|clearer|stable|steady)\b",
+    r"\b(?:standard )?baseline chatter\b",
+    r"\bambient (?:banter|chatter)\b",
+    r"\bnothing (?:critical|important|notable).{0,50}\bescalat",
+    r"\bescalat(?:e|ed|ing|ion).{0,30}\bproduction\b",
+    r"\bpublic chat telemetry\b",
+    r"\btelemetry across (?:the )?(?:broadcast|live|show|stream)\b",
+)
+
+_TIKTOK_SHOW_ANALYSIS_EVIDENCE_STOP_WORDS = frozenset(
+    {
+        "about",
+        "after",
+        "again",
+        "also",
+        "and",
+        "are",
+        "chat",
+        "comment",
+        "comments",
+        "from",
+        "good",
+        "great",
+        "have",
+        "just",
+        "live",
+        "people",
+        "really",
+        "recurring",
+        "room",
+        "said",
+        "saying",
+        "show",
+        "song",
+        "subject",
+        "that",
+        "the",
+        "their",
+        "they",
+        "this",
+        "tiktok",
+        "tonight",
+        "track",
+        "throughout",
+        "viewer",
+        "viewers",
+        "what",
+        "with",
+        "yeah",
+        "your",
+    }
+)
+
+
+def _durable_tiktok_show_analysis_intent_from_prompt(prompt: str) -> str:
+    if "Durable TikTok show analysis context:" not in str(prompt or ""):
+        return ""
+    match = re.search(
+        r"^- Analysis intent=([a-z_]+)\.$",
+        str(prompt or ""),
+        re.MULTILINE,
+    )
+    return match.group(1) if match else "show_recap"
+
+
+def _durable_tiktok_evidence_terms_from_prompt(prompt: str) -> set[str]:
+    terms = set()
+    value = str(prompt or "")
+    signal_pattern = re.compile(
+        r"^- Signal (?P<term>\"(?:\\.|[^\"])*\"):",
+        re.MULTILINE,
+    )
+    for match in signal_pattern.finditer(value):
+        try:
+            signal = str(json.loads(match.group("term")) or "")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            signal = ""
+        terms.update(
+            token
+            for token in re.findall(r"[a-z0-9][a-z0-9'’-]{2,}", signal.casefold())
+            if token not in _TIKTOK_SHOW_ANALYSIS_EVIDENCE_STOP_WORDS
+            and not token.isdigit()
+        )
+    support_pattern = re.compile(
+        r"^\s*(?:Support|- t\+).*?:\s*(?P<text>\"(?:\\.|[^\"])*\")$",
+        re.MULTILINE,
+    )
+    for match in support_pattern.finditer(value):
+        try:
+            evidence = str(json.loads(match.group("text")) or "")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            evidence = ""
+        terms.update(
+            token
+            for token in re.findall(r"[a-z0-9][a-z0-9'’-]{3,}", evidence.casefold())
+            if token not in _TIKTOK_SHOW_ANALYSIS_EVIDENCE_STOP_WORDS
+            and not token.isdigit()
+        )
+    return terms
+
+
+def tiktok_show_analysis_response_failure(response: str, prompt: str) -> str:
+    """Return a bounded correction reason for a visibly ungrounded draft."""
+
+    intent = _durable_tiktok_show_analysis_intent_from_prompt(prompt)
+    if not intent:
+        return ""
+    normalized = _normalize_guard_text(response)
+    if any(
+        re.search(pattern, normalized, flags=re.IGNORECASE)
+        for pattern in _TIKTOK_SHOW_ANALYSIS_FILLER_PATTERNS
+    ):
+        return "operational_or_ambient_filler"
+    prompt_text = str(prompt or "")
+    if (
+        "durable TikTok event archive could not be read" in prompt_text
+        or "no public show timeline is available" in prompt_text
+    ):
+        return ""
+    if intent not in {"chat_topics", "show_recap"}:
+        return ""
+    if "Comment evidence: no eligible public TikTok comments" in prompt_text:
+        if re.search(
+            r"\b(?:no eligible|no comments|no public comments|none were|"
+            r"nothing was recorded|cannot identify|can't identify)\b",
+            normalized,
+        ):
+            return ""
+        return "no_comment_evidence_overclaimed"
+    if "No nontrivial word or phrase recurred" in prompt_text:
+        if re.search(
+            r"\b(?:no clear|no recurring|did not recur|didn't recur|isolated|"
+            r"thin evidence|not enough evidence|nothing repeated)\b",
+            normalized,
+        ):
+            return ""
+        return "thin_evidence_overclaimed"
+    evidence_terms = _durable_tiktok_evidence_terms_from_prompt(prompt_text)
+    response_terms = {
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9'’-]{2,}", normalized)
+        if token not in _TIKTOK_SHOW_ANALYSIS_EVIDENCE_STOP_WORDS
+        and not token.isdigit()
+    }
+    if evidence_terms and not evidence_terms.intersection(response_terms):
+        return "archive_evidence_not_used"
+    return ""
+
+
+def build_tiktok_show_analysis_correction_prompt(
+    prompt: str,
+    failure: str,
+) -> str:
+    return (
+        (prompt or "")
+        + "\n\nTIKTOK CHAT EVIDENCE CORRECTION REQUIRED ("
+        + str(failure or "grounding")
+        + "): The previous draft did not use the durable public-chat evidence "
+        "that this turn supplied. Regenerate now from the full-archive counts, "
+        "grouped signal support, and representative excerpts. Lead with the "
+        "concrete topics or requested result. Use room continuity only to "
+        "understand the question. Do not use prior BNL replies, connection "
+        "status, operational escalation, generic ambient chatter, or an "
+        "unrequested track ranking as evidence of what viewers discussed."
     )
 
 
@@ -31664,6 +31903,11 @@ _tiktok_live_memory_runtime = {
     "last_ingested": 0,
     "total_ingested": 0,
     "last_error_type": "",
+    "show_ledger_last_reason": "never",
+    "show_ledger_last_written": 0,
+    "show_ledger_last_finalized": 0,
+    "show_ledger_last_events": 0,
+    "show_ledger_last_error_type": "",
 }
 
 
@@ -31962,9 +32206,12 @@ async def moment_engine_sweep_task():
 
 @tasks.loop(minutes=1)
 async def queue_artist_memory_sync_task():
-    """Sync only the site's explicitly authorized public artist-memory feed."""
+    """Sync authorized artist memory and source-aware TikTok show episodes."""
 
-    if not BNL_QUEUE_PRODUCTION_ENABLED:
+    if not (
+        BNL_QUEUE_PRODUCTION_ENABLED
+        or BNL_TIKTOK_LIVE_MEMORY_ENABLED
+    ):
         return
     read_model = await asyncio.to_thread(fetch_bnl_read_model, True)
     if not read_model:
@@ -31978,35 +32225,94 @@ async def queue_artist_memory_sync_task():
         guild_id = int(getattr(guild, "id", 0) or 0)
         if not guild_id:
             continue
+        if BNL_QUEUE_PRODUCTION_ENABLED:
+            try:
+                result = await asyncio.to_thread(
+                    sync_queue_artist_memory_read_model,
+                    DB_FILE,
+                    guild_id=guild_id,
+                    read_model=read_model,
+                    environ=os.environ,
+                )
+                logging.info(
+                    "queue_artist_memory_sync guild=%s status=%s reason=%s "
+                    "records=%s records_unchanged=%s rejected=%s evidence_created=%s "
+                    "evidence_updated=%s evidence_retired=%s ledger_inserted=%s "
+                    "ledger_deduplicated=%s ledger_superseded=%s",
+                    guild_id,
+                    result.get("status"),
+                    result.get("reason"),
+                    result.get("recordCount", 0),
+                    result.get("recordUnchanged", 0),
+                    result.get("rejectedRecordCount", 0),
+                    result.get("evidenceCreated", 0),
+                    result.get("evidenceUpdated", 0),
+                    result.get("evidenceRetired", 0),
+                    result.get("ledgerInserted", 0),
+                    result.get("ledgerDeduplicated", 0),
+                    result.get("ledgerSuperseded", 0),
+                )
+            except Exception as exc:
+                logging.exception(
+                    "queue_artist_memory_sync_failed guild=%s error_type=%s",
+                    guild_id,
+                    type(exc).__name__,
+                )
+        if not BNL_TIKTOK_LIVE_MEMORY_ENABLED:
+            continue
         try:
-            result = await asyncio.to_thread(
-                sync_queue_artist_memory_read_model,
+            artist_identity_index = await asyncio.to_thread(
+                build_queue_artist_tiktok_identity_index,
+                DB_FILE,
+                guild_id=guild_id,
+                environ=os.environ,
+            )
+            show_ledger_result = await asyncio.to_thread(
+                sync_tiktok_show_evidence_ledgers,
                 DB_FILE,
                 guild_id=guild_id,
                 read_model=read_model,
-                environ=os.environ,
+                artist_identity_index=artist_identity_index,
             )
+            _tiktok_live_memory_runtime["show_ledger_last_reason"] = str(
+                show_ledger_result.get("reason") or "unknown"
+            )
+            _tiktok_live_memory_runtime["show_ledger_last_written"] = int(
+                show_ledger_result.get("showsWritten") or 0
+            )
+            _tiktok_live_memory_runtime["show_ledger_last_finalized"] = int(
+                show_ledger_result.get("showsFinalized") or 0
+            )
+            _tiktok_live_memory_runtime["show_ledger_last_events"] = int(
+                show_ledger_result.get("sourceEvents") or 0
+            )
+            _tiktok_live_memory_runtime["show_ledger_last_error_type"] = ""
             logging.info(
-                "queue_artist_memory_sync guild=%s status=%s reason=%s "
-                "records=%s records_unchanged=%s rejected=%s evidence_created=%s "
-                "evidence_updated=%s evidence_retired=%s ledger_inserted=%s "
-                "ledger_deduplicated=%s ledger_superseded=%s",
+                "tiktok_show_evidence_ledger_sync guild=%s status=%s "
+                "reason=%s shows_seen=%s shows_written=%s "
+                "shows_unchanged=%s shows_finalized=%s events=%s "
+                "participants=%s projections_inserted=%s "
+                "projections_deduplicated=%s projection_errors=%s",
                 guild_id,
-                result.get("status"),
-                result.get("reason"),
-                result.get("recordCount", 0),
-                result.get("recordUnchanged", 0),
-                result.get("rejectedRecordCount", 0),
-                result.get("evidenceCreated", 0),
-                result.get("evidenceUpdated", 0),
-                result.get("evidenceRetired", 0),
-                result.get("ledgerInserted", 0),
-                result.get("ledgerDeduplicated", 0),
-                result.get("ledgerSuperseded", 0),
+                show_ledger_result.get("status"),
+                show_ledger_result.get("reason"),
+                show_ledger_result.get("showsSeen", 0),
+                show_ledger_result.get("showsWritten", 0),
+                show_ledger_result.get("showsUnchanged", 0),
+                show_ledger_result.get("showsFinalized", 0),
+                show_ledger_result.get("sourceEvents", 0),
+                show_ledger_result.get("participants", 0),
+                show_ledger_result.get("projectionInserted", 0),
+                show_ledger_result.get("projectionDeduplicated", 0),
+                show_ledger_result.get("projectionErrors", 0),
             )
         except Exception as exc:
+            _tiktok_live_memory_runtime[
+                "show_ledger_last_error_type"
+            ] = type(exc).__name__
             logging.exception(
-                "queue_artist_memory_sync_failed guild=%s error_type=%s",
+                "tiktok_show_evidence_ledger_sync_failed guild=%s "
+                "error_type=%s",
                 guild_id,
                 type(exc).__name__,
             )
@@ -36493,6 +36799,11 @@ def build_user_aware_prompt(
     website_read_model_prompt_block = ""
     if website_read_model_context:
         website_read_model_prompt_block = f"{website_read_model_context}\n"
+    tiktok_show_analysis_turn_contract = (
+        build_tiktok_show_analysis_turn_contract(
+            website_read_model_context
+        )
+    )
 
     source_context_prompt_block = ""
     if source_context_block:
@@ -36506,6 +36817,41 @@ def build_user_aware_prompt(
     queue_artist_memory_prompt_block = (
         f"{queue_artist_memory_context}\n"
         if queue_artist_memory_context
+        else ""
+    )
+    tiktok_subject_continuity_allowed = True
+    if os.path.exists(DB_FILE):
+        try:
+            with sqlite3.connect(DB_FILE, timeout=0.5) as relationship_conn:
+                tiktok_subject_continuity_allowed = bool(
+                    get_relationship_v2_member_settings(
+                        relationship_conn,
+                        guild_id=guild_id,
+                        user_id=user_id,
+                    ).get("proactive_enabled", True)
+                )
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            tiktok_subject_continuity_allowed = False
+    tiktok_show_evidence_query = clean_content
+    selected_show_date = re.search(
+        r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b",
+        website_read_model_context or "",
+    )
+    if selected_show_date and selected_show_date.group(1) not in clean_content:
+        tiktok_show_evidence_query = (
+            f"{clean_content} {selected_show_date.group(1)}"
+        )
+    tiktok_show_evidence_context = build_tiktok_show_evidence_context(
+        DB_FILE,
+        guild_id=guild_id,
+        user_text=tiktok_show_evidence_query,
+        subject_user_id=(
+            user_id if tiktok_subject_continuity_allowed else 0
+        ),
+    )
+    tiktok_show_evidence_prompt_block = (
+        f"{tiktok_show_evidence_context}\n"
+        if tiktok_show_evidence_context
         else ""
     )
     community_visual_basis = build_community_visual_basis(
@@ -36523,6 +36869,7 @@ def build_user_aware_prompt(
         or show_state_context
         or website_read_model_context
         or queue_artist_memory_context
+        or tiktok_show_evidence_context
         or community_visual_prompt_block
     )
     if ordinary_chat_single_packet and specialized_owner_present:
@@ -36569,6 +36916,10 @@ def build_user_aware_prompt(
                     bool(website_read_model_context),
                 ),
                 ("queue_artist_memory", bool(queue_artist_memory_context)),
+                (
+                    "tiktok_show_attendance",
+                    bool(tiktok_show_evidence_context),
+                ),
             )
             if present
         )
@@ -36606,6 +36957,10 @@ def build_user_aware_prompt(
                         bool(website_read_model_context),
                     ),
                     ("queue_artist_memory", bool(queue_artist_memory_context)),
+                    (
+                        "tiktok_show_attendance",
+                        bool(tiktok_show_evidence_context),
+                    ),
                     ("source_context", bool(source_context_block)),
                     ("canon", _canon_relevant_to_response(clean_content)),
                 )
@@ -36734,10 +37089,14 @@ def build_user_aware_prompt(
             or show_state_context
             or website_read_model_context
             or queue_artist_memory_context
+            or tiktok_show_evidence_context
             or source_context_block
         )
         prompt_metadata["queue_artist_memory_context_present"] = bool(
             queue_artist_memory_context
+        )
+        prompt_metadata["tiktok_show_evidence_context_present"] = bool(
+            tiktok_show_evidence_context
         )
         prompt_metadata["community_visual_basis_status"] = (
             community_visual_basis.status
@@ -36971,8 +37330,10 @@ def build_user_aware_prompt(
         f"{show_state_prompt_block}"
         f"{website_read_model_prompt_block}"
         f"{queue_artist_memory_prompt_block}"
+        f"{tiktok_show_evidence_prompt_block}"
         f"{source_context_prompt_block}"
         f"{exact_quote_prompt_block}"
+        f"{tiktok_show_analysis_turn_contract}"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {safe_display_name}\n"
         "Live request appears only in Current user request above."
@@ -38141,7 +38502,14 @@ async def _generate_direct_payload_session(session_key, reason: str):
         return
     if allow_greeting:
         set_last_greeting_at(session["requester_user_id"], session["guild_id"], datetime.now(PACIFIC_TZ).isoformat())
-    if not website_read_model_context:
+    direct_payload_model_persistence_allowed = (
+        model_response_persistence_allowed_with_website_context(
+            direct_content,
+            session.get("channel_policy", "unknown"),
+            website_read_model_context,
+        )
+    )
+    if direct_payload_model_persistence_allowed:
         await asyncio.to_thread(
             save_model_message,
             session["requester_user_id"],
@@ -38152,6 +38520,12 @@ async def _generate_direct_payload_session(session_key, reason: str):
             channel_id=getattr(anchor_message.channel, "id", 0),
             route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
             discord_message_ids=tuple(sent_message_ids),
+        )
+    elif website_read_model_context:
+        logging.info(
+            "direct_payload_response_persistence_skipped "
+            "reason=website_read_model_no_store channel_policy=%s",
+            session.get("channel_policy", "unknown"),
         )
     await persist_bnl_self_name_decision_after_send_async(
         guild_id=session["guild_id"],
@@ -38436,6 +38810,9 @@ async def apply_guarded_response_regeneration(
         "regenerated_for_register_mismatch": False,
         "generic_non_answer_triggered": False,
         "generic_non_answer_regenerated": False,
+        "tiktok_show_analysis_guard_triggered": False,
+        "tiktok_show_analysis_regenerated": False,
+        "tiktok_show_analysis_guard_reason": "",
         "source_grounding_guard_triggered": False,
         "source_grounding_regenerated": False,
         "contextual_followthrough_guard_triggered": False,
@@ -38742,6 +39119,12 @@ async def apply_guarded_response_regeneration(
             or (not source_context_available and _contains_unsupported_source_authority_claim(candidate))
             or detect_normal_chat_presentation_mode_leak(candidate, route_mode)
             or is_generic_non_answer_response(candidate, user_display_name)
+            or bool(
+                tiktok_show_analysis_response_failure(
+                    candidate,
+                    prompt,
+                )
+            )
             or (
                 contextual_followthrough_required
                 and is_contextual_followthrough_deflection(candidate)
@@ -38865,6 +39248,68 @@ async def apply_guarded_response_regeneration(
                     }
                 )
                 return "", diagnostics
+
+    tiktok_analysis_failure = tiktok_show_analysis_response_failure(
+        response,
+        prompt,
+    )
+    if tiktok_analysis_failure:
+        diagnostics["tiktok_show_analysis_guard_triggered"] = True
+        diagnostics["tiktok_show_analysis_guard_reason"] = (
+            tiktok_analysis_failure
+        )
+        logging.warning(
+            "tiktok_show_analysis_guard_triggered reason=%s "
+            "route_mode=%s channel_policy=%s",
+            tiktok_analysis_failure,
+            route_mode,
+            channel_policy,
+        )
+        if not regeneration_allowed:
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "tiktok_show_analysis_validation_only"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        regenerated = await regenerate(
+            build_tiktok_show_analysis_correction_prompt(
+                prompt,
+                tiktok_analysis_failure,
+            )
+        )
+        diagnostics["tiktok_show_analysis_regenerated"] = True
+        regenerated = (regenerated or "").strip()
+        regenerated_failure = tiktok_show_analysis_response_failure(
+            regenerated,
+            prompt,
+        )
+        diagnostics["tiktok_show_analysis_guard_reason"] = (
+            regenerated_failure
+        )
+        if retry_has_guard_failure(regenerated):
+            logging.warning(
+                "tiktok_show_analysis_response_suppressed_after_retry "
+                "reason=%s route_mode=%s channel_policy=%s",
+                regenerated_failure or "other_guard",
+                route_mode,
+                channel_policy,
+            )
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "tiktok_show_analysis_after_retry"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        response = regenerated
 
     exact_reply_grounding = reply_referent_grounding(response)
     diagnostics["exact_reply_grounding_status"] = (
@@ -39448,6 +39893,25 @@ async def apply_guarded_response_regeneration(
                 "suppressed": True,
                 "suppression_reason": (
                     "exact_reply_grounding_failed_before_send"
+                ),
+                "guard_fallback_or_generic_non_answer": True,
+            }
+        )
+        return "", diagnostics
+    final_tiktok_analysis_failure = tiktok_show_analysis_response_failure(
+        response,
+        prompt,
+    )
+    if final_tiktok_analysis_failure:
+        diagnostics.update(
+            {
+                "tiktok_show_analysis_guard_triggered": True,
+                "tiktok_show_analysis_guard_reason": (
+                    final_tiktok_analysis_failure
+                ),
+                "suppressed": True,
+                "suppression_reason": (
+                    "tiktok_show_analysis_failed_before_send"
                 ),
                 "guard_fallback_or_generic_non_answer": True,
             }
@@ -41320,7 +41784,15 @@ async def send_planned_conversation_response(
             message.author.id,
             show_state_context_on_commit,
         )
-    if allow_model_save and not website_read_model_context:
+    direct_model_persistence_allowed = (
+        allow_model_save
+        and model_response_persistence_allowed_with_website_context(
+            getattr(message, "content", ""),
+            plan.channel_policy,
+            website_read_model_context,
+        )
+    )
+    if direct_model_persistence_allowed:
         model_decision = await asyncio.to_thread(
             save_model_message,
             message.author.id,
@@ -41333,6 +41805,12 @@ async def send_planned_conversation_response(
             discord_message_ids=tuple(sent_message_ids),
         )
         logging.info("model_conversation_row_after_send route=%s channel_policy=%s saved=%s reason=%s", plan.route_mode, plan.channel_policy, int(bool(getattr(model_decision, "save_conversation", False))), getattr(model_decision, "reason", "unknown"))
+    elif allow_model_save and website_read_model_context:
+        logging.info(
+            "direct_response_persistence_skipped "
+            "reason=website_read_model_no_store channel_policy=%s",
+            plan.channel_policy,
+        )
     await persist_bnl_self_name_decision_after_send_async(
         guild_id=message.guild.id,
         addressing=self_name_addressing,
@@ -45469,6 +45947,7 @@ async def bnl_status(interaction: discord.Interaction):
         f"- tiktok_live_last_error_code: `{tiktok_live_diag.get('lastErrorCode')}` memory_default=`{tiktok_live_diag.get('memoryDefault')}`",
         f"- tiktok_live_memory_enabled: `{'yes' if BNL_TIKTOK_LIVE_MEMORY_ENABLED else 'no'}` placement=`above_community_canon`",
         f"- tiktok_live_memory_last_ingested: `{int(_tiktok_live_memory_runtime.get('last_ingested') or 0)}` total_since_start=`{int(_tiktok_live_memory_runtime.get('total_ingested') or 0)}` reason=`{_tiktok_live_memory_runtime.get('last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('last_error_type') or 'none'}`",
+        f"- tiktok_show_evidence_ledger_last_sync: written=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_written') or 0)}` finalized=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_finalized') or 0)}` events=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_events') or 0)}` reason=`{_tiktok_live_memory_runtime.get('show_ledger_last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('show_ledger_last_error_type') or 'none'}`",
         f"- tiktok_live_identity_policy: `handle_display_correlated_v1` owner_handle_configured=`{'yes' if bool(BNL_TIKTOK_OWNER_HANDLES) else 'no'}`",
         f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap_today=`{ambient_cap_today}` normal_cap=`{AMBIENT_DAILY_POST_CAP}` high_activity_cap=`2` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
         f"- ambient_posts_today: `{ambient_posts_today}`",
