@@ -2459,10 +2459,30 @@ def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, use
                     and isinstance(ledger.get("messages"), list)
                     else []
                 )
+                discord_participants = (
+                    ledger.get("discordParticipants")
+                    if isinstance(ledger, dict)
+                    and isinstance(ledger.get("discordParticipants"), list)
+                    else []
+                )
+                discord_interactions = (
+                    ledger.get("discordInteractions")
+                    if isinstance(ledger, dict)
+                    and isinstance(ledger.get("discordInteractions"), list)
+                    else []
+                )
                 if any(
                     isinstance(message, dict)
                     and str(message.get("subjectRef") or "") == subject
                     for message in messages
+                ) or any(
+                    isinstance(participant, dict)
+                    and str(participant.get("subjectRef") or "") == subject
+                    for participant in discord_participants
+                ) or any(
+                    isinstance(interaction, dict)
+                    and str(interaction.get("subjectRef") or "") == subject
+                    for interaction in discord_interactions
                 ):
                     affected_tiktok_show_keys.add(str(show_key or ""))
         if affected_tiktok_show_keys and _table_exists(
