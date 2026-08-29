@@ -1,15 +1,20 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 from bnl_journal_source_store import (
     ensure_schema as ensure_journal_source_schema,
     record_source_event,
 )
 from bnl_memory_ledger import (
+    LIVING_CANON_RECURRENCE_VERSION,
+    LIVING_CANON_V1_FORMATION_ENV,
+    MEMORY_LEDGER_SHADOW_ENV,
     ensure_memory_ledger_schema,
     shadow_conversation_row,
     shadow_tiktok_live_chat_event,
@@ -19,10 +24,18 @@ from bnl_memory_governance import (
     ensure_governance_schema,
 )
 from bnl_tiktok_live_context import build_tiktok_show_evidence_ledger
+from bnl_shared_brain_synthesis import render_packet_context
 from bnl_tiktok_show_ledger import (
     TIKTOK_SHOW_EVIDENCE_TABLE,
     build_tiktok_show_evidence_context,
+    select_tiktok_show_episode_context_items,
     sync_tiktok_show_evidence_ledgers,
+    tiktok_show_episode_context_item_version,
+)
+from bnl_unified_intelligence_packet import (
+    IntelligencePacketRequest,
+    build_packet,
+    revalidate_packet,
 )
 
 
@@ -731,6 +744,55 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertEqual(second["showsUnchanged"], 1)
             self.assertEqual(second["projectionDeduplicated"], 0)
 
+    def test_finalization_refreshes_existing_living_canon_owner_when_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            read_model = {
+                "sections": {
+                    "archive": {
+                        "currentShow": None,
+                        "latestShow": archived_show(),
+                        "shows": [],
+                    }
+                }
+            }
+            with mock.patch.dict(
+                os.environ,
+                {
+                    MEMORY_LEDGER_SHADOW_ENV: "true",
+                    LIVING_CANON_V1_FORMATION_ENV: "true",
+                },
+                clear=False,
+            ):
+                result = sync_tiktok_show_evidence_ledgers(
+                    db_file,
+                    guild_id=77,
+                    read_model=read_model,
+                    artist_identity_index=artist_index(),
+                )
+
+            self.assertEqual(result["livingCanonSubjectsEvaluated"], 1)
+            self.assertGreaterEqual(result["livingCanonCandidatesRefreshed"], 1)
+            self.assertEqual(result["livingCanonFormationErrors"], 0)
+            conn = sqlite3.connect(db_file)
+            candidate = conn.execute(
+                """
+                SELECT candidate_state,independent_occurrence_count,
+                       recurrence_contract_version
+                FROM memory_ledger_knowledge_candidates
+                WHERE subject_key='discord_user:42'
+                  AND recurrence_contract_version=?
+                ORDER BY created_at LIMIT 1
+                """,
+                (LIVING_CANON_RECURRENCE_VERSION,),
+            ).fetchone()
+            conn.close()
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate[0], "provisional")
+            self.assertEqual(candidate[1], 1)
+            self.assertEqual(candidate[2], LIVING_CANON_RECURRENCE_VERSION)
+
     def test_sync_backfills_lineage_when_raw_memory_shadows_arrive_later(self):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "bnl.db")
@@ -913,6 +975,249 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 user_text="What happened in chat on 2026-08-27?",
             )
             self.assertEqual(wrong_episode, "")
+
+    def test_selector_preserves_show_authority_and_explicit_continuity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model={
+                    "sections": {
+                        "archive": {
+                            "currentShow": None,
+                            "latestShow": archived_show(),
+                            "shows": [],
+                        }
+                    }
+                },
+                artist_identity_index=artist_index(),
+            )
+            conn = sqlite3.connect(db_file)
+            items = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="Give me yesterday's show timeline and chat rundown.",
+                subject_user_id=42,
+                now="2026-08-29T12:00:00-07:00",
+            )
+            self.assertEqual(
+                {item.kind for item in items},
+                {"operations", "community", "dialogue"},
+            )
+            operations = next(item for item in items if item.kind == "operations")
+            community = next(item for item in items if item.kind == "community")
+            dialogue = next(item for item in items if item.kind == "dialogue")
+            self.assertEqual(operations.source_class, "first_party_record")
+            self.assertEqual(operations.usage, "authoritative_show_chronology")
+            self.assertIn("First Signal", operations.text)
+            self.assertEqual(community.source_class, "evidence_projection")
+            self.assertIn("Open Signal", community.text)
+            self.assertIn("revisable evidence projection", community.text)
+            self.assertEqual(dialogue.source_class, "evidence_projection")
+            self.assertIn("Alex", dialogue.text)
+            self.assertIn("Queue Light", dialogue.text)
+            self.assertTrue(all(item.show_dates == ("2026-08-28",) for item in items))
+            for item in items:
+                self.assertEqual(
+                    tiktok_show_episode_context_item_version(
+                        conn,
+                        guild_id=77,
+                        user_text="Give me yesterday's show timeline and chat rundown.",
+                        subject_user_id=42,
+                        source_ref=item.source_ref,
+                        now="2026-08-29T12:00:00-07:00",
+                    ),
+                    item.source_digest,
+                )
+
+            unrelated = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="How are you doing today?",
+                subject_user_id=42,
+                allow_subject_continuity=False,
+                now="2026-08-29T12:00:00-07:00",
+            )
+            self.assertEqual(unrelated, ())
+            explicit_self = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="What did I ask BNL during yesterday's show?",
+                subject_user_id=42,
+                allow_subject_continuity=False,
+                now="2026-08-29T12:00:00-07:00",
+            )
+            self.assertTrue(explicit_self)
+            self.assertTrue(
+                any(item.subject_key == "discord_user:42" for item in explicit_self)
+            )
+            conn.close()
+
+    def test_multi_show_baseline_keeps_speaker_evidence_from_each_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            older_show = json.loads(
+                json.dumps(archived_show())
+                .replace("show-attendance-1", "show-attendance-older")
+                .replace("2026-08-28", "2026-08-21")
+                .replace("2026-08-29", "2026-08-22")
+            )
+            older_event = {
+                "event_id": "event-older-regular",
+                "occurred_at_ms": stamp("2026-08-22T00:03:10Z"),
+                "subject_ref": "tiktok_user:older.regular",
+                "private_display_name": "Older Regular",
+                "raw_text": "First Signal keeps bringing me back each week.",
+                "metadata": {
+                    "eventType": "comment",
+                    "handle": "older.regular",
+                },
+            }
+            recorded = record_source_event(
+                db_file,
+                guild_id=77,
+                source_kind="tiktok_live_chat",
+                source_key=older_event["event_id"],
+                occurred_at_ms=older_event["occurred_at_ms"],
+                raw_text=older_event["raw_text"],
+                sanitized_summary=older_event["raw_text"],
+                channel_policy="public_context",
+                subject_ref=older_event["subject_ref"],
+                private_display_name=older_event["private_display_name"],
+                public_usable=True,
+                metadata=older_event["metadata"],
+            )
+            self.assertTrue(recorded.ok)
+            sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model={
+                    "sections": {
+                        "archive": {
+                            "currentShow": None,
+                            "latestShow": archived_show(),
+                            "shows": [older_show],
+                        }
+                    }
+                },
+                artist_identity_index=artist_index(),
+            )
+            conn = sqlite3.connect(db_file)
+            items = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text=(
+                    "Who are the regulars across recent shows and what have "
+                    "people been saying?"
+                ),
+                now="2026-08-29T12:00:00-07:00",
+            )
+            conn.close()
+
+            community = next(item for item in items if item.kind == "community")
+            dialogue = next(item for item in items if item.kind == "dialogue")
+            self.assertEqual(
+                set(community.show_dates),
+                {"2026-08-21", "2026-08-28"},
+            )
+            self.assertIn("across 2 finalized BARCODE Radio episodes", dialogue.text)
+            self.assertIn("2026-08-21 TikTok", dialogue.text)
+            self.assertIn("Older Regular", dialogue.text)
+            self.assertIn("2026-08-28 TikTok", dialogue.text)
+            self.assertIn("Alex", dialogue.text)
+            self.assertIn("single episode does not establish a regular", community.text)
+
+    def test_finalized_show_flows_through_existing_packet_and_revalidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model={
+                    "sections": {
+                        "archive": {
+                            "currentShow": None,
+                            "latestShow": archived_show(),
+                            "shows": [],
+                        }
+                    }
+                },
+                artist_identity_index=artist_index(),
+            )
+            conn = sqlite3.connect(db_file)
+            request = IntelligencePacketRequest(
+                guild_id=77,
+                subject_user_id=42,
+                route_mode="normal_chat",
+                conversation_surface="mention_or_reply",
+                subject_display_name="Alex",
+                channel_id=9001,
+                channel_name="barcode-bot",
+                channel_policy="public_home",
+                visibility_allowance="public_safe",
+                user_text="Give me yesterday's show timeline and chat rundown.",
+                participant_user_ids=(42,),
+                direct_state="direct",
+                budget_chars=6000,
+                now="2026-08-29T12:00:00-07:00",
+            )
+            packet = build_packet(
+                conn,
+                request,
+                persist=True,
+                environ={
+                    "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                    "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                    "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                    "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+                    "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+                    "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+                },
+            )
+            self.assertIsNotNone(packet)
+            show_items = tuple(
+                item for item in packet.items if item.lane == "show_episode"
+            )
+            self.assertEqual(
+                {item.source_type for item in show_items},
+                {
+                    "barcode_show_operations",
+                    "barcode_show_community_projection",
+                    "barcode_show_dialogue_projection",
+                },
+            )
+            self.assertTrue(all(item.lifecycle == "finalized" for item in show_items))
+            self.assertTrue(all(item.visibility == "public_safe" for item in show_items))
+            self.assertTrue(all(not item.canon_status for item in show_items))
+            self.assertTrue(all(not item.root_identities for item in show_items))
+            self.assertEqual(packet.diagnostics.invalid_invariants, [])
+            self.assertTrue(revalidate_packet(conn, packet).valid)
+            rendered, lane_counts, rendered_count, _digests = (
+                render_packet_context(
+                    packet,
+                    max_items=8,
+                    max_chars=6000,
+                )
+            )
+            self.assertIn("finalized BARCODE Radio evidence", rendered)
+            self.assertIn("Queue knowledge does not imply queue control", rendered)
+            self.assertIn("Community Canon at Open Signal", rendered)
+            self.assertIn("nothing automatically becomes Legacy/Core", rendered)
+            self.assertIn(("show_episode", 3), lane_counts)
+            self.assertGreaterEqual(rendered_count, 3)
+
+            conn.execute(
+                f"DELETE FROM {TIKTOK_SHOW_EVIDENCE_TABLE} WHERE guild_id=77"
+            )
+            conn.commit()
+            self.assertFalse(revalidate_packet(conn, packet).valid)
+            conn.close()
 
     def test_complete_delete_removes_bound_sources_and_invalidates_episode(self):
         with tempfile.TemporaryDirectory() as directory:

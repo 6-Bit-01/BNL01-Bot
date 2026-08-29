@@ -8,6 +8,9 @@ from unittest import mock
 
 import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
+from bnl_canon_source_contract import adapt_open_signal_claim
+from bnl_tiktok_live_context import SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION
+from bnl_tiktok_show_ledger import ensure_tiktok_show_evidence_schema
 
 
 class LivingCanonRecurrenceV1Tests(unittest.TestCase):
@@ -142,6 +145,122 @@ class LivingCanonRecurrenceV1Tests(unittest.TestCase):
                 "discord_user:7", "Test Member", text, "inert summary",
                 hashlib.sha256(text.encode("utf-8")).hexdigest(), 1,
                 json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+
+    def add_tiktok_event(self, event_id, text, observed_at):
+        observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        occurred_at_ms = int(observed.timestamp() * 1000)
+        metadata = {"eventType": "comment", "handle": "test.member"}
+        self.conn.execute(
+            """
+            INSERT INTO bnl_journal_source_events(
+              guild_id,source_kind,source_key,occurred_at_ms,ingested_at_ms,
+              channel_id,channel_policy,subject_ref,private_display_name,
+              raw_text,sanitized_summary,content_hash,public_usable,
+              metadata_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                1,
+                "tiktok_live_chat",
+                event_id,
+                occurred_at_ms,
+                occurred_at_ms + 1,
+                0,
+                "public_context",
+                "discord_user:7",
+                "Test Member",
+                text,
+                text,
+                hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                1,
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        result = ledger.shadow_tiktok_live_chat_event(
+            self.conn,
+            guild_id=1,
+            event_id=event_id,
+            subject_key="discord_user:7",
+            subject_display_name="Test Member",
+            content=text,
+            observed_at=observed.isoformat(),
+            source_sequence=occurred_at_ms,
+        )
+        self.assertIn(result.outcome, {"inserted", "deduplicated"})
+        return result.entry_id, {
+            "eventId": event_id,
+            "subjectRef": "discord_user:7",
+            "occurredAtMs": occurred_at_ms,
+            "text": text,
+        }
+
+    def finalize_tiktok_show(self, show_key, messages):
+        ensure_tiktok_show_evidence_schema(self.conn)
+        start_ms = min(message["occurredAtMs"] for message in messages) - 60_000
+        end_ms = max(message["occurredAtMs"] for message in messages) + 60_000
+        payload = {
+            "schemaVersion": SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
+            "showKey": show_key,
+            "showDate": "2026-07-20",
+            "showTitle": "BARCODE Radio",
+            "lifecycle": "finalized",
+            "startedAtMs": start_ms,
+            "endedAtMs": end_ms,
+            "coverage": {"sourceEventIds": [row["eventId"] for row in messages]},
+            "messages": list(messages),
+            "participants": [],
+            "topics": [],
+            "trackMoments": [],
+            "trackRoster": [],
+            "operationalEvents": [],
+            "discordInteractions": [],
+            "discordParticipants": [],
+            "showTopics": [],
+        }
+        source_digest = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        payload["sourceDigest"] = source_digest
+        now = "2026-07-20T12:00:00+00:00"
+        self.conn.execute(
+            """
+            INSERT INTO tiktok_show_evidence_ledgers(
+              guild_id,show_key,schema_version,show_date,show_title,
+              lifecycle_status,started_at_ms,ended_at_ms,event_count,
+              participant_count,topic_count,track_count,source_digest,
+              ledger_json,finalized_at,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                1,
+                show_key,
+                SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
+                "2026-07-20",
+                "BARCODE Radio",
+                "finalized",
+                start_ms,
+                end_ms,
+                len(messages),
+                1,
+                0,
+                0,
+                source_digest,
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+                now,
+                now,
             ),
         )
 
@@ -474,6 +593,56 @@ class LivingCanonRecurrenceV1Tests(unittest.TestCase):
         row = self.candidate()
         self.assertEqual(row[1], "provisional")
         self.assertEqual(row[4], 1)
+
+    def test_tiktok_show_is_open_signal_and_one_recurrence_occurrence(self):
+        self.ensure_journal_receipt_schema()
+        first, first_message = self.add_tiktok_event(
+            "show-one-comment-one",
+            "I tune ceramic antennas with copper meshes during field experiments.",
+            "2026-07-20T10:00:00+00:00",
+        )
+        second, second_message = self.add_tiktok_event(
+            "show-one-comment-two",
+            "We tune the ceramic antenna with a copper mesh during the field experiment.",
+            "2026-07-20T10:05:00+00:00",
+        )
+        self.finalize_tiktok_show(
+            "show-one",
+            (first_message, second_message),
+        )
+
+        selected = ledger.select_public_conversation_assessment_evidence(
+            self.conn,
+            guild_id=1,
+            subject_key="discord_user:7",
+            request_text="What do you remember about my antenna experiments?",
+        )
+        self.assertEqual(selected.eligible_count, 2)
+        self.assertEqual(len(selected.items), 1)
+        self.assertEqual(selected.items[0].route_mode, "tiktok_live_chat")
+        adapted = adapt_open_signal_claim(selected.items[0])
+        self.assertEqual(adapted.reason, "eligible_open_signal")
+        self.assertEqual(adapted.claim.canon_status.value, "open_signal")
+
+        formed = self.form(second)
+        self.assertEqual(len(formed), 1)
+        provisional = self.candidate()
+        self.assertEqual(provisional[1], "provisional")
+        self.assertEqual(provisional[3], 2)
+        self.assertEqual(provisional[4], 1)
+
+        discord_root = self.add_conversation(
+            6,
+            "I tune ceramic antennas with copper meshes during field experiments.",
+            "2026-07-21T10:00:00+00:00",
+        )
+        established = self.form(discord_root)
+        self.assertEqual(len(established), 1)
+        current = self.candidate()
+        self.assertEqual(current[1], "established")
+        self.assertEqual(current[3], 2)
+        self.assertEqual(current[4], 2)
+        self.assertNotEqual(first, second)
 
     def test_occurrence_boundaries_cross_midnight_and_exact_thirty_minutes(self):
         cross_midnight = (

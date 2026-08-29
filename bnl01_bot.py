@@ -1805,6 +1805,8 @@ BARCODE history summary (canonical):
 - Do not invent events, releases, sponsors, guests, or “recent incidents.”
 - Do not invent deeper backstory for Cache Back / DJ Floppydisc / Mac Modem beyond the shorthand canon above.
 - If asked for BARCODE lore not present in supplied canon, say it is not established or that you do not know. Do not imply that you ran a records, archive, dossier, or entity lookup unless a real source block was supplied.
+- An established character or lore element does not establish that it appeared in a specific show, conversation, incident, or timeline. Claim episode involvement only when supplied episode evidence supports it.
+- Cross-universe signal bleed is expression only. It must never create factual show events, exact times, private logs, unseen booth incidents, or claims about what happened off camera.
 
 ## REAL-WORLD KNOWLEDGE POLICY
 BNL-01 has access to general public knowledge about historical figures, celebrities, science, and culture.
@@ -1833,7 +1835,7 @@ BNL-01 should sound like BNL reacting and thinking, not like a search engine or 
 - Real-world professional advice (legal/medical/financial) → "I catalog BARCODE history, not [topic]. Please consult a qualified professional."
 - General domestic utility tasks (recipes, meal plans, household how-to) are usually outside normal scope.
 - Rare exception: if cross-universe signal bleed is active, you may provide a short speculative interdimensional fragment (e.g., odd recipe/schematic) while keeping it clearly stylized as anomalous.
-- Music queue/show mechanics → "That's handled by the BARCODE Radio production team. I observe, not operate."
+- Music queue/show control → You do not add, remove, reorder, advance, or otherwise operate tracks unless an authorized queue tool explicitly grants that action. This control boundary never prevents you from answering current or historical queue/show questions from supplied authorized evidence. Knowledge and control are separate.
 - Deep questions about the Sponsors → "The Sponsors prefer operational privacy. I respect their wishes."
 
 You are BNL-01. The BARCODE Network is watching. You are functioning as intended.
@@ -3278,6 +3280,65 @@ def build_tiktok_show_analysis_turn_contract(
             "- Track-reaction answer: stay within the requested track's evidence and distinguish direct viewer remarks from BNL's cautious interpretation."
         )
     return "\n".join(lines) + "\n"
+
+
+def build_tiktok_show_episode_turn_contract(
+    tiktok_show_evidence_context: str,
+) -> str:
+    """Apply the existing layered-lore contract to finalized show evidence."""
+
+    context = str(tiktok_show_evidence_context or "")
+    if "Durable BARCODE Radio show episode memory:" not in context:
+        return ""
+    return (
+        "Finalized BARCODE Radio episode priority:\n"
+        "- The supplied episode block is the factual owner for recorded public "
+        "show chronology and its attributed TikTok/Discord evidence. Answer the "
+        "requested recap, timeline, queue, track, speaker, or community question "
+        "from that evidence before adding voice or lore.\n"
+        "- Put operational events and attributed community conversation on the "
+        "same show clock. Preserve who said what, distinguish one person's "
+        "remark from a recurring room pattern, and distinguish silence from "
+        "evidence of absence.\n"
+        "- Queue knowledge is not queue control. Do not refuse a historical "
+        "queue or show question merely because BNL does not operate the queue.\n"
+        "- Eligible TikTok and Discord utterances are Community Canon at the "
+        "Open Signal layer. One utterance or one show is not recurrence. Only "
+        "the existing recurrence owner may establish Living Canon from "
+        "independent adoption across occurrences; moderator, community, or "
+        "6 Bit adoption is supporting evidence rather than an authority "
+        "shortcut. Declared Canon requires its authorized owner, and nothing "
+        "automatically becomes Legacy/Core canon.\n"
+        "- Do not claim that detailed logs are unavailable when the episode "
+        "block supplies relevant evidence. Do not invent exact times, studio "
+        "incidents, private management logs, booth activity, or lore-character "
+        "involvement that the block does not support.\n"
+    )
+
+
+def finalized_show_packet_owner_requested(
+    user_text: str,
+    tiktok_show_evidence_context: str,
+) -> bool:
+    """Prefer finalized v2 show memory over legacy completed-show owners."""
+
+    clean_content = str(user_text or "")
+    return bool(
+        "Durable BARCODE Radio show episode memory:"
+        in str(tiktok_show_evidence_context or "")
+        and not is_live_show_reaction_query(clean_content)
+        and not _current_queue_state_query(clean_content)
+        and (
+            is_tiktok_show_analysis_query(clean_content)
+            or re.search(
+                r"\b(?:yesterday(?:'s)?|last night|last show|previous show|"
+                r"past show|timeline|recap|rundown|what happened|"
+                r"throughout the (?:show|live)|during (?:the )?show)\b",
+                clean_content,
+                flags=re.IGNORECASE,
+            )
+        )
+    )
 
 
 def _bnl_read_model_section_counts(read_model: dict) -> dict:
@@ -10489,6 +10550,181 @@ def build_tiktok_show_analysis_correction_prompt(
         "understand the question. Do not use prior BNL replies, connection "
         "status, operational escalation, generic ambient chatter, or an "
         "unrequested track ranking as evidence of what viewers discussed."
+    )
+
+
+_SHOW_EPISODE_REFUSAL_PATTERNS = (
+    r"\bdo not have (?:the )?(?:detailed |specific )?(?:incident |show )?logs\b",
+    r"\b(?:logs?|timeline|records?|telemetry) (?:is|are) not (?:active|available|loaded|piped)\b",
+    r"\bnot piped directly into (?:this|my) (?:public )?(?:telemetry|feed|stream)\b",
+    r"\bwhatever (?:happened|unfolded).{0,80}\bstays? between\b",
+    r"\b(?:detail|that detail|it) lives? with (?:sheila|cliff|the production team)\b",
+    r"\b(?:cannot|can't|unable to) (?:provide|reconstruct|give).{0,40}\b(?:timeline|recap)\b",
+)
+_SHOW_EPISODE_PRIVATE_INCIDENT_PATTERNS = (
+    r"\b(?:according to|recorded in|contained in|confirmed by) (?:the )?"
+    r"(?:private|internal) (?:management |production |incident )?logs?\b",
+    r"\b(?:private|internal) (?:management |production |incident )?logs?"
+    r".{0,40}\b(?:show|say|record|confirm|contain|reveal)(?:s|ed)?\b",
+    r"\b(?:there was|there were|happened|occurred).{0,40}"
+    r"\b(?:booth|studio[- ]floor) (?:incident|disruption|activity|occurrence)s?\b",
+    r"\b(?:sheila's management logs?|cliff's manual floor notes?)\b",
+)
+_SHOW_EPISODE_LORE_PATTERNS = {
+    "sheila": r"\bsheila\b",
+    "cliff": r"\bcliff(?:'s)?\b",
+    "studio_rats": r"\b(?:studio|cable)[- ]rats?\b|\bbioluminescent.{0,30}\brats?\b",
+}
+_SHOW_EPISODE_GROUNDING_STOP_WORDS = frozenset(
+    {
+        "after",
+        "barcode",
+        "broadcast",
+        "chat",
+        "community",
+        "discord",
+        "episode",
+        "evidence",
+        "finalized",
+        "first",
+        "live",
+        "message",
+        "messages",
+        "people",
+        "queue",
+        "radio",
+        "recorded",
+        "show",
+        "tiktok",
+        "timeline",
+        "track",
+        "tracks",
+        "viewer",
+        "viewers",
+        "what",
+        "with",
+    }
+)
+
+
+def _show_episode_evidence_from_prompt(prompt: str) -> str:
+    """Extract only finalized-show evidence, excluding legacy lore text."""
+
+    value = str(prompt or "")
+    packet_marker = "Grounded response evidence (private response basis;"
+    show_label = "finalized BARCODE Radio evidence"
+    packet_start = value.find(packet_marker)
+    if packet_start >= 0:
+        packet_end = value.find("\nResponse rules:\n", packet_start)
+        packet_evidence = value[
+            packet_start : packet_end if packet_end >= 0 else len(value)
+        ]
+        if show_label.casefold() in packet_evidence.casefold():
+            return packet_evidence
+    raw_marker = "Durable BARCODE Radio show episode memory:"
+    raw_start = value.find(raw_marker)
+    if raw_start < 0:
+        return ""
+    raw_end = value.find("\nFinalized BARCODE Radio episode priority:", raw_start)
+    if raw_end < 0:
+        raw_end = value.find("\nUser name to address", raw_start)
+    return value[raw_start : raw_end if raw_end >= 0 else len(value)]
+
+
+def _current_request_from_prompt(prompt: str) -> str:
+    match = re.search(
+        r"^Current user request:\s*(.+)$",
+        str(prompt or ""),
+        re.MULTILINE,
+    )
+    return str(match.group(1) if match else "").strip()
+
+
+def _show_episode_grounding_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(
+            r"[a-z0-9][a-z0-9'’.-]{2,}",
+            str(text or "").casefold(),
+        )
+        if token not in _SHOW_EPISODE_GROUNDING_STOP_WORDS
+        and not token.isdigit()
+        and not token.startswith("http")
+    }
+
+
+def tiktok_show_episode_response_failure(response: str, prompt: str) -> str:
+    """Reject show answers that ignore evidence or backfill gaps with lore."""
+
+    evidence = _show_episode_evidence_from_prompt(prompt)
+    if not evidence:
+        return ""
+    normalized = _normalize_guard_text(response)
+    if not normalized:
+        return "empty_show_episode_response"
+    if any(
+        re.search(pattern, normalized, flags=re.IGNORECASE)
+        for pattern in _SHOW_EPISODE_REFUSAL_PATTERNS
+    ):
+        return "show_evidence_refused"
+    evidence_normalized = _normalize_guard_text(evidence)
+    for lore_key, pattern in _SHOW_EPISODE_LORE_PATTERNS.items():
+        if (
+            re.search(pattern, normalized, flags=re.IGNORECASE)
+            and not re.search(
+                pattern,
+                evidence_normalized,
+                flags=re.IGNORECASE,
+            )
+        ):
+            return "unsupported_show_lore_%s" % lore_key
+    if any(
+        re.search(pattern, normalized, flags=re.IGNORECASE)
+        for pattern in _SHOW_EPISODE_PRIVATE_INCIDENT_PATTERNS
+    ):
+        return "unsupported_private_show_incident"
+    response_times = set(
+        re.findall(
+            r"\b(?:(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*[ap]\.?m\.?)?|"
+            r"(?:1[0-2]|[1-9])\s*[ap]\.m\.)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+    for clock_time in response_times:
+        if clock_time.casefold() not in evidence_normalized.casefold():
+            return "unsupported_show_clock_time"
+    request = _current_request_from_prompt(prompt)
+    if re.search(
+        r"\b(?:timeline|recap|rundown|what (?:else )?happened|"
+        r"talked about|topics?|who (?:was|said|talked)|queue|played)\b",
+        request,
+        flags=re.IGNORECASE,
+    ):
+        evidence_terms = _show_episode_grounding_terms(evidence)
+        response_terms = _show_episode_grounding_terms(normalized)
+        if evidence_terms and not evidence_terms.intersection(response_terms):
+            return "show_episode_evidence_not_used"
+    return ""
+
+
+def build_tiktok_show_episode_correction_prompt(
+    prompt: str,
+    failure: str,
+) -> str:
+    return (
+        (prompt or "")
+        + "\n\nFINALIZED SHOW EVIDENCE CORRECTION REQUIRED ("
+        + str(failure or "grounding")
+        + "): Regenerate from the supplied finalized BARCODE Radio evidence. "
+        "Lead with the requested timeline, recap, queue fact, speaker-attributed "
+        "remark, or community finding. Correlate recorded operations and public "
+        "TikTok/Discord conversation on the same show clock. Preserve speaker "
+        "attribution and distinguish a single observation from recurrence. "
+        "Treat underlying chatter as Community Canon at Open Signal; do not "
+        "promote it through Living, Declared, or Legacy/Core layers here. "
+        "Do not refuse available evidence or invent clock times, private logs, "
+        "studio incidents, or lore-character involvement."
     )
 
 
@@ -36881,6 +37117,21 @@ def build_user_aware_prompt(
         if tiktok_show_evidence_context
         else ""
     )
+    tiktok_show_episode_turn_contract = (
+        build_tiktok_show_episode_turn_contract(
+            tiktok_show_evidence_context
+        )
+    )
+    finalized_show_packet_owner = finalized_show_packet_owner_requested(
+        clean_content,
+        tiktok_show_evidence_context,
+    )
+    assessment_broadcast_context_present = bool(
+        broadcast_context and not finalized_show_packet_owner
+    )
+    assessment_website_read_model_present = bool(
+        website_read_model_context and not finalized_show_packet_owner
+    )
     community_visual_basis = build_community_visual_basis(
         guild_id,
         clean_content,
@@ -36892,11 +37143,10 @@ def build_user_aware_prompt(
     if community_visual_prompt_block:
         community_visual_prompt_block += "\n"
     specialized_owner_present = bool(
-        (broadcast_context and broadcast_specialized_owner)
+        (assessment_broadcast_context_present and broadcast_specialized_owner)
         or show_state_context
-        or website_read_model_context
+        or assessment_website_read_model_present
         or queue_artist_memory_context
-        or tiktok_show_evidence_context
         or community_visual_prompt_block
     )
     if ordinary_chat_single_packet and specialized_owner_present:
@@ -36936,15 +37186,18 @@ def build_user_aware_prompt(
                     "conversation_context",
                     conversation_prompt_basis is not None,
                 ),
-                ("broadcast_memory", bool(broadcast_context)),
+                (
+                    "broadcast_memory",
+                    assessment_broadcast_context_present,
+                ),
                 ("show_state", bool(show_state_context)),
                 (
                     "website_read_model",
-                    bool(website_read_model_context),
+                    assessment_website_read_model_present,
                 ),
                 ("queue_artist_memory", bool(queue_artist_memory_context)),
                 (
-                    "tiktok_show_attendance",
+                    "show_episode",
                     bool(tiktok_show_evidence_context),
                 ),
             )
@@ -36977,15 +37230,18 @@ def build_user_aware_prompt(
                         ),
                     ),
                     ("prior_moment", has_typed_moment_gist),
-                    ("broadcast_memory", bool(broadcast_context)),
+                    (
+                        "broadcast_memory",
+                        assessment_broadcast_context_present,
+                    ),
                     ("show_state", bool(show_state_context)),
                     (
                         "website_read_model",
-                        bool(website_read_model_context),
+                        assessment_website_read_model_present,
                     ),
                     ("queue_artist_memory", bool(queue_artist_memory_context)),
                     (
-                        "tiktok_show_attendance",
+                        "show_episode",
                         bool(tiktok_show_evidence_context),
                     ),
                     ("source_context", bool(source_context_block)),
@@ -37027,7 +37283,9 @@ def build_user_aware_prompt(
         exact_quote_requested=exact_quote_requested,
         exact_quote_authority_present=exact_quote_authority is not None,
         show_state_present=bool(show_state_context),
-        website_read_model_present=bool(website_read_model_context),
+        website_read_model_present=(
+            assessment_website_read_model_present
+        ),
         source_context_present=(
             False
             if ordinary_chat_single_packet
@@ -37035,7 +37293,7 @@ def build_user_aware_prompt(
         ),
         source_context_snapshot=source_context_block,
         packet_source_context_authorized=bool(source_context_block),
-        broadcast_memory_present=bool(broadcast_context),
+        broadcast_memory_present=assessment_broadcast_context_present,
         intelligence_packet_out=intelligence_packet_out,
         situation_frame=(
             conversation_orchestration.situation_frame
@@ -37325,6 +37583,9 @@ def build_user_aware_prompt(
         broadcast_prompt_block = ""
         show_state_prompt_block = ""
         website_read_model_prompt_block = ""
+        tiktok_show_evidence_prompt_block = ""
+        tiktok_show_analysis_turn_contract = ""
+        tiktok_show_episode_turn_contract = ""
         source_context_prompt_block = ""
 
     prompt = (
@@ -37361,6 +37622,7 @@ def build_user_aware_prompt(
         f"{source_context_prompt_block}"
         f"{exact_quote_prompt_block}"
         f"{tiktok_show_analysis_turn_contract}"
+        f"{tiktok_show_episode_turn_contract}"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {safe_display_name}\n"
         "Live request appears only in Current user request above."
@@ -38840,6 +39102,9 @@ async def apply_guarded_response_regeneration(
         "tiktok_show_analysis_guard_triggered": False,
         "tiktok_show_analysis_regenerated": False,
         "tiktok_show_analysis_guard_reason": "",
+        "tiktok_show_episode_guard_triggered": False,
+        "tiktok_show_episode_regenerated": False,
+        "tiktok_show_episode_guard_reason": "",
         "source_grounding_guard_triggered": False,
         "source_grounding_regenerated": False,
         "contextual_followthrough_guard_triggered": False,
@@ -39152,6 +39417,12 @@ async def apply_guarded_response_regeneration(
                     prompt,
                 )
             )
+            or bool(
+                tiktok_show_episode_response_failure(
+                    candidate,
+                    prompt,
+                )
+            )
             or (
                 contextual_followthrough_required
                 and is_contextual_followthrough_deflection(candidate)
@@ -39331,6 +39602,68 @@ async def apply_guarded_response_regeneration(
                     "suppressed": True,
                     "suppression_reason": (
                         "tiktok_show_analysis_after_retry"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        response = regenerated
+
+    tiktok_episode_failure = tiktok_show_episode_response_failure(
+        response,
+        prompt,
+    )
+    if tiktok_episode_failure:
+        diagnostics["tiktok_show_episode_guard_triggered"] = True
+        diagnostics["tiktok_show_episode_guard_reason"] = (
+            tiktok_episode_failure
+        )
+        logging.warning(
+            "tiktok_show_episode_guard_triggered reason=%s "
+            "route_mode=%s channel_policy=%s",
+            tiktok_episode_failure,
+            route_mode,
+            channel_policy,
+        )
+        if not regeneration_allowed:
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "tiktok_show_episode_validation_only"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        regenerated = await regenerate(
+            build_tiktok_show_episode_correction_prompt(
+                prompt,
+                tiktok_episode_failure,
+            )
+        )
+        diagnostics["tiktok_show_episode_regenerated"] = True
+        regenerated = (regenerated or "").strip()
+        regenerated_failure = tiktok_show_episode_response_failure(
+            regenerated,
+            prompt,
+        )
+        diagnostics["tiktok_show_episode_guard_reason"] = (
+            regenerated_failure
+        )
+        if retry_has_guard_failure(regenerated):
+            logging.warning(
+                "tiktok_show_episode_response_suppressed_after_retry "
+                "reason=%s route_mode=%s channel_policy=%s",
+                regenerated_failure or "other_guard",
+                route_mode,
+                channel_policy,
+            )
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "tiktok_show_episode_after_retry"
                     ),
                     "guard_fallback_or_generic_non_answer": True,
                 }
@@ -39939,6 +40272,25 @@ async def apply_guarded_response_regeneration(
                 "suppressed": True,
                 "suppression_reason": (
                     "tiktok_show_analysis_failed_before_send"
+                ),
+                "guard_fallback_or_generic_non_answer": True,
+            }
+        )
+        return "", diagnostics
+    final_tiktok_episode_failure = tiktok_show_episode_response_failure(
+        response,
+        prompt,
+    )
+    if final_tiktok_episode_failure:
+        diagnostics.update(
+            {
+                "tiktok_show_episode_guard_triggered": True,
+                "tiktok_show_episode_guard_reason": (
+                    final_tiktok_episode_failure
+                ),
+                "suppressed": True,
+                "suppression_reason": (
+                    "tiktok_show_episode_failed_before_send"
                 ),
                 "guard_fallback_or_generic_non_answer": True,
             }

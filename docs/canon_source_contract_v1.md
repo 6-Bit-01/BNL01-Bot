@@ -63,6 +63,15 @@ require compatible handle and display-name evidence; ambiguous matches remain
 TikTok-only. A TikTok moderator flag is trusted only as room-role evidence for
 the exact account. None of these paths grant TikTok output or queue controls.
 
+The existing Open Signal/Living Canon owner may validate those raw utterances
+directly against their immutable Journal receipts. A finalized show supplies
+one bounded occurrence identity for all compatible remarks in that episode;
+message volume within a show cannot manufacture recurrence. Independent later
+shows and eligible Discord occurrences may support the existing revisable
+Living Canon contract. Episode aggregates never become corroborating roots,
+and finalization neither enables formation nor bypasses Declared/Legacy/Core
+authority.
+
 The only artist/entity operational queue-data persistence exception is the independently versioned `sections.artistMemory` public catalog. Its validator requires both production gates, exact schema/policy strings, a matching digest, approved public live-broadcast provenance, and a bounded record count. Each record carries source-aware artist, song, optional album/project, show, and lifecycle fields. Accepted is provisional and a confirmed play supersedes that revision. Provider and submitted conflicts remain explicit; exactly one semantic provider artist ID may own the primary subject, while channels/uploaders and all submission attribution remain disconnected from Discord identity. The bridge writes through existing entity evidence and memory ledger tables, skips unchanged digests, supersedes older active revisions, and never marks a Source File refresh dirty. Private, rehearsal, simulation, file, payment, account, contact, dossier, relationship, and canon fields remain ineligible.
 
 A separate public show-episode projection may retain the website archive's sanitized milestone sequence and track roster as operational chronology. It joins that chronology to the complete eligible TikTok source window and to public Discord user/model rows only when a stored BNL response explicitly targets the member in the same channel within the bounded show-response window. The website remains authoritative for queue, playback, Wheel, sponsor, signal-hold, order, and outcome state; authored TikTok/Discord text remains attributed observation evidence. Exact source-owned subject references may bind episode surfaces, while names, handles, and queue attribution alone cannot merge identities. The projection is query-retrieved, lineage-linked, superseding, deletion-aware, above Community Canon, and grants no queue mutation, output, relationship, dossier, Source File, or canon authority.

@@ -60,6 +60,7 @@ _LIVING_CANON_AUTHORITY_TABLES = frozenset(
     {
         "conversations",
         "bnl_journal_source_events",
+        "tiktok_show_evidence_ledgers",
         "memory_ledger_entries",
         "memory_ledger_lineage",
         "memory_ledger_participants",
@@ -649,7 +650,7 @@ _PUBLIC_ASSESSMENT_PROCESS_TERMS = frozenset(
     }
 )
 _PUBLIC_ASSESSMENT_ALLOWED_ROUTES = frozenset(
-    {"normal_chat", "conversation_continuity"}
+    {"normal_chat", "conversation_continuity", "tiktok_live_chat"}
 )
 _PUBLIC_ASSESSMENT_GENERIC_PROFILE_TERMS = frozenset(
     {
@@ -668,7 +669,7 @@ _PUBLIC_ASSESSMENT_GENERIC_PROFILE_TERMS = frozenset(
     }
 )
 _PUBLIC_ASSESSMENT_SEMANTICS_VERSION = "public_assessment_semantics_v3"
-_PUBLIC_ASSESSMENT_ROOT_STATE_VERSION = "public_assessment_root_state_v3"
+_PUBLIC_ASSESSMENT_ROOT_STATE_VERSION = "public_assessment_root_state_v4"
 _PUBLIC_ASSESSMENT_ACTION_ALIASES = {
     "ask": "ask",
     "asked": "ask",
@@ -2756,6 +2757,11 @@ def _knowledge_visibility(values: set[str]) -> tuple[str, str]:
 def _knowledge_route_visibility_is_explicit(entry: dict[str, Any]) -> bool:
     policy = str(entry.get("channel_policy") or "").strip()
     visibility = str(entry.get("visibility") or "").strip()
+    if (
+        str(entry.get("source_table") or "") == "tiktok_live_chat"
+        and policy == "public_context"
+    ):
+        return visibility == Visibility.PUBLIC_SAFE.value
     if policy == "member_control":
         return visibility in {
             Visibility.PRIVATE.value,
@@ -2961,6 +2967,8 @@ def _knowledge_occurrence_identity(
 ) -> str:
     """Collapse one Moment or one bounded 30-minute exchange."""
     evidence_identity = _knowledge_evidence_identity(conn, entry)
+    if str(entry.get("source_table") or "") == "tiktok_live_chat":
+        return _tiktok_show_occurrence_identity(conn, entry)
     if (
         str(entry.get("source_table") or "") != "conversations"
         or str(entry.get("source_role") or "").lower()
@@ -6744,10 +6752,23 @@ def _conversation_motif_history(
         FROM main.memory_ledger_entries e
         WHERE guild_id=? AND subject_key=?
           AND entry_type='observation' AND predicate_key='conversation'
-          AND source_table='conversations' AND source_role='user'
+          AND source_role='user'
           AND source_class='public_observation'
-          AND route_mode IN ('normal_chat','conversation_continuity')
-          AND (?=0 OR route_mode='normal_chat')
+          AND (
+            (
+              source_table='conversations'
+              AND route_mode IN ('normal_chat','conversation_continuity')
+            )
+            OR (
+              source_table='tiktok_live_chat'
+              AND route_mode='tiktok_live_chat'
+            )
+          )
+          AND (
+            ?=0 OR (
+              source_table='conversations' AND route_mode='normal_chat'
+            )
+          )
           AND channel_policy IN (
             'public_home','public_context','public_selective'
           )
@@ -7426,6 +7447,7 @@ def _main_table_columns(
         "memory_moment_members",
         "memory_moment_participants",
         "bnl_journal_source_events",
+        "tiktok_show_evidence_ledgers",
     }:
         return set()
     if not conn.execute(
@@ -7492,6 +7514,305 @@ def _main_public_assessment_entry(
     if not row:
         return {}
     return dict(zip(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS, row))
+
+
+def _tiktok_show_occurrence_identity(
+    conn: sqlite3.Connection,
+    entry: Mapping[str, Any],
+) -> str:
+    """Bind one raw TikTok utterance to exactly one finalized show root."""
+
+    required = {
+        "guild_id",
+        "show_key",
+        "schema_version",
+        "lifecycle_status",
+        "started_at_ms",
+        "ended_at_ms",
+        "source_digest",
+        "ledger_json",
+    }
+    if not required.issubset(
+        _main_table_columns(conn, "tiktok_show_evidence_ledgers")
+    ):
+        return ""
+    guild_id = _public_assessment_int(entry.get("guild_id"))
+    event_id = str(entry.get("source_row_id") or "")
+    sequence = _public_assessment_int(entry.get("source_sequence"))
+    subject_key = str(entry.get("subject_key") or "")
+    if guild_id is None or not event_id or sequence is None or sequence <= 0:
+        return ""
+    rows = conn.execute(
+        """
+        SELECT show_key,schema_version,source_digest,ledger_json
+        FROM main.tiktok_show_evidence_ledgers
+        WHERE guild_id=? AND lifecycle_status='finalized'
+          AND started_at_ms<=? AND ended_at_ms>=?
+        ORDER BY ended_at_ms DESC,show_key
+        LIMIT 4
+        """,
+        (guild_id, sequence, sequence),
+    ).fetchall()
+    matches: list[tuple[str, str]] = []
+    for show_key, schema_version, source_digest, raw_json in rows:
+        try:
+            ledger = json.loads(str(raw_json or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(ledger, dict):
+            continue
+        digest_payload = dict(ledger)
+        digest_payload.pop("sourceDigest", None)
+        computed_digest = hashlib.sha256(
+            json.dumps(
+                digest_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            not re.fullmatch(r"[a-f0-9]{64}", str(source_digest or ""))
+            or str(ledger.get("schemaVersion") or "")
+            != str(schema_version or "")
+            or str(ledger.get("showKey") or "") != str(show_key or "")
+            or str(ledger.get("sourceDigest") or "")
+            != str(source_digest or "")
+            or computed_digest != str(source_digest or "")
+            or str(ledger.get("lifecycle") or "") != "finalized"
+        ):
+            continue
+        evidence_rows = [
+            message
+            for message in ledger.get("messages") or ()
+            if isinstance(message, dict)
+            and str(message.get("eventId") or "") == event_id
+            and str(message.get("subjectRef") or "") == subject_key
+            and _public_assessment_int(message.get("occurredAtMs")) == sequence
+        ]
+        if len(evidence_rows) == 1:
+            matches.append((str(show_key or ""), str(source_digest or "")))
+    if len(matches) != 1 or not all(matches[0]):
+        return ""
+    return _knowledge_digest(
+        "tiktok_show_occurrence",
+        guild_id,
+        matches[0][0],
+        matches[0][1],
+    )
+
+
+def _read_tiktok_public_assessment_root_state(
+    conn: sqlite3.Connection,
+    *,
+    entry: Mapping[str, Any],
+    guild_id: int,
+    subject_key: str,
+    living_validation: bool,
+) -> PublicAssessmentRootState | None:
+    """Validate an Open Signal root against the immutable TikTok receipt."""
+
+    entry_guild = _public_assessment_int(entry.get("guild_id"))
+    entry_channel = _public_assessment_int(entry.get("channel_id"))
+    event_id = str(entry.get("source_row_id") or "")
+    expected_entry_id = stable_entry_id(
+        guild_id=entry_guild,
+        source_table="tiktok_live_chat",
+        source_row_id=event_id,
+        source_revision=str(entry.get("source_revision") or ""),
+        entry_type="observation",
+        subject_key=str(entry.get("subject_key") or ""),
+        predicate_key="conversation",
+    )
+    if (
+        entry_guild != int(guild_id or 0)
+        or entry_channel != 0
+        or str(entry.get("schema_version") or "")
+        != MEMORY_LEDGER_SCHEMA_VERSION
+        or str(entry.get("entry_id") or "") != expected_entry_id
+        or str(entry.get("subject_key") or "") != str(subject_key or "")
+        or str(entry.get("entry_type") or "") != "observation"
+        or str(entry.get("predicate_key") or "") != "conversation"
+        or str(entry.get("source_table") or "") != "tiktok_live_chat"
+        or not event_id
+        or str(entry.get("source_revision") or "") != event_id
+        or str(entry.get("source_role") or "") != "user"
+        or str(entry.get("source_class") or "")
+        != SourceClass.PUBLIC_OBSERVATION.value
+        or str(entry.get("route_mode") or "") != "tiktok_live_chat"
+        or str(entry.get("channel_policy") or "") != "public_context"
+        or str(entry.get("visibility") or "")
+        != Visibility.PUBLIC_SAFE.value
+        or str(entry.get("confidence") or "") != Confidence.MEDIUM.value
+        or _public_assessment_bool_state(entry.get("public_usable")) is not True
+        or _public_assessment_bool_state(entry.get("derived")) is not False
+        or _public_assessment_bool_state(entry.get("projection")) is not False
+        or str(entry.get("lifecycle_status") or "") != ACTIVE_LIFECYCLE
+    ):
+        return None
+    participant_rows = tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT guild_id,participant_key,display_name,
+                   participant_role,order_index
+            FROM main.memory_ledger_participants
+            WHERE entry_id=?
+            ORDER BY guild_id,participant_role,participant_key,order_index
+            """,
+            (str(entry.get("entry_id") or ""),),
+        ).fetchall()
+    )
+    if participant_rows != (
+        (
+            int(guild_id),
+            str(subject_key),
+            str(entry.get("subject_display_name") or ""),
+            "author",
+            0,
+        ),
+    ):
+        return None
+    outgoing = tuple(
+        tuple(str(value or "") for value in row)
+        for row in conn.execute(
+            """
+            SELECT guild_id,lineage_type,target_entry_id,created_at
+            FROM main.memory_ledger_lineage
+            WHERE entry_id=?
+            ORDER BY guild_id,lineage_type,target_entry_id,created_at
+            """,
+            (str(entry.get("entry_id") or ""),),
+        ).fetchall()
+    )
+    incoming = tuple(
+        tuple(str(value or "") for value in row)
+        for row in conn.execute(
+            """
+            SELECT guild_id,entry_id,lineage_type,created_at
+            FROM main.memory_ledger_lineage
+            WHERE target_entry_id=?
+            ORDER BY guild_id,entry_id,lineage_type,created_at
+            """,
+            (str(entry.get("entry_id") or ""),),
+        ).fetchall()
+    )
+    if any(
+        _public_assessment_int(row[0]) != int(guild_id or 0)
+        for row in (*outgoing, *incoming)
+    ) or any(
+        str(row[2] or "") in {"correction_of", "supersedes", "retracts"}
+        for row in incoming
+    ):
+        return None
+    required_receipt = set(_PUBLIC_ASSESSMENT_JOURNAL_RECEIPT_COLUMNS)
+    if not required_receipt.issubset(
+        _main_table_columns(conn, "bnl_journal_source_events")
+    ):
+        return None
+    trigger_snapshot = _main_public_assessment_journal_trigger_snapshot(conn)
+    if not trigger_snapshot:
+        return None
+    receipts = conn.execute(
+        "SELECT %s FROM main.bnl_journal_source_events "
+        "WHERE guild_id=? AND source_kind='tiktok_live_chat' "
+        "AND source_key=? ORDER BY event_seq LIMIT 2"
+        % ",".join(_PUBLIC_ASSESSMENT_JOURNAL_RECEIPT_COLUMNS),
+        (int(guild_id), event_id),
+    ).fetchall()
+    if len(receipts) != 1:
+        return None
+    receipt = tuple(receipts[0])
+    sequence = _public_assessment_int(entry.get("source_sequence"))
+    observed = _parse_knowledge_time(entry.get("observed_at"))
+    expected_ms = (
+        int(round(observed.timestamp() * 1000)) if observed is not None else None
+    )
+    if (
+        sequence is None
+        or sequence <= 0
+        or expected_ms != sequence
+        or _public_assessment_int(receipt[1]) != int(guild_id)
+        or str(receipt[2] or "") != "tiktok_live_chat"
+        or str(receipt[3] or "") != event_id
+        or _public_assessment_int(receipt[4]) != sequence
+        or _public_assessment_int(receipt[5]) not in {None, 0}
+        or str(receipt[6] or "") != "public_context"
+        or str(receipt[7] or "") != str(subject_key)
+        or str(receipt[8] or "")
+        != str(entry.get("subject_display_name") or "")
+        or str(receipt[9] or "")[:1000]
+        != str(entry.get("normalized_value") or "")
+        or str(receipt[10] or "")
+        != hashlib.sha256(str(receipt[9] or "").encode("utf-8")).hexdigest()
+        or _public_assessment_bool_state(receipt[11]) is not True
+    ):
+        return None
+    try:
+        receipt_metadata = json.loads(str(receipt[12] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(receipt_metadata, dict):
+        return None
+    if _knowledge_operational_or_test_source(dict(entry)):
+        return None
+    safe_text = _public_assessment_text(str(entry.get("normalized_value") or ""))
+    semantics = public_assessment_semantics(
+        str(entry.get("normalized_value") or "")
+    )
+    root_identity = _main_public_assessment_root_identity(conn, entry)
+    show_occurrence = _tiktok_show_occurrence_identity(conn, entry)
+    occurrence_identity = (
+        show_occurrence
+        if show_occurrence
+        else "" if living_validation else root_identity
+    )
+    if (
+        not safe_text
+        or semantics.attribution_mode
+        not in {"subject_action", "authored_topic"}
+        or not semantics.action_identity
+        or not semantics.point_identity
+        or not root_identity
+        or not occurrence_identity
+    ):
+        return None
+    source_digest = _public_assessment_state_digest(
+        _PUBLIC_ASSESSMENT_ROOT_STATE_VERSION,
+        tuple(entry.get(column) for column in _PUBLIC_ASSESSMENT_LEDGER_COLUMNS),
+        trigger_snapshot,
+        receipt,
+        participant_rows,
+        outgoing,
+        incoming,
+        root_identity,
+        occurrence_identity,
+        semantics.attribution_mode,
+        semantics.polarity,
+        semantics.action_identity,
+        semantics.material_facets,
+        semantics.point_identity,
+    )
+    return PublicAssessmentRootState(
+        entry_id=str(entry.get("entry_id") or ""),
+        subject_key=str(subject_key),
+        text=safe_text,
+        observed_at=str(entry.get("observed_at") or ""),
+        visibility=str(entry.get("visibility") or ""),
+        channel_policy=str(entry.get("channel_policy") or ""),
+        route_mode=str(entry.get("route_mode") or ""),
+        source_role=str(entry.get("source_role") or ""),
+        source_class=str(entry.get("source_class") or ""),
+        lifecycle_status=str(entry.get("lifecycle_status") or ""),
+        source_row_id=event_id,
+        root_identity=root_identity,
+        occurrence_identity=occurrence_identity,
+        source_digest=source_digest,
+        semantics=semantics,
+        public_usable=True,
+        derived=False,
+        projection=False,
+    )
 
 
 def _public_assessment_sql_identity(value: Any) -> str:
@@ -7800,7 +8121,7 @@ def _main_public_assessment_root_identity(
     if (
         not entry_id
         or not guild_id
-        or source_table != "conversations"
+        or source_table not in {"conversations", "tiktok_live_chat"}
         or not source_row_id
     ):
         return ""
@@ -8288,6 +8609,9 @@ def _main_public_assessment_occurrence_identity(
     root_identity = _main_public_assessment_root_identity(conn, entry)
     if not root_identity:
         return ""
+    if str(entry.get("source_table") or "") == "tiktok_live_chat":
+        show_occurrence = _tiktok_show_occurrence_identity(conn, entry)
+        return show_occurrence or ("" if raw_exchange_only else root_identity)
     if (
         str(entry.get("source_table") or "") != "conversations"
         or str(entry.get("source_role") or "").lower() != "user"
@@ -8934,6 +9258,14 @@ def read_public_assessment_root_state(
         return None
     entry = _main_public_assessment_entry(conn, str(entry_id or ""))
     expected_subject = str(subject_key or "")
+    if entry and str(entry.get("source_table") or "") == "tiktok_live_chat":
+        return _read_tiktok_public_assessment_root_state(
+            conn,
+            entry=entry,
+            guild_id=int(guild_id or 0),
+            subject_key=expected_subject,
+            living_validation=living_validation,
+        )
     entry_guild_id = _public_assessment_int(entry.get("guild_id")) if entry else None
     entry_channel_id = _public_assessment_int(entry.get("channel_id")) if entry else None
     public_usable_state = (
@@ -9292,6 +9624,22 @@ def _living_canon_raw_exchange_component(
     current_id = str(entry.get("entry_id") or "")
     observed_at = str(entry.get("observed_at") or "")
     observed = _parse_knowledge_time(observed_at)
+    if str(entry.get("source_table") or "") == "tiktok_live_chat":
+        source_sequence = _public_assessment_int(entry.get("source_sequence"))
+        show_occurrence = _tiktok_show_occurrence_identity(conn, entry)
+        if (
+            not current_id
+            or observed is None
+            or source_sequence is None
+            or source_sequence <= 0
+            or not show_occurrence
+        ):
+            return "", (), ("", 0, "")
+        return (
+            show_occurrence,
+            (current_id,),
+            (observed_at, source_sequence, current_id),
+        )
     scope = (
         int(entry.get("guild_id") or 0),
         int(entry.get("channel_id") or 0),
@@ -10489,7 +10837,8 @@ def _living_canon_rejection_reason_counts(
         SELECT visibility,public_usable,derived,projection,source_role,
                source_class,channel_policy,lifecycle_status
         FROM main.memory_ledger_entries
-        WHERE guild_id=? AND subject_key=? AND source_table='conversations'
+        WHERE guild_id=? AND subject_key=?
+          AND source_table IN ('conversations','tiktok_live_chat')
           AND entry_type='observation' AND predicate_key='conversation'
         ORDER BY observed_at DESC,source_sequence DESC,entry_id DESC
         LIMIT ?
@@ -10771,7 +11120,8 @@ def form_atomic_candidates_from_recurring_conversation(
         guild_id = int(trigger.get("guild_id") or 0)
         subject_key = str(trigger.get("subject_key") or "")
         if (
-            str(trigger.get("source_table") or "") != "conversations"
+            str(trigger.get("source_table") or "")
+            not in {"conversations", "tiktok_live_chat"}
             or str(trigger.get("source_role") or "").lower() != "user"
             or str(trigger.get("entry_type") or "") != "observation"
             or str(trigger.get("predicate_key") or "") != "conversation"

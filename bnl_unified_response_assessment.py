@@ -26,7 +26,7 @@ from bnl_canon_source_contract import BNL01, CANON_ENTITY_IDENTITIES
 from bnl_conversation_context_v2 import assess_payload_grounding
 
 
-ASSESSMENT_VERSION = "unified_response_assessment_v7"
+ASSESSMENT_VERSION = "unified_response_assessment_v8"
 CONVERSATION_TURN_PACKET_VERSION = "conversation_turn_evidence_v3"
 SITUATION_FRAME_VERSION = "situation_frame_v3"
 FRAME_SOURCE_REVALIDATION_VERSION = "frame_source_revalidation_v1"
@@ -49,6 +49,7 @@ _LOWER_PRECEDENCE_LANES = (
     "website_read_model",
     "source_context",
     "broadcast_memory",
+    "show_episode",
     "active_episode",
     "prior_moment",
     "governed_memory",
@@ -63,6 +64,7 @@ _KNOWN_LANES = frozenset(
         "website_read_model",
         "source_context",
         "broadcast_memory",
+        "show_episode",
         "active_episode",
         "prior_moment",
         "governed_memory",
