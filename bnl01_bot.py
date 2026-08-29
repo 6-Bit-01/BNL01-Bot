@@ -35,6 +35,7 @@ from bnl_tiktok_live_context import (
     build_durable_show_prompt_context,
     build_live_prompt_context,
     is_live_show_reaction_query,
+    is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
     live_context_diagnostics,
     select_show_for_tiktok_analysis,
@@ -2410,6 +2411,59 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
     return False
 
 
+_CONVERSATION_TIKTOK_USER_LINE_RE = re.compile(
+    r"^User/member(?:\s+\([^\n]*\))?:\s*(?P<text>.+)$",
+    re.MULTILINE,
+)
+
+
+def resolve_tiktok_show_analysis_request(
+    user_text: str,
+    conversation_context: str = "",
+) -> str:
+    """Resolve an explicit durable query or one bounded human follow-up.
+
+    Conversation context is used only to decide whether to reload the durable
+    source. Prior BNL replies are deliberately ineligible and never become
+    evidence for the new answer.
+    """
+
+    current = re.sub(r"\s+", " ", str(user_text or "")).strip()
+    if not current:
+        return ""
+    if is_tiktok_show_analysis_query(current):
+        return current
+    if not is_tiktok_show_analysis_followup(current):
+        return ""
+
+    prior_human_requests = [
+        re.sub(r"\s+", " ", match.group("text")).strip()
+        for match in _CONVERSATION_TIKTOK_USER_LINE_RE.finditer(
+            str(conversation_context or "")
+        )
+    ]
+    skipped_current_copy = False
+    followup_chain = []
+    for prior in reversed(prior_human_requests):
+        if not skipped_current_copy and prior.casefold() == current.casefold():
+            # Some routes include the current payload in the rendered room
+            # block. It is not a prior turn and cannot establish its own scope.
+            skipped_current_copy = True
+            continue
+        if is_tiktok_show_analysis_query(prior) or is_live_show_reaction_query(prior):
+            chain = "\n".join(reversed(followup_chain))
+            request = f"{prior}\n{chain}\nCurrent follow-up: {current}" if chain else (
+                f"{prior}\nCurrent follow-up: {current}"
+            )
+            return _safe_truncate_summary(request, 2000)
+        if is_tiktok_show_analysis_followup(prior):
+            followup_chain.append(f"Prior follow-up: {prior}")
+            continue
+        # Never leap over an unrelated human turn to resurrect an older topic.
+        break
+    return ""
+
+
 def _read_model_sections(read_model: dict) -> dict:
     sections = read_model.get("sections") if isinstance(read_model, dict) else {}
     return sections if isinstance(sections, dict) else {}
@@ -2699,7 +2753,13 @@ def _load_durable_tiktok_show_events(
     return events
 
 
-def build_bnl_read_model_context(read_model: dict, user_text: str, channel_policy: str) -> str:
+def build_bnl_read_model_context(
+    read_model: dict,
+    user_text: str,
+    channel_policy: str,
+    *,
+    tiktok_show_analysis_request: str = "",
+) -> str:
     """Build a compact prompt block from the channel-authorized read model."""
 
     declared_access_scope = website_queue_access_scope(read_model)
@@ -2719,7 +2779,12 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     source_context_items = _public_source_context_items(read_model)
     queue_query = _queue_read_model_query(user_text)
     live_reaction_query = is_live_show_reaction_query(user_text)
-    show_analysis_query = is_tiktok_show_analysis_query(user_text)
+    show_analysis_text = (
+        str(tiktok_show_analysis_request or "").strip()
+        or (user_text if is_tiktok_show_analysis_query(user_text) else "")
+    )
+    show_analysis_query = bool(show_analysis_text)
+    tiktok_context_query = live_reaction_query or show_analysis_query
     operational_query = queue_query or live_reaction_query or show_analysis_query
     queue_focus = _queue_query_focus(user_text) if operational_query else {}
     if live_reaction_query or show_analysis_query:
@@ -2878,7 +2943,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             queued_tracks,
             user_text,
             queue_focus,
-        ) if queue_query else ([] if live_reaction_query else queued_tracks[:8])
+        ) if queue_query else ([] if tiktok_context_query else queued_tracks[:8])
         if selected_queued_tracks:
             lines.append("\nRelevant queued tracks:")
             for track in selected_queued_tracks:
@@ -2935,14 +3000,14 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             if show_analysis_query:
                 durable_events = _load_durable_tiktok_show_events(
                     archive,
-                    user_text,
+                    show_analysis_text,
                 )
                 lines.append(
                     "\n"
                     + build_durable_show_prompt_context(
                         archive,
                         durable_events,
-                        user_text,
+                        show_analysis_text,
                     )
                 )
             else:
@@ -3054,12 +3119,12 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             "- Answer only what was asked. For a full-lineup request, direct the user to the queue page instead of reproducing the entire queue in Discord.",
             (
                 "- Queue state and aggregate TikTok room metrics are temporary operational context. Public TikTok comments/questions are separately archived as conversation evidence above Community Canon; this response may use normal public conversation memory."
-                if live_reaction_query
+                if tiktok_context_query
                 else "- Do not treat this operational queue context as durable memory."
             ),
             (
                 "- Never promote one TikTok comment, one queue state, or one engagement count into canon, a relationship fact, or verified external truth."
-                if live_reaction_query
+                if tiktok_context_query
                 else "- Do not write, merge, promote, or persist this context."
             ),
             "- Do not claim private account/payment/user data.",
@@ -3074,12 +3139,24 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     return "\n".join(lines)
 
 
-def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> str:
-    if not is_bnl_read_model_relevant(user_text, channel_policy):
+def maybe_build_bnl_read_model_context(
+    user_text: str,
+    channel_policy: str,
+    *,
+    conversation_context: str = "",
+) -> str:
+    show_analysis_request = resolve_tiktok_show_analysis_request(
+        user_text,
+        conversation_context,
+    )
+    if not (
+        is_bnl_read_model_relevant(user_text, channel_policy)
+        or show_analysis_request
+    ):
         return ""
     queue_query = _queue_read_model_query(user_text)
     live_reaction_query = is_live_show_reaction_query(user_text)
-    show_analysis_query = is_tiktok_show_analysis_query(user_text)
+    show_analysis_query = bool(show_analysis_request)
     read_model = fetch_bnl_read_model(
         force=queue_query or live_reaction_query or show_analysis_query
     )
@@ -3099,7 +3176,12 @@ def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> s
             "reason=current_queue_owner_unavailable"
         )
         return ""
-    return build_bnl_read_model_context(read_model, user_text, channel_policy)
+    return build_bnl_read_model_context(
+        read_model,
+        user_text,
+        channel_policy,
+        tiktok_show_analysis_request=show_analysis_request,
+    )
 
 
 def public_tiktok_interaction_memory_allowed(
@@ -3110,11 +3192,13 @@ def public_tiktok_interaction_memory_allowed(
     """Allow the public BNL exchange to persist, never the injected snapshot."""
 
     context = str(website_read_model_context or "")
+    durable_show_context = "Durable TikTok show analysis context:" in context
     return bool(
         (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES
         and (
             is_live_show_reaction_query(user_text)
             or is_tiktok_show_analysis_query(user_text)
+            or durable_show_context
         )
         and "Website public read model context:" in context
         and "accessScope=public" in context
@@ -34466,10 +34550,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(collapsed_items, style_key, style_rule)
-            batch_website_read_model_context = maybe_build_bnl_read_model_context(
-                combined_text,
-                channel_policy,
+            recent_room_prompt = str(
+                orchestration_state.get("recent_room_prompt") or ""
             )
+            if recent_room_prompt:
+                batch_website_read_model_context = maybe_build_bnl_read_model_context(
+                    combined_text,
+                    channel_policy,
+                    conversation_context=recent_room_prompt,
+                )
+            else:
+                batch_website_read_model_context = maybe_build_bnl_read_model_context(
+                    combined_text,
+                    channel_policy,
+                )
             batch_source_context_available = bool(
                 batch_website_read_model_context
             )
@@ -34486,7 +34580,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "request:\n"
                     + batch_website_read_model_context
                     + "\nAnswer current queue questions directly from this context. "
-                    "Answer TikTok-reaction questions from the authorized live-show context when present. "
+                    "Answer TikTok chat, reaction-analysis, and follow-up questions from the authorized live-show evidence when present. "
                     "Answer only what was asked; if the context marks a full-lineup "
                     "request, send the queue-page link instead of listing every track. "
                     "Do not replace the current readout with the normal Friday "
@@ -34520,9 +34614,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     + batch_attribution_contract.prompt_block
                     + "\n"
                 )
-            recent_room_prompt = str(
-                orchestration_state.get("recent_room_prompt") or ""
-            )
             if recent_room_prompt:
                 prompt += "\n\n" + recent_room_prompt + "\n"
             orchestration_prompt_block = str(
@@ -37785,7 +37876,11 @@ async def _generate_direct_payload_session(session_key, reason: str):
         ),
         **session_owner_states,
     )
-    website_read_model_context = maybe_build_bnl_read_model_context(direct_content, session.get("channel_policy", "unknown"))
+    website_read_model_context = maybe_build_bnl_read_model_context(
+        direct_content,
+        session.get("channel_policy", "unknown"),
+        conversation_context=room_context,
+    )
     source_context_block = await maybe_build_source_context_for_direct_message(
         anchor_message,
         direct_content,
@@ -42335,7 +42430,11 @@ async def on_message(message: discord.Message):
                     **direct_owner_states,
                 )
             )
-            website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
+            website_read_model_context = maybe_build_bnl_read_model_context(
+                direct_content,
+                channel_policy,
+                conversation_context=room_context,
+            )
             source_context_block = await maybe_build_source_context_for_direct_message(
                 message,
                 direct_content,
@@ -42874,7 +42973,11 @@ async def on_message(message: discord.Message):
             ),
             **direct_owner_states,
         )
-        website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
+        website_read_model_context = maybe_build_bnl_read_model_context(
+            direct_content,
+            channel_policy,
+            conversation_context=room_context,
+        )
         source_context_block = await maybe_build_source_context_for_direct_message(
             message,
             direct_content,
@@ -43364,7 +43467,11 @@ async def on_message(message: discord.Message):
             ),
             **direct_owner_states,
         )
-        website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
+        website_read_model_context = maybe_build_bnl_read_model_context(
+            direct_content,
+            channel_policy,
+            conversation_context=room_context,
+        )
         source_context_block = await maybe_build_source_context_for_direct_message(
             message,
             direct_content,
