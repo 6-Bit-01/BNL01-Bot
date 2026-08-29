@@ -768,6 +768,52 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "One combined response.",
         )
 
+    async def test_public_batch_guard_exhaustion_recovers_required_reply(self):
+        channel = self._channel(8104)
+        answer = "A concrete public answer survived the guard repair limit."
+        guard = mock.AsyncMock(
+            return_value=(
+                "",
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "contextual_followthrough_after_retry"
+                    ),
+                },
+            )
+        )
+
+        async def generate(*_args, **_kwargs):
+            return answer
+
+        self._prime_flush(channel, "BNL, why did that queue decision change?")
+
+        with (
+            self._flush_runtime(
+                channel.id,
+                generate,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=guard,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(channel.sent, [answer])
+        guard.assert_awaited_once()
+
     async def test_sealed_batch_queue_question_receives_private_read_model_context(self):
         channel = self._channel(8150)
         generation_calls = []
@@ -1259,6 +1305,10 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "chat. At t+4.5m the Wheel confirmed Second Artist's Queue Light; "
             "Alex then asked BNL about that move in Discord."
         )
+        retry_with_unsupported_lore = (
+            repaired
+            + " Cliff handled a studio-floor interruption between those events."
+        )
         prompts = []
         source_context_flags = []
         assessment_calls = []
@@ -1269,7 +1319,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             source_context_flags.append(
                 bool(kwargs.get("source_context_available"))
             )
-            return observed_refusal if len(prompts) == 1 else repaired
+            return (
+                observed_refusal
+                if len(prompts) == 1
+                else retry_with_unsupported_lore
+            )
 
         def assess(**kwargs):
             assessment_calls.append(kwargs)
@@ -1343,6 +1397,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(channel.sent, [repaired])
         self.assertNotIn(observed_refusal, channel.sent)
+        self.assertNotIn("Cliff", channel.sent[0])
 
     async def test_batch_records_one_participant_neutral_unified_assessment_after_send(self):
         channel = self._channel(8137)

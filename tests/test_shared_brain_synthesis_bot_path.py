@@ -830,6 +830,55 @@ class SharedBrainSynthesisBotPathTests(
             finalized.await_args.kwargs["candidate_live"]
         )
 
+    async def test_direct_guard_exhaustion_recovers_required_reply(self):
+        message = FakeMessage()
+        guard = mock.AsyncMock(
+            return_value=(
+                "",
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "contextual_followthrough_after_retry"
+                    ),
+                },
+            )
+        )
+        finalized = mock.AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalized,
+                )
+            )
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "Concrete established answer.",
+                self.plan(),
+                prompt="baseline prompt",
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+            )
+
+        self.assertEqual(message.replies, ["Concrete established answer."])
+        finalized.assert_awaited_once()
+        self.assertTrue(finalized.await_args.kwargs["response_sent"])
+        self.assertEqual(
+            finalized.await_args.kwargs["guard_status"],
+            "guard_response_obligation_recovered_sent",
+        )
+
     async def test_all_synthesis_gates_off_preserves_baseline_bytes(self):
         baseline = "  Established baseline — unchanged.\nSecond line.  "
         prompt = "  Baseline prompt.\nKeep this spacing exactly.  "
@@ -1874,7 +1923,7 @@ class SharedBrainSynthesisBotPathTests(
         self.assertTrue(finalize.await_args.kwargs["response_sent"])
         self.assertFalse(finalize.await_args.kwargs["candidate_live"])
 
-    async def test_single_packet_guard_modification_suppresses_send(self):
+    async def test_single_packet_guard_modification_recovers_send(self):
         message = FakeMessage()
         message.author.display_name = "Test Member"
         run = SimpleNamespace(run_id="single-run")
@@ -1941,7 +1990,7 @@ class SharedBrainSynthesisBotPathTests(
                 ordinary_chat_single_packet_execution=execution,
             )
 
-        self.assertEqual(message.replies, [])
+        self.assertEqual(message.replies, ["Modified candidate."])
         self.assertFalse(guard.await_args.kwargs["regeneration_allowed"])
         record_block.assert_awaited_once()
         self.assertEqual(
@@ -1949,7 +1998,7 @@ class SharedBrainSynthesisBotPathTests(
             "single_packet_guard_modified_response",
         )
         finalize.assert_awaited_once()
-        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
         self.assertFalse(finalize.await_args.kwargs["candidate_live"])
 
     async def test_typed_single_packet_candidate_is_not_semantically_rejudged(self):

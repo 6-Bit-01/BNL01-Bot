@@ -10762,6 +10762,360 @@ def tiktok_show_episode_response_failure(
     return ""
 
 
+def remove_unsupported_show_lore_sentences(
+    response: str,
+    prompt: str,
+) -> str:
+    """Remove lore-only sentences that are absent from finalized show evidence."""
+
+    value = str(response or "").strip()
+    evidence = _normalize_guard_text(_show_episode_evidence_from_prompt(prompt))
+    if not value or not evidence:
+        return value
+    unsupported_patterns = tuple(
+        pattern
+        for pattern in _SHOW_EPISODE_LORE_PATTERNS.values()
+        if not re.search(
+            pattern,
+            evidence,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not unsupported_patterns:
+        return value
+
+    def contains_unsupported_lore(text: str) -> bool:
+        return any(
+            re.search(pattern, text, flags=re.IGNORECASE)
+            for pattern in unsupported_patterns
+        )
+
+    sanitized_lines = []
+    for raw_line in value.splitlines():
+        if not contains_unsupported_lore(raw_line):
+            sanitized_lines.append(raw_line.rstrip())
+            continue
+        bullet_match = re.match(
+            r"^(?P<prefix>\s*(?:[-*+]|\d+[.)])\s+)(?P<body>.*)$",
+            raw_line,
+        )
+        prefix = bullet_match.group("prefix") if bullet_match else ""
+        body = bullet_match.group("body") if bullet_match else raw_line
+        kept_sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", body)
+            if sentence.strip()
+            and not contains_unsupported_lore(sentence)
+        ]
+        if kept_sentences:
+            sanitized_lines.append(prefix + " ".join(kept_sentences))
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(sanitized_lines)).strip()
+
+
+_SOURCE_NEUTRAL_GUARD_RECOVERY_PREFIXES = (
+    "community_visual_",
+    "conversation_source_",
+    "current_payload_grounding_",
+    "exact_quote_",
+    "exact_reply_grounding_",
+    "generic_non_answer_",
+    "memory_source_",
+    "media_only_",
+    "prompt_source_",
+    "scripted_mode_leak_",
+    "source_grounding_",
+    "source_revalidation_",
+    "source_safe_recall_",
+    "unified_moment_canary_",
+)
+
+
+def _guard_recovery_requires_source_neutral_response(reason: str) -> bool:
+    normalized = str(reason or "").strip().lower()
+    return any(
+        normalized.startswith(prefix)
+        for prefix in _SOURCE_NEUTRAL_GUARD_RECOVERY_PREFIXES
+    )
+
+
+def build_show_episode_evidence_fallback(prompt: str) -> str:
+    """Render retained show facts directly when prose repair is exhausted."""
+
+    evidence = _show_episode_evidence_from_prompt(prompt)
+    if not evidence:
+        return ""
+    summary_lines = []
+    timeline_lines = []
+    supporting_lines = []
+    safe_support_sections = {
+        "authoritative show roster and lifecycle:",
+        "track-linked chat moments (timing correlation only):",
+        "recurring language/topics across retained public show chat:",
+        "people in this episode:",
+    }
+    support_section_active = False
+
+    for raw_line in evidence.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        annotation = re.match(r"^\[E\d+\s*\|[^\]]+\]\s*(.+)$", line)
+        if annotation:
+            line = annotation.group(1).strip()
+        lowered = line.casefold()
+        if lowered.startswith("show episode:") or lowered.startswith(
+            "episode interaction totals:"
+        ):
+            summary_lines.append(line)
+            support_section_active = False
+            continue
+        if lowered in safe_support_sections:
+            support_section_active = True
+            continue
+        if lowered.startswith(
+            (
+                "authoritative queue/broadcast events",
+                "source-linked authored examples:",
+                "public discord interactions with bnl during this episode:",
+                "attributed public tiktok/discord evidence:",
+            )
+        ):
+            support_section_active = False
+            continue
+        if re.search(r"\bt[+-]\d+(?:\.\d+)?m\b", line, flags=re.I):
+            timeline_lines.append(line)
+            continue
+        if line.startswith("-") and support_section_active:
+            supporting_lines.append(line)
+            continue
+        if annotation and line:
+            supporting_lines.append("- " + line)
+
+    def timeline_key(value: str) -> float:
+        match = re.search(r"\bt([+-])(\d+(?:\.\d+)?)m\b", value, flags=re.I)
+        if not match:
+            return float("inf")
+        offset = float(match.group(2))
+        return -offset if match.group(1) == "-" else offset
+
+    timeline_lines = sorted(
+        dict.fromkeys(timeline_lines),
+        key=timeline_key,
+    )
+    summary_lines = list(dict.fromkeys(summary_lines))
+    supporting_lines = list(dict.fromkeys(supporting_lines))
+    if not timeline_lines and not supporting_lines:
+        return ""
+
+    rendered = ["Here’s the verified show record directly:"]
+    rendered.extend(summary_lines[:3])
+    if timeline_lines:
+        rendered.append("Chronology:")
+        rendered.extend(timeline_lines[:40])
+    if supporting_lines:
+        rendered.append("Other retained show evidence:")
+        rendered.extend(supporting_lines[:20])
+    return "\n".join(rendered).strip()
+
+
+def build_guard_response_obligation_fallback(
+    current_user_text: str,
+    suppression_reason: str,
+) -> str:
+    """Return a non-empty, source-neutral reply for an authorized turn."""
+
+    _ = current_user_text
+    reason = str(suppression_reason or "guard_repair_exhausted").lower()
+    if "quote" in reason:
+        return (
+            "I can’t verify the exact wording from the current message state, "
+            "so I won’t present a reconstructed quote as exact."
+        )
+    if "source" in reason or "basis" in reason or "canary" in reason:
+        return (
+            "I can’t verify that from the current evidence, so I won’t present "
+            "an unsupported answer as fact."
+        )
+    if reason == "media_only_no_text":
+        return (
+            "I couldn’t ground a reliable answer in that attachment, so I’m "
+            "not going to invent what it contains."
+        )
+    if reason.startswith("exact_reply_grounding_"):
+        return (
+            "I couldn’t keep the answer bound to the exact reply target, so I’m "
+            "not going to answer a nearby message by mistake."
+        )
+    return (
+        "I can’t verify a clean answer from the current evidence without "
+        "inventing details."
+    )
+
+
+def recover_guarded_response_obligation(
+    response: str,
+    *,
+    baseline_response: str,
+    prompt: str,
+    current_user_text: str,
+    diagnostics: dict,
+    route_mode: str,
+    channel_policy: str,
+    source_context_available: bool = False,
+    exact_quote_requested: bool = False,
+    exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
+    third_party_attribution_requested: bool = False,
+) -> str:
+    """Recover an authorized reply after a draft guard exhausts repair.
+
+    Guards retain authority over unsafe prose and stale evidence. They do not
+    own the already-authorized response act, so this function always returns a
+    non-empty delivery candidate.
+    """
+
+    original_reason = str(
+        diagnostics.get("suppression_reason") or "guard_repair_exhausted"
+    )
+    diagnostics["original_suppression_reason"] = original_reason
+    diagnostics["response_obligation_recovered"] = True
+    diagnostics["suppressed"] = False
+    diagnostics["guard_fallback_or_generic_non_answer"] = True
+    candidates = tuple(
+        dict.fromkeys(
+            str(candidate or "").strip()
+            for candidate in (response or "", baseline_response or "")
+            if str(candidate or "").strip()
+        )
+    )
+
+    source_neutral = _guard_recovery_requires_source_neutral_response(
+        original_reason
+    )
+    show_evidence = _show_episode_evidence_from_prompt(prompt)
+    if show_evidence and not source_neutral:
+        for candidate in candidates:
+            repaired = remove_unsupported_show_lore_sentences(
+                candidate,
+                prompt,
+            )
+            if not repaired:
+                continue
+            if tiktok_show_analysis_response_failure(repaired, prompt):
+                continue
+            if tiktok_show_episode_response_failure(
+                repaired,
+                prompt,
+                current_user_text=current_user_text,
+            ):
+                continue
+            if contains_fake_lookup_claim(repaired):
+                continue
+            if (
+                not source_context_available
+                and _contains_unsupported_source_authority_claim(repaired)
+            ):
+                continue
+            if detect_normal_chat_presentation_mode_leak(
+                repaired,
+                route_mode,
+            ):
+                continue
+            diagnostics["response_obligation_recovery_kind"] = (
+                "grounded_show_candidate"
+            )
+            diagnostics["source_neutral_recovery"] = False
+            logging.warning(
+                "response_obligation_recovered_after_guard reason=%s "
+                "kind=grounded_show_candidate route_mode=%s channel_policy=%s",
+                original_reason,
+                route_mode,
+                channel_policy,
+            )
+            return repaired
+        evidence_fallback = build_show_episode_evidence_fallback(prompt)
+        if evidence_fallback:
+            diagnostics["response_obligation_recovery_kind"] = (
+                "grounded_show_evidence"
+            )
+            diagnostics["source_neutral_recovery"] = False
+            logging.warning(
+                "response_obligation_recovered_after_guard reason=%s "
+                "kind=grounded_show_evidence route_mode=%s channel_policy=%s",
+                original_reason,
+                route_mode,
+                channel_policy,
+            )
+            return evidence_fallback
+
+    quote_guard_requested = bool(
+        exact_quote_requested or third_party_attribution_requested
+    )
+    if not source_neutral:
+        for candidate in candidates:
+            if is_generic_non_answer_response(candidate):
+                continue
+            if (
+                original_reason.startswith("contextual_followthrough_")
+                and is_contextual_followthrough_deflection(candidate)
+            ):
+                continue
+            if contains_fake_lookup_claim(candidate):
+                continue
+            if (
+                not source_context_available
+                and _contains_unsupported_source_authority_claim(candidate)
+            ):
+                continue
+            if detect_normal_chat_presentation_mode_leak(candidate, route_mode):
+                continue
+            if (
+                diagnostics.get("source_safe_recall_output_leak_guard_triggered")
+                and response_exposes_source_safe_recall_controls(candidate)
+            ):
+                continue
+            if (
+                diagnostics.get("unified_moment_canary_output_leak_guard_triggered")
+                and response_exposes_canary_control_markers(candidate)
+            ):
+                continue
+            if exact_quote_response_failure(
+                candidate,
+                requested=quote_guard_requested,
+                authority=exact_quote_authority,
+                exact_requested=exact_quote_requested,
+            ):
+                continue
+            diagnostics["response_obligation_recovery_kind"] = (
+                "last_safe_candidate"
+            )
+            diagnostics["source_neutral_recovery"] = False
+            logging.warning(
+                "response_obligation_recovered_after_guard reason=%s "
+                "kind=last_safe_candidate route_mode=%s channel_policy=%s",
+                original_reason,
+                route_mode,
+                channel_policy,
+            )
+            return candidate
+
+    fallback = build_guard_response_obligation_fallback(
+        current_user_text,
+        original_reason,
+    )
+    diagnostics["response_obligation_recovery_kind"] = "source_neutral"
+    diagnostics["source_neutral_recovery"] = True
+    diagnostics["_revalidated_prompt_source_bases"] = ()
+    logging.warning(
+        "response_obligation_recovered_after_guard reason=%s "
+        "kind=source_neutral route_mode=%s channel_policy=%s",
+        original_reason,
+        route_mode,
+        channel_policy,
+    )
+    return fallback
+
+
 def build_tiktok_show_episode_correction_prompt(
     prompt: str,
     failure: str,
@@ -30416,7 +30770,10 @@ async def get_gemini_response(
                 int(recent_media_context_present),
             )
             logging.info("canned_media_fallback_blocked route=%s channel_policy=%s", route, _extract_channel_policy_from_prompt(prompt))
-            return ""
+            return build_guard_response_obligation_fallback(
+                prompt,
+                "media_only_no_text",
+            )
 
         if contains_fake_lookup_claim(text):
             source = "broadcast_memory_context" if "Broadcast memory" in (prompt or "") else "standard_context"
@@ -30429,7 +30786,13 @@ async def get_gemini_response(
             )
             if regenerated:
                 return regenerated
-            return _safe_uncertain_response_from_prompt(prompt)
+            return (
+                _safe_uncertain_response_from_prompt(prompt)
+                or build_guard_response_obligation_fallback(
+                    prompt,
+                    "source_grounding_after_retry",
+                )
+            )
 
         if unsupported_source_authority:
             repaired = _repair_unsupported_authority_with_conversation_context(text, prompt, route)
@@ -30444,7 +30807,13 @@ async def get_gemini_response(
             )
             if regenerated:
                 return regenerated
-            return _safe_uncertain_response_from_prompt(prompt)
+            return (
+                _safe_uncertain_response_from_prompt(prompt)
+                or build_guard_response_obligation_fallback(
+                    prompt,
+                    "source_grounding_after_retry",
+                )
+            )
 
         if public_authority_guard_active and contains_operator_causality_claim(text):
             logging.info("model_response_rejected reason=public_operator_causality_claim")
@@ -30456,7 +30825,10 @@ async def get_gemini_response(
             )
             if regenerated:
                 return regenerated
-            return ""
+            return build_guard_response_obligation_fallback(
+                prompt,
+                "public_operator_causality_after_retry",
+            )
 
         return text
     except BackgroundGenerationUnavailable:
@@ -36291,6 +36663,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             or guard_diagnostics.get(
                 "source_safe_recall_output_leak_guard_triggered"
             )
+            or guard_diagnostics.get(
+                "tiktok_show_analysis_guard_triggered"
+            )
+            or guard_diagnostics.get(
+                "tiktok_show_episode_guard_triggered"
+            )
+            or guard_diagnostics.get("response_obligation_recovered")
             or batch_canary_guard_fallback_triggered
         )
         regenerated_for_mode_leak = bool(
@@ -36340,21 +36719,38 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             return
         if guard_diagnostics.get("suppressed"):
-            logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", ROUTE_MODE_NORMAL_CHAT, channel_policy)
-            await safely_finalize_shared_brain_synthesis(
-                batch_synthesis_decision,
-                final_response=response or batch_baseline_response,
-                response_sent=False,
-                candidate_live=False,
-                guard_status="batch_guard_suppressed",
+            response = recover_guarded_response_obligation(
+                response,
+                baseline_response=batch_baseline_response,
+                prompt=prompt,
+                current_user_text=combined_text,
+                diagnostics=guard_diagnostics,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                channel_policy=channel_policy,
+                source_context_available=batch_source_context_available,
+                exact_quote_requested=(
+                    batch_attribution_contract.exact_quote_requested
+                ),
+                exact_quote_authority=(
+                    batch_attribution_contract.exact_quote_authority
+                ),
+                third_party_attribution_requested=(
+                    batch_attribution_contract
+                    .third_party_attribution_requested
+                ),
             )
-            return
+            batch_synthesis_candidate_active = False
         batch_presend_source_bases = tuple(
             guard_diagnostics.get("_revalidated_prompt_source_bases")
             or batch_prompt_source_bases
         )
+        if guard_diagnostics.get("source_neutral_recovery"):
+            batch_presend_source_bases = ()
         await _stop_batch_typing(channel_id, local_generation_id, reason="response_ready")
-        if batch_attribution_contract.exact_quote_authority is not None:
+        if (
+            batch_attribution_contract.exact_quote_authority is not None
+            and not guard_diagnostics.get("source_neutral_recovery")
+        ):
             presend_quote_failure = await exact_quote_presend_failure(
                 response,
                 exact_requested=(
@@ -36369,19 +36765,41 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             if presend_quote_failure:
                 logging.warning(
-                    "batch_exact_quote_suppressed_before_send reason=%s "
+                    "batch_exact_quote_recovered_before_send reason=%s "
                     "channel_id=%s",
                     presend_quote_failure,
                     channel_id,
                 )
-                await safely_finalize_shared_brain_synthesis(
-                    batch_synthesis_decision,
-                    final_response=response,
-                    response_sent=False,
-                    candidate_live=False,
-                    guard_status="batch_exact_quote_presend_failed",
+                guard_diagnostics.update(
+                    {
+                        "suppressed": True,
+                        "suppression_reason": presend_quote_failure,
+                        "exact_quote_guard_triggered": True,
+                        "exact_quote_guard_reason": presend_quote_failure,
+                    }
                 )
-                return
+                response = recover_guarded_response_obligation(
+                    response,
+                    baseline_response=batch_baseline_response,
+                    prompt=prompt,
+                    current_user_text=combined_text,
+                    diagnostics=guard_diagnostics,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    source_context_available=(
+                        batch_source_context_available
+                    ),
+                    exact_quote_requested=(
+                        batch_attribution_contract.exact_quote_requested
+                    ),
+                    exact_quote_authority=None,
+                    third_party_attribution_requested=(
+                        batch_attribution_contract
+                        .third_party_attribution_requested
+                    ),
+                )
+                batch_presend_source_bases = ()
+                batch_synthesis_candidate_active = False
         batch_source_failure = prompt_source_basis_failure(
             batch_presend_source_bases
         )
@@ -36455,22 +36873,36 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             )
             if guard_diagnostics.get("suppressed"):
-                await safely_finalize_shared_brain_synthesis(
-                    batch_synthesis_decision,
-                    final_response=response,
-                    response_sent=False,
-                    candidate_live=False,
-                    guard_status=(
-                        "batch_baseline_guard_suppressed_at_presend"
+                response = recover_guarded_response_obligation(
+                    response,
+                    baseline_response=batch_baseline_response,
+                    prompt=prompt,
+                    current_user_text=combined_text,
+                    diagnostics=guard_diagnostics,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    source_context_available=(
+                        batch_source_context_available
+                    ),
+                    exact_quote_requested=(
+                        batch_attribution_contract.exact_quote_requested
+                    ),
+                    exact_quote_authority=(
+                        batch_attribution_contract.exact_quote_authority
+                    ),
+                    third_party_attribution_requested=(
+                        batch_attribution_contract
+                        .third_party_attribution_requested
                     ),
                 )
-                return
             batch_presend_source_bases = tuple(
                 guard_diagnostics.get(
                     "_revalidated_prompt_source_bases"
                 )
                 or batch_prompt_source_bases
             )
+            if guard_diagnostics.get("source_neutral_recovery"):
+                batch_presend_source_bases = ()
             fallback_hard_interrupt = (
                 _hard_interrupt_active_for_generation(
                     channel_id,
@@ -36518,21 +36950,40 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
         if batch_source_failure:
             _log_batch_event(
-                logging.INFO,
-                "response_suppressed_before_send",
+                logging.WARNING,
+                "response_obligation_recovered_before_send",
                 guild_id,
                 channel_id,
                 len(items),
                 f"reason={batch_source_failure}",
             )
-            await safely_finalize_shared_brain_synthesis(
-                batch_synthesis_decision,
-                final_response=response,
-                response_sent=False,
-                candidate_live=False,
-                guard_status="batch_prompt_source_presend_failed",
+            guard_diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": batch_source_failure,
+                    "prompt_source_basis_changed": True,
+                }
             )
-            return
+            response = recover_guarded_response_obligation(
+                response,
+                baseline_response=batch_baseline_response,
+                prompt=prompt,
+                current_user_text=combined_text,
+                diagnostics=guard_diagnostics,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                channel_policy=channel_policy,
+                source_context_available=batch_source_context_available,
+                exact_quote_requested=(
+                    batch_attribution_contract.exact_quote_requested
+                ),
+                exact_quote_authority=None,
+                third_party_attribution_requested=(
+                    batch_attribution_contract
+                    .third_party_attribution_requested
+                ),
+            )
+            batch_presend_source_bases = ()
+            batch_synthesis_candidate_active = False
         batch_frame = orchestration_state["decision"].situation_frame
         if isinstance(batch_frame, SituationFrameV1):
             batch_frame_revalidation = revalidate_situation_frame(
@@ -36632,7 +37083,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             response_sent=True,
             candidate_live=batch_synthesis_candidate_active,
             guard_status=(
-                "batch_candidate_sent"
+                "batch_guard_recovery_sent"
+                if guard_diagnostics.get("response_obligation_recovered")
+                else "batch_candidate_sent"
                 if batch_synthesis_candidate_active
                 else "batch_established_path_sent"
             ),
@@ -38707,6 +39160,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         guild_id=session["guild_id"],
         channel_id=session.get("channel_id", 0),
     )
+    direct_payload_baseline_response = response or ""
 
     response, guard_diagnostics = await apply_guarded_response_regeneration(
         response or "",
@@ -38743,14 +39197,32 @@ async def _generate_direct_payload_session(session_key, reason: str):
         situation_frame_route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
     )
     if guard_diagnostics.get("suppressed"):
-        logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", "direct_payload_session", session.get("channel_policy", "unknown"))
-        close_direct_payload_session_after_failed_generation(session_key, session, "guard_suppressed")
-        return
+        response = recover_guarded_response_obligation(
+            response,
+            baseline_response=direct_payload_baseline_response,
+            prompt=prompt,
+            current_user_text=direct_content,
+            diagnostics=guard_diagnostics,
+            route_mode=ROUTE_MODE_NORMAL_CHAT,
+            channel_policy=session.get("channel_policy", "unknown"),
+            source_context_available=source_context_available,
+            exact_quote_requested=bool(
+                prompt_metadata.get("exact_quote_requested")
+            ),
+            exact_quote_authority=prompt_metadata.get(
+                "exact_quote_authority"
+            ),
+            third_party_attribution_requested=bool(
+                prompt_metadata.get("third_party_attribution_requested")
+            ),
+        )
     direct_payload_presend_source_bases = tuple(
         guard_diagnostics.get("_revalidated_prompt_source_bases")
         or prompt_metadata.get("prompt_source_bases")
         or ()
     )
+    if guard_diagnostics.get("source_neutral_recovery"):
+        direct_payload_presend_source_bases = ()
 
     fallback_response_sent = False
     if not response:
@@ -38767,42 +39239,83 @@ async def _generate_direct_payload_session(session_key, reason: str):
     if _abort_if_invalidated("revision_changed_before_send"):
         logging.info("direct_session_pre_send_abort reason=revision_changed_before_send")
         return
-    quote_presend_failure = await exact_quote_presend_failure(
-        response,
-        exact_requested=bool(
-            prompt_metadata.get("exact_quote_requested")
-        ),
-        third_party_attribution_requested=bool(
-            prompt_metadata.get("third_party_attribution_requested")
-        ),
-        authority=prompt_metadata.get("exact_quote_authority"),
-        channel=getattr(anchor_message, "channel", None),
-    )
+    quote_presend_failure = ""
+    if not guard_diagnostics.get("source_neutral_recovery"):
+        quote_presend_failure = await exact_quote_presend_failure(
+            response,
+            exact_requested=bool(
+                prompt_metadata.get("exact_quote_requested")
+            ),
+            third_party_attribution_requested=bool(
+                prompt_metadata.get("third_party_attribution_requested")
+            ),
+            authority=prompt_metadata.get("exact_quote_authority"),
+            channel=getattr(anchor_message, "channel", None),
+        )
     if quote_presend_failure:
         logging.warning(
-            "direct_payload_exact_quote_suppressed_before_send reason=%s",
+            "direct_payload_exact_quote_recovered_before_send reason=%s",
             quote_presend_failure,
         )
-        close_direct_payload_session_after_failed_generation(
-            session_key,
-            session,
-            "exact_quote_presend_failed",
+        guard_diagnostics.update(
+            {
+                "suppressed": True,
+                "suppression_reason": quote_presend_failure,
+                "exact_quote_guard_triggered": True,
+                "exact_quote_guard_reason": quote_presend_failure,
+            }
         )
-        return
+        response = recover_guarded_response_obligation(
+            response,
+            baseline_response=direct_payload_baseline_response,
+            prompt=prompt,
+            current_user_text=direct_content,
+            diagnostics=guard_diagnostics,
+            route_mode=ROUTE_MODE_NORMAL_CHAT,
+            channel_policy=session.get("channel_policy", "unknown"),
+            source_context_available=source_context_available,
+            exact_quote_requested=bool(
+                prompt_metadata.get("exact_quote_requested")
+            ),
+            exact_quote_authority=None,
+            third_party_attribution_requested=bool(
+                prompt_metadata.get("third_party_attribution_requested")
+            ),
+        )
+        direct_payload_presend_source_bases = ()
     direct_payload_source_failure = prompt_source_basis_failure(
         direct_payload_presend_source_bases
     )
     if direct_payload_source_failure:
         logging.warning(
-            "direct_payload_source_suppressed_before_send reason=%s",
+            "direct_payload_source_recovered_before_send reason=%s",
             direct_payload_source_failure,
         )
-        close_direct_payload_session_after_failed_generation(
-            session_key,
-            session,
-            "prompt_source_presend_failed",
+        guard_diagnostics.update(
+            {
+                "suppressed": True,
+                "suppression_reason": direct_payload_source_failure,
+                "prompt_source_basis_changed": True,
+            }
         )
-        return
+        response = recover_guarded_response_obligation(
+            response,
+            baseline_response=direct_payload_baseline_response,
+            prompt=prompt,
+            current_user_text=direct_content,
+            diagnostics=guard_diagnostics,
+            route_mode=ROUTE_MODE_NORMAL_CHAT,
+            channel_policy=session.get("channel_policy", "unknown"),
+            source_context_available=source_context_available,
+            exact_quote_requested=bool(
+                prompt_metadata.get("exact_quote_requested")
+            ),
+            exact_quote_authority=None,
+            third_party_attribution_requested=bool(
+                prompt_metadata.get("third_party_attribution_requested")
+            ),
+        )
+        direct_payload_presend_source_bases = ()
     session_frame = session_orchestration.situation_frame
     if isinstance(session_frame, SituationFrameV1):
         session_frame_revalidation = revalidate_situation_frame(
@@ -39181,6 +39694,7 @@ async def apply_guarded_response_regeneration(
         "tiktok_show_analysis_guard_reason": "",
         "tiktok_show_episode_guard_triggered": False,
         "tiktok_show_episode_regenerated": False,
+        "tiktok_show_episode_lore_sanitized": False,
         "tiktok_show_episode_guard_reason": "",
         "source_grounding_guard_triggered": False,
         "source_grounding_regenerated": False,
@@ -39225,6 +39739,10 @@ async def apply_guarded_response_regeneration(
         "suppressed": False,
         "suppression_reason": "",
         "guard_fallback_or_generic_non_answer": False,
+        "response_obligation_recovered": False,
+        "response_obligation_recovery_kind": "",
+        "source_neutral_recovery": False,
+        "original_suppression_reason": "",
     }
     response = (response or "").strip()
     logging.info("response_pre_guard_length route=%s channel_policy=%s length=%s", route_mode, channel_policy, len(response))
@@ -39669,7 +40187,7 @@ async def apply_guarded_response_regeneration(
         )
         if retry_has_guard_failure(regenerated):
             logging.warning(
-                "tiktok_show_analysis_response_suppressed_after_retry "
+                "tiktok_show_analysis_candidate_rejected_after_retry "
                 "reason=%s route_mode=%s channel_policy=%s",
                 regenerated_failure or "other_guard",
                 route_mode,
@@ -39732,24 +40250,47 @@ async def apply_guarded_response_regeneration(
             regenerated_failure
         )
         if retry_has_guard_failure(regenerated):
-            logging.warning(
-                "tiktok_show_episode_response_suppressed_after_retry "
-                "reason=%s route_mode=%s channel_policy=%s",
-                regenerated_failure or "other_guard",
-                route_mode,
-                channel_policy,
-            )
-            diagnostics.update(
-                {
-                    "suppressed": True,
-                    "suppression_reason": (
-                        "tiktok_show_episode_after_retry"
-                    ),
-                    "guard_fallback_or_generic_non_answer": True,
-                }
-            )
-            return "", diagnostics
-        response = regenerated
+            lore_sanitized = ""
+            if regenerated_failure.startswith("unsupported_show_lore_"):
+                lore_sanitized = remove_unsupported_show_lore_sentences(
+                    regenerated,
+                    prompt,
+                )
+            if (
+                lore_sanitized
+                and lore_sanitized != regenerated
+                and not retry_has_guard_failure(lore_sanitized)
+            ):
+                logging.warning(
+                    "tiktok_show_episode_lore_sanitized_after_retry "
+                    "reason=%s route_mode=%s channel_policy=%s",
+                    regenerated_failure,
+                    route_mode,
+                    channel_policy,
+                )
+                diagnostics["tiktok_show_episode_lore_sanitized"] = True
+                diagnostics["tiktok_show_episode_guard_reason"] = ""
+                response = lore_sanitized
+            else:
+                logging.warning(
+                    "tiktok_show_episode_candidate_rejected_after_retry "
+                    "reason=%s route_mode=%s channel_policy=%s",
+                    regenerated_failure or "other_guard",
+                    route_mode,
+                    channel_policy,
+                )
+                diagnostics.update(
+                    {
+                        "suppressed": True,
+                        "suppression_reason": (
+                            "tiktok_show_episode_after_retry"
+                        ),
+                        "guard_fallback_or_generic_non_answer": True,
+                    }
+                )
+                return "", diagnostics
+        else:
+            response = regenerated
 
     exact_reply_grounding = reply_referent_grounding(response)
     diagnostics["exact_reply_grounding_status"] = (
@@ -39823,7 +40364,7 @@ async def apply_guarded_response_regeneration(
 
     if has_media and not _strip_media_context_block(current_user_text or "").strip():
         if is_generic_non_answer_response(response, user_display_name) or not response:
-            logging.info("media_only_no_text_response_suppressed route=%s channel_policy=%s", route_mode, channel_policy)
+            logging.info("media_only_no_text_candidate_rejected route=%s channel_policy=%s", route_mode, channel_policy)
             diagnostics.update({"suppressed": True, "suppression_reason": "media_only_no_text", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
     source_grounding_failure = bool(
@@ -39841,7 +40382,7 @@ async def apply_guarded_response_regeneration(
         regenerated = (regenerated or "").strip()
         regenerated_invalid = retry_has_guard_failure(regenerated)
         if regenerated_invalid:
-            logging.warning("source_grounding_response_suppressed_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
+            logging.warning("source_grounding_candidate_rejected_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
             diagnostics.update({"suppressed": True, "suppression_reason": "source_grounding_after_retry", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
         response = regenerated
@@ -39948,7 +40489,7 @@ async def apply_guarded_response_regeneration(
             if not retry_has_guard_failure(regenerated):
                 response = regenerated
             else:
-                logging.warning("scripted_mode_leak_response_suppressed_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
+                logging.warning("scripted_mode_leak_candidate_rejected_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
                 diagnostics.update({"suppressed": True, "suppression_reason": "scripted_mode_leak_after_retry", "guard_fallback_or_generic_non_answer": True})
                 return "", diagnostics
         else:
@@ -39956,7 +40497,7 @@ async def apply_guarded_response_regeneration(
             if fallback and not is_generic_non_answer_response(fallback, user_display_name):
                 response = fallback
             else:
-                logging.warning("scripted_mode_leak_response_suppressed_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
+                logging.warning("scripted_mode_leak_candidate_rejected_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
                 diagnostics.update({"suppressed": True, "suppression_reason": "scripted_mode_leak_no_safe_fallback", "guard_fallback_or_generic_non_answer": True})
                 return "", diagnostics
     community_visual_failure = (
@@ -40012,7 +40553,7 @@ async def apply_guarded_response_regeneration(
             response = regenerated
         else:
             logging.warning(
-                "community_visual_response_suppressed_after_retry route_mode=%s channel_policy=%s",
+                "community_visual_candidate_rejected_after_retry route_mode=%s channel_policy=%s",
                 route_mode,
                 channel_policy,
             )
@@ -40052,7 +40593,7 @@ async def apply_guarded_response_regeneration(
             response = regenerated
         else:
             logging.warning(
-                "contextual_followthrough_response_suppressed_after_retry route_mode=%s channel_policy=%s",
+                "contextual_followthrough_candidate_rejected_after_retry route_mode=%s channel_policy=%s",
                 route_mode,
                 channel_policy,
             )
@@ -40077,7 +40618,7 @@ async def apply_guarded_response_regeneration(
         if not retry_has_guard_failure(regenerated):
             response = regenerated
         else:
-            logging.warning("generic_non_answer_suppressed_after_retry route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
+            logging.warning("generic_non_answer_candidate_rejected_after_retry route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
             diagnostics.update({"suppressed": True, "suppression_reason": "generic_non_answer_after_retry", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
     current_payload_grounding = payload_grounding(response)
@@ -40122,7 +40663,7 @@ async def apply_guarded_response_regeneration(
         if retry_has_guard_failure(regenerated):
             logging.warning(
                 "current_payload_grounding_regeneration_result "
-                "status=%s outcome=suppressed route_mode=%s "
+                "status=%s outcome=candidate_rejected route_mode=%s "
                 "channel_policy=%s",
                 regenerated_grounding.status,
                 route_mode,
@@ -40440,10 +40981,20 @@ async def validate_deterministic_normal_chat_response(
     )
     if diagnostics.get("suppressed"):
         logging.warning(
-            "deterministic_normal_chat_response_suppressed route_mode=%s channel_policy=%s reason=%s",
+            "deterministic_normal_chat_response_recovered route_mode=%s channel_policy=%s reason=%s",
             route_mode,
             channel_policy,
             diagnostics.get("suppression_reason", "guard"),
+        )
+        validated = recover_guarded_response_obligation(
+            validated,
+            baseline_response=response,
+            prompt="",
+            current_user_text=current_user_text,
+            diagnostics=diagnostics,
+            route_mode=route_mode,
+            channel_policy=channel_policy,
+            source_context_available=True,
         )
     return validated
 
@@ -41751,18 +42302,31 @@ async def send_planned_conversation_response(
             )
             or synthesis_decision
         )
-        await safely_finalize_shared_brain_synthesis(
-            synthesis_decision,
-            final_response=response,
-            response_sent=False,
-            candidate_live=False,
-            guard_status=reason,
+        if not guard_diagnostics.get("suppressed"):
+            guard_diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": reason,
+                }
+            )
+        response = recover_guarded_response_obligation(
+            response,
+            baseline_response=baseline_response,
+            prompt=prompt,
+            current_user_text=getattr(message, "content", ""),
+            diagnostics=guard_diagnostics,
+            route_mode=plan.route_mode,
+            channel_policy=plan.channel_policy,
+            source_context_available=source_context_available,
+            exact_quote_requested=exact_quote_requested,
+            exact_quote_authority=exact_quote_authority,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
         )
-        _finish_direct_repair_generation(
-            direct_repair_generation,
-            "single_packet_guard_suppressed",
-        )
-        return model_decision
+        synthesis_candidate_active = False
+        if guard_diagnostics.get("source_neutral_recovery"):
+            prompt_source_bases = ()
     canary_guard_fallback_triggered = False
     if (
         not single_packet_cutover
@@ -41843,6 +42407,9 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get(
             "source_safe_recall_output_leak_guard_triggered"
         )
+        or guard_diagnostics.get("tiktok_show_analysis_guard_triggered")
+        or guard_diagnostics.get("tiktok_show_episode_guard_triggered")
+        or guard_diagnostics.get("response_obligation_recovered")
         or canary_guard_fallback_triggered
         or archive_guard_triggered
     )
@@ -41852,20 +42419,28 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("regenerated_for_register_mismatch")
     )
     if guard_diagnostics.get("suppressed"):
-        logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", plan.route_mode, plan.channel_policy)
-        await safely_finalize_shared_brain_synthesis(
-            synthesis_decision,
-            final_response=response or baseline_response,
-            response_sent=False,
-            candidate_live=False,
-            guard_status="guard_suppressed",
+        response = recover_guarded_response_obligation(
+            response,
+            baseline_response=baseline_response,
+            prompt=prompt,
+            current_user_text=getattr(message, "content", ""),
+            diagnostics=guard_diagnostics,
+            route_mode=plan.route_mode,
+            channel_policy=plan.channel_policy,
+            source_context_available=source_context_available,
+            exact_quote_requested=exact_quote_requested,
+            exact_quote_authority=exact_quote_authority,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
         )
-        _finish_direct_repair_generation(direct_repair_generation, "guard_suppressed")
-        return model_decision
+        synthesis_candidate_active = False
     prompt_source_bases = tuple(
         guard_diagnostics.get("_revalidated_prompt_source_bases")
         or prompt_source_bases
     )
+    if guard_diagnostics.get("source_neutral_recovery"):
+        prompt_source_bases = ()
     subject_ran = bool(subject_extraction_ran) if subject_extraction_ran is not None else bool(plan.subject_extraction_allowed)
     update_last_route_debug(
         route_mode=plan.route_mode,
@@ -41903,8 +42478,17 @@ async def send_planned_conversation_response(
         save_policy_reason=getattr(model_decision, "reason", "unknown"),
         durable_memory_write=getattr(model_decision, "write_memory_tier", False),
         scripted_mode_leak_guard_triggered=guard_triggered,
-        leak_guard_result="regenerated" if regenerated_for_mode_leak else ("suppressed" if guard_diagnostics.get("suppressed") else "clear"),
-        fallback_used=ordinary_chat_legacy_fallback_active,
+        leak_guard_result=(
+            "recovered"
+            if guard_diagnostics.get("response_obligation_recovered")
+            else "regenerated"
+            if regenerated_for_mode_leak
+            else "clear"
+        ),
+        fallback_used=bool(
+            ordinary_chat_legacy_fallback_active
+            or guard_diagnostics.get("response_obligation_recovered")
+        ),
         regenerated_for_mode_leak=regenerated_for_mode_leak,
         media_present=bool(media_context.get("present", False)),
         media_context_included=bool(media_context.get("included", False)),
@@ -41956,18 +42540,20 @@ async def send_planned_conversation_response(
                 guard_status="stale_before_send_commit",
             )
         return model_decision
-    quote_presend_failure = await exact_quote_presend_failure(
-        response,
-        exact_requested=exact_quote_requested,
-        third_party_attribution_requested=(
-            third_party_attribution_requested
-        ),
-        authority=exact_quote_authority,
-        channel=getattr(message, "channel", None),
-    )
+    quote_presend_failure = ""
+    if not guard_diagnostics.get("source_neutral_recovery"):
+        quote_presend_failure = await exact_quote_presend_failure(
+            response,
+            exact_requested=exact_quote_requested,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
+            authority=exact_quote_authority,
+            channel=getattr(message, "channel", None),
+        )
     if quote_presend_failure:
         logging.warning(
-            "direct_exact_quote_suppressed_before_send reason=%s",
+            "direct_exact_quote_recovered_before_send reason=%s",
             quote_presend_failure,
         )
         if single_packet_cutover and synthesis_decision is not None:
@@ -41981,18 +42567,31 @@ async def send_planned_conversation_response(
                 )
                 or synthesis_decision
             )
-        await safely_finalize_shared_brain_synthesis(
-            synthesis_decision,
-            final_response=response,
-            response_sent=False,
-            candidate_live=False,
-            guard_status="exact_quote_presend_failed",
+        guard_diagnostics.update(
+            {
+                "suppressed": True,
+                "suppression_reason": quote_presend_failure,
+                "exact_quote_guard_triggered": True,
+                "exact_quote_guard_reason": quote_presend_failure,
+            }
         )
-        _finish_direct_repair_generation(
-            direct_repair_generation,
-            "exact_quote_presend_failed",
+        response = recover_guarded_response_obligation(
+            response,
+            baseline_response=baseline_response,
+            prompt=prompt,
+            current_user_text=getattr(message, "content", ""),
+            diagnostics=guard_diagnostics,
+            route_mode=plan.route_mode,
+            channel_policy=plan.channel_policy,
+            source_context_available=source_context_available,
+            exact_quote_requested=exact_quote_requested,
+            exact_quote_authority=None,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
         )
-        return model_decision
+        prompt_source_bases = ()
+        synthesis_candidate_active = False
     direct_source_failure = prompt_source_basis_failure(
         prompt_source_bases
     )
@@ -42009,18 +42608,31 @@ async def send_planned_conversation_response(
                 )
                 or synthesis_decision
             )
-        await safely_finalize_shared_brain_synthesis(
-            synthesis_decision,
-            final_response=response,
-            response_sent=False,
-            candidate_live=False,
-            guard_status="single_packet_source_presend_failed",
+        guard_diagnostics.update(
+            {
+                "suppressed": True,
+                "suppression_reason": direct_source_failure,
+                "prompt_source_basis_changed": True,
+            }
         )
-        _finish_direct_repair_generation(
-            direct_repair_generation,
-            "prompt_source_presend_failed",
+        response = recover_guarded_response_obligation(
+            response,
+            baseline_response=baseline_response,
+            prompt=prompt,
+            current_user_text=getattr(message, "content", ""),
+            diagnostics=guard_diagnostics,
+            route_mode=plan.route_mode,
+            channel_policy=plan.channel_policy,
+            source_context_available=source_context_available,
+            exact_quote_requested=exact_quote_requested,
+            exact_quote_authority=None,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
         )
-        return model_decision
+        prompt_source_bases = ()
+        direct_source_failure = ""
+        synthesis_candidate_active = False
     if direct_source_failure and synthesis_candidate_active:
         synthesis_decision = await safely_fallback_shared_brain_synthesis(
             synthesis_decision,
@@ -42037,22 +42649,27 @@ async def send_planned_conversation_response(
             regeneration_allowed=True,
         )
         if guard_diagnostics.get("suppressed"):
-            await safely_finalize_shared_brain_synthesis(
-                synthesis_decision,
-                final_response=response,
-                response_sent=False,
-                candidate_live=False,
-                guard_status="baseline_guard_suppressed_at_presend",
+            response = recover_guarded_response_obligation(
+                response,
+                baseline_response=baseline_response,
+                prompt=prompt,
+                current_user_text=getattr(message, "content", ""),
+                diagnostics=guard_diagnostics,
+                route_mode=plan.route_mode,
+                channel_policy=plan.channel_policy,
+                source_context_available=source_context_available,
+                exact_quote_requested=exact_quote_requested,
+                exact_quote_authority=exact_quote_authority,
+                third_party_attribution_requested=(
+                    third_party_attribution_requested
+                ),
             )
-            _finish_direct_repair_generation(
-                direct_repair_generation,
-                "guard_suppressed",
-            )
-            return model_decision
         prompt_source_bases = tuple(
             guard_diagnostics.get("_revalidated_prompt_source_bases")
             or prompt_source_bases
         )
+        if guard_diagnostics.get("source_neutral_recovery"):
+            prompt_source_bases = ()
         if _abort_stale_direct_repair_generation(
             direct_repair_generation,
             "after_presend_canary_fallback",
@@ -42070,21 +42687,33 @@ async def send_planned_conversation_response(
         )
     if direct_source_failure:
         logging.warning(
-            "direct_prompt_source_suppressed_before_send reason=%s",
+            "direct_prompt_source_recovered_before_send reason=%s",
             direct_source_failure,
         )
-        await safely_finalize_shared_brain_synthesis(
-            synthesis_decision,
-            final_response=response,
-            response_sent=False,
-            candidate_live=False,
-            guard_status="prompt_source_presend_failed",
+        guard_diagnostics.update(
+            {
+                "suppressed": True,
+                "suppression_reason": direct_source_failure,
+                "prompt_source_basis_changed": True,
+            }
         )
-        _finish_direct_repair_generation(
-            direct_repair_generation,
-            "prompt_source_presend_failed",
+        response = recover_guarded_response_obligation(
+            response,
+            baseline_response=baseline_response,
+            prompt=prompt,
+            current_user_text=getattr(message, "content", ""),
+            diagnostics=guard_diagnostics,
+            route_mode=plan.route_mode,
+            channel_policy=plan.channel_policy,
+            source_context_available=source_context_available,
+            exact_quote_requested=exact_quote_requested,
+            exact_quote_authority=None,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
         )
-        return model_decision
+        prompt_source_bases = ()
+        synthesis_candidate_active = False
     if isinstance(situation_frame, SituationFrameV1):
         final_frame_revalidation = revalidate_situation_frame(
             situation_frame,
@@ -42152,18 +42781,32 @@ async def send_planned_conversation_response(
                     )
                     or synthesis_decision
                 )
-            await safely_finalize_shared_brain_synthesis(
-                synthesis_decision,
-                final_response=response,
-                response_sent=False,
-                candidate_live=False,
-                guard_status="single_packet_frame_presend_failed",
+            guard_diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "source_revalidation_frame_"
+                        + final_frame_revalidation.status
+                    ),
+                }
             )
-            _finish_direct_repair_generation(
-                direct_repair_generation,
-                "frame_presend_failed",
+            response = recover_guarded_response_obligation(
+                response,
+                baseline_response=baseline_response,
+                prompt=prompt,
+                current_user_text=getattr(message, "content", ""),
+                diagnostics=guard_diagnostics,
+                route_mode=plan.route_mode,
+                channel_policy=plan.channel_policy,
+                source_context_available=source_context_available,
+                exact_quote_requested=exact_quote_requested,
+                exact_quote_authority=None,
+                third_party_attribution_requested=(
+                    third_party_attribution_requested
+                ),
             )
-            return model_decision
+            prompt_source_bases = ()
+            synthesis_candidate_active = False
         if deterministic_frame_clarification:
             guard_diagnostics[
                 "deterministic_frame_clarification"
@@ -42223,7 +42866,9 @@ async def send_planned_conversation_response(
         response_sent=True,
         candidate_live=synthesis_candidate_active,
         guard_status=(
-            "single_packet_candidate_sent"
+            "guard_response_obligation_recovered_sent"
+            if guard_diagnostics.get("response_obligation_recovered")
+            else "single_packet_candidate_sent"
             if single_packet_cutover and synthesis_candidate_active
             else "single_packet_deterministic_block_sent"
             if single_packet_cutover

@@ -337,10 +337,13 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Explicit user-tag recipients: @6 Bit", rendered)
         self.assertNotIn("456", rendered)
 
-    async def test_guard_suppression_closes_failed_revision_instead_of_retrying(self):
+    async def test_guard_suppression_recovers_and_sends_payload_reply(self):
         key = (1, 2, 3)
         channel = SimpleNamespace(id=2, name="general-chat")
-        anchor = SimpleNamespace(channel=channel)
+        anchor = SimpleNamespace(
+            channel=channel,
+            reply=mock.AsyncMock(return_value=SimpleNamespace(id=0)),
+        )
         guild = SimpleNamespace(id=1)
         member = SimpleNamespace(id=3, display_name="member")
         session = {
@@ -372,18 +375,63 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(bnl01_bot, "log_response_style"),
             mock.patch.object(bnl01_bot, "_build_direct_payload_prompt", return_value="prompt"),
             mock.patch.object(bnl01_bot, "_apply_direct_response_pacing", new=mock.AsyncMock()),
-            mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", new=mock.AsyncMock(return_value="unsafe draft")),
-            mock.patch.object(bnl01_bot, "suppress_stale_media_fallback", return_value="unsafe draft"),
+            mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", new=mock.AsyncMock(return_value="Concrete payload answer.")),
+            mock.patch.object(bnl01_bot, "suppress_stale_media_fallback", return_value="Concrete payload answer."),
             mock.patch.object(
                 bnl01_bot,
                 "apply_guarded_response_regeneration",
-                new=mock.AsyncMock(return_value=("", {"suppressed": True})),
+                new=mock.AsyncMock(
+                    return_value=(
+                        "",
+                        {
+                            "suppressed": True,
+                            "suppression_reason": (
+                                "contextual_followthrough_after_retry"
+                            ),
+                        },
+                    )
+                ),
             ),
             mock.patch.object(bnl01_bot, "is_privileged_member", return_value=False),
+            mock.patch.object(
+                bnl01_bot,
+                "DIRECT_PRE_SEND_GRACE_SECONDS",
+                0,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "exact_quote_presend_failure",
+                new=mock.AsyncMock(return_value=""),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "model_response_persistence_allowed_with_website_context",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "persist_bnl_self_name_decision_after_send_async",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
         ):
             await bnl01_bot._generate_direct_payload_session(key, "hard_cap")
-        self.assertNotIn(key, bnl01_bot._direct_payload_sessions)
-        self.assertTrue(session["completed"])
+        anchor.reply.assert_awaited_once()
+        self.assertEqual(
+            anchor.reply.await_args.args[0],
+            "Concrete payload answer.",
+        )
+        self.assertIn(key, bnl01_bot._direct_payload_sessions)
+        self.assertFalse(session["completed"])
         self.assertFalse(session["generating"])
 
     async def test_deferred_payload_prompt_uses_direct_memory_and_paraphrase_contract(self):
@@ -2350,6 +2398,19 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(candidate, response)
         provider.assert_not_awaited()
+
+    async def test_validation_only_guard_failure_recovers_nonempty_reply(self):
+        candidate = "What can I help with?"
+        response = await bnl01_bot.validate_deterministic_normal_chat_response(
+            candidate,
+            user_id=101,
+            guild_id=1,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="sealed_test",
+            current_user_text="Keep going.",
+        )
+        self.assertTrue(response)
+        self.assertNotEqual(response, candidate)
 
     async def test_explicit_status_question_allows_literal_operational_answer(self):
         for user_text in (
