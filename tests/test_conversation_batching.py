@@ -1230,6 +1230,120 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("vending machine", prompts[1])
         self.assertEqual(channel.sent, [repaired_response])
 
+    async def test_public_plain_name_show_timeline_uses_finalized_episode_owner(self):
+        channel = self._channel(8150)
+        request = (
+            "BNL, what happened during yesterday's BARCODE Radio show? Give me "
+            "a chronological timeline using the show chat, queue events, tracks, "
+            "and your Discord conversations."
+        )
+        episode_context = (
+            "Durable BARCODE Radio show episode memory:\n"
+            "Show episode: BARCODE Radio on 2026-08-28; 227 authoritative "
+            "operational events / 48 rostered tracks; 1406 TikTok messages; "
+            "35 directed Discord interactions / 35 paired BNL replies.\n"
+            "- t+1.2m [track play started] Neon Fox — First Signal\n"
+            "- t+4.5m [wheel confirmed] Second Artist — Queue Light\n"
+            "Attributed public TikTok/Discord evidence:\n"
+            "- TikTok t+2.0m Alex: \"the green visuals during this song are wild\"\n"
+            "- Discord t+5.2m Alex: \"Did the Wheel put Queue Light up next, BNL?\""
+        )
+        observed_refusal = (
+            "I don't have yesterday's broadcast logs or chat feed loaded in my "
+            "active buffer, 6 Bit. You'll need to check the raw recordings "
+            "directly or ask Sheila for the show breakdown."
+        )
+        repaired = (
+            "The retained episode clock begins at t+1.2m with Neon Fox's First "
+            "Signal, followed by Alex calling out its green visuals in TikTok "
+            "chat. At t+4.5m the Wheel confirmed Second Artist's Queue Light; "
+            "Alex then asked BNL about that move in Discord."
+        )
+        prompts = []
+        source_context_flags = []
+        assessment_calls = []
+        real_guard = bnl01_bot.apply_guarded_response_regeneration
+
+        async def generate(prompt, *_args, **kwargs):
+            prompts.append(prompt)
+            source_context_flags.append(
+                bool(kwargs.get("source_context_available"))
+            )
+            return observed_refusal if len(prompts) == 1 else repaired
+
+        def assess(**kwargs):
+            assessment_calls.append(kwargs)
+            return None
+
+        self._prime_flush(channel, request)
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "DB_FILE",
+                "missing-public-show-batch-test.db",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_tiktok_show_evidence_context",
+                return_value=episode_context,
+            ) as build_episode,
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=assess,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=real_guard,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn(episode_context, prompts[0])
+        self.assertIn(
+            "Finalized BARCODE Radio episode priority:",
+            prompts[0],
+        )
+        self.assertIn(
+            "FINALIZED SHOW EVIDENCE CORRECTION REQUIRED",
+            prompts[1],
+        )
+        self.assertEqual(source_context_flags, [True, True])
+        build_episode.assert_called_once_with(
+            "missing-public-show-batch-test.db",
+            guild_id=channel.guild.id,
+            user_text=request,
+            subject_user_id=100,
+        )
+        self.assertEqual(len(assessment_calls), 1)
+        self.assertIn(
+            "show_episode",
+            assessment_calls[0]["prompt_lanes"],
+        )
+        self.assertFalse(
+            assessment_calls[0]["website_read_model_present"]
+        )
+        self.assertEqual(channel.sent, [repaired])
+        self.assertNotIn(observed_refusal, channel.sent)
+
     async def test_batch_records_one_participant_neutral_unified_assessment_after_send(self):
         channel = self._channel(8137)
         now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)

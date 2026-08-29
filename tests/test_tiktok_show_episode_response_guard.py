@@ -72,6 +72,20 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
             "show_evidence_refused",
         )
 
+    def test_guard_rejects_observed_active_buffer_and_sheila_handoff(self):
+        refusal = (
+            "I don't have yesterday's broadcast logs or chat feed loaded in "
+            "my active buffer, 6 Bit. You'll need to check the raw recordings "
+            "directly or ask Sheila for the show breakdown."
+        )
+        self.assertEqual(
+            bnl01_bot.tiktok_show_episode_response_failure(
+                refusal,
+                RAW_PROMPT,
+            ),
+            "show_evidence_refused",
+        )
+
     def test_guard_rejects_invented_clock_time(self):
         response = (
             "At 7:05 PM, Neon Fox's First Signal began, then Queue Light "

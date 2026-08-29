@@ -3341,6 +3341,52 @@ def finalized_show_packet_owner_requested(
     )
 
 
+def build_tiktok_show_evidence_context_for_turn(
+    *,
+    guild_id: int,
+    user_text: str,
+    subject_user_id: int = 0,
+    website_read_model_context: str = "",
+) -> str:
+    """Select finalized show evidence through the shared turn-level owner."""
+
+    tiktok_subject_continuity_allowed = True
+    if int(subject_user_id or 0) > 0 and os.path.exists(DB_FILE):
+        try:
+            with sqlite3.connect(DB_FILE, timeout=0.5) as relationship_conn:
+                tiktok_subject_continuity_allowed = bool(
+                    get_relationship_v2_member_settings(
+                        relationship_conn,
+                        guild_id=guild_id,
+                        user_id=subject_user_id,
+                    ).get("proactive_enabled", True)
+                )
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            tiktok_subject_continuity_allowed = False
+    tiktok_show_evidence_query = str(user_text or "")
+    selected_show_date = re.search(
+        r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b",
+        website_read_model_context or "",
+    )
+    if (
+        selected_show_date
+        and selected_show_date.group(1) not in tiktok_show_evidence_query
+    ):
+        tiktok_show_evidence_query = (
+            f"{tiktok_show_evidence_query} {selected_show_date.group(1)}"
+        ).strip()
+    return build_tiktok_show_evidence_context(
+        DB_FILE,
+        guild_id=guild_id,
+        user_text=tiktok_show_evidence_query,
+        subject_user_id=(
+            int(subject_user_id or 0)
+            if tiktok_subject_continuity_allowed
+            else 0
+        ),
+    )
+
+
 def _bnl_read_model_section_counts(read_model: dict) -> dict:
     sections = _read_model_sections(read_model)
     queue = _first_mapping(sections.get("queue"), read_model.get("queue") if isinstance(read_model, dict) else None)
@@ -10555,6 +10601,7 @@ def build_tiktok_show_analysis_correction_prompt(
 
 _SHOW_EPISODE_REFUSAL_PATTERNS = (
     r"\bdo not have (?:the )?(?:detailed |specific )?(?:incident |show )?logs\b",
+    r"\b(?:do not|don't) have.{0,100}\b(?:broadcast |show |chat )?(?:logs?|feed|recordings?)\b",
     r"\b(?:logs?|timeline|records?|telemetry) (?:is|are) not (?:active|available|loaded|piped)\b",
     r"\bnot piped directly into (?:this|my) (?:public )?(?:telemetry|feed|stream)\b",
     r"\bwhatever (?:happened|unfolded).{0,80}\bstays? between\b",
@@ -10653,7 +10700,12 @@ def _show_episode_grounding_terms(text: str) -> set[str]:
     }
 
 
-def tiktok_show_episode_response_failure(response: str, prompt: str) -> str:
+def tiktok_show_episode_response_failure(
+    response: str,
+    prompt: str,
+    *,
+    current_user_text: str = "",
+) -> str:
     """Reject show answers that ignore evidence or backfill gaps with lore."""
 
     evidence = _show_episode_evidence_from_prompt(prompt)
@@ -10694,7 +10746,9 @@ def tiktok_show_episode_response_failure(response: str, prompt: str) -> str:
     for clock_time in response_times:
         if clock_time.casefold() not in evidence_normalized.casefold():
             return "unsupported_show_clock_time"
-    request = _current_request_from_prompt(prompt)
+    request = str(current_user_text or "").strip() or _current_request_from_prompt(
+        prompt
+    )
     if re.search(
         r"\b(?:timeline|recap|rundown|what (?:else )?happened|"
         r"talked about|topics?|who (?:was|said|talked)|queue|played)\b",
@@ -35133,8 +35187,37 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     combined_text,
                     channel_policy,
                 )
+            batch_tiktok_show_evidence_context = (
+                build_tiktok_show_evidence_context_for_turn(
+                    guild_id=guild_id,
+                    user_text=combined_text,
+                    subject_user_id=(
+                        first_uid if len(unique_user_ids) == 1 else 0
+                    ),
+                    website_read_model_context=(
+                        batch_website_read_model_context
+                    ),
+                )
+            )
+            batch_tiktok_show_episode_turn_contract = (
+                build_tiktok_show_episode_turn_contract(
+                    batch_tiktok_show_evidence_context
+                )
+            )
+            batch_finalized_show_packet_owner = (
+                finalized_show_packet_owner_requested(
+                    combined_text,
+                    batch_tiktok_show_evidence_context,
+                )
+            )
             batch_source_context_available = bool(
                 batch_website_read_model_context
+                or batch_tiktok_show_evidence_context
+            )
+            batch_source_no_store_reason = (
+                "finalized_show_evidence_no_store"
+                if batch_tiktok_show_evidence_context
+                else "website_read_model_no_store"
             )
             batch_public_tiktok_memory_allowed = (
                 public_tiktok_interaction_memory_allowed(
@@ -35162,6 +35245,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     channel_id,
                     len(collapsed_items),
                     f"channel_policy={channel_policy}",
+                )
+            if batch_tiktok_show_evidence_context:
+                prompt += (
+                    "\n\n"
+                    + batch_tiktok_show_evidence_context
+                    + "\n"
+                    + batch_tiktok_show_episode_turn_contract
                 )
             batch_attribution_contract = build_batch_attribution_contract(
                 collapsed_items,
@@ -35389,7 +35479,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         ),
                         (
                             "website_read_model",
-                            batch_source_context_available,
+                            bool(
+                                batch_website_read_model_context
+                                and not batch_finalized_show_packet_owner
+                            ),
+                        ),
+                        (
+                            "show_episode",
+                            bool(batch_tiktok_show_evidence_context),
                         ),
                     )
                     if present
@@ -35459,7 +35556,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         is not None
                     ),
                     website_read_model_present=(
-                        batch_source_context_available
+                        bool(
+                            batch_website_read_model_context
+                            and not batch_finalized_show_packet_owner
+                        )
                     ),
                     current_direct=bool(
                         active_packet.get("addressed_to_bot")
@@ -35991,7 +36091,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             save_policy_reason=(
                 "public_tiktok_interaction_normal_memory"
                 if batch_public_tiktok_memory_allowed
-                else "website_read_model_no_store"
+                else batch_source_no_store_reason
                 if batch_source_context_available
                 else "batch_model_save_pending"
             ),
@@ -36518,7 +36618,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         ):
             logging.info(
                 "batch_response_persistence_skipped "
-                "reason=website_read_model_no_store channel_policy=%s",
+                "reason=%s channel_policy=%s",
+                batch_source_no_store_reason,
                 channel_policy,
             )
             _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
@@ -37082,35 +37183,11 @@ def build_user_aware_prompt(
         if queue_artist_memory_context
         else ""
     )
-    tiktok_subject_continuity_allowed = True
-    if os.path.exists(DB_FILE):
-        try:
-            with sqlite3.connect(DB_FILE, timeout=0.5) as relationship_conn:
-                tiktok_subject_continuity_allowed = bool(
-                    get_relationship_v2_member_settings(
-                        relationship_conn,
-                        guild_id=guild_id,
-                        user_id=user_id,
-                    ).get("proactive_enabled", True)
-                )
-        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
-            tiktok_subject_continuity_allowed = False
-    tiktok_show_evidence_query = clean_content
-    selected_show_date = re.search(
-        r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b",
-        website_read_model_context or "",
-    )
-    if selected_show_date and selected_show_date.group(1) not in clean_content:
-        tiktok_show_evidence_query = (
-            f"{clean_content} {selected_show_date.group(1)}"
-        )
-    tiktok_show_evidence_context = build_tiktok_show_evidence_context(
-        DB_FILE,
+    tiktok_show_evidence_context = build_tiktok_show_evidence_context_for_turn(
         guild_id=guild_id,
-        user_text=tiktok_show_evidence_query,
-        subject_user_id=(
-            user_id if tiktok_subject_continuity_allowed else 0
-        ),
+        user_text=clean_content,
+        subject_user_id=user_id,
+        website_read_model_context=website_read_model_context,
     )
     tiktok_show_evidence_prompt_block = (
         f"{tiktok_show_evidence_context}\n"
@@ -39421,6 +39498,7 @@ async def apply_guarded_response_regeneration(
                 tiktok_show_episode_response_failure(
                     candidate,
                     prompt,
+                    current_user_text=current_user_text,
                 )
             )
             or (
@@ -39612,6 +39690,7 @@ async def apply_guarded_response_regeneration(
     tiktok_episode_failure = tiktok_show_episode_response_failure(
         response,
         prompt,
+        current_user_text=current_user_text,
     )
     if tiktok_episode_failure:
         diagnostics["tiktok_show_episode_guard_triggered"] = True
@@ -39647,6 +39726,7 @@ async def apply_guarded_response_regeneration(
         regenerated_failure = tiktok_show_episode_response_failure(
             regenerated,
             prompt,
+            current_user_text=current_user_text,
         )
         diagnostics["tiktok_show_episode_guard_reason"] = (
             regenerated_failure
@@ -40280,6 +40360,7 @@ async def apply_guarded_response_regeneration(
     final_tiktok_episode_failure = tiktok_show_episode_response_failure(
         response,
         prompt,
+        current_user_text=current_user_text,
     )
     if final_tiktok_episode_failure:
         diagnostics.update(
