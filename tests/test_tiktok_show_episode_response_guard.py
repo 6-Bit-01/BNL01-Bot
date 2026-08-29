@@ -56,6 +56,22 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
             "unsupported_show_lore_cliff",
         )
 
+    def test_guard_rejects_public_surface_snapshot_refusal(self):
+        refusal = (
+            "I can't give you a minute-by-minute timeline of the chat or "
+            "Discord exchanges from yesterday, 6 Bit—that level of granular "
+            "conversation logging isn't available in my current surface "
+            "snapshot. I can, however, confirm the high-level metrics from "
+            "the broadcast."
+        )
+        self.assertEqual(
+            bnl01_bot.tiktok_show_episode_response_failure(
+                refusal,
+                RAW_PROMPT,
+            ),
+            "show_evidence_refused",
+        )
+
     def test_guard_rejects_invented_clock_time(self):
         response = (
             "At 7:05 PM, Neon Fox's First Signal began, then Queue Light "

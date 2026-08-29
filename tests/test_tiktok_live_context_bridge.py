@@ -124,6 +124,9 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
             "Give me a quick rundown on what people talked about throughout the live",
             "What recurring topics came up in chat during the show?",
             "How did the broadcast go?",
+            "BNL, what happened during yesterday's BARCODE Radio show? "
+            "Give me a chronological timeline using the show chat, queue "
+            "events, tracks, and your Discord conversations.",
         )
         for value in positives:
             with self.subTest(value=value):

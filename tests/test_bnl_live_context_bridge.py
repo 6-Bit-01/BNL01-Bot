@@ -427,6 +427,35 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
         self.assertNotIn("Now playing:", context)
         self.assertNotIn("Ranking by public chat messages", context)
 
+    def test_historical_multisource_timeline_reloads_durable_show_owner(self):
+        question = (
+            "BNL, what happened during yesterday's BARCODE Radio show? "
+            "Give me a chronological timeline using the show chat, queue "
+            "events, tracks, and your Discord conversations."
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ), mock.patch.object(
+            bnl01_bot,
+            "fetch_bnl_read_model",
+            return_value=public_read_model_with_show_archive(),
+        ) as fetch, mock.patch.object(
+            bnl01_bot,
+            "_load_durable_tiktok_show_events",
+            return_value=[],
+        ) as archive_load:
+            context = bnl01_bot.maybe_build_bnl_read_model_context(
+                question,
+                "public_home",
+            )
+
+        fetch.assert_called_once_with(force=True)
+        archive_load.assert_called_once()
+        self.assertIn("Durable TikTok show analysis context", context)
+        self.assertIn("Analysis intent=show_recap", context)
+
     def test_each_explicit_chat_analysis_turn_reloads_its_durable_owner(self):
         questions = (
             "Any recurring topics from TikTok chat during the show?",

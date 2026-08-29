@@ -108,6 +108,11 @@ _SHOW_ANALYSIS_PATTERNS = (
     r"(?:said|talked about|discussed|mentioned|asked)\b.*"
     r"\b(?:during|throughout|on|in|from) (?:the )?"
     r"(?:live|show|stream|broadcast)\b",
+    r"\bwhat happened (?:during|throughout|at|in|on) (?:the )?"
+    r"(?:(?:(?:yesterday|last night)(?:['’]s)?|last|previous|past) "
+    r"(?:(?:barcode radio|tiktok) )?(?:live|show|stream|broadcast)|"
+    r"(?:(?:barcode radio|tiktok) )?(?:live|show|stream|broadcast) "
+    r"(?:yesterday|last night))\b",
 )
 
 _SHOW_ANALYSIS_FOLLOWUP_PATTERNS = (
