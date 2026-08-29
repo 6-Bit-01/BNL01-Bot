@@ -63,7 +63,7 @@ the allowlists or expansion authorization changes. IDs are not exposed.
 
 ## One factual owner and one call
 
-The immutable Situation Frame v3 and `unified_intelligence_packet_v10` are
+The immutable Situation Frame v3 and `unified_intelligence_packet_v11` are
 frozen before generation. The packet renderer supplies the sole BARCODE,
 member, identity, relationship, episode, publication, canon, and
 stored-history factual view. The current request and verified exact-reply or
@@ -155,7 +155,7 @@ stale baseline answer.
 
 ## Content-free receipts
 
-`shared_brain_synthesis_v11` receipts retain only hashes, counts, bounded
+`shared_brain_synthesis_v12` receipts retain only hashes, counts, bounded
 statuses, and timing. Ordinary-chat rows include the frame revision and input
 digest, packet/source snapshot digests, selected lane/status/domain counts,
 prompt-applied state, provider and corrective call counts, candidate-selected

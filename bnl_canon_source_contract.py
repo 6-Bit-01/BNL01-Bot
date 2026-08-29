@@ -19,7 +19,7 @@ LEGACY_CANON_ADAPTER_VERSION = "legacy_canon_adapter_v1"
 DECLARED_CANON_ADAPTER_VERSION = "declared_canon_adapter_v1"
 BROADCAST_CANON_ADAPTER_VERSION = "broadcast_declared_adapter_v1"
 LIVING_CANON_ADAPTER_VERSION = "living_canon_adapter_v1"
-OPEN_SIGNAL_ADAPTER_VERSION = "open_signal_adapter_v3"
+OPEN_SIGNAL_ADAPTER_VERSION = "open_signal_adapter_v4"
 WEBSITE_LORE_ADAPTER_VERSION = "website_lore_review_adapter_v1"
 LIVING_CANON_RECURRENCE_VERSION = "living_canon_recurrence_v1"
 LIVING_CANON_GROUPING_SIGNATURE_VERSION = (
@@ -28,7 +28,7 @@ LIVING_CANON_GROUPING_SIGNATURE_VERSION = (
 ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION = (
     "memory_ledger_atomic_knowledge_lifecycle_v1"
 )
-PUBLIC_ASSESSMENT_EVIDENCE_VERSION = "public_assessment_evidence_v3"
+PUBLIC_ASSESSMENT_EVIDENCE_VERSION = "public_assessment_evidence_v4"
 ENTITY_ACCOUNT_BINDING_CONTRACT_VERSION = "canon_entity_account_binding_v1"
 
 
@@ -1504,7 +1504,11 @@ def adapt_open_signal_claim(row: Any) -> CanonAdapterResult:
         or _mapping_text(row, "channel_policy").casefold()
         not in {"public_home", "public_context", "public_selective"}
         or _mapping_text(row, "route_mode").casefold()
-        not in {"normal_chat", "conversation_continuity"}
+        not in {
+            "normal_chat",
+            "conversation_continuity",
+            "tiktok_live_chat",
+        }
         or attribution_mode
         not in {"subject_action", "authored_topic"}
         or polarity

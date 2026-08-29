@@ -34,6 +34,7 @@ from bnl_canon_source_contract import (
     EntityAccountBinding,
     SourceClass,
     SubjectIdentity,
+    Visibility,
     adapt_legacy_canon_fact,
     adapt_living_atomic_claim,
     adapt_open_signal_claim,
@@ -84,6 +85,10 @@ from bnl_moment_engine import (
 )
 from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import shadow_packet_posture
+from bnl_tiktok_show_ledger import (
+    select_tiktok_show_episode_context_items,
+    tiktok_show_episode_context_item_version,
+)
 from bnl_website_relay_state import (
     render_accepted_relay_publication,
     revalidate_accepted_relay_publication_on_connection,
@@ -91,7 +96,7 @@ from bnl_website_relay_state import (
 )
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v10"
+SCHEMA_VERSION = "unified_intelligence_packet_v11"
 SUBJECT_RESOLUTION_VERSION = "governed_packet_subject_resolution_v1"
 SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v2"
 JOURNAL_PUBLICATION_SOURCE_CLASS = "journal_publication_projection"
@@ -159,6 +164,7 @@ _LANE_CAPS = {
     "approved_fact": 4,
     "moment": 3,
     "episode": 4,
+    "show_episode": 4,
     "atomic_knowledge": 6,
     "recurring_theme": 3,
     "open_loop": 3,
@@ -175,6 +181,7 @@ _BROAD_PROFILE_LANE_CAPS = {
     "atomic_knowledge": 6,
     "moment": 2,
     "episode": 2,
+    "show_episode": 3,
     "recurring_theme": 2,
     "open_loop": 1,
     "canon": 1,
@@ -188,6 +195,7 @@ _VALIDATION_SUPPORT_LANES = frozenset(
         "approved_fact",
         "moment",
         "episode",
+        "show_episode",
         "atomic_knowledge",
         "recurring_theme",
         "open_loop",
@@ -252,6 +260,7 @@ _ASSESSMENT_LANE_MAP = {
     "open_loop": "governed_memory",
     "moment": "prior_moment",
     "episode": "prior_moment",
+    "show_episode": "show_episode",
     "recurring_theme": "governed_memory",
     "canon": "canon",
     "source_file": "source_context",
@@ -2978,6 +2987,112 @@ def _episode_items(
     return items
 
 
+def _show_episode_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+) -> list[IntelligencePacketItem]:
+    """Adapt finalized BARCODE Radio evidence into the existing packet.
+
+    The finalized show ledger remains the source owner.  These bounded views
+    deliberately keep first-party operations separate from projections over
+    attributed Community Canon / Open Signal utterances.
+    """
+
+    allow_subject_continuity = bool(
+        str(request.frame_subject_requirement or "").strip().lower()
+        == "required"
+    )
+    selected = select_tiktok_show_episode_context_items(
+        conn,
+        guild_id=int(request.guild_id or 0),
+        user_text=str(request.user_text or "")[:8000],
+        subject_user_id=int(request.subject_user_id or 0),
+        allow_subject_continuity=allow_subject_continuity,
+        now=request.now or None,
+    )
+    items: list[IntelligencePacketItem] = []
+    source_types = {
+        "operations": "barcode_show_operations",
+        "community": "barcode_show_community_projection",
+        "dialogue": "barcode_show_dialogue_projection",
+    }
+    predicates = {
+        "operations": "barcode_radio.show_operations",
+        "community": "barcode_radio.show_community",
+        "dialogue": "barcode_radio.show_dialogue",
+    }
+    attribution_modes = {
+        "operations": "first_party_record",
+        "community": "aggregate_projection",
+        "dialogue": "speaker_attributed_projection",
+    }
+    for selected_item in selected:
+        source_class = str(selected_item.source_class or "")
+        item = IntelligencePacketItem(
+            lane="show_episode",
+            source_class=source_class,
+            source_type=source_types.get(
+                selected_item.kind,
+                "barcode_show_evidence_projection",
+            ),
+            source_ref=selected_item.source_ref,
+            source_digest=selected_item.source_digest,
+            subject_key=selected_item.subject_key,
+            predicate_key=predicates.get(
+                selected_item.kind,
+                "barcode_radio.show_evidence",
+            ),
+            text=selected_item.text,
+            visibility=Visibility.PUBLIC_SAFE.value,
+            confidence=selected_item.confidence,
+            lifecycle="finalized",
+            authority=_AUTHORITY_RANK.get(source_class, 0),
+            participants=selected_item.participants,
+            lineage=tuple(
+                "tiktok_show_evidence:%s" % show_key
+                for show_key in selected_item.show_keys
+            ),
+            observed_at=selected_item.observed_at,
+            usage=selected_item.usage,
+            score=selected_item.score,
+            revalidation_kind="show_episode",
+            revalidation_key=selected_item.source_ref,
+            attribution_mode=attribution_modes.get(
+                selected_item.kind,
+                "aggregate_projection",
+            ),
+            event_ref=(
+                selected_item.show_keys[0]
+                if len(selected_item.show_keys) == 1
+                else ""
+            ),
+            episode_ref=(
+                selected_item.show_keys[0]
+                if len(selected_item.show_keys) == 1
+                else "multi_show"
+            ),
+            phase="historical",
+            uncertainty_status=selected_item.uncertainty_status,
+        )
+        if not _route_allows_item(request, item):
+            diagnostics.visibility_exclusions += 1
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="show_episode",
+                reason="show_episode_visibility",
+                source_class=source_class,
+            )
+            continue
+        diagnostics.candidates_by_lane["show_episode"] = (
+            diagnostics.candidates_by_lane.get("show_episode", 0) + 1
+        )
+        items.append(item)
+    return items
+
+
 def _declared_items(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
@@ -5021,6 +5136,7 @@ def _select_items(
         "recurring_theme": 2,
         "atomic_knowledge": 3,
         "conversation_context": 3,
+        "show_episode": 4,
         "assessment_observation": 4,
         "episode": 5,
         "moment": 6,
@@ -5036,6 +5152,7 @@ def _select_items(
                 "conversation_context": 1,
                 "assessment_observation": 2,
                 "approved_fact": 3,
+                "show_episode": 3,
                 "recurring_theme": 4,
                 "atomic_knowledge": 5,
                 "episode": 6,
@@ -5053,6 +5170,7 @@ def _select_items(
         "conversation_context": 1,
         "assessment_observation": 1,
         "open_loop": 1,
+        "show_episode": 2,
         "episode": 2,
         "moment": 3,
         "canon": 3,
@@ -5573,6 +5691,27 @@ def _episode_version(
     return ""
 
 
+def _show_episode_version(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    item: IntelligencePacketItem,
+) -> str:
+    return tiktok_show_episode_context_item_version(
+        conn,
+        guild_id=int(packet.request.guild_id or 0),
+        user_text=str(packet.request.user_text or "")[:8000],
+        subject_user_id=int(packet.request.subject_user_id or 0),
+        source_ref=str(item.revalidation_key or item.source_ref or ""),
+        allow_subject_continuity=bool(
+            str(packet.request.frame_subject_requirement or "")
+            .strip()
+            .lower()
+            == "required"
+        ),
+        now=packet.request.now or None,
+    )
+
+
 def _canon_version(item: IntelligencePacketItem) -> str:
     for fact in CANON_FACTS:
         if _canon_digest(fact) == item.revalidation_key:
@@ -6027,6 +6166,8 @@ def _revalidate_packet_in_snapshot(
                 current = _moment_version(conn, packet, item)
             elif item.revalidation_kind == "episode":
                 current = _episode_version(conn, packet, item)
+            elif item.revalidation_kind == "show_episode":
+                current = _show_episode_version(conn, packet, item)
             elif item.revalidation_kind == "atomic":
                 current = (
                     _living_atomic_version(conn, item)
@@ -6378,6 +6519,40 @@ def _packet_invariants(
             and item.occurrence_identities
         ):
             invalid.append("episode_lane_contract_violation")
+        if item.lane == "show_episode" and not (
+            item.revalidation_kind == "show_episode"
+            and item.source_ref.startswith("show_episode:")
+            and item.lifecycle == "finalized"
+            and item.visibility in _PUBLIC_VISIBILITIES
+            and bool(item.lineage)
+            and not item.root_identities
+            and not item.occurrence_identities
+            and not item.point_identity
+            and not item.supporting_observations
+            and not item.canon_status
+            and not item.canon_domain
+            and not item.canon_claim_kind
+            and (
+                item.source_type == "barcode_show_operations"
+                and item.source_class == SourceClass.FIRST_PARTY_RECORD.value
+                and item.attribution_mode == "first_party_record"
+                and item.usage == "authoritative_show_chronology"
+                and item.uncertainty_status
+                == "recorded_public_operations_only"
+                or item.source_type
+                in {
+                    "barcode_show_community_projection",
+                    "barcode_show_dialogue_projection",
+                }
+                and item.source_class == SourceClass.EVIDENCE_PROJECTION.value
+                and item.attribution_mode
+                in {
+                    "aggregate_projection",
+                    "speaker_attributed_projection",
+                }
+            )
+        ):
+            invalid.append("show_episode_lane_contract_violation")
         if item.canon_status == CanonStatus.OPEN_SIGNAL.value and not (
             item.lane == "assessment_observation"
             and item.revalidation_kind == "public_assessment"
@@ -6952,6 +7127,14 @@ def build_packet(
                 conn,
                 request,
                 subject_resolution,
+                diagnostics,
+                exclusions,
+            )
+        )
+        candidates.extend(
+            _show_episode_items(
+                conn,
+                request,
                 diagnostics,
                 exclusions,
             )

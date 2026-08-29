@@ -29,7 +29,10 @@ proof of recurrence.
   Current established atomic and finalized Moment rows normalize as internal,
   review-only Open Signal until the recurrence contract is proved; they are not
   silently promoted to Living Canon.
-- Public assessment observations remain ephemeral Open Signal.
+- Public assessment observations remain ephemeral Open Signal. This includes
+  retained public Discord authorship and exact Journal-bound TikTok
+  utterances; the finalized show ledger supplies TikTok occurrence identity,
+  while its episode/participant/topic projections remain non-root evidence.
 - The unified intelligence packet remains the only broad-profile factual
   selection owner.
 
@@ -60,6 +63,13 @@ qualifying occurrences may become establishment-eligible only after lifecycle
 and correction checks. Neutral patterns cannot create scalar identity, roles,
 relationships, milestones, operational truth, Declared Canon, or Legacy
 Canon.
+
+For TikTok, every compatible utterance is still its own Open Signal root, but
+all roots from one finalized BARCODE Radio show collapse to one occurrence.
+Only an independent later show or eligible Discord occurrence can supply
+cross-occurrence recurrence. Finalizing a show asks this existing owner to
+refresh already-bound Discord subjects when the formation gate is enabled; it
+does not grant the show projection promotion authority or enable the gate.
 
 PR 5 admits a recurrence-marked Living candidate only when the complete v1
 adapter proof matches the current authoritative Ledger roots and occurrence

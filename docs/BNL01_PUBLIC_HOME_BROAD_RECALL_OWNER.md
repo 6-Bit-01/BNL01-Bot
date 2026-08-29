@@ -126,6 +126,12 @@ deletion, privacy change, retraction, or supersession removes the affected
 support, and post-correction establishment requires two fresh qualifying
 occurrences.
 
+Raw Journal-bound TikTok utterances use the same owner and safety contract.
+Each authored utterance is Open Signal, while every compatible root from one
+finalized show collapses to one show occurrence. A later finalized show or an
+eligible Discord occurrence may provide independent recurrence. Show and
+participant aggregates remain projections and cannot count as extra roots.
+
 This PR does not activate that formation path, run historical catch-up, or add
 Living claims to the live packet. Its historical analyzer is content-free and
 zero-write. Any bounded historical apply remains a separately approved
