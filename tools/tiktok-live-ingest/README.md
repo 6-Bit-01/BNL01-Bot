@@ -1,4 +1,4 @@
-# TikTok LIVE public telemetry transport (shadow-only)
+# TikTok LIVE public telemetry transport and gated BNL context
 
 This directory documents the optional transport used by
 `scripts/tiktok_live_chat_transport.py`. It connects directly to TikTok's
@@ -11,7 +11,7 @@ This is **not** part of the main BNL Python environment. The production bot
 supports Python 3.9 and 3.12; `piratetok-live-py` requires Python 3.11 or newer.
 Keep the transport in its own virtual environment.
 
-The transport and weekly shadow supervisor:
+The transport and weekly supervisor:
 
 - read public comments, taps/likes, viewer snapshots, shares, follows, gifts,
   TikTok Q&A questions, joins, and stream lifecycle events;
@@ -22,9 +22,23 @@ The transport and weekly shadow supervisor:
   payment/customer data, or currency conversion;
 - treat TikTok gift diamonds only as platform-provided engagement units, not
   BARCODE payment truth and not a cash value;
-- do not write a database or durable transcript;
+- do not write BNL's database directly;
+- append accepted public comments/questions to a bounded mode-`0600` handoff
+  spool so the main bot can archive them through BNL's existing owners;
 - do not call Gemini, Discord, the website, Relay, Journal, Moments,
   Relationship, Source Files, dossiers, queue actions, or payment owners.
+
+The supervisor additionally publishes one bounded, atomically replaced JSON
+snapshot at `/run/bnl-tiktok-chat-shadow/live-context.json` and appends public
+comments/questions to
+`/run/bnl-tiktok-chat-shadow/public-conversation.ndjson`. Both handoff files are
+mode `0600` and disappear with the systemd runtime directory. The main bot
+cannot use the live snapshot unless
+`BNL_TIKTOK_LIVE_CONTEXT_ENABLED=true`; even then, BNL loads it only for an
+explicit current-show or TikTok-reaction question whose website queue scope is
+authorized in that exact Discord channel. The bot independently ingests the text
+spool when `BNL_TIKTOK_LIVE_MEMORY_ENABLED=true`; that memory gate defaults to
+the context gate's value.
 
 Every accepted event is hard-coded as:
 
@@ -32,8 +46,11 @@ Every accepted event is hard-coded as:
 source=tiktok_live_webcast
 visibility=public_observation
 lifecycle=current_show_only
-memory_default=do_not_store
-identity_default=tiktok_only_unlinked
+memory_default=source_aware
+public_text_memory=durable_public_conversation
+metric_memory=current_show_only
+memory_placement=above_community_canon
+identity_default=handle_display_correlated_v1
 ```
 
 Authority varies by event type:
@@ -44,8 +61,13 @@ like/share/follow/gift/join=public_interaction_event
 viewer_snapshot=platform_room_metric
 ```
 
-A TikTok handle is not a Discord identity, website account, queue submitter,
-artist profile, Source File subject, or dossier identity.
+A TikTok handle alone does not merge an ordinary viewer with a Discord identity,
+website account, queue submitter, artist profile, Source File subject, or dossier
+identity. A known-member binding requires both a compatible handle and a close
+supporting display name. The owner-declared `@six.bit` primary account and
+`@pr0x60` / `PR0X` side account resolve to the same owner subject. TikTok's
+moderator flag is trusted as room-role evidence for that exact account, never as
+permission for BNL to moderate.
 
 ## Isolated setup
 
@@ -108,13 +130,18 @@ that window it:
 - keeps watching after a LIVE ends in case the stream restarts;
 - prints comments, batched tap events, changed viewer counts, shares, follows,
   completed gifts, and TikTok Q&A questions;
+- appends every accepted public comment/question to the bounded bot handoff
+  spool before snapshot throttling;
 - counts joins without printing every join line;
 - prints a bounded end-of-window telemetry summary;
 - stops and destroys its terminal scrollback at 2:00 AM;
 - restarts the tmux terminal if the supervisor process crashes.
 
-Raw public observations remain only in a dedicated tmux terminal. Routine
-systemd logs contain scheduler health, not the transcript or telemetry stream.
+Raw engagement observations remain only in a dedicated tmux terminal and the
+bounded volatile runtime snapshot. Public comments/questions also enter the
+volatile handoff spool and are then stored by the main bot in BNL's append-only
+Journal source archive and Unified Memory Ledger. Routine systemd logs contain
+scheduler health, not the transcript or telemetry stream.
 
 After the unit files are installed and enabled, attach with:
 
@@ -132,9 +159,12 @@ systemctl status bnl-tiktok-chat-shadow.service --no-pager -l
 systemctl list-timers bnl-tiktok-chat-shadow.timer --no-pager
 ```
 
-The service/timer are a shadow reliability tool only. Enabling them does not
-authorize BNL to consume, answer, store, summarize, publish, or act on TikTok
-telemetry.
+The service/timer alone do not authorize BNL consumption. The bot context gate
+and website queue access scope must both authorize a live-reaction response.
+The separate memory gate authorizes only public text archival and the normal
+conversation-memory path described above. Neither gate permits TikTok output,
+queue mutation, automatic canon/relationship promotion, Source Files, dossiers,
+or recaps.
 
 ## NDJSON contract
 
@@ -178,14 +208,20 @@ transport_error
 `transport_error` carries only a bounded error class/code. Raw exception text,
 URLs, cookies, and request headers are not emitted.
 
-## Current stop point
+## Current production boundary
 
 The direct connection has been observed receiving real public LIVE comments,
-moderator status, and the LIVE-end event. This phase expands the same shadow
-transport to additional public engagement telemetry so the next full show can
-validate availability, volume, timing, and replay behavior.
+moderator status, and the LIVE-end event. The live snapshot makes recent
+comments/questions and bounded engagement counters available to `bnl01_bot.py`
+only for relevant live-show questions. The current website queue snapshot stays
+authoritative for what the show is doing; TikTok telemetry is reaction evidence
+only. BNL answers the requested fact without dumping a transcript or metrics.
 
-It still does not wire any TikTok event into `bnl01_bot.py`, Gemini, Discord
-output, durable memory, the queue, the website, or a public surface. Private BNL
-awareness and queue/track correlation remain separate implementation and
-activation gates.
+Every accepted public comment/question becomes source-linked conversation
+evidence when the memory gate is enabled. It can feed normal continuity, the
+Journal, and bounded surface lore immediately above Community Canon, but one
+utterance cannot establish canon, a relationship, a submitter/artist identity,
+or verified external fact. Aggregate room metrics remain current-show-only.
+Disabling the context gate returns BNL to queue-only live awareness; disabling
+the memory gate stops new text ingestion without deleting previously governed
+source history.

@@ -870,6 +870,54 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             bnl01_bot._channel_pending_request_anchor,
         )
 
+    async def test_public_tiktok_batch_response_uses_normal_conversation_memory(self):
+        channel = self._channel(8152)
+        save_model = mock.Mock()
+        public_live_context = (
+            "Website public read model context:\n"
+            "Source: barcode-network-site / publicOnly=true / "
+            "accessScope=public / version=1\n"
+            "Current TikTok LIVE public reaction context:\n"
+            "- @viewer: this track is wild"
+        )
+
+        async def generate(_prompt, **_kwargs):
+            return "TikTok chat is reacting well to the current track."
+
+        self._prime_flush(channel, "BNL, what is TikTok chat saying?")
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value=public_live_context,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "save_model_message",
+                new=save_model,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(
+            channel.sent,
+            ["TikTok chat is reacting well to the current track."],
+        )
+        save_model.assert_called_once()
+        self.assertEqual(save_model.call_args.args[2], channel.sent[0])
+        self.assertEqual(save_model.call_args.kwargs["channel_policy"], "public_home")
+
     async def test_non_privileged_tester_queue_fragment_bypasses_reply_cooldown(self):
         channel = self._channel(8151)
         generation_calls = []

@@ -12,6 +12,8 @@ RETRY_SECONDS="${BNL_TIKTOK_RETRY_SECONDS:-20}"
 CDN="${BNL_TIKTOK_CDN:-us}"
 MAX_RETRIES="${BNL_TIKTOK_MAX_RETRIES:-5}"
 STALE_TIMEOUT="${BNL_TIKTOK_STALE_TIMEOUT:-60}"
+CONTEXT_PATH="${BNL_TIKTOK_LIVE_CONTEXT_PATH:-/run/bnl-tiktok-chat-shadow/live-context.json}"
+ARCHIVE_SPOOL_PATH="${BNL_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH:-/run/bnl-tiktok-chat-shadow/public-conversation.ndjson}"
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "[scheduler] Missing isolated TikTok Python: $PYTHON" >&2
@@ -29,4 +31,6 @@ exec "$PYTHON" -u "$ROOT/scripts/tiktok_live_chat_shadow_window.py" \
   --retry-seconds "$RETRY_SECONDS" \
   --cdn "$CDN" \
   --max-retries "$MAX_RETRIES" \
-  --stale-timeout "$STALE_TIMEOUT"
+  --stale-timeout "$STALE_TIMEOUT" \
+  --context-path "$CONTEXT_PATH" \
+  --archive-spool-path "$ARCHIVE_SPOOL_PATH"

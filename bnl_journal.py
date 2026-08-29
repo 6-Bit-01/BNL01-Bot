@@ -2317,7 +2317,9 @@ def _historical_source_reflection_basis(
             FROM bnl_journal_source_events
             WHERE guild_id=? AND public_usable=1
               AND occurred_at_ms>=? AND occurred_at_ms<?
-              AND source_kind IN ('discord_message','website_relay')
+              AND source_kind IN (
+                'discord_message','tiktok_live_chat','website_relay'
+              )
               AND TRIM(sanitized_summary)<>''
             ORDER BY occurred_at_ms DESC,event_seq DESC
             LIMIT 500
@@ -2358,7 +2360,7 @@ def _historical_source_reflection_basis(
         ) = row
         kind = str(source_kind or "")
         policy = str(channel_policy or "")
-        if kind == "discord_message" and policy not in PUBLIC_POLICIES:
+        if kind in {"discord_message", "tiktok_live_chat"} and policy not in PUBLIC_POLICIES:
             continue
         if kind == "website_relay" and policy not in {"", "public_relay"}:
             continue
@@ -2406,7 +2408,7 @@ def _historical_source_reflection_basis(
         ref_id = f"reflection:event:{int(event_seq)}"
         basis_kind = (
             "public_source_history"
-            if kind == "discord_message"
+            if kind in {"discord_message", "tiktok_live_chat"}
             else "accepted_relay_continuity"
         )
         safe_candidates.append(
@@ -2422,7 +2424,7 @@ def _historical_source_reflection_basis(
                 "reuseEligible": True,
                 "_diversityKey": (
                     str(subject_ref or "")
-                    if kind == "discord_message"
+                    if kind in {"discord_message", "tiktok_live_chat"}
                     else event_type or str(source_key or "")
                 ),
             }
@@ -2758,7 +2760,16 @@ def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, en
 
 
 def _source_for_prompt(source: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"refId", "sourceKind", "summary", "observedAt", "eventType", "channelPolicy", "participantAlias"}
+    allowed = {
+        "refId",
+        "sourceKind",
+        "summary",
+        "observedAt",
+        "eventType",
+        "channelPolicy",
+        "participantAlias",
+        "conversationSurface",
+    }
     return {k: v for k, v in source.items() if k in allowed and v not in (None, "")}
 
 
@@ -3492,7 +3503,7 @@ def build_source_packet_between(
                 "summary": str(event.get("sanitized_summary") or "")[:1000],
                 "observedAt": observed_at,
             }
-            if event.get("source_kind") == "discord_message":
+            if event.get("source_kind") in {"discord_message", "tiktok_live_chat"}:
                 subject_ref = str(event.get("subject_ref") or "")
                 source_key = str(event.get("source_key") or "")
                 message_id = metadata.get("messageId") or metadata.get("legacyMessageId")
@@ -3506,6 +3517,11 @@ def build_source_packet_between(
                     "participantAlias": "participant-" + _hash("journal-participant", guild_id, subject_ref)[:8] if subject_ref else "",
                     "displayName": str(event.get("private_display_name") or ""),
                     "channelPolicy": str(event.get("channel_policy") or ""),
+                    "conversationSurface": (
+                        "tiktok_live_chat"
+                        if event.get("source_kind") == "tiktok_live_chat"
+                        else "discord"
+                    ),
                 })
             elif event.get("source_kind") == "website_relay":
                 relays.append({

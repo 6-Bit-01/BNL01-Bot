@@ -8,6 +8,8 @@ from bnl_tiktok_live_chat import (
     INTERACTION_AUTHORITY,
     MEMORY_DEFAULT,
     METRIC_AUTHORITY,
+    METRIC_MEMORY,
+    PUBLIC_TEXT_MEMORY,
     SOURCE,
     VISIBILITY,
     LiveChatAdapter,
@@ -43,7 +45,7 @@ def payload(**changes):
 
 
 class ParseTests(unittest.TestCase):
-    def test_adapter_owns_source_and_no_store_semantics(self):
+    def test_adapter_owns_source_and_source_aware_memory_semantics(self):
         event = parse_line(
             json.dumps(payload(source="spoof", memory_default="store")),
             now=1_700_000_000.0,
@@ -53,7 +55,8 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(record["visibility"], VISIBILITY)
         self.assertEqual(record["authority"], AUTHORITY)
         self.assertEqual(record["authority"], COMMENT_AUTHORITY)
-        self.assertEqual(record["memory_default"], MEMORY_DEFAULT)
+        self.assertEqual(MEMORY_DEFAULT, "source_aware")
+        self.assertEqual(record["memory_default"], PUBLIC_TEXT_MEMORY)
         self.assertEqual(record["identity_default"], IDENTITY_DEFAULT)
 
     def test_sanitizes_and_bounds_comment(self):
@@ -83,6 +86,8 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(parsed[0].telemetry_record()["authority"], INTERACTION_AUTHORITY)
         self.assertEqual(parsed[1].telemetry_record()["authority"], METRIC_AUTHORITY)
         self.assertEqual(parsed[5].telemetry_record()["authority"], COMMENT_AUTHORITY)
+        self.assertEqual(parsed[0].telemetry_record()["memory_default"], METRIC_MEMORY)
+        self.assertEqual(parsed[5].telemetry_record()["memory_default"], PUBLIC_TEXT_MEMORY)
 
     def test_source_timestamp_is_preserved_separately_from_receipt_time(self):
         event = parse_line(

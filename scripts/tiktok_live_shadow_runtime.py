@@ -7,10 +7,12 @@ import asyncio
 import os
 import signal
 from datetime import datetime
-from typing import Set
+from typing import Optional, Set
 from zoneinfo import ZoneInfo
 
 from bnl_tiktok_live_chat import JOIN, VIEWER_SNAPSHOT, LiveChatAdapter
+from bnl_tiktok_live_context import LiveContextSnapshotWriter
+from bnl_tiktok_live_memory import TikTokPublicConversationSpoolWriter
 from scripts.tiktok_live_shadow_model import (
     REPO_ROOT,
     CycleResult,
@@ -38,11 +40,36 @@ async def _consume_stdout(
     timezone: ZoneInfo,
     ended_rooms: Set[str],
     state: CycleState,
+    context_writer: Optional[LiveContextSnapshotWriter] = None,
+    archive_writer: Optional[TikTokPublicConversationSpoolWriter] = None,
 ) -> None:
     async for raw in reader:
         duplicates_before = adapter.buffer.duplicates
         invalid_before = int(adapter.health["invalid_lines"])
         event = adapter.ingest_line(raw)
+        if archive_writer is not None and event is not None and event.event_type in {
+            "comment",
+            "question",
+        }:
+            try:
+                archive_writer.append(event.telemetry_record())
+            except Exception as exc:
+                print(
+                    "[archive] append_failed {}".format(
+                        _safe_code(exc.__class__.__name__)
+                    ),
+                    flush=True,
+                )
+        if context_writer is not None and event is not None:
+            try:
+                context_writer.publish(adapter)
+            except Exception as exc:
+                print(
+                    "[bridge] publish_failed {}".format(
+                        _safe_code(exc.__class__.__name__)
+                    ),
+                    flush=True,
+                )
         state.duplicate_replays_suppressed += (
             adapter.buffer.duplicates - duplicates_before
         )
@@ -89,6 +116,24 @@ async def _consume_stdout(
         print(format_event(event, timezone), flush=True)
 
 
+async def _publish_context_heartbeat(
+    writer: LiveContextSnapshotWriter,
+    adapter: LiveChatAdapter,
+    process: asyncio.subprocess.Process,
+) -> None:
+    while process.returncode is None:
+        try:
+            writer.publish(adapter, force=True)
+        except Exception as exc:
+            print(
+                "[bridge] heartbeat_failed {}".format(
+                    _safe_code(exc.__class__.__name__)
+                ),
+                flush=True,
+            )
+        await asyncio.sleep(5.0)
+
+
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -113,6 +158,8 @@ async def run_transport_cycle(
     ended_rooms: Set[str],
     stop_event: asyncio.Event,
     deadline: datetime,
+    context_writer: Optional[LiveContextSnapshotWriter] = None,
+    archive_writer: Optional[TikTokPublicConversationSpoolWriter] = None,
 ) -> CycleResult:
     command = build_transport_command(args)
     env = os.environ.copy()
@@ -137,9 +184,18 @@ async def run_transport_cycle(
             timezone,
             ended_rooms,
             state,
+            context_writer,
+            archive_writer,
         )
     )
     stderr_task = asyncio.create_task(_drain_stderr(process.stderr))
+    context_task = (
+        asyncio.create_task(
+            _publish_context_heartbeat(context_writer, adapter, process)
+        )
+        if context_writer is not None
+        else None
+    )
     process_task = asyncio.create_task(process.wait())
     stop_task = asyncio.create_task(stop_event.wait())
 
@@ -160,7 +216,19 @@ async def run_transport_cycle(
 
     return_code = await process.wait()
     await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-    for task in (process_task, stop_task):
+    if context_writer is not None:
+        try:
+            context_writer.publish(adapter, force=True)
+        except Exception as exc:
+            print(
+                "[bridge] final_publish_failed {}".format(
+                    _safe_code(exc.__class__.__name__)
+                ),
+                flush=True,
+            )
+    for task in (process_task, stop_task, context_task):
+        if task is None:
+            continue
         if not task.done():
             task.cancel()
     return CycleResult(return_code=return_code, state=state, stop_reason=stop_reason)
@@ -214,5 +282,3 @@ def format_summary(health: dict, cycle_count: int) -> str:
         reconnects=health["reconnect_count"],
         cycles=cycle_count,
     )
-
-

@@ -12381,6 +12381,92 @@ def shadow_conversation_row(
     return result
 
 
+def shadow_tiktok_live_chat_event(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    event_id: str,
+    subject_key: str,
+    subject_display_name: str,
+    content: str,
+    observed_at: str,
+    source_sequence: int,
+    moderator_flag: bool = False,
+) -> LedgerWriteResult:
+    """Store one public TikTok utterance as conversation-shaped evidence.
+
+    TikTok remains a distinct platform source.  A caller may pass an approved
+    Discord subject binding, but this function never infers one.  The row is a
+    public observation that may support continuity and surface lore; it is not
+    a canon, relationship, or role promotion by itself.
+    """
+
+    clean_event_id = str(event_id or "").strip()[:240]
+    clean_subject_key = str(subject_key or "").strip()[:240]
+    clean_value = str(content or "").strip()[:1000]
+    if (
+        int(guild_id or 0) <= 0
+        or not clean_event_id
+        or not clean_subject_key
+        or not clean_value
+    ):
+        return LedgerWriteResult(
+            outcome="skipped",
+            reason_code="invalid_tiktok_live_chat_event",
+            source_table="tiktok_live_chat",
+            source_row_id=clean_event_id,
+            source_revision=clean_event_id,
+            source_event_key=clean_event_id,
+            guild_id=int(guild_id or 0),
+        )
+    visibility = Visibility.PUBLIC_SAFE
+    source_class = SourceClass.PUBLIC_OBSERVATION
+    public_ok = _public_ok(
+        clean_subject_key,
+        "conversation",
+        clean_value,
+        source_class,
+        visibility,
+        Confidence.MEDIUM,
+    )
+    return insert_ledger_entry(
+        conn,
+        LedgerEntry(
+            guild_id=int(guild_id),
+            source_table="tiktok_live_chat",
+            source_row_id=clean_event_id,
+            source_revision=clean_event_id,
+            source_event_key=clean_event_id,
+            source_role="user",
+            entry_type="observation",
+            subject_key=clean_subject_key,
+            subject_display_name=str(subject_display_name or "")[:160],
+            predicate_key="conversation",
+            value=clean_value,
+            source_class=source_class,
+            route_mode="tiktok_live_chat",
+            channel_id=0,
+            channel_name="tiktok-live",
+            channel_policy="public_context",
+            visibility=visibility,
+            confidence=Confidence.MEDIUM,
+            public_usable=public_ok,
+            salience=0.25 if moderator_flag else 0.2,
+            observed_at=str(observed_at or _now()),
+            source_sequence=max(0, int(source_sequence or 0)),
+            freshness="surface_lore_input",
+            participants=(
+                LedgerParticipant(
+                    clean_subject_key,
+                    str(subject_display_name or "")[:160],
+                    "author",
+                    0,
+                ),
+            ),
+        ),
+    )
+
+
 def shadow_first_party_user_fact(
     conn: sqlite3.Connection,
     *,

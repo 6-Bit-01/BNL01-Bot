@@ -1,10 +1,11 @@
-"""Ephemeral, read-only TikTok LIVE public telemetry boundary for BNL.
+"""Read-only TikTok LIVE public telemetry boundary for BNL.
 
 The direct Webcast client lives in an isolated Python 3.11+ process. This
 standard-library-only module stays compatible with the bot's Python 3.9/3.12
 runtime, validates the transport's NDJSON, and keeps current-show observations
-in bounded RAM. It does not start the collector, call Gemini, write a database,
-or post output.
+in bounded RAM. A separate handoff may archive public comments/questions through
+BNL's normal memory owners. This module does not start the collector, call
+Gemini, write a database, or post output.
 """
 
 from __future__ import annotations
@@ -28,8 +29,10 @@ INTERACTION_AUTHORITY = "public_interaction_event"
 METRIC_AUTHORITY = "platform_room_metric"
 AUTHORITY = COMMENT_AUTHORITY  # compatibility alias for comment context
 LIFECYCLE = "current_show_only"
-MEMORY_DEFAULT = "do_not_store"
-IDENTITY_DEFAULT = "tiktok_only_unlinked"
+MEMORY_DEFAULT = "source_aware"
+PUBLIC_TEXT_MEMORY = "durable_public_conversation"
+METRIC_MEMORY = "current_show_only"
+IDENTITY_DEFAULT = "handle_display_correlated_v1"
 
 COMMENT = "comment"
 LIKE = "like"
@@ -135,7 +138,7 @@ class LiveEvent:
             "visibility": VISIBILITY,
             "authority": COMMENT_AUTHORITY,
             "lifecycle": LIFECYCLE,
-            "memory_default": MEMORY_DEFAULT,
+            "memory_default": PUBLIC_TEXT_MEMORY,
             "identity_default": IDENTITY_DEFAULT,
         }
 
@@ -152,7 +155,11 @@ class LiveEvent:
             "visibility": VISIBILITY,
             "authority": self.authority,
             "lifecycle": LIFECYCLE,
-            "memory_default": MEMORY_DEFAULT,
+            "memory_default": (
+                PUBLIC_TEXT_MEMORY
+                if self.event_type in {COMMENT, QUESTION}
+                else METRIC_MEMORY
+            ),
             "identity_default": IDENTITY_DEFAULT,
         }
         if self.unique_id:
