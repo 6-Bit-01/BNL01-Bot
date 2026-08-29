@@ -93,6 +93,10 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
         positives = (
             "What's TikTok chat saying?",
             "whats chat thinking about the show",
+            "What did TikTok chat just say?",
+            "What is the chat talking about right now?",
+            "Nice. What is the chat talking bout?",
+            "No, BNL, the TikTok chat.",
             "How are the viewers reacting?",
             "How's the live going?",
             "What is happening during the show?",
