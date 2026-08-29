@@ -17955,6 +17955,8 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
                         "messageId": int(message_id or 0) or None,
                         "conversationRowId": row_id,
                         "routeMode": route_mode,
+                        "directedToBnl": bool(directed_to_bnl),
+                        "channelName": (channel_name or "").lower()[:80],
                     },
                 )
         except Exception as exc:
@@ -31907,6 +31909,10 @@ _tiktok_live_memory_runtime = {
     "show_ledger_last_written": 0,
     "show_ledger_last_finalized": 0,
     "show_ledger_last_events": 0,
+    "show_ledger_last_operational_events": 0,
+    "show_ledger_last_discord_interactions": 0,
+    "show_ledger_last_discord_exchanges": 0,
+    "show_ledger_last_conversation_rows": 0,
     "show_ledger_last_error_type": "",
 }
 
@@ -32286,11 +32292,26 @@ async def queue_artist_memory_sync_task():
             _tiktok_live_memory_runtime["show_ledger_last_events"] = int(
                 show_ledger_result.get("sourceEvents") or 0
             )
+            _tiktok_live_memory_runtime[
+                "show_ledger_last_operational_events"
+            ] = int(show_ledger_result.get("operationalEvents") or 0)
+            _tiktok_live_memory_runtime[
+                "show_ledger_last_discord_interactions"
+            ] = int(show_ledger_result.get("discordInteractions") or 0)
+            _tiktok_live_memory_runtime[
+                "show_ledger_last_discord_exchanges"
+            ] = int(show_ledger_result.get("discordExchanges") or 0)
+            _tiktok_live_memory_runtime[
+                "show_ledger_last_conversation_rows"
+            ] = int(show_ledger_result.get("discordConversationRows") or 0)
             _tiktok_live_memory_runtime["show_ledger_last_error_type"] = ""
             logging.info(
-                "tiktok_show_evidence_ledger_sync guild=%s status=%s "
+                "barcode_show_episode_ledger_sync guild=%s status=%s "
                 "reason=%s shows_seen=%s shows_written=%s "
-                "shows_unchanged=%s shows_finalized=%s events=%s "
+                "shows_unchanged=%s shows_finalized=%s tiktok_events=%s "
+                "operational_events=%s track_roster=%s discord_interactions=%s "
+                "discord_exchanges=%s discord_participants=%s "
+                "discord_conversation_rows=%s "
                 "participants=%s projections_inserted=%s "
                 "projections_deduplicated=%s projection_errors=%s",
                 guild_id,
@@ -32301,6 +32322,12 @@ async def queue_artist_memory_sync_task():
                 show_ledger_result.get("showsUnchanged", 0),
                 show_ledger_result.get("showsFinalized", 0),
                 show_ledger_result.get("sourceEvents", 0),
+                show_ledger_result.get("operationalEvents", 0),
+                show_ledger_result.get("trackRoster", 0),
+                show_ledger_result.get("discordInteractions", 0),
+                show_ledger_result.get("discordExchanges", 0),
+                show_ledger_result.get("discordParticipants", 0),
+                show_ledger_result.get("discordConversationRows", 0),
                 show_ledger_result.get("participants", 0),
                 show_ledger_result.get("projectionInserted", 0),
                 show_ledger_result.get("projectionDeduplicated", 0),
@@ -32311,7 +32338,7 @@ async def queue_artist_memory_sync_task():
                 "show_ledger_last_error_type"
             ] = type(exc).__name__
             logging.exception(
-                "tiktok_show_evidence_ledger_sync_failed guild=%s "
+                "barcode_show_episode_ledger_sync_failed guild=%s "
                 "error_type=%s",
                 guild_id,
                 type(exc).__name__,
@@ -45947,7 +45974,7 @@ async def bnl_status(interaction: discord.Interaction):
         f"- tiktok_live_last_error_code: `{tiktok_live_diag.get('lastErrorCode')}` memory_default=`{tiktok_live_diag.get('memoryDefault')}`",
         f"- tiktok_live_memory_enabled: `{'yes' if BNL_TIKTOK_LIVE_MEMORY_ENABLED else 'no'}` placement=`above_community_canon`",
         f"- tiktok_live_memory_last_ingested: `{int(_tiktok_live_memory_runtime.get('last_ingested') or 0)}` total_since_start=`{int(_tiktok_live_memory_runtime.get('total_ingested') or 0)}` reason=`{_tiktok_live_memory_runtime.get('last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('last_error_type') or 'none'}`",
-        f"- tiktok_show_evidence_ledger_last_sync: written=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_written') or 0)}` finalized=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_finalized') or 0)}` events=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_events') or 0)}` reason=`{_tiktok_live_memory_runtime.get('show_ledger_last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('show_ledger_last_error_type') or 'none'}`",
+        f"- barcode_show_episode_ledger_last_sync: written=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_written') or 0)}` finalized=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_finalized') or 0)}` tiktok_events=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_events') or 0)}` operational_events=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_operational_events') or 0)}` discord_interactions=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_discord_interactions') or 0)}` discord_exchanges=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_discord_exchanges') or 0)}` conversation_rows=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_conversation_rows') or 0)}` reason=`{_tiktok_live_memory_runtime.get('show_ledger_last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('show_ledger_last_error_type') or 'none'}`",
         f"- tiktok_live_identity_policy: `handle_display_correlated_v1` owner_handle_configured=`{'yes' if bool(BNL_TIKTOK_OWNER_HANDLES) else 'no'}`",
         f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap_today=`{ambient_cap_today}` normal_cap=`{AMBIENT_DAILY_POST_CAP}` high_activity_cap=`2` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
         f"- ambient_posts_today: `{ambient_posts_today}`",

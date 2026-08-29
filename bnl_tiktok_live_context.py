@@ -261,7 +261,63 @@ SHOW_ANALYSIS_INTENT_TRACK_RANKING = "track_ranking"
 SHOW_ANALYSIS_INTENT_TRACK_REACTION = "track_reaction"
 SHOW_ANALYSIS_INTENT_CHAT_TOPICS = "chat_topics"
 SHOW_ANALYSIS_INTENT_SHOW_RECAP = "show_recap"
-SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION = "tiktok_show_evidence_ledger_v1"
+SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION = "tiktok_show_evidence_ledger_v2"
+
+_SHOW_OPERATIONAL_EVENT_TYPES = frozenset(
+    {
+        "session_created",
+        "submissions_opened",
+        "submissions_closed",
+        "broadcast_started",
+        "track_submitted",
+        "track_loaded",
+        "track_play_started",
+        "track_paused",
+        "track_stalled",
+        "track_resumed",
+        "track_playback_error",
+        "track_finished",
+        "track_skipped",
+        "track_removed",
+        "track_returned",
+        "track_restored",
+        "track_signal_hold_applied",
+        "wheel_spin_unlocked",
+        "wheel_launched",
+        "wheel_reencrypted",
+        "wheel_spun",
+        "wheel_result_rejected",
+        "wheel_confirmed",
+        "wheel_cancelled",
+        "sponsor_break_started",
+        "sponsor_break_completed",
+        "sponsor_break_skipped",
+        "sponsor_break_reset",
+        "session_archived",
+    }
+)
+_SHOW_OPERATIONAL_DETAIL_KEYS = (
+    "playbackProvider",
+    "playbackPositionSeconds",
+    "playbackDurationSeconds",
+    "playbackErrorCode",
+    "wheelCandidateCount",
+    "wheelSpinDurationMs",
+    "wheelSpinsAdded",
+    "wheelSpinsOwed",
+    "signalHoldPreviousLane",
+    "signalHoldApplicationCount",
+)
+_SHOW_OPERATIONAL_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,59}$")
+_PUBLIC_DISCORD_SHOW_POLICIES = frozenset(
+    {"public_home", "public_context", "public_selective"}
+)
+_SHOW_OPERATIONAL_QUERY_RE = re.compile(
+    r"\b(?:queue|wheel|submission|submitted|intake|sponsor|break|signal hold|"
+    r"paused?|stalled?|resumed?|skipped?|removed?|returned?|restored?|"
+    r"started?|finished?|played?|timeline|what happened|recap|rundown)\b",
+    re.IGNORECASE,
+)
 
 _HEALTH_FIELDS = (
     "state",
@@ -393,6 +449,7 @@ def _iso_epoch_ms(value: Any) -> Optional[int]:
 def _history_track_identity(value: Any) -> Tuple[str, str, str]:
     if not isinstance(value, Mapping):
         return "", "", ""
+    track_id = _bounded_text(value.get("trackId") or value.get("id"), 160)
     project = _bounded_text(
         value.get("projectLabel") or value.get("artist") or value.get("submittedArtistName"),
         120,
@@ -403,7 +460,11 @@ def _history_track_identity(value: Any) -> Tuple[str, str, str]:
     )
     if not project and not title:
         return "", "", ""
-    normalized = _SPACE_RE.sub(" ", f"{project}\x1f{title}").strip().casefold()
+    normalized = (
+        f"track_id:{track_id}"
+        if track_id
+        else _SPACE_RE.sub(" ", f"{project}\x1f{title}").strip().casefold()
+    )
     label = " — ".join(part for part in (project, title) if part)
     return normalized, project, label
 
@@ -603,6 +664,660 @@ def _show_track_windows(show: Mapping[str, Any]) -> list[Dict[str, Any]]:
 
     close_current(ordered_events[-1][0])
     return windows
+
+
+def _bounded_number(value: Any, *, maximum: float = 10**9) -> Optional[float]:
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return round(min(number, maximum), 3)
+
+
+def _optional_nonnegative_int(
+    value: Any,
+    *,
+    maximum: int = 10**12,
+) -> Optional[int]:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        return min(maximum, max(0, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _show_track_roster(show: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    raw_roster = show.get("trackRoster")
+    if not isinstance(raw_roster, Sequence) or isinstance(raw_roster, (str, bytes)):
+        return []
+    roster = []
+    for raw in raw_roster:
+        if not isinstance(raw, Mapping):
+            continue
+        track_key, project, label = _history_track_identity(raw)
+        if not track_key:
+            continue
+        handle = _bounded_text(raw.get("submittedByTikTokHandle"), 80).lstrip("@").casefold()
+        lane = _bounded_text(raw.get("lane"), 24).casefold()
+        outcome = _bounded_text(raw.get("outcome"), 24).casefold()
+        roster.append(
+            {
+                "trackId": _bounded_text(raw.get("trackId"), 160),
+                "trackKey": track_key,
+                "projectLabel": project,
+                "title": _bounded_text(raw.get("title"), 160),
+                "trackLabel": label,
+                "submittedByTikTokHandle": handle,
+                "lane": lane if lane in {"priority", "wheel", "regular"} else "",
+                "outcome": outcome
+                if outcome in {"active", "finished", "skipped", "removed", "unknown"}
+                else "unknown",
+                "submittedAtMs": _iso_epoch_ms(raw.get("submittedAt")),
+                "resolvedAtMs": _iso_epoch_ms(raw.get("resolvedAt")),
+                "wheelChosen": bool(raw.get("wheelChosen") is True),
+                "submissionEventSequence": _optional_nonnegative_int(
+                    raw.get("submissionEventSequence"), maximum=10**9
+                ),
+                "outcomeEventSequence": _optional_nonnegative_int(
+                    raw.get("outcomeEventSequence"), maximum=10**9
+                ),
+                "submissionOrder": None,
+                "playedOrder": None,
+                "operationalEventIds": [],
+            }
+        )
+    roster.sort(
+        key=lambda item: (
+            int(item.get("submissionEventSequence") or 10**9),
+            int(item.get("submittedAtMs") or 0),
+            str(item.get("trackLabel") or "").casefold(),
+        )
+    )
+    return roster
+
+
+def _show_operational_events(
+    show: Mapping[str, Any],
+    roster: Sequence[Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    milestones = show.get("milestones")
+    if not isinstance(milestones, Sequence) or isinstance(milestones, (str, bytes)):
+        return []
+    start_ms, _end_ms = show_timeline_bounds_ms(show)
+    show_key = tiktok_show_evidence_key(show)
+    roster_by_id = {
+        str(item.get("trackId") or ""): item
+        for item in roster
+        if str(item.get("trackId") or "")
+    }
+    roster_by_key: Dict[str, Mapping[str, Any]] = {}
+    for item in roster:
+        track_key = str(item.get("trackKey") or "")
+        if track_key:
+            roster_by_key.setdefault(track_key, item)
+        legacy_key = _SPACE_RE.sub(
+            " ",
+            f"{str(item.get('projectLabel') or '')}\x1f"
+            f"{str(item.get('title') or '')}",
+        ).strip().casefold()
+        if legacy_key.strip("\x1f"):
+            roster_by_key.setdefault(legacy_key, item)
+    events = []
+    for raw in milestones:
+        if not isinstance(raw, Mapping):
+            continue
+        occurred_at_ms = _iso_epoch_ms(raw.get("occurredAt"))
+        event_type = _bounded_text(raw.get("eventType"), 60).casefold()
+        if occurred_at_ms is None or not _SHOW_OPERATIONAL_EVENT_TYPE_RE.fullmatch(
+            event_type
+        ):
+            continue
+        sequence = _nonnegative_int(raw.get("sequence"), maximum=10**9)
+        raw_track = raw.get("track") if isinstance(raw.get("track"), Mapping) else {}
+        track_key, project, track_label = _history_track_identity(raw_track)
+        track_id = _bounded_text(raw_track.get("trackId"), 160)
+        legacy_track_key = ""
+        if raw_track:
+            legacy_track_key = _SPACE_RE.sub(
+                " ",
+                f"{_bounded_text(raw_track.get('projectLabel'), 120)}\x1f"
+                f"{_bounded_text(raw_track.get('title'), 160)}",
+            ).strip().casefold()
+        roster_track = (
+            roster_by_id.get(track_id)
+            or roster_by_key.get(track_key)
+            or roster_by_key.get(legacy_track_key)
+            or {}
+        )
+        if roster_track:
+            track_key = str(roster_track.get("trackKey") or track_key)
+            project = str(roster_track.get("projectLabel") or project)
+            track_label = str(roster_track.get("trackLabel") or track_label)
+            track_id = str(roster_track.get("trackId") or track_id)
+        details_raw = raw.get("details")
+        details_raw = details_raw if isinstance(details_raw, Mapping) else {}
+        details: Dict[str, Any] = {}
+        for key in _SHOW_OPERATIONAL_DETAIL_KEYS:
+            value = details_raw.get(key)
+            if key in {
+                "playbackProvider",
+                "playbackErrorCode",
+                "signalHoldPreviousLane",
+            }:
+                safe = _bounded_text(value, 60)
+            else:
+                safe = _bounded_number(value)
+            if safe not in {None, ""}:
+                details[key] = safe
+        if event_type.startswith("track_"):
+            category = "track"
+        elif event_type.startswith("wheel_"):
+            category = "wheel"
+        elif event_type.startswith("sponsor_break_"):
+            category = "sponsor_break"
+        elif event_type in {"submissions_opened", "submissions_closed", "session_created"}:
+            category = "intake"
+        else:
+            category = "broadcast"
+        event_id = _bounded_text(raw.get("eventId"), 240) or (
+            f"{show_key}:{sequence or len(events) + 1}"
+        )
+        events.append(
+            {
+                "eventId": event_id,
+                "sequence": sequence,
+                "eventType": event_type,
+                "category": category,
+                "occurredAtMs": int(occurred_at_ms),
+                "minuteOffset": round(
+                    float(occurred_at_ms - start_ms) / 60000.0,
+                    3,
+                )
+                if start_ms is not None
+                else 0.0,
+                "headline": _bounded_text(raw.get("headline"), 180),
+                "detail": _bounded_text(raw.get("detail"), 320),
+                "trackId": track_id,
+                "trackKey": track_key,
+                "trackLabel": track_label,
+                "projectLabel": project,
+                "submittedByTikTokHandle": str(
+                    roster_track.get("submittedByTikTokHandle")
+                    or _bounded_text(raw_track.get("submittedByTikTokHandle"), 80).lstrip("@").casefold()
+                )[:80],
+                "lane": str(roster_track.get("lane") or _bounded_text(raw_track.get("lane"), 24))[:24],
+                "outcome": str(roster_track.get("outcome") or _bounded_text(raw_track.get("outcome"), 24))[:24],
+                "submissionOrder": _optional_nonnegative_int(
+                    raw_track.get("submissionOrder"), maximum=10**9
+                ),
+                "playedOrder": _optional_nonnegative_int(
+                    raw_track.get("playedOrder"), maximum=10**9
+                ),
+                "details": details,
+            }
+        )
+    events.sort(
+        key=lambda item: (
+            int(item.get("occurredAtMs") or 0),
+            int(item.get("sequence") or 0),
+            str(item.get("eventId") or ""),
+        )
+    )
+    return events
+
+
+def _operational_context_at(
+    occurred_at_ms: int,
+    operational_events: Sequence[Mapping[str, Any]],
+    track_windows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    queue_state = "unknown"
+    broadcast_state = "pre_show"
+    wheel_state = "idle"
+    sponsor_break_state = "idle"
+    last_event: Optional[Mapping[str, Any]] = None
+    next_event: Optional[Mapping[str, Any]] = None
+    for event in operational_events:
+        timestamp = int(event.get("occurredAtMs") or 0)
+        if timestamp > int(occurred_at_ms):
+            next_event = event
+            break
+        last_event = event
+        event_type = str(event.get("eventType") or "")
+        if event_type == "submissions_opened":
+            queue_state = "open"
+        elif event_type == "submissions_closed":
+            queue_state = "closed"
+        elif event_type == "broadcast_started":
+            broadcast_state = "active"
+        elif event_type == "session_archived":
+            broadcast_state = "archived"
+        if event_type == "wheel_launched":
+            wheel_state = "launched"
+        elif event_type == "wheel_reencrypted":
+            wheel_state = "re_encrypted"
+        elif event_type == "wheel_spun":
+            wheel_state = "spinning"
+        elif event_type == "wheel_result_rejected":
+            wheel_state = "rerouting"
+        elif event_type == "wheel_confirmed":
+            wheel_state = "confirmed"
+        elif event_type == "wheel_cancelled":
+            wheel_state = "cancelled"
+        if event_type == "sponsor_break_started":
+            sponsor_break_state = "running"
+        elif event_type == "sponsor_break_completed":
+            sponsor_break_state = "completed"
+        elif event_type == "sponsor_break_skipped":
+            sponsor_break_state = "skipped"
+        elif event_type == "sponsor_break_reset":
+            sponsor_break_state = "idle"
+    active_track: Optional[Mapping[str, Any]] = None
+    for window in track_windows:
+        if (
+            int(window.get("start_ms") or 0)
+            <= int(occurred_at_ms)
+            < int(window.get("end_ms") or 0)
+        ):
+            active_track = window
+            break
+    return {
+        "queueState": queue_state,
+        "broadcastState": broadcast_state,
+        "wheelState": wheel_state,
+        "sponsorBreakState": sponsor_break_state,
+        "activeTrackKey": str(active_track.get("track_key") or "") if active_track else "",
+        "activeTrackLabel": str(active_track.get("label") or "") if active_track else "",
+        "lastOperationalEventId": str(last_event.get("eventId") or "") if last_event else "",
+        "lastOperationalEventType": str(last_event.get("eventType") or "") if last_event else "",
+        "nextOperationalEventId": str(next_event.get("eventId") or "") if next_event else "",
+        "nextOperationalEventType": str(next_event.get("eventType") or "") if next_event else "",
+    }
+
+
+def _show_operational_summary(
+    operational_events: Sequence[Mapping[str, Any]],
+    roster: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    event_counts: Dict[str, int] = {}
+    category_counts: Dict[str, int] = {}
+    outcome_counts: Dict[str, int] = {}
+    lane_counts: Dict[str, int] = {}
+    for event in operational_events:
+        event_type = str(event.get("eventType") or "")
+        category = str(event.get("category") or "other")
+        if event_type:
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+        category_counts[category] = category_counts.get(category, 0) + 1
+    for track in roster:
+        outcome = str(track.get("outcome") or "unknown")
+        lane = str(track.get("lane") or "unknown")
+        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        lane_counts[lane] = lane_counts.get(lane, 0) + 1
+    return {
+        "eventCount": len(operational_events),
+        "trackCount": len(roster),
+        "eventTypeCounts": dict(sorted(event_counts.items())),
+        "categoryCounts": dict(sorted(category_counts.items())),
+        "trackOutcomeCounts": dict(sorted(outcome_counts.items())),
+        "trackLaneCounts": dict(sorted(lane_counts.items())),
+        "broadcastStarted": bool(event_counts.get("broadcast_started")),
+        "archived": bool(event_counts.get("session_archived")),
+    }
+
+
+def _normalize_show_discord_exchanges(
+    exchanges: Optional[Sequence[Mapping[str, Any]]],
+    *,
+    start_ms: int,
+    end_ms: int,
+    operational_events: Sequence[Mapping[str, Any]],
+    track_windows: Sequence[Mapping[str, Any]],
+) -> Tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+    """Normalize public Discord request/BNL-response pairs for one show.
+
+    The database owner performs the actual pairing.  This layer enforces the
+    public-policy, show-window, identity, and bounded-text contract before the
+    exchange is admitted to the durable episode.
+    """
+
+    normalized: list[Dict[str, Any]] = []
+    for raw_exchange in exchanges or ():
+        if not isinstance(raw_exchange, Mapping):
+            continue
+        subject_ref = _bounded_text(raw_exchange.get("subjectRef"), 160)
+        if not re.fullmatch(r"discord_user:[1-9][0-9]{0,24}", subject_ref):
+            continue
+        channel_policy = _bounded_text(
+            raw_exchange.get("channelPolicy"), 40
+        ).casefold()
+        if channel_policy not in _PUBLIC_DISCORD_SHOW_POLICIES:
+            continue
+        speaker_label = (
+            _bounded_text(
+                raw_exchange.get("speakerLabel")
+                or raw_exchange.get("displayName"),
+                160,
+            )
+            or "Discord member"
+        )
+        user_messages: list[Dict[str, Any]] = []
+        seen_user_rows = set()
+        for raw_message in raw_exchange.get("userMessages") or ():
+            if not isinstance(raw_message, Mapping):
+                continue
+            occurred_at_ms = _nonnegative_int(
+                raw_message.get("occurredAtMs"), maximum=10**15
+            )
+            conversation_row_id = _nonnegative_int(
+                raw_message.get("conversationRowId"), maximum=10**12
+            )
+            text = _bounded_text(raw_message.get("text"), 2000)
+            message_policy = _bounded_text(
+                raw_message.get("channelPolicy") or channel_policy,
+                40,
+            ).casefold()
+            if (
+                not text
+                or not conversation_row_id
+                or conversation_row_id in seen_user_rows
+                or message_policy not in _PUBLIC_DISCORD_SHOW_POLICIES
+                or occurred_at_ms < int(start_ms)
+                or occurred_at_ms > int(end_ms)
+            ):
+                continue
+            seen_user_rows.add(conversation_row_id)
+            operational_context = _operational_context_at(
+                occurred_at_ms,
+                operational_events,
+                track_windows,
+            )
+            user_messages.append(
+                {
+                    "conversationRowId": conversation_row_id,
+                    "messageId": _nonnegative_int(
+                        raw_message.get("messageId"), maximum=10**24
+                    ),
+                    "occurredAtMs": occurred_at_ms,
+                    "minuteOffset": round(
+                        max(0.0, float(occurred_at_ms - start_ms) / 60000.0),
+                        3,
+                    ),
+                    "subjectRef": subject_ref,
+                    "speakerLabel": speaker_label,
+                    "text": text,
+                    "textDigest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "question": "?" in text,
+                    "addressedBnl": True,
+                    "queueReference": bool(_QUEUE_REFERENCE_RE.search(text)),
+                    "channelId": _nonnegative_int(
+                        raw_message.get("channelId")
+                        or raw_exchange.get("channelId"),
+                        maximum=10**24,
+                    ),
+                    "channelName": _bounded_text(
+                        raw_message.get("channelName")
+                        or raw_exchange.get("channelName"),
+                        80,
+                    ).casefold(),
+                    "channelPolicy": message_policy,
+                    "routeMode": _bounded_text(
+                        raw_message.get("routeMode"), 80
+                    ).casefold(),
+                    "trackKey": str(
+                        operational_context.get("activeTrackKey") or ""
+                    )[:320],
+                    "trackLabel": str(
+                        operational_context.get("activeTrackLabel") or ""
+                    )[:280],
+                    "operationalContext": operational_context,
+                }
+            )
+        user_messages.sort(
+            key=lambda item: (
+                int(item.get("occurredAtMs") or 0),
+                int(item.get("conversationRowId") or 0),
+            )
+        )
+        if not user_messages:
+            continue
+        raw_response = raw_exchange.get("bnlResponse")
+        response: Optional[Dict[str, Any]] = None
+        response_row_id = 0
+        response_ms = int(user_messages[-1]["occurredAtMs"])
+        response_policy = channel_policy
+        if isinstance(raw_response, Mapping):
+            response_text = _bounded_text(raw_response.get("text"), 4000)
+            candidate_row_id = _nonnegative_int(
+                raw_response.get("conversationRowId"), maximum=10**12
+            )
+            candidate_response_ms = _nonnegative_int(
+                raw_response.get("occurredAtMs"), maximum=10**15
+            )
+            candidate_policy = _bounded_text(
+                raw_response.get("channelPolicy") or channel_policy,
+                40,
+            ).casefold()
+            if (
+                response_text
+                and candidate_row_id
+                and candidate_policy in _PUBLIC_DISCORD_SHOW_POLICIES
+                and candidate_response_ms
+                >= int(user_messages[-1]["occurredAtMs"])
+                and candidate_response_ms <= int(end_ms) + 15 * 60 * 1000
+            ):
+                response_row_id = candidate_row_id
+                response_ms = candidate_response_ms
+                response_policy = candidate_policy
+                response_operational_context = _operational_context_at(
+                    response_ms,
+                    operational_events,
+                    track_windows,
+                )
+                raw_message_ids = raw_response.get("messageIds")
+                if not isinstance(raw_message_ids, Sequence) or isinstance(
+                    raw_message_ids, (str, bytes)
+                ):
+                    raw_message_ids = ()
+                response = {
+                    "conversationRowId": response_row_id,
+                    "messageIds": [
+                        _nonnegative_int(value, maximum=10**24)
+                        for value in raw_message_ids
+                        if _nonnegative_int(value, maximum=10**24)
+                    ],
+                    "occurredAtMs": response_ms,
+                    "minuteOffset": round(
+                        max(0.0, float(response_ms - start_ms) / 60000.0),
+                        3,
+                    ),
+                    "speakerLabel": "BNL-01",
+                    "text": response_text,
+                    "textDigest": hashlib.sha256(
+                        response_text.encode("utf-8")
+                    ).hexdigest(),
+                    "channelId": _nonnegative_int(
+                        raw_response.get("channelId")
+                        or raw_exchange.get("channelId"),
+                        maximum=10**24,
+                    ),
+                    "channelName": _bounded_text(
+                        raw_response.get("channelName")
+                        or raw_exchange.get("channelName"),
+                        80,
+                    ).casefold(),
+                    "channelPolicy": response_policy,
+                    "routeMode": _bounded_text(
+                        raw_response.get("routeMode"), 80
+                    ).casefold(),
+                    "trackKey": str(
+                        response_operational_context.get("activeTrackKey") or ""
+                    )[:320],
+                    "trackLabel": str(
+                        response_operational_context.get("activeTrackLabel") or ""
+                    )[:280],
+                    "operationalContext": response_operational_context,
+                }
+        conversation_row_ids = list(
+            dict.fromkeys(
+                [
+                    int(message["conversationRowId"])
+                    for message in user_messages
+                ]
+                + ([response_row_id] if response_row_id else [])
+            )
+        )
+        fallback_row_id = int(user_messages[0]["conversationRowId"])
+        normalized.append(
+            {
+                "exchangeId": _bounded_text(
+                    raw_exchange.get("exchangeId"), 240
+                )
+                or f"discord_interaction:{response_row_id or fallback_row_id}:"
+                f"{subject_ref.rsplit(':', 1)[-1]}",
+                "surface": "discord",
+                "subjectRef": subject_ref,
+                "speakerLabel": speaker_label,
+                "channelId": int(
+                    (response or {}).get("channelId")
+                    or raw_exchange.get("channelId")
+                    or user_messages[0].get("channelId")
+                    or 0
+                ),
+                "channelName": str(
+                    (response or {}).get("channelName")
+                    or raw_exchange.get("channelName")
+                    or user_messages[0].get("channelName")
+                    or ""
+                )[:80],
+                "channelPolicy": response_policy,
+                "startedAtMs": int(user_messages[0]["occurredAtMs"]),
+                "endedAtMs": response_ms,
+                "questionCount": sum(
+                    1 for message in user_messages if message.get("question")
+                ),
+                "queueReferenceCount": sum(
+                    1
+                    for message in user_messages
+                    if message.get("queueReference")
+                ),
+                "conversationRowIds": conversation_row_ids,
+                "userMessages": user_messages,
+                "bnlResponse": response,
+                "interactionType": (
+                    "paired_exchange" if response is not None else "directed_message"
+                ),
+                "pairingBasis": _bounded_text(
+                    raw_exchange.get("pairingBasis"), 240
+                )
+                or (
+                    "same public channel, explicit response target, bounded response window"
+                    if response is not None
+                    else "public source event explicitly directed to BNL"
+                ),
+            }
+        )
+    normalized.sort(
+        key=lambda item: (
+            int(item.get("startedAtMs") or 0),
+            int(item.get("endedAtMs") or 0),
+            str(item.get("exchangeId") or ""),
+        )
+    )
+
+    participant_groups: Dict[str, list[Mapping[str, Any]]] = {}
+    for exchange in normalized:
+        participant_groups.setdefault(str(exchange.get("subjectRef") or ""), []).append(
+            exchange
+        )
+    participants = []
+    for subject_ref, authored_exchanges in participant_groups.items():
+        user_messages = [
+            message
+            for exchange in authored_exchanges
+            for message in exchange.get("userMessages") or ()
+            if isinstance(message, Mapping)
+        ]
+        conversation_row_ids = list(
+            dict.fromkeys(
+                int(value)
+                for exchange in authored_exchanges
+                for value in exchange.get("conversationRowIds") or ()
+                if _nonnegative_int(value, maximum=10**12)
+            )
+        )
+        track_counts: Dict[str, Dict[str, Any]] = {}
+        for message in user_messages:
+            track_key = str(message.get("trackKey") or "")
+            if not track_key:
+                continue
+            aggregate = track_counts.setdefault(
+                track_key,
+                {
+                    "trackKey": track_key,
+                    "trackLabel": str(message.get("trackLabel") or ""),
+                    "messageCount": 0,
+                },
+            )
+            aggregate["messageCount"] += 1
+        participants.append(
+            {
+                "surface": "discord",
+                "subjectRef": subject_ref,
+                "speakerLabel": str(
+                    authored_exchanges[0].get("speakerLabel") or "Discord member"
+                )[:160],
+                "messageCount": len(user_messages),
+                "questionCount": sum(
+                    1 for message in user_messages if message.get("question")
+                ),
+                "bnlAddressCount": len(user_messages),
+                "queueReferenceCount": sum(
+                    1 for message in user_messages if message.get("queueReference")
+                ),
+                "interactionCount": len(authored_exchanges),
+                "exchangeCount": sum(
+                    1
+                    for exchange in authored_exchanges
+                    if isinstance(exchange.get("bnlResponse"), Mapping)
+                ),
+                "bnlResponseCount": sum(
+                    1
+                    for exchange in authored_exchanges
+                    if isinstance(exchange.get("bnlResponse"), Mapping)
+                ),
+                "firstSeenAtMs": int(user_messages[0].get("occurredAtMs") or 0),
+                "lastSeenAtMs": int(user_messages[-1].get("occurredAtMs") or 0),
+                "conversationRowIds": conversation_row_ids,
+                "sampleConversationRowIds": [
+                    int(message.get("conversationRowId") or 0)
+                    for message in _evenly_spaced_events(
+                        user_messages,
+                        min(6, len(user_messages)),
+                    )
+                ],
+                "trackMoments": sorted(
+                    track_counts.values(),
+                    key=lambda item: (
+                        -int(item.get("messageCount") or 0),
+                        str(item.get("trackLabel") or ""),
+                    ),
+                ),
+            }
+        )
+    participants.sort(
+        key=lambda item: (
+            -int(item.get("messageCount") or 0),
+            str(item.get("speakerLabel") or "").casefold(),
+            str(item.get("subjectRef") or ""),
+        )
+    )
+    return normalized, participants
 
 
 def _safe_durable_event(value: Any) -> Optional[Dict[str, Any]]:
@@ -1140,13 +1855,15 @@ def build_tiktok_show_evidence_ledger(
     durable_events: Sequence[Any],
     *,
     artist_identity_index: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
+    discord_exchanges: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Assemble one complete, source-linked show attendance episode.
+    """Assemble one complete, source-linked BARCODE show episode.
 
-    Every eligible public message is represented in ``messages`` and linked to
-    its author, time, and active track window.  Topic and participant records
-    are deterministic projections over those source rows; they never merge a
-    TikTok identity with a Discord or artist identity on resemblance alone.
+    Every eligible public TikTok message, authoritative queue/broadcast event,
+    and paired public Discord exchange with BNL is represented and placed on
+    the same show clock. Topic and participant records are deterministic
+    projections over those source rows; identities are joined across surfaces
+    only when their exact source-owned subject reference already matches.
     """
 
     if not isinstance(show, Mapping):
@@ -1156,6 +1873,29 @@ def build_tiktok_show_evidence_ledger(
     if not show_key or start_ms is None or end_ms is None or end_ms < start_ms:
         return {}
     annotated, windows = _annotated_show_events(show, durable_events)
+    track_roster = _show_track_roster(show)
+    operational_events = _show_operational_events(show, track_roster)
+    roster_by_key = {
+        str(item.get("trackKey") or ""): item
+        for item in track_roster
+        if str(item.get("trackKey") or "")
+    }
+    for event in operational_events:
+        roster_track = roster_by_key.get(str(event.get("trackKey") or ""))
+        if not roster_track:
+            continue
+        roster_track.setdefault("submissionOrder", None)
+        roster_track.setdefault("playedOrder", None)
+        roster_track.setdefault("operationalEventIds", [])
+        if event.get("submissionOrder") is not None:
+            roster_track["submissionOrder"] = int(
+                event.get("submissionOrder") or 0
+            )
+        if event.get("playedOrder") is not None:
+            roster_track["playedOrder"] = int(event.get("playedOrder") or 0)
+        roster_track["operationalEventIds"].append(
+            str(event.get("eventId") or "")
+        )
     normalized_events: list[Dict[str, Any]] = []
     for event in annotated:
         text = str(event.get("raw_text") or "")
@@ -1164,6 +1904,11 @@ def build_tiktok_show_evidence_ledger(
                 match.group(1).casefold()
                 for match in _MENTIONED_HANDLE_RE.finditer(text)
             )
+        )
+        operational_context = _operational_context_at(
+            int(event.get("occurred_at_ms") or 0),
+            operational_events,
+            windows,
         )
         normalized_events.append(
             {
@@ -1187,8 +1932,17 @@ def build_tiktok_show_evidence_ledger(
                 "addressedBnl": bool(_BNL_ADDRESS_RE.search(text)),
                 "queueReference": bool(_QUEUE_REFERENCE_RE.search(text)),
                 "mentionedHandles": list(mentioned_handles),
+                "operationalContext": operational_context,
             }
         )
+
+    discord_interactions, discord_participants = _normalize_show_discord_exchanges(
+        discord_exchanges,
+        start_ms=int(start_ms),
+        end_ms=int(end_ms),
+        operational_events=operational_events,
+        track_windows=windows,
+    )
 
     signal_source = [
         {
@@ -1208,6 +1962,38 @@ def build_tiktok_show_evidence_ledger(
     topics = [
         _ledger_signal_record(signal_source, signal)
         for signal in topic_signals
+    ]
+    discord_signal_source = [
+        {
+            "event_id": (
+                "discord_conversation:"
+                + str(message.get("conversationRowId") or "")
+            ),
+            "occurred_at_ms": int(message.get("occurredAtMs") or 0),
+            "raw_text": str(message.get("text") or ""),
+            "subject_ref": str(exchange.get("subjectRef") or ""),
+            "speaker_key": str(exchange.get("subjectRef") or ""),
+            "speaker_label": str(
+                exchange.get("speakerLabel") or "Discord member"
+            ),
+            "track_key": str(message.get("trackKey") or ""),
+            "track_label": str(message.get("trackLabel") or ""),
+            "minute_offset": float(message.get("minuteOffset") or 0.0),
+        }
+        for exchange in discord_interactions
+        for message in exchange.get("userMessages") or ()
+        if isinstance(message, Mapping)
+    ]
+    combined_signal_source = sorted(
+        [*signal_source, *discord_signal_source],
+        key=lambda item: (
+            int(item.get("occurred_at_ms") or 0),
+            str(item.get("event_id") or ""),
+        ),
+    )
+    show_topics = [
+        _ledger_signal_record(combined_signal_source, signal)
+        for signal in _chat_topic_signals(combined_signal_source, limit=12)
     ]
 
     participant_groups: Dict[str, list[Dict[str, Any]]] = {}
@@ -1258,6 +2044,7 @@ def build_tiktok_show_evidence_ledger(
         ]
         participants.append(
             {
+                "surface": "tiktok",
                 "subjectRef": subject_ref[:160],
                 "speakerLabel": str(first.get("speakerLabel") or "TikTok viewer")[:220],
                 "displayName": str(first.get("displayName") or "")[:120],
@@ -1362,6 +2149,55 @@ def build_tiktok_show_evidence_ledger(
         key=lambda item: (-int(item["participantCount"]), -int(item["messageCount"]), item["handle"])
     )
 
+    tiktok_participants_by_subject = {
+        str(item.get("subjectRef") or ""): item
+        for item in participants
+        if str(item.get("subjectRef") or "")
+    }
+    cross_source_bindings = []
+    for discord_participant in discord_participants:
+        subject_ref = str(discord_participant.get("subjectRef") or "")
+        tiktok_participant = tiktok_participants_by_subject.get(subject_ref)
+        if not tiktok_participant:
+            continue
+        cross_source_bindings.append(
+            {
+                "subjectRef": subject_ref,
+                "surfaces": ["tiktok", "discord"],
+                "tiktokSpeakerLabel": str(
+                    tiktok_participant.get("speakerLabel") or "TikTok viewer"
+                )[:220],
+                "discordSpeakerLabel": str(
+                    discord_participant.get("speakerLabel") or "Discord member"
+                )[:160],
+                "basis": "exact source-owned subject reference",
+                "boundary": "no display-name or handle resemblance matching",
+            }
+        )
+
+    discord_user_message_count = sum(
+        len(exchange.get("userMessages") or ())
+        for exchange in discord_interactions
+    )
+    discord_response_count = sum(
+        1
+        for exchange in discord_interactions
+        if isinstance(exchange.get("bnlResponse"), Mapping)
+    )
+    discord_conversation_row_ids = list(
+        dict.fromkeys(
+            int(value)
+            for exchange in discord_interactions
+            for value in exchange.get("conversationRowIds") or ()
+            if _nonnegative_int(value, maximum=10**12)
+        )
+    )
+    distinct_subject_refs = {
+        str(item.get("subjectRef") or "")
+        for item in (*participants, *discord_participants)
+        if str(item.get("subjectRef") or "")
+    }
+
     archived = _show_has_archive_boundary(show)
     ledger = {
         "schemaVersion": SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
@@ -1377,11 +2213,27 @@ def build_tiktok_show_evidence_ledger(
             "accountedEventCount": len(normalized_events),
             "participantCount": len(participants),
             "trackWindowCount": len(windows),
+            "trackRosterCount": len(track_roster),
+            "operationalEventCount": len(operational_events),
+            "discordInteractionCount": len(discord_interactions),
+            "discordExchangeCount": discord_response_count,
+            "discordParticipantCount": len(discord_participants),
+            "discordUserMessageCount": discord_user_message_count,
+            "discordBnlResponseCount": discord_response_count,
+            "distinctSubjectCount": len(distinct_subject_refs),
+            "evidenceItemCount": (
+                len(normalized_events)
+                + len(operational_events)
+                + discord_user_message_count
+                + discord_response_count
+            ),
             "unassignedMessageCount": int(unassigned),
             "allEligibleMessagesAccounted": True,
+            "allPublicShowMilestonesAccounted": True,
             "sourceEventIds": [
                 str(event.get("eventId") or "") for event in normalized_events
             ],
+            "conversationRowIds": discord_conversation_row_ids,
         },
         "interactions": {
             "questionCount": sum(
@@ -1410,21 +2262,61 @@ def build_tiktok_show_evidence_ledger(
                     if event.get("queueReference")
                 }
             ),
+            "discordInteractionCount": len(discord_interactions),
+            "discordExchangeCount": discord_response_count,
+            "discordQuestionCount": sum(
+                int(exchange.get("questionCount") or 0)
+                for exchange in discord_interactions
+            ),
+            "discordQueueReferenceCount": sum(
+                int(exchange.get("queueReferenceCount") or 0)
+                for exchange in discord_interactions
+            ),
+            "allQuestionCount": sum(
+                1
+                for event in normalized_events
+                if event.get("eventType") == "question"
+                or "?" in str(event.get("text") or "")
+            )
+            + sum(
+                int(exchange.get("questionCount") or 0)
+                for exchange in discord_interactions
+            ),
+            "allQueueReferenceCount": sum(
+                1 for event in normalized_events if event.get("queueReference")
+            )
+            + sum(
+                int(exchange.get("queueReferenceCount") or 0)
+                for exchange in discord_interactions
+            ),
         },
         "participants": participants,
+        "discordParticipants": discord_participants,
+        "crossSourceBindings": cross_source_bindings,
         "topics": topics,
+        "showTopics": show_topics,
         "trackMoments": track_moments,
+        "trackRoster": track_roster,
+        "operationalEvents": operational_events,
+        "operationalSummary": _show_operational_summary(
+            operational_events,
+            track_roster,
+        ),
+        "discordInteractions": discord_interactions,
         "namedMentions": mention_records,
         "messages": normalized_events,
         "identityBoundary": (
-            "TikTok handle/display correlation and exact queue-submitted TikTok "
-            "attribution may connect source records; resemblance alone never "
-            "merges a Discord, viewer, or artist identity."
+            "Exact source-owned subject references and exact queue-submitted "
+            "TikTok attribution may connect source records. Display-name or "
+            "handle resemblance alone never merges Discord, viewer, or artist "
+            "identities."
         ),
         "memoryBoundary": (
             "This is a source-aware public show episode above Community Canon. "
-            "It supports continuity but does not make one remark, inferred topic, "
-            "or temporal correlation canon or verified external fact."
+            "Queue/broadcast milestones are authoritative operational facts; "
+            "authored TikTok and Discord text remains attributed evidence. The "
+            "episode supports continuity but does not make one remark, inferred "
+            "topic, or temporal correlation canon or verified external fact."
         ),
     }
     ledger["sourceDigest"] = hashlib.sha256(
@@ -1436,6 +2328,95 @@ def build_tiktok_show_evidence_ledger(
         ).encode("utf-8")
     ).hexdigest()
     return ledger
+
+
+def _direct_operational_evidence_lines(
+    events: Sequence[Mapping[str, Any]],
+    user_text: str,
+    *,
+    limit: int = 10,
+) -> list[str]:
+    if not events or not _SHOW_OPERATIONAL_QUERY_RE.search(user_text or ""):
+        return []
+    safe_limit = max(1, min(int(limit or 1), 12))
+    query_terms = {
+        token
+        for token in _chat_tokens(user_text)
+        if token not in _CHAT_TOPIC_STOP_WORDS and not token.isdigit()
+    }
+    scored = []
+    for index, event in enumerate(events):
+        searchable = " ".join(
+            str(event.get(field) or "")
+            for field in (
+                "eventType",
+                "headline",
+                "detail",
+                "trackLabel",
+                "submittedByTikTokHandle",
+                "lane",
+                "outcome",
+            )
+        ).replace("_", " ")
+        overlap = query_terms.intersection(_chat_tokens(searchable))
+        score = len(overlap)
+        if score:
+            scored.append((score, index))
+    indexes: set[int] = set()
+    if scored:
+        for _score, index in sorted(scored, key=lambda item: (-item[0], item[1])):
+            for candidate in (index - 1, index, index + 1):
+                if 0 <= candidate < len(events):
+                    indexes.add(candidate)
+                if len(indexes) >= safe_limit:
+                    break
+            if len(indexes) >= safe_limit:
+                break
+    else:
+        anchors = [
+            index
+            for index, event in enumerate(events)
+            if str(event.get("eventType") or "")
+            in {
+                "broadcast_started",
+                "submissions_opened",
+                "submissions_closed",
+                "track_play_started",
+                "track_finished",
+                "track_skipped",
+                "track_removed",
+                "wheel_confirmed",
+                "sponsor_break_started",
+                "sponsor_break_completed",
+                "session_archived",
+            }
+        ]
+        indexes.update(anchors[:safe_limit])
+    lines = []
+    for index in sorted(indexes)[:safe_limit]:
+        event = events[index]
+        event_type = str(event.get("eventType") or "show_event").replace(
+            "_", " "
+        )
+        headline = _bounded_text(event.get("headline"), 180) or event_type
+        facts = [
+            _bounded_text(event.get("trackLabel"), 220),
+            _bounded_text(event.get("detail"), 260),
+        ]
+        if event.get("submissionOrder") is not None:
+            facts.append(f"submission order {int(event.get('submissionOrder') or 0)}")
+        if event.get("playedOrder") is not None:
+            facts.append(f"played order {int(event.get('playedOrder') or 0)}")
+        details = event.get("details")
+        if isinstance(details, Mapping) and details:
+            facts.append(json.dumps(details, sort_keys=True, ensure_ascii=False))
+        suffix = "; ".join(value for value in facts if value)
+        lines.append(
+            f"- t+{float(event.get('minuteOffset') or 0.0):.1f}m "
+            f"[{event_type}] {headline}"
+            + (f" — {suffix}" if suffix else "")
+        )
+    return lines
 
 
 def build_durable_show_prompt_context(
@@ -1458,16 +2439,31 @@ def build_durable_show_prompt_context(
     show_label = _bounded_text(show.get("title"), 160) or "BARCODE Radio"
     show_date = _bounded_text(show.get("showDate"), 40) or "date unavailable"
     status = _bounded_text(show.get("status"), 40) or "unknown"
+    direct_roster = _show_track_roster(show)
+    direct_operational_events = _show_operational_events(show, direct_roster)
+    direct_operational_lines = _direct_operational_evidence_lines(
+        direct_operational_events,
+        user_text,
+    )
     if durable_events is None:
-        return "\n".join(
-            [
-                "Durable TikTok show analysis context:",
-                f"- Analysis intent={intent}.",
-                f"- Show={show_label}; showDate={show_date}; status={status}; selectedFrom={source_key}.",
-                "- Availability: the public show timeline is available, but the durable TikTok event archive could not be read for this request.",
-                "- Do not report zero engagement, invent a ranking, or claim that the expired live buffer is the historical source.",
-            ]
-        )
+        unavailable_lines = [
+            "Durable BARCODE show analysis context:",
+            f"- Analysis intent={intent}.",
+            f"- Show={show_label}; showDate={show_date}; status={status}; selectedFrom={source_key}.",
+            (
+                f"- Authoritative show operations remain available: "
+                f"{len(direct_operational_events)} queue/broadcast milestones and "
+                f"{len(direct_roster)} rostered tracks."
+            ),
+            "- Availability: the public show timeline is available, but the durable TikTok event archive could not be read for this request.",
+            "- Do not report zero engagement, invent a ranking, or claim that the expired live buffer is the historical source.",
+        ]
+        if direct_operational_lines:
+            unavailable_lines.append(
+                "Authoritative queue/broadcast evidence relevant to the request:"
+            )
+            unavailable_lines.extend(direct_operational_lines)
+        return "\n".join(unavailable_lines)
     annotated_events, _windows = _annotated_show_events(show, durable_events)
     ranked, unassigned = _correlate_show_comments(show, durable_events)
     attendance_ledger = build_tiktok_show_evidence_ledger(
@@ -1504,8 +2500,18 @@ def build_durable_show_prompt_context(
             f"{int((attendance_ledger.get('interactions') or {}).get('bnlAddressCount') or 0)} messages addressed BNL; "
             f"{int((attendance_ledger.get('interactions') or {}).get('queueReferenceCount') or 0)} queue/wheel references."
         ),
+        (
+            "- Authoritative episode operations: "
+            f"{len(attendance_ledger.get('operationalEvents') or [])} public queue/broadcast milestones; "
+            f"{len(attendance_ledger.get('trackRoster') or [])} rostered tracks."
+        ),
         "- Correlation rule: a message is assigned only by its durable occurrence time to the website's track-loaded/play-started through finished/skipped/removed (or next-loaded) window. Say 'observed while the track was active,' not that the track caused the message.",
     ]
+    if direct_operational_lines:
+        lines.append(
+            "\nAuthoritative queue/broadcast evidence relevant to the request:"
+        )
+        lines.extend(direct_operational_lines)
     participant_rows = attendance_ledger.get("participants") or []
     if participant_rows:
         lines.append(

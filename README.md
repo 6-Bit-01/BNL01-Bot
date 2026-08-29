@@ -97,7 +97,7 @@ Private and public responses use the website's same explicit sanitized operation
 
 Operational queue questions bypass the short read-model cache and search the complete current order before prompt assembly. The prompt receives only the matching track or requested live fact; Now Playing and Up Next stay concise, while a full-lineup request receives the canonical queue-page link rather than a Discord data dump. BNL may read this truth but cannot move tracks, choose Wheel winners, or operate playback.
 
-The only queue persistence path is the website's exact `queue_artist_memory_v1` section. Once both production gates are true, a one-minute sync validates the section digest and stores its public production artist/song/album facts through the existing entity-evidence and unified memory-ledger owners. Accepted tracks are provisional; a confirmed play supersedes their provisional ledger revision. Submitted/provider conflicts stay explicit. Only a semantic provider artist ID can become the primary artist key; YouTube channels and SoundCloud uploaders remain account provenance, and every TikTok/provider/submitted label stays disconnected from Discord identity. Private/test/simulation data, file metadata, and every other queue section are rejected. The sync checkpoint skips unchanged catalogs, and ordinary conversation recall is exact-name/music-query scoped. This catalog never marks Source Files dirty and cannot automatically create dossiers, relationships, or canon identity.
+The only artist/entity queue persistence path is the website's exact `queue_artist_memory_v1` section. Once both production gates are true, a one-minute sync validates the section digest and stores its public production artist/song/album facts through the existing entity-evidence and unified memory-ledger owners. Accepted tracks are provisional; a confirmed play supersedes their provisional ledger revision. Submitted/provider conflicts stay explicit. Only a semantic provider artist ID can become the primary artist key; YouTube channels and SoundCloud uploaders remain account provenance, and every TikTok/provider/submitted label stays disconnected from Discord identity. Private/test/simulation data and file metadata are rejected. The sync checkpoint skips unchanged catalogs, and ordinary conversation recall is exact-name/music-query scoped. This catalog never marks Source Files dirty and cannot automatically create dossiers, relationships, or canon identity.
 
 Activation order is site first, bot second:
 
@@ -129,6 +129,26 @@ surface-level lore formation. A public Discord reply BNL gives about those live
 reactions follows the ordinary conversation persistence path. Aggregate viewers,
 taps, gifts, joins, and other room metrics remain current-show-only and do not
 become personal memory or canon.
+
+The same one-minute read-model cycle automatically assembles a durable public
+show episode for every retained show. It preserves the website archive's full
+public-safe queue/broadcast milestone sequence and track roster, places every
+eligible TikTok comment/question on that clock, and pairs public Discord user
+rows only when BNL's stored response explicitly targets that member in the same
+channel within the bounded response window. Questions, answers, track state,
+Wheel/sponsor/signal-hold events, order, and outcomes therefore remain available
+after the live snapshot expires. Ordinary recall retrieves only the show and
+evidence slices relevant to the current question; the complete ledger is not
+dumped into every prompt.
+
+This episode is a limited operational-memory exception, not a second queue
+owner. Website milestones and roster outcomes are authoritative operational
+facts; TikTok and Discord text remains attributed observation evidence. Exact
+source-owned subject references may connect the same participant across episode
+surfaces, while name/handle resemblance and queue attribution alone never merge
+identities. Episode projections remain above Community Canon, follow Memory
+Ledger lineage/supersession, and are invalidated by the existing complete-delete
+path when a bound member exercises deletion.
 
 Declared TikTok owner handles `@six.bit` and `@pr0x60` resolve to the same BNL
 owner subject; `PR0X`/`Prox` is the side-account display identity. Other known
