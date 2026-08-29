@@ -23,7 +23,7 @@ from bnl_dossier_source_packets import subject_key as normalized_subject_key
 from bnl_journal import purge_user_journal_derivatives_on_connection
 from bnl_journal_source_store import (
     journal_release_privacy_fence,
-    purge_user_discord_sources_on_connection,
+    purge_user_bound_conversation_sources_on_connection,
 )
 from bnl_memory_ledger import (
     ensure_memory_ledger_schema,
@@ -2405,6 +2405,7 @@ def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, use
         owned_ledger_ids: Set[str] = set()
         participant_model_ids: Set[str] = set()
         source_bound_raw_ids: Set[str] = set()
+        affected_tiktok_show_keys: Set[str] = set()
         if _table_exists(conn, "memory_ledger_entries"):
             owned_ledger_ids.update(
                 str(row[0])
@@ -2439,6 +2440,49 @@ def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, use
                     source_row_ids=conversation_source_rows,
                 )
             )
+        if _table_exists(conn, "tiktok_show_evidence_ledgers"):
+            for show_key, ledger_json in conn.execute(
+                """
+                SELECT show_key,ledger_json
+                FROM tiktok_show_evidence_ledgers
+                WHERE guild_id=?
+                """,
+                (guild_id,),
+            ).fetchall():
+                try:
+                    ledger = json.loads(ledger_json or "{}")
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    ledger = {}
+                messages = (
+                    ledger.get("messages")
+                    if isinstance(ledger, dict)
+                    and isinstance(ledger.get("messages"), list)
+                    else []
+                )
+                if any(
+                    isinstance(message, dict)
+                    and str(message.get("subjectRef") or "") == subject
+                    for message in messages
+                ):
+                    affected_tiktok_show_keys.add(str(show_key or ""))
+        if affected_tiktok_show_keys and _table_exists(
+            conn,
+            "memory_ledger_entries",
+        ):
+            for show_keys in _bounded_chunks(affected_tiktok_show_keys):
+                placeholders = ",".join("?" for _value in show_keys)
+                owned_ledger_ids.update(
+                    str(row[0] or "")
+                    for row in conn.execute(
+                        """
+                        SELECT entry_id FROM memory_ledger_entries
+                        WHERE guild_id=? AND source_table='tiktok_show_evidence'
+                          AND source_event_key IN (%s)
+                        """ % placeholders,
+                        (guild_id, *show_keys),
+                    ).fetchall()
+                    if str(row[0] or "")
+                )
         delete_ledger_ids = (
             owned_ledger_ids
             | participant_model_ids
@@ -2451,6 +2495,16 @@ def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, use
                 subject_key=subject,
             )
         )
+        counts["tiktok_show_evidence_ledgers"] = 0
+        for show_keys in _bounded_chunks(affected_tiktok_show_keys):
+            placeholders = ",".join("?" for _value in show_keys)
+            counts["tiktok_show_evidence_ledgers"] += conn.execute(
+                """
+                DELETE FROM tiktok_show_evidence_ledgers
+                WHERE guild_id=? AND show_key IN (%s)
+                """ % placeholders,
+                (guild_id, *show_keys),
+            ).rowcount
         deleted_ledger_source_refs: Set[Tuple[str, str]] = set()
         if delete_ledger_ids:
             placeholders = ",".join("?" for _ in delete_ledger_ids)
@@ -2764,7 +2818,7 @@ def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, use
         # The Journal source archive is normally immutable. Complete deletion is
         # the governed, transaction-scoped exception for this member's raw Discord
         # inputs; website relays and other members/guilds remain untouched.
-        counts["bnl_journal_source_events"] = purge_user_discord_sources_on_connection(
+        counts["bnl_journal_source_events"] = purge_user_bound_conversation_sources_on_connection(
             conn, guild_id=guild_id, user_id=user_id
         )
         counts.update(purge_user_journal_derivatives_on_connection(

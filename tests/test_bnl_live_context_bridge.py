@@ -6,6 +6,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
@@ -396,6 +397,143 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
         self.assertEqual(context, "")
         fetch.assert_not_called()
 
+    def test_whole_live_rundown_is_explicit_and_reloads_without_room_context(self):
+        question = (
+            "Give me a quick rundown on what people talked about "
+            "throughout the live"
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ), mock.patch.object(
+            bnl01_bot,
+            "fetch_bnl_read_model",
+            return_value=public_read_model_with_show_archive(),
+        ) as fetch, mock.patch.object(
+            bnl01_bot,
+            "_load_durable_tiktok_show_events",
+            return_value=[],
+        ) as archive_load:
+            context = bnl01_bot.maybe_build_bnl_read_model_context(
+                question,
+                "public_home",
+            )
+
+        fetch.assert_called_once_with(force=True)
+        archive_load.assert_called_once()
+        self.assertIn("Analysis intent=chat_topics", context)
+        self.assertIn("Full-archive coverage", context)
+        self.assertNotIn("Now playing:", context)
+        self.assertNotIn("Ranking by public chat messages", context)
+
+    def test_each_explicit_chat_analysis_turn_reloads_its_durable_owner(self):
+        questions = (
+            "Any recurring topics from TikTok chat during the show?",
+            "Give me a quick rundown on what people talked about throughout the live",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ), mock.patch.object(
+            bnl01_bot,
+            "fetch_bnl_read_model",
+            return_value=public_read_model_with_show_archive(),
+        ) as fetch, mock.patch.object(
+            bnl01_bot,
+            "_load_durable_tiktok_show_events",
+            return_value=[],
+        ) as archive_load:
+            contexts = [
+                bnl01_bot.maybe_build_bnl_read_model_context(
+                    question,
+                    "public_home",
+                )
+                for question in questions
+            ]
+
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(archive_load.call_count, 2)
+        self.assertTrue(
+            all("Durable TikTok show analysis context" in value for value in contexts)
+        )
+
+    def test_public_tiktok_reply_can_persist_without_storing_injected_context(self):
+        durable_context = (
+            "Website public read model context:\n"
+            "Source: barcode-network-site / publicOnly=true / "
+            "accessScope=public / version=1\n"
+            "Durable TikTok show analysis context:\n"
+            "- Analysis intent=chat_topics."
+        )
+        self.assertTrue(
+            bnl01_bot.model_response_persistence_allowed_with_website_context(
+                "Give me a rundown of what people discussed throughout the live",
+                "public_home",
+                durable_context,
+            )
+        )
+        self.assertFalse(
+            bnl01_bot.model_response_persistence_allowed_with_website_context(
+                "What's playing right now?",
+                "public_home",
+                "Website public read model context:\naccessScope=public",
+            )
+        )
+
+    def test_durable_tiktok_turn_contract_uses_room_context_only_as_framing(self):
+        contract = bnl01_bot.build_tiktok_show_analysis_turn_contract(
+            "Durable TikTok show analysis context:\n"
+            "- Analysis intent=chat_topics."
+        )
+        self.assertIn("full eligible archive", contract)
+        self.assertIn("cannot supply claims about what TikTok viewers said", contract)
+        self.assertIn("three to five supported subjects", contract)
+
+    def test_tiktok_topic_response_guard_detects_filler_and_missing_evidence(self):
+        prompt = (
+            "Durable TikTok show analysis context:\n"
+            "- Analysis intent=chat_topics.\n"
+            "- Signal \"green visuals\": 3 messages / 3 unique chatters.\n"
+            "  Support t+2.0m | First Track | @one: "
+            "\"The green visuals are wild.\""
+        )
+        filler = (
+            "Connection is much clearer. It was standard baseline chatter and "
+            "ambient banter, with nothing critical enough to escalate to production."
+        )
+        unsupported = "People mostly discussed generic things throughout the live."
+        grounded = (
+            "Green visuals were the clearest recurring subject: 3 messages "
+            "from 3 chatters called out the changing look."
+        )
+        self.assertEqual(
+            bnl01_bot.tiktok_show_analysis_response_failure(filler, prompt),
+            "operational_or_ambient_filler",
+        )
+        self.assertEqual(
+            bnl01_bot.tiktok_show_analysis_response_failure(unsupported, prompt),
+            "archive_evidence_not_used",
+        )
+        self.assertEqual(
+            bnl01_bot.tiktok_show_analysis_response_failure(grounded, prompt),
+            "",
+        )
+        empty_prompt = (
+            "Durable TikTok show analysis context:\n"
+            "- Analysis intent=chat_topics.\n"
+            "- Comment evidence: no eligible public TikTok comments/questions "
+            "were present in the selected show window."
+        )
+        self.assertEqual(
+            bnl01_bot.tiktok_show_analysis_response_failure(
+                "People spent the live discussing production techniques.",
+                empty_prompt,
+            ),
+            "no_comment_evidence_overclaimed",
+        )
+
     def test_public_tiktok_exchange_uses_normal_memory_but_queue_only_does_not(self):
         public_context = (
             "Website public read model context:\n"
@@ -489,6 +627,141 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
             ]
             self.assertEqual(len(tiktok_sources), 1)
             self.assertEqual(tiktok_sources[0]["sourceKind"], "conversation")
+
+
+class BNLLiveContextGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_topic_guard_regenerates_operational_filler_from_archive_evidence(self):
+        prompt = (
+            "Current user request: Any recurring topics from chat tonight?\n"
+            "Durable TikTok show analysis context:\n"
+            "- Analysis intent=chat_topics.\n"
+            "- Signal \"green visuals\": 3 messages / 3 unique chatters.\n"
+            "  Support t+2.0m | First Track | @one: "
+            "\"The green visuals are wild.\""
+        )
+        initial = (
+            "Connection is much clearer. It was standard baseline chatter and "
+            "ambient banter, with nothing critical enough to escalate to production."
+        )
+        repaired = (
+            "Green visuals were the clearest recurring subject: 3 messages "
+            "from 3 chatters called out the changing look."
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "get_gemini_response_with_optional_typing",
+            new=mock.AsyncMock(return_value=repaired),
+        ) as regenerate:
+            response, diagnostics = (
+                await bnl01_bot.apply_guarded_response_regeneration(
+                    initial,
+                    prompt=prompt,
+                    user_id=1,
+                    guild_id=77,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_home",
+                    current_user_text=(
+                        "Any recurring topics from TikTok chat during the show?"
+                    ),
+                    source_context_available=True,
+                )
+            )
+
+        self.assertEqual(response, repaired)
+        self.assertTrue(
+            diagnostics["tiktok_show_analysis_guard_triggered"]
+        )
+        self.assertTrue(diagnostics["tiktok_show_analysis_regenerated"])
+        self.assertEqual(diagnostics["tiktok_show_analysis_guard_reason"], "")
+        regenerate.assert_awaited_once()
+
+    async def test_direct_public_tiktok_reply_is_saved_as_conversation_not_snapshot(self):
+        question = (
+            "Give me a quick rundown on what people talked about throughout the live"
+        )
+        website_context = (
+            "Website public read model context:\n"
+            "Source: barcode-network-site / publicOnly=true / "
+            "accessScope=public / version=1\n"
+            "Durable TikTok show analysis context:\n"
+            "- Analysis intent=chat_topics.\n"
+            "- Signal \"green visuals\": 3 messages / 3 unique chatters."
+        )
+        sent = SimpleNamespace(id=991)
+        channel = SimpleNamespace(id=81, name="barcode-bot")
+        message = SimpleNamespace(
+            content=question,
+            author=SimpleNamespace(id=1, display_name="6 Bit"),
+            guild=SimpleNamespace(id=77),
+            channel=channel,
+            reply=mock.AsyncMock(return_value=sent),
+        )
+        plan = bnl01_bot.plan_conversation_response(
+            question,
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            real_direct_target=True,
+            batching_enabled=True,
+        )
+        save = mock.Mock(
+            return_value=SimpleNamespace(
+                save_conversation=True,
+                reason="saved",
+            )
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "_apply_direct_response_pacing",
+            new=mock.AsyncMock(),
+        ), mock.patch.object(
+            bnl01_bot,
+            "maybe_generate_shared_brain_synthesis_canary",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch.object(
+            bnl01_bot,
+            "apply_guarded_response_regeneration",
+            new=mock.AsyncMock(
+                return_value=(
+                    "Green visuals were the strongest recurring subject.",
+                    {"suppressed": False},
+                )
+            ),
+        ), mock.patch.object(
+            bnl01_bot,
+            "build_message_media_context",
+            return_value={"present": False},
+        ), mock.patch.object(
+            bnl01_bot,
+            "save_model_message",
+            new=save,
+        ), mock.patch.object(
+            bnl01_bot,
+            "_mark_conversation_continuation_state",
+        ), mock.patch.object(
+            bnl01_bot,
+            "record_unified_response_assessment_shadow_after_send",
+            new=mock.AsyncMock(),
+        ):
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "Green visuals were the strongest recurring subject.",
+                plan,
+                website_read_model_context=website_context,
+                source_context_available=True,
+                prompt=website_context,
+                mark_recent_direct=False,
+            )
+
+        save.assert_called_once()
+        self.assertEqual(
+            save.call_args.args[2],
+            "Green visuals were the strongest recurring subject.",
+        )
+        self.assertNotIn(
+            "Durable TikTok show analysis context",
+            save.call_args.args[2],
+        )
 
 
 if __name__ == "__main__":

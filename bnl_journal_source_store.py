@@ -511,6 +511,46 @@ def purge_user_discord_sources_on_connection(conn: sqlite3.Connection, guild_id:
     return _purge_discord_source_events_on_connection(conn, guild_id, user_id)
 
 
+def purge_user_bound_conversation_sources_on_connection(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+) -> int:
+    """Purge bot-held public conversation sources bound to one Discord member.
+
+    This broader variant is reserved for complete deletion. It removes both
+    Discord sources and TikTok events whose governed correlation already bound
+    them to the exact ``discord_user`` subject; unrelated TikTok viewers and
+    all unbound public sources remain intact.
+    """
+
+    guild = int(guild_id)
+    user = int(user_id)
+    if guild <= 0:
+        raise ValueError("invalid_guild_id")
+    if user <= 0:
+        raise ValueError("invalid_user_id")
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (SOURCE_TABLE,),
+    ).fetchone()
+    if not exists:
+        return 0
+    conn.execute("DROP TRIGGER IF EXISTS %s" % DELETE_TRIGGER)
+    try:
+        cursor = conn.execute(
+            """
+            DELETE FROM bnl_journal_source_events
+            WHERE guild_id=? AND subject_ref=?
+              AND source_kind IN ('discord_message','tiktok_live_chat')
+            """,
+            (guild, "discord_user:%s" % user),
+        )
+        return int(cursor.rowcount or 0)
+    finally:
+        _create_delete_trigger(conn)
+
+
 def purge_guild_discord_sources_on_connection(conn: sqlite3.Connection, guild_id: int) -> int:
     """Purge one guild's raw Discord Journal sources in a caller transaction."""
     return _purge_discord_source_events_on_connection(conn, guild_id)
