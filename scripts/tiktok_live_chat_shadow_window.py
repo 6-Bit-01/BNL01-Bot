@@ -24,6 +24,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from bnl_tiktok_live_chat import LiveChatAdapter, LiveChatBuffer  # noqa: E402
 from bnl_tiktok_live_context import LiveContextSnapshotWriter  # noqa: E402
+from bnl_tiktok_live_memory import (  # noqa: E402
+    TikTokPublicConversationSpoolWriter,
+)
 from scripts.tiktok_live_shadow_model import (
     DEFAULT_BUFFER_EVENTS,
     DEFAULT_DEDUPE_SECONDS,
@@ -89,6 +92,11 @@ async def run_window(args: argparse.Namespace) -> int:
         if args.context_path is not None
         else None
     )
+    archive_writer = (
+        TikTokPublicConversationSpoolWriter(str(args.archive_spool_path))
+        if args.archive_spool_path is not None
+        else None
+    )
     if context_writer is not None:
         context_writer.publish(adapter, force=True)
     ended_rooms: Set[str] = set()
@@ -122,6 +130,7 @@ async def run_window(args: argparse.Namespace) -> int:
             stop_event,
             window.end,
             context_writer,
+            archive_writer,
         )
         if result.stop_reason in {"window_closed", "stop_requested"}:
             break
@@ -216,6 +225,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="volatile JSON path exported for the separately gated BNL reader",
+    )
+    parser.add_argument(
+        "--archive-spool-path",
+        type=Path,
+        default=None,
+        help="volatile append-only handoff for durable public chat ingestion",
     )
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument(

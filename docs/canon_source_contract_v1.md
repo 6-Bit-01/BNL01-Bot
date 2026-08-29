@@ -43,17 +43,27 @@ Missing, contradictory, or malformed scope/`publicOnly` combinations fail closed
 
 For a live operational question, the bot fetches a fresh snapshot, searches the complete ordered queue, and passes only the request-relevant facts into generation. It answers Now Playing, Up Next, position, movement, and confirmed Wheel-result questions directly; a request for the complete lineup is routed to the queue page. Read access never implies queue, Wheel, or playback control.
 
-TikTok LIVE public observations are a separate current-show-only source. When
-the local TikTok awareness gate is explicitly enabled, the isolated collector
-may expose a bounded volatile snapshot to the bot. BNL may load it only for an
-explicit live-show/reaction question and only when the same channel is
-authorized for the current website queue scope. The queue is authoritative for
-show state; TikTok comments/questions are viewer statements and engagement
-counters are platform-room metrics. They cannot override the queue, establish
-identity, enter memory or publication owners, trigger proactive output, or
-grant TikTok/queue controls. Missing or stale context fails closed.
+TikTok LIVE is a source-aware public conversation lane with a current-show view.
+When the local TikTok awareness gate is explicitly enabled, the isolated
+collector exposes a bounded volatile snapshot to the bot. BNL may load that view
+only for an explicit live-show/reaction question and only when the same channel
+is authorized for the current website queue scope. The queue is authoritative
+for show state; TikTok comments/questions are viewer statements and engagement
+counters are platform-room metrics. Missing or stale context fails closed.
 
-The only persistence exception is not operational queue context: it is the independently versioned `sections.artistMemory` public catalog. Its validator requires both production gates, exact schema/policy strings, a matching digest, approved public live-broadcast provenance, and a bounded record count. Each record carries source-aware artist, song, optional album/project, show, and lifecycle fields. Accepted is provisional and a confirmed play supersedes that revision. Provider and submitted conflicts remain explicit; exactly one semantic provider artist ID may own the primary subject, while channels/uploaders and all submission attribution remain disconnected from Discord identity. The bridge writes through existing entity evidence and memory ledger tables, skips unchanged digests, supersedes older active revisions, and never marks a Source File refresh dirty. Private, rehearsal, simulation, file, payment, account, contact, dossier, relationship, and canon fields remain ineligible.
+Every accepted public TikTok comment/question is also eligible for the separate
+memory handoff. The main bot writes it through the append-only Journal source
+archive and Unified Memory Ledger as a conversation observation immediately
+above Community Canon. It may support ordinary continuity and surface-level
+lore, but one utterance cannot create canon, relationship truth, a Source File,
+a dossier, or verified external fact. Aggregate viewers, taps, gifts, joins, and
+other room metrics remain current-show-only. Declared owner handles `@six.bit`
+and `@pr0x60` resolve to the same owner subject. Other cross-platform bindings
+require compatible handle and display-name evidence; ambiguous matches remain
+TikTok-only. A TikTok moderator flag is trusted only as room-role evidence for
+the exact account. None of these paths grant TikTok output or queue controls.
+
+The only operational queue-data persistence exception is the independently versioned `sections.artistMemory` public catalog. Its validator requires both production gates, exact schema/policy strings, a matching digest, approved public live-broadcast provenance, and a bounded record count. Each record carries source-aware artist, song, optional album/project, show, and lifecycle fields. Accepted is provisional and a confirmed play supersedes that revision. Provider and submitted conflicts remain explicit; exactly one semantic provider artist ID may own the primary subject, while channels/uploaders and all submission attribution remain disconnected from Discord identity. The bridge writes through existing entity evidence and memory ledger tables, skips unchanged digests, supersedes older active revisions, and never marks a Source File refresh dirty. Private, rehearsal, simulation, file, payment, account, contact, dossier, relationship, and canon fields remain ineligible.
 
 The website's bounded `sections.sourceContext` list remains public site canon, not live queue state. BNL may load those public summaries for an explicit site/read-model question even while live queue context is disabled. Queue/session/track values are still removed before prompt assembly.
 
@@ -90,7 +100,7 @@ Show-day announcement canon consumes the same gate decision without persisting q
 
 The 7:00 PM Pacific announcement is deliberately restrained: the schedule proves the broadcast window, not a current live/on-air state. The optional later-show sponsor reminder does not claim that a commercial break is active, due, required, or already called. Current state still requires fresh public runtime evidence and host control.
 
-Show-day alignment and operational queue context do not write memory, relationships, dossiers, Source Files, Relay, recaps, the Journal, or public copy lanes. The separate validated public artist catalog above is the sole memory exception and grants no other destination authority. Neither path enables show-day Discord posts, proactive engagement, queue write power, or either production gate.
+Show-day alignment and operational queue context do not write memory, relationships, dossiers, Source Files, Relay, recaps, the Journal, or public copy lanes. For queue-derived data, the separate validated public artist catalog above is the sole memory exception and grants no other destination authority. TikTok public conversation archival is an independent source path governed by the limits above. None of these paths enables show-day Discord posts, proactive engagement, queue write power, or either production gate.
 
 ## Not migrated
 

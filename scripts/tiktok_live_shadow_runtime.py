@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from bnl_tiktok_live_chat import JOIN, VIEWER_SNAPSHOT, LiveChatAdapter
 from bnl_tiktok_live_context import LiveContextSnapshotWriter
+from bnl_tiktok_live_memory import TikTokPublicConversationSpoolWriter
 from scripts.tiktok_live_shadow_model import (
     REPO_ROOT,
     CycleResult,
@@ -40,11 +41,25 @@ async def _consume_stdout(
     ended_rooms: Set[str],
     state: CycleState,
     context_writer: Optional[LiveContextSnapshotWriter] = None,
+    archive_writer: Optional[TikTokPublicConversationSpoolWriter] = None,
 ) -> None:
     async for raw in reader:
         duplicates_before = adapter.buffer.duplicates
         invalid_before = int(adapter.health["invalid_lines"])
         event = adapter.ingest_line(raw)
+        if archive_writer is not None and event is not None and event.event_type in {
+            "comment",
+            "question",
+        }:
+            try:
+                archive_writer.append(event.telemetry_record())
+            except Exception as exc:
+                print(
+                    "[archive] append_failed {}".format(
+                        _safe_code(exc.__class__.__name__)
+                    ),
+                    flush=True,
+                )
         if context_writer is not None and event is not None:
             try:
                 context_writer.publish(adapter)
@@ -144,6 +159,7 @@ async def run_transport_cycle(
     stop_event: asyncio.Event,
     deadline: datetime,
     context_writer: Optional[LiveContextSnapshotWriter] = None,
+    archive_writer: Optional[TikTokPublicConversationSpoolWriter] = None,
 ) -> CycleResult:
     command = build_transport_command(args)
     env = os.environ.copy()
@@ -169,6 +185,7 @@ async def run_transport_cycle(
             ended_rooms,
             state,
             context_writer,
+            archive_writer,
         )
     )
     stderr_task = asyncio.create_task(_drain_stderr(process.stderr))
@@ -265,4 +282,3 @@ def format_summary(health: dict, cycle_count: int) -> str:
         reconnects=health["reconnect_count"],
         cycles=cycle_count,
     )
-

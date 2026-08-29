@@ -36,6 +36,11 @@ from bnl_tiktok_live_context import (
     is_live_show_reaction_query,
     live_context_diagnostics,
 )
+from bnl_tiktok_live_memory import (
+    DEFAULT_ARCHIVE_SPOOL_PATH as DEFAULT_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH,
+    read_public_conversation_spool,
+    resolve_tiktok_identity,
+)
 from bnl_occasion import (
     OCCASION_CALENDAR_VERSION,
     OCCASION_CHANNEL_RETRY_MINUTES,
@@ -76,6 +81,7 @@ from bnl_memory_ledger import (
     shadow_broadcast_memory_row,
     shadow_declared_canon_projection,
     shadow_conversation_row,
+    shadow_tiktok_live_chat_event,
     record_shadow_receipt,
     shadow_broadcast_status_event,
     shadow_enabled as memory_ledger_shadow_enabled,
@@ -478,14 +484,44 @@ BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 BNL_READ_MODEL_URL = os.getenv("BNL_READ_MODEL_URL", "").strip()
 BNL_READ_MODEL_ENABLED = os.getenv("BNL_READ_MODEL_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_QUEUE_PRODUCTION_ENABLED = os.getenv("BNL_QUEUE_PRODUCTION_ENABLED", "").strip().lower() == "true"
-BNL_TIKTOK_LIVE_CONTEXT_ENABLED = os.getenv(
+_BNL_TIKTOK_LIVE_CONTEXT_GATE = os.getenv(
     "BNL_TIKTOK_LIVE_CONTEXT_ENABLED",
     "",
-).strip().lower() == "true"
+).strip()
+BNL_TIKTOK_LIVE_CONTEXT_ENABLED = (
+    _BNL_TIKTOK_LIVE_CONTEXT_GATE.lower() == "true"
+)
+_BNL_TIKTOK_LIVE_MEMORY_GATE = os.getenv(
+    "BNL_TIKTOK_LIVE_MEMORY_ENABLED",
+    _BNL_TIKTOK_LIVE_CONTEXT_GATE,
+).strip()
+BNL_TIKTOK_LIVE_MEMORY_ENABLED = (
+    _BNL_TIKTOK_LIVE_MEMORY_GATE.lower() == "true"
+)
 BNL_TIKTOK_LIVE_CONTEXT_PATH = os.getenv(
     "BNL_TIKTOK_LIVE_CONTEXT_PATH",
     DEFAULT_TIKTOK_LIVE_CONTEXT_PATH,
 ).strip() or DEFAULT_TIKTOK_LIVE_CONTEXT_PATH
+BNL_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH = os.getenv(
+    "BNL_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH",
+    DEFAULT_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH,
+).strip() or DEFAULT_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH
+BNL_TIKTOK_OWNER_HANDLES = tuple(
+    value.strip().lstrip("@").lower()
+    for value in os.getenv(
+        "BNL_TIKTOK_OWNER_HANDLES",
+        "six.bit,pr0x60",
+    ).split(",")
+    if value.strip().lstrip("@")
+)
+BNL_TIKTOK_OWNER_NAMES = tuple(
+    value.strip()
+    for value in os.getenv(
+        "BNL_TIKTOK_OWNER_NAMES",
+        "6 Bit,PR0X,Prox",
+    ).split(",")
+    if value.strip()
+)
 try:
     BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS = min(
         60.0,
@@ -2776,6 +2812,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                     BNL_TIKTOK_LIVE_CONTEXT_PATH,
                     enabled=BNL_TIKTOK_LIVE_CONTEXT_ENABLED,
                     max_age_seconds=BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
+                    declared_owner_handles=BNL_TIKTOK_OWNER_HANDLES,
                 )
             )
         else:
@@ -2875,8 +2912,16 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             "- This is public website context only.",
             "- BNL can read the authorized snapshot but cannot move tracks, choose winners, start playback, or operate the queue. Never deflect a readable fact question to the production team.",
             "- Answer only what was asked. For a full-lineup request, direct the user to the queue page instead of reproducing the entire queue in Discord.",
-            "- Do not treat this as durable memory.",
-            "- Do not write, merge, promote, or persist this context.",
+            (
+                "- Queue state and aggregate TikTok room metrics are temporary operational context. Public TikTok comments/questions are separately archived as conversation evidence above Community Canon; this response may use normal public conversation memory."
+                if live_reaction_query
+                else "- Do not treat this operational queue context as durable memory."
+            ),
+            (
+                "- Never promote one TikTok comment, one queue state, or one engagement count into canon, a relationship fact, or verified external truth."
+                if live_reaction_query
+                else "- Do not write, merge, promote, or persist this context."
+            ),
             "- Do not claim private account/payment/user data.",
             "- Do not claim simulation/test tracks are present; the read model excludes them.",
             "- Do not expose raw JSON directly; answer naturally from the compact public fields above.",
@@ -2911,6 +2956,26 @@ def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> s
         )
         return ""
     return build_bnl_read_model_context(read_model, user_text, channel_policy)
+
+
+def public_tiktok_interaction_memory_allowed(
+    user_text: str,
+    channel_policy: str,
+    website_read_model_context: str,
+) -> bool:
+    """Allow the public BNL exchange to persist, never the injected snapshot."""
+
+    context = str(website_read_model_context or "")
+    return bool(
+        (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES
+        and is_live_show_reaction_query(user_text)
+        and "Website public read model context:" in context
+        and "accessScope=public" in context
+        and (
+            "Current TikTok LIVE reaction context:" in context
+            or "Current TikTok LIVE public reaction context:" in context
+        )
+    )
 
 
 def _bnl_read_model_section_counts(read_model: dict) -> dict:
@@ -31347,6 +31412,241 @@ def iter_managed_guilds():
     return list(client.guilds)
 
 
+_tiktok_live_memory_runtime = {
+    "offset": 0,
+    "last_reason": "never",
+    "last_ingested": 0,
+    "total_ingested": 0,
+    "last_error_type": "",
+}
+
+
+def _known_discord_identities_for_tiktok(guild_id: int) -> dict[int, tuple[str, ...]]:
+    """Return bounded public name hints for two-signal TikTok correlation."""
+
+    identities: dict[int, set[str]] = {}
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            tables = {
+                str(row[0] or "")
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "user_profiles" in tables:
+                for user_id, display_name, preferred_name in conn.execute(
+                    "SELECT user_id,display_name,preferred_name FROM user_profiles "
+                    "WHERE guild_id=? AND user_id>0 ORDER BY user_id LIMIT 10000",
+                    (int(guild_id),),
+                ).fetchall():
+                    values = identities.setdefault(int(user_id), set())
+                    for value in (display_name, preferred_name):
+                        if str(value or "").strip():
+                            values.add(str(value).strip())
+            if "conversations" in tables:
+                for user_id, user_name in conn.execute(
+                    "SELECT user_id,user_name FROM conversations "
+                    "WHERE guild_id=? AND user_id>0 AND role='user' "
+                    "AND TRIM(user_name)<>'' GROUP BY user_id,user_name "
+                    "ORDER BY MAX(id) DESC LIMIT 10000",
+                    (int(guild_id),),
+                ).fetchall():
+                    identities.setdefault(int(user_id), set()).add(
+                        str(user_name).strip()
+                    )
+    except sqlite3.Error as exc:
+        logging.debug(
+            "tiktok_identity_hints_unavailable error_type=%s",
+            type(exc).__name__,
+        )
+    return {
+        user_id: tuple(sorted(values))
+        for user_id, values in identities.items()
+        if values
+    }
+
+
+def _archive_one_tiktok_live_conversation(
+    guild_id: int,
+    record: Mapping[str, Any],
+    known_identities: Mapping[int, tuple[str, ...]],
+) -> bool:
+    event_type = str(record.get("event_type") or "").strip().lower()
+    text_key = "comment_text" if event_type == "comment" else "question_text"
+    content = str(record.get(text_key) or "").strip()
+    event_id = str(record.get("event_id") or "").strip()
+    if event_type not in {"comment", "question"} or not content or not event_id:
+        return False
+    identity = resolve_tiktok_identity(
+        record,
+        known_discord_identities=known_identities,
+        owner_user_id=BNL_OWNER_USER_ID,
+        owner_handles=BNL_TIKTOK_OWNER_HANDLES,
+        owner_names=BNL_TIKTOK_OWNER_NAMES,
+    )
+    occurred_seconds = float(
+        record.get("source_at") or record.get("observed_at") or time.time()
+    )
+    occurred_at_ms = max(0, int(occurred_seconds * 1000))
+    observed_at = datetime.fromtimestamp(
+        occurred_at_ms / 1000.0,
+        tz=timezone.utc,
+    ).isoformat()
+    handle = str(record.get("unique_id") or "").strip().lstrip("@").lower()
+    display_name = str(record.get("display_name") or "").strip()
+    journal_result = record_journal_source_event(
+        DB_FILE,
+        guild_id=int(guild_id),
+        source_kind="tiktok_live_chat",
+        source_key=event_id,
+        occurred_at_ms=occurred_at_ms,
+        raw_text=content,
+        sanitized_summary=sanitize_journal_source_summary(
+            content,
+            [value for value in (display_name, handle) if value],
+        ),
+        channel_policy="public_context",
+        subject_ref=identity.subject_ref,
+        private_display_name=display_name or ("@" + handle if handle else ""),
+        public_usable=True,
+        metadata={
+            "platform": "tiktok",
+            "eventType": event_type,
+            "eventId": event_id,
+            "roomId": str(record.get("room_id") or "")[:160],
+            "handle": handle,
+            "moderator": bool(record.get("moderator_flag") is True),
+            "identityPolicy": "handle_display_correlated_v1",
+            "identityBindingBasis": identity.binding_basis,
+            "boundDiscordUserId": identity.bound_discord_user_id or None,
+            "memoryPlacement": "above_community_canon",
+        },
+    )
+    if not journal_result.ok:
+        logging.warning(
+            "tiktok_live_archive_conflict event_id=%s status=%s",
+            event_id,
+            journal_result.status,
+        )
+    _shadow_memory_ledger_write(
+        "tiktok_live_chat",
+        lambda ledger_conn: shadow_tiktok_live_chat_event(
+            ledger_conn,
+            guild_id=int(guild_id),
+            event_id=event_id,
+            subject_key=identity.subject_ref,
+            subject_display_name=display_name or ("@" + handle if handle else ""),
+            content=content,
+            observed_at=observed_at,
+            source_sequence=occurred_at_ms,
+            moderator_flag=bool(record.get("moderator_flag") is True),
+        ),
+        guild_id=int(guild_id),
+        source_table="tiktok_live_chat",
+        source_row_id=event_id,
+        source_revision=event_id,
+        source_event_key=event_id,
+    )
+    return bool(journal_result.ok)
+
+
+def ingest_tiktok_live_memory_once(
+    guild_id: int,
+    *,
+    path: str = "",
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Ingest one bounded spool batch; advance only after the full batch lands."""
+
+    spool_path = str(path or BNL_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH)
+    batch = read_public_conversation_spool(spool_path, offset=int(offset or 0))
+    if batch.reason not in {"ok", "spool_missing", "partial_line_waiting"}:
+        return {
+            "ok": False,
+            "reason": batch.reason,
+            "offset": int(offset or 0),
+            "ingested": 0,
+            "reset": batch.reset,
+        }
+    if not batch.records:
+        return {
+            "ok": True,
+            "reason": batch.reason,
+            "offset": batch.next_offset,
+            "ingested": 0,
+            "reset": batch.reset,
+        }
+    known_identities = _known_discord_identities_for_tiktok(int(guild_id))
+    ingested = 0
+    try:
+        for record in batch.records:
+            if _archive_one_tiktok_live_conversation(
+                int(guild_id),
+                record,
+                known_identities,
+            ):
+                ingested += 1
+    except Exception as exc:
+        logging.exception(
+            "tiktok_live_memory_ingest_failed error_type=%s",
+            type(exc).__name__,
+        )
+        return {
+            "ok": False,
+            "reason": "archive_write_failed",
+            "offset": int(offset or 0),
+            "ingested": ingested,
+            "reset": batch.reset,
+            "errorType": type(exc).__name__,
+        }
+    return {
+        "ok": True,
+        "reason": "ingested",
+        "offset": batch.next_offset,
+        "ingested": ingested,
+        "reset": batch.reset,
+    }
+
+
+@tasks.loop(seconds=2)
+async def tiktok_live_memory_ingest_task():
+    if not BNL_TIKTOK_LIVE_MEMORY_ENABLED:
+        return
+    guild_id = int(BNL_PRIMARY_GUILD_ID or 0)
+    if guild_id <= 0:
+        managed = list(iter_managed_guilds())
+        guild_id = int(getattr(managed[0], "id", 0) or 0) if managed else 0
+    if guild_id <= 0:
+        _tiktok_live_memory_runtime["last_reason"] = "guild_unavailable"
+        return
+    result = await asyncio.to_thread(
+        ingest_tiktok_live_memory_once,
+        guild_id,
+        offset=int(_tiktok_live_memory_runtime.get("offset") or 0),
+    )
+    _tiktok_live_memory_runtime["last_reason"] = str(
+        result.get("reason") or "unknown"
+    )
+    _tiktok_live_memory_runtime["last_ingested"] = int(
+        result.get("ingested") or 0
+    )
+    _tiktok_live_memory_runtime["last_error_type"] = str(
+        result.get("errorType") or ""
+    )
+    if result.get("ok"):
+        _tiktok_live_memory_runtime["offset"] = int(
+            result.get("offset") or 0
+        )
+        _tiktok_live_memory_runtime["total_ingested"] = int(
+            _tiktok_live_memory_runtime.get("total_ingested") or 0
+        ) + int(result.get("ingested") or 0)
+
+
+@tiktok_live_memory_ingest_task.before_loop
+async def _before_tiktok_live_memory_ingest_task():
+    await client.wait_until_ready()
+
+
 @tasks.loop(minutes=1)
 async def moment_engine_sweep_task():
     if not memory_ledger_shadow_enabled():
@@ -34004,6 +34304,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_source_context_available = bool(
                 batch_website_read_model_context
             )
+            batch_public_tiktok_memory_allowed = (
+                public_tiktok_interaction_memory_allowed(
+                    combined_text,
+                    channel_policy,
+                    batch_website_read_model_context,
+                )
+            )
             if batch_website_read_model_context:
                 prompt += (
                     "\n\nAuthoritative current live-show context for this "
@@ -34835,7 +35142,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             memory_context_source_count=1,
             memory_injection_decision="batch_prompt_public_safe",
             memory_write_decision=(
-                "none"
+                get_route_mode_contract(
+                    ROUTE_MODE_NORMAL_CHAT
+                ).save_behavior
+                if batch_public_tiktok_memory_allowed
+                else "none"
                 if batch_source_context_available
                 else get_route_mode_contract(
                     ROUTE_MODE_NORMAL_CHAT
@@ -34849,7 +35160,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             entity_subjects_detected_count=0,
             subject_extraction_ran=False,
             save_policy_reason=(
-                "website_read_model_no_store"
+                "public_tiktok_interaction_normal_memory"
+                if batch_public_tiktok_memory_allowed
+                else "website_read_model_no_store"
                 if batch_source_context_available
                 else "batch_model_save_pending"
             ),
@@ -35370,7 +35683,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="batch_discord_send_failed",
             )
             return
-        if batch_source_context_available:
+        if (
+            batch_source_context_available
+            and not batch_public_tiktok_memory_allowed
+        ):
             logging.info(
                 "batch_response_persistence_skipped "
                 "reason=website_read_model_no_store channel_policy=%s",
@@ -35642,6 +35958,12 @@ async def on_ready():
 
     if not queue_artist_memory_sync_task.is_running():
         queue_artist_memory_sync_task.start()
+
+    if (
+        BNL_TIKTOK_LIVE_MEMORY_ENABLED
+        and not tiktok_live_memory_ingest_task.is_running()
+    ):
+        tiktok_live_memory_ingest_task.start()
 
     if not moment_engine_sweep_task.is_running():
         moment_engine_sweep_task.start()
@@ -44857,6 +45179,9 @@ async def bnl_status(interaction: discord.Interaction):
         f"- tiktok_live_snapshot_state: `{tiktok_live_diag.get('state')}` age_seconds=`{tiktok_live_diag.get('snapshotAgeSeconds') if tiktok_live_diag.get('snapshotAgeSeconds') is not None else 'none'}`",
         f"- tiktok_live_events_buffered: `{tiktok_live_diag.get('events')}` comments_accepted=`{tiktok_live_diag.get('commentsAccepted')}` viewers=`{tiktok_live_diag.get('viewerCount')}`",
         f"- tiktok_live_last_error_code: `{tiktok_live_diag.get('lastErrorCode')}` memory_default=`{tiktok_live_diag.get('memoryDefault')}`",
+        f"- tiktok_live_memory_enabled: `{'yes' if BNL_TIKTOK_LIVE_MEMORY_ENABLED else 'no'}` placement=`above_community_canon`",
+        f"- tiktok_live_memory_last_ingested: `{int(_tiktok_live_memory_runtime.get('last_ingested') or 0)}` total_since_start=`{int(_tiktok_live_memory_runtime.get('total_ingested') or 0)}` reason=`{_tiktok_live_memory_runtime.get('last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('last_error_type') or 'none'}`",
+        f"- tiktok_live_identity_policy: `handle_display_correlated_v1` owner_handle_configured=`{'yes' if bool(BNL_TIKTOK_OWNER_HANDLES) else 'no'}`",
         f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap_today=`{ambient_cap_today}` normal_cap=`{AMBIENT_DAILY_POST_CAP}` high_activity_cap=`2` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
         f"- ambient_posts_today: `{ambient_posts_today}`",
         f"- ambient_capacity_actual_posts_today: `{ambient_capacity['actualPosts']}`",

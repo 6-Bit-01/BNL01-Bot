@@ -23,6 +23,7 @@ Environment=BNL_TIKTOK_WINDOW_START=18:50
 Environment=BNL_TIKTOK_WINDOW_END=02:00
 Environment=BNL_TIKTOK_RETRY_SECONDS=20
 Environment=BNL_TIKTOK_LIVE_CONTEXT_PATH=/run/bnl-tiktok-chat-shadow/live-context.json
+Environment=BNL_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH=/run/bnl-tiktok-chat-shadow/public-conversation.ndjson
 Environment=BNL_TIKTOK_TMUX_SESSION=tiktok-chat-shadow
 Environment=BNL_TIKTOK_TMUX_SOCKET=/run/bnl-tiktok-chat-shadow/tmux.sock
 ExecStart=/home/ubuntu/bnl01/scripts/tiktok_live_chat_shadow_service.sh
