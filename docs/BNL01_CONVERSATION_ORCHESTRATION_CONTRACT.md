@@ -26,9 +26,11 @@ that an upstream stage already discarded.
 | Generation and delivery | A natural BNL response from the coordinated packet, followed by a successful send | Retroactively changing the coordinator's route or evidence |
 
 Route, safety, visibility, and third-party-only boundaries remain higher
-authority than an ordinary response obligation. Relationship evidence may
-shape tone after a response is authorized, but it cannot silence or force the
-turn.
+authority than the content of an ordinary response. Once the coordinator has
+authorized an answer, those boundaries may reject, repair, or replace unsafe
+prose with a source-neutral reply; they do not cancel the response act.
+Relationship evidence may shape tone after a response is authorized, but it
+cannot silence or force the turn.
 
 ## Authoritative turn order
 
@@ -47,7 +49,10 @@ turn.
    once. No answer-intent latch survives the rebuild.
 8. Generate from the already selected packet. Do not rerun or reinterpret
    context selection inside the generator.
-9. Deliver the response.
+9. Apply response guards to the draft. A failed repair rejects that draft, not
+   the authorized response act: recover a grounded cleaned candidate or a
+   source-neutral reply, then deliver it. Only a newer packet revision or an
+   earlier route/safety block may stop this send.
 10. Only after successful delivery, commit any explicit BNL self-name decision
     through the existing Memory Ledger and consume any repair/retransmission
     state.
@@ -191,8 +196,9 @@ does not widen scope. Nearby non-target contributions remain typed,
 source-linked revalidation evidence for drift detection, but they are not
 rendered into the generation prompt. If a draft positively switches to or
 mixes in one of those competing sources, the shared response guard may perform
-one regeneration using only the exact target; a second proven switch is
-suppressed before delivery.
+one regeneration using only the exact target. A second proven switch rejects
+that candidate before delivery and recovers the response obligation without
+using the competing source; it does not silently drop the turn.
 
 ## Moment boundary
 
@@ -243,7 +249,8 @@ current payload precedence, contribution type, ambiguity, cross-room
 exclusion, long-source budget priority, Moment state, third-party-only turns,
 route blocks, interruption rebuilds, and event-loop offloading. Exact-reply
 coverage must exercise the complete handler path through prompt construction,
-generation, guard regeneration or suppression, and final send.
+generation, guard regeneration or candidate rejection, obligated-response
+recovery, and final send.
 
 Response influence has one dedicated fail-closed gate:
 `BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED`. It defaults off and is not

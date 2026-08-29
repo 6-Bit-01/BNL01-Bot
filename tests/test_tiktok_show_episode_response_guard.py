@@ -115,6 +115,116 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
             "",
         )
 
+    def test_lore_sentence_removal_preserves_grounded_episode_answer(self):
+        response = (
+            "The retained timeline starts with Neon Fox's First Signal. "
+            "Cliff checked the studio cables during the track. "
+            "The Wheel then confirmed Second Artist's Queue Light, and Alex "
+            "asked BNL about that move."
+        )
+        sanitized = bnl01_bot.remove_unsupported_show_lore_sentences(
+            response,
+            RAW_PROMPT,
+        )
+        self.assertNotIn("Cliff", sanitized)
+        self.assertIn("Neon Fox's First Signal", sanitized)
+        self.assertIn("Second Artist's Queue Light", sanitized)
+        self.assertEqual(
+            bnl01_bot.tiktok_show_episode_response_failure(
+                sanitized,
+                RAW_PROMPT,
+            ),
+            "",
+        )
+
+    def test_lore_sentence_removal_fails_closed_when_nothing_grounded_remains(self):
+        response = "Cliff and the Studio Rats handled everything backstage."
+        self.assertEqual(
+            bnl01_bot.remove_unsupported_show_lore_sentences(
+                response,
+                RAW_PROMPT,
+            ),
+            "",
+        )
+
+    def test_response_obligation_recovery_sends_cleaned_show_answer(self):
+        diagnostics = {
+            "suppressed": True,
+            "suppression_reason": "tiktok_show_episode_after_retry",
+        }
+        recovered = bnl01_bot.recover_guarded_response_obligation(
+            "",
+            baseline_response=(
+                "The timeline starts with Neon Fox's First Signal. "
+                "Sheila handled an interruption off camera. The Wheel then "
+                "confirmed Second Artist's Queue Light, and Alex asked BNL "
+                "about that move in Discord."
+            ),
+            prompt=RAW_PROMPT,
+            current_user_text=(
+                "What else happened during yesterday's show? Give me a timeline."
+            ),
+            diagnostics=diagnostics,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="public_home",
+            source_context_available=True,
+        )
+        self.assertNotIn("Sheila", recovered)
+        self.assertIn("First Signal", recovered)
+        self.assertIn("Queue Light", recovered)
+        self.assertFalse(diagnostics["suppressed"])
+        self.assertTrue(diagnostics["response_obligation_recovered"])
+        self.assertEqual(
+            diagnostics["response_obligation_recovery_kind"],
+            "grounded_show_candidate",
+        )
+
+    def test_response_obligation_recovery_renders_evidence_when_draft_is_unusable(self):
+        diagnostics = {
+            "suppressed": True,
+            "suppression_reason": "tiktok_show_episode_after_retry",
+        }
+        recovered = bnl01_bot.recover_guarded_response_obligation(
+            "",
+            baseline_response=(
+                "Cliff and the Studio Rats handled everything backstage."
+            ),
+            prompt=RAW_PROMPT,
+            current_user_text="Give me the show timeline.",
+            diagnostics=diagnostics,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="public_home",
+            source_context_available=True,
+        )
+        self.assertIn("verified show record", recovered)
+        self.assertIn("t+1.2m", recovered)
+        self.assertIn("t+4.5m", recovered)
+        self.assertNotIn("Cliff", recovered)
+        self.assertEqual(
+            diagnostics["response_obligation_recovery_kind"],
+            "grounded_show_evidence",
+        )
+
+    def test_source_guard_recovery_returns_nonempty_source_neutral_reply(self):
+        diagnostics = {
+            "suppressed": True,
+            "suppression_reason": "source_grounding_after_retry",
+        }
+        recovered = bnl01_bot.recover_guarded_response_obligation(
+            "",
+            baseline_response="I checked the private archive and confirmed it.",
+            prompt="Current user request: What happened?",
+            current_user_text="What happened?",
+            diagnostics=diagnostics,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="public_home",
+            source_context_available=False,
+        )
+        self.assertTrue(recovered)
+        self.assertNotIn("private archive", recovered)
+        self.assertTrue(diagnostics["source_neutral_recovery"])
+        self.assertFalse(diagnostics["suppressed"])
+
     def test_packet_evidence_uses_the_same_guard(self):
         self.assertEqual(
             bnl01_bot.tiktok_show_episode_response_failure(

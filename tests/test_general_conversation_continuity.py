@@ -446,6 +446,22 @@ class GeneralConversationContinuityGuardTests(unittest.IsolatedAsyncioTestCase):
         )
         provider.assert_awaited_once()
 
+        recovered = bnl01_bot.recover_guarded_response_obligation(
+            response,
+            baseline_response=(
+                "Scenario parameters updated. Continuation input logged."
+            ),
+            prompt=CONTINUITY_PROMPT,
+            current_user_text="Keep going.",
+            diagnostics=diagnostics,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="sealed_test",
+            source_context_available=True,
+        )
+        self.assertTrue(recovered)
+        self.assertNotIn("parameters updated", recovered.lower())
+        self.assertFalse(diagnostics["suppressed"])
+
     async def test_substantive_technical_and_mechanical_answers_pass_unchanged(self):
         candidates = (
             "Those retry parameters are wrong. Set retries to three and run it again.",

@@ -363,7 +363,7 @@ class MediaGroundingRepairTests(unittest.IsolatedAsyncioTestCase):
             ["free_speak_media_generation", "media_response_grounding_repair", "media_grounding_strict_regeneration"],
         )
 
-    async def test_current_media_repair_and_strict_regeneration_failure_suppresses_response(self):
+    async def test_current_media_repair_and_strict_regeneration_failure_returns_safe_reply(self):
         prompt = (
             "Current channel policy: sealed_test\n"
             "Current user request: [Current message media context:\n- gif embed (title=confused office)\n]\n"
@@ -384,7 +384,9 @@ class MediaGroundingRepairTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
             text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
 
-        self.assertEqual(text, "")
+        self.assertTrue(text)
+        self.assertIn("couldn’t ground a reliable answer", text)
+        self.assertNotIn("weekly deployments", text)
         self.assertEqual(
             [call.args[1] for call in generate.await_args_list],
             ["free_speak_media_generation", "media_response_grounding_repair", "media_grounding_strict_regeneration"],
@@ -679,7 +681,7 @@ class ConversationContinuityRegenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotRegex(text.lower(), r"archives?|point me at|reliable record")
         self.assertEqual([call.args[1] for call in generate.await_args_list], ["normal_chat", "conversation_grounding_regeneration"])
 
-    async def test_failed_grounded_retry_suppresses_instead_of_emitting_stock_meta_answer(self):
+    async def test_failed_grounded_retry_returns_source_neutral_reply(self):
         responses = [
             gemini_response("The Network archives yielded no results for the tag.", 9),
             gemini_response("I do have relevant recent conversation; point me at the specific bit.", 8),
@@ -695,7 +697,9 @@ class ConversationContinuityRegenerationTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
             text = await bnl01_bot.get_gemini_response(self.prompt(), 101, 1, route="normal_chat")
 
-        self.assertEqual("", text)
+        self.assertTrue(text)
+        self.assertIn("can’t verify that from the current evidence", text)
+        self.assertNotRegex(text.lower(), r"archives?|point me at|reliable record")
 
 
 class ConversationContinuityRepairSafetyTests(unittest.TestCase):
