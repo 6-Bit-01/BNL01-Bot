@@ -1353,6 +1353,20 @@ class LeakGuardTests(unittest.TestCase):
 
     def test_repair_detection_is_intent_not_a_canned_response(self):
         self.assertTrue(bnl01_bot.is_conversational_repair_intent("that's not what I asked"))
+        exact_failure_repair = (
+            "BNL WE TALKED ABOUT THIS, THIS WAS SUPPOSED TO BE YOUR FUCKING MOMENT"
+        )
+        self.assertTrue(
+            bnl01_bot.is_conversational_repair_intent(exact_failure_repair)
+        )
+        repair_prompt = bnl01_bot._format_batched_prompt(
+            [("6 Bit", exact_failure_repair)],
+            "steady_reply",
+            "Keep it direct.",
+        )
+        self.assertIn("Never blame the user", repair_prompt)
+        self.assertIn("do not literalize words such as 'moment'", repair_prompt)
+        self.assertIn("make the corrected attempt now", repair_prompt)
         self.assertFalse(bnl01_bot.is_conversational_repair_intent("you missed—what should we deploy now?"))
         self.assertEqual(bnl01_bot.try_repair_response("that's not what I asked"), "")
 

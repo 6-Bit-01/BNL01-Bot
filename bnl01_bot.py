@@ -32,9 +32,13 @@ from bnl_canon_source_contract import (
 from bnl_tiktok_live_context import (
     DEFAULT_CONTEXT_PATH as DEFAULT_TIKTOK_LIVE_CONTEXT_PATH,
     DEFAULT_MAX_AGE_SECONDS as DEFAULT_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
+    build_durable_show_prompt_context,
     build_live_prompt_context,
     is_live_show_reaction_query,
+    is_tiktok_show_analysis_query,
     live_context_diagnostics,
+    select_show_for_tiktok_analysis,
+    show_timeline_bounds_ms,
 )
 from bnl_tiktok_live_memory import (
     DEFAULT_ARCHIVE_SPOOL_PATH as DEFAULT_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH,
@@ -2366,6 +2370,8 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
         return True
     if is_live_show_reaction_query(normalized):
         return True
+    if is_tiktok_show_analysis_query(normalized):
+        return True
 
     explicit_site_patterns = [
         r"\b(read model|website read model|public read model)\b",
@@ -2610,6 +2616,89 @@ def _queue_request_focus_lines(focus: dict, queue_url: str) -> list:
     return lines
 
 
+def _load_durable_tiktok_show_events(
+    archive: Any,
+    user_text: str,
+    *,
+    guild_id: int | None = None,
+    limit: int = 20_000,
+) -> list[dict[str, Any]] | None:
+    """Read public TikTok conversation evidence for one selected show window."""
+
+    show, _source_key = select_show_for_tiktok_analysis(archive, user_text)
+    start_ms, end_ms = show_timeline_bounds_ms(show)
+    selected_guild_id = int(
+        BNL_PRIMARY_GUILD_ID if guild_id is None else guild_id
+    )
+    if (
+        start_ms is None
+        or end_ms is None
+        or end_ms < start_ms
+        or selected_guild_id <= 0
+        or DB_FILE == ":memory:"
+        or not os.path.exists(DB_FILE)
+    ):
+        return None
+    safe_limit = max(1, min(50_000, int(limit or 20_000)))
+    try:
+        with sqlite3.connect(
+            "file:%s?mode=ro" % DB_FILE,
+            uri=True,
+            timeout=0.2,
+        ) as conn:
+            rows = conn.execute(
+                """
+                SELECT occurred_at_ms, subject_ref, private_display_name,
+                       raw_text, metadata_json
+                FROM bnl_journal_source_events
+                WHERE guild_id=?
+                  AND source_kind='tiktok_live_chat'
+                  AND public_usable=1
+                  AND occurred_at_ms>=?
+                  AND occurred_at_ms<=?
+                ORDER BY occurred_at_ms, event_seq
+                LIMIT ?
+                """,
+                (
+                    selected_guild_id,
+                    int(start_ms),
+                    int(end_ms),
+                    safe_limit,
+                ),
+            ).fetchall()
+    except (OSError, sqlite3.DatabaseError, ValueError, TypeError) as exc:
+        logging.warning(
+            "tiktok_show_analysis_archive_read_failed error=%s",
+            type(exc).__name__,
+        )
+        return None
+
+    events = []
+    for occurred_at_ms, subject_ref, display_name, raw_text, metadata_json in rows:
+        try:
+            metadata = json.loads(metadata_json or "{}")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        events.append(
+            {
+                "occurred_at_ms": int(occurred_at_ms or 0),
+                "subject_ref": str(subject_ref or "")[:160],
+                "private_display_name": str(display_name or "")[:120],
+                "raw_text": str(raw_text or "")[:1000],
+                "metadata": metadata,
+            }
+        )
+    logging.info(
+        "tiktok_show_analysis_archive_loaded guild_id=%s show_date=%s events=%s",
+        selected_guild_id,
+        str(show.get("showDate") or "")[:40],
+        len(events),
+    )
+    return events
+
+
 def build_bnl_read_model_context(read_model: dict, user_text: str, channel_policy: str) -> str:
     """Build a compact prompt block from the channel-authorized read model."""
 
@@ -2623,15 +2712,17 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         return ""
 
     queue = _first_mapping(sections.get("queue"), read_model.get("queue"))
+    archive = _first_mapping(sections.get("archive"), read_model.get("archive"))
     artists_section = sections.get("artists") if sections.get("artists") is not None else read_model.get("artists")
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
     source_context_items = _public_source_context_items(read_model)
     queue_query = _queue_read_model_query(user_text)
     live_reaction_query = is_live_show_reaction_query(user_text)
-    operational_query = queue_query or live_reaction_query
+    show_analysis_query = is_tiktok_show_analysis_query(user_text)
+    operational_query = queue_query or live_reaction_query or show_analysis_query
     queue_focus = _queue_query_focus(user_text) if operational_query else {}
-    if live_reaction_query:
+    if live_reaction_query or show_analysis_query:
         queue_focus["show_reaction"] = True
 
     # A private website response still contains independently public-safe site
@@ -2839,23 +2930,37 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                 lines.append("\nRelevant recent queue events:")
                 lines.extend(f"- {line}" for line in event_lines)
 
-    if live_reaction_query:
+    if live_reaction_query or show_analysis_query:
         if access_scope in {"public", "private"}:
-            lines.append(
-                "\n"
-                + build_live_prompt_context(
-                    BNL_TIKTOK_LIVE_CONTEXT_PATH,
-                    enabled=BNL_TIKTOK_LIVE_CONTEXT_ENABLED,
-                    max_age_seconds=BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
-                    declared_owner_handles=BNL_TIKTOK_OWNER_HANDLES,
+            if show_analysis_query:
+                durable_events = _load_durable_tiktok_show_events(
+                    archive,
+                    user_text,
                 )
-            )
+                lines.append(
+                    "\n"
+                    + build_durable_show_prompt_context(
+                        archive,
+                        durable_events,
+                        user_text,
+                    )
+                )
+            else:
+                lines.append(
+                    "\n"
+                    + build_live_prompt_context(
+                        BNL_TIKTOK_LIVE_CONTEXT_PATH,
+                        enabled=BNL_TIKTOK_LIVE_CONTEXT_ENABLED,
+                        max_age_seconds=BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
+                        declared_owner_handles=BNL_TIKTOK_OWNER_HANDLES,
+                    )
+                )
         else:
             lines.extend(
                 [
-                    "\nCurrent TikTok LIVE reaction context:",
-                    "- Availability: unavailable because the current queue session does not authorize live-show context in this channel.",
-                    "- Do not invent current TikTok comments, engagement, audience reactions, or queue state.",
+                    "\nTikTok show reaction context:",
+                    "- Availability: unavailable because the queue/show session does not authorize live-show context in this channel.",
+                    "- Do not invent current or historical TikTok comments, engagement, audience reactions, or queue state.",
                 ]
             )
 
@@ -2974,12 +3079,16 @@ def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> s
         return ""
     queue_query = _queue_read_model_query(user_text)
     live_reaction_query = is_live_show_reaction_query(user_text)
-    read_model = fetch_bnl_read_model(force=queue_query or live_reaction_query)
+    show_analysis_query = is_tiktok_show_analysis_query(user_text)
+    read_model = fetch_bnl_read_model(
+        force=queue_query or live_reaction_query or show_analysis_query
+    )
     if not read_model:
         return ""
     if (
         _current_queue_state_query(user_text)
         and not live_reaction_query
+        and not show_analysis_query
         and not queue_usability(
             read_model,
             allow_private=_channel_allows_private_bnl_queue(channel_policy),
@@ -3003,12 +3112,16 @@ def public_tiktok_interaction_memory_allowed(
     context = str(website_read_model_context or "")
     return bool(
         (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES
-        and is_live_show_reaction_query(user_text)
+        and (
+            is_live_show_reaction_query(user_text)
+            or is_tiktok_show_analysis_query(user_text)
+        )
         and "Website public read model context:" in context
         and "accessScope=public" in context
         and (
             "Current TikTok LIVE reaction context:" in context
             or "Current TikTok LIVE public reaction context:" in context
+            or "Durable TikTok show analysis context:" in context
         )
     )
 
@@ -9788,6 +9901,14 @@ NORMAL_CHAT_CORRECTION_RULE = (
 )
 
 
+NORMAL_CHAT_REPAIR_ACCOUNTABILITY_RULE = (
+    "If BNL's prior reply missed available context, own that miss briefly and make the corrected attempt now. "
+    "Never blame the user, their wording, timing, settings, output parameters, or failure to configure BNL. "
+    "Read obvious idioms and emotional emphasis by conversational meaning; do not literalize words such as "
+    "'moment' to evade the correction or turn the reply into a technical lecture."
+)
+
+
 _CONTEXTUAL_FOLLOWTHROUGH_CUES_RE = re.compile(
     r"\b(?:continue|keep going|pick (?:it|that|this) back up|pick up where|"
     r"where we left off|what happens next|then what|finish (?:it|that|this)|"
@@ -16118,8 +16239,14 @@ def is_conversational_repair_intent(user_text: str) -> bool:
         "you missed my point",
         "you're not listening",
         "youre not listening",
+        "we talked about this",
+        "we already talked about this",
+        "this was supposed to be your moment",
+        "that was supposed to be your moment",
     )
     if any(p in t for p in hard_dissatisfaction):
+        return True
+    if re.search(r"\b(?:this|that) was supposed to be your(?: [a-z]+){0,3} moment\b", t):
         return True
 
     # Soft dissatisfaction should not hijack clear follow-up questions.
@@ -33276,7 +33403,12 @@ def _get_recent_same_user_message_for_previous_request(
         if current_message_id and int(event.get("message_id") or 0) == int(current_message_id or 0):
             continue
         text = (event.get("text_for_context") or event.get("text_summary") or "").strip()
-        if not text or _is_previous_message_request(text) or _is_low_signal_conversation_fragment(text):
+        if (
+            not text
+            or _is_previous_message_request(text)
+            or is_conversational_repair_intent(text)
+            or _is_low_signal_conversation_fragment(text)
+        ):
             continue
         logging.info(
             "previous_message_resolved source=recent_room_event guild_id=%s channel_id=%s user_id=%s message_id=%s",
@@ -33623,6 +33755,8 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     repair_turn_rule = (
         "- This is a correction turn. Use the visible prior exchange and make the corrected attempt now; do not ask the user to repeat or restate the request. "
         + NORMAL_CHAT_CORRECTION_RULE
+        + " "
+        + NORMAL_CHAT_REPAIR_ACCOUNTABILITY_RULE
         + "\n"
         if is_conversational_repair_intent(combined_user_text)
         else ""
@@ -36695,7 +36829,8 @@ def build_user_aware_prompt(
         prompt_contract += (
             "Correction-turn contract: use the visible prior exchange and make the corrected attempt now. "
             "Do not ask the user to repeat, restate, or specify the exact output again. "
-            f"{NORMAL_CHAT_CORRECTION_RULE}\n"
+            f"{NORMAL_CHAT_CORRECTION_RULE} "
+            f"{NORMAL_CHAT_REPAIR_ACCOUNTABILITY_RULE}\n"
         )
     current_turn_prompt_block = f"{current_turn_context}\n" if (current_turn_context or "").strip() else ""
     unified_moment_canary_prompt_block = (
@@ -41230,6 +41365,7 @@ async def on_message(message: discord.Message):
     )
     media_context = build_message_media_context(message)
     conversation_content = append_media_context_to_text(clean_content, media_context)
+    durable_conversation_content = conversation_content
     logging.info(
         "media_context_route media_present=%s media_context_included=%s media_item_count=%s conversation_surface=%s channel_policy=%s",
         int(media_context.get("present", False)),
@@ -41252,8 +41388,13 @@ async def on_message(message: discord.Message):
             response_state="observed" if media_context.get("present") else "ignored",
         )
 
+    previous_message_request = _is_previous_message_request(clean_content)
+    repair_context_request = is_conversational_repair_intent(clean_content)
     if (
         _is_previous_message_request(clean_content)
+        and not orchestration_influences
+    ) or (
+        repair_context_request
         and not orchestration_influences
     ):
         previous = _get_recent_same_user_message_for_previous_request(
@@ -41265,9 +41406,14 @@ async def on_message(message: discord.Message):
         )
         if previous:
             previous_text = previous.get("text", "")
+            context_label = (
+                "Previous same-user request to repair now (transient room context):"
+                if repair_context_request
+                else "Previous same-user message to answer now (transient room context):"
+            )
             clean_content = (
                 f"{clean_content}\n\n"
-                "Previous same-user message to answer now (transient room context):\n"
+                f"{context_label}\n"
                 f"{previous_text}"
             ).strip()
             conversation_content = append_media_context_to_text(clean_content, media_context)
@@ -41278,7 +41424,7 @@ async def on_message(message: discord.Message):
                 message.author.id,
                 previous.get("source", "unknown"),
             )
-        elif real_direct_target or free_speak_surface:
+        elif previous_message_request and (real_direct_target or free_speak_surface):
             _mark_awaiting_retransmission(message.guild.id, message.channel.id, message.author.id)
             reply = "I can’t safely resolve the prior message from here. Send it again and I’ll answer that payload directly."
             await message.reply(reply)
@@ -41928,7 +42074,7 @@ async def on_message(message: discord.Message):
             active_direct_session=active_same_user_session,
             conversation_surface=conversation_surface,
         )
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
 
         if await _maybe_start_deferred_payload_session(
             message,
@@ -42548,7 +42694,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
 
         self_reflection = (
             ""
@@ -43038,7 +43184,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
 
         self_reflection = (
             ""
