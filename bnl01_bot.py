@@ -29,6 +29,13 @@ from bnl_canon_source_contract import (
     strip_queue_sections,
     website_queue_access_scope,
 )
+from bnl_tiktok_live_context import (
+    DEFAULT_CONTEXT_PATH as DEFAULT_TIKTOK_LIVE_CONTEXT_PATH,
+    DEFAULT_MAX_AGE_SECONDS as DEFAULT_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
+    build_live_prompt_context,
+    is_live_show_reaction_query,
+    live_context_diagnostics,
+)
 from bnl_occasion import (
     OCCASION_CALENDAR_VERSION,
     OCCASION_CHANNEL_RETRY_MINUTES,
@@ -471,6 +478,32 @@ BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 BNL_READ_MODEL_URL = os.getenv("BNL_READ_MODEL_URL", "").strip()
 BNL_READ_MODEL_ENABLED = os.getenv("BNL_READ_MODEL_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_QUEUE_PRODUCTION_ENABLED = os.getenv("BNL_QUEUE_PRODUCTION_ENABLED", "").strip().lower() == "true"
+BNL_TIKTOK_LIVE_CONTEXT_ENABLED = os.getenv(
+    "BNL_TIKTOK_LIVE_CONTEXT_ENABLED",
+    "",
+).strip().lower() == "true"
+BNL_TIKTOK_LIVE_CONTEXT_PATH = os.getenv(
+    "BNL_TIKTOK_LIVE_CONTEXT_PATH",
+    DEFAULT_TIKTOK_LIVE_CONTEXT_PATH,
+).strip() or DEFAULT_TIKTOK_LIVE_CONTEXT_PATH
+try:
+    BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS = min(
+        60.0,
+        max(
+            10.0,
+            float(
+                os.getenv(
+                    "BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS",
+                    str(DEFAULT_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS),
+                )
+                or DEFAULT_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS
+            ),
+        ),
+    )
+except (TypeError, ValueError):
+    BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS = (
+        DEFAULT_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS
+    )
 
 BNL_WEBSITE_CONTRACT_VERSION = effective_contract_version(os.getenv("BNL_WEBSITE_CONTRACT_VERSION", "2"))
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
@@ -2281,6 +2314,8 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
         return False
     if _queue_read_model_query(normalized):
         return True
+    if is_live_show_reaction_query(normalized):
+        return True
 
     explicit_site_patterns = [
         r"\b(read model|website read model|public read model)\b",
@@ -2503,6 +2538,8 @@ def _queue_request_focus_lines(focus: dict, queue_url: str) -> list:
         lines.append("- Position request: report the matched track's current queuePosition and only the useful immediate context.")
     if focus.get("wheel"):
         lines.append("- Wheel request: use the current Wheel state and the latest confirmed winner; do not treat an unconfirmed result as a winner.")
+    if focus.get("show_reaction"):
+        lines.append("- Live-reaction request: use the queue snapshot as authoritative show state, then describe only the bounded TikTok reaction evidence supplied below.")
     return lines
 
 
@@ -2524,7 +2561,11 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
     source_context_items = _public_source_context_items(read_model)
     queue_query = _queue_read_model_query(user_text)
-    queue_focus = _queue_query_focus(user_text) if queue_query else {}
+    live_reaction_query = is_live_show_reaction_query(user_text)
+    operational_query = queue_query or live_reaction_query
+    queue_focus = _queue_query_focus(user_text) if operational_query else {}
+    if live_reaction_query:
+        queue_focus["show_reaction"] = True
 
     # A private website response still contains independently public-safe site
     # context. Once its queue/history sections have been stripped for a public
@@ -2550,7 +2591,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     include_public_site_canon = bool(
         source_context_items
         and (
-            not queue_query
+            not operational_query
             or not queue
             or re.search(r"\b(?:site|website|dossier)\b", user_text or "", re.IGNORECASE)
         )
@@ -2578,7 +2619,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         playback_timing = _first_mapping(queue.get("playbackTiming"))
         recent_events = _first_list(queue.get("recentEvents"))
         lines.append("\nQueue:")
-        if queue_query:
+        if operational_query:
             lines.extend(_queue_request_focus_lines(queue_focus, queue_url))
         session_bits = []
         session_field_specs = (
@@ -2618,7 +2659,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             lines.append(f"- Up next: {next_label}")
         else:
             lines.append("- Up next: none")
-        if queue_focus.get("now_playing") and playback_timing:
+        if (queue_focus.get("now_playing") or queue_focus.get("show_reaction")) and playback_timing:
             playback_bits = []
             for label, key in (
                 ("state", "playbackState"),
@@ -2675,7 +2716,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             queued_tracks,
             user_text,
             queue_focus,
-        ) if queue_query else queued_tracks[:8]
+        ) if queue_query else ([] if live_reaction_query else queued_tracks[:8])
         if selected_queued_tracks:
             lines.append("\nRelevant queued tracks:")
             for track in selected_queued_tracks:
@@ -2711,7 +2752,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                 label = _track_label(track, include_lane=True)
                 if label:
                     lines.append(f"- {label}")
-        if queue_focus.get("wheel") or queue_focus.get("movement"):
+        if queue_focus.get("wheel") or queue_focus.get("movement") or queue_focus.get("show_reaction"):
             event_source = (
                 _first_list(wheel.get("recentEvents"))
                 if queue_focus.get("wheel") and wheel
@@ -2727,9 +2768,28 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                 lines.append("\nRelevant recent queue events:")
                 lines.extend(f"- {line}" for line in event_lines)
 
+    if live_reaction_query:
+        if access_scope in {"public", "private"}:
+            lines.append(
+                "\n"
+                + build_live_prompt_context(
+                    BNL_TIKTOK_LIVE_CONTEXT_PATH,
+                    enabled=BNL_TIKTOK_LIVE_CONTEXT_ENABLED,
+                    max_age_seconds=BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
+                )
+            )
+        else:
+            lines.extend(
+                [
+                    "\nCurrent TikTok LIVE reaction context:",
+                    "- Availability: unavailable because the current queue session does not authorize live-show context in this channel.",
+                    "- Do not invent current TikTok comments, engagement, audience reactions, or queue state.",
+                ]
+            )
+
     artists_section_map = artists_section if isinstance(artists_section, dict) else {}
     artists = _first_list(artists_section_map.get("items"), artists_section_map.get("artists"), artists_section if isinstance(artists_section, list) else [])
-    if artists and not queue_query:
+    if artists and not operational_query:
         lines.append("\nArtists:")
         for artist in artists[:8]:
             if not isinstance(artist, dict):
@@ -2770,7 +2830,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             text = _format_public_dossier_item(dossier, include_boundaries=True)
             if text:
                 lines.append(f"- {text}")
-    elif dossier_items and not dossier_question and not queue_query:
+    elif dossier_items and not dossier_question and not operational_query:
         lines.append("\nPublic dossiers:")
         for dossier in dossier_items[:4]:
             text = _format_public_dossier_item(dossier, include_boundaries=False)
@@ -2779,7 +2839,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
 
     rules_section_map = rules_section if isinstance(rules_section, dict) else {}
     read_model_rules = _first_list(rules_section_map.get("items"), rules_section_map.get("rules"), rules_section if isinstance(rules_section, list) else [])
-    if not queue_query:
+    if not operational_query:
         lines.append("\nRead-model rules:")
         for rule in read_model_rules[:5]:
             rule_text = _compact_public_text(rule, 160)
@@ -2787,7 +2847,7 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                 lines.append(f"- {rule_text}")
     operator_lanes = _website_operator_lanes(read_model)
     lane_rules = _format_operator_lane_items(operator_lanes.get("doNotStore", []), limit=5) if operator_lanes else []
-    if lane_rules and not queue_query:
+    if lane_rules and not operational_query:
         lines.append("\nSite lane rules:")
         for rule in lane_rules[:5]:
             lines.append(f"- {rule}")
@@ -2833,11 +2893,13 @@ def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> s
     if not is_bnl_read_model_relevant(user_text, channel_policy):
         return ""
     queue_query = _queue_read_model_query(user_text)
-    read_model = fetch_bnl_read_model(force=queue_query)
+    live_reaction_query = is_live_show_reaction_query(user_text)
+    read_model = fetch_bnl_read_model(force=queue_query or live_reaction_query)
     if not read_model:
         return ""
     if (
         _current_queue_state_query(user_text)
+        and not live_reaction_query
         and not queue_usability(
             read_model,
             allow_private=_channel_allows_private_bnl_queue(channel_policy),
@@ -2899,6 +2961,16 @@ def get_bnl_read_model_diagnostic_state() -> dict:
         "rd_classifier_enabled": True,
         "canon_source_contract": canon_diag,
     }
+
+
+def get_tiktok_live_context_diagnostic_state() -> dict:
+    """Return content-free health for the volatile TikTok situation bridge."""
+
+    return live_context_diagnostics(
+        BNL_TIKTOK_LIVE_CONTEXT_PATH,
+        enabled=BNL_TIKTOK_LIVE_CONTEXT_ENABLED,
+        max_age_seconds=BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
+    )
 
 
 def _website_read_model_queue(read_model: dict) -> dict:
@@ -33934,10 +34006,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             if batch_website_read_model_context:
                 prompt += (
-                    "\n\nAuthoritative current website queue context for this "
+                    "\n\nAuthoritative current live-show context for this "
                     "request:\n"
                     + batch_website_read_model_context
                     + "\nAnswer current queue questions directly from this context. "
+                    "Answer TikTok-reaction questions from the authorized live-show context when present. "
                     "Answer only what was asked; if the context marks a full-lineup "
                     "request, send the queue-page link instead of listing every track. "
                     "Do not replace the current readout with the normal Friday "
@@ -44754,6 +44827,7 @@ async def bnl_status(interaction: discord.Interaction):
     flags_source_state = "available" if _bnl_control_flags_last_source_url else "not yet fetched"
     website_bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
     read_model_diag = get_bnl_read_model_diagnostic_state()
+    tiktok_live_diag = get_tiktok_live_context_diagnostic_state()
     dossier_diag = build_dossier_recommendation_diagnostics(guild.id)
     broadcast_channel = guild.get_channel(BNL_BROADCAST_MEMORY_CHANNEL_ID) if BNL_BROADCAST_MEMORY_CHANNEL_ID else None
     broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
@@ -44778,6 +44852,11 @@ async def bnl_status(interaction: discord.Interaction):
         f"- queue_production_local_capability: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('localQueueProductionCapability') else 'no'}`",
         f"- queue_production_website_capability: `{(read_model_diag.get('canon_source_contract') or {}).get('websiteQueueProductionCapability')}`",
         f"- queue_effective_usable: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('effectiveQueueUsable') else 'no'}` reason=`{(read_model_diag.get('canon_source_contract') or {}).get('queueReason')}`",
+        f"- tiktok_live_context_enabled: `{'yes' if tiktok_live_diag.get('enabled') else 'no'}`",
+        f"- tiktok_live_snapshot_available: `{'yes' if tiktok_live_diag.get('snapshotAvailable') else 'no'}` reason=`{tiktok_live_diag.get('snapshotReason')}`",
+        f"- tiktok_live_snapshot_state: `{tiktok_live_diag.get('state')}` age_seconds=`{tiktok_live_diag.get('snapshotAgeSeconds') if tiktok_live_diag.get('snapshotAgeSeconds') is not None else 'none'}`",
+        f"- tiktok_live_events_buffered: `{tiktok_live_diag.get('events')}` comments_accepted=`{tiktok_live_diag.get('commentsAccepted')}` viewers=`{tiktok_live_diag.get('viewerCount')}`",
+        f"- tiktok_live_last_error_code: `{tiktok_live_diag.get('lastErrorCode')}` memory_default=`{tiktok_live_diag.get('memoryDefault')}`",
         f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap_today=`{ambient_cap_today}` normal_cap=`{AMBIENT_DAILY_POST_CAP}` high_activity_cap=`2` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
         f"- ambient_posts_today: `{ambient_posts_today}`",
         f"- ambient_capacity_actual_posts_today: `{ambient_capacity['actualPosts']}`",

@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from bnl_tiktok_live_chat import LiveChatAdapter, LiveChatBuffer  # noqa: E402
+from bnl_tiktok_live_context import LiveContextSnapshotWriter  # noqa: E402
 from scripts.tiktok_live_shadow_model import (
     DEFAULT_BUFFER_EVENTS,
     DEFAULT_DEDUPE_SECONDS,
@@ -83,6 +84,13 @@ async def run_window(args: argparse.Namespace) -> int:
         ),
         clear_on_live_end=False,
     )
+    context_writer = (
+        LiveContextSnapshotWriter(str(args.context_path))
+        if args.context_path is not None
+        else None
+    )
+    if context_writer is not None:
+        context_writer.publish(adapter, force=True)
     ended_rooms: Set[str] = set()
     cycle_count = 0
 
@@ -113,6 +121,7 @@ async def run_window(args: argparse.Namespace) -> int:
             ended_rooms,
             stop_event,
             window.end,
+            context_writer,
         )
         if result.stop_reason in {"window_closed", "stop_requested"}:
             break
@@ -156,6 +165,8 @@ async def run_window(args: argparse.Namespace) -> int:
         )
 
     health = adapter.health_snapshot()
+    if context_writer is not None:
+        context_writer.publish(adapter, force=True)
     print(flush=True)
     print(format_summary(health, cycle_count), flush=True)
     return 0
@@ -199,6 +210,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--transport-script",
         type=Path,
         default=REPO_ROOT / "scripts" / "tiktok_live_chat_transport.py",
+    )
+    parser.add_argument(
+        "--context-path",
+        type=Path,
+        default=None,
+        help="volatile JSON path exported for the separately gated BNL reader",
     )
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument(

@@ -110,6 +110,17 @@ Activation order is site first, bot second:
 
 Show-day copy follows the same boundary and accepts only public queue scope. A private test response cannot drive an intake, live, sponsor, recap, or public-current-state message. The 6:40 PM Pacific intake message names the native queue only when both production gates and public access are usable; otherwise it uses provider-neutral public-intake wording. The 7:00 PM message describes the scheduled broadcast window without claiming unverified live state, and the later sponsor message remains optional and host-controlled.
 
+Current-show TikTok awareness is a separate default-off read gate. The isolated
+collector may export a bounded snapshot only under the volatile systemd runtime
+directory. When `BNL_TIKTOK_LIVE_CONTEXT_ENABLED=true`, an explicit live-show or
+TikTok-reaction question can combine that snapshot with an authorized website
+queue read: the queue determines what is happening, while recent public TikTok
+comments and engagement describe reaction. Public Discord use requires public
+queue scope; private queue scope remains limited to the existing sealed/operator
+channels. The snapshot is never memory, Relay, Journal, Moments, Relationship,
+Source File, dossier, recap, canon, identity linkage, TikTok output, or queue
+control. Missing, stale, disconnected, or unauthorized context fails closed.
+
 Each scheduled show-day phase takes one atomic pre-generation claim with a unique worker token. A fresh claim blocks duplicate workers, while an active worker renews its six-minute lease once a minute through generation. After six minutes without a heartbeat the claim becomes recoverable, so a crash, restart, malformed timestamp, or material clock error cannot suppress the phase for the rest of its ten-minute delivery window. Immediately before the first Discord or website attempt, the worker atomically converts its token-owned claim into a durable `friday_show_updates` fence. That pre-publication fence prevents a restart after an accepted send from reclaiming and duplicating the phase. Fence persistence uses bounded retries and releases only before any external attempt, so a database outage cannot block the single scheduler loop. This deliberately favors at-most-once show-day copy: a process exit after the durable fence but before delivery can skip that one update, but cannot publish it twice.
 
 Holiday and occasion reflections extend the existing Ambient coordinator and

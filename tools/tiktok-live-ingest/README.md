@@ -1,4 +1,4 @@
-# TikTok LIVE public telemetry transport (shadow-only)
+# TikTok LIVE public telemetry transport and gated BNL context
 
 This directory documents the optional transport used by
 `scripts/tiktok_live_chat_transport.py`. It connects directly to TikTok's
@@ -11,7 +11,7 @@ This is **not** part of the main BNL Python environment. The production bot
 supports Python 3.9 and 3.12; `piratetok-live-py` requires Python 3.11 or newer.
 Keep the transport in its own virtual environment.
 
-The transport and weekly shadow supervisor:
+The transport and weekly supervisor:
 
 - read public comments, taps/likes, viewer snapshots, shares, follows, gifts,
   TikTok Q&A questions, joins, and stream lifecycle events;
@@ -25,6 +25,14 @@ The transport and weekly shadow supervisor:
 - do not write a database or durable transcript;
 - do not call Gemini, Discord, the website, Relay, Journal, Moments,
   Relationship, Source Files, dossiers, queue actions, or payment owners.
+
+The supervisor may additionally publish one bounded, atomically replaced JSON
+snapshot at `/run/bnl-tiktok-chat-shadow/live-context.json`. That file is
+volatile, mode `0600`, refreshed while the collector is healthy, and removed
+with the systemd runtime directory. The main bot cannot use it unless
+`BNL_TIKTOK_LIVE_CONTEXT_ENABLED=true`; even then, BNL loads it only for an
+explicit current-show or TikTok-reaction question whose website queue scope is
+authorized in that exact Discord channel.
 
 Every accepted event is hard-coded as:
 
@@ -113,8 +121,9 @@ that window it:
 - stops and destroys its terminal scrollback at 2:00 AM;
 - restarts the tmux terminal if the supervisor process crashes.
 
-Raw public observations remain only in a dedicated tmux terminal. Routine
-systemd logs contain scheduler health, not the transcript or telemetry stream.
+Raw public observations remain only in a dedicated tmux terminal and the
+bounded volatile runtime snapshot. Routine systemd logs contain scheduler
+health, not the transcript or telemetry stream. Neither surface is durable.
 
 After the unit files are installed and enabled, attach with:
 
@@ -132,9 +141,11 @@ systemctl status bnl-tiktok-chat-shadow.service --no-pager -l
 systemctl list-timers bnl-tiktok-chat-shadow.timer --no-pager
 ```
 
-The service/timer are a shadow reliability tool only. Enabling them does not
-authorize BNL to consume, answer, store, summarize, publish, or act on TikTok
-telemetry.
+The service/timer alone do not authorize BNL consumption. The separate bot
+gate and website queue access scope must both authorize a request. That
+authorization is read-only prompt context: it never permits TikTok output,
+queue mutation, memory, Relay, Journal, Moments, Relationship, Source Files,
+dossiers, recaps, canon, or identity linking.
 
 ## NDJSON contract
 
@@ -178,14 +189,15 @@ transport_error
 `transport_error` carries only a bounded error class/code. Raw exception text,
 URLs, cookies, and request headers are not emitted.
 
-## Current stop point
+## Current production boundary
 
 The direct connection has been observed receiving real public LIVE comments,
-moderator status, and the LIVE-end event. This phase expands the same shadow
-transport to additional public engagement telemetry so the next full show can
-validate availability, volume, timing, and replay behavior.
+moderator status, and the LIVE-end event. The volatile bridge makes recent
+comments/questions and bounded engagement counters available to `bnl01_bot.py`
+only for relevant live-show questions. The current website queue snapshot stays
+authoritative for what the show is doing; TikTok telemetry is reaction evidence
+only. BNL answers the requested fact without dumping a transcript or metrics.
 
-It still does not wire any TikTok event into `bnl01_bot.py`, Gemini, Discord
-output, durable memory, the queue, the website, or a public surface. Private BNL
-awareness and queue/track correlation remain separate implementation and
-activation gates.
+No event becomes durable memory or establishes a TikTok-to-Discord, submitter,
+artist, account, or real-identity connection. Deleting or disabling the runtime
+snapshot gate immediately returns BNL to queue-only awareness.
