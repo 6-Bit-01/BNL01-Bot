@@ -2142,6 +2142,12 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
 _PRIVATE_BNL_QUEUE_POLICIES = frozenset({"sealed_test", "internal_controlled"})
 
 _QUEUE_READ_MODEL_PATTERNS = (
+    r"\bwhat(?:['’]s| is|s) (?:the )?(?:link|url) (?:to|for) "
+    r"(?:the )?(?:current|now playing|playing|loaded|this) (?:track|song)\b",
+    r"\b(?:send|give|drop)(?: me)? (?:the )?(?:link|url) (?:to|for) "
+    r"(?:the )?(?:current|now playing|playing|loaded|this) (?:track|song)\b",
+    r"\b(?:current|now playing|playing|loaded) (?:track|song)(?:['’]s)? "
+    r"(?:link|url)\b",
     r"\bwho(?:['’]s| is) playing(?: (?:now|currently|right now))?\b",
     r"\bnow playing\b",
     r"\bwhat(?:['’]s| is) playing(?: (?:now|currently|right now))?\b",
@@ -2188,7 +2194,14 @@ def _queue_query_focus(text: str) -> dict:
     """Classify which slice of the complete queue snapshot this request needs."""
 
     normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
-    now_playing = bool(re.search(
+    track_link = bool(re.search(
+        r"\b(?:link|url) (?:to|for) (?:the )?"
+        r"(?:current|now playing|playing|loaded|this) (?:track|song)\b|"
+        r"\b(?:current|now playing|playing|loaded) "
+        r"(?:track|song)(?:['’]s)? (?:link|url)\b",
+        normalized,
+    ))
+    now_playing = track_link or bool(re.search(
         r"\b(?:now playing|whats playing|what(?:['’]s| is) playing|"
         r"what (?:song|track) is on|what (?:are we|am i) listening to|"
         r"what(?:['’]s| is|s) (?:currently )?(?:pulled|loaded) up|"
@@ -2234,6 +2247,7 @@ def _queue_query_focus(text: str) -> dict:
     ))
     return {
         "now_playing": now_playing,
+        "track_link": track_link,
         "up_next": up_next,
         "full_lineup": full_lineup,
         "wheel": wheel,
@@ -2448,6 +2462,7 @@ def _track_label(
     include_lane: bool = True,
     include_source: bool = False,
     include_queue_details: bool = False,
+    include_public_source_url: bool = False,
 ) -> str:
     if not isinstance(track, dict):
         return ""
@@ -2517,6 +2532,15 @@ def _track_label(
                     duration_label = f"est. {duration_label}"
         if duration_label:
             extras.append(f"duration={duration_label}")
+    if include_public_source_url:
+        source_url = _compact_public_text(track.get("publicSourceUrl"), 500)
+        parsed_source_url = urllib.parse.urlparse(source_url)
+        if (
+            source_url
+            and parsed_source_url.scheme in {"http", "https"}
+            and parsed_source_url.netloc
+        ):
+            extras.append(f"publicSourceUrl={source_url}")
     if label and extras:
         label = f"{label} ({', '.join(extras)})"
     return label
@@ -2566,7 +2590,14 @@ def _queue_request_focus_lines(focus: dict, queue_url: str) -> list:
             "- Full-lineup request: do not reproduce the complete lineup in Discord; "
             f"direct the user to {destination}."
         )
-    if focus.get("now_playing"):
+    if focus.get("track_link"):
+        lines.append(
+            "- Current-track-link request: reply with the exact publicSourceUrl "
+            "from Now playing and no unrelated statistics. If it is absent, say "
+            "that no public source link is available; never deflect a readable link "
+            "request to the DJ, host, or production team."
+        )
+    elif focus.get("now_playing"):
         lines.append("- Now-playing request: answer with the current loaded track and playback state only unless the user asks for more.")
     if focus.get("up_next"):
         lines.append("- Up-next request: answer with Up next only unless the user asks for more.")
@@ -2685,7 +2716,11 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         revision = _first_present_value(queue, ("revision",))
         if revision is not None:
             lines.append(f"- Queue revision: {_compact_public_text(revision, 30)}")
-        now_label = _track_label(now_playing, include_queue_details=True)
+        now_label = _track_label(
+            now_playing,
+            include_queue_details=True,
+            include_public_source_url=bool(queue_focus.get("track_link")),
+        )
         if now_label:
             lines.append(f"- Now playing: {now_label}")
         else:

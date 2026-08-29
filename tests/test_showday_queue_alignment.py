@@ -293,12 +293,62 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
             "what are we listening to",
             "what did you pull up",
             "what's pulled up in now playing",
+            "Whats the link to the current track?",
+            "Drop me the URL for the loaded song",
             "whats next",
             "who won the wheel",
         )
         for phrase in phrases:
             with self.subTest(phrase=phrase):
                 self.assertTrue(bnl01_bot._queue_read_model_query(phrase))
+
+    def test_current_track_link_request_includes_only_the_public_source_url(self):
+        model = read_model(True)
+        model["sections"]["queue"]["nowPlaying"] = {
+            "submittedArtistName": "Current Artist",
+            "submittedSongTitle": "Current Track",
+            "publicSourceUrl": "https://www.youtube.com/watch?v=abcdefghijk",
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ):
+            context = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "Whats the link to the current track?",
+                "public_home",
+            )
+
+        self.assertIn("Current-track-link request", context)
+        self.assertIn(
+            "publicSourceUrl=https://www.youtube.com/watch?v=abcdefghijk",
+            context,
+        )
+        self.assertIn("never deflect", context)
+
+    def test_current_track_link_request_drops_an_invalid_source_url(self):
+        model = private_read_model()
+        model["sections"]["queue"]["nowPlaying"] = {
+            "submittedArtistName": "Current Artist",
+            "submittedSongTitle": "Current Track",
+            "publicSourceUrl": "javascript:alert(1)",
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+            clear=False,
+        ):
+            context = bnl01_bot.build_bnl_read_model_context(
+                model,
+                "Whats the link to the current track?",
+                "sealed_test",
+            )
+
+        self.assertIn("Current-track-link request", context)
+        self.assertNotIn("javascript:alert", context)
 
     def test_complete_queue_is_searched_beyond_position_eight_without_dumping_it(self):
         model = private_read_model()

@@ -56,6 +56,9 @@ _SPACE_RE = re.compile(r"\s+")
 _HANDLE_RE = re.compile(r"^[A-Za-z0-9._]+$")
 
 _LIVE_REACTION_PATTERNS = (
+    r"\b(?:tiktok|tik tok)(?: live| stream)? (?:chat|comments?)\b",
+    r"\bwhat(?:['’]s| is|s) (?:the )?chat talking (?:about|bout)\b",
+    r"\bwhat did (?:the )?(?:live |stream )?chat (?:just )?say\b",
     r"\bwhat(?:['’]s| is|s) (?:the )?(?:tiktok )?chat (?:saying|thinking|doing)\b",
     r"\bwhat (?:does|do) (?:the )?(?:tiktok )?chat think\b",
     r"\bhow(?:['’]s| is) (?:the )?(?:tiktok )?chat (?:reacting|feeling|doing)\b",

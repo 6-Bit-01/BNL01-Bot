@@ -150,6 +150,11 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
                     "How is TikTok chat reacting to the show?",
                     "public_home",
                 )
+                exact_live_chat_context = bnl01_bot.build_bnl_read_model_context(
+                    public_read_model(),
+                    "What did TikTok chat just say?",
+                    "public_home",
+                )
 
         self.assertIn("Now playing: 6 Bit — Training Module One", context)
         self.assertIn("track_play_started", context)
@@ -157,6 +162,11 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
         self.assertNotIn("Do Not Dump Me", context)
         self.assertIn("queue snapshot as authoritative show state", context)
         self.assertIn("above Community Canon", context)
+        self.assertIn("This track is wild.", exact_live_chat_context)
+        self.assertIn(
+            "Current TikTok LIVE public reaction context",
+            exact_live_chat_context,
+        )
 
     def test_private_queue_scope_cannot_feed_public_live_reaction_context(self):
         model = public_read_model()
