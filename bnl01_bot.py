@@ -21,6 +21,7 @@ from bnl_canon_source_contract import (
     CANON_SOURCE_CONTRACT_VERSION,
     build_claim_contract_inventory,
     diagnostics as canon_source_diagnostics,
+    env_queue_production_enabled,
     queue_usability,
     render_concise_public_schedule,
     render_founders,
@@ -3349,6 +3350,13 @@ def build_tiktok_show_evidence_context_for_turn(
     website_read_model_context: str = "",
 ) -> str:
     """Select finalized show evidence through the shared turn-level owner."""
+
+    if not env_queue_production_enabled():
+        logging.info(
+            "show_episode_evidence_context_skipped "
+            "reason=local_queue_production_gate_disabled"
+        )
+        return ""
 
     tiktok_subject_continuity_allowed = True
     if int(subject_user_id or 0) > 0 and os.path.exists(DB_FILE):
@@ -32575,6 +32583,7 @@ _tiktok_live_memory_runtime = {
     "show_ledger_last_discord_interactions": 0,
     "show_ledger_last_discord_exchanges": 0,
     "show_ledger_last_conversation_rows": 0,
+    "show_ledger_authorization_eligible": False,
     "show_ledger_last_error_type": "",
 }
 
@@ -32883,6 +32892,12 @@ async def queue_artist_memory_sync_task():
         return
     read_model = await asyncio.to_thread(fetch_bnl_read_model, True)
     if not read_model:
+        _tiktok_live_memory_runtime[
+            "show_ledger_authorization_eligible"
+        ] = False
+        _tiktok_live_memory_runtime[
+            "show_ledger_last_reason"
+        ] = "read_model_unavailable"
         logging.warning("queue_artist_memory_sync_skipped reason=read_model_unavailable")
         return
     guilds = list(iter_managed_guilds())
@@ -32941,10 +32956,14 @@ async def queue_artist_memory_sync_task():
                 guild_id=guild_id,
                 read_model=read_model,
                 artist_identity_index=artist_identity_index,
+                environ=os.environ,
             )
             _tiktok_live_memory_runtime["show_ledger_last_reason"] = str(
                 show_ledger_result.get("reason") or "unknown"
             )
+            _tiktok_live_memory_runtime[
+                "show_ledger_authorization_eligible"
+            ] = bool(show_ledger_result.get("authorizationEligible"))
             _tiktok_live_memory_runtime["show_ledger_last_written"] = int(
                 show_ledger_result.get("showsWritten") or 0
             )
@@ -32969,7 +32988,8 @@ async def queue_artist_memory_sync_task():
             _tiktok_live_memory_runtime["show_ledger_last_error_type"] = ""
             logging.info(
                 "barcode_show_episode_ledger_sync guild=%s status=%s "
-                "reason=%s shows_seen=%s shows_written=%s "
+                "reason=%s authorization_eligible=%s "
+                "shows_seen=%s shows_written=%s "
                 "shows_unchanged=%s shows_finalized=%s tiktok_events=%s "
                 "operational_events=%s track_roster=%s discord_interactions=%s "
                 "discord_exchanges=%s discord_participants=%s "
@@ -32979,6 +32999,7 @@ async def queue_artist_memory_sync_task():
                 guild_id,
                 show_ledger_result.get("status"),
                 show_ledger_result.get("reason"),
+                int(bool(show_ledger_result.get("authorizationEligible"))),
                 show_ledger_result.get("showsSeen", 0),
                 show_ledger_result.get("showsWritten", 0),
                 show_ledger_result.get("showsUnchanged", 0),
@@ -32996,6 +33017,9 @@ async def queue_artist_memory_sync_task():
                 show_ledger_result.get("projectionErrors", 0),
             )
         except Exception as exc:
+            _tiktok_live_memory_runtime[
+                "show_ledger_authorization_eligible"
+            ] = False
             _tiktok_live_memory_runtime[
                 "show_ledger_last_error_type"
             ] = type(exc).__name__
@@ -47052,7 +47076,7 @@ async def bnl_status(interaction: discord.Interaction):
         f"- tiktok_live_last_error_code: `{tiktok_live_diag.get('lastErrorCode')}` memory_default=`{tiktok_live_diag.get('memoryDefault')}`",
         f"- tiktok_live_memory_enabled: `{'yes' if BNL_TIKTOK_LIVE_MEMORY_ENABLED else 'no'}` placement=`above_community_canon`",
         f"- tiktok_live_memory_last_ingested: `{int(_tiktok_live_memory_runtime.get('last_ingested') or 0)}` total_since_start=`{int(_tiktok_live_memory_runtime.get('total_ingested') or 0)}` reason=`{_tiktok_live_memory_runtime.get('last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('last_error_type') or 'none'}`",
-        f"- barcode_show_episode_ledger_last_sync: written=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_written') or 0)}` finalized=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_finalized') or 0)}` tiktok_events=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_events') or 0)}` operational_events=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_operational_events') or 0)}` discord_interactions=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_discord_interactions') or 0)}` discord_exchanges=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_discord_exchanges') or 0)}` conversation_rows=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_conversation_rows') or 0)}` reason=`{_tiktok_live_memory_runtime.get('show_ledger_last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('show_ledger_last_error_type') or 'none'}`",
+        f"- barcode_show_episode_ledger_last_sync: authorized=`{'yes' if _tiktok_live_memory_runtime.get('show_ledger_authorization_eligible') else 'no'}` written=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_written') or 0)}` finalized=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_finalized') or 0)}` tiktok_events=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_events') or 0)}` operational_events=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_operational_events') or 0)}` discord_interactions=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_discord_interactions') or 0)}` discord_exchanges=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_discord_exchanges') or 0)}` conversation_rows=`{int(_tiktok_live_memory_runtime.get('show_ledger_last_conversation_rows') or 0)}` reason=`{_tiktok_live_memory_runtime.get('show_ledger_last_reason')}` error_type=`{_tiktok_live_memory_runtime.get('show_ledger_last_error_type') or 'none'}`",
         f"- tiktok_live_identity_policy: `handle_display_correlated_v1` owner_handle_configured=`{'yes' if bool(BNL_TIKTOK_OWNER_HANDLES) else 'no'}`",
         f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap_today=`{ambient_cap_today}` normal_cap=`{AMBIENT_DAILY_POST_CAP}` high_activity_cap=`2` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
         f"- ambient_posts_today: `{ambient_posts_today}`",

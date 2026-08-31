@@ -130,16 +130,29 @@ reactions follows the ordinary conversation persistence path. Aggregate viewers,
 taps, gifts, joins, and other room metrics remain current-show-only and do not
 become personal memory or canon.
 
-The same one-minute read-model cycle automatically assembles a durable public
-show episode for every retained show. It preserves the website archive's full
-public-safe queue/broadcast milestone sequence and track roster, places every
-eligible TikTok comment/question on that clock, and pairs public Discord user
-rows only when BNL's stored response explicitly targets that member in the same
-channel within the bounded response window. Questions, answers, track state,
+The same one-minute read-model cycle may assemble a durable public show episode
+for a retained show only after the local queue gate, website queue capability,
+top-level public scope, and exact `queue_public_history_projection_v1` archive
+contract all pass. The archive must be available, `public_safe`, explicitly
+public, digest/revision-bearing, browser-personal-history-free, and free of test
+or simulation markers. Private, unavailable, malformed, capability-disabled,
+and local-gate-disabled projections create no show row or Memory Ledger
+projection. Each admitted episode carries a content-free
+`show_queue_evidence_authorization_v1` receipt in its source digest. Older rows
+without that receipt are preserved for audit but quarantined from show recall,
+packet selection, recurrence grouping, and source revalidation; an eligible
+public source refresh rewrites the matching row through the existing owner.
+
+An authorized episode preserves the website archive's full public-safe
+queue/broadcast milestone sequence and track roster, places every eligible
+TikTok comment/question on that clock, and pairs public Discord user rows only
+when BNL's stored response explicitly targets that member in the same channel
+within the bounded response window. Questions, answers, track state,
 Wheel/sponsor/signal-hold events, order, and outcomes therefore remain available
 after the live snapshot expires. Ordinary recall retrieves only the show and
 evidence slices relevant to the current question; the complete ledger is not
-dumped into every prompt.
+dumped into every prompt. The local queue gate is checked again for direct show
+context, packet selection, and send-time packet revalidation.
 
 This episode is a limited operational-memory exception, not a second queue
 owner. Website milestones and roster outcomes are authoritative operational

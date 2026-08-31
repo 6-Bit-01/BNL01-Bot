@@ -38,6 +38,7 @@ from bnl_canon_source_contract import (
     adapt_legacy_canon_fact,
     adapt_living_atomic_claim,
     adapt_open_signal_claim,
+    env_queue_production_enabled,
     matching_canon_entity_identities,
     matching_canon_member_identities,
     normalize_canon_identity_label,
@@ -2992,6 +2993,8 @@ def _show_episode_items(
     request: IntelligencePacketRequest,
     diagnostics: IntelligencePacketDiagnostics,
     exclusions: list[IntelligencePacketExclusion],
+    *,
+    environ: Mapping[str, str] | None = None,
 ) -> list[IntelligencePacketItem]:
     """Adapt finalized BARCODE Radio evidence into the existing packet.
 
@@ -2999,6 +3002,17 @@ def _show_episode_items(
     deliberately keep first-party operations separate from projections over
     attributed Community Canon / Open Signal utterances.
     """
+
+    if not env_queue_production_enabled(
+        dict(environ) if environ is not None else None
+    ):
+        _add_exclusion(
+            diagnostics,
+            exclusions,
+            lane="show_episode",
+            reason="show_queue_evidence_local_gate_disabled",
+        )
+        return []
 
     allow_subject_continuity = bool(
         str(request.frame_subject_requirement or "").strip().lower()
@@ -5695,7 +5709,13 @@ def _show_episode_version(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
     item: IntelligencePacketItem,
+    *,
+    environ: Mapping[str, str] | None = None,
 ) -> str:
+    if not env_queue_production_enabled(
+        dict(environ) if environ is not None else None
+    ):
+        return ""
     return tiktok_show_episode_context_item_version(
         conn,
         guild_id=int(packet.request.guild_id or 0),
@@ -6167,7 +6187,12 @@ def _revalidate_packet_in_snapshot(
             elif item.revalidation_kind == "episode":
                 current = _episode_version(conn, packet, item)
             elif item.revalidation_kind == "show_episode":
-                current = _show_episode_version(conn, packet, item)
+                current = _show_episode_version(
+                    conn,
+                    packet,
+                    item,
+                    environ=environ,
+                )
             elif item.revalidation_kind == "atomic":
                 current = (
                     _living_atomic_version(conn, item)
@@ -7137,6 +7162,7 @@ def build_packet(
                 request,
                 diagnostics,
                 exclusions,
+                environ=environ,
             )
         )
         candidates.extend(

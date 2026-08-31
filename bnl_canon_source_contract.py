@@ -30,6 +30,11 @@ ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION = (
 )
 PUBLIC_ASSESSMENT_EVIDENCE_VERSION = "public_assessment_evidence_v4"
 ENTITY_ACCOUNT_BINDING_CONTRACT_VERSION = "canon_entity_account_binding_v1"
+SHOW_QUEUE_EVIDENCE_AUTHORIZATION_VERSION = (
+    "show_queue_evidence_authorization_v1"
+)
+SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION = "queue_public_history_projection_v1"
+SHOW_QUEUE_ARCHIVE_SOURCE = "queue_bnl_history_projection"
 
 
 class CanonStatus(str, Enum):
@@ -3240,6 +3245,168 @@ def queue_usability(
         "privateAllowed": bool(allow_private),
         "reason": reason,
     }
+
+
+def _show_queue_archive(read_model: dict | None) -> dict[str, Any]:
+    if not isinstance(read_model, dict):
+        return {}
+    sections = read_model.get("sections")
+    if not isinstance(sections, dict):
+        return {}
+    archive = sections.get("archive")
+    return dict(archive) if isinstance(archive, Mapping) else {}
+
+
+def _show_queue_archive_contains_test_evidence(value: Any) -> bool:
+    """Reject explicit simulation/test markers from a public projection."""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized_key = str(key or "").strip().casefold()
+            if normalized_key in {"issimulation", "istesttrack"} and item is True:
+                return True
+            if _show_queue_archive_contains_test_evidence(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_show_queue_archive_contains_test_evidence(item) for item in value)
+    if isinstance(value, str):
+        normalized = value.casefold()
+        return "[queue simulation track]" in normalized
+    return False
+
+
+def show_queue_evidence_authorization(
+    read_model: dict | None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate the exact public-production archive admitted to show memory.
+
+    This is a narrow exception for the existing finalized-show owner. It does
+    not grant queue mutation, general queue persistence, Source File, dossier,
+    Relationship, or canon authority.
+    """
+
+    queue = queue_usability(
+        read_model,
+        environ=dict(environ) if environ is not None else None,
+        allow_private=False,
+    )
+    decision: dict[str, Any] = {
+        "usable": False,
+        "reason": str(queue.get("reason") or "queue_not_usable"),
+        "receipt": None,
+    }
+    if not queue.get("usable"):
+        return decision
+    if not isinstance(read_model, dict) or (
+        read_model.get("ok") is not True
+        or read_model.get("version") != 1
+        or read_model.get("source") != "barcode-network-site"
+        or read_model.get("publicOnly") is not True
+        or website_queue_access_scope(read_model) != "public"
+    ):
+        decision["reason"] = "read_model_public_contract_invalid"
+        return decision
+
+    archive = _show_queue_archive(read_model)
+    source_revision = archive.get("sourceRevision")
+    source_digest = str(archive.get("sourceDigest") or "").strip().casefold()
+    coverage_started_at = str(
+        archive.get("historyCoverageStartedAt") or ""
+    ).strip()
+    archive_contract_valid = bool(
+        archive.get("available") is True
+        and archive.get("reason") in {None, ""}
+        and archive.get("schemaVersion") == SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION
+        and archive.get("source") == SHOW_QUEUE_ARCHIVE_SOURCE
+        and archive.get("visibility") == "public_safe"
+        and archive.get("accessScope") == "public"
+        and archive.get("memoryDefault") == "do_not_store"
+        and archive.get("sourceFileDefault") == "review_evidence_only"
+        and archive.get("publicDossierDefault") == "not_automatic"
+        and isinstance(source_revision, int)
+        and not isinstance(source_revision, bool)
+        and source_revision >= 0
+        and re.fullmatch(r"[a-f0-9]{64}", source_digest)
+        and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", coverage_started_at)
+        and archive.get("personalHistory") is None
+        and not _show_queue_archive_contains_test_evidence(archive)
+    )
+    if not archive_contract_valid:
+        decision["reason"] = "archive_public_contract_invalid"
+        return decision
+
+    receipt = {
+        "contractVersion": SHOW_QUEUE_EVIDENCE_AUTHORIZATION_VERSION,
+        "readModelSource": "barcode-network-site",
+        "publicOnly": True,
+        "localQueueProduction": True,
+        "websiteQueueProduction": True,
+        "accessScope": "public",
+        "archiveSchemaVersion": SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION,
+        "archiveSource": SHOW_QUEUE_ARCHIVE_SOURCE,
+        "archiveVisibility": "public_safe",
+        "archiveSourceRevision": source_revision,
+        "archiveSourceDigest": source_digest,
+        "historyCoverageStartedAt": coverage_started_at,
+    }
+    decision.update(
+        {
+            "usable": True,
+            "reason": "eligible_public_production_archive",
+            "receipt": receipt,
+        }
+    )
+    return decision
+
+
+def show_queue_evidence_authorization_receipt_valid(value: Any) -> bool:
+    """Validate a content-free receipt persisted with one show ledger."""
+
+    if not isinstance(value, Mapping):
+        return False
+    expected_keys = {
+        "contractVersion",
+        "readModelSource",
+        "publicOnly",
+        "localQueueProduction",
+        "websiteQueueProduction",
+        "accessScope",
+        "archiveSchemaVersion",
+        "archiveSource",
+        "archiveVisibility",
+        "archiveSourceRevision",
+        "archiveSourceDigest",
+        "historyCoverageStartedAt",
+    }
+    revision = value.get("archiveSourceRevision")
+    return bool(
+        set(value.keys()) == expected_keys
+        and value.get("contractVersion")
+        == SHOW_QUEUE_EVIDENCE_AUTHORIZATION_VERSION
+        and value.get("readModelSource") == "barcode-network-site"
+        and value.get("publicOnly") is True
+        and value.get("localQueueProduction") is True
+        and value.get("websiteQueueProduction") is True
+        and value.get("accessScope") == "public"
+        and value.get("archiveSchemaVersion")
+        == SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION
+        and value.get("archiveSource") == SHOW_QUEUE_ARCHIVE_SOURCE
+        and value.get("archiveVisibility") == "public_safe"
+        and isinstance(revision, int)
+        and not isinstance(revision, bool)
+        and revision >= 0
+        and re.fullmatch(
+            r"[a-f0-9]{64}",
+            str(value.get("archiveSourceDigest") or "").strip().casefold(),
+        )
+        and re.fullmatch(
+            r"20\d{2}-\d{2}-\d{2}",
+            str(value.get("historyCoverageStartedAt") or "").strip(),
+        )
+    )
 
 def _looks_queue_derived(value: Any) -> bool:
     if isinstance(value, dict):

@@ -19,7 +19,13 @@ import sqlite3
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-from bnl_canon_source_contract import Confidence, SourceClass, Visibility
+from bnl_canon_source_contract import (
+    Confidence,
+    SourceClass,
+    Visibility,
+    show_queue_evidence_authorization,
+    show_queue_evidence_authorization_receipt_valid,
+)
 from bnl_memory_ledger import (
     LINEAGE_TYPES,
     LedgerEntry,
@@ -45,7 +51,6 @@ TIKTOK_SHOW_EVIDENCE_RESPONSE_WINDOW_MS = 15 * 60 * 1000
 TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT = 2
 TIKTOK_SHOW_EVIDENCE_RECALL_MESSAGE_LIMIT = 10
 SHOW_EPISODE_CONTEXT_VERSION = "barcode_show_episode_context_v1"
-_LEGACY_SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION = "tiktok_show_evidence_ledger_v1"
 
 _SPACE_RE = re.compile(r"\s+")
 _QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]{2,}", re.IGNORECASE)
@@ -184,10 +189,7 @@ def _safe_document(value: Any) -> Optional[dict[str, Any]]:
     if not isinstance(value, Mapping):
         return None
     schema_version = value.get("schemaVersion")
-    if schema_version not in {
-        SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
-        _LEGACY_SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
-    }:
+    if schema_version != SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION:
         return None
     show_key = _safe_label(value.get("showKey"), 200)
     source_digest = _safe_label(value.get("sourceDigest"), 64).lower()
@@ -198,9 +200,12 @@ def _safe_document(value: Any) -> Optional[dict[str, Any]]:
         or not isinstance(value.get("participants"), list)
         or not isinstance(value.get("topics"), list)
         or not isinstance(value.get("trackMoments"), list)
+        or not show_queue_evidence_authorization_receipt_valid(
+            value.get("sourceAuthorization")
+        )
     ):
         return None
-    if schema_version == SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION and any(
+    if any(
         not isinstance(value.get(field), list)
         for field in (
             "trackRoster",
@@ -211,7 +216,36 @@ def _safe_document(value: Any) -> Optional[dict[str, Any]]:
         )
     ):
         return None
+    digest_payload = dict(value)
+    digest_payload.pop("sourceDigest", None)
+    computed_digest = hashlib.sha256(
+        _canonical_json(digest_payload).encode("utf-8")
+    ).hexdigest()
+    if computed_digest != source_digest:
+        return None
     return dict(value)
+
+
+def _seal_authorized_show_ledger(
+    ledger: Any,
+    authorization_receipt: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Bind one public show document to its validated source authorization."""
+
+    if (
+        not isinstance(ledger, Mapping)
+        or not show_queue_evidence_authorization_receipt_valid(
+            authorization_receipt
+        )
+    ):
+        return None
+    sealed = dict(ledger)
+    sealed.pop("sourceDigest", None)
+    sealed["sourceAuthorization"] = dict(authorization_receipt)
+    sealed["sourceDigest"] = hashlib.sha256(
+        _canonical_json(sealed).encode("utf-8")
+    ).hexdigest()
+    return _safe_document(sealed)
 
 
 def _context_digest(*values: Any) -> str:
@@ -1437,8 +1471,9 @@ def sync_tiktok_show_evidence_ledgers(
     artist_identity_index: Optional[
         Mapping[str, Sequence[Mapping[str, Any]]]
     ] = None,
+    environ: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
-    """Idempotently assemble every available public show into memory."""
+    """Idempotently assemble every authorized public-production show."""
 
     result = {
         "status": "skipped",
@@ -1461,10 +1496,32 @@ def sync_tiktok_show_evidence_ledgers(
         "livingCanonSubjectsEvaluated": 0,
         "livingCanonCandidatesRefreshed": 0,
         "livingCanonFormationErrors": 0,
+        "authorizationEligible": False,
     }
+    authorization = show_queue_evidence_authorization(
+        read_model,
+        environ=environ,
+    )
+    if not authorization.get("usable"):
+        result["reason"] = str(
+            authorization.get("reason") or "archive_not_authorized"
+        )
+        return result
+    authorization_receipt = authorization.get("receipt")
+    if not show_queue_evidence_authorization_receipt_valid(
+        authorization_receipt
+    ):
+        result["reason"] = "archive_authorization_receipt_invalid"
+        return result
+    result["authorizationEligible"] = True
     archive = _archive_from_read_model(read_model)
     shows = tiktok_show_records(archive)
     if not shows or int(guild_id or 0) <= 0 or not db_file:
+        result["reason"] = (
+            "no_show_records"
+            if not shows
+            else "invalid_sync_target"
+        )
         return result
     result["showsSeen"] = len(shows)
     conn = sqlite3.connect(db_file, timeout=10.0)
@@ -1486,13 +1543,14 @@ def sync_tiktok_show_evidence_ledgers(
             )
             if discord_exchanges is None:
                 continue
-            ledger = _safe_document(
+            ledger = _seal_authorized_show_ledger(
                 build_tiktok_show_evidence_ledger(
                     show,
                     source_events,
                     artist_identity_index=artist_identity_index,
                     discord_exchanges=discord_exchanges,
-                )
+                ),
+                authorization_receipt,
             )
             if ledger is None:
                 continue

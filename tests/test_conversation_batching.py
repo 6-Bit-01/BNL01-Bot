@@ -1332,6 +1332,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self._prime_flush(channel, request)
         with (
             self._flush_runtime(channel.id, generate),
+            mock.patch.dict(
+                os.environ,
+                {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+                clear=False,
+            ),
             mock.patch.object(
                 bnl01_bot,
                 "resolve_channel_policy",
