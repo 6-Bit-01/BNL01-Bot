@@ -226,6 +226,25 @@ class DormantSignalEchoTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(candidate)
         self.assertEqual(reason, "no_eligible_familiar_absent_member")
 
+    def test_member_proactive_opt_out_blocks_candidate_selection(self):
+        self.seed_familiar_member()
+        with sqlite3.connect(self.db_path) as conn:
+            bnl01_bot.set_relationship_v2_member_setting(
+                conn,
+                guild_id=77,
+                user_id=42,
+                proactive_enabled=False,
+            )
+
+        candidate, reason = bnl01_bot.select_dormant_echo_candidate(
+            77,
+            now_pacific=self.now,
+            guild=self.guild,
+        )
+
+        self.assertIsNone(candidate)
+        self.assertEqual(reason, "member_opt_out")
+
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -488,6 +507,49 @@ class DormantSignalEchoTests(unittest.IsolatedAsyncioTestCase):
                 """
             ).fetchone()[0]
         self.assertEqual(remaining, 0)
+
+    async def test_publish_rechecks_consent_and_withholds_after_opt_out(self):
+        prepared = {
+            "status": "ready",
+            "message": "An Emerald-shaped harmonic still fits this synth thread.",
+            "subjectUserId": 42,
+            "subjectDisplayName": "Emerald",
+            "basis": {"subjectUserId": 42},
+        }
+        with sqlite3.connect(self.db_path) as conn:
+            bnl01_bot.set_relationship_v2_member_setting(
+                conn,
+                guild_id=77,
+                user_id=42,
+                proactive_enabled=False,
+            )
+        with mock.patch.object(
+            bnl01_bot,
+            "schedule_after_ambient_post",
+            side_effect=AssertionError("withheld echo must not consume capacity"),
+        ):
+            result = await bnl01_bot.publish_prepared_dormant_echo(
+                77,
+                222,
+                self.channel,
+                prepared,
+                capacity_used_before_send=0,
+                now_pacific=self.now,
+            )
+
+        self.assertEqual(
+            result,
+            {"status": "withheld", "reason": "member_opt_out"},
+        )
+        self.assertEqual(self.channel.sent, [])
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM ambient_log WHERE guild_id=77"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+        runtime = bnl01_bot._get_ambient_runtime_state(77)
+        self.assertEqual(runtime["last_dormant_echo_status"], "withheld")
+        self.assertEqual(runtime["last_dormant_echo_reason"], "member_opt_out")
 
     async def test_global_cooldown_prevents_repeat_before_candidate_lookup(self):
         with sqlite3.connect(self.db_path) as conn:

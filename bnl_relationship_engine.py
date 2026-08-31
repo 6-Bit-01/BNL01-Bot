@@ -235,6 +235,41 @@ def get_member_settings(conn: sqlite3.Connection, *, guild_id: int, user_id: int
     ensure_relationship_v2_schema(conn); row = conn.execute("SELECT proactive_enabled,playful_rivalry_enabled FROM relationship_member_settings_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).fetchone()
     return {"proactive_enabled": bool(row[0]) if row else True, "playful_rivalry_enabled": bool(row[1]) if row else True}
 
+
+def proactive_consent_decision(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    user_id: int,
+) -> tuple[bool, str]:
+    """Resolve the existing member-owned proactive preference, fail closed.
+
+    The slash-command setting and the latest typed opt-in/opt-out preference are
+    two views of the same Relationship v2 control. Callers outside the planner
+    use this adapter instead of reading either table independently or creating
+    a second consent store.
+    """
+
+    if int(guild_id or 0) <= 0 or int(user_id or 0) <= 0:
+        return False, "proactive_consent_subject_invalid"
+    try:
+        settings = get_member_settings(
+            conn,
+            guild_id=int(guild_id),
+            user_id=int(user_id),
+        )
+        preference = _latest_pref(
+            conn,
+            guild_id=int(guild_id),
+            user_id=int(user_id),
+            key="proactive",
+        )
+    except (sqlite3.Error, TypeError, ValueError):
+        return False, "proactive_consent_lookup_failed"
+    if not settings.get("proactive_enabled", True) or preference == "disabled":
+        return False, "member_opt_out"
+    return True, "proactive_consent_allowed"
+
 def rebuild_state(conn: sqlite3.Connection, *, guild_id: int, subject_user_id: int, evaluated_at: str = "") -> dict[str, Any]:
     ensure_relationship_v2_schema(conn); eval_dt = parse_utc(evaluated_at or _now())
     settings = get_member_settings(conn, guild_id=guild_id, user_id=subject_user_id)
@@ -439,7 +474,17 @@ def plan_engagement(conn: sqlite3.Connection, *, guild_id: int, user_id: int, ca
     ensure_relationship_v2_schema(conn); now_dt=parse_utc(now or _now()); settings=get_member_settings(conn,guild_id=guild_id,user_id=user_id); withheld=[]; errors=[]
     state=rebuild_state(conn,guild_id=guild_id,subject_user_id=user_id,evaluated_at=now_dt.isoformat())
     open_loops = _open_loop_count(conn, guild_id=guild_id, user_id=user_id, channel_policy=channel_policy); moments = _compatible_moment_count(conn, guild_id=guild_id, user_id=user_id, channel_policy=channel_policy)
-    if not settings["proactive_enabled"] or state.get("engagement_opt_out"): withheld.append("member_opt_out")
+    proactive_allowed, proactive_reason = proactive_consent_decision(
+        conn,
+        guild_id=guild_id,
+        user_id=user_id,
+    )
+    if not proactive_allowed or state.get("engagement_opt_out"):
+        withheld.append(
+            proactive_reason
+            if proactive_reason == "proactive_consent_lookup_failed"
+            else "member_opt_out"
+        )
     if not settings["playful_rivalry_enabled"] and candidate_type == "playful_rivalry": withheld.append("playful_rivalry_disabled")
     if channel_policy not in PUBLIC_POLICIES: withheld.append("channel_policy_ineligible")
     if route_mode not in RELATIONSHIP_LIVE_ROUTES: withheld.append("route_ineligible")

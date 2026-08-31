@@ -23,6 +23,7 @@ from bnl_memory_governance import (
     complete_delete_member_data,
     ensure_governance_schema,
 )
+from bnl_relationship_engine import set_member_setting
 from bnl_tiktok_live_context import build_tiktok_show_evidence_ledger
 from bnl_shared_brain_synthesis import render_packet_context
 from bnl_tiktok_show_ledger import (
@@ -1217,6 +1218,89 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             )
             conn.commit()
             self.assertFalse(revalidate_packet(conn, packet).valid)
+            conn.close()
+
+    def test_packet_show_continuity_honors_member_proactive_opt_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model={
+                    "sections": {
+                        "archive": {
+                            "currentShow": None,
+                            "latestShow": archived_show(),
+                            "shows": [],
+                        }
+                    }
+                },
+                artist_identity_index=artist_index(),
+            )
+            conn = sqlite3.connect(db_file)
+            request = IntelligencePacketRequest(
+                guild_id=77,
+                subject_user_id=42,
+                route_mode="normal_chat",
+                conversation_surface="mention_or_reply",
+                subject_display_name="Alex",
+                channel_id=9001,
+                channel_name="barcode-bot",
+                channel_policy="public_home",
+                visibility_allowance="public_safe",
+                user_text="What happened next?",
+                participant_user_ids=(42,),
+                direct_state="direct",
+                budget_chars=6000,
+                frame_subject_requirement="required",
+                now="2026-08-29T12:00:00-07:00",
+            )
+            flags = {
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+                "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+                "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+            }
+            allowed_packet = build_packet(
+                conn,
+                request,
+                persist=False,
+                environ=flags,
+            )
+            self.assertTrue(
+                any(item.lane == "show_episode" for item in allowed_packet.items)
+            )
+
+            set_member_setting(
+                conn,
+                guild_id=77,
+                user_id=42,
+                proactive_enabled=False,
+            )
+            conn.commit()
+            blocked_packet = build_packet(
+                conn,
+                request,
+                persist=False,
+                environ=flags,
+            )
+            self.assertFalse(
+                any(item.lane == "show_episode" for item in blocked_packet.items)
+            )
+            self.assertEqual(
+                blocked_packet.diagnostics.excluded_by_reason.get(
+                    "member_opt_out"
+                ),
+                1,
+            )
+            self.assertFalse(
+                revalidate_packet(conn, allowed_packet, environ=flags).valid
+            )
             conn.close()
 
     def test_complete_delete_removes_bound_sources_and_invalidates_episode(self):
