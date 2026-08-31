@@ -141,6 +141,16 @@ after the live snapshot expires. Ordinary recall retrieves only the show and
 evidence slices relevant to the current question; the complete ledger is not
 dumped into every prompt.
 
+Participant presence and Relationship proactive consent authorize continuity;
+they do not create show intent. A show/continuity request or an actual evidence
+match must exist before the selector may use the current member's episode
+participation. Relative-day words only select this owner when the request also
+names show scope, and historical analysis resolves the matching show date
+instead of falling through to the current show. Episode rebuilds are additive for public Discord exchanges
+already captured by this owner, so ordinary conversation pruning cannot erase
+an earlier request/BNL-response pair during finalization. The existing
+complete-delete path still removes the owning episode and its projections.
+
 This episode is a limited operational-memory exception, not a second queue
 owner. Website milestones and roster outcomes are authoritative operational
 facts; TikTok and Discord text remains attributed observation evidence. Exact

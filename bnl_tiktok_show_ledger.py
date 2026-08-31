@@ -33,6 +33,7 @@ from bnl_tiktok_live_context import (
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     build_tiktok_show_evidence_ledger,
     show_timeline_bounds_ms,
+    tiktok_show_evidence_key,
     tiktok_show_records,
 )
 
@@ -53,7 +54,7 @@ _SHOW_QUERY_RE = re.compile(
     r"\b(?:tiktok|tik tok|barcode radio|broadcast|show|episode|live|chat|viewer|"
     r"audience|track|song|queue|wheel|submissions?|intake|sponsor|break|"
     r"signal hold|paused?|stalled?|resumed?|skipped?|removed?|returned?|"
-    r"restored?|started?|finished?|timeline|tonight|today|yesterday|last night|"
+    r"restored?|started?|finished?|timeline|"
     r"last show|previous show|past show|show chat|talked about)\b",
     re.IGNORECASE,
 )
@@ -83,6 +84,10 @@ _SUBJECT_CONTINUITY_QUERY_RE = re.compile(
     r"\b(?:remember me|know me|about me|my history|my activity|my messages?|"
     r"what did i|when did i|did i|have i|was i|where was i|"
     r"what do you think of me|your (?:read|opinion|impression) of me)\b",
+    re.IGNORECASE,
+)
+_RELATIVE_SHOW_DATE_SCOPE_RE = re.compile(
+    r"\b(?:tiktok|tik tok|barcode radio|broadcast|show|episode|live|stream)\b",
     re.IGNORECASE,
 )
 _MULTI_SHOW_QUERY_RE = re.compile(
@@ -248,6 +253,8 @@ def _requested_show_date(user_text: str, *, now: Any = None) -> str:
     if explicit:
         return explicit.group(1)
     lowered = query.casefold()
+    if not _RELATIVE_SHOW_DATE_SCOPE_RE.search(lowered):
+        return ""
     current_date = _coerce_pacific_now(now).date()
     if re.search(r"\b(?:yesterday|last night)\b", lowered):
         return (current_date - timedelta(days=1)).isoformat()
@@ -1364,6 +1371,183 @@ def _archive_from_read_model(read_model: Any) -> Mapping[str, Any]:
     return archive if isinstance(archive, Mapping) else {}
 
 
+def _stored_show_document(
+    raw_json: Any,
+    *,
+    show_key: str,
+    source_digest: Any,
+    lifecycle_status: Any,
+) -> Optional[dict[str, Any]]:
+    """Load one internally consistent prior show revision for additive rebuilds."""
+
+    try:
+        document = _safe_document(json.loads(str(raw_json or "{}")))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if document is None or (
+        str(document.get("showKey") or "") != str(show_key or "")
+        or str(document.get("sourceDigest") or "")
+        != str(source_digest or "")
+        or str(document.get("lifecycle") or "")
+        != str(lifecycle_status or "")
+    ):
+        return None
+    return document
+
+
+def _discord_message_identity(message: Any) -> str:
+    if not isinstance(message, Mapping):
+        return ""
+    for prefix, field in (
+        ("conversation", "conversationRowId"),
+        ("message", "messageId"),
+    ):
+        try:
+            value = int(message.get(field) or 0)
+        except (TypeError, ValueError, OverflowError):
+            value = 0
+        if value > 0:
+            return f"{prefix}:{value}"
+    return ""
+
+
+def _discord_exchange_message_keys(exchange: Any) -> set[str]:
+    if not isinstance(exchange, Mapping):
+        return set()
+    return {
+        identity
+        for identity in (
+            _discord_message_identity(message)
+            for message in exchange.get("userMessages") or ()
+        )
+        if identity
+    }
+
+
+def _merge_retained_discord_exchanges(
+    current: Sequence[Mapping[str, Any]],
+    prior_ledger: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Keep captured public exchanges when source conversation rows age out.
+
+    The existing show ledger remains the sole durable owner. Rebuilds are
+    additive for already-admitted Discord evidence; privacy deletion still
+    removes the owning show row before any later rebuild can consult it.
+    """
+
+    candidates: list[tuple[int, Mapping[str, Any]]] = []
+    if isinstance(prior_ledger, Mapping):
+        candidates.extend(
+            (0, exchange)
+            for exchange in prior_ledger.get("discordInteractions") or ()
+            if isinstance(exchange, Mapping)
+        )
+    candidates.extend(
+        (1, exchange)
+        for exchange in current or ()
+        if isinstance(exchange, Mapping)
+    )
+
+    groups: list[dict[str, Any]] = []
+    for source_priority, exchange in candidates:
+        subject_ref = str(exchange.get("subjectRef") or "")
+        message_keys = _discord_exchange_message_keys(exchange)
+        exchange_id = str(exchange.get("exchangeId") or "")
+        matching = [
+            index
+            for index, group in enumerate(groups)
+            if group["subjectRef"] == subject_ref
+            and (
+                bool(message_keys.intersection(group["messageKeys"]))
+                or bool(exchange_id and exchange_id in group["exchangeIds"])
+            )
+        ]
+        entry = (source_priority, exchange)
+        if not matching:
+            groups.append(
+                {
+                    "subjectRef": subject_ref,
+                    "messageKeys": set(message_keys),
+                    "exchangeIds": {exchange_id} if exchange_id else set(),
+                    "candidates": [entry],
+                }
+            )
+            continue
+        target = groups[matching[0]]
+        target["messageKeys"].update(message_keys)
+        if exchange_id:
+            target["exchangeIds"].add(exchange_id)
+        target["candidates"].append(entry)
+        for index in reversed(matching[1:]):
+            merged = groups.pop(index)
+            target["messageKeys"].update(merged["messageKeys"])
+            target["exchangeIds"].update(merged["exchangeIds"])
+            target["candidates"].extend(merged["candidates"])
+
+    merged_exchanges: list[dict[str, Any]] = []
+    for group in groups:
+        group_candidates = list(group["candidates"])
+
+        def candidate_rank(
+            candidate: tuple[int, Mapping[str, Any]],
+        ) -> tuple[int, int, int, str]:
+            source_priority, exchange = candidate
+            return (
+                int(isinstance(exchange.get("bnlResponse"), Mapping)),
+                int(source_priority),
+                len(exchange.get("userMessages") or ()),
+                str(exchange.get("exchangeId") or ""),
+            )
+
+        _base_priority, base_exchange = max(
+            group_candidates,
+            key=candidate_rank,
+        )
+        response_candidates = [
+            candidate
+            for candidate in group_candidates
+            if isinstance(candidate[1].get("bnlResponse"), Mapping)
+        ]
+        response = (
+            max(response_candidates, key=candidate_rank)[1].get("bnlResponse")
+            if response_candidates
+            else None
+        )
+        messages_by_key: dict[str, Mapping[str, Any]] = {}
+        for source_priority in (0, 1):
+            for candidate_priority, exchange in group_candidates:
+                if candidate_priority != source_priority:
+                    continue
+                for message in exchange.get("userMessages") or ():
+                    identity = _discord_message_identity(message)
+                    if identity and isinstance(message, Mapping):
+                        messages_by_key[identity] = message
+        user_messages = sorted(
+            messages_by_key.values(),
+            key=lambda message: (
+                int(message.get("occurredAtMs") or 0),
+                int(message.get("conversationRowId") or 0),
+                int(message.get("messageId") or 0),
+            ),
+        )
+        merged = dict(base_exchange)
+        merged["userMessages"] = [dict(message) for message in user_messages]
+        merged["bnlResponse"] = dict(response) if response is not None else None
+        merged_exchanges.append(merged)
+
+    merged_exchanges.sort(
+        key=lambda exchange: (
+            int(
+                ((exchange.get("userMessages") or [{}])[0]).get(
+                    "occurredAtMs", 0
+                )
+            ),
+            str(exchange.get("exchangeId") or ""),
+        )
+    )
+    return merged_exchanges
+
+
 def _projection_expectations(
     conn: sqlite3.Connection,
     *,
@@ -1472,6 +1656,27 @@ def sync_tiktok_show_evidence_ledgers(
         ensure_tiktok_show_evidence_schema(conn)
         ensure_memory_ledger_schema(conn)
         for show in shows:
+            show_key = tiktok_show_evidence_key(show)
+            if not show_key:
+                continue
+            existing = conn.execute(
+                f"""
+                SELECT source_digest,lifecycle_status,ledger_json
+                FROM {TIKTOK_SHOW_EVIDENCE_TABLE}
+                WHERE guild_id=? AND show_key=?
+                """,
+                (int(guild_id), show_key),
+            ).fetchone()
+            prior_ledger = (
+                _stored_show_document(
+                    existing[2],
+                    show_key=show_key,
+                    source_digest=existing[0],
+                    lifecycle_status=existing[1],
+                )
+                if existing
+                else None
+            )
             source_events = _load_show_source_events(
                 conn,
                 guild_id=int(guild_id),
@@ -1486,6 +1691,10 @@ def sync_tiktok_show_evidence_ledgers(
             )
             if discord_exchanges is None:
                 continue
+            discord_exchanges = _merge_retained_discord_exchanges(
+                discord_exchanges,
+                prior_ledger,
+            )
             ledger = _safe_document(
                 build_tiktok_show_evidence_ledger(
                     show,
@@ -1520,14 +1729,6 @@ def sync_tiktok_show_evidence_ledgers(
             )
             show_key = str(ledger["showKey"])
             source_digest = str(ledger["sourceDigest"])
-            existing = conn.execute(
-                f"""
-                SELECT source_digest,lifecycle_status
-                FROM {TIKTOK_SHOW_EVIDENCE_TABLE}
-                WHERE guild_id=? AND show_key=?
-                """,
-                (int(guild_id), show_key),
-            ).fetchone()
             now = datetime.now(timezone.utc).isoformat()
             lifecycle = str(ledger.get("lifecycle") or "provisional")
             if existing and str(existing[0] or "") == source_digest:
@@ -1717,6 +1918,9 @@ def _document_relevance(
     requested_show_date: str = "",
 ) -> tuple[int, list[Mapping[str, Any]]]:
     query = str(user_text or "")
+    query_terms = _query_terms(query)
+    explicit_episode_scope = _show_episode_scope_requested(query)
+    evidence_query_overlap = False
     score = max(0, 20 - recency_rank)
     if requested_show_date:
         if requested_show_date != str(ledger.get("showDate") or ""):
@@ -1731,6 +1935,7 @@ def _document_relevance(
         if isinstance(item, Mapping)
     ]
     participant_matches = []
+    direct_subject_candidates = []
     for participant in participants:
         direct_subject = bool(
             allow_direct_subject
@@ -1750,14 +1955,18 @@ def _document_relevance(
             for attribution in participant.get("artistAttributions") or ()
             if isinstance(attribution, Mapping)
         )
-        if direct_subject or named or artist_named:
+        if direct_subject:
+            direct_subject_candidates.append(participant)
+        if named or artist_named:
             participant_matches.append(participant)
-            score += 120 if direct_subject else 90
+            evidence_query_overlap = True
+            score += 90
     for track in ledger.get("trackMoments") or ():
         if isinstance(track, Mapping) and _phrase_in_query(
             query,
             track.get("trackLabel"),
         ):
+            evidence_query_overlap = True
             score += 80
     for track in ledger.get("trackRoster") or ():
         if isinstance(track, Mapping) and any(
@@ -1769,11 +1978,12 @@ def _document_relevance(
                 track.get("submittedByTikTokHandle"),
             )
         ):
+            evidence_query_overlap = True
             score += 85
     for topic in ledger.get("showTopics") or ledger.get("topics") or ():
         if isinstance(topic, Mapping) and _phrase_in_query(query, topic.get("term")):
+            evidence_query_overlap = True
             score += 60
-    query_terms = _query_terms(query)
     for event in ledger.get("operationalEvents") or ():
         if not isinstance(event, Mapping):
             continue
@@ -1791,6 +2001,7 @@ def _document_relevance(
         ).replace("_", " ")
         overlap = query_terms.intersection(_query_terms(searchable))
         if overlap:
+            evidence_query_overlap = True
             score += min(60, 12 * len(overlap))
     for exchange in ledger.get("discordInteractions") or ():
         if not isinstance(exchange, Mapping):
@@ -1812,7 +2023,15 @@ def _document_relevance(
         )
         overlap = query_terms.intersection(_query_terms(exchange_text))
         if overlap:
+            evidence_query_overlap = True
             score += min(70, 14 * len(overlap))
+    if direct_subject_candidates and (
+        explicit_episode_scope or evidence_query_overlap
+    ):
+        for participant in direct_subject_candidates:
+            if participant not in participant_matches:
+                participant_matches.append(participant)
+                score += 120
     if _SHOW_QUERY_RE.search(query):
         score += 30
     elif _COMMUNITY_BASELINE_QUERY_RE.search(query):

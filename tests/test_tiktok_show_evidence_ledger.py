@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -744,6 +745,98 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertEqual(second["showsUnchanged"], 1)
             self.assertEqual(second["projectionDeduplicated"], 0)
 
+    def test_sync_preserves_captured_exchange_after_conversation_pruning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            provisional_show = json.loads(json.dumps(archived_show()))
+            provisional_show["status"] = "live"
+            provisional_show["milestones"] = [
+                event
+                for event in provisional_show["milestones"]
+                if event["eventType"] != "session_archived"
+            ]
+            provisional_model = {
+                "sections": {
+                    "archive": {
+                        "currentShow": provisional_show,
+                        "latestShow": None,
+                        "shows": [],
+                    }
+                }
+            }
+            first = sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=provisional_model,
+                artist_identity_index=artist_index(),
+            )
+            self.assertEqual(first["showsWritten"], 1)
+            self.assertEqual(first["showsFinalized"], 0)
+
+            conn = sqlite3.connect(db_file)
+            original_json = conn.execute(
+                f"SELECT ledger_json "
+                f"FROM {TIKTOK_SHOW_EVIDENCE_TABLE}"
+            ).fetchone()[0]
+            conn.execute("DELETE FROM conversations WHERE id IN (101,102)")
+            conn.commit()
+            conn.close()
+            original = json.loads(original_json)
+            self.assertEqual(original["lifecycle"], "provisional")
+            self.assertEqual(
+                sum(
+                    1
+                    for exchange in original["discordInteractions"]
+                    if isinstance(exchange.get("bnlResponse"), dict)
+                ),
+                1,
+            )
+
+            finalized_model = {
+                "sections": {
+                    "archive": {
+                        "currentShow": None,
+                        "latestShow": archived_show(),
+                        "shows": [],
+                    }
+                }
+            }
+
+            rebuilt = sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=finalized_model,
+                artist_identity_index=artist_index(),
+            )
+            self.assertEqual(rebuilt["showsWritten"], 1)
+            self.assertEqual(rebuilt["showsFinalized"], 1)
+            self.assertEqual(rebuilt["discordInteractions"], 2)
+            self.assertEqual(rebuilt["discordExchanges"], 1)
+
+            conn = sqlite3.connect(db_file)
+            rebuilt_json = conn.execute(
+                f"SELECT ledger_json "
+                f"FROM {TIKTOK_SHOW_EVIDENCE_TABLE}"
+            ).fetchone()[0]
+            conn.close()
+            stored = json.loads(rebuilt_json)
+            self.assertEqual(stored["lifecycle"], "finalized")
+            alex = next(
+                exchange
+                for exchange in stored["discordInteractions"]
+                if exchange["subjectRef"] == "discord_user:42"
+            )
+            self.assertEqual(len(alex["userMessages"]), 1)
+            self.assertEqual(
+                alex["userMessages"][0]["conversationRowId"],
+                101,
+            )
+            self.assertEqual(
+                alex["bnlResponse"]["text"],
+                "Yes—the Wheel confirmed Queue Light, and it is playing now.",
+            )
+
     def test_finalization_refreshes_existing_living_canon_owner_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "bnl.db")
@@ -1041,6 +1134,33 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 now="2026-08-29T12:00:00-07:00",
             )
             self.assertEqual(unrelated, ())
+            same_day_unrelated = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="How are you doing today?",
+                subject_user_id=42,
+                allow_subject_continuity=True,
+                now="2026-08-28T12:00:00-07:00",
+            )
+            self.assertEqual(same_day_unrelated, ())
+            prior_day_unrelated = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="What did you do yesterday?",
+                subject_user_id=42,
+                allow_subject_continuity=True,
+                now="2026-08-29T12:00:00-07:00",
+            )
+            self.assertEqual(prior_day_unrelated, ())
+            proactive_unrelated = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="How do I make pasta?",
+                subject_user_id=42,
+                allow_subject_continuity=True,
+                now="2026-08-29T12:00:00-07:00",
+            )
+            self.assertEqual(proactive_unrelated, ())
             explicit_self = select_tiktok_show_episode_context_items(
                 conn,
                 guild_id=77,
@@ -1211,6 +1331,33 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertIn("nothing automatically becomes Legacy/Core", rendered)
             self.assertIn(("show_episode", 3), lane_counts)
             self.assertGreaterEqual(rendered_count, 3)
+
+            unrelated_packet = build_packet(
+                conn,
+                replace(
+                    request,
+                    user_text="How do I make pasta?",
+                    frame_subject_requirement="required",
+                ),
+                persist=False,
+                environ={
+                    "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                    "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                    "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                    "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+                    "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+                    "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+                },
+            )
+            self.assertFalse(
+                unrelated_packet
+                and any(
+                    item.lane == "show_episode"
+                    for item in unrelated_packet.items
+                )
+            )
 
             conn.execute(
                 f"DELETE FROM {TIKTOK_SHOW_EVIDENCE_TABLE} WHERE guild_id=77"
