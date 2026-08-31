@@ -10601,7 +10601,7 @@ def build_tiktok_show_analysis_correction_prompt(
 
 _SHOW_EPISODE_REFUSAL_PATTERNS = (
     r"\bdo not have (?:the )?(?:detailed |specific )?(?:incident |show )?logs\b",
-    r"\b(?:do not|don't) have.{0,100}\b(?:broadcast |show |chat )?(?:logs?|feed|recordings?)\b",
+    r"\b(?:do not|don't) have(?!\s+to\b).{0,100}\b(?:broadcast |show |chat )?(?:logs?|feed|recordings?)\b",
     r"\b(?:logs?|timeline|records?|telemetry) (?:is|are) not (?:active|available|loaded|piped)\b",
     r"\bnot piped directly into (?:this|my) (?:public )?(?:telemetry|feed|stream)\b",
     r"\bwhatever (?:happened|unfolded).{0,80}\bstays? between\b",

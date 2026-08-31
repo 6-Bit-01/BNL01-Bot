@@ -86,6 +86,24 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
             "show_evidence_refused",
         )
 
+    def test_guard_accepts_grounded_no_obligation_language(self):
+        for response in (
+            "We don't have to show logs to establish the chronology: First "
+            "Signal opened the retained sequence, Alex discussed its green "
+            "visuals, and the Wheel later moved Queue Light next.",
+            "We do not have to dump the chat feed to answer this: First Signal "
+            "opened the retained sequence, Alex discussed its green visuals, "
+            "and the Wheel later moved Queue Light next.",
+        ):
+            with self.subTest(response=response):
+                self.assertEqual(
+                    bnl01_bot.tiktok_show_episode_response_failure(
+                        response,
+                        RAW_PROMPT,
+                    ),
+                    "",
+                )
+
     def test_guard_rejects_invented_clock_time(self):
         response = (
             "At 7:05 PM, Neon Fox's First Signal began, then Queue Light "
