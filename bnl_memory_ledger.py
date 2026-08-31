@@ -31,6 +31,7 @@ from bnl_canon_source_contract import (
     is_public_usable,
     map_channel_policy_visibility,
     map_route_source_label,
+    show_queue_evidence_authorization_receipt_valid,
 )
 
 MEMORY_LEDGER_SCHEMA_VERSION = "memory_ledger_v1"
@@ -7580,6 +7581,9 @@ def _tiktok_show_occurrence_identity(
             != str(source_digest or "")
             or computed_digest != str(source_digest or "")
             or str(ledger.get("lifecycle") or "") != "finalized"
+            or not show_queue_evidence_authorization_receipt_valid(
+                ledger.get("sourceAuthorization")
+            )
         ):
             continue
         evidence_rows = [

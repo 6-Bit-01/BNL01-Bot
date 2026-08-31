@@ -20,9 +20,10 @@ import stat
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 
 SCHEMA_VERSION = 2
@@ -56,6 +57,11 @@ _PUBLIC_EVENT_TYPES = frozenset({"comment", "question"})
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SPACE_RE = re.compile(r"\s+")
 _HANDLE_RE = re.compile(r"^[A-Za-z0-9._]+$")
+_PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+_SHOW_DATE_SCOPE_RE = re.compile(
+    r"\b(?:tiktok|tik tok|barcode radio|broadcast|show|episode|live|stream)\b",
+    re.IGNORECASE,
+)
 
 _LIVE_REACTION_PATTERNS = (
     r"\b(?:tiktok|tik tok)(?: live| stream)? (?:chat|comments?)\b",
@@ -511,6 +517,8 @@ def tiktok_show_records(archive: Any) -> list[Dict[str, Any]]:
 def select_show_for_tiktok_analysis(
     archive: Any,
     user_text: str,
+    *,
+    now: Any = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Select the bounded public show record implied by one analytics request."""
 
@@ -523,7 +531,34 @@ def select_show_for_tiktok_analysis(
         for source_key, show in candidates:
             if _bounded_text(show.get("showDate"), 40) == explicit_date.group(0):
                 return dict(show), source_key
-    if re.search(r"\b(?:last|previous|prior) show\b", normalized):
+        return {}, "none"
+    relative_date = ""
+    if _SHOW_DATE_SCOPE_RE.search(normalized) and re.search(
+        r"\b(?:yesterday|last night)\b",
+        normalized,
+    ):
+        if isinstance(now, datetime):
+            current = now
+        elif now is not None:
+            try:
+                current = datetime.fromisoformat(
+                    str(now).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                current = datetime.now(timezone.utc)
+        else:
+            current = datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        relative_date = (
+            current.astimezone(_PACIFIC_TZ).date() - timedelta(days=1)
+        ).isoformat()
+    if relative_date:
+        for source_key, show in candidates:
+            if _bounded_text(show.get("showDate"), 40) == relative_date:
+                return dict(show), source_key
+        return {}, "none"
+    if re.search(r"\b(?:last|previous|prior|past) show\b", normalized):
         for source_key, show in candidates:
             if source_key in {"latestShow", "shows"}:
                 return dict(show), source_key

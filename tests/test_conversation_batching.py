@@ -1332,6 +1332,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self._prime_flush(channel, request)
         with (
             self._flush_runtime(channel.id, generate),
+            mock.patch.dict(
+                os.environ,
+                {"BNL_QUEUE_PRODUCTION_ENABLED": "true"},
+                clear=False,
+            ),
             mock.patch.object(
                 bnl01_bot,
                 "resolve_channel_policy",
@@ -1385,7 +1390,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "missing-public-show-batch-test.db",
             guild_id=channel.guild.id,
             user_text=request,
-            subject_user_id=100,
+            subject_user_id=0,
         )
         self.assertEqual(len(assessment_calls), 1)
         self.assertIn(

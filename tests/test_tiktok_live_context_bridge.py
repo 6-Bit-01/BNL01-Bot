@@ -238,6 +238,27 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
         self.assertEqual(show["sessionId"], "latest")
         self.assertEqual(source, "latestShow")
 
+        for query in (
+            "What happened during yesterday's BARCODE Radio show?",
+            "Give me the show timeline from last night.",
+            "Summarize the past show.",
+        ):
+            with self.subTest(query=query):
+                show, source = select_show_for_tiktok_analysis(
+                    archive,
+                    query,
+                    now="2026-08-29T12:00:00-07:00",
+                )
+                self.assertEqual(show["sessionId"], "latest")
+                self.assertEqual(source, "latestShow")
+
+        missing, source = select_show_for_tiktok_analysis(
+            archive,
+            "Give me the 2026-08-27 show timeline.",
+        )
+        self.assertEqual(missing, {})
+        self.assertEqual(source, "none")
+
     def test_whole_show_topics_receive_actual_chat_evidence_and_lexical_support(self):
         show = {
             "sessionId": "show-topic-evidence",

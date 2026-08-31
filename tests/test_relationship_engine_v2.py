@@ -167,6 +167,7 @@ def _case_proactive_consent_owner_combines_settings_preferences_and_errors():
     )
 
 def _case_legacy_show_continuity_uses_effective_consent_and_fails_closed(monkeypatch):
+    monkeypatch.setenv('BNL_QUEUE_PRODUCTION_ENABLED','true')
     tmp=tempfile.NamedTemporaryFile(delete=False); tmp.close(); monkeypatch.setattr(bnl01_bot,'DB_FILE',tmp.name); bnl01_bot.init_db()
     selected=[]
     monkeypatch.setattr(

@@ -1,8 +1,11 @@
+import copy
+import hashlib
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -251,6 +254,38 @@ def archived_show():
                 "track": None,
             },
         ],
+    }
+
+
+ENABLED_QUEUE_ENV = {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}
+
+
+def authorized_read_model(archive):
+    return {
+        "ok": True,
+        "version": 1,
+        "source": "barcode-network-site",
+        "publicOnly": True,
+        "accessScope": "public",
+        "capabilities": {"queueProduction": True},
+        "sections": {
+            "archive": {
+                "available": True,
+                "reason": None,
+                "schemaVersion": "queue_public_history_projection_v1",
+                "source": "queue_bnl_history_projection",
+                "visibility": "public_safe",
+                "accessScope": "public",
+                "historyCoverageStartedAt": "2026-08-24",
+                "sourceRevision": 42,
+                "sourceDigest": "a" * 64,
+                "memoryDefault": "do_not_store",
+                "sourceFileDefault": "review_evidence_only",
+                "publicDossierDefault": "not_automatic",
+                "personalHistory": None,
+                **archive,
+            }
+        },
     }
 
 
@@ -661,22 +696,17 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "bnl.db")
             self.seed_source_and_memory(db_file)
-            read_model = {
-                "ok": True,
-                "version": 1,
-                "sections": {
-                    "archive": {
-                        "currentShow": None,
-                        "latestShow": archived_show(),
-                        "shows": [],
-                    }
-                },
-            }
+            read_model = authorized_read_model({
+                "currentShow": None,
+                "latestShow": archived_show(),
+                "shows": [],
+            })
             first = sync_tiktok_show_evidence_ledgers(
                 db_file,
                 guild_id=77,
                 read_model=read_model,
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             self.assertEqual(first["status"], "completed")
             self.assertEqual(first["showsWritten"], 1)
@@ -740,24 +770,375 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 guild_id=77,
                 read_model=read_model,
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             self.assertEqual(second["showsWritten"], 0)
             self.assertEqual(second["showsUnchanged"], 1)
             self.assertEqual(second["projectionDeduplicated"], 0)
 
+    def test_sync_requires_exact_public_production_archive_authorization(self):
+        valid = authorized_read_model({
+            "currentShow": None,
+            "latestShow": archived_show(),
+            "shows": [],
+        })
+        cases = []
+
+        local_off = copy.deepcopy(valid)
+        cases.append(("local_off", local_off, {}, "local_gate_disabled"))
+
+        website_off = copy.deepcopy(valid)
+        website_off["capabilities"]["queueProduction"] = False
+        cases.append((
+            "website_off",
+            website_off,
+            ENABLED_QUEUE_ENV,
+            "website_capability_missing_or_false",
+        ))
+
+        private = copy.deepcopy(valid)
+        private["publicOnly"] = False
+        private["accessScope"] = "private"
+        private["sections"]["archive"]["accessScope"] = "private"
+        private["sections"]["archive"]["visibility"] = "bnl_private_safe"
+        cases.append((
+            "private_scope",
+            private,
+            ENABLED_QUEUE_ENV,
+            "private_access_not_allowed",
+        ))
+
+        unavailable = copy.deepcopy(valid)
+        unavailable["sections"]["archive"]["available"] = False
+        unavailable["sections"]["archive"]["reason"] = (
+            "queue_projection_unavailable"
+        )
+        cases.append((
+            "unavailable",
+            unavailable,
+            ENABLED_QUEUE_ENV,
+            "archive_public_contract_invalid",
+        ))
+
+        malformed = copy.deepcopy(valid)
+        malformed["sections"]["archive"]["sourceDigest"] = "not-a-digest"
+        cases.append((
+            "malformed",
+            malformed,
+            ENABLED_QUEUE_ENV,
+            "archive_public_contract_invalid",
+        ))
+
+        simulation = copy.deepcopy(valid)
+        simulation["sections"]["archive"]["latestShow"]["trackRoster"][0][
+            "isSimulation"
+        ] = True
+        cases.append((
+            "simulation",
+            simulation,
+            ENABLED_QUEUE_ENV,
+            "archive_public_contract_invalid",
+        ))
+
+        for label, model, environ, reason in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                db_file = str(Path(directory) / "bnl.db")
+                result = sync_tiktok_show_evidence_ledgers(
+                    db_file,
+                    guild_id=77,
+                    read_model=model,
+                    artist_identity_index=artist_index(),
+                    environ=environ,
+                )
+                self.assertEqual(result["status"], "skipped")
+                self.assertEqual(result["reason"], reason)
+                self.assertFalse(result["authorizationEligible"])
+                self.assertEqual(result["showsWritten"], 0)
+                self.assertFalse(Path(db_file).exists())
+
+    def test_authorization_receipt_quarantines_unreceipted_show_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            read_model = authorized_read_model({
+                "currentShow": None,
+                "latestShow": archived_show(),
+                "shows": [],
+            })
+            result = sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=read_model,
+                artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
+            )
+            self.assertTrue(result["authorizationEligible"])
+
+            conn = sqlite3.connect(db_file)
+            stored = json.loads(conn.execute(
+                f"SELECT ledger_json FROM {TIKTOK_SHOW_EVIDENCE_TABLE}"
+            ).fetchone()[0])
+            receipt = stored["sourceAuthorization"]
+            self.assertEqual(
+                receipt["contractVersion"],
+                "show_queue_evidence_authorization_v1",
+            )
+            self.assertEqual(receipt["accessScope"], "public")
+            self.assertTrue(receipt["websiteQueueProduction"])
+
+            legacy = dict(stored)
+            legacy.pop("sourceAuthorization")
+            legacy.pop("sourceDigest")
+            legacy_digest = hashlib.sha256(
+                json.dumps(
+                    legacy,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            legacy["sourceDigest"] = legacy_digest
+            conn.execute(
+                f"UPDATE {TIKTOK_SHOW_EVIDENCE_TABLE} "
+                "SET source_digest=?,ledger_json=?",
+                (
+                    legacy_digest,
+                    json.dumps(
+                        legacy,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            self.assertEqual(
+                build_tiktok_show_evidence_context(
+                    db_file,
+                    guild_id=77,
+                    user_text="Give me the 2026-08-28 show timeline.",
+                ),
+                "",
+            )
+
+            repaired = sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=read_model,
+                artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
+            )
+            self.assertEqual(repaired["showsWritten"], 1)
+            self.assertIn(
+                "Durable BARCODE Radio show episode memory:",
+                build_tiktok_show_evidence_context(
+                    db_file,
+                    guild_id=77,
+                    user_text="Give me the 2026-08-28 show timeline.",
+                ),
+            )
+
+    def test_sync_preserves_captured_exchange_after_conversation_pruning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            provisional_show = json.loads(json.dumps(archived_show()))
+            provisional_show["status"] = "live"
+            provisional_show["milestones"] = [
+                event
+                for event in provisional_show["milestones"]
+                if event["eventType"] != "session_archived"
+            ]
+            provisional_model = authorized_read_model({
+                "currentShow": provisional_show,
+                "latestShow": None,
+                "shows": [],
+            })
+            first = sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=provisional_model,
+                artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
+            )
+            self.assertEqual(first["showsWritten"], 1)
+            self.assertEqual(first["showsFinalized"], 0)
+
+            conn = sqlite3.connect(db_file)
+            original_json = conn.execute(
+                f"SELECT ledger_json "
+                f"FROM {TIKTOK_SHOW_EVIDENCE_TABLE}"
+            ).fetchone()[0]
+            conn.execute("DELETE FROM conversations WHERE id IN (101,102)")
+            conn.commit()
+            conn.close()
+            original = json.loads(original_json)
+            self.assertEqual(original["lifecycle"], "provisional")
+            self.assertEqual(
+                sum(
+                    1
+                    for exchange in original["discordInteractions"]
+                    if isinstance(exchange.get("bnlResponse"), dict)
+                ),
+                1,
+            )
+
+            finalized_model = authorized_read_model({
+                "currentShow": None,
+                "latestShow": archived_show(),
+                "shows": [],
+            })
+
+            rebuilt = sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=finalized_model,
+                artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
+            )
+            self.assertEqual(rebuilt["showsWritten"], 1)
+            self.assertEqual(rebuilt["showsFinalized"], 1)
+            self.assertEqual(rebuilt["discordInteractions"], 2)
+            self.assertEqual(rebuilt["discordExchanges"], 1)
+
+            conn = sqlite3.connect(db_file)
+            rebuilt_json = conn.execute(
+                f"SELECT ledger_json "
+                f"FROM {TIKTOK_SHOW_EVIDENCE_TABLE}"
+            ).fetchone()[0]
+            conn.close()
+            stored = json.loads(rebuilt_json)
+            self.assertEqual(stored["lifecycle"], "finalized")
+            alex = next(
+                exchange
+                for exchange in stored["discordInteractions"]
+                if exchange["subjectRef"] == "discord_user:42"
+            )
+            self.assertEqual(len(alex["userMessages"]), 1)
+            self.assertEqual(
+                alex["userMessages"][0]["conversationRowId"],
+                101,
+            )
+            self.assertEqual(
+                alex["bnlResponse"]["text"],
+                "Yes—the Wheel confirmed Queue Light, and it is playing now.",
+            )
+    def test_public_show_boundaries_normalize_the_configured_owner_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            ensure_journal_source_schema(db_file)
+            for event in durable_events():
+                result = record_source_event(
+                    db_file,
+                    guild_id=77,
+                    source_kind="tiktok_live_chat",
+                    source_key=event["event_id"],
+                    occurred_at_ms=event["occurred_at_ms"],
+                    raw_text=event["raw_text"],
+                    sanitized_summary=event["raw_text"],
+                    channel_policy="public_context",
+                    subject_ref=event["subject_ref"],
+                    private_display_name=(
+                        "Test Member"
+                        if event["subject_ref"] == "discord_user:42"
+                        else event["private_display_name"]
+                    ),
+                    public_usable=True,
+                    metadata=event["metadata"],
+                )
+                self.assertTrue(result.ok)
+            self.seed_conversations(db_file)
+            conn = sqlite3.connect(db_file)
+            conn.execute(
+                """
+                UPDATE conversations SET user_name='Test Member'
+                WHERE user_id=42 AND role='user'
+                """
+            )
+            conn.commit()
+            conn.close()
+            self.seed_shadow_memory(db_file)
+            read_model = authorized_read_model({
+                "currentShow": None,
+                "latestShow": archived_show(),
+                "shows": [],
+            })
+
+            with mock.patch.dict(
+                os.environ,
+                {"BNL_OWNER_USER_ID": "42"},
+                clear=False,
+            ):
+                result = sync_tiktok_show_evidence_ledgers(
+                    db_file,
+                    guild_id=77,
+                    read_model=read_model,
+                    artist_identity_index=artist_index(),
+                    environ=ENABLED_QUEUE_ENV,
+                )
+                self.assertEqual(result["status"], "completed")
+
+                conn = sqlite3.connect(db_file)
+                raw_ledger = conn.execute(
+                    f"SELECT ledger_json FROM {TIKTOK_SHOW_EVIDENCE_TABLE}"
+                ).fetchone()[0]
+                projection_rows = conn.execute(
+                    """
+                    SELECT subject_display_name,normalized_value
+                    FROM memory_ledger_entries
+                    WHERE source_table='tiktok_show_evidence'
+                      AND public_usable=1
+                    ORDER BY entry_id
+                    """
+                ).fetchall()
+                projection_participants = conn.execute(
+                    """
+                    SELECT participant.display_name
+                    FROM memory_ledger_participants AS participant
+                    JOIN memory_ledger_entries AS entry
+                      ON entry.entry_id=participant.entry_id
+                    WHERE entry.source_table='tiktok_show_evidence'
+                      AND entry.public_usable=1
+                    ORDER BY participant.entry_id,participant.order_index
+                    """
+                ).fetchall()
+                packet_items = select_tiktok_show_episode_context_items(
+                    conn,
+                    guild_id=77,
+                    user_text="What did 6 Bit say during yesterday's show?",
+                    now="2026-08-29T12:00:00-07:00",
+                )
+                conn.close()
+                legacy_context = build_tiktok_show_evidence_context(
+                    db_file,
+                    guild_id=77,
+                    user_text="What did 6 Bit say during the show?",
+                )
+
+            public_projection = json.dumps(
+                [projection_rows, projection_participants],
+                ensure_ascii=False,
+            )
+            packet_context = "\n".join(item.text for item in packet_items)
+            self.assertIn("Test Member", raw_ledger)
+            self.assertNotIn("Test Member", public_projection)
+            self.assertNotIn("Test Member", packet_context)
+            self.assertNotIn("Test Member", legacy_context)
+            self.assertIn("6 Bit", public_projection)
+            self.assertIn("6 Bit", packet_context)
+            self.assertIn("6 Bit", legacy_context)
+
     def test_finalization_refreshes_existing_living_canon_owner_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "bnl.db")
             self.seed_source_and_memory(db_file)
-            read_model = {
-                "sections": {
-                    "archive": {
-                        "currentShow": None,
-                        "latestShow": archived_show(),
-                        "shows": [],
-                    }
-                }
-            }
+            read_model = authorized_read_model({
+                "currentShow": None,
+                "latestShow": archived_show(),
+                "shows": [],
+            })
             with mock.patch.dict(
                 os.environ,
                 {
@@ -771,6 +1152,7 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                     guild_id=77,
                     read_model=read_model,
                     artist_identity_index=artist_index(),
+                    environ=ENABLED_QUEUE_ENV,
                 )
 
             self.assertEqual(result["livingCanonSubjectsEvaluated"], 1)
@@ -801,20 +1183,17 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 db_file,
                 include_shadow_memory=False,
             )
-            read_model = {
-                "sections": {
-                    "archive": {
-                        "currentShow": archived_show(),
-                        "latestShow": None,
-                        "shows": [],
-                    }
-                }
-            }
+            read_model = authorized_read_model({
+                "currentShow": archived_show(),
+                "latestShow": None,
+                "shows": [],
+            })
             first = sync_tiktok_show_evidence_ledgers(
                 db_file,
                 guild_id=77,
                 read_model=read_model,
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             self.assertEqual(first["projectionInserted"], 6)
             conn = sqlite3.connect(db_file)
@@ -838,6 +1217,7 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 guild_id=77,
                 read_model=read_model,
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             self.assertEqual(second["showsUnchanged"], 1)
             self.assertEqual(second["projectionInserted"], 0)
@@ -862,16 +1242,13 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             sync_tiktok_show_evidence_ledgers(
                 db_file,
                 guild_id=77,
-                read_model={
-                    "sections": {
-                        "archive": {
-                            "currentShow": archived_show(),
-                            "latestShow": None,
-                            "shows": [],
-                        }
-                    }
-                },
+                read_model=authorized_read_model({
+                    "currentShow": archived_show(),
+                    "latestShow": None,
+                    "shows": [],
+                }),
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
 
             broad = build_tiktok_show_evidence_context(
@@ -984,16 +1361,13 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             sync_tiktok_show_evidence_ledgers(
                 db_file,
                 guild_id=77,
-                read_model={
-                    "sections": {
-                        "archive": {
-                            "currentShow": None,
-                            "latestShow": archived_show(),
-                            "shows": [],
-                        }
-                    }
-                },
+                read_model=authorized_read_model({
+                    "currentShow": None,
+                    "latestShow": archived_show(),
+                    "shows": [],
+                }),
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             conn = sqlite3.connect(db_file)
             items = select_tiktok_show_episode_context_items(
@@ -1042,6 +1416,33 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 now="2026-08-29T12:00:00-07:00",
             )
             self.assertEqual(unrelated, ())
+            same_day_unrelated = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="How are you doing today?",
+                subject_user_id=42,
+                allow_subject_continuity=True,
+                now="2026-08-28T12:00:00-07:00",
+            )
+            self.assertEqual(same_day_unrelated, ())
+            prior_day_unrelated = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="What did you do yesterday?",
+                subject_user_id=42,
+                allow_subject_continuity=True,
+                now="2026-08-29T12:00:00-07:00",
+            )
+            self.assertEqual(prior_day_unrelated, ())
+            proactive_unrelated = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text="How do I make pasta?",
+                subject_user_id=42,
+                allow_subject_continuity=True,
+                now="2026-08-29T12:00:00-07:00",
+            )
+            self.assertEqual(proactive_unrelated, ())
             explicit_self = select_tiktok_show_episode_context_items(
                 conn,
                 guild_id=77,
@@ -1095,16 +1496,13 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             sync_tiktok_show_evidence_ledgers(
                 db_file,
                 guild_id=77,
-                read_model={
-                    "sections": {
-                        "archive": {
-                            "currentShow": None,
-                            "latestShow": archived_show(),
-                            "shows": [older_show],
-                        }
-                    }
-                },
+                read_model=authorized_read_model({
+                    "currentShow": None,
+                    "latestShow": archived_show(),
+                    "shows": [older_show],
+                }),
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             conn = sqlite3.connect(db_file)
             items = select_tiktok_show_episode_context_items(
@@ -1138,16 +1536,13 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             sync_tiktok_show_evidence_ledgers(
                 db_file,
                 guild_id=77,
-                read_model={
-                    "sections": {
-                        "archive": {
-                            "currentShow": None,
-                            "latestShow": archived_show(),
-                            "shows": [],
-                        }
-                    }
-                },
+                read_model=authorized_read_model({
+                    "currentShow": None,
+                    "latestShow": archived_show(),
+                    "shows": [],
+                }),
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             conn = sqlite3.connect(db_file)
             request = IntelligencePacketRequest(
@@ -1179,6 +1574,7 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                     "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
                     "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
                     "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+                    "BNL_QUEUE_PRODUCTION_ENABLED": "true",
                 },
             )
             self.assertIsNotNone(packet)
@@ -1198,7 +1594,16 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertTrue(all(not item.canon_status for item in show_items))
             self.assertTrue(all(not item.root_identities for item in show_items))
             self.assertEqual(packet.diagnostics.invalid_invariants, [])
-            self.assertTrue(revalidate_packet(conn, packet).valid)
+            self.assertTrue(
+                revalidate_packet(
+                    conn,
+                    packet,
+                    environ=ENABLED_QUEUE_ENV,
+                ).valid
+            )
+            self.assertFalse(
+                revalidate_packet(conn, packet, environ={}).valid
+            )
             rendered, lane_counts, rendered_count, _digests = (
                 render_packet_context(
                     packet,
@@ -1213,11 +1618,44 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertIn(("show_episode", 3), lane_counts)
             self.assertGreaterEqual(rendered_count, 3)
 
+            unrelated_packet = build_packet(
+                conn,
+                replace(
+                    request,
+                    user_text="How do I make pasta?",
+                    frame_subject_requirement="required",
+                ),
+                persist=False,
+                environ={
+                    "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                    "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                    "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                    "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+                    "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+                    "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+                },
+            )
+            self.assertFalse(
+                unrelated_packet
+                and any(
+                    item.lane == "show_episode"
+                    for item in unrelated_packet.items
+                )
+            )
+
             conn.execute(
                 f"DELETE FROM {TIKTOK_SHOW_EVIDENCE_TABLE} WHERE guild_id=77"
             )
             conn.commit()
-            self.assertFalse(revalidate_packet(conn, packet).valid)
+            self.assertFalse(
+                revalidate_packet(
+                    conn,
+                    packet,
+                    environ=ENABLED_QUEUE_ENV,
+                ).valid
+            )
             conn.close()
 
     def test_packet_show_continuity_honors_member_proactive_opt_out(self):
@@ -1227,16 +1665,13 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             sync_tiktok_show_evidence_ledgers(
                 db_file,
                 guild_id=77,
-                read_model={
-                    "sections": {
-                        "archive": {
-                            "currentShow": None,
-                            "latestShow": archived_show(),
-                            "shows": [],
-                        }
-                    }
-                },
+                read_model=authorized_read_model({
+                    "currentShow": None,
+                    "latestShow": archived_show(),
+                    "shows": [],
+                }),
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             conn = sqlite3.connect(db_file)
             request = IntelligencePacketRequest(
@@ -1265,6 +1700,7 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
                 "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
                 "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+                "BNL_QUEUE_PRODUCTION_ENABLED": "true",
             }
             allowed_packet = build_packet(
                 conn,
@@ -1310,16 +1746,13 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             sync_tiktok_show_evidence_ledgers(
                 db_file,
                 guild_id=77,
-                read_model={
-                    "sections": {
-                        "archive": {
-                            "currentShow": archived_show(),
-                            "latestShow": None,
-                            "shows": [],
-                        }
-                    }
-                },
+                read_model=authorized_read_model({
+                    "currentShow": archived_show(),
+                    "latestShow": None,
+                    "shows": [],
+                }),
                 artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
             )
             conn = sqlite3.connect(db_file)
             ensure_governance_schema(conn)
