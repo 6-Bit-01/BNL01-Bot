@@ -744,6 +744,114 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertEqual(second["showsUnchanged"], 1)
             self.assertEqual(second["projectionDeduplicated"], 0)
 
+    def test_public_show_boundaries_normalize_the_configured_owner_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            ensure_journal_source_schema(db_file)
+            for event in durable_events():
+                result = record_source_event(
+                    db_file,
+                    guild_id=77,
+                    source_kind="tiktok_live_chat",
+                    source_key=event["event_id"],
+                    occurred_at_ms=event["occurred_at_ms"],
+                    raw_text=event["raw_text"],
+                    sanitized_summary=event["raw_text"],
+                    channel_policy="public_context",
+                    subject_ref=event["subject_ref"],
+                    private_display_name=(
+                        "Test Member"
+                        if event["subject_ref"] == "discord_user:42"
+                        else event["private_display_name"]
+                    ),
+                    public_usable=True,
+                    metadata=event["metadata"],
+                )
+                self.assertTrue(result.ok)
+            self.seed_conversations(db_file)
+            conn = sqlite3.connect(db_file)
+            conn.execute(
+                """
+                UPDATE conversations SET user_name='Test Member'
+                WHERE user_id=42 AND role='user'
+                """
+            )
+            conn.commit()
+            conn.close()
+            self.seed_shadow_memory(db_file)
+            read_model = {
+                "sections": {
+                    "archive": {
+                        "currentShow": None,
+                        "latestShow": archived_show(),
+                        "shows": [],
+                    }
+                }
+            }
+
+            with mock.patch.dict(
+                os.environ,
+                {"BNL_OWNER_USER_ID": "42"},
+                clear=False,
+            ):
+                result = sync_tiktok_show_evidence_ledgers(
+                    db_file,
+                    guild_id=77,
+                    read_model=read_model,
+                    artist_identity_index=artist_index(),
+                )
+                self.assertEqual(result["status"], "completed")
+
+                conn = sqlite3.connect(db_file)
+                raw_ledger = conn.execute(
+                    f"SELECT ledger_json FROM {TIKTOK_SHOW_EVIDENCE_TABLE}"
+                ).fetchone()[0]
+                projection_rows = conn.execute(
+                    """
+                    SELECT subject_display_name,normalized_value
+                    FROM memory_ledger_entries
+                    WHERE source_table='tiktok_show_evidence'
+                      AND public_usable=1
+                    ORDER BY entry_id
+                    """
+                ).fetchall()
+                projection_participants = conn.execute(
+                    """
+                    SELECT participant.display_name
+                    FROM memory_ledger_participants AS participant
+                    JOIN memory_ledger_entries AS entry
+                      ON entry.entry_id=participant.entry_id
+                    WHERE entry.source_table='tiktok_show_evidence'
+                      AND entry.public_usable=1
+                    ORDER BY participant.entry_id,participant.order_index
+                    """
+                ).fetchall()
+                packet_items = select_tiktok_show_episode_context_items(
+                    conn,
+                    guild_id=77,
+                    user_text="What did 6 Bit say during yesterday's show?",
+                    now="2026-08-29T12:00:00-07:00",
+                )
+                conn.close()
+                legacy_context = build_tiktok_show_evidence_context(
+                    db_file,
+                    guild_id=77,
+                    user_text="What did 6 Bit say during the show?",
+                )
+
+            public_projection = json.dumps(
+                [projection_rows, projection_participants],
+                ensure_ascii=False,
+            )
+            packet_context = "\n".join(item.text for item in packet_items)
+            self.assertIn("Test Member", raw_ledger)
+            self.assertNotIn("Test Member", public_projection)
+            self.assertNotIn("Test Member", packet_context)
+            self.assertNotIn("Test Member", legacy_context)
+            self.assertIn("6 Bit", public_projection)
+            self.assertIn("6 Bit", packet_context)
+            self.assertIn("6 Bit", legacy_context)
+
     def test_finalization_refreshes_existing_living_canon_owner_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "bnl.db")

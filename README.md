@@ -148,7 +148,10 @@ source-owned subject references may connect the same participant across episode
 surfaces, while name/handle resemblance and queue attribution alone never merge
 identities. Episode projections remain above Community Canon, follow Memory
 Ledger lineage/supersession, and are invalidated by the existing complete-delete
-path when a bound member exercises deletion.
+path when a bound member exercises deletion. When the configured owner appears
+in source evidence, public-safe episode projections and recall render that
+subject only as `6 Bit`; a retained private source label never enters public
+memory or prompt context.
 
 Declared TikTok owner handles `@six.bit` and `@pr0x60` resolve to the same BNL
 owner subject; `PR0X`/`Prox` is the side-account display identity. Other known
