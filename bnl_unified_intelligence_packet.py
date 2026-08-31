@@ -84,7 +84,7 @@ from bnl_moment_engine import (
     select_situation_aware_episode_gists,
 )
 from bnl_profile_points import material_profile_point_map
-from bnl_relationship_engine import shadow_packet_posture
+from bnl_relationship_engine import proactive_consent_decision, shadow_packet_posture
 from bnl_tiktok_show_ledger import (
     select_tiktok_show_episode_context_items,
     tiktok_show_episode_context_item_version,
@@ -3000,15 +3000,36 @@ def _show_episode_items(
     attributed Community Canon / Open Signal utterances.
     """
 
+    requested_subject_user_id = int(request.subject_user_id or 0)
+    subject_user_id = requested_subject_user_id
+    consent_allowed = requested_subject_user_id <= 0
+    consent_reason = "proactive_consent_allowed"
+    if requested_subject_user_id > 0:
+        consent_allowed, consent_reason = proactive_consent_decision(
+            conn,
+            guild_id=int(request.guild_id or 0),
+            user_id=requested_subject_user_id,
+        )
+        if not consent_allowed:
+            subject_user_id = 0
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="show_episode",
+                reason=consent_reason,
+                source_class="evidence_projection",
+            )
     allow_subject_continuity = bool(
-        str(request.frame_subject_requirement or "").strip().lower()
+        consent_allowed
+        and subject_user_id > 0
+        and str(request.frame_subject_requirement or "").strip().lower()
         == "required"
     )
     selected = select_tiktok_show_episode_context_items(
         conn,
         guild_id=int(request.guild_id or 0),
         user_text=str(request.user_text or "")[:8000],
-        subject_user_id=int(request.subject_user_id or 0),
+        subject_user_id=subject_user_id,
         allow_subject_continuity=allow_subject_continuity,
         now=request.now or None,
     )
@@ -5696,14 +5717,27 @@ def _show_episode_version(
     packet: UnifiedIntelligencePacket,
     item: IntelligencePacketItem,
 ) -> str:
+    requested_subject_user_id = int(packet.request.subject_user_id or 0)
+    subject_user_id = requested_subject_user_id
+    consent_allowed = requested_subject_user_id <= 0
+    if requested_subject_user_id > 0:
+        consent_allowed, _reason = proactive_consent_decision(
+            conn,
+            guild_id=int(packet.request.guild_id or 0),
+            user_id=requested_subject_user_id,
+        )
+        if not consent_allowed:
+            subject_user_id = 0
     return tiktok_show_episode_context_item_version(
         conn,
         guild_id=int(packet.request.guild_id or 0),
         user_text=str(packet.request.user_text or "")[:8000],
-        subject_user_id=int(packet.request.subject_user_id or 0),
+        subject_user_id=subject_user_id,
         source_ref=str(item.revalidation_key or item.source_ref or ""),
         allow_subject_continuity=bool(
-            str(packet.request.frame_subject_requirement or "")
+            consent_allowed
+            and subject_user_id > 0
+            and str(packet.request.frame_subject_requirement or "")
             .strip()
             .lower()
             == "required"

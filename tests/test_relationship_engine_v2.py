@@ -142,6 +142,48 @@ def _case_settings_view_live_off_and_toggle_controls():
     set_member_setting(c,guild_id=1,user_id=2,proactive_enabled=True,playful_rivalry_enabled=True)
     assert 'proactive=enabled' in settings_summary(c,guild_id=1,user_id=2) and 'playful_rivalry=enabled' in settings_summary(c,guild_id=1,user_id=2)
 
+def _case_proactive_consent_owner_combines_settings_preferences_and_errors():
+    c=conn()
+    assert proactive_consent_decision(c,guild_id=1,user_id=2) == (
+        True,
+        'proactive_consent_allowed',
+    )
+    obs(c,"don't follow up",1)
+    assert proactive_consent_decision(c,guild_id=1,user_id=2) == (
+        False,
+        'member_opt_out',
+    )
+    set_member_setting(c,guild_id=1,user_id=2,proactive_enabled=True)
+    assert proactive_consent_decision(c,guild_id=1,user_id=2)[0]
+    set_member_setting(c,guild_id=1,user_id=2,proactive_enabled=False)
+    assert proactive_consent_decision(c,guild_id=1,user_id=2) == (
+        False,
+        'member_opt_out',
+    )
+    c.close()
+    assert proactive_consent_decision(c,guild_id=1,user_id=2) == (
+        False,
+        'proactive_consent_lookup_failed',
+    )
+
+def _case_legacy_show_continuity_uses_effective_consent_and_fails_closed(monkeypatch):
+    tmp=tempfile.NamedTemporaryFile(delete=False); tmp.close(); monkeypatch.setattr(bnl01_bot,'DB_FILE',tmp.name); bnl01_bot.init_db()
+    selected=[]
+    monkeypatch.setattr(
+        bnl01_bot,
+        'build_tiktok_show_evidence_context',
+        lambda _db, **kwargs: selected.append(kwargs['subject_user_id']) or 'context',
+    )
+    assert bnl01_bot.build_tiktok_show_evidence_context_for_turn(guild_id=1,user_text='What happened?',subject_user_id=2) == 'context'
+    assert selected[-1] == 2
+    with sqlite3.connect(tmp.name) as c:
+        set_member_setting(c,guild_id=1,user_id=2,proactive_enabled=False)
+    bnl01_bot.build_tiktok_show_evidence_context_for_turn(guild_id=1,user_text='What happened?',subject_user_id=2)
+    assert selected[-1] == 0
+    monkeypatch.setattr(bnl01_bot,'DB_FILE',os.path.join(tmp.name,'unavailable.db'))
+    bnl01_bot.build_tiktok_show_evidence_context_for_turn(guild_id=1,user_text='What happened?',subject_user_id=2)
+    assert selected[-1] == 0
+
 def _case_correction_forget_deactivates_underlying_event_and_delete_removes_projection():
     c=conn(); eid=obs(c,'thank you',1); assert state(c)['rapport'] > 0
     led=c.execute('select ledger_entry_id from relationship_event_ledger_links_v2 where event_id=?',(eid,)).fetchone()[0]

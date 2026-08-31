@@ -133,11 +133,11 @@ from bnl_moment_engine import (
 from bnl_relationship_engine import (
     active_engagement_live_enabled as relationship_v2_active_engagement_live_enabled,
     ensure_relationship_v2_schema,
-    get_member_settings as get_relationship_v2_member_settings,
     governed_summary as governed_relationship_v2_summary,
     live_enabled as relationship_v2_live_enabled,
     observe_message as observe_relationship_v2_message,
     plan_engagement as plan_relationship_v2_engagement,
+    proactive_consent_decision as relationship_v2_proactive_consent_decision,
     refresh_moment_links as refresh_relationship_v2_moment_links,
     set_member_setting as set_relationship_v2_member_setting,
     settings_summary as relationship_v2_settings_summary,
@@ -3350,16 +3350,16 @@ def build_tiktok_show_evidence_context_for_turn(
 ) -> str:
     """Select finalized show evidence through the shared turn-level owner."""
 
-    tiktok_subject_continuity_allowed = True
-    if int(subject_user_id or 0) > 0 and os.path.exists(DB_FILE):
+    tiktok_subject_continuity_allowed = int(subject_user_id or 0) <= 0
+    if int(subject_user_id or 0) > 0:
         try:
             with sqlite3.connect(DB_FILE, timeout=0.5) as relationship_conn:
                 tiktok_subject_continuity_allowed = bool(
-                    get_relationship_v2_member_settings(
+                    relationship_v2_proactive_consent_decision(
                         relationship_conn,
                         guild_id=guild_id,
                         user_id=subject_user_id,
-                    ).get("proactive_enabled", True)
+                    )[0]
                 )
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
             tiktok_subject_continuity_allowed = False
@@ -18009,9 +18009,21 @@ def select_dormant_echo_candidate(
         ),
     )
     rows = cursor.fetchall()
+    consent_rejections: set[str] = set()
+    consented_rows = []
+    for row in rows:
+        allowed, reason = relationship_v2_proactive_consent_decision(
+            conn,
+            guild_id=int(guild_id),
+            user_id=int(row[0] or 0),
+        )
+        if allowed:
+            consented_rows.append(row)
+        else:
+            consent_rejections.add(reason)
     conn.close()
 
-    for row in rows:
+    for row in consented_rows:
         (
             user_id,
             stored_display_name,
@@ -18069,6 +18081,10 @@ def select_dormant_echo_candidate(
             },
             "candidate_selected",
         )
+    if "proactive_consent_lookup_failed" in consent_rejections:
+        return None, "proactive_consent_lookup_failed"
+    if "member_opt_out" in consent_rejections:
+        return None, "member_opt_out"
     return None, "no_eligible_familiar_absent_member"
 
 
@@ -31480,6 +31496,34 @@ async def publish_prepared_dormant_echo(
 ) -> dict:
     if prepared.get("status") != "ready" or not prepared.get("message"):
         return {"status": "not_ready", "reason": "prepared_echo_missing"}
+    subject_user_id = int(prepared.get("subjectUserId") or 0)
+    try:
+        with sqlite3.connect(DB_FILE, timeout=0.5) as relationship_conn:
+            consent_allowed, consent_reason = (
+                relationship_v2_proactive_consent_decision(
+                    relationship_conn,
+                    guild_id=int(guild_id),
+                    user_id=subject_user_id,
+                )
+            )
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        consent_allowed = False
+        consent_reason = "proactive_consent_lookup_failed"
+    if not consent_allowed:
+        _set_dormant_echo_runtime_state(
+            guild_id,
+            status="withheld",
+            reason=consent_reason,
+            subject=prepared.get("subjectDisplayName") or "",
+            basis=prepared.get("basis") or {},
+        )
+        logging.info(
+            "dormant_echo_withheld_before_send guild=%s subject_user_id=%s reason=%s",
+            int(guild_id),
+            subject_user_id,
+            consent_reason,
+        )
+        return {"status": "withheld", "reason": consent_reason}
     now = now_pacific or datetime.now(PACIFIC_TZ)
     if now.tzinfo is None:
         now = PACIFIC_TZ.localize(now)

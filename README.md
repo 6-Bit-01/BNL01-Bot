@@ -195,7 +195,12 @@ currently present.
 without changing the shared cap. The selected basis is stored on the existing
 Ambient log as counts and source-row references, never as a second proactive
 engine or new memory authority. Memory/Governance/Relationship v2 live gates
-remain unchanged.
+remain unchanged. Dormant Echo selection and its final pre-send fence both read
+the existing member-owned Relationship v2 proactive preference; an opt-out or
+unreadable preference withholds the echo. The unified intelligence packet uses
+the same decision before adding member-bound show-episode continuity, while
+subject-neutral public show evidence remains available. No second consent store
+or new output authority is introduced.
 
 ## Relay accepted-history durability
 
