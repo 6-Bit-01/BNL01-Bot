@@ -218,6 +218,20 @@ class LivingCanonRecurrenceV1Tests(unittest.TestCase):
             "discordInteractions": [],
             "discordParticipants": [],
             "showTopics": [],
+            "sourceAuthorization": {
+                "contractVersion": "show_queue_evidence_authorization_v1",
+                "readModelSource": "barcode-network-site",
+                "publicOnly": True,
+                "localQueueProduction": True,
+                "websiteQueueProduction": True,
+                "accessScope": "public",
+                "archiveSchemaVersion": "queue_public_history_projection_v1",
+                "archiveSource": "queue_bnl_history_projection",
+                "archiveVisibility": "public_safe",
+                "archiveSourceRevision": 1,
+                "archiveSourceDigest": "a" * 64,
+                "historyCoverageStartedAt": "2026-08-24",
+            },
         }
         source_digest = hashlib.sha256(
             json.dumps(

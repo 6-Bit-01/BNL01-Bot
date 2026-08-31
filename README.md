@@ -130,16 +130,39 @@ reactions follows the ordinary conversation persistence path. Aggregate viewers,
 taps, gifts, joins, and other room metrics remain current-show-only and do not
 become personal memory or canon.
 
-The same one-minute read-model cycle automatically assembles a durable public
-show episode for every retained show. It preserves the website archive's full
-public-safe queue/broadcast milestone sequence and track roster, places every
-eligible TikTok comment/question on that clock, and pairs public Discord user
-rows only when BNL's stored response explicitly targets that member in the same
-channel within the bounded response window. Questions, answers, track state,
+The same one-minute read-model cycle may assemble a durable public show episode
+for a retained show only after the local queue gate, website queue capability,
+top-level public scope, and exact `queue_public_history_projection_v1` archive
+contract all pass. The archive must be available, `public_safe`, explicitly
+public, digest/revision-bearing, browser-personal-history-free, and free of test
+or simulation markers. Private, unavailable, malformed, capability-disabled,
+and local-gate-disabled projections create no show row or Memory Ledger
+projection. Each admitted episode carries a content-free
+`show_queue_evidence_authorization_v1` receipt in its source digest. Older rows
+without that receipt are preserved for audit but quarantined from show recall,
+packet selection, recurrence grouping, and source revalidation; an eligible
+public source refresh rewrites the matching row through the existing owner.
+
+An authorized episode preserves the website archive's full public-safe
+queue/broadcast milestone sequence and track roster, places every eligible
+TikTok comment/question on that clock, and pairs public Discord user rows only
+when BNL's stored response explicitly targets that member in the same channel
+within the bounded response window. Questions, answers, track state,
 Wheel/sponsor/signal-hold events, order, and outcomes therefore remain available
 after the live snapshot expires. Ordinary recall retrieves only the show and
 evidence slices relevant to the current question; the complete ledger is not
-dumped into every prompt.
+dumped into every prompt. The local queue gate is checked again for direct show
+context, packet selection, and send-time packet revalidation.
+
+Participant presence and Relationship proactive consent authorize continuity;
+they do not create show intent. A show/continuity request or an actual evidence
+match must exist before the selector may use the current member's episode
+participation. Relative-day words only select this owner when the request also
+names show scope, and historical analysis resolves the matching show date
+instead of falling through to the current show. Episode rebuilds are additive for public Discord exchanges
+already captured by this owner, so ordinary conversation pruning cannot erase
+an earlier request/BNL-response pair during finalization. The existing
+complete-delete path still removes the owning episode and its projections.
 
 This episode is a limited operational-memory exception, not a second queue
 owner. Website milestones and roster outcomes are authoritative operational
@@ -148,7 +171,10 @@ source-owned subject references may connect the same participant across episode
 surfaces, while name/handle resemblance and queue attribution alone never merge
 identities. Episode projections remain above Community Canon, follow Memory
 Ledger lineage/supersession, and are invalidated by the existing complete-delete
-path when a bound member exercises deletion.
+path when a bound member exercises deletion. When the configured owner appears
+in source evidence, public-safe episode projections and recall render that
+subject only as `6 Bit`; a retained private source label never enters public
+memory or prompt context.
 
 Declared TikTok owner handles `@six.bit` and `@pr0x60` resolve to the same BNL
 owner subject; `PR0X`/`Prox` is the side-account display identity. Other known

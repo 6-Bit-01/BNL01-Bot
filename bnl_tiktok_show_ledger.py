@@ -19,7 +19,14 @@ import sqlite3
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-from bnl_canon_source_contract import Confidence, SourceClass, Visibility
+from bnl_canon_source_contract import (
+    SIX_BIT,
+    Confidence,
+    SourceClass,
+    Visibility,
+    show_queue_evidence_authorization,
+    show_queue_evidence_authorization_receipt_valid,
+)
 from bnl_memory_ledger import (
     LINEAGE_TYPES,
     LedgerEntry,
@@ -33,6 +40,7 @@ from bnl_tiktok_live_context import (
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     build_tiktok_show_evidence_ledger,
     show_timeline_bounds_ms,
+    tiktok_show_evidence_key,
     tiktok_show_records,
 )
 
@@ -45,7 +53,6 @@ TIKTOK_SHOW_EVIDENCE_RESPONSE_WINDOW_MS = 15 * 60 * 1000
 TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT = 2
 TIKTOK_SHOW_EVIDENCE_RECALL_MESSAGE_LIMIT = 10
 SHOW_EPISODE_CONTEXT_VERSION = "barcode_show_episode_context_v1"
-_LEGACY_SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION = "tiktok_show_evidence_ledger_v1"
 
 _SPACE_RE = re.compile(r"\s+")
 _QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]{2,}", re.IGNORECASE)
@@ -53,7 +60,7 @@ _SHOW_QUERY_RE = re.compile(
     r"\b(?:tiktok|tik tok|barcode radio|broadcast|show|episode|live|chat|viewer|"
     r"audience|track|song|queue|wheel|submissions?|intake|sponsor|break|"
     r"signal hold|paused?|stalled?|resumed?|skipped?|removed?|returned?|"
-    r"restored?|started?|finished?|timeline|tonight|today|yesterday|last night|"
+    r"restored?|started?|finished?|timeline|"
     r"last show|previous show|past show|show chat|talked about)\b",
     re.IGNORECASE,
 )
@@ -83,6 +90,10 @@ _SUBJECT_CONTINUITY_QUERY_RE = re.compile(
     r"\b(?:remember me|know me|about me|my history|my activity|my messages?|"
     r"what did i|when did i|did i|have i|was i|where was i|"
     r"what do you think of me|your (?:read|opinion|impression) of me)\b",
+    re.IGNORECASE,
+)
+_RELATIVE_SHOW_DATE_SCOPE_RE = re.compile(
+    r"\b(?:tiktok|tik tok|barcode radio|broadcast|show|episode|live|stream)\b",
     re.IGNORECASE,
 )
 _MULTI_SHOW_QUERY_RE = re.compile(
@@ -180,14 +191,32 @@ def _safe_label(value: Any, limit: int = 220) -> str:
     return _SPACE_RE.sub(" ", str(value or "")).strip()[:limit].rstrip()
 
 
+def _configured_owner_subject_ref() -> str:
+    try:
+        owner_user_id = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
+    except (OverflowError, TypeError, ValueError):
+        return ""
+    return f"discord_user:{owner_user_id}" if owner_user_id > 0 else ""
+
+
+def _public_show_speaker_label(
+    subject_ref: Any,
+    value: Any,
+    fallback: str = "Show participant",
+    *,
+    limit: int = 160,
+) -> str:
+    owner_subject_ref = _configured_owner_subject_ref()
+    if owner_subject_ref and str(subject_ref or "") == owner_subject_ref:
+        return SIX_BIT.name
+    return _safe_label(value, limit) or fallback
+
+
 def _safe_document(value: Any) -> Optional[dict[str, Any]]:
     if not isinstance(value, Mapping):
         return None
     schema_version = value.get("schemaVersion")
-    if schema_version not in {
-        SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
-        _LEGACY_SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
-    }:
+    if schema_version != SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION:
         return None
     show_key = _safe_label(value.get("showKey"), 200)
     source_digest = _safe_label(value.get("sourceDigest"), 64).lower()
@@ -198,9 +227,12 @@ def _safe_document(value: Any) -> Optional[dict[str, Any]]:
         or not isinstance(value.get("participants"), list)
         or not isinstance(value.get("topics"), list)
         or not isinstance(value.get("trackMoments"), list)
+        or not show_queue_evidence_authorization_receipt_valid(
+            value.get("sourceAuthorization")
+        )
     ):
         return None
-    if schema_version == SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION and any(
+    if any(
         not isinstance(value.get(field), list)
         for field in (
             "trackRoster",
@@ -211,7 +243,36 @@ def _safe_document(value: Any) -> Optional[dict[str, Any]]:
         )
     ):
         return None
+    digest_payload = dict(value)
+    digest_payload.pop("sourceDigest", None)
+    computed_digest = hashlib.sha256(
+        _canonical_json(digest_payload).encode("utf-8")
+    ).hexdigest()
+    if computed_digest != source_digest:
+        return None
     return dict(value)
+
+
+def _seal_authorized_show_ledger(
+    ledger: Any,
+    authorization_receipt: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Bind one public show document to its validated source authorization."""
+
+    if (
+        not isinstance(ledger, Mapping)
+        or not show_queue_evidence_authorization_receipt_valid(
+            authorization_receipt
+        )
+    ):
+        return None
+    sealed = dict(ledger)
+    sealed.pop("sourceDigest", None)
+    sealed["sourceAuthorization"] = dict(authorization_receipt)
+    sealed["sourceDigest"] = hashlib.sha256(
+        _canonical_json(sealed).encode("utf-8")
+    ).hexdigest()
+    return _safe_document(sealed)
 
 
 def _context_digest(*values: Any) -> str:
@@ -248,6 +309,8 @@ def _requested_show_date(user_text: str, *, now: Any = None) -> str:
     if explicit:
         return explicit.group(1)
     lowered = query.casefold()
+    if not _RELATIVE_SHOW_DATE_SCOPE_RE.search(lowered):
+        return ""
     current_date = _coerce_pacific_now(now).date()
     if re.search(r"\b(?:yesterday|last night)\b", lowered):
         return (current_date - timedelta(days=1)).isoformat()
@@ -1126,7 +1189,10 @@ def _project_finalized_show(
         if subject_ref:
             episode_subjects.setdefault(
                 subject_ref,
-                str(item.get("speakerLabel") or "Show participant")[:160],
+                _public_show_speaker_label(
+                    subject_ref,
+                    item.get("speakerLabel"),
+                ),
             )
     coverage = ledger.get("coverage") or {}
     episode_value = _canonical_json(
@@ -1152,9 +1218,24 @@ def _project_finalized_show(
             "operationalSummary": ledger.get("operationalSummary") or {},
             "topics": topics,
             "trackMoments": tracks,
-            "crossSourceBindings": list(
-                ledger.get("crossSourceBindings") or ()
-            )[:12],
+            "crossSourceBindings": [
+                {
+                    **binding,
+                    "tiktokSpeakerLabel": _public_show_speaker_label(
+                        binding.get("subjectRef"),
+                        binding.get("tiktokSpeakerLabel"),
+                        "TikTok viewer",
+                        limit=220,
+                    ),
+                    "discordSpeakerLabel": _public_show_speaker_label(
+                        binding.get("subjectRef"),
+                        binding.get("discordSpeakerLabel"),
+                        "Discord member",
+                    ),
+                }
+                for binding in ledger.get("crossSourceBindings") or ()
+                if isinstance(binding, Mapping)
+            ][:12],
             "sourceDigest": source_digest,
             "epistemicStatus": (
                 "authoritative public queue chronology plus source-linked "
@@ -1219,6 +1300,10 @@ def _project_finalized_show(
             or participant.get("handle")
             or "unknown-viewer"
         )[:240]
+        public_speaker_label = _public_show_speaker_label(
+            subject_ref,
+            participant.get("speakerLabel"),
+        )
         row_key = hashlib.sha256(subject_ref.encode("utf-8")).hexdigest()[:32]
         participant_value = _canonical_json(
             {
@@ -1226,7 +1311,7 @@ def _project_finalized_show(
                 "showKey": show_key,
                 "showDate": ledger.get("showDate"),
                 "surface": surface,
-                "speakerLabel": participant.get("speakerLabel"),
+                "speakerLabel": public_speaker_label,
                 "handle": participant.get("handle"),
                 "messageCount": participant.get("messageCount"),
                 "questionCount": participant.get("questionCount"),
@@ -1258,9 +1343,7 @@ def _project_finalized_show(
             source_role=f"{surface}_participant_episode_projection",
             entry_type="shared_moment",
             subject_key=subject_ref,
-            subject_display_name=str(
-                participant.get("speakerLabel") or "Show participant"
-            )[:160],
+            subject_display_name=public_speaker_label,
             predicate_key="barcode_radio.show_participation",
             value=participant_value,
             source_class=SourceClass.DERIVED_SUMMARY,
@@ -1287,9 +1370,7 @@ def _project_finalized_show(
             participants=(
                 LedgerParticipant(
                     subject_ref,
-                    str(
-                        participant.get("speakerLabel") or "Show participant"
-                    )[:160],
+                    public_speaker_label,
                     "author",
                     0,
                 ),
@@ -1362,6 +1443,183 @@ def _archive_from_read_model(read_model: Any) -> Mapping[str, Any]:
     if archive is None:
         archive = read_model.get("archive")
     return archive if isinstance(archive, Mapping) else {}
+
+
+def _stored_show_document(
+    raw_json: Any,
+    *,
+    show_key: str,
+    source_digest: Any,
+    lifecycle_status: Any,
+) -> Optional[dict[str, Any]]:
+    """Load one internally consistent prior show revision for additive rebuilds."""
+
+    try:
+        document = _safe_document(json.loads(str(raw_json or "{}")))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if document is None or (
+        str(document.get("showKey") or "") != str(show_key or "")
+        or str(document.get("sourceDigest") or "")
+        != str(source_digest or "")
+        or str(document.get("lifecycle") or "")
+        != str(lifecycle_status or "")
+    ):
+        return None
+    return document
+
+
+def _discord_message_identity(message: Any) -> str:
+    if not isinstance(message, Mapping):
+        return ""
+    for prefix, field in (
+        ("conversation", "conversationRowId"),
+        ("message", "messageId"),
+    ):
+        try:
+            value = int(message.get(field) or 0)
+        except (TypeError, ValueError, OverflowError):
+            value = 0
+        if value > 0:
+            return f"{prefix}:{value}"
+    return ""
+
+
+def _discord_exchange_message_keys(exchange: Any) -> set[str]:
+    if not isinstance(exchange, Mapping):
+        return set()
+    return {
+        identity
+        for identity in (
+            _discord_message_identity(message)
+            for message in exchange.get("userMessages") or ()
+        )
+        if identity
+    }
+
+
+def _merge_retained_discord_exchanges(
+    current: Sequence[Mapping[str, Any]],
+    prior_ledger: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Keep captured public exchanges when source conversation rows age out.
+
+    The existing show ledger remains the sole durable owner. Rebuilds are
+    additive for already-admitted Discord evidence; privacy deletion still
+    removes the owning show row before any later rebuild can consult it.
+    """
+
+    candidates: list[tuple[int, Mapping[str, Any]]] = []
+    if isinstance(prior_ledger, Mapping):
+        candidates.extend(
+            (0, exchange)
+            for exchange in prior_ledger.get("discordInteractions") or ()
+            if isinstance(exchange, Mapping)
+        )
+    candidates.extend(
+        (1, exchange)
+        for exchange in current or ()
+        if isinstance(exchange, Mapping)
+    )
+
+    groups: list[dict[str, Any]] = []
+    for source_priority, exchange in candidates:
+        subject_ref = str(exchange.get("subjectRef") or "")
+        message_keys = _discord_exchange_message_keys(exchange)
+        exchange_id = str(exchange.get("exchangeId") or "")
+        matching = [
+            index
+            for index, group in enumerate(groups)
+            if group["subjectRef"] == subject_ref
+            and (
+                bool(message_keys.intersection(group["messageKeys"]))
+                or bool(exchange_id and exchange_id in group["exchangeIds"])
+            )
+        ]
+        entry = (source_priority, exchange)
+        if not matching:
+            groups.append(
+                {
+                    "subjectRef": subject_ref,
+                    "messageKeys": set(message_keys),
+                    "exchangeIds": {exchange_id} if exchange_id else set(),
+                    "candidates": [entry],
+                }
+            )
+            continue
+        target = groups[matching[0]]
+        target["messageKeys"].update(message_keys)
+        if exchange_id:
+            target["exchangeIds"].add(exchange_id)
+        target["candidates"].append(entry)
+        for index in reversed(matching[1:]):
+            merged = groups.pop(index)
+            target["messageKeys"].update(merged["messageKeys"])
+            target["exchangeIds"].update(merged["exchangeIds"])
+            target["candidates"].extend(merged["candidates"])
+
+    merged_exchanges: list[dict[str, Any]] = []
+    for group in groups:
+        group_candidates = list(group["candidates"])
+
+        def candidate_rank(
+            candidate: tuple[int, Mapping[str, Any]],
+        ) -> tuple[int, int, int, str]:
+            source_priority, exchange = candidate
+            return (
+                int(isinstance(exchange.get("bnlResponse"), Mapping)),
+                int(source_priority),
+                len(exchange.get("userMessages") or ()),
+                str(exchange.get("exchangeId") or ""),
+            )
+
+        _base_priority, base_exchange = max(
+            group_candidates,
+            key=candidate_rank,
+        )
+        response_candidates = [
+            candidate
+            for candidate in group_candidates
+            if isinstance(candidate[1].get("bnlResponse"), Mapping)
+        ]
+        response = (
+            max(response_candidates, key=candidate_rank)[1].get("bnlResponse")
+            if response_candidates
+            else None
+        )
+        messages_by_key: dict[str, Mapping[str, Any]] = {}
+        for source_priority in (0, 1):
+            for candidate_priority, exchange in group_candidates:
+                if candidate_priority != source_priority:
+                    continue
+                for message in exchange.get("userMessages") or ():
+                    identity = _discord_message_identity(message)
+                    if identity and isinstance(message, Mapping):
+                        messages_by_key[identity] = message
+        user_messages = sorted(
+            messages_by_key.values(),
+            key=lambda message: (
+                int(message.get("occurredAtMs") or 0),
+                int(message.get("conversationRowId") or 0),
+                int(message.get("messageId") or 0),
+            ),
+        )
+        merged = dict(base_exchange)
+        merged["userMessages"] = [dict(message) for message in user_messages]
+        merged["bnlResponse"] = dict(response) if response is not None else None
+        merged_exchanges.append(merged)
+
+    merged_exchanges.sort(
+        key=lambda exchange: (
+            int(
+                ((exchange.get("userMessages") or [{}])[0]).get(
+                    "occurredAtMs", 0
+                )
+            ),
+            str(exchange.get("exchangeId") or ""),
+        )
+    )
+    return merged_exchanges
 
 
 def _projection_expectations(
@@ -1437,8 +1695,9 @@ def sync_tiktok_show_evidence_ledgers(
     artist_identity_index: Optional[
         Mapping[str, Sequence[Mapping[str, Any]]]
     ] = None,
+    environ: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
-    """Idempotently assemble every available public show into memory."""
+    """Idempotently assemble every authorized public-production show."""
 
     result = {
         "status": "skipped",
@@ -1461,10 +1720,32 @@ def sync_tiktok_show_evidence_ledgers(
         "livingCanonSubjectsEvaluated": 0,
         "livingCanonCandidatesRefreshed": 0,
         "livingCanonFormationErrors": 0,
+        "authorizationEligible": False,
     }
+    authorization = show_queue_evidence_authorization(
+        read_model,
+        environ=environ,
+    )
+    if not authorization.get("usable"):
+        result["reason"] = str(
+            authorization.get("reason") or "archive_not_authorized"
+        )
+        return result
+    authorization_receipt = authorization.get("receipt")
+    if not show_queue_evidence_authorization_receipt_valid(
+        authorization_receipt
+    ):
+        result["reason"] = "archive_authorization_receipt_invalid"
+        return result
+    result["authorizationEligible"] = True
     archive = _archive_from_read_model(read_model)
     shows = tiktok_show_records(archive)
     if not shows or int(guild_id or 0) <= 0 or not db_file:
+        result["reason"] = (
+            "no_show_records"
+            if not shows
+            else "invalid_sync_target"
+        )
         return result
     result["showsSeen"] = len(shows)
     conn = sqlite3.connect(db_file, timeout=10.0)
@@ -1472,6 +1753,27 @@ def sync_tiktok_show_evidence_ledgers(
         ensure_tiktok_show_evidence_schema(conn)
         ensure_memory_ledger_schema(conn)
         for show in shows:
+            show_key = tiktok_show_evidence_key(show)
+            if not show_key:
+                continue
+            existing = conn.execute(
+                f"""
+                SELECT source_digest,lifecycle_status,ledger_json
+                FROM {TIKTOK_SHOW_EVIDENCE_TABLE}
+                WHERE guild_id=? AND show_key=?
+                """,
+                (int(guild_id), show_key),
+            ).fetchone()
+            prior_ledger = (
+                _stored_show_document(
+                    existing[2],
+                    show_key=show_key,
+                    source_digest=existing[0],
+                    lifecycle_status=existing[1],
+                )
+                if existing
+                else None
+            )
             source_events = _load_show_source_events(
                 conn,
                 guild_id=int(guild_id),
@@ -1486,13 +1788,18 @@ def sync_tiktok_show_evidence_ledgers(
             )
             if discord_exchanges is None:
                 continue
-            ledger = _safe_document(
+            discord_exchanges = _merge_retained_discord_exchanges(
+                discord_exchanges,
+                prior_ledger,
+            )
+            ledger = _seal_authorized_show_ledger(
                 build_tiktok_show_evidence_ledger(
                     show,
                     source_events,
                     artist_identity_index=artist_identity_index,
                     discord_exchanges=discord_exchanges,
-                )
+                ),
+                authorization_receipt,
             )
             if ledger is None:
                 continue
@@ -1520,14 +1827,6 @@ def sync_tiktok_show_evidence_ledgers(
             )
             show_key = str(ledger["showKey"])
             source_digest = str(ledger["sourceDigest"])
-            existing = conn.execute(
-                f"""
-                SELECT source_digest,lifecycle_status
-                FROM {TIKTOK_SHOW_EVIDENCE_TABLE}
-                WHERE guild_id=? AND show_key=?
-                """,
-                (int(guild_id), show_key),
-            ).fetchone()
             now = datetime.now(timezone.utc).isoformat()
             lifecycle = str(ledger.get("lifecycle") or "provisional")
             if existing and str(existing[0] or "") == source_digest:
@@ -1717,6 +2016,9 @@ def _document_relevance(
     requested_show_date: str = "",
 ) -> tuple[int, list[Mapping[str, Any]]]:
     query = str(user_text or "")
+    query_terms = _query_terms(query)
+    explicit_episode_scope = _show_episode_scope_requested(query)
+    evidence_query_overlap = False
     score = max(0, 20 - recency_rank)
     if requested_show_date:
         if requested_show_date != str(ledger.get("showDate") or ""):
@@ -1731,17 +2033,27 @@ def _document_relevance(
         if isinstance(item, Mapping)
     ]
     participant_matches = []
+    direct_subject_candidates = []
     for participant in participants:
+        participant_subject_ref = str(participant.get("subjectRef") or "")
         direct_subject = bool(
             allow_direct_subject
             and subject_ref
-            and str(participant.get("subjectRef") or "") == subject_ref
+            and participant_subject_ref == subject_ref
         )
         named = any(
             _phrase_in_query(query, value)
             for value in (
-                participant.get("speakerLabel"),
-                participant.get("displayName"),
+                _public_show_speaker_label(
+                    participant_subject_ref,
+                    participant.get("speakerLabel"),
+                    "",
+                ),
+                _public_show_speaker_label(
+                    participant_subject_ref,
+                    participant.get("displayName"),
+                    "",
+                ),
                 participant.get("handle"),
             )
         )
@@ -1750,14 +2062,18 @@ def _document_relevance(
             for attribution in participant.get("artistAttributions") or ()
             if isinstance(attribution, Mapping)
         )
-        if direct_subject or named or artist_named:
+        if direct_subject:
+            direct_subject_candidates.append(participant)
+        if named or artist_named:
             participant_matches.append(participant)
-            score += 120 if direct_subject else 90
+            evidence_query_overlap = True
+            score += 90
     for track in ledger.get("trackMoments") or ():
         if isinstance(track, Mapping) and _phrase_in_query(
             query,
             track.get("trackLabel"),
         ):
+            evidence_query_overlap = True
             score += 80
     for track in ledger.get("trackRoster") or ():
         if isinstance(track, Mapping) and any(
@@ -1769,11 +2085,12 @@ def _document_relevance(
                 track.get("submittedByTikTokHandle"),
             )
         ):
+            evidence_query_overlap = True
             score += 85
     for topic in ledger.get("showTopics") or ledger.get("topics") or ():
         if isinstance(topic, Mapping) and _phrase_in_query(query, topic.get("term")):
+            evidence_query_overlap = True
             score += 60
-    query_terms = _query_terms(query)
     for event in ledger.get("operationalEvents") or ():
         if not isinstance(event, Mapping):
             continue
@@ -1791,13 +2108,18 @@ def _document_relevance(
         ).replace("_", " ")
         overlap = query_terms.intersection(_query_terms(searchable))
         if overlap:
+            evidence_query_overlap = True
             score += min(60, 12 * len(overlap))
     for exchange in ledger.get("discordInteractions") or ():
         if not isinstance(exchange, Mapping):
             continue
         exchange_text = " ".join(
             [
-                str(exchange.get("speakerLabel") or ""),
+                _public_show_speaker_label(
+                    exchange.get("subjectRef"),
+                    exchange.get("speakerLabel"),
+                    "",
+                ),
                 *[
                     str(message.get("text") or "")
                     for message in exchange.get("userMessages") or ()
@@ -1812,7 +2134,15 @@ def _document_relevance(
         )
         overlap = query_terms.intersection(_query_terms(exchange_text))
         if overlap:
+            evidence_query_overlap = True
             score += min(70, 14 * len(overlap))
+    if direct_subject_candidates and (
+        explicit_episode_scope or evidence_query_overlap
+    ):
+        for participant in direct_subject_candidates:
+            if participant not in participant_matches:
+                participant_matches.append(participant)
+                score += 120
     if _SHOW_QUERY_RE.search(query):
         score += 30
     elif _COMMUNITY_BASELINE_QUERY_RE.search(query):
@@ -2106,8 +2436,9 @@ def _community_episode_context_item(
             if not subject_ref:
                 continue
             all_subjects.append(subject_ref)
-            participant_labels[subject_ref] = str(
-                participant.get("speakerLabel") or "Show participant"
+            participant_labels[subject_ref] = _public_show_speaker_label(
+                subject_ref,
+                participant.get("speakerLabel"),
             )
             participant_messages[subject_ref] = (
                 participant_messages.get(subject_ref, 0)
@@ -2405,7 +2736,15 @@ def _dialogue_episode_context_item(
             "showTitle": str(ledger.get("showTitle") or "BARCODE Radio"),
         }
         episode_messages = [
-            {**item, **episode, "surface": "TikTok"}
+            {
+                **item,
+                **episode,
+                "speakerLabel": _public_show_speaker_label(
+                    item.get("subjectRef"),
+                    item.get("speakerLabel"),
+                ),
+                "surface": "TikTok",
+            }
             for item in ledger.get("messages") or ()
             if isinstance(item, Mapping)
         ]
@@ -2422,8 +2761,10 @@ def _dialogue_episode_context_item(
                         "eventId": "discord_conversation:%s"
                         % str(message.get("conversationRowId") or ""),
                         "subjectRef": str(exchange.get("subjectRef") or ""),
-                        "speakerLabel": str(
-                            exchange.get("speakerLabel") or "Discord member"
+                        "speakerLabel": _public_show_speaker_label(
+                            exchange.get("subjectRef"),
+                            exchange.get("speakerLabel"),
+                            "Discord member",
                         ),
                         "surface": "Discord",
                     }
@@ -2458,8 +2799,10 @@ def _dialogue_episode_context_item(
                 str(message.get("showDate") or "unknown date"),
                 str(message.get("surface") or "show chat"),
                 float(message.get("minuteOffset") or 0.0),
-                _safe_label(message.get("speakerLabel"), 160)
-                or "Show participant",
+                _public_show_speaker_label(
+                    message.get("subjectRef"),
+                    message.get("speakerLabel"),
+                ),
                 moment,
                 json.dumps(
                     _safe_label(message.get("text"), 360),
@@ -2765,9 +3108,13 @@ def build_tiktok_show_evidence_context(
         if shown_participants:
             lines.append("People in this episode:")
             for participant in shown_participants[:8]:
+                public_speaker_label = _public_show_speaker_label(
+                    participant.get("subjectRef"),
+                    participant.get("speakerLabel"),
+                )
                 detail = (
                     f"- [{str(participant.get('surface') or 'tiktok')}] "
-                    f"{json.dumps(str(participant.get('speakerLabel') or 'Show participant'), ensure_ascii=False)}: "
+                    f"{json.dumps(public_speaker_label, ensure_ascii=False)}: "
                     f"{int(participant.get('messageCount') or 0)} authored messages, "
                     f"{int(participant.get('questionCount') or 0)} questions, "
                     f"{int(participant.get('bnlAddressCount') or 0)} addressed BNL, "
@@ -2908,7 +3255,14 @@ def build_tiktok_show_evidence_context(
             str(item.get("subjectRef") or "") for item in participant_matches
         }
         tiktok_messages = [
-            {**item, "surface": "tiktok"}
+            {
+                **item,
+                "speakerLabel": _public_show_speaker_label(
+                    item.get("subjectRef"),
+                    item.get("speakerLabel"),
+                ),
+                "surface": "tiktok",
+            }
             for item in ledger.get("messages") or ()
             if isinstance(item, Mapping)
         ]
@@ -2923,8 +3277,10 @@ def build_tiktok_show_evidence_context(
                 "eventId": "discord_conversation:"
                 + str(message.get("conversationRowId") or ""),
                 "subjectRef": str(exchange.get("subjectRef") or ""),
-                "speakerLabel": str(
-                    exchange.get("speakerLabel") or "Discord member"
+                "speakerLabel": _public_show_speaker_label(
+                    exchange.get("subjectRef"),
+                    exchange.get("speakerLabel"),
+                    "Discord member",
                 ),
                 "surface": "discord",
             }
@@ -2969,6 +3325,10 @@ def build_tiktok_show_evidence_context(
             lines.append("Source-linked authored examples:")
             for message in relevant_messages[:bounded_message_limit]:
                 track_label = str(message.get("trackLabel") or "")
+                public_speaker_label = _public_show_speaker_label(
+                    message.get("subjectRef"),
+                    message.get("speakerLabel"),
+                )
                 operational_context = (
                     message.get("operationalContext")
                     if isinstance(message.get("operationalContext"), Mapping)
@@ -2988,7 +3348,7 @@ def build_tiktok_show_evidence_context(
                 lines.append(
                     f"- [{str(message.get('surface') or 'tiktok')}] "
                     f"t+{float(message.get('minuteOffset') or 0.0):.1f}m "
-                    f"{json.dumps(str(message.get('speakerLabel') or 'Show participant'), ensure_ascii=False)}"
+                    f"{json.dumps(public_speaker_label, ensure_ascii=False)}"
                     f"{moment}{operation_suffix}: "
                     f"{json.dumps(str(message.get('text') or ''), ensure_ascii=False)}"
                 )
@@ -2998,7 +3358,11 @@ def build_tiktok_show_evidence_context(
             exchange_subject = str(exchange.get("subjectRef") or "")
             exchange_text = " ".join(
                 [
-                    str(exchange.get("speakerLabel") or ""),
+                    _public_show_speaker_label(
+                        exchange_subject,
+                        exchange.get("speakerLabel"),
+                        "",
+                    ),
                     *[
                         str(message.get("text") or "")
                         for message in exchange.get("userMessages") or ()
@@ -3027,12 +3391,17 @@ def build_tiktok_show_evidence_context(
         if relevant_exchanges:
             lines.append("Public Discord interactions with BNL during this episode:")
             for _exchange_score, exchange in relevant_exchanges[:6]:
+                public_speaker_label = _public_show_speaker_label(
+                    exchange.get("subjectRef"),
+                    exchange.get("speakerLabel"),
+                    "Discord member",
+                )
                 for message in (exchange.get("userMessages") or ())[-3:]:
                     if not isinstance(message, Mapping):
                         continue
                     lines.append(
                         f"- t+{float(message.get('minuteOffset') or 0.0):.1f}m "
-                        f"{json.dumps(str(exchange.get('speakerLabel') or 'Discord member'), ensure_ascii=False)}: "
+                        f"{json.dumps(public_speaker_label, ensure_ascii=False)}: "
                         f"{json.dumps(_safe_label(message.get('text'), 1200), ensure_ascii=False)}"
                     )
                 response = exchange.get("bnlResponse")
