@@ -3138,6 +3138,327 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(checked_bases, [(refreshed_basis,)])
 
+    async def test_plain_name_batch_uses_ordinary_single_packet_cutover(self):
+        channel = self._channel(8132)
+        basis = object()
+        packet = object()
+        assessment = object()
+        decision = SimpleNamespace(
+            candidate_selected=True,
+            typed_contract_status="valid",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Cache Back is BARCODE's archive specialist.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(basis,),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        ordinary_generation = mock.AsyncMock(return_value=execution)
+        shared_generation = mock.AsyncMock()
+        shared_basis = mock.Mock(return_value=object())
+        finalize = mock.AsyncMock(return_value=decision)
+
+        def build_assessment(*_args, **kwargs):
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError(
+                "plain-name batch must not call the established provider "
+                "before the ordinary single-packet route"
+            )
+
+        self._prime_flush(channel, "BNL, who is Cache Back?")
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.object(
+                bnl01_bot,
+                "ordinary_chat_route_scope_decision",
+                return_value=SimpleNamespace(eligible=True, reason="canary"),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=build_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=basis,
+            ) as ordinary_basis,
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+                new=shared_basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_single_packet",
+                new=ordinary_generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=shared_generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=finalize,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        ordinary_basis.assert_called_once()
+        ordinary_generation.assert_awaited_once()
+        shared_basis.assert_not_called()
+        shared_generation.assert_not_awaited()
+        self.assertEqual(
+            channel.sent,
+            ["Cache Back is BARCODE's archive specialist."],
+        )
+        finalize.assert_awaited_once()
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
+        self.assertTrue(finalize.await_args.kwargs["candidate_live"])
+        self.assertEqual(
+            finalize.await_args.kwargs["guard_status"],
+            "batch_single_packet_candidate_sent",
+        )
+
+    async def test_late_fragment_stales_batch_single_packet_without_second_call(
+        self,
+    ):
+        channel = self._channel(8133)
+        basis = object()
+        packet = object()
+        assessment = object()
+        decision = SimpleNamespace(
+            candidate_selected=True,
+            typed_contract_status="valid",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Cache Back is BARCODE's archive specialist.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(basis,),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        finalize = mock.AsyncMock(return_value=True)
+        block = mock.AsyncMock(return_value=decision)
+
+        def build_assessment(*_args, **kwargs):
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        async def ordinary_generation(**_kwargs):
+            self._append(
+                channel,
+                "And which BARCODE member handles signal recovery?",
+            )
+            return execution
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError(
+                "stale single-packet work must be handed off, not regenerated "
+                "through the legacy provider"
+            )
+
+        self._prime_flush(channel, "BNL, who is Cache Back?")
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.object(
+                bnl01_bot,
+                "ordinary_chat_route_scope_decision",
+                return_value=SimpleNamespace(
+                    eligible=True,
+                    reason="canary",
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=build_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+            ) as shared_basis,
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_single_packet",
+                new=mock.AsyncMock(side_effect=ordinary_generation),
+            ) as ordinary,
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=mock.AsyncMock(),
+            ) as shared_generation,
+            mock.patch.object(
+                bnl01_bot,
+                "safely_record_ordinary_chat_single_packet_block",
+                new=block,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=finalize,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        ordinary.assert_awaited_once()
+        shared_basis.assert_not_called()
+        shared_generation.assert_not_awaited()
+        self.assertEqual(channel.sent, [])
+        self.assertEqual(
+            len(bnl01_bot._channel_interrupt_handoff[channel.id]),
+            2,
+        )
+        block.assert_awaited_once_with(
+            decision,
+            reason="stale_after_batch_single_packet_generation",
+        )
+        finalize.assert_awaited_once()
+        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+        self.assertEqual(
+            finalize.await_args.kwargs["guard_status"],
+            "stale_after_batch_single_packet_generation",
+        )
+
+    async def test_batch_single_packet_send_failure_never_marks_candidate_live(
+        self,
+    ):
+        channel = self._channel(8134)
+        basis = object()
+        packet = object()
+        assessment = object()
+        decision = SimpleNamespace(
+            candidate_selected=True,
+            typed_contract_status="valid",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Cache Back is BARCODE's archive specialist.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(basis,),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        ordinary = mock.AsyncMock(return_value=execution)
+        finalize = mock.AsyncMock(return_value=True)
+        block = mock.AsyncMock(return_value=decision)
+
+        def build_assessment(*_args, **kwargs):
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError(
+                "single-packet send failure must not invoke the legacy provider"
+            )
+
+        self._prime_flush(channel, "BNL, who is Cache Back?")
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.object(
+                channel,
+                "send",
+                new=mock.AsyncMock(
+                    side_effect=RuntimeError("discord unavailable")
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "ordinary_chat_route_scope_decision",
+                return_value=SimpleNamespace(
+                    eligible=True,
+                    reason="canary",
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=build_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+            ) as shared_basis,
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_single_packet",
+                new=ordinary,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=mock.AsyncMock(),
+            ) as shared_generation,
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_record_ordinary_chat_single_packet_block",
+                new=block,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=finalize,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        ordinary.assert_awaited_once()
+        shared_basis.assert_not_called()
+        shared_generation.assert_not_awaited()
+        block.assert_awaited_once_with(
+            decision,
+            reason="single_packet_discord_send_failed",
+        )
+        finalize.assert_awaited_once()
+        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+        self.assertEqual(
+            finalize.await_args.kwargs["guard_status"],
+            "batch_discord_send_failed",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

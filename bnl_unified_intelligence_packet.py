@@ -4996,6 +4996,14 @@ def _filter_frame_applicable_candidates(
         str(request.frame_subject_requirement or "").strip().lower()
         == "required"
     )
+    unscoped_conversation_task = any(
+        str(task.authority_scope or "").strip().lower() == "packet"
+        and str(task.subject_requirement or "").strip().lower()
+        != "required"
+        and str(task.object_kind or "unknown").strip().lower()
+        in {"unknown", "multiple"}
+        for task in request.frame_tasks
+    )
     accepted_subject_keys = {
         value
         for value in (
@@ -5031,6 +5039,10 @@ def _filter_frame_applicable_candidates(
             subject_required
             and item.lane in subject_scoped_lanes
             and item.subject_key not in accepted_subject_keys
+            and not (
+                item.lane == "conversation_context"
+                and unscoped_conversation_task
+            )
         ):
             exclude(item, "frame_subject_mismatch")
             continue

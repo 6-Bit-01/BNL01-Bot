@@ -976,6 +976,134 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(prompt.ready)
         self.assertIn("subjects=S1,S2", prompt.prompt)
 
+    def test_subject_task_does_not_evict_unscoped_conversation_task_evidence(self):
+        text = (
+            "Who is Cache Back, and what beam width did we choose for "
+            "Amber Compass?"
+        )
+        prior_text = (
+            "For Amber Compass, we chose a narrow beam and a slow pulse."
+        )
+        self.conn.execute(
+            """
+            INSERT INTO conversations(
+                id,guild_id,user_id,user_name,role,content,channel_id,
+                channel_policy,route_mode,timestamp
+            ) VALUES(902,1,7,'Test Member','user',?,10,
+                     'public_context','normal_chat',?)
+            """,
+            (prior_text, "2026-08-10T12:00:30+00:00"),
+        )
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            channel_policy="public_context",
+            current_text=text,
+            current_speaker_user_ids=(7,),
+            current_speaker_labels=("Test Member",),
+            addressee_kinds=("discord_mention",),
+            source_message_ids=(402,),
+            explicit_mention_count=1,
+            subject_entity_refs=("cache_back",),
+            subject_label_hints=("Cache Back",),
+            referent_status="resolved",
+            response_act="answer",
+            packet_revision="turn_mixed_subject_context_01",
+        )
+        request = IntelligencePacketRequest(
+            guild_id=1,
+            subject_user_id=0,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            channel_id=10,
+            channel_name="bnl-testing",
+            channel_policy="public_context",
+            visibility_allowance="public_safe",
+            user_text=text,
+            participant_user_ids=(7,),
+            direct_state="direct",
+            budget_chars=5000,
+            conversation_evidence=(
+                PacketConversationEvidence(
+                    text=prior_text,
+                    source_id=902,
+                    speaker_user_id=7,
+                    speaker_label="Test Member",
+                ),
+                PacketConversationEvidence(
+                    text=text,
+                    speaker_user_id=7,
+                    speaker_label="Test Member",
+                    current_turn=True,
+                ),
+            ),
+            declared_canon_authorized=True,
+            frame_schema_version=frame.schema_version,
+            frame_revision=frame.frame_revision,
+            frame_input_evidence_digest=frame.input_evidence_digest,
+            frame_status=frame.status,
+            frame_subject_requirement=frame.subject_requirement,
+            frame_subjects=tuple(
+                PacketFrameSubject(
+                    user_id=subject.user_id,
+                    entity_ref=subject.entity_ref,
+                    label_hint=subject.label_hint,
+                    binding_method=subject.binding_method,
+                    confidence=subject.confidence,
+                    role_hints=subject.role_hints,
+                    domain_hints=subject.domain_hints,
+                )
+                for subject in frame.subjects
+            ),
+            frame_tasks=tuple(
+                PacketFrameTask(
+                    task_id=task.task_id,
+                    text_digest=task.text_digest,
+                    task_kind=task.task_kind,
+                    object_kind=task.object_kind,
+                    authority_scope=task.authority_scope,
+                    temporal_scope=task.temporal_scope,
+                    currentness=task.currentness,
+                    required_response_act=task.required_response_act,
+                    subject_requirement=task.subject_requirement,
+                    subject_indexes=task.subject_indexes,
+                )
+                for task in frame.tasks
+            ),
+            frame_role_hints=frame.role_hints,
+            frame_domain_hints=frame.domain_hints,
+            frame_event_ref=frame.event_ref,
+            frame_event_relation=frame.event_relation,
+            frame_task_kind=frame.task_kind,
+            frame_object_kind=frame.object_kind,
+            frame_phase=frame.phase,
+            frame_temporal_scope=frame.temporal_scope,
+            frame_currentness=frame.currentness,
+            now="2026-08-10T12:02:00+00:00",
+        )
+
+        packet = build_packet(
+            self.conn,
+            request,
+            persist=True,
+            environ=self.flags,
+        )
+
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(
+            tuple(task.authority_scope for task in frame.tasks),
+            ("packet", "packet"),
+        )
+        self.assertTrue(
+            any(
+                item.lane == "conversation_context"
+                and "narrow beam" in item.text
+                for item in packet.items
+            )
+        )
+        self.assertEqual(packet.diagnostics.invalid_invariants, [])
+
     def test_multi_subject_render_reserves_evidence_for_each_subject(self):
         basis = self._multi_subject_basis(
             "Compare Cache Back and Mac Modem.",
@@ -1279,6 +1407,61 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 answered,
             ).status,
             "current_fact_not_held",
+        )
+
+    def test_typed_current_request_uses_request_authority(self):
+        request_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text="What should we test first?",
+                frame_subject_requirement="not_applicable",
+                frame_subjects=(),
+                frame_tasks=(
+                    PacketFrameTask(
+                        task_id="T1",
+                        text_digest="d" * 64,
+                        task_kind="answer",
+                        object_kind="unknown",
+                        authority_scope="current_request",
+                        temporal_scope="unspecified",
+                        currentness="unknown",
+                        required_response_act="answer",
+                        subject_requirement="not_applicable",
+                    ),
+                ),
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="not_applicable",
+                reason_codes=("subject_not_required",),
+            ),
+        )
+        request_basis = replace(self.basis, packet=request_packet)
+        valid = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"Test the slow pulse '
+            'first.","supportKind":"current_request","evidenceIds":'
+            '["REQUEST"]}]}'
+        )
+        wrong = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"Test the slow pulse '
+            'first.","supportKind":"external_public","evidenceIds":'
+            '["PUBLIC"]}]}'
+        )
+
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                request_basis,
+                valid,
+            ).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                request_basis,
+                wrong,
+            ).status,
+            "request_support_invalid",
         )
 
     def test_receipt_is_content_free_and_counts_one_call(self):
