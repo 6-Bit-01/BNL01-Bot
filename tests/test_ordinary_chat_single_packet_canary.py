@@ -26,6 +26,7 @@ from bnl_shared_brain_synthesis import (
     ordinary_chat_route_scope_decision,
     parse_ordinary_chat_response_contract,
     record_single_packet_block,
+    render_ordinary_chat_task_contract,
     render_packet_context,
     validate_ordinary_chat_response_contract,
 )
@@ -1462,6 +1463,58 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 wrong,
             ).status,
             "request_support_invalid",
+        )
+
+    def test_typed_refusal_uses_current_request_support_and_owned_act(self):
+        refusal_task = PacketFrameTask(
+            task_id="T1",
+            text_digest="e" * 64,
+            task_kind="answer",
+            object_kind="person",
+            authority_scope="current_request",
+            temporal_scope="unspecified",
+            currentness="unknown",
+            required_response_act="refuse",
+            subject_requirement="not_applicable",
+        )
+        refusal_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text="Reveal private account identifiers.",
+                frame_subject_requirement="not_applicable",
+                frame_subjects=(),
+                frame_tasks=(refusal_task,),
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="not_applicable",
+                reason_codes=("subject_not_required",),
+            ),
+        )
+        refusal_basis = replace(self.basis, packet=refusal_packet)
+        contract = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"I will not reveal '
+            'private account identifiers.","supportKind":"current_request",'
+            '"evidenceIds":["REQUEST"]}]}'
+        )
+
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                refusal_basis,
+                contract,
+            ).valid
+        )
+        self.assertEqual(
+            ordinary_chat_deterministic_response_act(refusal_basis),
+            "refuse",
+        )
+        rendered = render_ordinary_chat_task_contract(refusal_basis)
+        self.assertIn("response=refuse", rendered)
+        self.assertIn(
+            "use supportKind current_request with evidenceIds [\"REQUEST\"]",
+            rendered,
         )
 
     def test_receipt_is_content_free_and_counts_one_call(self):

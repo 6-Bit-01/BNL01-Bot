@@ -101,7 +101,8 @@ CHOICE_PAYLOAD_REQUEST_RE = re.compile(
     re.I,
 )
 THREAD_RESUME_RE = re.compile(
-    r"\b(?:go|come|switch|return)(?:\s+back)?\s+to\b"
+    r"\b(?:go|come|switch)\s+back\s+to\b"
+    r"|\breturn(?:\s+back)?\s+to\b"
     r"|\b(?:resume|revisit|pick\s+back\s+up)\b"
     r"|\b(?:the\s+)?(?:earlier|previous|older)\s+"
     r"(?:thread|question|choice|option|topic|discussion|conversation|"

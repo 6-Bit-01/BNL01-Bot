@@ -34729,16 +34729,19 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
 
     if multiline_payload_detected:
         return "answer", "single_message_multiline_request_payload"
-    if pending_request_intent and len(texts) == 1 and _is_single_payload_like_item(texts[0]):
-        return "answer", "pending_request_single_payload_continuation"
-    if pending_request_intent and _is_payload_like_cluster(items):
-        return "answer", "pending_request_payload_continuation"
+    # A complete current-turn request owns its own frame. A short-lived
+    # pending list anchor may collect otherwise unframed payload fragments,
+    # but it must not reinterpret the next self-contained question as payload.
     if question_like or request_like or bot_named:
         if request_intent:
             return "answer", f"request_intent:{request_reason}"
         if payload_expected:
             return "answer", f"request_payload_expected:{payload_reason}"
         return "answer", "question_request_or_addressed"
+    if pending_request_intent and len(texts) == 1 and _is_single_payload_like_item(texts[0]):
+        return "answer", "pending_request_single_payload_continuation"
+    if pending_request_intent and _is_payload_like_cluster(items):
+        return "answer", "pending_request_payload_continuation"
     if media_context_present:
         media_labels = []
         for t in texts:
@@ -34804,7 +34807,9 @@ def _detect_request_action(text: str):
 
 def _build_active_response_packet(channel_id: int, items, pending_state, pending_anchor=None, bot_user=None, *, guild_id: int = 0, channel_policy: str = "unknown", recent_bnl_reply_context: bool = False, consume_retransmission: bool = False):
     original_items = list(items or [])
-    payload_items = _collect_batch_request_payload_items(original_items, pending_state=bool(pending_state), pending_anchor=pending_anchor)
+    # First collect only payload structure present in this batch. Pending state
+    # is consulted after classification proves this is a continuation.
+    payload_items = _collect_batch_request_payload_items(original_items)
     collapsed_items = _collapse_consecutive_batch_fragments(original_items)
     combined_text = " ".join(
         (content or "") for (_name, content, _user_id) in original_items
@@ -34847,8 +34852,23 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
     if repair_intent:
         decision, reason = "answer", "repair_intent_contextual_generation"
     is_single_payload_continuation = reason == "pending_request_single_payload_continuation"
+    pending_payload_continuation = reason in {
+        "pending_request_payload_continuation",
+        "pending_request_single_payload_continuation",
+    }
+    if pending_payload_continuation:
+        payload_items = _collect_batch_request_payload_items(
+            original_items,
+            pending_state=bool(pending_state),
+            pending_anchor=pending_anchor,
+        )
     has_request_payload = bool(payload_items)
-    if (not has_request_payload) and pending_request and decision == "answer":
+    if (
+        not has_request_payload
+        and pending_request
+        and pending_payload_continuation
+        and decision == "answer"
+    ):
         payload_items = [
             (content or "").strip()
             for (_name, content, _uid) in collapsed_items
@@ -35663,6 +35683,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 ),
             )
             orchestration_decision = orchestration_state["decision"]
+            batch_route_mode = str(
+                getattr(
+                    orchestration_decision.situation_frame,
+                    "route_mode",
+                    "",
+                )
+                or ROUTE_MODE_NORMAL_CHAT
+            )
             if orchestration_decision.influences_response:
                 if orchestration_decision.response_act in {"answer", "clarify"}:
                     decision = "answer"
@@ -35804,7 +35832,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guild_id=guild_id,
                 user_id=first_uid,
                 channel_id=channel_id,
-                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                route_mode=batch_route_mode,
                 channel_policy=channel_policy,
                 current_direct=batch_current_direct,
                 user_text=combined_text,
@@ -35908,7 +35936,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     source_safe_recall_synthesis_enabled(
                         guild_id=guild_id,
                         user_id=first_uid,
-                        route_mode=ROUTE_MODE_NORMAL_CHAT,
+                        route_mode=batch_route_mode,
                         channel_policy=channel_policy,
                         user_text=combined_text,
                         current_direct=bool(
@@ -35922,7 +35950,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_memory_context = build_user_memory_context(
                     first_uid,
                     guild_id,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    route_mode=batch_route_mode,
                     channel_policy=channel_policy,
                     user_text=combined_text,
                     is_owner_or_mod=batch_member_is_privileged,
@@ -35978,7 +36006,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_memory_context,
                     user_id=first_uid,
                     guild_id=guild_id,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    route_mode=batch_route_mode,
                     channel_policy=channel_policy,
                     user_text=combined_text,
                     is_owner_or_mod=batch_member_is_privileged,
@@ -36105,7 +36133,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 and unified_moment_canary_enabled(
                     guild_id=guild_id,
                     channel_id=channel_id,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    route_mode=batch_route_mode,
                     channel_policy=channel_policy,
                 )
             )
@@ -36113,7 +36141,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_unified_assessment = (
                 build_unified_response_assessment_shadow(
                     guild_id=guild_id,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    route_mode=batch_route_mode,
                     channel_policy=channel_policy,
                     conversation_surface=(
                         conversation_surface_for_channel_policy(
@@ -36188,7 +36216,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     guild_id=guild_id,
                     channel_id=channel_id,
                     channel_policy=channel_policy,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    route_mode=batch_route_mode,
                     topic_text=combined_text,
                     participant_user_ids=(
                         batch_unified_assessment.participant_user_ids
@@ -36211,7 +36239,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     guild_id=guild_id,
                     user_id=first_uid,
                     channel_id=channel_id,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    route_mode=batch_route_mode,
                     channel_policy=channel_policy,
                     current_direct=batch_current_direct,
                     user_text=combined_text,
@@ -36233,7 +36261,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     guild_id=guild_id,
                     user_id=first_uid,
                     channel_id=channel_id,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    route_mode=batch_route_mode,
                     channel_policy=channel_policy,
                     current_direct=bool(
                         active_packet.get("addressed_to_bot")
@@ -36277,7 +36305,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     source_safe_recall_synthesis_contract(
                         guild_id=guild_id,
                         user_id=first_uid,
-                        route_mode=ROUTE_MODE_NORMAL_CHAT,
+                        route_mode=batch_route_mode,
                         channel_policy=channel_policy,
                         user_text=combined_text,
                         current_direct=bool(
@@ -36380,7 +36408,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         orchestration_state["decision"].situation_frame
                     ),
                     situation_frame_current_text=combined_text,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    route_mode=batch_route_mode,
                     channel_policy=channel_policy,
                     conversation_surface=(
                         conversation_surface_for_channel_policy(
@@ -36941,7 +36969,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             and batch_ordinary_chat_execution.block_reason
             and str(response or "")
             == _ordinary_chat_single_packet_block_response(
-                batch_ordinary_chat_execution.block_reason
+                batch_ordinary_chat_execution.block_reason,
+                orchestration_state["decision"].situation_frame,
             )
         )
         batch_typed_single_packet_candidate = bool(
@@ -41837,13 +41866,50 @@ class OrdinaryChatLegacyBaselineExecution:
     provider_call_count: int
 
 
-def _ordinary_chat_single_packet_block_response(reason: str) -> str:
+def _ordinary_chat_ambiguous_subject_labels(
+    situation_frame: SituationFrameV1 | None,
+) -> tuple[str, ...]:
+    if str(getattr(situation_frame, "status", "") or "").lower() != (
+        "ambiguous"
+    ):
+        return ()
+    labels = tuple(
+        dict.fromkeys(
+            str(getattr(subject, "label_hint", "") or "").strip()
+            for subject in tuple(
+                getattr(situation_frame, "subjects", ()) or ()
+            )
+            if str(getattr(subject, "label_hint", "") or "").strip()
+        )
+    )
+    return labels if 2 <= len(labels) <= 4 else ()
+
+
+def _ordinary_chat_single_packet_block_response(
+    reason: str,
+    situation_frame: SituationFrameV1 | None = None,
+) -> str:
     value = str(reason or "").lower()
     if "deterministic_task_hold" in value or "current_fact" in value:
         return (
             "I can’t verify that live or current fact from an authoritative "
             "source right now, so I’m holding it instead of guessing."
         )
+    if "deterministic_task_refuse" in value:
+        return (
+            "I can discuss public BARCODE roles, but I won’t reveal private "
+            "owner-control details, account identifiers, credentials, or "
+            "infrastructure-access information."
+        )
+    if "deterministic_task_clarify" in value or "ambiguous" in value:
+        labels = _ordinary_chat_ambiguous_subject_labels(situation_frame)
+        if len(labels) == 2:
+            return "Do you mean %s or %s?" % labels
+        if labels:
+            return "Do you mean %s, or %s?" % (
+                ", ".join(labels[:-1]),
+                labels[-1],
+            )
     if "deterministic_task_clarify" in value:
         return (
             "I’m missing one exact target for that question. Name the person, "
@@ -42351,7 +42417,10 @@ async def maybe_generate_ordinary_chat_single_packet(
         )
         return OrdinaryChatSinglePacketExecution(
             decision=None,
-            response=_ordinary_chat_single_packet_block_response(reason),
+            response=_ordinary_chat_single_packet_block_response(
+                reason,
+                situation_frame,
+            ),
             prompt=str(prompt or ""),
             prompt_source_bases=(),
             candidate_active=False,
@@ -42403,7 +42472,10 @@ async def maybe_generate_ordinary_chat_single_packet(
         reason = "receipt_begin_failed"
         return OrdinaryChatSinglePacketExecution(
             decision=None,
-            response=_ordinary_chat_single_packet_block_response(reason),
+            response=_ordinary_chat_single_packet_block_response(
+                reason,
+                situation_frame,
+            ),
             prompt=str(prompt or ""),
             prompt_source_bases=(basis,),
             candidate_active=False,
@@ -42415,7 +42487,10 @@ async def maybe_generate_ordinary_chat_single_packet(
         reason = str(run.fallback_reason or prompt_failure or "preflight_block")
         return OrdinaryChatSinglePacketExecution(
             decision=blocked_single_packet_decision(run, reason=reason),
-            response=_ordinary_chat_single_packet_block_response(reason),
+            response=_ordinary_chat_single_packet_block_response(
+                reason,
+                situation_frame,
+            ),
             prompt=packet_prompt.prompt,
             prompt_source_bases=(basis,),
             candidate_active=False,
@@ -42503,7 +42578,10 @@ async def maybe_generate_ordinary_chat_single_packet(
     reason = str(decision.fallback_reason or "candidate_rejected")
     return OrdinaryChatSinglePacketExecution(
         decision=decision,
-        response=_ordinary_chat_single_packet_block_response(reason),
+        response=_ordinary_chat_single_packet_block_response(
+            reason,
+            situation_frame,
+        ),
         prompt=packet_prompt.prompt,
         prompt_source_bases=(basis,),
         candidate_active=False,
@@ -42551,6 +42629,7 @@ def ordinary_chat_legacy_baseline_fallback_allowed(
     if (
         "ambiguous" in block_reason
         or "deterministic_task_clarify" in block_reason
+        or "deterministic_task_refuse" in block_reason
     ):
         return False
     if str(getattr(situation_frame, "status", "") or "").lower() == (
@@ -42573,7 +42652,7 @@ def ordinary_chat_legacy_baseline_fallback_allowed(
             return False
         if currentness == "current" and required_act == "hold":
             return False
-        if required_act == "clarify":
+        if required_act in {"clarify", "refuse"}:
             return False
 
     if not tasks and _ORDINARY_CHAT_VOLATILE_FALLBACK_RE.search(
@@ -42938,7 +43017,8 @@ async def send_planned_conversation_response(
         and ordinary_chat_single_packet_execution.block_reason
         and str(response or "")
         == _ordinary_chat_single_packet_block_response(
-            ordinary_chat_single_packet_execution.block_reason
+            ordinary_chat_single_packet_execution.block_reason,
+            situation_frame,
         )
     )
     single_packet_block_reason = str(
