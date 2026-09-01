@@ -706,6 +706,36 @@ def _situation_task_segments(text: str) -> Tuple[str, ...]:
     return parts or (str(text or ""),)
 
 
+def situation_task_texts(
+    frame: SituationFrameV1 | None,
+    *,
+    current_text: str,
+) -> Tuple[str, ...]:
+    """Resolve transient task wording only when it matches the frozen frame.
+
+    Task text remains absent from the immutable frame and its receipts.  The
+    provider contract may still recover the wording from the current request,
+    but only when both the whole-request digest and every ordered task digest
+    match the already-owned frame.
+    """
+
+    if not isinstance(frame, SituationFrameV1):
+        return ()
+    text = str(current_text or "")
+    if _situation_digest(text) != frame.current_text_digest:
+        return ()
+    segments = _situation_task_segments(text)
+    tasks = tuple(frame.tasks or ())
+    if not tasks or len(segments) != len(tasks):
+        return ()
+    if any(
+        _situation_digest(segment) != task.text_digest
+        for segment, task in zip(segments, tasks)
+    ):
+        return ()
+    return segments
+
+
 def _task_subject_indexes(
     segment: str,
     subjects: Sequence[SituationSubjectReference],

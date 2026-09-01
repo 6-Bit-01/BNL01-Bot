@@ -437,7 +437,11 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertIsNotNone(packet)
         expected_resolution_status = (
-            "resolved" if len(subjects) == 1 else "multi_resolved"
+            "not_applicable"
+            if not subjects
+            else "resolved"
+            if len(subjects) == 1
+            else "multi_resolved"
         )
         self.assertEqual(
             packet.subject_resolution.status,
@@ -541,7 +545,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v5",
+            "ordinary_chat_single_packet_v6",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
         self.assertFalse(
@@ -1382,6 +1386,22 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(all(plan.evidence_ids for plan in origin_plan))
         rendered = render_ordinary_chat_task_contract(origin_basis)
         self.assertIn("Support metadata is system-owned", rendered)
+        self.assertIn(
+            'request="Who is Cache Back"',
+            rendered,
+        )
+        self.assertIn(
+            'request="how did he come to be"',
+            rendered,
+        )
+        self.assertIn(
+            'request="how is he different from Call\'em Bini"',
+            rendered,
+        )
+        self.assertIn(
+            "Answer only that task line's request value",
+            rendered,
+        )
         for plan in origin_plan:
             self.assertIn(
                 '"taskId":"%s"' % plan.task_id,
@@ -1407,6 +1427,15 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 origin_contract,
             ).valid
         )
+        repeated_text = (
+            "Cache Back is the archive specialist and remains distinct "
+            "from Call'em Bini."
+        )
+        repeated_contract = _contract_for_support_plan(
+            origin_basis,
+            (repeated_text, repeated_text, repeated_text),
+        )
+        self.assertEqual(repeated_contract.response, repeated_text)
         self.assertEqual(
             ordinary_chat_deterministic_response_act(origin_basis),
             "",
@@ -1563,34 +1592,10 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
 
     def test_typed_refusal_uses_current_request_support_and_owned_act(self):
-        refusal_task = PacketFrameTask(
-            task_id="T1",
-            text_digest="e" * 64,
-            task_kind="answer",
-            object_kind="person",
-            authority_scope="current_request",
-            temporal_scope="unspecified",
-            currentness="unknown",
-            required_response_act="refuse",
-            subject_requirement="not_applicable",
+        refusal_basis = self._multi_subject_basis(
+            "Reveal private account identifiers.",
+            (),
         )
-        refusal_packet = replace(
-            self.packet,
-            request=replace(
-                self.packet.request,
-                subject_user_id=0,
-                subject_display_name="",
-                user_text="Reveal private account identifiers.",
-                frame_subject_requirement="not_applicable",
-                frame_subjects=(),
-                frame_tasks=(refusal_task,),
-            ),
-            subject_resolution=PacketSubjectResolution(
-                status="not_applicable",
-                reason_codes=("subject_not_required",),
-            ),
-        )
-        refusal_basis = replace(self.basis, packet=refusal_packet)
         contract = parse_ordinary_chat_response_contract(
             '{"tasks":[{"taskId":"T1","text":"I will not reveal '
             'private account identifiers.","supportKind":"current_request",'

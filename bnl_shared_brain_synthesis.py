@@ -52,6 +52,7 @@ from bnl_unified_response_assessment import (
     UnifiedResponseAssessment,
     assess_response_coherence,
     shadow_enabled as assessment_shadow_enabled,
+    situation_task_texts,
 )
 
 
@@ -79,7 +80,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v5"
+    "ordinary_chat_single_packet_v6"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV = (
@@ -1296,9 +1297,18 @@ class OrdinaryChatResponseContract:
 
     @property
     def response(self) -> str:
-        return "\n\n".join(
-            task.text.strip() for task in self.tasks if task.text.strip()
-        ).strip()
+        parts = []
+        seen = set()
+        for task in self.tasks:
+            text = task.text.strip()
+            if not text:
+                continue
+            normalized = re.sub(r"\s+", " ", text).strip().casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            parts.append(text)
+        return "\n\n".join(parts).strip()
 
 
 @dataclass(frozen=True)
@@ -3248,12 +3258,21 @@ def render_ordinary_chat_task_contract(
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
         return ""
+    frame = getattr(basis.assessment, "situation_frame", None)
+    task_requests = situation_task_texts(
+        frame,
+        current_text=str(basis.packet.request.user_text or ""),
+    )
+    if len(task_requests) != len(tasks):
+        return ""
     support_plans = ordinary_chat_task_support_plan(basis)
     task_lines = [
-        "- %s | authority=%s | object=%s | currentness=%s | response=%s "
+        "- %s | request=%s | authority=%s | object=%s | currentness=%s "
+        "| response=%s "
         "| subjects=%s | supportKind=%s | evidenceIds=%s"
         % (
             str(getattr(task, "task_id", "") or ""),
+            json.dumps(task_request, ensure_ascii=True),
             str(getattr(task, "authority_scope", "") or "unknown"),
             str(getattr(task, "object_kind", "") or "unknown"),
             str(getattr(task, "currentness", "") or "unknown"),
@@ -3266,7 +3285,11 @@ def render_ordinary_chat_task_contract(
             plan.support_kind or "invalid",
             json.dumps(list(plan.evidence_ids), separators=(",", ":")),
         )
-        for task, plan in zip(tasks, support_plans)
+        for task, plan, task_request in zip(
+            tasks,
+            support_plans,
+            task_requests,
+        )
     ]
     evidence_lines = [
         "- %s | lane=%s | subjects=%s"
@@ -3291,7 +3314,7 @@ def render_ordinary_chat_task_contract(
             "tasks": [
                 {
                     "taskId": plan.task_id,
-                    "text": "visible answer",
+                    "text": "visible answer for %s only" % plan.task_id,
                     "supportKind": plan.support_kind or "invalid",
                     "evidenceIds": list(plan.evidence_ids),
                 }
@@ -3315,7 +3338,9 @@ def render_ordinary_chat_task_contract(
         + "system-owned: copy each task line's supportKind and evidenceIds "
         + "values exactly into its JSON object. Do not choose, substitute, "
         + "add, remove, or reorder support references. Generate only each "
-        + "task's visible text. For response=refuse, refuse the requested "
+        + "task's visible text. Answer only that task line's request value; "
+        + "do not repeat, summarize, or include another task's answer in it. "
+        + "For response=refuse, refuse the requested "
         + "disclosure in that text. For supportKind=hold or clarify, make the "
         + "visible text perform that act. The text fields become the visible "
         + "reply. "

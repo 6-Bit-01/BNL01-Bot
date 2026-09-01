@@ -5,6 +5,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
+from bnl_unified_response_assessment import situation_task_texts
 
 
 def _addressing():
@@ -103,10 +104,11 @@ class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
         self.assertEqual(frame.tasks[0].required_response_act, "hold")
 
     def test_live_compound_pronouns_bind_per_task_without_authority_escape(self):
-        frame = _frame(
+        text = (
             "Who is Cache Back, how did he come to be, and how is he "
             "different from Call'em Bini?"
         )
+        frame = _frame(text)
         subject_keys = tuple(
             subject.entity_ref for subject in frame.subjects
         )
@@ -127,6 +129,21 @@ class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
                 ("cache_back",),
                 ("cache_back", "call_em_bini"),
             ),
+        )
+        self.assertEqual(
+            situation_task_texts(frame, current_text=text),
+            (
+                "Who is Cache Back",
+                "how did he come to be",
+                "how is he different from Call'em Bini",
+            ),
+        )
+        self.assertEqual(
+            situation_task_texts(
+                frame,
+                current_text=text + " changed",
+            ),
+            (),
         )
 
     def test_named_singular_pronoun_ambiguity_requires_clarification(self):
