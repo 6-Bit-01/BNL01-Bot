@@ -1094,9 +1094,17 @@ class SharedBrainSynthesisBotPathTests(
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
                 text=(
-                    '{"tasks":[{"taskId":"T1","text":"One generated '
-                    'answer.","supportKind":"external_public",'
-                    '"evidenceIds":["PUBLIC"]}]}'
+                    '{"tasks":['
+                    '{"taskId":"T1","text":"One generated answer.",'
+                    '"supportKind":"external_public",'
+                    '"evidenceIds":["PUBLIC"]},'
+                    '{"taskId":"T2","text":"One generated answer.",'
+                    '"supportKind":"external_public",'
+                    '"evidenceIds":["PUBLIC"]},'
+                    '{"taskId":"T3","text":"One generated answer.",'
+                    '"supportKind":"external_public",'
+                    '"evidenceIds":["PUBLIC"]}'
+                    ']}'
                 ),
                 provider_call_count=1,
             )
