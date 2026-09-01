@@ -26706,6 +26706,15 @@ def _typed_canon_subject_references(
 
     text = unicodedata.normalize("NFKC", str(current_text or ""))
     text = text.replace("’", "'").casefold()
+    singular_pronoun = re.search(
+        r"\b(?:he|him|his|she|her|hers|that\s+(?:person|member|"
+        r"character|entity))\b",
+        text,
+        re.I,
+    )
+    pronoun_antecedent_limit = (
+        singular_pronoun.start() if singular_pronoun is not None else -1
+    )
     factual_subject_cue_re = re.compile(
         r"\b(?:tell\s+me\s+about|what\s+do\s+you\s+"
         r"(?:know|remember)\s+about|what\s+happened\s+with|"
@@ -26757,10 +26766,34 @@ def _typed_canon_subject_references(
                 r"(?:connected|related)\s+to\b" % escaped,
                 r"\b(?:connected|related)\s+to\s+(?:the\s+)?"
                 r"(?P<alias>%s)(?![a-z0-9])" % escaped,
+                r"\b(?:different\s+from|differs?\s+from|versus|vs\.?)\s+"
+                r"(?:the\s+)?(?P<alias>%s)(?![a-z0-9])" % escaped,
             )
             for pattern in subject_patterns:
                 for match in re.finditer(pattern, text, re.I):
                     start, end = match.span("alias")
+                    candidates.add(
+                        (start, end, subject.key, subject.name)
+                    )
+            if (
+                pronoun_antecedent_limit > 0
+                and subject.key
+                not in {
+                    "barcode",
+                    "barcode_network",
+                    "barcode_radio",
+                    "bnl_01",
+                }
+            ):
+                for match in re.finditer(
+                    r"(?<![a-z0-9])(?P<alias>%s)(?![a-z0-9])"
+                    % escaped,
+                    text[:pronoun_antecedent_limit],
+                    re.I,
+                ):
+                    start, end = match.span("alias")
+                    if text[end : end + 2] == "'s":
+                        continue
                     candidates.add(
                         (start, end, subject.key, subject.name)
                     )
@@ -26829,6 +26862,63 @@ _EXACT_REPLY_CANON_IDENTITY_QUERY_RE = re.compile(
     r"connection))\b",
     re.I,
 )
+
+
+def _exact_reply_canon_discourse_focus_keys(
+    reply_text: str,
+    eligible_identities,
+) -> tuple[str, ...]:
+    """Return canon aliases used as grammatical sentence subjects.
+
+    This is identity-only discourse binding.  It does not promote prior model
+    prose into factual evidence, and it deliberately ignores possessives,
+    prepositional mentions, predicate complements, and coordinated subjects.
+    """
+
+    normalized = unicodedata.normalize(
+        "NFKC",
+        str(reply_text or ""),
+    ).replace("’", "'")
+    sentences = tuple(
+        sentence.strip(" \t\r\n\"'()[]{}")
+        for sentence in re.split(r"(?<=[.!?;])\s+|[\r\n]+", normalized)
+        if sentence.strip()
+    )
+    focus_keys = []
+    subject_verb_re = re.compile(
+        r"^\s+(?:is|was|are|were|serves?|served|handles?|handled|"
+        r"maintains?|maintained|recovers?|recovered|protects?|protected|"
+        r"manages?|managed|keeps?|kept|became|remains?|remained|"
+        r"emerged|originated|works?|worked|helps?|helped|does|did|has|"
+        r"had)\b",
+        re.I,
+    )
+    for sentence in sentences:
+        for identity in eligible_identities:
+            matched = False
+            for alias in (identity.name, *identity.aliases):
+                value = unicodedata.normalize(
+                    "NFKC",
+                    str(alias or ""),
+                ).replace("’", "'").strip()
+                if not value:
+                    continue
+                match = re.match(
+                    r"^%s(?![a-z0-9])" % re.escape(value),
+                    sentence,
+                    re.I,
+                )
+                if match is None:
+                    continue
+                tail = sentence[match.end() :]
+                if tail.startswith("'s") or not subject_verb_re.match(tail):
+                    continue
+                focus_keys.append(identity.key)
+                matched = True
+                break
+            if matched:
+                break
+    return tuple(dict.fromkeys(focus_keys))
 
 
 def _exact_reply_canon_subject_references(
@@ -26935,6 +27025,15 @@ def _exact_reply_canon_subject_references(
                 if len(remaining) == 1:
                     return remaining, "resolved"
                 return (), "ambiguous"
+        focus_keys = _exact_reply_canon_discourse_focus_keys(
+            reply_text,
+            eligible,
+        )
+        focused = tuple(
+            identity for identity in resolved if identity[0] in focus_keys
+        )
+        if len(focused) == 1:
+            return focused, "resolved"
         if len(resolved) == 1:
             return tuple(resolved), "resolved"
         return (), "ambiguous"
@@ -35462,6 +35561,32 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         post_generation_regeneration_pending = None
         payload_completion_regenerated = False
         response = ""
+        batch_ordinary_chat_execution = None
+        batch_single_packet_cutover = False
+
+        async def _finalize_stale_batch_single_packet(
+            execution: OrdinaryChatSinglePacketExecution | None,
+            *,
+            stale_reason: str,
+            final_response: str,
+        ) -> None:
+            if execution is None or execution.decision is None:
+                return
+            stale_decision = (
+                await safely_record_ordinary_chat_single_packet_block(
+                    execution.decision,
+                    reason=stale_reason,
+                )
+                or execution.decision
+            )
+            await safely_finalize_shared_brain_synthesis(
+                stale_decision,
+                final_response=final_response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status=stale_reason,
+            )
+
         while True:
             if (
                 batch_exclusively_targets_other_people(items)
@@ -35654,6 +35779,45 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_website_read_model_context
                 or batch_tiktok_show_evidence_context
             )
+            community_visual_basis = build_community_visual_basis(
+                guild_id,
+                (
+                    tuple(
+                        content
+                        for _name, content, _uid in collapsed_items
+                    )
+                    if len(unique_user_ids) == 1
+                    else ""
+                ),
+                channel_policy=channel_policy,
+            )
+            community_visual_prompt = (
+                render_community_visual_basis_for_prompt(
+                    community_visual_basis
+                )
+            )
+            batch_current_direct = bool(
+                active_packet.get("addressed_to_bot")
+                or is_broad_personal_recall_request(combined_text)
+            )
+            batch_ordinary_chat_scope = ordinary_chat_route_scope_decision(
+                guild_id=guild_id,
+                user_id=first_uid,
+                channel_id=channel_id,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                channel_policy=channel_policy,
+                current_direct=batch_current_direct,
+                user_text=combined_text,
+                has_media=bool(active_packet.get("media_present")),
+                specialized_owner_present=bool(
+                    batch_source_context_available
+                    or community_visual_prompt
+                ),
+            )
+            batch_ordinary_chat_single_packet = bool(
+                len(unique_user_ids) == 1
+                and batch_ordinary_chat_scope.eligible
+            )
             batch_source_no_store_reason = (
                 "finalized_show_evidence_no_store"
                 if batch_tiktok_show_evidence_context
@@ -35713,7 +35877,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     + batch_attribution_contract.prompt_block
                     + "\n"
                 )
-            if recent_room_prompt:
+            if recent_room_prompt and not batch_ordinary_chat_single_packet:
                 prompt += "\n\n" + recent_room_prompt + "\n"
             orchestration_prompt_block = str(
                 orchestration_state.get("prompt_block") or ""
@@ -35724,7 +35888,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_memory_source_metadata: dict = {}
             batch_member_is_privileged = False
             batch_memory_target_user_id = 0
-            if len(unique_user_ids) == 1:
+            batch_source_safe_recall = False
+            if (
+                len(unique_user_ids) == 1
+                and not batch_ordinary_chat_single_packet
+            ):
                 member = channel.guild.get_member(first_uid)
                 batch_member_is_privileged = is_privileged_member(
                     member,
@@ -35932,8 +36100,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     if present
                 )
             )
-            batch_unified_moment_canary_scope = (
-                unified_moment_canary_enabled(
+            batch_unified_moment_canary_scope = bool(
+                not batch_ordinary_chat_single_packet
+                and unified_moment_canary_enabled(
                     guild_id=guild_id,
                     channel_id=channel_id,
                     route_mode=ROUTE_MODE_NORMAL_CHAT,
@@ -36037,6 +36206,28 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_prompt_source_bases.append(
                     batch_unified_moment_canary_basis
                 )
+            batch_ordinary_chat_basis = (
+                build_ordinary_chat_basis(
+                    guild_id=guild_id,
+                    user_id=first_uid,
+                    channel_id=channel_id,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    current_direct=batch_current_direct,
+                    user_text=combined_text,
+                    packet=batch_intelligence_packet_out.get("packet"),
+                    assessment=batch_unified_assessment,
+                    has_media=bool(active_packet.get("media_present")),
+                )
+                if batch_ordinary_chat_single_packet
+                else None
+            )
+            batch_ordinary_chat_preflight_block_reason = (
+                "packet_or_assessment_unavailable"
+                if batch_ordinary_chat_single_packet
+                and batch_ordinary_chat_basis is None
+                else ""
+            )
             batch_shared_brain_synthesis_basis = (
                 build_shared_brain_synthesis_basis(
                     guild_id=guild_id,
@@ -36067,6 +36258,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
                 if len(unique_user_ids) == 1
                 and not batch_source_context_available
+                and not batch_ordinary_chat_single_packet
                 else None
             )
             continuity_contract = build_general_conversation_continuity_contract(
@@ -36077,7 +36269,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             if continuity_contract:
                 prompt += "\n\n" + continuity_contract
-            if len(unique_user_ids) == 1:
+            if (
+                len(unique_user_ids) == 1
+                and not batch_ordinary_chat_single_packet
+            ):
                 batch_recall_synthesis_contract = (
                     source_safe_recall_synthesis_contract(
                         guild_id=guild_id,
@@ -36112,18 +36307,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "\n\n"
                     + batch_unified_moment_canary_basis.rendered_context
                 )
-            community_visual_basis = build_community_visual_basis(
-                guild_id,
-                (
-                    tuple(content for _name, content, _uid in collapsed_items)
-                    if len(unique_user_ids) == 1
-                    else ""
-                ),
-                channel_policy=channel_policy,
-            )
-            community_visual_prompt = render_community_visual_basis_for_prompt(
-                community_visual_basis
-            )
             if community_visual_prompt:
                 prompt += "\n\n" + community_visual_prompt + "\n"
             recent_media_prompt = ""
@@ -36184,22 +36367,71 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 len(collapsed_items),
                 f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f};indicator_active={int(typing_active)}",
             )
-            response = await get_gemini_response(
-                prompt,
-                user_id=first_uid,
-                guild_id=channel.guild.id,
-                route=generation_route,
-                source_context_available=batch_source_context_available,
+            batch_ordinary_chat_execution = (
+                await maybe_generate_ordinary_chat_single_packet(
+                    channel=channel,
+                    prompt=prompt,
+                    basis=batch_ordinary_chat_basis,
+                    scope_applied=batch_ordinary_chat_single_packet,
+                    preflight_block_reason=(
+                        batch_ordinary_chat_preflight_block_reason
+                    ),
+                    situation_frame=(
+                        orchestration_state["decision"].situation_frame
+                    ),
+                    situation_frame_current_text=combined_text,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    conversation_surface=(
+                        conversation_surface_for_channel_policy(
+                            channel_policy,
+                            channel_id == get_guild_config(guild_id),
+                        )
+                    ),
+                    user_id=first_uid,
+                    guild_id=guild_id,
+                    user_display_name=(
+                        collapsed_items[-1][0]
+                        if collapsed_items
+                        else ""
+                    ),
+                    source_context_available=bool(
+                        batch_ordinary_chat_basis
+                        or batch_source_context_available
+                    ),
+                )
             )
+            batch_single_packet_cutover = bool(
+                batch_ordinary_chat_execution is not None
+                and not batch_ordinary_chat_execution.legacy_baseline_active
+            )
+            if batch_ordinary_chat_execution is not None:
+                response = batch_ordinary_chat_execution.response
+                prompt = batch_ordinary_chat_execution.prompt
+                batch_prompt_source_bases = list(
+                    batch_ordinary_chat_execution.prompt_source_bases
+                )
+                generation_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
+            else:
+                response = await get_gemini_response(
+                    prompt,
+                    user_id=first_uid,
+                    guild_id=channel.guild.id,
+                    route=generation_route,
+                    source_context_available=batch_source_context_available,
+                )
 
-            response = suppress_stale_media_fallback(
-                response,
-                current_text=combined_text,
-                current_has_media=bool(active_packet.get("media_present")),
-                user_id=first_uid,
-                guild_id=guild_id,
-                channel_id=channel_id,
-            )
+            if not batch_single_packet_cutover:
+                response = suppress_stale_media_fallback(
+                    response,
+                    current_text=combined_text,
+                    current_has_media=bool(
+                        active_packet.get("media_present")
+                    ),
+                    user_id=first_uid,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                )
 
             if not response:
                 latest_result = GenerationResult(
@@ -36230,7 +36462,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _log_batch_event(logging.INFO, "active_packet_completion_check", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing_count={len(missing_items)};decision={decision};reason={reason}")
                 if missing_items:
                     _log_batch_event(logging.INFO, "request_payload_items_missing", guild_id, channel_id, len(missing_items), f"missing_items={len(missing_items)}")
-                    if not payload_completion_regenerated:
+                    if (
+                        not payload_completion_regenerated
+                        and not batch_single_packet_cutover
+                    ):
                         correction_prompt = (
                             prompt
                             + "\n\nCORRECTION REQUIRED: Your last draft omitted required payload items. "
@@ -36346,6 +36581,24 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     }
                     _channel_preempted_generation_id[channel_id] = 0
                     _channel_message_interrupt_generation_id[channel_id] = 0
+                    if batch_single_packet_cutover:
+                        _channel_interrupt_handoff[channel_id] = list(
+                            items
+                        )
+                        _channel_first_seen[channel_id] = datetime.now(
+                            PACIFIC_TZ
+                        )
+                        _channel_last_message_at[channel_id] = (
+                            datetime.now(PACIFIC_TZ)
+                        )
+                        await _finalize_stale_batch_single_packet(
+                            batch_ordinary_chat_execution,
+                            stale_reason=(
+                                "stale_after_batch_single_packet_generation"
+                            ),
+                            final_response=response,
+                        )
+                        return
                     continue
 
             late_count = len(_channel_buffers[channel_id])
@@ -36354,6 +36607,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _channel_preempted_generation_id[channel_id] = local_generation_id
                 _channel_message_interrupt_generation_id[channel_id] = local_generation_id
                 _log_batch_event(logging.INFO, "stale_generation_interrupted", guild_id, channel_id, late_count, "late_message_arrived")
+                if batch_single_packet_cutover:
+                    _channel_interrupt_handoff[channel_id] = list(items)
+                    _channel_first_seen[channel_id] = datetime.now(
+                        PACIFIC_TZ
+                    )
+                    await _finalize_stale_batch_single_packet(
+                        batch_ordinary_chat_execution,
+                        stale_reason=(
+                            "stale_after_batch_single_packet_generation"
+                        ),
+                        final_response=response,
+                    )
+                    _channel_preempted_generation_id[channel_id] = 0
+                    _channel_message_interrupt_generation_id[channel_id] = 0
+                    return
                 if (not regenerated_once) and datetime.now(PACIFIC_TZ) < cycle_deadline:
                     late_items = list(_channel_buffers[channel_id])
                     _channel_buffers[channel_id].clear()
@@ -36400,6 +36668,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if pending_after_discard > 0 or interrupted_by_message:
                 _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "interrupted_preempted")
             if pending_after_discard > 0:
+                if batch_single_packet_cutover:
+                    await _finalize_stale_batch_single_packet(
+                        batch_ordinary_chat_execution,
+                        stale_reason=(
+                            "stale_before_batch_single_packet_send"
+                        ),
+                        final_response=response,
+                    )
                 # The generated response covered ``items`` but cannot be sent after a
                 # newer fragment arrived. Preserve that full packet for the successor
                 # flush; requeueing only the newest buffer loses the conversation that
@@ -36452,6 +36728,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         )
         if stale_response:
             _log_batch_event(logging.INFO, "stale_response_blocked_before_send", guild_id, channel_id, buffered_count, "hard_message_interrupt")
+            if batch_single_packet_cutover:
+                await _finalize_stale_batch_single_packet(
+                    batch_ordinary_chat_execution,
+                    stale_reason=(
+                        "stale_before_batch_single_packet_send"
+                    ),
+                    final_response=response,
+                )
             if hard_interrupt:
                 pause_seconds = random.uniform(HARD_INTERRUPT_REEVALUATE_PAUSE_MIN_SECONDS, HARD_INTERRUPT_REEVALUATE_PAUSE_MAX_SECONDS)
                 await asyncio.sleep(pause_seconds)
@@ -36507,9 +36791,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_bypass_reason="none",
             deterministic_response=False,
             simple_greeting_detected=is_simple_greeting_to_bnl(combined_text),
-            memory_context_injected=True,
-            memory_context_source_count=1,
-            memory_injection_decision="batch_prompt_public_safe",
+            memory_context_injected=bool(batch_memory_context),
+            memory_context_source_count=(
+                1 if batch_memory_context else 0
+            ),
+            memory_injection_decision=(
+                "single_packet_owner"
+                if batch_single_packet_cutover
+                else "batch_prompt_public_safe"
+                if batch_memory_context
+                else "none"
+            ),
             memory_write_decision=(
                 get_route_mode_contract(
                     ROUTE_MODE_NORMAL_CHAT
@@ -36523,8 +36815,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             ),
             source_analysis_context_injected=(
                 batch_source_context_available
+                or batch_single_packet_cutover
             ),
-            source_context_allowed=batch_source_context_available,
+            source_context_allowed=bool(
+                batch_source_context_available
+                or batch_single_packet_cutover
+            ),
             community_scouting_ran=False,
             entity_subjects_detected_count=0,
             subject_extraction_ran=False,
@@ -36549,6 +36845,26 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             canned_ack_suppressed=bool(locals().get("ack_diag", {}).get("canned_ack_suppressed", False)),
             ack_converted_to_observe=bool(locals().get("ack_diag", {}).get("ack_converted_to_observe", False)),
             ack_escalated_to_generation=bool(locals().get("ack_diag", {}).get("ack_escalated_to_generation", False)),
+            ordinary_chat_single_packet_applied=(
+                batch_single_packet_cutover
+            ),
+            ordinary_chat_legacy_baseline_fallback=False,
+            ordinary_chat_single_packet_provider_call_count=(
+                batch_ordinary_chat_execution.provider_call_count
+                if batch_ordinary_chat_execution is not None
+                else 0
+            ),
+            ordinary_chat_single_packet_corrective_call_count=(
+                batch_ordinary_chat_execution.corrective_call_count
+                if batch_ordinary_chat_execution is not None
+                else 0
+            ),
+            ordinary_chat_single_packet_block_reason=(
+                batch_ordinary_chat_execution.block_reason
+                if batch_ordinary_chat_execution is not None
+                else ""
+            ),
+            ordinary_chat_legacy_baseline_generation_provider_call_count=0,
         )
 
         batch_baseline_response = response or ""
@@ -36556,75 +36872,223 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         batch_baseline_source_bases = tuple(
             batch_prompt_source_bases
         )
-        batch_synthesis_execution = (
-            await maybe_generate_shared_brain_synthesis_canary(
-                channel=channel,
-                baseline_response=batch_baseline_response,
-                prompt=batch_baseline_prompt,
-                prompt_source_bases=batch_baseline_source_bases,
-                basis=batch_shared_brain_synthesis_basis,
-                user_id=first_uid,
-                guild_id=guild_id,
-                user_display_name=(
-                    collapsed_items[-1][0] if collapsed_items else ""
-                ),
-                source_context_available=batch_source_context_available,
+        batch_synthesis_execution = None
+        if batch_ordinary_chat_execution is None:
+            batch_synthesis_execution = (
+                await maybe_generate_shared_brain_synthesis_canary(
+                    channel=channel,
+                    baseline_response=batch_baseline_response,
+                    prompt=batch_baseline_prompt,
+                    prompt_source_bases=batch_baseline_source_bases,
+                    basis=batch_shared_brain_synthesis_basis,
+                    user_id=first_uid,
+                    guild_id=guild_id,
+                    user_display_name=(
+                        collapsed_items[-1][0]
+                        if collapsed_items
+                        else ""
+                    ),
+                    source_context_available=(
+                        batch_source_context_available
+                    ),
+                )
+                if not batch_source_context_available
+                else None
             )
-            if not batch_source_context_available
-            else None
-        )
         batch_synthesis_decision = (
-            batch_synthesis_execution.decision
+            batch_ordinary_chat_execution.decision
+            if batch_ordinary_chat_execution is not None
+            else batch_synthesis_execution.decision
             if batch_synthesis_execution is not None
             else None
         )
         batch_synthesis_candidate_active = bool(
-            batch_synthesis_execution is not None
+            batch_ordinary_chat_execution.candidate_active
+            if batch_ordinary_chat_execution is not None
+            else batch_synthesis_execution is not None
             and batch_synthesis_execution.candidate_active
         )
-        if batch_synthesis_execution is not None:
+        if batch_single_packet_cutover:
+            response = batch_ordinary_chat_execution.response
+            prompt = batch_ordinary_chat_execution.prompt
+            batch_prompt_source_bases = list(
+                batch_ordinary_chat_execution.prompt_source_bases
+            )
+        elif batch_synthesis_execution is not None:
             response = batch_synthesis_execution.response
             prompt = batch_synthesis_execution.prompt
             batch_prompt_source_bases = list(
                 batch_synthesis_execution.prompt_source_bases
             )
         batch_canary_guard_fallback_triggered = False
-        archive_guard_triggered = bool(_contains_unsupported_source_authority_claim(response or ""))
-        response, guard_diagnostics = await apply_guarded_response_regeneration(
-            response or "",
-            prompt=prompt,
-            user_id=first_uid,
-            guild_id=guild_id,
-            route_mode=ROUTE_MODE_NORMAL_CHAT,
-            channel_policy=channel_policy,
-            directness=batch_directness,
-            user_display_name=collapsed_items[-1][0] if collapsed_items else "",
-            current_user_text=combined_text,
-            has_media=bool(active_packet.get("media_present", False)),
-            is_reply=False,
-            generation_route=generation_route if 'generation_route' in locals() else "get_gemini_response",
-            channel=channel,
-            source_context_available=batch_source_context_available,
-            batch_generation_id=local_generation_id,
-            conversation_continuity_required=batch_continuity_required,
-            community_visual_basis=community_visual_basis,
-            exact_quote_requested=(
-                batch_attribution_contract.exact_quote_requested
-            ),
-            exact_quote_authority=(
-                batch_attribution_contract.exact_quote_authority
-            ),
-            third_party_attribution_requested=(
-                batch_attribution_contract.third_party_attribution_requested
-            ),
-            prompt_source_bases=tuple(batch_prompt_source_bases),
-            regeneration_allowed=not batch_synthesis_candidate_active,
-            situation_frame=(
-                orchestration_state["decision"].situation_frame
-            ),
+        batch_response_source_context_available = bool(
+            batch_source_context_available or batch_single_packet_cutover
         )
+        archive_guard_triggered = bool(
+            not batch_response_source_context_available
+            and _contains_unsupported_source_authority_claim(
+                response or ""
+            )
+        )
+        batch_single_packet_selected_response = (
+            str(response or "") if batch_single_packet_cutover else ""
+        )
+        batch_deterministic_single_packet_block = bool(
+            batch_single_packet_cutover
+            and batch_ordinary_chat_execution is not None
+            and not batch_synthesis_candidate_active
+            and batch_ordinary_chat_execution.provider_call_count == 0
+            and batch_ordinary_chat_execution.block_reason
+            and str(response or "")
+            == _ordinary_chat_single_packet_block_response(
+                batch_ordinary_chat_execution.block_reason
+            )
+        )
+        batch_typed_single_packet_candidate = bool(
+            batch_single_packet_cutover
+            and batch_synthesis_candidate_active
+            and batch_synthesis_decision is not None
+            and str(
+                getattr(
+                    batch_synthesis_decision,
+                    "typed_contract_status",
+                    "",
+                )
+                or ""
+            )
+            == "valid"
+        )
+        if batch_deterministic_single_packet_block:
+            guard_diagnostics = {
+                "suppressed": False,
+                "deterministic_single_packet_block": True,
+                "_revalidated_prompt_source_bases": tuple(
+                    batch_prompt_source_bases
+                ),
+            }
+        elif batch_typed_single_packet_candidate:
+            guard_diagnostics = {
+                "suppressed": False,
+                "typed_single_packet_selection_boundary": True,
+                "_revalidated_prompt_source_bases": tuple(
+                    batch_prompt_source_bases
+                ),
+            }
+        else:
+            response, guard_diagnostics = (
+                await apply_guarded_response_regeneration(
+                    response or "",
+                    prompt=prompt,
+                    user_id=first_uid,
+                    guild_id=guild_id,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    directness=batch_directness,
+                    user_display_name=(
+                        collapsed_items[-1][0]
+                        if collapsed_items
+                        else ""
+                    ),
+                    current_user_text=combined_text,
+                    has_media=bool(
+                        active_packet.get("media_present", False)
+                    ),
+                    is_reply=False,
+                    generation_route=(
+                        generation_route
+                        if "generation_route" in locals()
+                        else "get_gemini_response"
+                    ),
+                    channel=channel,
+                    source_context_available=(
+                        batch_response_source_context_available
+                    ),
+                    batch_generation_id=local_generation_id,
+                    conversation_continuity_required=(
+                        batch_continuity_required
+                    ),
+                    community_visual_basis=community_visual_basis,
+                    exact_quote_requested=(
+                        batch_attribution_contract.exact_quote_requested
+                    ),
+                    exact_quote_authority=(
+                        batch_attribution_contract.exact_quote_authority
+                    ),
+                    third_party_attribution_requested=(
+                        batch_attribution_contract
+                        .third_party_attribution_requested
+                    ),
+                    prompt_source_bases=tuple(
+                        batch_prompt_source_bases
+                    ),
+                    regeneration_allowed=bool(
+                        not batch_synthesis_candidate_active
+                        and not batch_single_packet_cutover
+                    ),
+                    situation_frame=(
+                        orchestration_state["decision"].situation_frame
+                    ),
+                )
+            )
         if (
-            batch_synthesis_candidate_active
+            batch_single_packet_cutover
+            and batch_synthesis_candidate_active
+            and batch_synthesis_decision is not None
+            and (
+                guard_diagnostics.get("suppressed")
+                or str(response or "")
+                != batch_single_packet_selected_response
+            )
+        ):
+            batch_single_packet_guard_reason = (
+                "single_packet_guard_suppressed"
+                if guard_diagnostics.get("suppressed")
+                else "single_packet_guard_modified_response"
+            )
+            batch_synthesis_decision = (
+                await safely_record_ordinary_chat_single_packet_block(
+                    batch_synthesis_decision,
+                    reason=batch_single_packet_guard_reason,
+                )
+                or batch_synthesis_decision
+            )
+            if not guard_diagnostics.get("suppressed"):
+                guard_diagnostics.update(
+                    {
+                        "suppressed": True,
+                        "suppression_reason": (
+                            batch_single_packet_guard_reason
+                        ),
+                    }
+                )
+            response = recover_guarded_response_obligation(
+                response,
+                baseline_response=batch_baseline_response,
+                prompt=prompt,
+                current_user_text=combined_text,
+                diagnostics=guard_diagnostics,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                channel_policy=channel_policy,
+                source_context_available=(
+                    batch_response_source_context_available
+                ),
+                exact_quote_requested=(
+                    batch_attribution_contract.exact_quote_requested
+                ),
+                exact_quote_authority=(
+                    batch_attribution_contract.exact_quote_authority
+                ),
+                third_party_attribution_requested=(
+                    batch_attribution_contract
+                    .third_party_attribution_requested
+                ),
+            )
+            batch_synthesis_candidate_active = False
+            if guard_diagnostics.get("source_neutral_recovery"):
+                batch_prompt_source_bases = []
+        if (
+            not batch_single_packet_cutover
+            and batch_synthesis_candidate_active
             and batch_synthesis_decision is not None
         ):
             batch_fallback_reason = ""
@@ -36772,18 +37236,33 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _channel_preempted_generation_id[channel_id] = 0
             _channel_message_interrupt_generation_id[channel_id] = 0
             if batch_synthesis_decision is not None:
-                batch_synthesis_decision = (
-                    await safely_fallback_shared_brain_synthesis(
-                        batch_synthesis_decision,
-                        "stale_after_batch_candidate_guard",
+                if batch_single_packet_cutover:
+                    batch_synthesis_decision = (
+                        await safely_record_ordinary_chat_single_packet_block(
+                            batch_synthesis_decision,
+                            reason=(
+                                "stale_after_batch_single_packet_guard"
+                            ),
+                        )
+                        or batch_synthesis_decision
                     )
-                )
+                else:
+                    batch_synthesis_decision = (
+                        await safely_fallback_shared_brain_synthesis(
+                            batch_synthesis_decision,
+                            "stale_after_batch_candidate_guard",
+                        )
+                    )
                 await safely_finalize_shared_brain_synthesis(
                     batch_synthesis_decision,
-                    final_response=batch_baseline_response,
+                    final_response=response,
                     response_sent=False,
                     candidate_live=False,
-                    guard_status="stale_after_batch_candidate_guard",
+                    guard_status=(
+                        "stale_after_batch_single_packet_guard"
+                        if batch_single_packet_cutover
+                        else "stale_after_batch_candidate_guard"
+                    ),
                 )
             return
         if guard_diagnostics.get("suppressed"):
@@ -36838,6 +37317,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     presend_quote_failure,
                     channel_id,
                 )
+                if (
+                    batch_single_packet_cutover
+                    and batch_synthesis_decision is not None
+                ):
+                    batch_synthesis_decision = (
+                        await safely_record_ordinary_chat_single_packet_block(
+                            batch_synthesis_decision,
+                            reason=(
+                                "single_packet_exact_quote_%s"
+                                % presend_quote_failure
+                            ),
+                        )
+                        or batch_synthesis_decision
+                    )
                 guard_diagnostics.update(
                     {
                         "suppressed": True,
@@ -36855,7 +37348,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     route_mode=ROUTE_MODE_NORMAL_CHAT,
                     channel_policy=channel_policy,
                     source_context_available=(
-                        batch_source_context_available
+                        batch_response_source_context_available
                     ),
                     exact_quote_requested=(
                         batch_attribution_contract.exact_quote_requested
@@ -36871,8 +37364,54 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         batch_source_failure = prompt_source_basis_failure(
             batch_presend_source_bases
         )
+        if batch_source_failure and batch_single_packet_cutover:
+            if batch_synthesis_decision is not None:
+                batch_synthesis_decision = (
+                    await safely_record_ordinary_chat_single_packet_block(
+                        batch_synthesis_decision,
+                        reason=(
+                            "single_packet_presend_%s"
+                            % batch_source_failure
+                        ),
+                        source_revalidation_status=(
+                            batch_source_failure
+                        ),
+                    )
+                    or batch_synthesis_decision
+                )
+            guard_diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": batch_source_failure,
+                    "prompt_source_basis_changed": True,
+                }
+            )
+            response = recover_guarded_response_obligation(
+                response,
+                baseline_response=batch_baseline_response,
+                prompt=prompt,
+                current_user_text=combined_text,
+                diagnostics=guard_diagnostics,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                channel_policy=channel_policy,
+                source_context_available=(
+                    batch_response_source_context_available
+                ),
+                exact_quote_requested=(
+                    batch_attribution_contract.exact_quote_requested
+                ),
+                exact_quote_authority=None,
+                third_party_attribution_requested=(
+                    batch_attribution_contract
+                    .third_party_attribution_requested
+                ),
+            )
+            batch_presend_source_bases = ()
+            batch_synthesis_candidate_active = False
+            batch_source_failure = ""
         if (
             batch_source_failure
+            and not batch_single_packet_cutover
             and batch_synthesis_candidate_active
             and batch_synthesis_decision is not None
         ):
@@ -37040,7 +37579,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 diagnostics=guard_diagnostics,
                 route_mode=ROUTE_MODE_NORMAL_CHAT,
                 channel_policy=channel_policy,
-                source_context_available=batch_source_context_available,
+                source_context_available=(
+                    batch_response_source_context_available
+                ),
                 exact_quote_requested=(
                     batch_attribution_contract.exact_quote_requested
                 ),
@@ -37054,6 +37595,16 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_synthesis_candidate_active = False
         batch_frame = orchestration_state["decision"].situation_frame
         if isinstance(batch_frame, SituationFrameV1):
+            batch_packet_basis = getattr(
+                getattr(batch_synthesis_decision, "run", None),
+                "basis",
+                None,
+            )
+            batch_packet = getattr(batch_packet_basis, "packet", None)
+            batch_packet_snapshot_digest = str(
+                getattr(batch_packet, "source_snapshot_digest", "")
+                or ""
+            )
             batch_frame_revalidation = revalidate_situation_frame(
                 batch_frame,
                 current_text=combined_text,
@@ -37065,6 +37616,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     )
                 ),
                 channel_policy=channel_policy,
+                packet_source_snapshot_digest=(
+                    batch_packet_snapshot_digest
+                    if batch_single_packet_cutover
+                    else ""
+                ),
             )
             guard_diagnostics.update(
                 {
@@ -37088,6 +37644,75 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_frame_revalidation.status,
                 len(batch_frame_revalidation.reason_codes),
             )
+            batch_single_packet_block_reason = str(
+                batch_ordinary_chat_execution.block_reason
+                if batch_ordinary_chat_execution is not None
+                else ""
+            ).lower()
+            batch_deterministic_frame_clarification = bool(
+                batch_deterministic_single_packet_block
+                and batch_frame_revalidation.status == "ambiguous"
+                and (
+                    "frame_ambiguous"
+                    in batch_single_packet_block_reason
+                    or "deterministic_task_clarify"
+                    in batch_single_packet_block_reason
+                )
+            )
+            if (
+                batch_single_packet_cutover
+                and batch_frame_revalidation.status != "valid"
+                and not batch_deterministic_frame_clarification
+            ):
+                if batch_synthesis_decision is not None:
+                    batch_synthesis_decision = (
+                        await safely_record_ordinary_chat_single_packet_block(
+                            batch_synthesis_decision,
+                            reason=(
+                                "single_packet_frame_%s"
+                                % batch_frame_revalidation.status
+                            ),
+                            frame_revalidation_status=(
+                                batch_frame_revalidation.status
+                            ),
+                        )
+                        or batch_synthesis_decision
+                    )
+                guard_diagnostics.update(
+                    {
+                        "suppressed": True,
+                        "suppression_reason": (
+                            "source_revalidation_frame_"
+                            + batch_frame_revalidation.status
+                        ),
+                    }
+                )
+                response = recover_guarded_response_obligation(
+                    response,
+                    baseline_response=batch_baseline_response,
+                    prompt=prompt,
+                    current_user_text=combined_text,
+                    diagnostics=guard_diagnostics,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    source_context_available=(
+                        batch_response_source_context_available
+                    ),
+                    exact_quote_requested=(
+                        batch_attribution_contract.exact_quote_requested
+                    ),
+                    exact_quote_authority=None,
+                    third_party_attribution_requested=(
+                        batch_attribution_contract
+                        .third_party_attribution_requested
+                    ),
+                )
+                batch_presend_source_bases = ()
+                batch_synthesis_candidate_active = False
+            if batch_deterministic_frame_clarification:
+                guard_diagnostics[
+                    "deterministic_frame_clarification"
+                ] = True
         _log_batch_event(
             logging.INFO,
             "response_send_commit_start",
@@ -37123,6 +37748,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", generation_route if 'generation_route' in locals() else "get_gemini_response", channel_id, len(response or ""))
         except Exception as exc:
             logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", generation_route if 'generation_route' in locals() else "get_gemini_response", channel_id, type(exc).__name__)
+            if (
+                batch_single_packet_cutover
+                and batch_synthesis_decision is not None
+            ):
+                batch_synthesis_decision = (
+                    await safely_record_ordinary_chat_single_packet_block(
+                        batch_synthesis_decision,
+                        reason="single_packet_discord_send_failed",
+                    )
+                    or batch_synthesis_decision
+                )
             await safely_finalize_shared_brain_synthesis(
                 batch_synthesis_decision,
                 final_response=response,
@@ -37153,6 +37789,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             guard_status=(
                 "batch_guard_recovery_sent"
                 if guard_diagnostics.get("response_obligation_recovered")
+                else "batch_single_packet_candidate_sent"
+                if (
+                    batch_single_packet_cutover
+                    and batch_synthesis_candidate_active
+                )
+                else "batch_single_packet_deterministic_block_sent"
+                if batch_single_packet_cutover
                 else "batch_candidate_sent"
                 if batch_synthesis_candidate_active
                 else "batch_established_path_sent"

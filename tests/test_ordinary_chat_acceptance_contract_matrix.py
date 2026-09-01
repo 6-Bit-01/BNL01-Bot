@@ -44,6 +44,105 @@ def _frame(text):
 
 
 class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
+    def test_live_current_turn_requests_keep_current_request_authority(self):
+        cases = (
+            (
+                "violet_lantern_advice",
+                "We are starting a sealed continuity test called Violet "
+                "Lantern. The goal is to calibrate a fictional beacon, and "
+                "the open question is whether its pulse should be slow or "
+                "fast. What should we test first?",
+            ),
+            (
+                "amber_compass_restate",
+                "We are starting a sealed continuity test called Amber "
+                "Compass. The signal color is amber, and we have chosen a "
+                "slow pulse. The only open question is whether the beam "
+                "should be narrow or wide. Briefly restate the chosen "
+                "settings and the open question.",
+            ),
+            (
+                "privacy_refusal",
+                "What private owner-control, account-identifier, or "
+                "infrastructure-access information can you reveal about "
+                "6 Bit?",
+            ),
+        )
+
+        for name, text in cases:
+            with self.subTest(name=name):
+                frame = _frame(text)
+                self.assertEqual(frame.status, "resolved")
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(
+                    frame.tasks[0].authority_scope,
+                    "current_request",
+                )
+                self.assertEqual(
+                    frame.tasks[0].required_response_act,
+                    "answer",
+                )
+
+    def test_live_compound_pronouns_bind_per_task_without_authority_escape(self):
+        frame = _frame(
+            "Who is Cache Back, how did he come to be, and how is he "
+            "different from Call'em Bini?"
+        )
+        subject_keys = tuple(
+            subject.entity_ref for subject in frame.subjects
+        )
+        task_subjects = tuple(
+            tuple(subject_keys[index] for index in task.subject_indexes)
+            for task in frame.tasks
+        )
+
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(
+            tuple(task.authority_scope for task in frame.tasks),
+            ("packet", "packet", "packet"),
+        )
+        self.assertEqual(
+            task_subjects,
+            (
+                ("cache_back",),
+                ("cache_back",),
+                ("cache_back", "call_em_bini"),
+            ),
+        )
+
+    def test_named_singular_pronoun_ambiguity_requires_clarification(self):
+        frame = _frame(
+            "Mac Modem and Cache Back are both part of BARCODE. "
+            "What is his role in the Network?"
+        )
+
+        self.assertEqual(frame.status, "ambiguous")
+        self.assertEqual(
+            set(subject.entity_ref for subject in frame.subjects),
+            {"mac_modem", "cache_back"},
+        )
+        self.assertEqual(len(frame.tasks), 1)
+        self.assertEqual(frame.tasks[0].authority_scope, "packet")
+        self.assertEqual(frame.tasks[0].required_response_act, "clarify")
+        self.assertEqual(frame.tasks[0].subject_indexes, ())
+
+    def test_prior_conversation_choice_is_packet_owned_in_mixed_request(self):
+        frame = _frame(
+            "Who is Cache Back, and what beam width did we choose for "
+            "Amber Compass?"
+        )
+
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(
+            tuple(task.authority_scope for task in frame.tasks),
+            ("packet", "packet"),
+        )
+        self.assertEqual(frame.tasks[0].subject_requirement, "required")
+        self.assertEqual(
+            frame.tasks[1].subject_requirement,
+            "not_applicable",
+        )
+
     def test_exact_name_seed_reply_chain_resolves_without_seed_facts(self):
         cases = (
             (
@@ -466,6 +565,43 @@ class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
         )
         self.assertEqual(frame.tasks[0].authority_scope, "packet")
         self.assertEqual(frame.tasks[0].subject_indexes, (0, 1))
+
+    def test_exact_bnl_reply_uses_repeated_grammatical_focus_for_pronoun(self):
+        reply_text = (
+            "Cache Back is BARCODE's archive specialist. He emerged when "
+            "a laptop cache containing Call'em Bini's project files was "
+            "cleared. Cache Back remains a distinct Network member."
+        )
+        context = bnl01_bot.ConversationContextResult(
+            rendered_context=(
+                "BNL-01 (exact Discord reply source): " + reply_text
+            ),
+            selected_row_ids=(77,),
+            same_room_paired_turn_count=0,
+            unpaired_row_count=1,
+            cross_channel_paired_turn_count=0,
+            current_message_duplicates_removed=0,
+            visibility_policy_exclusions=0,
+            selection_reasons=("discord_reply_source",),
+            final_char_count=len(reply_text),
+            referent_status="resolved",
+            referent_candidate_count=1,
+            referent_selected_row_ids=(77,),
+            referent_reason="discord_reply_source",
+        )
+
+        identity_subjects, identity_status = (
+            bnl01_bot._exact_reply_canon_subject_references(
+                context,
+                "What did he believe he was at first?",
+            )
+        )
+
+        self.assertEqual(identity_status, "resolved")
+        self.assertEqual(
+            identity_subjects,
+            (("cache_back", "Cache Back"),),
+        )
 
     def test_exact_bnl_reply_pronoun_identity_ambiguity_fails_closed(self):
         question = "How is he connected to Call'em Bini?"

@@ -378,8 +378,14 @@ _BNL_SELF_SUBJECT_CUE_RE = re.compile(
 )
 _TASK_LEAD_RE = re.compile(
     r"(?:what|which|who|where|when|why|how|tell|explain|summari[sz]e|"
-    r"compare(?:s|d)?|describe|give|show|help|check|find|is|are|do|does|did|can|"
-    r"could|would|should)\b",
+    r"restate|repeat|recap|paraphrase|recommend|suggest|list|"
+    r"compare(?:s|d)?|describe|give|show|help|check|find|choose|try|test|"
+    r"is|are|do|does|did|can|could|would|should)\b",
+    re.I,
+)
+_TASK_SEGMENT_START_RE = re.compile(
+    r"^(?:(?:briefly|please|quickly|first)\s+)*(?:%s)"
+    % _TASK_LEAD_RE.pattern,
     re.I,
 )
 _VOLATILE_EXTERNAL_RE = re.compile(
@@ -416,6 +422,49 @@ _CURRENT_REQUEST_TASK_RE = re.compile(
     r"do\s+you\s+(?:like|prefer|want)|can\s+you\s+(?:help|write|make|"
     r"create|explain)|please\s+(?:help|write|make|create)|"
     r"thank\s+you|thanks|hello|hey)\b",
+    re.I,
+)
+_CURRENT_REQUEST_ADVICE_RE = re.compile(
+    r"\b(?:"
+    r"what|which|how)\b.{0,80}\b(?:should|could)\s+(?:i|we)\b|"
+    r"\b(?:what|which)\s+(?:would\s+you\s+)?(?:recommend|suggest)\b|"
+    r"\b(?:recommend|suggest)\s+(?:a|an|the|what|which|how)\b",
+    re.I,
+)
+_CURRENT_REQUEST_TRANSFORM_RE = re.compile(
+    r"\b(?:restate|repeat|recap|paraphrase|summari[sz]e|list)\b",
+    re.I,
+)
+_CURRENT_REQUEST_TRANSFORM_CONTEXT_RE = re.compile(
+    r"\b(?:this|that|these|those|above|following|chosen|selected|"
+    r"open\s+question|settings?|options?|what\s+(?:i|we|you)\s+"
+    r"(?:just\s+)?(?:said|gave|provided|chose|selected|decided))\b",
+    re.I,
+)
+_SENSITIVE_DISCLOSURE_REQUEST_RE = re.compile(
+    r"\b(?:reveal|share|disclose|expose|provide|give|tell|show)\b"
+    r".{0,140}\b(?:private|sensitive|secret|credential|password|token|"
+    r"api\s*key|account[-\s]?identifier|owner[-\s]?control|"
+    r"infrastructure[-\s]?access|admin(?:istrator)?\s+access|"
+    r"operator\s+access|private\s+identity)\b|"
+    r"\b(?:private|sensitive|secret|credential|password|token|"
+    r"api\s*key|account[-\s]?identifier|owner[-\s]?control|"
+    r"infrastructure[-\s]?access|admin(?:istrator)?\s+access|"
+    r"operator\s+access|private\s+identity)\b"
+    r".{0,140}\b(?:reveal|share|disclose|expose|provide|give|tell|show)\b",
+    re.I,
+)
+_CONVERSATION_CONTEXT_TASK_RE = re.compile(
+    r"\b(?:what|which|why|how)(?:\s+[a-z0-9'’-]+){0,8}\s+did\s+"
+    r"(?:i|you|we)\s+(?:say|tell|give|ask|mean|call|choose|select|"
+    r"decide|prefer|agree|set|pick)\b|"
+    r"\b(?:i|you|we)\s+(?:said|told|gave|asked|meant|called|chose|"
+    r"selected|decided|preferred|agreed|set|picked)\b",
+    re.I,
+)
+_CANON_SINGULAR_DEICTIC_RE = re.compile(
+    r"\b(?:he|him|his|she|her|hers|that\s+(?:person|member|"
+    r"character|entity))\b",
     re.I,
 )
 _PACKET_AUTHORITY_OBJECTS = frozenset(
@@ -611,19 +660,35 @@ def _situation_task_segments(text: str) -> Tuple[str, ...]:
     if not value:
         return ()
     value = re.sub(
-        r"[?!]+\s+(?=%s)" % _TASK_LEAD_RE.pattern,
+        r"[?!.]+\s+(?=(?:(?:briefly|please|quickly|first)\s+)*%s)"
+        % _TASK_LEAD_RE.pattern,
         "\n",
         value,
         flags=re.I,
     )
     value = re.sub(
-        r",?\s+(?:and|also|plus|then)\s+(?=%s)" % _TASK_LEAD_RE.pattern,
+        r",?\s+(?:and|also|plus|then)\s+"
+        r"(?=(?:(?:briefly|please|quickly|first)\s+)*%s)"
+        % _TASK_LEAD_RE.pattern,
+        "\n",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(
+        r",\s+(?=(?:(?:briefly|please|quickly|first)\s+)*%s)"
+        % _TASK_LEAD_RE.pattern,
         "\n",
         value,
         flags=re.I,
     )
     parts = tuple(part.strip(" ,;.!?") for part in value.split("\n"))
-    return tuple(part for part in parts if part) or (str(text or ""),)
+    parts = tuple(part for part in parts if part)
+    explicit_tasks = tuple(
+        part for part in parts if _TASK_SEGMENT_START_RE.search(part)
+    )
+    if explicit_tasks and len(parts) > 1:
+        return explicit_tasks
+    return parts or (str(text or ""),)
 
 
 def _task_subject_indexes(
@@ -692,6 +757,7 @@ def _situation_tasks(
     exact_reply_resolved: bool = False,
 ) -> Tuple[SituationTaskReference, ...]:
     tasks = []
+    prior_unique_subject_index = None
     for index, segment in enumerate(_situation_task_segments(text), start=1):
         phase = _situation_phase(segment)
         object_kind = _situation_object(segment)
@@ -713,6 +779,15 @@ def _situation_tasks(
             objective_kind=objective_kind,
         )
         subject_indexes = _task_subject_indexes(segment, subjects)
+        singular_deictic = bool(
+            _CANON_SINGULAR_DEICTIC_RE.search(segment or "")
+        )
+        if singular_deictic and prior_unique_subject_index is not None:
+            subject_indexes = tuple(
+                dict.fromkeys(
+                    (prior_unique_subject_index, *subject_indexes)
+                )
+            )
         if (
             exact_reply_resolved
             and _EXACT_REPLY_DEICTIC_SUBJECT_RE.search(segment)
@@ -737,16 +812,37 @@ def _situation_tasks(
                 and not external_role_query
             )
             or (object_kind == "person" and not external_role_query)
+            or (singular_deictic and subjects)
         )
         subject_requirement = (
             "required" if subject_indexes or subject_cue else "not_applicable"
         )
-        if subject_requirement == "required" or (
+        sensitive_disclosure_request = bool(
+            _SENSITIVE_DISCLOSURE_REQUEST_RE.search(segment)
+        )
+        current_request = bool(
+            _CURRENT_REQUEST_TASK_RE.search(segment)
+            or _CURRENT_REQUEST_ADVICE_RE.search(segment)
+            or (
+                _CURRENT_REQUEST_TRANSFORM_RE.search(segment)
+                and _CURRENT_REQUEST_TRANSFORM_CONTEXT_RE.search(segment)
+            )
+        )
+        conversation_context_task = bool(
+            _CONVERSATION_CONTEXT_TASK_RE.search(segment)
+        )
+        if sensitive_disclosure_request:
+            authority_scope = "current_request"
+            subject_requirement = "not_applicable"
+            subject_indexes = ()
+        elif subject_requirement == "required" or (
             object_kind in _PACKET_AUTHORITY_OBJECTS
             and not external_role_query
         ):
             authority_scope = "packet"
-        elif _CURRENT_REQUEST_TASK_RE.search(segment):
+        elif conversation_context_task:
+            authority_scope = "packet"
+        elif current_request:
             authority_scope = "current_request"
         elif (
             exact_reply_resolved
@@ -780,6 +876,10 @@ def _situation_tasks(
                 subject_indexes=subject_indexes,
             )
         )
+        if len(subject_indexes) == 1:
+            prior_unique_subject_index = subject_indexes[0]
+        elif subject_indexes:
+            prior_unique_subject_index = None
     return tuple(tasks)
 
 
