@@ -424,6 +424,16 @@ _CURRENT_REQUEST_TASK_RE = re.compile(
     r"thank\s+you|thanks|hello|hey)\b",
     re.I,
 )
+_CURRENT_REQUEST_SOCIAL_RE = re.compile(
+    r"^\s*(?:"
+    r"what(?:['’]?s|\s+is)\s+up|"
+    r"how(?:['’]?s|\s+is)\s+it\s+going|"
+    r"how(?:['’]?s|\s+are)\s+things|"
+    r"how\s+(?:are|have)\s+you\s+(?:been|doing)|"
+    r"you\s+good|sup"
+    r")\s*[?!.]*\s*$",
+    re.I,
+)
 _CURRENT_REQUEST_ADVICE_RE = re.compile(
     r"\b(?:"
     r"what|which|how)\b.{0,80}\b(?:should|could)\s+(?:i|we)\b|"
@@ -439,6 +449,11 @@ _CURRENT_REQUEST_TRANSFORM_CONTEXT_RE = re.compile(
     r"\b(?:this|that|these|those|above|following|chosen|selected|"
     r"open\s+question|settings?|options?|what\s+(?:i|we|you)\s+"
     r"(?:just\s+)?(?:said|gave|provided|chose|selected|decided))\b",
+    re.I,
+)
+_CURRENT_REQUEST_BARE_TRANSFORM_RE = re.compile(
+    r"^\s*(?:list|restate|repeat|recap|paraphrase|summari[sz]e)"
+    r"\s*[?!.]*\s*$",
     re.I,
 )
 _SENSITIVE_DISCLOSURE_REQUEST_RE = re.compile(
@@ -822,7 +837,9 @@ def _situation_tasks(
         )
         current_request = bool(
             _CURRENT_REQUEST_TASK_RE.search(segment)
+            or _CURRENT_REQUEST_SOCIAL_RE.search(segment)
             or _CURRENT_REQUEST_ADVICE_RE.search(segment)
+            or _CURRENT_REQUEST_BARE_TRANSFORM_RE.search(segment)
             or (
                 _CURRENT_REQUEST_TRANSFORM_RE.search(segment)
                 and _CURRENT_REQUEST_TRANSFORM_CONTEXT_RE.search(segment)
