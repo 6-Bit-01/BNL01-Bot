@@ -61,6 +61,11 @@ class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
                 "should be narrow or wide. Briefly restate the chosen "
                 "settings and the open question.",
             ),
+            ("casual_whats_up", "whats up?"),
+            ("casual_apostrophe", "what's up?"),
+            ("casual_progress", "How’s it going?"),
+            ("casual_check_in", "You good?"),
+            ("bare_list", "List"),
         )
 
         for name, text in cases:
@@ -88,6 +93,14 @@ class OrdinaryChatAcceptanceContractMatrixTests(unittest.TestCase):
         self.assertEqual(frame.tasks[0].authority_scope, "current_request")
         self.assertEqual(frame.tasks[0].required_response_act, "refuse")
         self.assertEqual(frame.tasks[0].subject_requirement, "not_applicable")
+
+    def test_casual_check_in_pattern_does_not_capture_live_weather(self):
+        frame = _frame("What's up with the weather today?")
+
+        self.assertEqual(frame.status, "resolved")
+        self.assertEqual(len(frame.tasks), 1)
+        self.assertEqual(frame.tasks[0].authority_scope, "external_current")
+        self.assertEqual(frame.tasks[0].required_response_act, "hold")
 
     def test_live_compound_pronouns_bind_per_task_without_authority_escape(self):
         frame = _frame(

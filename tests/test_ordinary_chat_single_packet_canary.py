@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import unittest
@@ -24,6 +25,7 @@ from bnl_shared_brain_synthesis import (
     ordinary_chat_configuration,
     ordinary_chat_deterministic_response_act,
     ordinary_chat_route_scope_decision,
+    ordinary_chat_task_support_plan,
     parse_ordinary_chat_response_contract,
     record_single_packet_block,
     render_ordinary_chat_task_contract,
@@ -43,6 +45,25 @@ from bnl_unified_response_assessment import (
     build_unified_response_assessment,
     revalidate_situation_frame,
 )
+
+
+def _contract_for_support_plan(basis, texts):
+    plans = ordinary_chat_task_support_plan(basis)
+    return parse_ordinary_chat_response_contract(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "taskId": plan.task_id,
+                        "text": text,
+                        "supportKind": plan.support_kind,
+                        "evidenceIds": list(plan.evidence_ids),
+                    }
+                    for plan, text in zip(plans, texts)
+                ]
+            }
+        )
+    )
 
 
 class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
@@ -520,7 +541,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v4",
+            "ordinary_chat_single_packet_v5",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
         self.assertFalse(
@@ -858,20 +879,9 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertIn("one shared mind with filtered surfaces", owned.prompt)
 
     def test_typed_response_contract_accepts_only_applicable_packet_refs(self):
-        evidence_id = next(
-            evidence_id
-            for (
-                evidence_id,
-                lane,
-                _digest,
-                _subject_indexes,
-            ) in self.basis.rendered_evidence_refs
-            if lane == "approved_fact"
-        )
-        contract = parse_ordinary_chat_response_contract(
-            '{"tasks":[{"taskId":"T1","text":"Your favorite movie is '
-            'Arrival.","supportKind":"packet","evidenceIds":["%s"]}]}'
-            % evidence_id
+        contract = _contract_for_support_plan(
+            self.basis,
+            ("Your favorite movie is Arrival.",),
         )
         validation = validate_ordinary_chat_response_contract(
             self.basis,
@@ -934,6 +944,34 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     "typed_contract_%s" % expected,
                 )
 
+    def test_system_owned_support_plan_is_ordered_and_bounded(self):
+        crowded_basis = replace(
+            self.basis,
+            rendered_evidence_refs=tuple(
+                (
+                    "E%s" % index,
+                    "approved_fact",
+                    "%064x" % index,
+                    (0,),
+                )
+                for index in range(1, 10)
+            ),
+        )
+
+        plan = ordinary_chat_task_support_plan(crowded_basis)
+
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0].support_kind, "packet")
+        self.assertEqual(
+            plan[0].evidence_ids,
+            tuple("E%s" % index for index in range(1, 9)),
+        )
+        rendered = render_ordinary_chat_task_contract(crowded_basis)
+        self.assertIn(
+            '"evidenceIds":["E1","E2","E3","E4","E5","E6","E7","E8"]',
+            rendered,
+        )
+
     def test_multi_subject_comparison_requires_support_for_every_subject(self):
         basis = self._multi_subject_basis(
             "Compare Cache Back and Mac Modem.",
@@ -951,11 +989,17 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         }
         cache_evidence = evidence_by_subject[(0,)]
         mac_evidence = evidence_by_subject[(1,)]
-        valid = parse_ordinary_chat_response_contract(
-            '{"tasks":[{"taskId":"T1","text":"Cache Back protects '
-            'archive continuity, while Mac Modem introduces unstable '
-            'distortions.","supportKind":"packet","evidenceIds":["%s",'
-            '"%s"]}]}' % (cache_evidence, mac_evidence)
+        support_plan = ordinary_chat_task_support_plan(basis)
+        self.assertEqual(len(support_plan), 1)
+        self.assertEqual(support_plan[0].support_kind, "packet")
+        self.assertIn(cache_evidence, support_plan[0].evidence_ids)
+        self.assertIn(mac_evidence, support_plan[0].evidence_ids)
+        valid = _contract_for_support_plan(
+            basis,
+            (
+                "Cache Back protects archive continuity, while Mac Modem "
+                "introduces unstable distortions.",
+            ),
         )
         incomplete = parse_ordinary_chat_response_contract(
             '{"tasks":[{"taskId":"T1","text":"They differ.",'
@@ -1212,7 +1256,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             "packet_support_invalid",
         )
 
-    def test_owner_declared_cache_bini_relationship_supports_live_three_way_packet(self):
+    def test_owner_declared_cache_bini_relationship_supports_live_compound_packets(self):
         authority = {
             "BNL_OWNER_USER_ID": "61",
             "BNL_PRIMARY_GUILD_ID": "1",
@@ -1266,6 +1310,14 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     ("mac_modem", "Mac Modem"),
                 ),
             )
+            origin_basis = self._multi_subject_basis(
+                "Who is Cache Back, how did he come to be, and how is he "
+                "different from Call'em Bini?",
+                (
+                    ("cache_back", "Cache Back"),
+                    ("call_em_bini", "Call'em Bini"),
+                ),
+            )
 
         declared_refs = {
             subject_indexes: evidence_id
@@ -1296,16 +1348,19 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             ) in basis.rendered_evidence_refs
             if lane == "canon" and subject_indexes == (2,)
         )
-        contract = parse_ordinary_chat_response_contract(
-            '{"tasks":[{"taskId":"T1","text":"Cache Back has an '
-            "established canon origin connection to Call'em Bini while Mac "
-            'Modem has a different established role.","supportKind":'
-            '"packet","evidenceIds":["%s","%s","%s"]}]}'
-            % (
-                declared_refs[(0,)],
-                declared_refs[(1,)],
-                mac_evidence,
-            )
+        support_plan = ordinary_chat_task_support_plan(basis)
+        self.assertEqual(len(support_plan), 1)
+        self.assertEqual(support_plan[0].support_kind, "packet")
+        self.assertIn(declared_refs[(0,)], support_plan[0].evidence_ids)
+        self.assertIn(declared_refs[(1,)], support_plan[0].evidence_ids)
+        self.assertIn(mac_evidence, support_plan[0].evidence_ids)
+        contract = _contract_for_support_plan(
+            basis,
+            (
+                "Cache Back has an established canon origin connection to "
+                "Call'em Bini while Mac Modem has a different established "
+                "role.",
+            ),
         )
         self.assertTrue(
             validate_ordinary_chat_response_contract(
@@ -1314,6 +1369,48 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             ).valid
         )
         self.assertEqual(ordinary_chat_deterministic_response_act(basis), "")
+
+        origin_plan = ordinary_chat_task_support_plan(origin_basis)
+        self.assertEqual(
+            tuple(plan.task_id for plan in origin_plan),
+            ("T1", "T2", "T3"),
+        )
+        self.assertEqual(
+            tuple(plan.support_kind for plan in origin_plan),
+            ("packet", "packet", "packet"),
+        )
+        self.assertTrue(all(plan.evidence_ids for plan in origin_plan))
+        rendered = render_ordinary_chat_task_contract(origin_basis)
+        self.assertIn("Support metadata is system-owned", rendered)
+        for plan in origin_plan:
+            self.assertIn(
+                '"taskId":"%s"' % plan.task_id,
+                rendered,
+            )
+            self.assertIn(
+                '"evidenceIds":%s'
+                % json.dumps(list(plan.evidence_ids), separators=(",", ":")),
+                rendered,
+            )
+        origin_contract = _contract_for_support_plan(
+            origin_basis,
+            (
+                "Cache Back is BARCODE's archive specialist.",
+                "He emerged from cached project data during a cleanup.",
+                "Cache Back is a distinct Network member, while Call'em "
+                "Bini is the artist whose cached material was involved.",
+            ),
+        )
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                origin_basis,
+                origin_contract,
+            ).valid
+        )
+        self.assertEqual(
+            ordinary_chat_deterministic_response_act(origin_basis),
+            "",
+        )
 
     def test_typed_external_task_uses_public_not_packet_authority(self):
         external_packet = replace(
@@ -1513,27 +1610,16 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         rendered = render_ordinary_chat_task_contract(refusal_basis)
         self.assertIn("response=refuse", rendered)
         self.assertIn(
-            "use supportKind current_request with evidenceIds [\"REQUEST\"]",
+            'supportKind=current_request | evidenceIds=["REQUEST"]',
             rendered,
         )
 
     def test_receipt_is_content_free_and_counts_one_call(self):
         run = self._begin()
         self.assertTrue(run.prompt_applied)
-        evidence_id = next(
-            evidence_id
-            for (
-                evidence_id,
-                lane,
-                _digest,
-                _subject_indexes,
-            ) in self.basis.rendered_evidence_refs
-            if lane == "approved_fact"
-        )
-        contract = parse_ordinary_chat_response_contract(
-            '{"tasks":[{"taskId":"T1","text":"Your favorite movie is '
-            'Arrival.","supportKind":"packet","evidenceIds":["%s"]}]}'
-            % evidence_id
+        contract = _contract_for_support_plan(
+            self.basis,
+            ("Your favorite movie is Arrival.",),
         )
         decision = evaluate_single_packet_response(
             self.conn,
@@ -1605,7 +1691,10 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(report["ordinaryTypedContractViolationRuns"], 0)
         self.assertEqual(report["typedTaskTotal"], 1)
         self.assertEqual(report["typedTaskCoverageTotal"], 1)
-        self.assertEqual(report["typedSupportReferenceTotal"], 1)
+        self.assertEqual(
+            report["typedSupportReferenceTotal"],
+            len(ordinary_chat_task_support_plan(self.basis)[0].evidence_ids),
+        )
         self.assertEqual(report["invalidScopeRuns"], 0)
 
     def test_unsupported_packet_domain_claims_are_rejected_before_selection(self):

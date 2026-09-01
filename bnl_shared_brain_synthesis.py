@@ -79,7 +79,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v4"
+    "ordinary_chat_single_packet_v5"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV = (
@@ -1274,6 +1274,15 @@ class OrdinaryChatTaskResult:
 
     task_id: str
     text: str
+    support_kind: str
+    evidence_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class OrdinaryChatTaskSupportPlan:
+    """System-owned support binding for one ordinary-chat task."""
+
+    task_id: str
     support_kind: str
     evidence_ids: tuple[str, ...] = ()
 
@@ -3105,6 +3114,132 @@ def _ordinary_task_allowed_lanes(task: Any) -> frozenset[str]:
     return frozenset(_RENDERABLE_LANES)
 
 
+def ordinary_chat_task_support_plan(
+    basis: SharedBrainSynthesisBasis,
+) -> tuple[OrdinaryChatTaskSupportPlan, ...]:
+    """Bind every typed task to exact support before provider generation."""
+
+    evidence_scope = tuple(
+        (
+            evidence_id,
+            lane,
+            tuple(int(index) for index in subject_indexes),
+        )
+        for evidence_id, lane, _digest_value, subject_indexes in (
+            basis.rendered_evidence_refs
+        )
+    )
+    plans = []
+    for task in _ordinary_frame_tasks(basis):
+        task_id = str(getattr(task, "task_id", "") or "")
+        authority = str(getattr(task, "authority_scope", "") or "")
+        required_act = str(
+            getattr(task, "required_response_act", "") or "answer"
+        )
+        if required_act == "clarify":
+            plans.append(OrdinaryChatTaskSupportPlan(task_id, "clarify"))
+            continue
+        if required_act == "hold" or authority == "external_current":
+            plans.append(OrdinaryChatTaskSupportPlan(task_id, "hold"))
+            continue
+        if required_act == "refuse":
+            plans.append(
+                OrdinaryChatTaskSupportPlan(
+                    task_id,
+                    "current_request",
+                    ("REQUEST",),
+                )
+            )
+            continue
+        if authority == "external_public":
+            plans.append(
+                OrdinaryChatTaskSupportPlan(
+                    task_id,
+                    "external_public",
+                    ("PUBLIC",),
+                )
+            )
+            continue
+        if authority == "current_request":
+            plans.append(
+                OrdinaryChatTaskSupportPlan(
+                    task_id,
+                    "current_request",
+                    ("REQUEST",),
+                )
+            )
+            continue
+        if authority != "packet":
+            plans.append(OrdinaryChatTaskSupportPlan(task_id, ""))
+            continue
+
+        allowed_lanes = _ordinary_task_allowed_lanes(task)
+        required_subject_indexes = tuple(
+            dict.fromkeys(
+                int(subject_index)
+                for subject_index in getattr(task, "subject_indexes", ())
+            )
+        )
+        required_subject_set = set(required_subject_indexes)
+        allowed_refs = tuple(
+            (evidence_id, subject_indexes)
+            for evidence_id, lane, subject_indexes in evidence_scope
+            if lane in allowed_lanes
+            and (
+                not required_subject_set
+                or required_subject_set.intersection(subject_indexes)
+            )
+        )
+        covered_subjects = {
+            subject_index
+            for _evidence_id, subject_indexes in allowed_refs
+            for subject_index in subject_indexes
+            if subject_index in required_subject_set
+        }
+        if not allowed_refs or required_subject_set - covered_subjects:
+            plans.append(OrdinaryChatTaskSupportPlan(task_id, "hold"))
+            continue
+
+        selected_ids = []
+        for required_subject_index in required_subject_indexes:
+            evidence_id = next(
+                (
+                    candidate_id
+                    for candidate_id, subject_indexes in allowed_refs
+                    if required_subject_index in subject_indexes
+                ),
+                "",
+            )
+            if evidence_id and evidence_id not in selected_ids:
+                selected_ids.append(evidence_id)
+        if len(selected_ids) > 8:
+            plans.append(OrdinaryChatTaskSupportPlan(task_id, "hold"))
+            continue
+        for evidence_id, _subject_indexes in allowed_refs:
+            if len(selected_ids) >= 8:
+                break
+            if evidence_id not in selected_ids:
+                selected_ids.append(evidence_id)
+        selected_subjects = {
+            subject_index
+            for evidence_id, subject_indexes in allowed_refs
+            if evidence_id in selected_ids
+            for subject_index in subject_indexes
+            if subject_index in required_subject_set
+        }
+        if required_subject_set - selected_subjects:
+            plans.append(OrdinaryChatTaskSupportPlan(task_id, "hold"))
+            continue
+        plans.append(
+            OrdinaryChatTaskSupportPlan(
+                task_id,
+                "packet",
+                tuple(selected_ids),
+            )
+        )
+    return tuple(plans)
+
+
 def render_ordinary_chat_task_contract(
     basis: SharedBrainSynthesisBasis,
 ) -> str:
@@ -3113,9 +3248,10 @@ def render_ordinary_chat_task_contract(
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
         return ""
+    support_plans = ordinary_chat_task_support_plan(basis)
     task_lines = [
         "- %s | authority=%s | object=%s | currentness=%s | response=%s "
-        "| subjects=%s"
+        "| subjects=%s | supportKind=%s | evidenceIds=%s"
         % (
             str(getattr(task, "task_id", "") or ""),
             str(getattr(task, "authority_scope", "") or "unknown"),
@@ -3127,8 +3263,10 @@ def render_ordinary_chat_task_contract(
                 for subject_index in getattr(task, "subject_indexes", ())
             )
             or "none",
+            plan.support_kind or "invalid",
+            json.dumps(list(plan.evidence_ids), separators=(",", ":")),
         )
-        for task in tasks
+        for task, plan in zip(tasks, support_plans)
     ]
     evidence_lines = [
         "- %s | lane=%s | subjects=%s"
@@ -3148,6 +3286,20 @@ def render_ordinary_chat_task_contract(
             subject_indexes,
         ) in basis.rendered_evidence_refs
     ]
+    exact_template = json.dumps(
+        {
+            "tasks": [
+                {
+                    "taskId": plan.task_id,
+                    "text": "visible answer",
+                    "supportKind": plan.support_kind or "invalid",
+                    "evidenceIds": list(plan.evidence_ids),
+                }
+                for plan in support_plans
+            ]
+        },
+        separators=(",", ":"),
+    )
     return (
         "TYPED TURN TASK CONTRACT:\n"
         + "\n".join(task_lines)
@@ -3156,18 +3308,17 @@ def render_ordinary_chat_task_contract(
         + "\n- PUBLIC may support stable general public knowledge only.\n"
         + "- REQUEST may support a non-factual conversational response only.\n"
         + "PROVIDER OUTPUT CONTRACT:\n"
-        + "Return only one JSON object with exactly this shape: "
-        + '{"tasks":[{"taskId":"T1","text":"visible answer",'
-        + '"supportKind":"packet","evidenceIds":["E1"]}]}.\n'
-        + "Return every task exactly once and in order. Use supportKind packet "
-        + "with applicable E-identifiers for stored/BARCODE claims; "
-        + "external_public with PUBLIC for stable general knowledge; "
-        + "current_request with REQUEST for non-factual conversation; hold "
-        + "with no identifiers when current or selected evidence cannot be "
-        + "verified; clarify with no identifiers only when the typed task "
-        + "requires clarification. For a task with response=refuse, refuse "
-        + "the requested disclosure and use supportKind current_request with "
-        + "evidenceIds [\"REQUEST\"]. The text fields become the visible reply. "
+        + "Return only this exact JSON template, replacing each visible "
+        + "answer placeholder and no other value: "
+        + exact_template
+        + ".\nReturn every task exactly once and in order. Support metadata is "
+        + "system-owned: copy each task line's supportKind and evidenceIds "
+        + "values exactly into its JSON object. Do not choose, substitute, "
+        + "add, remove, or reorder support references. Generate only each "
+        + "task's visible text. For response=refuse, refuse the requested "
+        + "disclosure in that text. For supportKind=hold or clarify, make the "
+        + "visible text perform that act. The text fields become the visible "
+        + "reply. "
         + "Do not include Markdown fences, task labels, citations, internal "
         + "terms, or any text outside the JSON object."
     )
@@ -3265,109 +3416,44 @@ def validate_ordinary_chat_response_contract(
             status="task_coverage_mismatch",
             task_count=len(tasks),
         )
-    evidence_scope = {
-        evidence_id: (lane, tuple(subject_indexes))
-        for (
-            evidence_id,
-            lane,
-            _digest_value,
-            subject_indexes,
-        ) in basis.rendered_evidence_refs
-    }
+    support_plans = ordinary_chat_task_support_plan(basis)
     support_count = 0
-    for task, result in zip(tasks, contract.tasks):
+    for task, result, plan in zip(tasks, contract.tasks, support_plans):
         authority = str(getattr(task, "authority_scope", "") or "")
         required_act = str(
             getattr(task, "required_response_act", "") or "answer"
         )
-        if required_act == "clarify":
-            if result.support_kind != "clarify" or result.evidence_ids:
-                return OrdinaryChatContractValidation(
-                    status="clarification_contract_mismatch",
-                    task_count=len(tasks),
-                )
-            continue
-        if required_act == "hold" or authority == "external_current":
-            if result.support_kind != "hold" or result.evidence_ids:
-                return OrdinaryChatContractValidation(
-                    status="current_fact_not_held",
-                    task_count=len(tasks),
-                )
-            continue
-        if authority == "packet":
-            allowed_lanes = _ordinary_task_allowed_lanes(task)
-            required_subject_indexes = set(
-                int(subject_index)
-                for subject_index in getattr(task, "subject_indexes", ())
-            )
-            allowed_ids = {
-                evidence_id
-                for evidence_id, (
-                    lane,
-                    subject_indexes,
-                ) in evidence_scope.items()
-                if lane in allowed_lanes
-                and (
-                    not required_subject_indexes
-                    or required_subject_indexes.intersection(subject_indexes)
-                )
-            }
-            covered_subject_indexes = {
-                subject_index
-                for evidence_id in allowed_ids
-                for subject_index in evidence_scope[evidence_id][1]
-                if subject_index in required_subject_indexes
-            }
-            missing_subject_evidence = bool(
-                required_subject_indexes - covered_subject_indexes
-            )
-            if result.support_kind == "hold" and (
-                not allowed_ids or missing_subject_evidence
-            ):
-                if result.evidence_ids:
-                    return OrdinaryChatContractValidation(
-                        status="hold_has_support_reference",
-                        task_count=len(tasks),
-                    )
-                continue
-            if (
-                result.support_kind != "packet"
-                or not result.evidence_ids
-                or not set(result.evidence_ids).issubset(allowed_ids)
-                or missing_subject_evidence
-                or required_subject_indexes
-                - {
-                    subject_index
-                    for evidence_id in result.evidence_ids
-                    for subject_index in evidence_scope[evidence_id][1]
-                    if subject_index in required_subject_indexes
-                }
-            ):
-                return OrdinaryChatContractValidation(
-                    status="packet_support_invalid",
-                    task_count=len(tasks),
-                )
-        elif authority == "external_public":
-            if (
-                result.support_kind != "external_public"
-                or result.evidence_ids != ("PUBLIC",)
-            ):
-                return OrdinaryChatContractValidation(
-                    status="external_support_invalid",
-                    task_count=len(tasks),
-                )
-        elif authority == "current_request":
-            if (
-                result.support_kind != "current_request"
-                or result.evidence_ids != ("REQUEST",)
-            ):
-                return OrdinaryChatContractValidation(
-                    status="request_support_invalid",
-                    task_count=len(tasks),
-                )
-        else:
+        if not plan.support_kind:
             return OrdinaryChatContractValidation(
                 status="authority_scope_invalid",
+                task_count=len(tasks),
+            )
+        if (
+            result.support_kind != plan.support_kind
+            or result.evidence_ids != plan.evidence_ids
+        ):
+            if (
+                plan.support_kind == "hold"
+                and result.support_kind == "hold"
+                and result.evidence_ids
+            ):
+                status = "hold_has_support_reference"
+            elif required_act == "clarify":
+                status = "clarification_contract_mismatch"
+            elif required_act == "hold" or authority == "external_current":
+                status = "current_fact_not_held"
+            elif required_act == "refuse":
+                status = "request_support_invalid"
+            elif authority == "packet":
+                status = "packet_support_invalid"
+            elif authority == "external_public":
+                status = "external_support_invalid"
+            elif authority == "current_request":
+                status = "request_support_invalid"
+            else:
+                status = "authority_scope_invalid"
+            return OrdinaryChatContractValidation(
+                status=status,
                 task_count=len(tasks),
             )
         support_count += len(result.evidence_ids)
@@ -3387,51 +3473,14 @@ def ordinary_chat_deterministic_response_act(
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
         return ""
-    evidence_scope = {
-        evidence_id: (lane, tuple(subject_indexes))
-        for (
-            evidence_id,
-            lane,
-            _digest_value,
-            subject_indexes,
-        ) in basis.rendered_evidence_refs
-    }
+    support_plans = ordinary_chat_task_support_plan(basis)
     acts = []
-    for task in tasks:
+    for task, plan in zip(tasks, support_plans):
         act = str(
             getattr(task, "required_response_act", "") or "answer"
         )
-        if (
-            act == "answer"
-            and str(getattr(task, "authority_scope", "") or "")
-            == "packet"
-        ):
-            allowed_lanes = _ordinary_task_allowed_lanes(task)
-            required_subject_indexes = set(
-                int(subject_index)
-                for subject_index in getattr(task, "subject_indexes", ())
-            )
-            allowed_ids = {
-                evidence_id
-                for evidence_id, (lane, subject_indexes) in (
-                    evidence_scope.items()
-                )
-                if lane in allowed_lanes
-                and (
-                    not required_subject_indexes
-                    or required_subject_indexes.intersection(subject_indexes)
-                )
-            }
-            covered_subject_indexes = {
-                subject_index
-                for evidence_id in allowed_ids
-                for subject_index in evidence_scope[evidence_id][1]
-                if subject_index in required_subject_indexes
-            }
-            if not allowed_ids or (
-                required_subject_indexes - covered_subject_indexes
-            ):
-                act = "hold"
+        if act == "answer" and plan.support_kind == "hold":
+            act = "hold"
         acts.append(act)
     acts = tuple(acts)
     if any(act == "answer" for act in acts):
