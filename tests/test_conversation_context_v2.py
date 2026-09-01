@@ -46,8 +46,16 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertFalse(
             thread_resume_requested("Which title sounds older?")
         )
+        self.assertFalse(
+            thread_resume_requested(
+                "Who is Cache Back, and how did he come to be?"
+            )
+        )
         self.assertTrue(
             thread_resume_requested("Return to the older title question.")
+        )
+        self.assertTrue(
+            thread_resume_requested("Come back to the Cache Back question.")
         )
 
     def test_payload_anchor_matching_does_not_use_word_substrings(self):

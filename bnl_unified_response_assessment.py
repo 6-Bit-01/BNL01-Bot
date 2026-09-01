@@ -853,7 +853,9 @@ def _situation_tasks(
         else:
             authority_scope = "external_public"
         required_act = str(response_act or "observe")
-        if subject_requirement == "required" and not subject_indexes:
+        if sensitive_disclosure_request:
+            required_act = "refuse"
+        elif subject_requirement == "required" and not subject_indexes:
             required_act = "clarify"
         elif (
             authority_scope == "external_public"

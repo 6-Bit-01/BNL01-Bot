@@ -3165,7 +3165,9 @@ def render_ordinary_chat_task_contract(
         + "current_request with REQUEST for non-factual conversation; hold "
         + "with no identifiers when current or selected evidence cannot be "
         + "verified; clarify with no identifiers only when the typed task "
-        + "requires clarification. The text fields become the visible reply. "
+        + "requires clarification. For a task with response=refuse, refuse "
+        + "the requested disclosure and use supportKind current_request with "
+        + "evidenceIds [\"REQUEST\"]. The text fields become the visible reply. "
         + "Do not include Markdown fences, task labels, citations, internal "
         + "terms, or any text outside the JSON object."
     )
@@ -3380,7 +3382,7 @@ def validate_ordinary_chat_response_contract(
 def ordinary_chat_deterministic_response_act(
     basis: SharedBrainSynthesisBasis,
 ) -> str:
-    """Return hold/clarify only when every task is deterministic."""
+    """Return the owned response act when every task is deterministic."""
 
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
@@ -3434,7 +3436,11 @@ def ordinary_chat_deterministic_response_act(
     acts = tuple(acts)
     if any(act == "answer" for act in acts):
         return ""
-    return "clarify" if "clarify" in acts else "hold"
+    if "clarify" in acts:
+        return "clarify"
+    if "refuse" in acts:
+        return "refuse"
+    return "hold"
 
 
 def build_ordinary_chat_basis(

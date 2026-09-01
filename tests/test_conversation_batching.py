@@ -233,7 +233,113 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
     def _append(self, channel, text, *, user_id=100, name="Test Member"):
         bnl01_bot._channel_buffers[channel.id].append((name, text, user_id))
-        bnl01_bot._channel_last_message_at[channel.id] = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
+        bnl01_bot._channel_last_message_at[channel.id] = (
+            bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
+        )
+
+    def test_pending_payload_anchor_does_not_capture_a_new_question(self):
+        items = [("Test Member", "BNL-01, what's up?", 100)]
+        pending = {"reason": "request_intent:list"}
+        anchor = {"requester_user_id": 100}
+
+        with mock.patch.object(
+            bnl01_bot,
+            "_should_force_free_speak_continuation_answer",
+            return_value=(False, ""),
+        ):
+            packet = bnl01_bot._build_active_response_packet(
+                9910,
+                items,
+                pending,
+                pending_anchor=anchor,
+            )
+
+        self.assertEqual(packet["decision"], "answer")
+        self.assertEqual(packet["reason"], "request_intent:question_mark")
+        self.assertFalse(packet["has_request_payload"])
+        self.assertEqual(packet["payload_items"], [])
+
+    def test_pending_payload_anchor_still_collects_an_unframed_item(self):
+        items = [("Test Member", "Cache Back", 100)]
+        pending = {"reason": "request_intent:list"}
+        anchor = {"requester_user_id": 100}
+
+        with mock.patch.object(
+            bnl01_bot,
+            "_should_force_free_speak_continuation_answer",
+            return_value=(False, ""),
+        ):
+            packet = bnl01_bot._build_active_response_packet(
+                9911,
+                items,
+                pending,
+                pending_anchor=anchor,
+            )
+
+        self.assertEqual(
+            packet["reason"],
+            "pending_request_single_payload_continuation",
+        )
+        self.assertTrue(packet["has_request_payload"])
+        self.assertEqual(packet["payload_items"], ["Cache Back"])
+
+    async def test_pending_new_question_builds_a_normal_chat_frame(self):
+        items = [("Test Member", "BNL-01, what's up?", 100)]
+        pending = {"reason": "request_intent:list"}
+        anchor = {"requester_user_id": 100}
+        with mock.patch.object(
+            bnl01_bot,
+            "_should_force_free_speak_continuation_answer",
+            return_value=(False, ""),
+        ):
+            packet = bnl01_bot._build_active_response_packet(
+                9912,
+                items,
+                pending,
+                pending_anchor=anchor,
+            )
+
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "conversation_context_v2_enabled",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_recent_text_room_context_for_prompt",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_recent_moment_situation_for_turn_async",
+                new=mock.AsyncMock(return_value=None),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "conversation_supporting_owner_states",
+                new=mock.AsyncMock(return_value={}),
+            ),
+        ):
+            state = await bnl01_bot.build_active_batch_orchestration(
+                guild_id=1,
+                channel_id=9912,
+                channel_name="bnl-testing",
+                channel_policy="sealed_test",
+                first_uid=100,
+                collapsed_items=items,
+                unique_user_ids=(100,),
+                active_packet=packet,
+                engagement_decision=packet["decision"],
+                engagement_reason=packet["reason"],
+                pending_state=pending,
+                pending_anchor=anchor,
+            )
+
+        self.assertEqual(
+            state["decision"].situation_frame.route_mode,
+            bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+        )
 
     def _prime_flush(self, channel, *texts):
         now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
@@ -3178,7 +3284,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 bnl01_bot,
                 "ordinary_chat_route_scope_decision",
                 return_value=SimpleNamespace(eligible=True, reason="canary"),
-            ),
+            ) as ordinary_scope,
             mock.patch.object(
                 bnl01_bot,
                 "build_unified_response_assessment_shadow",
@@ -3224,6 +3330,18 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         ordinary_basis.assert_called_once()
         ordinary_generation.assert_awaited_once()
+        self.assertEqual(
+            ordinary_scope.call_args.kwargs["route_mode"],
+            bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+        )
+        self.assertEqual(
+            ordinary_basis.call_args.kwargs["route_mode"],
+            bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+        )
+        self.assertEqual(
+            ordinary_generation.await_args.kwargs["route_mode"],
+            bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+        )
         shared_basis.assert_not_called()
         shared_generation.assert_not_awaited()
         self.assertEqual(
