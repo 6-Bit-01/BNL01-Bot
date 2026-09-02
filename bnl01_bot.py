@@ -191,6 +191,7 @@ from bnl_shared_brain_synthesis import (
     ordinary_chat_configuration,
     ordinary_chat_deterministic_response_act,
     ordinary_chat_route_scope_decision,
+    publication_packet_owns_turn,
     parse_ordinary_chat_response_contract,
     record_fallback as record_shared_brain_synthesis_fallback,
     record_single_packet_block,
@@ -27563,6 +27564,11 @@ def _build_unified_intelligence_packet_shadow(
             if isinstance(situation_frame, SituationFrameV1)
             else "not_provided"
         ),
+        frame_ambiguity_reasons=(
+            situation_frame.ambiguity_reasons
+            if isinstance(situation_frame, SituationFrameV1)
+            else ()
+        ),
         frame_subject_requirement=(
             situation_frame.subject_requirement
             if isinstance(situation_frame, SituationFrameV1)
@@ -35807,6 +35813,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_website_read_model_context
                 or batch_tiktok_show_evidence_context
             )
+            batch_situation_frame = (
+                orchestration_state["decision"].situation_frame
+            )
+            batch_publication_packet_owns_turn = (
+                publication_packet_owns_turn(batch_situation_frame)
+            )
             community_visual_basis = build_community_visual_basis(
                 guild_id,
                 (
@@ -35838,7 +35850,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 user_text=combined_text,
                 has_media=bool(active_packet.get("media_present")),
                 specialized_owner_present=bool(
-                    batch_source_context_available
+                    (
+                        batch_source_context_available
+                        and not batch_publication_packet_owns_turn
+                    )
                     or community_visual_prompt
                 ),
             )
@@ -35858,7 +35873,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_website_read_model_context,
                 )
             )
-            if batch_website_read_model_context:
+            if (
+                batch_website_read_model_context
+                and not batch_publication_packet_owns_turn
+            ):
                 prompt += (
                     "\n\nAuthoritative current live-show context for this "
                     "request:\n"
@@ -35878,7 +35896,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     len(collapsed_items),
                     f"channel_policy={channel_policy}",
                 )
-            if batch_tiktok_show_evidence_context:
+            if (
+                batch_tiktok_show_evidence_context
+                and not batch_publication_packet_owns_turn
+            ):
                 prompt += (
                     "\n\n"
                     + batch_tiktok_show_evidence_context
@@ -36118,11 +36139,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             bool(
                                 batch_website_read_model_context
                                 and not batch_finalized_show_packet_owner
+                                and not batch_publication_packet_owns_turn
                             ),
                         ),
                         (
                             "show_episode",
-                            bool(batch_tiktok_show_evidence_context),
+                            bool(
+                                batch_tiktok_show_evidence_context
+                                and not batch_publication_packet_owns_turn
+                            ),
                         ),
                     )
                     if present
@@ -36196,6 +36221,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         bool(
                             batch_website_read_model_context
                             and not batch_finalized_show_packet_owner
+                            and not batch_publication_packet_owns_turn
                         )
                     ),
                     current_direct=bool(
@@ -36206,7 +36232,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_intelligence_packet_out
                     ),
                     situation_frame=(
-                        orchestration_state["decision"].situation_frame
+                        batch_situation_frame
                     ),
                 )
             )
@@ -38396,11 +38422,23 @@ def build_user_aware_prompt(
         clean_content,
         tiktok_show_evidence_context,
     )
+    publication_packet_owns_current_turn = publication_packet_owns_turn(
+        conversation_orchestration.situation_frame
+        if isinstance(
+            conversation_orchestration,
+            ConversationOrchestrationDecision,
+        )
+        else None
+    )
     assessment_broadcast_context_present = bool(
-        broadcast_context and not finalized_show_packet_owner
+        broadcast_context
+        and not finalized_show_packet_owner
+        and not publication_packet_owns_current_turn
     )
     assessment_website_read_model_present = bool(
-        website_read_model_context and not finalized_show_packet_owner
+        website_read_model_context
+        and not finalized_show_packet_owner
+        and not publication_packet_owns_current_turn
     )
     community_visual_basis = build_community_visual_basis(
         guild_id,
@@ -38414,9 +38452,15 @@ def build_user_aware_prompt(
         community_visual_prompt_block += "\n"
     specialized_owner_present = bool(
         (assessment_broadcast_context_present and broadcast_specialized_owner)
-        or show_state_context
+        or (
+            show_state_context
+            and not publication_packet_owns_current_turn
+        )
         or assessment_website_read_model_present
-        or queue_artist_memory_context
+        or (
+            queue_artist_memory_context
+            and not publication_packet_owns_current_turn
+        )
         or community_visual_prompt_block
     )
     if ordinary_chat_single_packet and specialized_owner_present:
@@ -38460,15 +38504,30 @@ def build_user_aware_prompt(
                     "broadcast_memory",
                     assessment_broadcast_context_present,
                 ),
-                ("show_state", bool(show_state_context)),
+                (
+                    "show_state",
+                    bool(
+                        show_state_context
+                        and not publication_packet_owns_current_turn
+                    ),
+                ),
                 (
                     "website_read_model",
                     assessment_website_read_model_present,
                 ),
-                ("queue_artist_memory", bool(queue_artist_memory_context)),
+                (
+                    "queue_artist_memory",
+                    bool(
+                        queue_artist_memory_context
+                        and not publication_packet_owns_current_turn
+                    ),
+                ),
                 (
                     "show_episode",
-                    bool(tiktok_show_evidence_context),
+                    bool(
+                        tiktok_show_evidence_context
+                        and not publication_packet_owns_current_turn
+                    ),
                 ),
             )
             if present
@@ -38504,15 +38563,30 @@ def build_user_aware_prompt(
                         "broadcast_memory",
                         assessment_broadcast_context_present,
                     ),
-                    ("show_state", bool(show_state_context)),
+                    (
+                        "show_state",
+                        bool(
+                            show_state_context
+                            and not publication_packet_owns_current_turn
+                        ),
+                    ),
                     (
                         "website_read_model",
                         assessment_website_read_model_present,
                     ),
-                    ("queue_artist_memory", bool(queue_artist_memory_context)),
+                    (
+                        "queue_artist_memory",
+                        bool(
+                            queue_artist_memory_context
+                            and not publication_packet_owns_current_turn
+                        ),
+                    ),
                     (
                         "show_episode",
-                        bool(tiktok_show_evidence_context),
+                        bool(
+                            tiktok_show_evidence_context
+                            and not publication_packet_owns_current_turn
+                        ),
                     ),
                     ("source_context", bool(source_context_block)),
                     ("canon", _canon_relevant_to_response(clean_content)),
@@ -38552,7 +38626,10 @@ def build_user_aware_prompt(
         continuity_required=continuity_required_state,
         exact_quote_requested=exact_quote_requested,
         exact_quote_authority_present=exact_quote_authority is not None,
-        show_state_present=bool(show_state_context),
+        show_state_present=bool(
+            show_state_context
+            and not publication_packet_owns_current_turn
+        ),
         website_read_model_present=(
             assessment_website_read_model_present
         ),
@@ -38853,6 +38930,7 @@ def build_user_aware_prompt(
         broadcast_prompt_block = ""
         show_state_prompt_block = ""
         website_read_model_prompt_block = ""
+        queue_artist_memory_prompt_block = ""
         tiktok_show_evidence_prompt_block = ""
         tiktok_show_analysis_turn_contract = ""
         tiktok_show_episode_turn_contract = ""

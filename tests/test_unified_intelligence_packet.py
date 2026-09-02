@@ -18,8 +18,10 @@ from bnl_shadow_acceptance import (
 )
 from bnl_shared_brain_synthesis import render_packet_context
 from bnl_unified_intelligence_packet import (
+    IntelligencePacketItem,
     IntelligencePacketRequest,
     PacketConversationEvidence,
+    PacketFrameTask,
     PacketFrameSubject,
     _safe_atomic_supporting_observation,
     build_evaluation_report,
@@ -2773,6 +2775,138 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             projected.entry_id,
             {item.source_ref for item in packet.items},
         )
+
+    def test_publication_task_survives_only_unrelated_subject_ambiguity(self):
+        publication = IntelligencePacketItem(
+            lane="journal_publication",
+            source_class=packet_module.JOURNAL_PUBLICATION_SOURCE_CLASS,
+            source_type="canonical_published_journal",
+            source_ref="journal:journal_weekly_queue:1",
+            source_digest="f" * 64,
+            subject_key="bnl_01",
+            predicate_key="published_journal_entry",
+            text="The Journal connected the queue run to the last show.",
+            visibility="public",
+            confidence=Confidence.APPROVED.value,
+            lifecycle="published",
+            authority=0,
+            usage="publication_projection",
+            score=135.0,
+            revalidation_kind="journal_publication",
+            revalidation_key=(
+                '{"entryId":"journal_weekly_queue",'
+                '"queryMode":"topic","revision":1}'
+            ),
+            attribution_mode="publication_only",
+            uncertainty_status="derived_publication_zero_fact_weight",
+        )
+        request = replace(
+            self.public_request(
+                text="What did the Journal say about the queue?"
+            ),
+            frame_schema_version="situation_frame_v1",
+            frame_revision="sf_journal_topic",
+            frame_input_evidence_digest="d" * 64,
+            frame_status="ambiguous",
+            frame_ambiguity_reasons=("multiple_subject_candidates",),
+            frame_subject_requirement="required",
+            frame_subjects=(
+                PacketFrameSubject(
+                    entity_ref="cache_back",
+                    binding_method="conversation_candidate",
+                    confidence="medium",
+                ),
+                PacketFrameSubject(
+                    entity_ref="call_em_bini",
+                    binding_method="conversation_candidate",
+                    confidence="medium",
+                ),
+            ),
+            frame_tasks=(
+                PacketFrameTask(
+                    task_id="T1",
+                    text_digest="e" * 64,
+                    task_kind="retrieve_publication",
+                    object_kind="journal",
+                    authority_scope="packet",
+                    temporal_scope="historical",
+                    currentness="historical",
+                    required_response_act="answer",
+                    subject_requirement="not_applicable",
+                ),
+            ),
+            frame_task_kind="retrieve_publication",
+            frame_object_kind="journal",
+            frame_phase="request",
+        )
+
+        def journal_candidates(
+            _conn,
+            _request,
+            diagnostics,
+            _exclusions,
+        ):
+            diagnostics.journal_query_status = "eligible"
+            diagnostics.journal_control_status = "valid"
+            diagnostics.journal_candidate_count = 1
+            diagnostics.candidates_by_lane["journal_publication"] = 1
+            diagnostics.publication_projection_count += 1
+            return [publication]
+
+        with (
+            mock.patch.object(
+                packet_module,
+                "_journal_publication_items",
+                side_effect=journal_candidates,
+            ),
+            mock.patch.object(
+                packet_module,
+                "revalidate_published_journal_entry_on_connection",
+                return_value=publication.source_digest,
+            ),
+        ):
+            packet = build_packet(
+                self.conn,
+                request,
+                persist=False,
+                environ=self.flags,
+            )
+
+        self.assertEqual(packet.subject_resolution.status, "ambiguous")
+        self.assertEqual(
+            tuple(
+                item.source_ref
+                for item in packet.items
+                if item.lane == "journal_publication"
+            ),
+            (publication.source_ref,),
+        )
+        self.assertTrue(
+            all(
+                item.lane in {"current_intent", "journal_publication"}
+                for item in packet.items
+            )
+        )
+        self.assertEqual(packet.diagnostics.revalidation_status, "passed")
+        self.assertFalse(packet.diagnostics.invalid_invariants)
+
+        deictic_request = replace(
+            request,
+            frame_ambiguity_reasons=(
+                "publication_referent_unresolved",
+                "multiple_subject_candidates",
+            ),
+        )
+        deictic_diagnostics = packet_module.IntelligencePacketDiagnostics()
+        deictic_diagnostics.journal_query_status = "eligible"
+        excluded = packet_module._filter_frame_applicable_candidates(
+            deictic_request,
+            packet_module.PacketSubjectResolution(status="ambiguous"),
+            [publication],
+            deictic_diagnostics,
+            [],
+        )
+        self.assertEqual(excluded, [])
 
     def test_gate_requires_all_shadows_and_rejects_live_authority(self):
         enabled = shadow_configuration(self.flags)

@@ -332,6 +332,47 @@ class SituationFrameV1Tests(unittest.TestCase):
                 self.assertEqual(frame.task_kind, "retrieve_publication")
                 self.assertEqual(frame.status, "resolved")
 
+    def test_unresolved_publication_deictic_is_not_treated_as_a_topic(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text="What did that Journal entry say?",
+            current_speaker_user_ids=(101,),
+            subject_entity_refs=("cache_back", "call_em_bini"),
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.status, "ambiguous")
+        self.assertIn(
+            "publication_referent_unresolved",
+            frame.ambiguity_reasons,
+        )
+        self.assertIn(
+            "multiple_subject_candidates",
+            frame.ambiguity_reasons,
+        )
+
+        resolved = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            channel_policy="sealed_test",
+            current_text="What did that Journal entry say?",
+            current_speaker_user_ids=(101,),
+            subject_entity_refs=("cache_back", "call_em_bini"),
+            reply_message_ids=(700,),
+            exact_source_row_ids=(77,),
+            referent_status="resolved",
+            response_act="answer",
+        )
+
+        self.assertNotIn(
+            "publication_referent_unresolved",
+            resolved.ambiguity_reasons,
+        )
+
     def test_mixed_request_is_split_into_ordered_authority_tasks(self):
         frame = build_situation_frame_v1(
             route_allowed=True,

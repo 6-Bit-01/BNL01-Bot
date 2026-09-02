@@ -1881,6 +1881,50 @@ def ordinary_chat_route_scope_decision(
     )
 
 
+def publication_packet_owns_turn(situation_frame: Any) -> bool:
+    """Return whether typed Journal/Relay tasks own this factual turn.
+
+    Specialized context can be discovered from topic words inside a
+    publication question.  That discovery must not divert the requested
+    Journal/Relay task to the legacy prompt.  A genuinely requested
+    specialized-owner task still keeps its existing route.
+    """
+
+    tasks = tuple(getattr(situation_frame, "tasks", ()) or ())
+    if not tasks:
+        return False
+    publication_task_present = False
+    for task in tasks:
+        authority_scope = str(
+            getattr(task, "authority_scope", "") or ""
+        ).strip().lower()
+        object_kind = str(
+            getattr(task, "object_kind", "") or ""
+        ).strip().lower()
+        task_kind = str(
+            getattr(task, "task_kind", "") or ""
+        ).strip().lower()
+        subject_requirement = str(
+            getattr(task, "subject_requirement", "") or ""
+        ).strip().lower()
+        publication_task = bool(
+            authority_scope == "packet"
+            and task_kind == "retrieve_publication"
+            and object_kind in {"journal", "relay"}
+            and subject_requirement != "required"
+        )
+        if publication_task:
+            publication_task_present = True
+            continue
+        if authority_scope == "packet" or object_kind in {
+            "queue",
+            "website",
+            "broadcast",
+        }:
+            return False
+    return publication_task_present
+
+
 def ordinary_chat_route_scope_enabled(**kwargs: Any) -> bool:
     return ordinary_chat_route_scope_decision(**kwargs).eligible
 

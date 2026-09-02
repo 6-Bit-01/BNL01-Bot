@@ -26,6 +26,7 @@ from bnl_shared_brain_synthesis import (
     ordinary_chat_deterministic_response_act,
     ordinary_chat_route_scope_decision,
     ordinary_chat_task_support_plan,
+    publication_packet_owns_turn,
     parse_ordinary_chat_response_contract,
     record_single_packet_block,
     render_ordinary_chat_task_contract,
@@ -801,6 +802,34 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 )
                 self.assertFalse(decision.eligible)
                 self.assertEqual(decision.reason, reason)
+
+    def test_publication_task_owns_topic_overlap_but_not_queue_task(self):
+        journal_topic = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text="What did the Journal say about the queue?",
+            current_speaker_user_ids=(7,),
+            response_act="answer",
+        )
+        mixed_current_queue = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text=(
+                "What did the Journal say about the queue, and is the "
+                "queue open right now?"
+            ),
+            current_speaker_user_ids=(7,),
+            response_act="answer",
+        )
+
+        self.assertTrue(publication_packet_owns_turn(journal_topic))
+        self.assertFalse(
+            publication_packet_owns_turn(mixed_current_queue)
+        )
 
     def test_packet_owned_prompt_rejects_legacy_and_nonpacket_owners(self):
         base_prompt = (

@@ -487,6 +487,7 @@ class IntelligencePacketRequest:
     frame_revision: str = ""
     frame_input_evidence_digest: str = ""
     frame_status: str = "not_provided"
+    frame_ambiguity_reasons: tuple[str, ...] = ()
     frame_subject_requirement: str = "legacy"
     frame_subjects: tuple[PacketFrameSubject, ...] = ()
     frame_tasks: tuple[PacketFrameTask, ...] = ()
@@ -4960,6 +4961,47 @@ def _relay_publication_items(
     return items
 
 
+def _subject_independent_publication_lanes(
+    request: IntelligencePacketRequest,
+) -> frozenset[str]:
+    """Keep publication tasks separate from unrelated subject ambiguity."""
+
+    ambiguity_reasons = frozenset(
+        str(reason or "").strip().lower()
+        for reason in request.frame_ambiguity_reasons
+        if str(reason or "").strip()
+    )
+    concrete_subjects = tuple(
+        subject
+        for subject in request.frame_subjects
+        if int(subject.user_id or 0) > 0
+        or str(subject.entity_ref or "").strip()
+    )
+    if (
+        str(request.frame_status or "").strip().lower() != "ambiguous"
+        or ambiguity_reasons != frozenset({"multiple_subject_candidates"})
+        or str(request.frame_subject_requirement or "").strip().lower()
+        != "required"
+        or len(concrete_subjects) < 2
+    ):
+        return frozenset()
+
+    lanes = set()
+    for task in request.frame_tasks:
+        object_kind = str(task.object_kind or "").strip().lower()
+        if (
+            str(task.authority_scope or "").strip().lower() == "packet"
+            and str(task.task_kind or "").strip().lower()
+            == "retrieve_publication"
+            and str(task.subject_requirement or "").strip().lower()
+            != "required"
+            and not task.subject_indexes
+            and object_kind in {"journal", "relay"}
+        ):
+            lanes.add("%s_publication" % object_kind)
+    return frozenset(lanes)
+
+
 def _filter_frame_applicable_candidates(
     request: IntelligencePacketRequest,
     subject_resolution: PacketSubjectResolution,
@@ -4985,8 +5027,16 @@ def _filter_frame_applicable_candidates(
     if not subject_resolution.applicable:
         kept = []
         reason = "frame_subject_%s" % subject_resolution.status
+        subject_independent_publication_lanes = (
+            _subject_independent_publication_lanes(request)
+            if subject_resolution.status == "ambiguous"
+            else frozenset()
+        )
         for item in candidates:
-            if item.lane == "current_intent":
+            if (
+                item.lane == "current_intent"
+                or item.lane in subject_independent_publication_lanes
+            ):
                 kept.append(item)
             else:
                 exclude(item, reason)
@@ -6136,6 +6186,26 @@ def _revalidate_packet_in_snapshot(
         packet.request,
         environ=environ,
     )
+    subject_independent_publication_lanes = (
+        _subject_independent_publication_lanes(packet.request)
+    )
+    subject_independent_publication_content = bool(
+        current_subject_resolution.status == "ambiguous"
+        and subject_independent_publication_lanes
+        and any(
+            item.lane in subject_independent_publication_lanes
+            for item in packet.items
+        )
+        and all(
+            item.lane == "current_intent"
+            or item.lane in subject_independent_publication_lanes
+            for item in packet.items
+        )
+        and all(
+            item.lane in subject_independent_publication_lanes
+            for item in packet.validation_items
+        )
+    )
     legacy_resolution_unspecified = bool(
         not str(packet.request.frame_revision or "").strip()
         and packet.subject_resolution.status == "unresolved"
@@ -6312,7 +6382,10 @@ def _revalidate_packet_in_snapshot(
         status = "processing_error"
     elif subject_changed:
         status = "subject_binding_changed"
-    elif not current_subject_resolution.applicable:
+    elif (
+        not current_subject_resolution.applicable
+        and not subject_independent_publication_content
+    ):
         status = "subject_%s" % current_subject_resolution.status
     elif changed:
         status = "source_changed"
@@ -6367,6 +6440,11 @@ def _packet_invariants(
     packet: UnifiedIntelligencePacket,
 ) -> tuple[str, ...]:
     invalid = []
+    subject_independent_publication_lanes = (
+        _subject_independent_publication_lanes(packet.request)
+        if packet.subject_resolution.status == "ambiguous"
+        else frozenset()
+    )
     accepted_subject_keys = {
         value for value in packet_subject_keys(packet) if value
     }
@@ -6419,7 +6497,11 @@ def _packet_invariants(
     if (
         str(packet.request.frame_revision or "").strip()
         and not packet.subject_resolution.applicable
-        and any(item.lane != "current_intent" for item in packet.items)
+        and any(
+            item.lane != "current_intent"
+            and item.lane not in subject_independent_publication_lanes
+            for item in packet.items
+        )
     ):
         invalid.append("unresolved_frame_subject_selected_content")
     if str(packet.request.frame_revision or "").strip() and not (
