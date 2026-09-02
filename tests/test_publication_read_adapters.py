@@ -1114,6 +1114,58 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             )
         )
 
+    def test_ambiguous_date_binding_must_match_selected_date(self):
+        self.add_journal(
+            "journal_first_unbound_date",
+            title="First Unbound Date Entry",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        journal_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Journal say about the 2026-08-04 event, "
+                "if the Journal was published on 2026-08-05?",
+                snapshot=control_snapshot(),
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual("ambiguous", journal_packet.subject_resolution.status)
+        self.assertEqual(
+            "eligible", journal_packet.diagnostics.journal_query_status
+        )
+        self.assertFalse(
+            any(
+                item.lane == "journal_publication"
+                for item in journal_packet.items
+            )
+        )
+
+        self.add_relay(
+            "bnl-first-unbound-date",
+            published_at="2026-08-05T01:00:00Z",
+        )
+        relay_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Relay say about the 2026-08-05 event, "
+                "if the Relay was published on 2026-08-06?",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual("ambiguous", relay_packet.subject_resolution.status)
+        self.assertEqual(
+            "eligible", relay_packet.diagnostics.relay_query_status
+        )
+        self.assertFalse(
+            any(
+                item.lane == "relay_publication" for item in relay_packet.items
+            )
+        )
+
     def test_ambiguous_exact_date_scans_complete_journal_match_set(self):
         hidden_ids = []
         for index in range(9):

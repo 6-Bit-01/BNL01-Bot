@@ -4988,10 +4988,20 @@ def _publication_date_selector_is_bound(
     user_text: str,
     object_kind: str,
 ) -> bool:
+    text = str(user_text or "")
     pattern = _PUBLICATION_DATE_SELECTOR_RE.get(
         str(object_kind or "").strip().lower()
     )
-    return bool(pattern and pattern.search(str(user_text or "")))
+    selected_date = re.search(
+        r"\b" + _PUBLICATION_DATE_LITERAL + r"\b",
+        text,
+    )
+    if pattern is None or selected_date is None:
+        return False
+    return any(
+        selected_date.group(0) in match.group(0)
+        for match in pattern.finditer(text)
+    )
 
 
 def _subject_independent_publication_lanes(
