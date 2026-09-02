@@ -363,8 +363,11 @@ _JOURNAL_LATEST_RE = re.compile(
 _JOURNAL_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 _JOURNAL_EXPLICIT_TITLE_RE = re.compile(
     r"\b(?:title(?:d)?|called|named)\s*(?::|=|is)?\s*"
-    r"(?:[\"“](?P<double_title>[^\"”\n]{3,300})[\"”]"
-    r"|['‘](?P<single_title>[^'’\n]{3,300})['’])",
+    r'(?:"(?P<straight_double_title>[^"\n]{3,300})"'
+    r"|“(?P<curly_double_title>[^”\n]{3,300})”"
+    r"|'(?P<straight_single_title>(?:[^'\n]|'(?=\w)){3,300})'"
+    r"|‘(?P<curly_single_title>(?:[^’\n]|’(?=\w)){3,300})’)"
+    r"(?=\s|[.,;:!?)]|$)",
     re.IGNORECASE,
 )
 _JOURNAL_QUERY_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
@@ -551,7 +554,19 @@ def _journal_query_title(user_text: str) -> str:
     match = _JOURNAL_EXPLICIT_TITLE_RE.search(str(user_text or ""))
     if not match:
         return ""
-    title = match.group("double_title") or match.group("single_title") or ""
+    title = next(
+        (
+            value
+            for value in (
+                match.group("straight_double_title"),
+                match.group("curly_double_title"),
+                match.group("straight_single_title"),
+                match.group("curly_single_title"),
+            )
+            if value
+        ),
+        "",
+    )
     return re.sub(r"\s+", " ", title).strip()
 
 
@@ -822,7 +837,7 @@ def select_published_journal_entries_on_connection(
     else:
         title_rows = (
             []
-            if requested_mode == "latest" or not explicit_title
+            if not explicit_title
             else _latest_published_journal_rows(
                 conn,
                 guild_id=guild_id,
@@ -830,7 +845,7 @@ def select_published_journal_entries_on_connection(
                 limit=None,
             )
         )
-        if title_rows:
+        if explicit_title:
             query_mode = "exact_title"
             rows = title_rows
         elif publication_date:

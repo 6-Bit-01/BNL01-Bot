@@ -76,6 +76,7 @@ class PublicationReadAdapterTests(unittest.TestCase):
             section_values,
             sort_keys=True,
             separators=(",", ":"),
+            ensure_ascii=False,
         )
         content_hash = hashlib.sha256(
             "|".join((title, excerpt, sections)).encode()
@@ -103,6 +104,7 @@ class PublicationReadAdapterTests(unittest.TestCase):
             public_payload,
             sort_keys=True,
             separators=(",", ":"),
+            ensure_ascii=False,
         )
         self.conn.execute(
             """
@@ -299,6 +301,89 @@ class PublicationReadAdapterTests(unittest.TestCase):
                         for publication in selected.publications
                     ),
                 )
+
+    def test_journal_exact_title_keeps_embedded_apostrophes(self):
+        self.add_journal("journal_short_artist", title="Artist")
+        self.add_journal(
+            "journal_straight_apostrophe",
+            title="Artist's Notes",
+        )
+        self.add_journal(
+            "journal_curly_apostrophe",
+            title="Artist’s Notes",
+        )
+        snapshot = control_snapshot()
+
+        cases = (
+            ("'Artist's Notes'", "journal_straight_apostrophe"),
+            ("‘Artist’s Notes’", "journal_curly_apostrophe"),
+        )
+        for quoted_title, expected_entry_id in cases:
+            with self.subTest(quoted_title=quoted_title):
+                selected = (
+                    journal.select_published_journal_entries_on_connection(
+                        self.conn,
+                        guild_id=1,
+                        user_text=(
+                            "show the Journal entry titled "
+                            + quoted_title
+                            + " from 2026-08-02"
+                        ),
+                        control_snapshot=snapshot,
+                        now=NOW,
+                    )
+                )
+                self.assertEqual("eligible", selected.status)
+                self.assertEqual("exact_title", selected.query_mode)
+                self.assertEqual(
+                    (expected_entry_id,),
+                    tuple(
+                        publication.entry_id
+                        for publication in selected.publications
+                    ),
+                )
+
+        followed_by_another_quote = (
+            journal.select_published_journal_entries_on_connection(
+                self.conn,
+                guild_id=1,
+                user_text=(
+                    "show the Journal entry titled 'Artist's Notes'. "
+                    "Compare it with 'Artist'."
+                ),
+                control_snapshot=snapshot,
+                now=NOW,
+            )
+        )
+        self.assertEqual("eligible", followed_by_another_quote.status)
+        self.assertEqual(
+            ("journal_straight_apostrophe",),
+            tuple(
+                publication.entry_id
+                for publication in followed_by_another_quote.publications
+            ),
+        )
+
+    def test_missing_explicit_journal_title_does_not_fall_back_to_date(self):
+        self.add_journal(
+            "journal_same_date_other_title",
+            title="Different Entry",
+        )
+
+        selected = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text=(
+                'show the Journal entry titled "Missing Entry" '
+                "from 2026-08-02"
+            ),
+            control_snapshot=control_snapshot(),
+            now=NOW,
+        )
+
+        self.assertEqual("not_found", selected.status)
+        self.assertEqual("exact_title", selected.query_mode)
+        self.assertEqual((), selected.publications)
 
     def test_explicit_latest_journal_prefers_publication_time_over_topic_density(self):
         self.add_journal(
@@ -747,6 +832,29 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
                     "passed",
                     single_quoted.diagnostics.revalidation_status,
                 )
+
+    def test_ambiguous_missing_explicit_title_does_not_project_date_match(self):
+        self.add_journal(
+            "journal_same_date_unrequested",
+            title="Different Entry",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        packet = build_packet(
+            self.conn,
+            self.framed_request(
+                'Show me the Journal entry titled "Missing Entry" '
+                "from 2026-08-04. What did it say?",
+                snapshot=control_snapshot(),
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual("ambiguous", packet.subject_resolution.status)
+        self.assertEqual("not_found", packet.diagnostics.journal_query_status)
+        self.assertFalse(
+            any(item.lane == "journal_publication" for item in packet.items)
+        )
 
     def test_ambiguous_exact_date_uses_one_eligible_publication(self):
         self.add_journal(
