@@ -303,6 +303,7 @@ class PublicationReadAdapterTests(unittest.TestCase):
                 )
 
     def test_journal_exact_title_keeps_embedded_apostrophes(self):
+        self.add_journal("journal_legacy_entry", title="Legacy Entry")
         self.add_journal("journal_short_artist", title="Artist")
         self.add_journal(
             "journal_straight_apostrophe",
@@ -433,6 +434,49 @@ class PublicationReadAdapterTests(unittest.TestCase):
                 )
             ),
         )
+
+        trailing_possessive_cases = (
+            (
+                "show the Journal entry titled 'Legacy Entry' "
+                "from the Artists' Guild",
+                "journal_legacy_entry",
+            ),
+            (
+                "show the Journal entry titled 'Artists' Notes' "
+                "from the Artists' Guild",
+                "journal_straight_plural_possessive",
+            ),
+            (
+                "show the Journal entry titled ‘Legacy Entry’ "
+                "from the Artists’ Guild",
+                "journal_legacy_entry",
+            ),
+            (
+                "show the Journal entry titled ‘Artists’ Notes’ "
+                "from the Artists’ Guild",
+                "journal_curly_plural_possessive",
+            ),
+        )
+        for user_text, expected_entry_id in trailing_possessive_cases:
+            with self.subTest(user_text=user_text):
+                selected = (
+                    journal.select_published_journal_entries_on_connection(
+                        self.conn,
+                        guild_id=1,
+                        user_text=user_text,
+                        control_snapshot=snapshot,
+                        now=NOW,
+                    )
+                )
+                self.assertEqual("eligible", selected.status)
+                self.assertEqual("exact_title", selected.query_mode)
+                self.assertEqual(
+                    (expected_entry_id,),
+                    tuple(
+                        publication.entry_id
+                        for publication in selected.publications
+                    ),
+                )
 
     def test_missing_explicit_journal_title_does_not_fall_back_to_date(self):
         self.add_journal(

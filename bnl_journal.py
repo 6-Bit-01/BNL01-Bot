@@ -550,11 +550,11 @@ def _journal_query_identity(user_text: str) -> str:
     return ""
 
 
-def _journal_query_title(user_text: str) -> str:
+def _journal_query_title_candidates(user_text: str) -> tuple[str, ...]:
     text = str(user_text or "")
     match = _JOURNAL_EXPLICIT_TITLE_START_RE.search(text)
     if not match:
-        return ""
+        return ()
     opener = match.group("quote")
     closer = _JOURNAL_TITLE_QUOTE_PAIRS[opener]
     title_start = match.end()
@@ -562,28 +562,19 @@ def _journal_query_title(user_text: str) -> str:
     line_end = len(text) if newline_at < 0 else newline_at
     scan_end = min(line_end, title_start + 300)
     close_at = text.find(closer, title_start + 3, scan_end + 1)
+    candidates: list[str] = []
     while close_at >= 0:
         suffix = text[close_at + 1 : line_end]
         if _JOURNAL_TITLE_CLOSE_BOUNDARY_RE.match(suffix):
-            later_close = text.find(closer, close_at + 1, scan_end + 1)
-            # With single quotes, a prior candidate can be a possessive
-            # apostrophe. Scan onward only when the next same-style mark
-            # can itself close; a mark followed by title text is an opener.
-            if (
-                opener not in {"'", "‘"}
-                or later_close < 0
-                or not _JOURNAL_TITLE_CLOSE_BOUNDARY_RE.match(
-                    text[later_close + 1 : line_end]
-                )
-            ):
+            title = re.sub(
+                r"\s+", " ", text[title_start:close_at]
+            ).strip()
+            if title and title not in candidates:
+                candidates.append(title)
+            if opener not in {"'", "‘"}:
                 break
         close_at = text.find(closer, close_at + 1, scan_end + 1)
-    if close_at < 0:
-        return ""
-    title = text[title_start:close_at]
-    return re.sub(r"\s+", " ", title).strip()
-
-
+    return tuple(candidates)
 def _journal_query_terms(user_text: str) -> set[str]:
     return {
         token
@@ -835,7 +826,10 @@ def select_published_journal_entries_on_connection(
         return JournalPublicationSelection("source_unavailable", requested_mode)
 
     identity = _journal_query_identity(user_text)
-    explicit_title = _journal_query_title(user_text)
+    explicit_title_candidates = _journal_query_title_candidates(user_text)
+    explicit_title = (
+        explicit_title_candidates[-1] if explicit_title_candidates else ""
+    )
     publication_date_match = _JOURNAL_DATE_RE.search(str(user_text or ""))
     publication_date = (
         publication_date_match.group(1) if publication_date_match else ""
@@ -849,16 +843,18 @@ def select_published_journal_entries_on_connection(
             limit=max(1, limit),
         )
     else:
-        title_rows = (
-            []
-            if not explicit_title
-            else _latest_published_journal_rows(
+        title_rows: list[dict[str, Any]] = []
+        for candidate in reversed(explicit_title_candidates):
+            candidate_rows = _latest_published_journal_rows(
                 conn,
                 guild_id=guild_id,
-                exact_title=explicit_title,
+                exact_title=candidate,
                 limit=None,
             )
-        )
+            if candidate_rows:
+                explicit_title = candidate
+                title_rows = candidate_rows
+                break
         if explicit_title:
             query_mode = "exact_title"
             rows = title_rows
