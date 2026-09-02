@@ -412,6 +412,28 @@ class PublicationReadAdapterTests(unittest.TestCase):
             ),
         )
 
+        arbitrary_clause_before_another_quote = (
+            journal.select_published_journal_entries_on_connection(
+                self.conn,
+                guild_id=1,
+                user_text=(
+                    "show the Journal entry titled 'Artists' Notes' "
+                    "alongside 'Artist'"
+                ),
+                control_snapshot=snapshot,
+                now=NOW,
+            )
+        )
+        self.assertEqual(
+            ("journal_straight_plural_possessive",),
+            tuple(
+                publication.entry_id
+                for publication in (
+                    arbitrary_clause_before_another_quote.publications
+                )
+            ),
+        )
+
     def test_missing_explicit_journal_title_does_not_fall_back_to_date(self):
         self.add_journal(
             "journal_same_date_other_title",

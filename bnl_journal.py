@@ -370,15 +370,6 @@ _JOURNAL_TITLE_QUOTE_PAIRS = {"\"": "\"", "“": "”", "'": "'", "‘": "’"}
 _JOURNAL_TITLE_CLOSE_BOUNDARY_RE = re.compile(
     r"^(?:\s|[.,;:!?)}\]]|$)"
 )
-_JOURNAL_TITLE_STRONG_CLOSE_BOUNDARY_RE = re.compile(
-    r"^\s*(?:[.,;:!?)}\]]|20\d{2}-\d{2}-\d{2}\b|"
-    r"(?:from|on)\s+(?:20\d{2}-\d{2}-\d{2}|today|tonight|"
-    r"yesterday|tomorrow)\b|"
-    r"(?:and|but|or|then)\s+(?:compare|explain|give|read|show|"
-    r"summarize|tell|what|when|where|which|who|why|how)\b|"
-    r"(?:please|what|when|where|which|who|why|how)\b)",
-    re.IGNORECASE,
-)
 _JOURNAL_QUERY_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
     "article",
     "called",
@@ -576,12 +567,14 @@ def _journal_query_title(user_text: str) -> str:
         if _JOURNAL_TITLE_CLOSE_BOUNDARY_RE.match(suffix):
             later_close = text.find(closer, close_at + 1, scan_end + 1)
             # With single quotes, a prior candidate can be a possessive
-            # apostrophe. Scan onward unless this is the last candidate or
-            # the suffix clearly begins a new clause.
+            # apostrophe. Scan onward only when the next same-style mark
+            # can itself close; a mark followed by title text is an opener.
             if (
                 opener not in {"'", "‘"}
                 or later_close < 0
-                or _JOURNAL_TITLE_STRONG_CLOSE_BOUNDARY_RE.match(suffix)
+                or not _JOURNAL_TITLE_CLOSE_BOUNDARY_RE.match(
+                    text[later_close + 1 : line_end]
+                )
             ):
                 break
         close_at = text.find(closer, close_at + 1, scan_end + 1)
