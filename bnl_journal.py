@@ -363,7 +363,8 @@ _JOURNAL_LATEST_RE = re.compile(
 _JOURNAL_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 _JOURNAL_EXPLICIT_TITLE_RE = re.compile(
     r"\b(?:title(?:d)?|called|named)\s*(?::|=|is)?\s*"
-    r"[\"“](?P<title>[^\"”\n]{3,300})[\"”]",
+    r"(?:[\"“](?P<double_title>[^\"”\n]{3,300})[\"”]"
+    r"|['‘](?P<single_title>[^'’\n]{3,300})['’])",
     re.IGNORECASE,
 )
 _JOURNAL_QUERY_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
@@ -548,7 +549,10 @@ def _journal_query_identity(user_text: str) -> str:
 
 def _journal_query_title(user_text: str) -> str:
     match = _JOURNAL_EXPLICIT_TITLE_RE.search(str(user_text or ""))
-    return re.sub(r"\s+", " ", match.group("title")).strip() if match else ""
+    if not match:
+        return ""
+    title = match.group("double_title") or match.group("single_title") or ""
+    return re.sub(r"\s+", " ", title).strip()
 
 
 def _journal_query_terms(user_text: str) -> set[str]:
@@ -583,7 +587,7 @@ def _latest_published_journal_rows(
     entry_id: str = "",
     publication_date: str = "",
     exact_title: str = "",
-    limit: int = JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT,
+    limit: Optional[int] = JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT,
 ) -> list[dict[str, Any]]:
     if not table_exists(conn, "bnl_journal_entries"):
         return []
@@ -615,16 +619,18 @@ def _latest_published_journal_rows(
             "AND LOWER(TRIM(e.title))=LOWER(TRIM(?))"
         )
         params.append(exact_title)
-    params.append(max(1, min(int(limit or 1), 500)))
-    rows = conn.execute(
+    sql = (
         "SELECT "
         + ",".join("e." + name for name in _JOURNAL_PUBLICATION_COLUMNS)
         + " FROM bnl_journal_entries e WHERE "
         + " AND ".join(where)
         + " ORDER BY COALESCE(e.published_at,e.created_at) DESC,"
-        "e.entry_id ASC,e.revision DESC LIMIT ?",
-        tuple(params),
-    ).fetchall()
+        "e.entry_id ASC,e.revision DESC"
+    )
+    if limit is not None:
+        params.append(max(1, min(int(limit or 1), 500)))
+        sql += " LIMIT ?"
+    rows = conn.execute(sql, tuple(params)).fetchall()
     return [dict(zip(_JOURNAL_PUBLICATION_COLUMNS, row)) for row in rows]
 
 
@@ -821,7 +827,7 @@ def select_published_journal_entries_on_connection(
                 conn,
                 guild_id=guild_id,
                 exact_title=explicit_title,
-                limit=max(8, limit),
+                limit=None,
             )
         )
         if title_rows:
@@ -833,7 +839,7 @@ def select_published_journal_entries_on_connection(
                 conn,
                 guild_id=guild_id,
                 publication_date=publication_date,
-                limit=max(8, limit),
+                limit=None,
             )
         else:
             query_mode = (
@@ -934,6 +940,7 @@ def revalidate_published_journal_entry_on_connection(
     control_snapshot: JournalControlSnapshot | None,
     user_text: str = "",
     now: Any = None,
+    require_unique_selection: bool = False,
 ) -> str:
     if (
         journal_control_snapshot_status(control_snapshot, now=now) != "valid"
@@ -947,6 +954,30 @@ def revalidate_published_journal_entry_on_connection(
         and entry_id in set(control_snapshot.memory_excluded_entry_ids)
     ):
         return ""
+    if require_unique_selection:
+        if not str(user_text or "").strip():
+            return ""
+        selection = select_published_journal_entries_on_connection(
+            conn,
+            guild_id=guild_id,
+            user_text=user_text,
+            control_snapshot=control_snapshot,
+            now=now,
+            limit=2,
+        )
+        if (
+            selection.status != "eligible"
+            or selection.query_mode != query_mode
+            or len(selection.publications) != 1
+        ):
+            return ""
+        publication = selection.publications[0]
+        if (
+            publication.entry_id != entry_id
+            or publication.revision != int(revision)
+        ):
+            return ""
+        return publication.source_digest
     if query_mode == "latest":
         if not str(user_text or "").strip():
             return ""

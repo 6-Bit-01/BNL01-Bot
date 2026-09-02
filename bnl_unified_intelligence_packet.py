@@ -6415,6 +6415,10 @@ def _revalidate_packet_in_snapshot(
                     control_snapshot=current_journal_control,
                     user_text=packet.request.user_text,
                     now=packet.request.now or None,
+                    require_unique_selection=(
+                        item.lane
+                        in subject_independent_publication_lanes
+                    ),
                 )
             elif item.revalidation_kind == "relay_publication":
                 payload = _publication_revalidation_payload(item)
@@ -6424,6 +6428,10 @@ def _revalidate_packet_in_snapshot(
                     relay_id=str(payload.get("relayId") or ""),
                     query_mode=str(payload.get("queryMode") or ""),
                     user_text=packet.request.user_text,
+                    require_unique_selection=(
+                        item.lane
+                        in subject_independent_publication_lanes
+                    ),
                 )
             elif item.revalidation_kind in {"current", "snapshot"}:
                 current = item.revalidation_key

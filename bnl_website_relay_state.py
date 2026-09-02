@@ -6,7 +6,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from bnl_journal_source_store import record_source_event, timestamp_to_epoch_ms
 
@@ -399,7 +399,7 @@ def _relay_publication_rows(
     guild_id: int,
     relay_id: str = "",
     publication_date: str = "",
-    limit: int = RELAY_PUBLICATION_TOPIC_SCAN_LIMIT,
+    limit: Optional[int] = RELAY_PUBLICATION_TOPIC_SCAN_LIMIT,
 ) -> list[dict[str, Any]]:
     if not _relay_table_exists(conn, "website_relay_history"):
         return []
@@ -414,15 +414,17 @@ def _relay_publication_rows(
     if publication_date:
         where.append("SUBSTR(published_timestamp,1,10)=?")
         params.append(publication_date)
-    params.append(max(1, min(int(limit or 1), 500)))
-    rows = conn.execute(
+    sql = (
         "SELECT "
         + ",".join(_RELAY_PUBLICATION_COLUMNS)
         + " FROM website_relay_history WHERE "
         + " AND ".join(where)
-        + " ORDER BY published_timestamp DESC,relay_id DESC LIMIT ?",
-        tuple(params),
-    ).fetchall()
+        + " ORDER BY published_timestamp DESC,relay_id DESC"
+    )
+    if limit is not None:
+        params.append(max(1, min(int(limit or 1), 500)))
+        sql += " LIMIT ?"
+    rows = conn.execute(sql, tuple(params)).fetchall()
     return [dict(zip(_RELAY_PUBLICATION_COLUMNS, row)) for row in rows]
 
 
@@ -614,7 +616,7 @@ def select_accepted_relay_publications_on_connection(
             conn,
             guild_id=guild_id,
             publication_date=publication_date,
-            limit=max(8, limit),
+            limit=None,
         )
     else:
         query_mode = (
@@ -715,7 +717,27 @@ def revalidate_accepted_relay_publication_on_connection(
     relay_id: str,
     query_mode: str,
     user_text: str = "",
+    require_unique_selection: bool = False,
 ) -> str:
+    if require_unique_selection:
+        if not str(user_text or "").strip():
+            return ""
+        selection = select_accepted_relay_publications_on_connection(
+            conn,
+            guild_id=guild_id,
+            user_text=user_text,
+            limit=2,
+        )
+        if (
+            selection.status != "eligible"
+            or selection.query_mode != query_mode
+            or len(selection.publications) != 1
+        ):
+            return ""
+        publication = selection.publications[0]
+        if publication.relay_id != relay_id:
+            return ""
+        return publication.source_digest
     if query_mode == "latest":
         if not str(user_text or "").strip():
             return ""

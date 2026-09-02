@@ -273,6 +273,33 @@ class PublicationReadAdapterTests(unittest.TestCase):
         )
         self.assertEqual("topic", deictic.query_mode)
 
+    def test_journal_exact_title_accepts_paired_single_quotes(self):
+        self.add_journal("journal_single_quote", title="Legacy Entry")
+        snapshot = control_snapshot()
+
+        for quoted_title in ("'Legacy Entry'", "‘Legacy Entry’"):
+            with self.subTest(quoted_title=quoted_title):
+                selected = (
+                    journal.select_published_journal_entries_on_connection(
+                        self.conn,
+                        guild_id=1,
+                        user_text=(
+                            "show the Journal entry titled " + quoted_title
+                        ),
+                        control_snapshot=snapshot,
+                        now=NOW,
+                    )
+                )
+                self.assertEqual("eligible", selected.status)
+                self.assertEqual("exact_title", selected.query_mode)
+                self.assertEqual(
+                    ("journal_single_quote",),
+                    tuple(
+                        publication.entry_id
+                        for publication in selected.publications
+                    ),
+                )
+
     def test_explicit_latest_journal_prefers_publication_time_over_topic_density(self):
         self.add_journal(
             "journal_older_dense",
@@ -696,6 +723,31 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             1,
         )
 
+        for quoted_title in ("'Legacy Entry'", "‘Legacy Entry’"):
+            with self.subTest(quoted_title=quoted_title):
+                single_quoted = build_packet(
+                    self.conn,
+                    self.framed_request(
+                        "Show me the Journal entry titled %s. "
+                        "What did it say?" % quoted_title,
+                        snapshot=snapshot,
+                    ),
+                    persist=False,
+                    environ=self.flags,
+                )
+                self.assertEqual(
+                    ("journal:%s:1" % entry_id,),
+                    tuple(
+                        item.source_ref
+                        for item in single_quoted.items
+                        if item.lane == "journal_publication"
+                    ),
+                )
+                self.assertEqual(
+                    "passed",
+                    single_quoted.diagnostics.revalidation_status,
+                )
+
     def test_ambiguous_exact_date_uses_one_eligible_publication(self):
         self.add_journal(
             "journal_date_visible",
@@ -730,6 +782,173 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         )
         self.assertEqual("passed", packet.diagnostics.revalidation_status)
         self.assertFalse(packet.diagnostics.invalid_invariants)
+
+    def test_ambiguous_exact_date_scans_complete_journal_match_set(self):
+        hidden_ids = []
+        for index in range(9):
+            entry_id = "journal_dense_date_%02d" % index
+            self.add_journal(
+                entry_id,
+                title="Dense Date Entry %02d" % index,
+                published_at="2026-08-04T%02d:00:00Z" % (9 - index),
+            )
+            if index < 7:
+                hidden_ids.append(entry_id)
+
+        packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Journal publish on 2026-08-04?",
+                snapshot=control_snapshot(public_excluded=hidden_ids),
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(9, packet.diagnostics.journal_candidate_count)
+        self.assertFalse(
+            any(item.lane == "journal_publication" for item in packet.items)
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "frame_subject_ambiguous",
+                0,
+            ),
+            2,
+        )
+
+    def test_ambiguous_exact_title_scans_complete_journal_match_set(self):
+        hidden_ids = []
+        for index in range(9):
+            entry_id = "journal_duplicate_title_%02d" % index
+            self.add_journal(
+                entry_id,
+                title="Shared Carrier Title",
+                published_at="2026-08-04T%02d:00:00Z" % (9 - index),
+            )
+            if index < 7:
+                hidden_ids.append(entry_id)
+
+        packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "Show me the Journal entry titled 'Shared Carrier Title'. "
+                "What did it say?",
+                snapshot=control_snapshot(public_excluded=hidden_ids),
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(9, packet.diagnostics.journal_candidate_count)
+        self.assertFalse(
+            any(item.lane == "journal_publication" for item in packet.items)
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "frame_subject_ambiguous",
+                0,
+            ),
+            2,
+        )
+
+    def test_ambiguous_exact_date_scans_complete_relay_match_set(self):
+        for index in range(9):
+            self.add_relay(
+                "bnl-dense-date-%02d" % index,
+                message="Dense date Relay %02d." % index,
+                lane="presence" if index < 7 else "current_signal",
+                event_type="online" if index < 7 else "public_discord_activity",
+                published_at="2026-08-04T%02d:00:00Z" % (9 - index),
+            )
+
+        packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What Relay was published on 2026-08-04?",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(9, packet.diagnostics.relay_candidate_count)
+        self.assertFalse(
+            any(item.lane == "relay_publication" for item in packet.items)
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "frame_subject_ambiguous",
+                0,
+            ),
+            2,
+        )
+
+    def test_ambiguous_publication_revalidation_rejects_new_match(self):
+        snapshot = control_snapshot()
+        self.add_journal(
+            "journal_unique_date",
+            title="Initially Unique Date Entry",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Journal publish on 2026-08-04?",
+                snapshot=snapshot,
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertTrue(
+            any(item.lane == "journal_publication" for item in packet.items)
+        )
+
+        self.add_journal(
+            "journal_competing_date",
+            title="Competing Date Entry",
+            published_at="2026-08-04T02:00:00Z",
+        )
+        changed = revalidate_packet(
+            self.conn,
+            packet,
+            environ=self.flags,
+            journal_control_snapshot=snapshot,
+            journal_control_snapshot_provided=True,
+        )
+
+        self.assertFalse(changed.valid)
+        self.assertEqual("source_changed", changed.status)
+
+        self.add_relay(
+            "bnl-unique-date",
+            published_at="2026-08-05T01:00:00Z",
+        )
+        relay_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What Relay was published on 2026-08-05?",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertTrue(
+            any(
+                item.lane == "relay_publication"
+                for item in relay_packet.items
+            )
+        )
+
+        self.add_relay(
+            "bnl-competing-date",
+            published_at="2026-08-05T02:00:00Z",
+        )
+        relay_changed = revalidate_packet(
+            self.conn,
+            relay_packet,
+            environ=self.flags,
+        )
+        self.assertFalse(relay_changed.valid)
+        self.assertEqual("source_changed", relay_changed.status)
 
     def test_packet_adapters_are_publication_only_and_revalidate_mutation(self):
         journal_id = "journal_packet_001"
