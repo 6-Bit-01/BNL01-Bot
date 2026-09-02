@@ -30,6 +30,7 @@ from bnl_unified_intelligence_packet import (
     shadow_configuration,
 )
 from bnl_unified_response_assessment import (
+    build_situation_frame_v1,
     build_unified_response_assessment,
 )
 
@@ -2955,6 +2956,10 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             authority=0,
             usage="publication_projection",
             revalidation_kind="journal_publication",
+            revalidation_key=(
+                '{"entryId":"allowed","queryMode":"exact_title",'
+                '"revision":1}'
+            ),
             attribution_mode="publication_only",
             uncertainty_status="derived_publication_zero_fact_weight",
         )
@@ -3044,6 +3049,134 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertEqual(deictic, [])
         self.assertEqual(
             deictic_diagnostics.excluded_by_reason,
+            {"frame_subject_ambiguous": 1},
+        )
+
+    def test_publication_exception_uses_production_frame_and_concrete_selector(
+        self,
+    ):
+        def production_request(text):
+            frame = build_situation_frame_v1(
+                route_allowed=True,
+                route_mode="normal_chat",
+                conversation_surface="public_home",
+                channel_policy="public_home",
+                current_text=text,
+                current_speaker_user_ids=(7,),
+                subject_entity_refs=("cache_back", "call_em_bini"),
+                response_act="answer",
+            )
+            self.assertEqual(frame.status, "ambiguous")
+            self.assertEqual(
+                frame.ambiguity_reasons,
+                ("multiple_subject_candidates",),
+            )
+            return replace(
+                self.public_request(text=text),
+                frame_schema_version=frame.schema_version,
+                frame_revision=frame.frame_revision,
+                frame_input_evidence_digest=frame.input_evidence_digest,
+                frame_status=frame.status,
+                frame_ambiguity_reasons=frame.ambiguity_reasons,
+                frame_subject_requirement=frame.subject_requirement,
+                frame_subjects=tuple(
+                    PacketFrameSubject(
+                        user_id=subject.user_id,
+                        entity_ref=subject.entity_ref,
+                        label_hint=subject.label_hint,
+                        binding_method=subject.binding_method,
+                        confidence=subject.confidence,
+                        role_hints=subject.role_hints,
+                        domain_hints=subject.domain_hints,
+                    )
+                    for subject in frame.subjects
+                ),
+                frame_tasks=tuple(
+                    PacketFrameTask(
+                        task_id=task.task_id,
+                        text_digest=task.text_digest,
+                        task_kind=task.task_kind,
+                        object_kind=task.object_kind,
+                        authority_scope=task.authority_scope,
+                        temporal_scope=task.temporal_scope,
+                        currentness=task.currentness,
+                        required_response_act=task.required_response_act,
+                        subject_requirement=task.subject_requirement,
+                        subject_indexes=task.subject_indexes,
+                    )
+                    for task in frame.tasks
+                ),
+                frame_task_kind=frame.task_kind,
+                frame_object_kind=frame.object_kind,
+                frame_phase=frame.phase,
+                frame_temporal_scope=frame.temporal_scope,
+                frame_currentness=frame.currentness,
+            )
+
+        exact_request = production_request(
+            "Show me the published Journal entry titled "
+            '"Backend Queue Runs, Soundstage Experiments, and '
+            'Post-Show Echoes." What did it say?'
+        )
+        vague_request = production_request(
+            "What did that Journal entry say?"
+        )
+        publication = IntelligencePacketItem(
+            lane="journal_publication",
+            source_class=packet_module.JOURNAL_PUBLICATION_SOURCE_CLASS,
+            source_type="canonical_published_journal",
+            source_ref="journal:journal_weekly_2026-08-24_7489c3d9:1",
+            source_digest="f" * 64,
+            subject_key="bnl_01",
+            predicate_key="published_journal_entry",
+            text="Published entry text.",
+            visibility="public",
+            confidence=Confidence.APPROVED.value,
+            lifecycle="published",
+            authority=0,
+            usage="publication_projection",
+            revalidation_kind="journal_publication",
+            revalidation_key=(
+                '{"entryId":"journal_weekly_2026-08-24_7489c3d9",'
+                '"queryMode":"exact_title","revision":1}'
+            ),
+            attribution_mode="publication_only",
+            uncertainty_status="derived_publication_zero_fact_weight",
+        )
+
+        exact_diagnostics = packet_module.IntelligencePacketDiagnostics()
+        exact_diagnostics.journal_query_status = "eligible"
+        exact_diagnostics.journal_candidate_count = 1
+        exact = packet_module._filter_frame_applicable_candidates(
+            exact_request,
+            packet_module.PacketSubjectResolution(status="ambiguous"),
+            [publication],
+            exact_diagnostics,
+            [],
+        )
+        self.assertEqual(exact, [publication])
+
+        vague_publication = replace(
+            publication,
+            revalidation_key=(
+                '{"entryId":"journal_weekly_2026-08-24_7489c3d9",'
+                '"queryMode":"topic","revision":1}'
+            ),
+        )
+        vague_diagnostics = packet_module.IntelligencePacketDiagnostics()
+        vague_diagnostics.journal_query_status = "eligible"
+        vague_diagnostics.journal_candidate_count = 1
+        vague_exclusions = []
+        vague = packet_module._filter_frame_applicable_candidates(
+            vague_request,
+            packet_module.PacketSubjectResolution(status="ambiguous"),
+            [vague_publication],
+            vague_diagnostics,
+            vague_exclusions,
+        )
+        self.assertEqual(vague, [])
+        self.assertEqual(
+            vague_diagnostics.excluded_by_reason,
             {"frame_subject_ambiguous": 1},
         )
 

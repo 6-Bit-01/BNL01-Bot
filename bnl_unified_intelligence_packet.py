@@ -4964,8 +4964,9 @@ def _relay_publication_items(
 def _subject_independent_publication_lanes(
     request: IntelligencePacketRequest,
     diagnostics: IntelligencePacketDiagnostics,
+    candidates: Sequence[IntelligencePacketItem],
 ) -> frozenset[str]:
-    """Return uniquely resolved publication lanes outside subject ambiguity."""
+    """Return concretely selected publication lanes outside subject ambiguity."""
 
     ambiguity_reasons = frozenset(
         str(reason or "").strip().lower()
@@ -4990,18 +4991,49 @@ def _subject_independent_publication_lanes(
         "journal": (
             str(diagnostics.journal_query_status or "").strip().lower(),
             int(diagnostics.journal_candidate_count or 0),
+            frozenset({"exact_identity", "exact_title", "exact_date"}),
         ),
         "relay": (
             str(diagnostics.relay_query_status or "").strip().lower(),
             int(diagnostics.relay_candidate_count or 0),
+            frozenset({"exact_identity", "exact_date"}),
         ),
     }
+    publication_items_by_lane: dict[
+        str,
+        dict[tuple[str, str, str], IntelligencePacketItem],
+    ] = {}
+    for item in candidates:
+        if item.lane not in {"journal_publication", "relay_publication"}:
+            continue
+        publication_items_by_lane.setdefault(item.lane, {})[
+            (item.source_ref, item.source_digest, item.revalidation_key)
+        ] = item
     lanes: set[str] = set()
     for task in request.frame_tasks:
         object_kind = str(task.object_kind or "").strip().lower()
-        query_status, candidate_count = publication_queries.get(
-            object_kind,
-            ("not_requested", 0),
+        query_status, candidate_count, concrete_query_modes = (
+            publication_queries.get(
+                object_kind,
+                ("not_requested", 0, frozenset()),
+            )
+        )
+        lane = "%s_publication" % object_kind
+        publication_items = tuple(
+            publication_items_by_lane.get(lane, {}).values()
+        )
+        query_mode = (
+            str(
+                _publication_revalidation_payload(publication_items[0]).get(
+                    "queryMode"
+                )
+                or ""
+            )
+            .strip()
+            .lower()
+            if len(publication_items) == 1
+            and publication_items[0].revalidation_kind == lane
+            else ""
         )
         if (
             str(task.authority_scope or "").strip().lower() == "packet"
@@ -5013,8 +5045,9 @@ def _subject_independent_publication_lanes(
             and object_kind in {"journal", "relay"}
             and query_status == "eligible"
             and candidate_count == 1
+            and query_mode in concrete_query_modes
         ):
-            lanes.add("%s_publication" % object_kind)
+            lanes.add(lane)
     return frozenset(lanes)
 
 
@@ -5044,7 +5077,11 @@ def _filter_frame_applicable_candidates(
         kept = []
         reason = "frame_subject_%s" % subject_resolution.status
         subject_independent_publication_lanes = (
-            _subject_independent_publication_lanes(request, diagnostics)
+            _subject_independent_publication_lanes(
+                request,
+                diagnostics,
+                candidates,
+            )
             if subject_resolution.status == "ambiguous"
             else frozenset()
         )
@@ -6206,6 +6243,7 @@ def _revalidate_packet_in_snapshot(
         _subject_independent_publication_lanes(
             packet.request,
             packet.diagnostics,
+            packet.items,
         )
     )
     subject_independent_publication_content = bool(
@@ -6463,6 +6501,7 @@ def _packet_invariants(
         _subject_independent_publication_lanes(
             packet.request,
             packet.diagnostics,
+            packet.items,
         )
         if packet.subject_resolution.status == "ambiguous"
         else frozenset()
