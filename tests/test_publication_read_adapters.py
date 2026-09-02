@@ -1091,6 +1091,28 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             )
         )
 
+        journal_topic_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Journal say about the 2026-08-04 "
+                "Journal event?",
+                snapshot=control_snapshot(),
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(
+            "eligible",
+            journal_topic_packet.diagnostics.journal_query_status,
+        )
+        self.assertFalse(
+            any(
+                item.lane == "journal_publication"
+                for item in journal_topic_packet.items
+            )
+        )
+
         self.add_relay(
             "bnl-same-date-topic",
             published_at="2026-08-05T01:00:00Z",
@@ -1111,6 +1133,26 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         self.assertFalse(
             any(
                 item.lane == "relay_publication" for item in relay_packet.items
+            )
+        )
+
+        relay_topic_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Relay say about the 2026-08-05 Relay event?",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(
+            "eligible",
+            relay_topic_packet.diagnostics.relay_query_status,
+        )
+        self.assertFalse(
+            any(
+                item.lane == "relay_publication"
+                for item in relay_topic_packet.items
             )
         )
 
