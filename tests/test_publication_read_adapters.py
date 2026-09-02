@@ -302,6 +302,38 @@ class PublicationReadAdapterTests(unittest.TestCase):
                     ),
                 )
 
+        for quoted_title in (
+            '"Legacy Entry"',
+            "“Legacy Entry”",
+            "'Legacy Entry'",
+            "‘Legacy Entry’",
+        ):
+            for dash in ("–", "—"):
+                with self.subTest(quoted_title=quoted_title, dash=dash):
+                    selected = (
+                        journal.select_published_journal_entries_on_connection(
+                            self.conn,
+                            guild_id=1,
+                            user_text=(
+                                "show the Journal entry titled "
+                                + quoted_title
+                                + dash
+                                + "what did it say?"
+                            ),
+                            control_snapshot=snapshot,
+                            now=NOW,
+                        )
+                    )
+                    self.assertEqual("eligible", selected.status)
+                    self.assertEqual("exact_title", selected.query_mode)
+                    self.assertEqual(
+                        ("journal_single_quote",),
+                        tuple(
+                            publication.entry_id
+                            for publication in selected.publications
+                        ),
+                    )
+
     def test_journal_exact_title_keeps_embedded_apostrophes(self):
         self.add_journal("journal_legacy_entry", title="Legacy Entry")
         self.add_journal("journal_short_artist", title="Artist")
@@ -477,6 +509,33 @@ class PublicationReadAdapterTests(unittest.TestCase):
                         for publication in selected.publications
                     ),
                 )
+
+    def test_missing_possessive_title_does_not_use_shorter_title(self):
+        self.add_journal("journal_short_artists", title="Artists")
+        self.add_journal("journal_short_cats", title="Cats")
+
+        missing_titles = (
+            "'Artists' Notes'",
+            "‘Artists’ Notes’",
+            "'Cats' and Dogs'",
+        )
+        for missing_title in missing_titles:
+            with self.subTest(missing_title=missing_title):
+                selected = (
+                    journal.select_published_journal_entries_on_connection(
+                        self.conn,
+                        guild_id=1,
+                        user_text=(
+                            "show the Journal entry titled " + missing_title
+                        ),
+                        control_snapshot=control_snapshot(),
+                        now=NOW,
+                    )
+                )
+
+                self.assertEqual("not_found", selected.status)
+                self.assertEqual("exact_title", selected.query_mode)
+                self.assertEqual((), selected.publications)
 
     def test_missing_explicit_journal_title_does_not_fall_back_to_date(self):
         self.add_journal(

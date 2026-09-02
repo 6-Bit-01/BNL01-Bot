@@ -368,8 +368,68 @@ _JOURNAL_EXPLICIT_TITLE_START_RE = re.compile(
 )
 _JOURNAL_TITLE_QUOTE_PAIRS = {"\"": "\"", "“": "”", "'": "'", "‘": "’"}
 _JOURNAL_TITLE_CLOSE_BOUNDARY_RE = re.compile(
-    r"^(?:\s|[.,;:!?)}\]]|$)"
+    r"^(?:\s|[.,;:!?)}\]‒–—]|$)"
 )
+_JOURNAL_TITLE_TRAILING_CLAUSE_STARTERS = {
+    "about",
+    "after",
+    "against",
+    "alongside",
+    "among",
+    "around",
+    "as",
+    "at",
+    "before",
+    "behind",
+    "below",
+    "beneath",
+    "beside",
+    "between",
+    "beyond",
+    "by",
+    "concerning",
+    "despite",
+    "during",
+    "except",
+    "for",
+    "from",
+    "how",
+    "in",
+    "inside",
+    "into",
+    "like",
+    "near",
+    "of",
+    "off",
+    "on",
+    "onto",
+    "outside",
+    "over",
+    "past",
+    "please",
+    "regarding",
+    "since",
+    "than",
+    "through",
+    "throughout",
+    "to",
+    "toward",
+    "under",
+    "underneath",
+    "until",
+    "up",
+    "upon",
+    "via",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "within",
+    "without",
+}
 _JOURNAL_QUERY_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
     "article",
     "called",
@@ -562,19 +622,49 @@ def _journal_query_title_candidates(user_text: str) -> tuple[str, ...]:
     line_end = len(text) if newline_at < 0 else newline_at
     scan_end = min(line_end, title_start + 300)
     close_at = text.find(closer, title_start + 3, scan_end + 1)
-    candidates: list[str] = []
+    candidates: list[tuple[str, int]] = []
     while close_at >= 0:
         suffix = text[close_at + 1 : line_end]
         if _JOURNAL_TITLE_CLOSE_BOUNDARY_RE.match(suffix):
             title = re.sub(
                 r"\s+", " ", text[title_start:close_at]
             ).strip()
-            if title and title not in candidates:
-                candidates.append(title)
+            if title and all(title != item[0] for item in candidates):
+                candidates.append((title, close_at))
             if opener not in {"'", "‘"}:
                 break
         close_at = text.find(closer, close_at + 1, scan_end + 1)
-    return tuple(candidates)
+    if not candidates:
+        return ()
+    if opener not in {"'", "‘"}:
+        return (candidates[0][0],)
+
+    # A plural possessive inside a single-quoted title produces a possible
+    # close before the real outer quote. Advance only when the current word
+    # can be possessive and the text before the next candidate still looks
+    # like title text. Once an authoritative outer boundary is found, never
+    # weaken the explicit title to a shorter stored publication.
+    selected_index = 0
+    while selected_index + 1 < len(candidates):
+        _, current_close = candidates[selected_index]
+        _, next_close = candidates[selected_index + 1]
+        between = text[current_close + 1 : next_close]
+        if closer in between:
+            break
+        current_word = re.search(
+            r"([A-Za-z0-9]+)$", text[title_start:current_close]
+        )
+        next_word = re.match(r"\s*([A-Za-z0-9]+)", between)
+        if (
+            current_word is None
+            or not current_word.group(1).lower().endswith("s")
+            or next_word is None
+            or next_word.group(1).lower()
+            in _JOURNAL_TITLE_TRAILING_CLAUSE_STARTERS
+        ):
+            break
+        selected_index += 1
+    return (candidates[selected_index][0],)
 def _journal_query_terms(user_text: str) -> set[str]:
     return {
         token
