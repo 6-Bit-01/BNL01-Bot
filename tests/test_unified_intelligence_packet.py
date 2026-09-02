@@ -2817,6 +2817,7 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             frame_revision="sf_journal_exact_title",
             frame_input_evidence_digest="d" * 64,
             frame_status="ambiguous",
+            frame_ambiguity_reasons=("multiple_subject_candidates",),
             frame_subject_requirement="required",
             frame_subjects=(
                 PacketFrameSubject(
@@ -2911,6 +2912,7 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             frame_revision="sf_journal_ambiguous_guard",
             frame_input_evidence_digest="a" * 64,
             frame_status="ambiguous",
+            frame_ambiguity_reasons=("multiple_subject_candidates",),
             frame_subject_requirement="required",
             frame_subjects=(
                 PacketFrameSubject(
@@ -3020,6 +3022,28 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertEqual(unresolved, [])
         self.assertEqual(
             unresolved_diagnostics.excluded_by_reason,
+            {"frame_subject_ambiguous": 1},
+        )
+        deictic_reference_request = replace(
+            request,
+            frame_ambiguity_reasons=(
+                "referent_ambiguous",
+                "multiple_subject_candidates",
+            ),
+        )
+        deictic_diagnostics = packet_module.IntelligencePacketDiagnostics()
+        deictic_diagnostics.journal_query_status = "eligible"
+        deictic_diagnostics.journal_candidate_count = 1
+        deictic = packet_module._filter_frame_applicable_candidates(
+            deictic_reference_request,
+            packet_module.PacketSubjectResolution(status="ambiguous"),
+            [publication],
+            deictic_diagnostics,
+            [],
+        )
+        self.assertEqual(deictic, [])
+        self.assertEqual(
+            deictic_diagnostics.excluded_by_reason,
             {"frame_subject_ambiguous": 1},
         )
 

@@ -301,6 +301,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             frame_revision=self.frame.frame_revision,
             frame_input_evidence_digest=self.frame.input_evidence_digest,
             frame_status=self.frame.status,
+            frame_ambiguity_reasons=self.frame.ambiguity_reasons,
             frame_subject_requirement=self.frame.subject_requirement,
             frame_subjects=frame_subjects,
             frame_tasks=tuple(
@@ -390,6 +391,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             frame_revision=frame.frame_revision,
             frame_input_evidence_digest=frame.input_evidence_digest,
             frame_status=frame.status,
+            frame_ambiguity_reasons=frame.ambiguity_reasons,
             frame_subject_requirement=frame.subject_requirement,
             frame_subjects=tuple(
                 PacketFrameSubject(
@@ -1092,6 +1094,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             frame_revision=frame.frame_revision,
             frame_input_evidence_digest=frame.input_evidence_digest,
             frame_status=frame.status,
+            frame_ambiguity_reasons=frame.ambiguity_reasons,
             frame_subject_requirement=frame.subject_requirement,
             frame_subjects=tuple(
                 PacketFrameSubject(

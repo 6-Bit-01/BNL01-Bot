@@ -487,6 +487,7 @@ class IntelligencePacketRequest:
     frame_revision: str = ""
     frame_input_evidence_digest: str = ""
     frame_status: str = "not_provided"
+    frame_ambiguity_reasons: tuple[str, ...] = ()
     frame_subject_requirement: str = "legacy"
     frame_subjects: tuple[PacketFrameSubject, ...] = ()
     frame_tasks: tuple[PacketFrameTask, ...] = ()
@@ -4966,6 +4967,11 @@ def _subject_independent_publication_lanes(
 ) -> frozenset[str]:
     """Return uniquely resolved publication lanes outside subject ambiguity."""
 
+    ambiguity_reasons = frozenset(
+        str(reason or "").strip().lower()
+        for reason in request.frame_ambiguity_reasons
+        if str(reason or "").strip()
+    )
     concrete_subjects = tuple(
         subject
         for subject in request.frame_subjects
@@ -4974,6 +4980,7 @@ def _subject_independent_publication_lanes(
     )
     if (
         str(request.frame_status or "").strip().lower() != "ambiguous"
+        or ambiguity_reasons != frozenset({"multiple_subject_candidates"})
         or str(request.frame_subject_requirement or "").strip().lower()
         != "required"
         or len(concrete_subjects) < 2

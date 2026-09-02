@@ -27563,6 +27563,11 @@ def _build_unified_intelligence_packet_shadow(
             if isinstance(situation_frame, SituationFrameV1)
             else "not_provided"
         ),
+        frame_ambiguity_reasons=(
+            situation_frame.ambiguity_reasons
+            if isinstance(situation_frame, SituationFrameV1)
+            else ()
+        ),
         frame_subject_requirement=(
             situation_frame.subject_requirement
             if isinstance(situation_frame, SituationFrameV1)
