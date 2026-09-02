@@ -4962,19 +4962,50 @@ def _relay_publication_items(
 
 def _subject_independent_publication_lanes(
     request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
 ) -> frozenset[str]:
-    """Return task-owned publication lanes that need no person subject."""
+    """Return uniquely resolved publication lanes outside subject ambiguity."""
 
+    concrete_subjects = tuple(
+        subject
+        for subject in request.frame_subjects
+        if int(subject.user_id or 0) > 0
+        or str(subject.entity_ref or "").strip()
+    )
+    if (
+        str(request.frame_status or "").strip().lower() != "ambiguous"
+        or str(request.frame_subject_requirement or "").strip().lower()
+        != "required"
+        or len(concrete_subjects) < 2
+    ):
+        return frozenset()
+    publication_queries = {
+        "journal": (
+            str(diagnostics.journal_query_status or "").strip().lower(),
+            int(diagnostics.journal_candidate_count or 0),
+        ),
+        "relay": (
+            str(diagnostics.relay_query_status or "").strip().lower(),
+            int(diagnostics.relay_candidate_count or 0),
+        ),
+    }
     lanes: set[str] = set()
     for task in request.frame_tasks:
         object_kind = str(task.object_kind or "").strip().lower()
+        query_status, candidate_count = publication_queries.get(
+            object_kind,
+            ("not_requested", 0),
+        )
         if (
             str(task.authority_scope or "").strip().lower() == "packet"
             and str(task.task_kind or "").strip().lower()
             == "retrieve_publication"
             and str(task.subject_requirement or "").strip().lower()
             != "required"
+            and not task.subject_indexes
             and object_kind in {"journal", "relay"}
+            and query_status == "eligible"
+            and candidate_count == 1
         ):
             lanes.add("%s_publication" % object_kind)
     return frozenset(lanes)
@@ -5006,7 +5037,7 @@ def _filter_frame_applicable_candidates(
         kept = []
         reason = "frame_subject_%s" % subject_resolution.status
         subject_independent_publication_lanes = (
-            _subject_independent_publication_lanes(request)
+            _subject_independent_publication_lanes(request, diagnostics)
             if subject_resolution.status == "ambiguous"
             else frozenset()
         )
@@ -6165,7 +6196,10 @@ def _revalidate_packet_in_snapshot(
         environ=environ,
     )
     subject_independent_publication_lanes = (
-        _subject_independent_publication_lanes(packet.request)
+        _subject_independent_publication_lanes(
+            packet.request,
+            packet.diagnostics,
+        )
     )
     subject_independent_publication_content = bool(
         current_subject_resolution.status == "ambiguous"
@@ -6419,7 +6453,10 @@ def _packet_invariants(
 ) -> tuple[str, ...]:
     invalid = []
     subject_independent_publication_lanes = (
-        _subject_independent_publication_lanes(packet.request)
+        _subject_independent_publication_lanes(
+            packet.request,
+            packet.diagnostics,
+        )
         if packet.subject_resolution.status == "ambiguous"
         else frozenset()
     )

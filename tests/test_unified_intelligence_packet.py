@@ -2912,6 +2912,18 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             frame_input_evidence_digest="a" * 64,
             frame_status="ambiguous",
             frame_subject_requirement="required",
+            frame_subjects=(
+                PacketFrameSubject(
+                    user_id=7,
+                    binding_method="conversation_candidate",
+                    confidence="medium",
+                ),
+                PacketFrameSubject(
+                    entity_ref="cache_back",
+                    binding_method="conversation_candidate",
+                    confidence="medium",
+                ),
+            ),
             frame_tasks=(
                 PacketFrameTask(
                     task_id="T1",
@@ -2959,6 +2971,8 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             uncertainty_status="",
         )
         diagnostics = packet_module.IntelligencePacketDiagnostics()
+        diagnostics.journal_query_status = "eligible"
+        diagnostics.journal_candidate_count = 1
         exclusions = []
 
         kept = packet_module._filter_frame_applicable_candidates(
@@ -2986,6 +3000,27 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertEqual(
             blocked_diagnostics.excluded_by_reason,
             {"frame_subject_blocked": 1},
+        )
+        unresolved_reference_request = replace(
+            request,
+            frame_subjects=(),
+        )
+        unresolved_diagnostics = (
+            packet_module.IntelligencePacketDiagnostics()
+        )
+        unresolved_diagnostics.journal_query_status = "eligible"
+        unresolved_diagnostics.journal_candidate_count = 4
+        unresolved = packet_module._filter_frame_applicable_candidates(
+            unresolved_reference_request,
+            packet_module.PacketSubjectResolution(status="ambiguous"),
+            [publication],
+            unresolved_diagnostics,
+            [],
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(
+            unresolved_diagnostics.excluded_by_reason,
+            {"frame_subject_ambiguous": 1},
         )
 
 
