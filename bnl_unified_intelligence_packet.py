@@ -295,6 +295,29 @@ _EPISODE_QUERY_RE = re.compile(
     re.I,
 )
 _TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]*", re.I)
+_PUBLICATION_DATE_LITERAL = r"20\d{2}-\d{2}-\d{2}"
+_PUBLICATION_DATE_SELECTOR_RE = {
+    "journal": re.compile(
+        r"(?:\bjournal(?:\s+entry)?\b\s+"
+        r"(?:(?:was\s+)?(?:publish(?:ed)?|post(?:ed)?|release(?:d)?)"
+        r"\s+(?:(?:on|for)\s+)?|(?:dated|from|for|on)\s+)"
+        + _PUBLICATION_DATE_LITERAL
+        + r"\b|\b"
+        + _PUBLICATION_DATE_LITERAL
+        + r"\s+journal(?:\s+entry)?\b)",
+        re.I,
+    ),
+    "relay": re.compile(
+        r"(?:\b(?:relay|website\s+(?:message|signal|status))\b\s+"
+        r"(?:(?:was\s+)?(?:publish(?:ed)?|post(?:ed)?|release(?:d)?)"
+        r"\s+(?:(?:on|for)\s+)?|(?:dated|from|for|on)\s+)"
+        + _PUBLICATION_DATE_LITERAL
+        + r"\b|\b"
+        + _PUBLICATION_DATE_LITERAL
+        + r"\s+(?:relay|website\s+(?:message|signal|status))\b)",
+        re.I,
+    ),
+}
 _TERM_STOPWORDS = {
     "a",
     "about",
@@ -4961,6 +4984,16 @@ def _relay_publication_items(
     return items
 
 
+def _publication_date_selector_is_bound(
+    user_text: str,
+    object_kind: str,
+) -> bool:
+    pattern = _PUBLICATION_DATE_SELECTOR_RE.get(
+        str(object_kind or "").strip().lower()
+    )
+    return bool(pattern and pattern.search(str(user_text or "")))
+
+
 def _subject_independent_publication_lanes(
     request: IntelligencePacketRequest,
     diagnostics: IntelligencePacketDiagnostics,
@@ -5044,6 +5077,13 @@ def _subject_independent_publication_lanes(
             and query_status == "eligible"
             and len(publication_items) == 1
             and query_mode in concrete_query_modes
+            and (
+                query_mode != "exact_date"
+                or _publication_date_selector_is_bound(
+                    request.user_text,
+                    object_kind,
+                )
+            )
         ):
             lanes.add(lane)
     return frozenset(lanes)

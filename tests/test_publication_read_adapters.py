@@ -1064,6 +1064,56 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         self.assertEqual("passed", packet.diagnostics.revalidation_status)
         self.assertFalse(packet.diagnostics.invalid_invariants)
 
+    def test_ambiguous_topic_date_is_not_a_publication_date_selector(self):
+        self.add_journal(
+            "journal_same_date_topic",
+            title="Unrelated Same-Date Entry",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        journal_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Journal say about the 2026-08-04 event?",
+                snapshot=control_snapshot(),
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual("ambiguous", journal_packet.subject_resolution.status)
+        self.assertEqual(
+            "eligible", journal_packet.diagnostics.journal_query_status
+        )
+        self.assertFalse(
+            any(
+                item.lane == "journal_publication"
+                for item in journal_packet.items
+            )
+        )
+
+        self.add_relay(
+            "bnl-same-date-topic",
+            published_at="2026-08-05T01:00:00Z",
+        )
+        relay_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Relay say about the 2026-08-05 event?",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual("ambiguous", relay_packet.subject_resolution.status)
+        self.assertEqual(
+            "eligible", relay_packet.diagnostics.relay_query_status
+        )
+        self.assertFalse(
+            any(
+                item.lane == "relay_publication" for item in relay_packet.items
+            )
+        )
+
     def test_ambiguous_exact_date_scans_complete_journal_match_set(self):
         hidden_ids = []
         for index in range(9):
