@@ -303,7 +303,8 @@ _PUBLICATION_DATE_FOLLOWUP_LITERAL = (
 _PUBLICATION_DATE_SELECTOR_BOUNDARY = (
     r"(?=\s*(?:$|[.?!;:)\]}‒–—]|"
     r"(?:,\s*(?:(?:and|but)\s+)?|(?:and|but)\s+)?"
-    r"(?:(?:then|please|also|just|briefly|quickly)\s+){0,2}"
+    r"(?:(?:then|please|also|just|briefly|quickly|kindly|now)\b"
+    r"\s*(?:[,;:]\s*)?){0,3}"
     + _PUBLICATION_DATE_FOLLOWUP_LITERAL
     + r"))"
 )

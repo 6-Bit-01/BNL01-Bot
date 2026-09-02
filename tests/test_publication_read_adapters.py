@@ -310,6 +310,19 @@ class PublicationReadAdapterTests(unittest.TestCase):
             tuple(item.entry_id for item in ascii_hyphen.publications),
         )
 
+        double_hyphen = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text='show the Journal entry -- titled "Legacy Entry"',
+            control_snapshot=snapshot,
+            now=NOW,
+        )
+        self.assertEqual("exact_title", double_hyphen.query_mode)
+        self.assertEqual(
+            ("journal_legacy_entry",),
+            tuple(item.entry_id for item in double_hyphen.publications),
+        )
+
         deictic = journal.select_published_journal_entries_on_connection(
             self.conn,
             guild_id=1,
@@ -1146,6 +1159,25 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             ),
         )
 
+        punctuated_modifier_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "Show the Journal published on 2026-08-04, and then, "
+                "please summarize it.",
+                snapshot=snapshot,
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(
+            ("journal:journal_date_visible:1",),
+            tuple(
+                item.source_ref
+                for item in punctuated_modifier_packet.items
+                if item.lane == "journal_publication"
+            ),
+        )
+
     def test_ambiguous_topic_date_is_not_a_publication_date_selector(self):
         self.add_journal(
             "journal_same_date_topic",
@@ -1516,6 +1548,22 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             any(
                 item.lane == "relay_publication"
                 for item in relay_adverb_packet.items
+            )
+        )
+
+        relay_punctuated_modifier_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "Show the Relay published on 2026-08-05, and then, "
+                "please summarize it.",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertTrue(
+            any(
+                item.lane == "relay_publication"
+                for item in relay_punctuated_modifier_packet.items
             )
         )
 
