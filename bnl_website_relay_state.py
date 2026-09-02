@@ -645,14 +645,13 @@ def select_accepted_relay_publications_on_connection(
                     if len(token) >= 4
                 }
                 score = len(terms & candidate_terms)
-                if score:
-                    scored.append(
-                        (
-                            score,
-                            str(row.get("published_timestamp") or ""),
-                            row,
-                        )
+                scored.append(
+                    (
+                        score,
+                        str(row.get("published_timestamp") or ""),
+                        row,
                     )
+                )
             scored.sort(
                 key=(
                     (lambda item: (item[1], item[0]))
@@ -661,6 +660,9 @@ def select_accepted_relay_publications_on_connection(
                 ),
                 reverse=True,
             )
+            # Lexical overlap is a ranking hint, not an authority gate. The
+            # one governed response model determines relevance from this
+            # bounded window of accepted public Relay evidence.
             rows = [row for _score, _timestamp, row in scored]
     candidate_count = len(rows)
     selected: list[AcceptedRelayPublication] = []

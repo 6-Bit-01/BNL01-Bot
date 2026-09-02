@@ -844,18 +844,17 @@ def select_published_journal_entries_on_connection(
                         )
                     )
                     score = len(terms & candidate_terms)
-                    if score:
-                        scored.append(
-                            (
-                                score,
-                                str(
-                                    row.get("published_at")
-                                    or row.get("created_at")
-                                    or ""
-                                ),
-                                row,
-                            )
+                    scored.append(
+                        (
+                            score,
+                            str(
+                                row.get("published_at")
+                                or row.get("created_at")
+                                or ""
+                            ),
+                            row,
                         )
+                    )
                 scored.sort(
                     key=(
                         (lambda item: (item[1], item[0]))
@@ -864,6 +863,9 @@ def select_published_journal_entries_on_connection(
                     ),
                     reverse=True,
                 )
+                # Lexical overlap ranks the bounded public evidence window;
+                # it does not decide whether BNL is allowed to reason over
+                # otherwise eligible recent Journal publications.
                 rows = [row for _score, _timestamp, row in scored]
 
     candidate_count = len(rows)

@@ -41963,11 +41963,45 @@ def _ordinary_chat_ambiguous_subject_labels(
     return labels if 2 <= len(labels) <= 4 else ()
 
 
+def _ordinary_chat_packet_publication_kind(
+    situation_frame: SituationFrameV1 | None,
+) -> str:
+    for task in tuple(getattr(situation_frame, "tasks", ()) or ()):
+        authority_scope = str(
+            getattr(task, "authority_scope", "") or ""
+        ).strip().lower()
+        object_kind = str(
+            getattr(task, "object_kind", "") or ""
+        ).strip().lower()
+        if authority_scope == "packet" and object_kind in {
+            "journal",
+            "relay",
+        }:
+            return object_kind
+    return ""
+
+
 def _ordinary_chat_single_packet_block_response(
     reason: str,
     situation_frame: SituationFrameV1 | None = None,
 ) -> str:
     value = str(reason or "").lower()
+    publication_kind = _ordinary_chat_packet_publication_kind(
+        situation_frame
+    )
+    if publication_kind and (
+        "deterministic_task_hold" in value
+        or "source" in value
+        or "packet" in value
+        or "control" in value
+        or "unavailable" in value
+    ):
+        label = publication_kind.capitalize()
+        return (
+            "I don’t have enough %s material to answer that honestly. I can "
+            "give you a general recap from other context, but I won’t pretend "
+            "it came from the %s." % (label, label)
+        )
     if "deterministic_task_hold" in value or "current_fact" in value:
         return (
             "I can’t verify that live or current fact from an authoritative "
@@ -42685,8 +42719,9 @@ def ordinary_chat_legacy_baseline_fallback_allowed(
     """Allow the established prompt only before a low-risk packet call.
 
     The packet route remains authoritative whenever it generated a candidate or
-    actually entered provider generation.  The legacy prompt is available only
-    for local packet/preflight failures, and never for typed live/current holds.
+    actually entered provider generation. The legacy prompt is available only
+    for local packet/preflight failures, never as a substitute publication
+    owner, and never for typed live/current holds.
     """
 
     if execution is None or execution.candidate_active:
@@ -42716,6 +42751,8 @@ def ordinary_chat_legacy_baseline_fallback_allowed(
         return False
 
     tasks = tuple(getattr(situation_frame, "tasks", ()) or ())
+    if _ordinary_chat_packet_publication_kind(situation_frame):
+        return False
     for task in tasks:
         authority_scope = str(
             getattr(task, "authority_scope", "") or ""

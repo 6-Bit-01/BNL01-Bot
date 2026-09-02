@@ -1535,6 +1535,47 @@ class SharedBrainSynthesisBotPathTests(
             )
         )
 
+    def test_publication_hold_does_not_relabel_legacy_context(self):
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=SimpleNamespace(
+                run=SimpleNamespace(prompt_applied=False)
+            ),
+            response="publication hold",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=False,
+            provider_call_count=0,
+            corrective_call_count=0,
+            block_reason="deterministic_task_hold",
+        )
+        frame = SimpleNamespace(
+            tasks=(
+                SimpleNamespace(
+                    authority_scope="packet",
+                    currentness="historical",
+                    required_response_act="answer",
+                    object_kind="relay",
+                ),
+            )
+        )
+
+        self.assertFalse(
+            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
+                execution,
+                situation_frame=frame,
+                request_text=(
+                    "What did the Relay say about the last show?"
+                ),
+            )
+        )
+        self.assertIn(
+            "Relay",
+            bnl01_bot._ordinary_chat_single_packet_block_response(
+                "deterministic_task_hold",
+                frame,
+            ),
+        )
+
     def test_legacy_baseline_never_follows_live_or_started_packet(self):
         live_frame = SimpleNamespace(
             tasks=(
