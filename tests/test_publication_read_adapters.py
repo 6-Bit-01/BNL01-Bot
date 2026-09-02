@@ -252,6 +252,8 @@ class PublicationReadAdapterTests(unittest.TestCase):
 
     def test_journal_exact_title_requires_explicit_selector_syntax(self):
         self.add_journal("journal_old_entry", title="Old Entry")
+        self.add_journal("journal_noise", title="Noise")
+        self.add_journal("journal_legacy_entry", title="Legacy Entry")
         snapshot = control_snapshot()
         explicit = journal.select_published_journal_entries_on_connection(
             self.conn,
@@ -264,6 +266,22 @@ class PublicationReadAdapterTests(unittest.TestCase):
         self.assertEqual(
             ("journal_old_entry",),
             tuple(item.entry_id for item in explicit.publications),
+        )
+
+        scoped = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text=(
+                "Regarding the project called 'Noise', show the Journal "
+                "titled 'Legacy Entry'"
+            ),
+            control_snapshot=snapshot,
+            now=NOW,
+        )
+        self.assertEqual("exact_title", scoped.query_mode)
+        self.assertEqual(
+            ("journal_legacy_entry",),
+            tuple(item.entry_id for item in scoped.publications),
         )
 
         deictic = journal.select_published_journal_entries_on_connection(
@@ -1113,6 +1131,28 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             )
         )
 
+        journal_object_topic_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Journal say about the Journal on "
+                "2026-08-04 event?",
+                snapshot=control_snapshot(),
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(
+            "eligible",
+            journal_object_topic_packet.diagnostics.journal_query_status,
+        )
+        self.assertFalse(
+            any(
+                item.lane == "journal_publication"
+                for item in journal_object_topic_packet.items
+            )
+        )
+
         self.add_relay(
             "bnl-same-date-topic",
             published_at="2026-08-05T01:00:00Z",
@@ -1153,6 +1193,27 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             any(
                 item.lane == "relay_publication"
                 for item in relay_topic_packet.items
+            )
+        )
+
+        relay_object_topic_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Relay say about the Relay on "
+                "2026-08-05 event?",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(
+            "eligible",
+            relay_object_topic_packet.diagnostics.relay_query_status,
+        )
+        self.assertFalse(
+            any(
+                item.lane == "relay_publication"
+                for item in relay_object_topic_packet.items
             )
         )
 

@@ -362,7 +362,9 @@ _JOURNAL_LATEST_RE = re.compile(
 )
 _JOURNAL_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 _JOURNAL_EXPLICIT_TITLE_START_RE = re.compile(
-    r"\b(?:title(?:d)?|called|named)\s*(?::|=|is)?\s*"
+    r"\b(?:journal(?:\s+entry)?|daily\s+entry|weekly\s+entry)\b\s+"
+    r"(?:(?:with|having)\s+(?:the\s+)?)?"
+    r"(?:title(?:d)?|called|named)\s*(?::|=|is)?\s*"
     r"(?P<quote>[\"“'‘])",
     re.IGNORECASE,
 )

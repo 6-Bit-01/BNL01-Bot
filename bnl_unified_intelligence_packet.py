@@ -296,21 +296,33 @@ _EPISODE_QUERY_RE = re.compile(
 )
 _TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]*", re.I)
 _PUBLICATION_DATE_LITERAL = r"20\d{2}-\d{2}-\d{2}"
+_PUBLICATION_DATE_FOLLOWUP_LITERAL = (
+    r"(?:what|when|where|why|how|tell|show|give|summarize|explain|compare|"
+    r"does|did|is|was|can|could|would|should)\b"
+)
+_PUBLICATION_DATE_SELECTOR_BOUNDARY = (
+    r"(?=\s*(?:$|[.?!;:)\]}‒–—]|"
+    r"(?:,\s*|(?:and|but)\s+)?"
+    + _PUBLICATION_DATE_FOLLOWUP_LITERAL
+    + r"))"
+)
 _PUBLICATION_DATE_SELECTOR_RE = {
     "journal": re.compile(
         r"\bjournal(?:\s+entry)?\b\s+"
         r"(?:(?:was\s+)?(?:publish(?:ed)?|post(?:ed)?|release(?:d)?)"
-        r"\s+(?:(?:on|for)\s+)?|(?:dated|from|for|on)\s+)"
+        r"\s+(?:(?:on|for)\s+)?|dated\s+)"
         + _PUBLICATION_DATE_LITERAL
-        + r"\b",
+        + r"\b"
+        + _PUBLICATION_DATE_SELECTOR_BOUNDARY,
         re.I,
     ),
     "relay": re.compile(
         r"\b(?:relay|website\s+(?:message|signal|status))\b\s+"
         r"(?:(?:was\s+)?(?:publish(?:ed)?|post(?:ed)?|release(?:d)?)"
-        r"\s+(?:(?:on|for)\s+)?|(?:dated|from|for|on)\s+)"
+        r"\s+(?:(?:on|for)\s+)?|dated\s+)"
         + _PUBLICATION_DATE_LITERAL
-        + r"\b",
+        + r"\b"
+        + _PUBLICATION_DATE_SELECTOR_BOUNDARY,
         re.I,
     ),
 }
