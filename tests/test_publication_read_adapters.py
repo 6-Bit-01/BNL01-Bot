@@ -284,6 +284,19 @@ class PublicationReadAdapterTests(unittest.TestCase):
             tuple(item.entry_id for item in scoped.publications),
         )
 
+        punctuated = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text='show the Journal entry, titled "Legacy Entry"',
+            control_snapshot=snapshot,
+            now=NOW,
+        )
+        self.assertEqual("exact_title", punctuated.query_mode)
+        self.assertEqual(
+            ("journal_legacy_entry",),
+            tuple(item.entry_id for item in punctuated.publications),
+        )
+
         deictic = journal.select_published_journal_entries_on_connection(
             self.conn,
             guild_id=1,
@@ -1082,6 +1095,25 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         self.assertEqual("passed", packet.diagnostics.revalidation_status)
         self.assertFalse(packet.diagnostics.invalid_invariants)
 
+        coordinated_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "Show the Journal published on 2026-08-04, and "
+                "summarize it.",
+                snapshot=snapshot,
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(
+            ("journal:journal_date_visible:1",),
+            tuple(
+                item.source_ref
+                for item in coordinated_packet.items
+                if item.lane == "journal_publication"
+            ),
+        )
+
     def test_ambiguous_topic_date_is_not_a_publication_date_selector(self):
         self.add_journal(
             "journal_same_date_topic",
@@ -1421,6 +1453,21 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             any(
                 item.lane == "relay_publication"
                 for item in relay_packet.items
+            )
+        )
+
+        relay_coordinated_packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "Show the Relay published on 2026-08-05, and summarize it.",
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertTrue(
+            any(
+                item.lane == "relay_publication"
+                for item in relay_coordinated_packet.items
             )
         )
 
