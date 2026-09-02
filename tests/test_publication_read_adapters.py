@@ -278,6 +278,40 @@ class PublicationReadAdapterTests(unittest.TestCase):
             "journal_newer_light",
         )
 
+    def test_natural_journal_topic_preserves_recent_publications_for_reasoning(self):
+        self.add_journal(
+            "journal_broadcast_older",
+            title="August 21 Broadcast Notes",
+            excerpt="The broadcast ran long and the video feed stuttered.",
+            body="Several BARCODE Vol. 1 contributors visited the session.",
+            published_at="2026-08-22T01:00:00Z",
+        )
+        self.add_journal(
+            "journal_broadcast_newer",
+            title="August 28 Broadcast Notes",
+            excerpt="The broadcast logged 48 rostered tracks.",
+            body="Operational and community activity were recorded together.",
+            published_at="2026-08-29T01:00:00Z",
+        )
+
+        selected = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text="What did the Journal say about the last show?",
+            control_snapshot=control_snapshot(),
+            now=NOW,
+        )
+
+        self.assertEqual("eligible", selected.status)
+        self.assertEqual("topic", selected.query_mode)
+        self.assertEqual(
+            (
+                "journal_broadcast_newer",
+                "journal_broadcast_older",
+            ),
+            tuple(item.entry_id for item in selected.publications),
+        )
+
     def test_journal_public_visibility_and_reuse_are_independent(self):
         entry_id = "journal_visibility_case"
         self.add_journal(entry_id, title="Public Ceramic Log")
@@ -455,6 +489,36 @@ class PublicationReadAdapterTests(unittest.TestCase):
         self.assertEqual(
             "bnl-relay-newer-light",
             selected.publications[0].relay_id,
+        )
+
+    def test_natural_relay_topic_preserves_recent_publications_for_reasoning(self):
+        self.add_relay(
+            "bnl-broadcast-older",
+            message=(
+                "The August 21 broadcast ran long and the video feed "
+                "stuttered."
+            ),
+            directive="Retain the preceding session as public context.",
+            published_at="2026-08-22T01:00:00Z",
+        )
+        self.add_relay(
+            "bnl-broadcast-newer",
+            message="The August 28 broadcast logged 48 rostered tracks.",
+            directive="Use the newest accepted session record first.",
+            published_at="2026-08-29T01:00:00Z",
+        )
+
+        selected = relay.select_accepted_relay_publications_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text="What did the Relay say about the last show?",
+        )
+
+        self.assertEqual("eligible", selected.status)
+        self.assertEqual("topic", selected.query_mode)
+        self.assertEqual(
+            ("bnl-broadcast-newer", "bnl-broadcast-older"),
+            tuple(item.relay_id for item in selected.publications),
         )
 
     def test_relay_attempts_and_presence_are_not_accepted_speech(self):
@@ -639,6 +703,43 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         )
         self.assertFalse(changed.valid)
         self.assertEqual("source_changed", changed.status)
+
+    def test_natural_relay_question_reaches_the_publication_packet(self):
+        self.add_relay(
+            "bnl-live-acceptance-older",
+            message=(
+                "The August 21 broadcast ran long and the video feed "
+                "stuttered."
+            ),
+            published_at="2026-08-22T01:00:00Z",
+        )
+        self.add_relay(
+            "bnl-live-acceptance-newer",
+            message="The August 28 broadcast logged 48 rostered tracks.",
+            published_at="2026-08-29T01:00:00Z",
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.request("What did the Relay say about the last show?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual("eligible", packet.diagnostics.relay_query_status)
+        self.assertFalse(packet.diagnostics.invalid_invariants)
+        self.assertEqual(2, packet.diagnostics.publication_projection_count)
+        self.assertEqual(
+            {
+                "relay:bnl-live-acceptance-newer",
+                "relay:bnl-live-acceptance-older",
+            },
+            {
+                item.source_ref
+                for item in packet.items
+                if item.lane == "relay_publication"
+            },
+        )
 
     def test_latest_journal_revalidation_rejects_newer_matching_publication(self):
         snapshot = control_snapshot()
