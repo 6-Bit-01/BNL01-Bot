@@ -18,9 +18,11 @@ from bnl_shadow_acceptance import (
 )
 from bnl_shared_brain_synthesis import render_packet_context
 from bnl_unified_intelligence_packet import (
+    IntelligencePacketItem,
     IntelligencePacketRequest,
     PacketConversationEvidence,
     PacketFrameSubject,
+    PacketFrameTask,
     _safe_atomic_supporting_observation,
     build_evaluation_report,
     build_packet,
@@ -2773,6 +2775,219 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             projected.entry_id,
             {item.source_ref for item in packet.items},
         )
+
+    def test_subject_free_journal_task_survives_ambiguous_frame_subjects(
+        self,
+    ):
+        publication = IntelligencePacketItem(
+            lane="journal_publication",
+            source_class=packet_module.JOURNAL_PUBLICATION_SOURCE_CLASS,
+            source_type="canonical_published_journal",
+            source_ref="journal:journal_weekly_2026-08-24_7489c3d9:1",
+            source_digest="f" * 64,
+            subject_key="bnl_01",
+            predicate_key="published_journal_entry",
+            text=(
+                "Backend Queue Runs, Soundstage Experiments, and "
+                "Post-Show Echoes: published entry text."
+            ),
+            visibility="public",
+            confidence=Confidence.APPROVED.value,
+            lifecycle="published",
+            authority=0,
+            usage="publication_projection",
+            score=155.0,
+            revalidation_kind="journal_publication",
+            revalidation_key=(
+                '{"entryId":"journal_weekly_2026-08-24_7489c3d9",'
+                '"queryMode":"exact_title","revision":1}'
+            ),
+            attribution_mode="publication_only",
+            uncertainty_status="derived_publication_zero_fact_weight",
+        )
+        request = replace(
+            self.public_request(
+                text=(
+                    "Show me the published Journal entry titled "
+                    '"Backend Queue Runs, Soundstage Experiments, and '
+                    'Post-Show Echoes." What did it say?'
+                )
+            ),
+            frame_schema_version="situation_frame_v1",
+            frame_revision="sf_journal_exact_title",
+            frame_input_evidence_digest="d" * 64,
+            frame_status="ambiguous",
+            frame_subject_requirement="required",
+            frame_subjects=(
+                PacketFrameSubject(
+                    user_id=7,
+                    binding_method="conversation_candidate",
+                    confidence="medium",
+                ),
+                PacketFrameSubject(
+                    entity_ref="cache_back",
+                    binding_method="conversation_candidate",
+                    confidence="medium",
+                ),
+            ),
+            frame_tasks=(
+                PacketFrameTask(
+                    task_id="T1",
+                    text_digest="e" * 64,
+                    task_kind="retrieve_publication",
+                    object_kind="journal",
+                    authority_scope="packet",
+                    temporal_scope="historical",
+                    currentness="historical",
+                    required_response_act="answer",
+                    subject_requirement="not_applicable",
+                ),
+            ),
+            frame_task_kind="retrieve_publication",
+            frame_object_kind="journal",
+            frame_phase="request",
+        )
+
+        def journal_candidates(
+            _conn,
+            _request,
+            diagnostics,
+            _exclusions,
+        ):
+            diagnostics.journal_query_status = "eligible"
+            diagnostics.journal_control_status = "valid"
+            diagnostics.journal_candidate_count = 1
+            diagnostics.candidates_by_lane["journal_publication"] = 1
+            diagnostics.publication_projection_count += 1
+            return [publication]
+
+        with (
+            mock.patch.object(
+                packet_module,
+                "_journal_publication_items",
+                side_effect=journal_candidates,
+            ),
+            mock.patch.object(
+                packet_module,
+                "revalidate_published_journal_entry_on_connection",
+                return_value=publication.source_digest,
+            ),
+        ):
+            packet = build_packet(
+                self.conn,
+                request,
+                persist=False,
+                environ=self.flags,
+            )
+
+        self.assertEqual(packet.subject_resolution.status, "ambiguous")
+        self.assertEqual(
+            tuple(
+                item.source_ref
+                for item in packet.items
+                if item.lane == "journal_publication"
+            ),
+            (publication.source_ref,),
+        )
+        self.assertTrue(
+            all(
+                item.lane in {"current_intent", "journal_publication"}
+                for item in packet.items
+            )
+        )
+        self.assertEqual(packet.diagnostics.revalidation_status, "passed")
+        self.assertNotIn(
+            "journal_publication",
+            packet.diagnostics.missing_lanes,
+        )
+        self.assertFalse(packet.diagnostics.invalid_invariants)
+
+    def test_publication_task_does_not_unblock_unrelated_or_blocked_content(
+        self,
+    ):
+        request = replace(
+            self.public_request(text="What did the Journal say?"),
+            frame_schema_version="situation_frame_v1",
+            frame_revision="sf_journal_ambiguous_guard",
+            frame_input_evidence_digest="a" * 64,
+            frame_status="ambiguous",
+            frame_subject_requirement="required",
+            frame_tasks=(
+                PacketFrameTask(
+                    task_id="T1",
+                    text_digest="b" * 64,
+                    task_kind="retrieve_publication",
+                    object_kind="journal",
+                    authority_scope="packet",
+                    temporal_scope="historical",
+                    currentness="historical",
+                    required_response_act="answer",
+                    subject_requirement="not_applicable",
+                ),
+            ),
+        )
+        publication = IntelligencePacketItem(
+            lane="journal_publication",
+            source_class=packet_module.JOURNAL_PUBLICATION_SOURCE_CLASS,
+            source_type="canonical_published_journal",
+            source_ref="journal:allowed:1",
+            source_digest="c" * 64,
+            subject_key="bnl_01",
+            predicate_key="published_journal_entry",
+            text="Allowed publication.",
+            visibility="public",
+            confidence=Confidence.APPROVED.value,
+            lifecycle="published",
+            authority=0,
+            usage="publication_projection",
+            revalidation_kind="journal_publication",
+            attribution_mode="publication_only",
+            uncertainty_status="derived_publication_zero_fact_weight",
+        )
+        unrelated = replace(
+            publication,
+            lane="canon",
+            source_class=SourceClass.APPROVED_CANON.value,
+            source_type="canon_fact",
+            source_ref="canon:unrelated",
+            subject_key="cache_back",
+            predicate_key="role",
+            text="Unrelated subject-bound canon.",
+            usage="content",
+            revalidation_kind="canon",
+            attribution_mode="",
+            uncertainty_status="",
+        )
+        diagnostics = packet_module.IntelligencePacketDiagnostics()
+        exclusions = []
+
+        kept = packet_module._filter_frame_applicable_candidates(
+            request,
+            packet_module.PacketSubjectResolution(status="ambiguous"),
+            [publication, unrelated],
+            diagnostics,
+            exclusions,
+        )
+
+        self.assertEqual(kept, [publication])
+        self.assertEqual(
+            diagnostics.excluded_by_reason,
+            {"frame_subject_ambiguous": 1},
+        )
+        blocked_diagnostics = packet_module.IntelligencePacketDiagnostics()
+        blocked = packet_module._filter_frame_applicable_candidates(
+            request,
+            packet_module.PacketSubjectResolution(status="blocked"),
+            [publication],
+            blocked_diagnostics,
+            [],
+        )
+        self.assertEqual(blocked, [])
+        self.assertEqual(
+            blocked_diagnostics.excluded_by_reason,
+            {"frame_subject_blocked": 1},
+        )
+
 
     def test_gate_requires_all_shadows_and_rejects_live_authority(self):
         enabled = shadow_configuration(self.flags)
