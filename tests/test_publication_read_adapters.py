@@ -312,11 +312,37 @@ class PublicationReadAdapterTests(unittest.TestCase):
             "journal_curly_apostrophe",
             title="Artist’s Notes",
         )
+        self.add_journal("journal_short_artists", title="Artists")
+        self.add_journal(
+            "journal_straight_plural_possessive",
+            title="Artists' Notes",
+        )
+        self.add_journal(
+            "journal_curly_plural_possessive",
+            title="Artists’ Notes",
+        )
+        self.add_journal("journal_short_cats", title="Cats")
+        self.add_journal(
+            "journal_coordinated_possessive",
+            title="Cats' and Dogs",
+        )
         snapshot = control_snapshot()
 
         cases = (
             ("'Artist's Notes'", "journal_straight_apostrophe"),
             ("‘Artist’s Notes’", "journal_curly_apostrophe"),
+            (
+                "'Artists' Notes'",
+                "journal_straight_plural_possessive",
+            ),
+            (
+                "‘Artists’ Notes’",
+                "journal_curly_plural_possessive",
+            ),
+            (
+                "'Cats' and Dogs'",
+                "journal_coordinated_possessive",
+            ),
         )
         for quoted_title, expected_entry_id in cases:
             with self.subTest(quoted_title=quoted_title):
@@ -361,6 +387,28 @@ class PublicationReadAdapterTests(unittest.TestCase):
             tuple(
                 publication.entry_id
                 for publication in followed_by_another_quote.publications
+            ),
+        )
+
+        plural_title_before_another_quote = (
+            journal.select_published_journal_entries_on_connection(
+                self.conn,
+                guild_id=1,
+                user_text=(
+                    "show the Journal entry titled 'Artists' and "
+                    "compare it with 'Artist'."
+                ),
+                control_snapshot=snapshot,
+                now=NOW,
+            )
+        )
+        self.assertEqual(
+            ("journal_short_artists",),
+            tuple(
+                publication.entry_id
+                for publication in (
+                    plural_title_before_another_quote.publications
+                )
             ),
         )
 

@@ -361,13 +361,22 @@ _JOURNAL_LATEST_RE = re.compile(
     re.IGNORECASE,
 )
 _JOURNAL_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
-_JOURNAL_EXPLICIT_TITLE_RE = re.compile(
+_JOURNAL_EXPLICIT_TITLE_START_RE = re.compile(
     r"\b(?:title(?:d)?|called|named)\s*(?::|=|is)?\s*"
-    r'(?:"(?P<straight_double_title>[^"\n]{3,300})"'
-    r"|“(?P<curly_double_title>[^”\n]{3,300})”"
-    r"|'(?P<straight_single_title>(?:[^'\n]|'(?=\w)){3,300})'"
-    r"|‘(?P<curly_single_title>(?:[^’\n]|’(?=\w)){3,300})’)"
-    r"(?=\s|[.,;:!?)]|$)",
+    r"(?P<quote>[\"“'‘])",
+    re.IGNORECASE,
+)
+_JOURNAL_TITLE_QUOTE_PAIRS = {"\"": "\"", "“": "”", "'": "'", "‘": "’"}
+_JOURNAL_TITLE_CLOSE_BOUNDARY_RE = re.compile(
+    r"^(?:\s|[.,;:!?)}\]]|$)"
+)
+_JOURNAL_TITLE_STRONG_CLOSE_BOUNDARY_RE = re.compile(
+    r"^\s*(?:[.,;:!?)}\]]|20\d{2}-\d{2}-\d{2}\b|"
+    r"(?:from|on)\s+(?:20\d{2}-\d{2}-\d{2}|today|tonight|"
+    r"yesterday|tomorrow)\b|"
+    r"(?:and|but|or|then)\s+(?:compare|explain|give|read|show|"
+    r"summarize|tell|what|when|where|which|who|why|how)\b|"
+    r"(?:please|what|when|where|which|who|why|how)\b)",
     re.IGNORECASE,
 )
 _JOURNAL_QUERY_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
@@ -551,22 +560,34 @@ def _journal_query_identity(user_text: str) -> str:
 
 
 def _journal_query_title(user_text: str) -> str:
-    match = _JOURNAL_EXPLICIT_TITLE_RE.search(str(user_text or ""))
+    text = str(user_text or "")
+    match = _JOURNAL_EXPLICIT_TITLE_START_RE.search(text)
     if not match:
         return ""
-    title = next(
-        (
-            value
-            for value in (
-                match.group("straight_double_title"),
-                match.group("curly_double_title"),
-                match.group("straight_single_title"),
-                match.group("curly_single_title"),
-            )
-            if value
-        ),
-        "",
-    )
+    opener = match.group("quote")
+    closer = _JOURNAL_TITLE_QUOTE_PAIRS[opener]
+    title_start = match.end()
+    newline_at = text.find("\n", title_start)
+    line_end = len(text) if newline_at < 0 else newline_at
+    scan_end = min(line_end, title_start + 300)
+    close_at = text.find(closer, title_start + 3, scan_end + 1)
+    while close_at >= 0:
+        suffix = text[close_at + 1 : line_end]
+        if _JOURNAL_TITLE_CLOSE_BOUNDARY_RE.match(suffix):
+            later_close = text.find(closer, close_at + 1, scan_end + 1)
+            # With single quotes, a prior candidate can be a possessive
+            # apostrophe. Scan onward unless this is the last candidate or
+            # the suffix clearly begins a new clause.
+            if (
+                opener not in {"'", "‘"}
+                or later_close < 0
+                or _JOURNAL_TITLE_STRONG_CLOSE_BOUNDARY_RE.match(suffix)
+            ):
+                break
+        close_at = text.find(closer, close_at + 1, scan_end + 1)
+    if close_at < 0:
+        return ""
+    title = text[title_start:close_at]
     return re.sub(r"\s+", " ", title).strip()
 
 
