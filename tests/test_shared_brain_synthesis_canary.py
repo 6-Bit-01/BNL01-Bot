@@ -2268,6 +2268,124 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertFalse(columns & forbidden)
         self.assertIn("authority_mode", columns)
 
+    def test_v11_receipt_migration_is_additive_and_idempotent(self):
+        telemetry_columns = (
+            "candidate_total_tokens",
+            "candidate_prompt_tokens",
+            "candidate_output_tokens",
+            "candidate_thought_tokens",
+            "candidate_cached_tokens",
+            "candidate_estimated_cost_nanos",
+            "candidate_cost_priced",
+            "candidate_provider_error_count",
+            "candidate_error_category",
+            "candidate_provider_error_code",
+        )
+        template = sqlite3.connect(":memory:")
+        legacy = sqlite3.connect(":memory:")
+        try:
+            ensure_schema(template)
+            current_sql = template.execute(
+                """
+                SELECT sql
+                FROM sqlite_master
+                WHERE type='table'
+                  AND name='memory_governance_shared_brain_synthesis_runs'
+                """
+            ).fetchone()[0]
+            legacy_sql = "\n".join(
+                line
+                for line in str(current_sql).splitlines()
+                if not any(
+                    ("%s " % column) in line
+                    for column in telemetry_columns
+                )
+            )
+            legacy.execute(legacy_sql)
+            legacy.execute(
+                """
+                INSERT INTO memory_governance_shared_brain_synthesis_runs(
+                  run_id,packet_run_id,packet_id,schema_version,guild_id,
+                  subject_hash,channel_scope_hash,route_mode,channel_policy,
+                  packet_digest,source_ref_digest,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "legacy-run",
+                    "legacy-packet-run",
+                    "legacy-packet",
+                    "shared_brain_synthesis_v11",
+                    1,
+                    "subject-hash",
+                    "channel-hash",
+                    "normal_chat",
+                    "public_home",
+                    "packet-digest",
+                    "source-digest",
+                    "2026-09-01T00:00:00+00:00",
+                    "2026-09-01T00:00:00+00:00",
+                ),
+            )
+            before = {
+                str(row[1])
+                for row in legacy.execute(
+                    """
+                    PRAGMA table_info(
+                      memory_governance_shared_brain_synthesis_runs
+                    )
+                    """
+                )
+            }
+            self.assertTrue(set(telemetry_columns).isdisjoint(before))
+
+            ensure_schema(legacy)
+            ensure_schema(legacy)
+
+            after = {
+                str(row[1])
+                for row in legacy.execute(
+                    """
+                    PRAGMA table_info(
+                      memory_governance_shared_brain_synthesis_runs
+                    )
+                    """
+                )
+            }
+            self.assertTrue(set(telemetry_columns).issubset(after))
+            row = legacy.execute(
+                """
+                SELECT run_id,schema_version,candidate_total_tokens,
+                       candidate_prompt_tokens,candidate_output_tokens,
+                       candidate_thought_tokens,candidate_cached_tokens,
+                       candidate_estimated_cost_nanos,candidate_cost_priced,
+                       candidate_provider_error_count,
+                       candidate_error_category,
+                       candidate_provider_error_code
+                FROM memory_governance_shared_brain_synthesis_runs
+                WHERE run_id='legacy-run'
+                """
+            ).fetchone()
+            self.assertEqual(
+                row,
+                (
+                    "legacy-run",
+                    "shared_brain_synthesis_v11",
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "",
+                    "",
+                ),
+            )
+        finally:
+            template.close()
+            legacy.close()
+
 
 if __name__ == "__main__":
     unittest.main()

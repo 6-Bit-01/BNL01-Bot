@@ -11,12 +11,28 @@ import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
 import bnl_website_relay_state as relay
-from bnl_shared_brain_synthesis import render_packet_context
+from bnl_shared_brain_synthesis import (
+    begin_single_packet_run,
+    build_ordinary_chat_basis,
+    evaluate_single_packet_response,
+    ordinary_chat_task_support_plan,
+    parse_ordinary_chat_response_contract,
+    render_packet_context,
+    validate_ordinary_chat_response_contract,
+)
 from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
+    PacketConversationEvidence,
+    PacketFrameSubject,
+    PacketFrameTask,
     build_evaluation_report,
     build_packet,
     revalidate_packet,
+)
+from bnl_unified_response_assessment import (
+    build_situation_frame_v1,
+    build_unified_response_assessment,
+    revalidate_situation_frame,
 )
 
 
@@ -703,6 +719,314 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         )
         self.assertFalse(changed.valid)
         self.assertEqual("source_changed", changed.status)
+
+    def test_mixed_journal_queue_full_chain_rejects_changed_queue(self):
+        text = (
+            "What did the Journal say about the queue, and is the queue "
+            "open right now?"
+        )
+        queue_snapshot = (
+            "Current BARCODE queue snapshot:\n"
+            "- accessScope=public; readOnly=true\n"
+            "- queue open: false"
+        )
+        changed_queue_snapshot = queue_snapshot.replace("false", "true")
+        snapshot = control_snapshot()
+        self.add_journal(
+            "journal_queue_handoff",
+            title="Queue Rehearsal Notes",
+            excerpt=(
+                "The Journal recorded the queue rehearsal as read-only."
+            ),
+            body=(
+                "The published rehearsal kept historical commentary "
+                "separate from current queue state."
+            ),
+        )
+        self.conn.commit()
+        flags = {
+            **self.flags,
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+            "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10",
+        }
+        with mock.patch.dict(os.environ, flags, clear=False):
+            frame = build_situation_frame_v1(
+                route_allowed=True,
+                route_mode="normal_chat",
+                conversation_surface="mention_or_reply",
+                channel_policy="public_home",
+                current_text=text,
+                current_speaker_user_ids=(7,),
+                current_speaker_labels=("Test Member",),
+                addressee_kinds=("discord_mention",),
+                source_message_ids=(301,),
+                explicit_mention_count=1,
+                referent_status="not_applicable",
+                response_act="answer",
+                packet_revision="mixed_journal_queue_full_chain",
+            )
+            self.assertEqual(frame.status, "resolved")
+            self.assertEqual(
+                tuple(task.object_kind for task in frame.tasks),
+                ("journal", "queue"),
+            )
+            request = IntelligencePacketRequest(
+                guild_id=1,
+                subject_user_id=0,
+                route_mode="normal_chat",
+                conversation_surface="mention_or_reply",
+                channel_id=10,
+                channel_name="bnl-testing",
+                channel_policy="public_home",
+                visibility_allowance="public_safe",
+                user_text=text,
+                participant_user_ids=(7,),
+                direct_state="direct",
+                budget_chars=8000,
+                conversation_evidence=(
+                    PacketConversationEvidence(
+                        text=text,
+                        speaker_user_id=7,
+                        speaker_label="Test Member",
+                        current_turn=True,
+                    ),
+                ),
+                operational_context_snapshot=queue_snapshot,
+                operational_context_kind="website_read_model",
+                operational_context_authorized=True,
+                now=NOW,
+                frame_schema_version=frame.schema_version,
+                frame_revision=frame.frame_revision,
+                frame_input_evidence_digest=frame.input_evidence_digest,
+                frame_status=frame.status,
+                frame_subject_requirement=frame.subject_requirement,
+                frame_subjects=tuple(
+                    PacketFrameSubject(
+                        user_id=subject.user_id,
+                        entity_ref=subject.entity_ref,
+                        label_hint=subject.label_hint,
+                        binding_method=subject.binding_method,
+                        confidence=subject.confidence,
+                        role_hints=subject.role_hints,
+                        domain_hints=subject.domain_hints,
+                    )
+                    for subject in frame.subjects
+                ),
+                frame_tasks=tuple(
+                    PacketFrameTask(
+                        task_id=task.task_id,
+                        text_digest=task.text_digest,
+                        task_kind=task.task_kind,
+                        object_kind=task.object_kind,
+                        authority_scope=task.authority_scope,
+                        temporal_scope=task.temporal_scope,
+                        currentness=task.currentness,
+                        required_response_act=(
+                            task.required_response_act
+                        ),
+                        subject_requirement=task.subject_requirement,
+                        subject_indexes=task.subject_indexes,
+                    )
+                    for task in frame.tasks
+                ),
+                frame_role_hints=frame.role_hints,
+                frame_domain_hints=frame.domain_hints,
+                frame_event_ref=frame.event_ref,
+                frame_event_relation=frame.event_relation,
+                frame_task_kind=frame.task_kind,
+                frame_object_kind=frame.object_kind,
+                frame_phase=frame.phase,
+                frame_temporal_scope=frame.temporal_scope,
+                frame_currentness=frame.currentness,
+                journal_control_snapshot=snapshot,
+                journal_control_status="valid",
+            )
+            packet = build_packet(
+                self.conn,
+                request,
+                persist=True,
+                environ=flags,
+            )
+            packet_lanes = {item.lane for item in packet.items}
+            self.assertIn("journal_publication", packet_lanes)
+            self.assertIn("website_read_model", packet_lanes)
+            self.assertFalse(packet.diagnostics.invalid_invariants)
+
+            frame_revalidation = revalidate_situation_frame(
+                frame,
+                current_text=text,
+                route_mode="normal_chat",
+                conversation_surface="mention_or_reply",
+                channel_policy="public_home",
+                packet_source_snapshot_digest=(
+                    packet.source_snapshot_digest
+                ),
+            )
+            self.assertEqual(frame_revalidation.status, "valid")
+            profile = packet.profile_sufficiency
+            assessment = build_unified_response_assessment(
+                guild_id=1,
+                route_mode="normal_chat",
+                channel_policy="public_home",
+                conversation_surface="mention_or_reply",
+                current_speaker_user_ids=(7,),
+                participant_user_ids=(7,),
+                speaker_labels=("Test Member",),
+                prompt_lanes=packet.assessment_lanes,
+                website_read_model_present=True,
+                current_text=text,
+                packet_selected_lanes=packet.assessment_lanes,
+                packet_excluded_lanes=packet.assessment_exclusions,
+                packet_conflict_reasons=(
+                    packet.diagnostics.conflict_reasons
+                ),
+                packet_missing_lanes=packet.assessment_missing_lanes,
+                packet_revalidation_status=(
+                    packet.diagnostics.revalidation_status
+                ),
+                profile_sufficiency_status=profile.status,
+                profile_sufficiency_met=profile.satisfied,
+                profile_required_point_count=profile.required_point_count,
+                profile_selected_point_count=profile.selected_point_count,
+                profile_independent_root_count=(
+                    profile.independent_root_count
+                ),
+                profile_independent_occurrence_count=(
+                    profile.independent_occurrence_count
+                ),
+                profile_sufficiency_reasons=profile.reason_codes,
+                situation_frame=frame,
+                frame_revalidation=frame_revalidation,
+            )
+            self.assertEqual(assessment.comparison_status, "match")
+            basis = build_ordinary_chat_basis(
+                guild_id=1,
+                user_id=7,
+                channel_id=10,
+                route_mode="normal_chat",
+                channel_policy="public_home",
+                current_direct=True,
+                user_text=text,
+                packet=packet,
+                assessment=assessment,
+                environ=flags,
+            )
+            self.assertIsNotNone(basis)
+            plans = ordinary_chat_task_support_plan(basis)
+            self.assertEqual(len(plans), 2)
+            evidence_lanes = {
+                evidence_id: lane
+                for evidence_id, lane, _digest, _subjects in (
+                    basis.rendered_evidence_refs
+                )
+            }
+            self.assertEqual(
+                {evidence_lanes[item] for item in plans[0].evidence_ids},
+                {"journal_publication"},
+            )
+            self.assertEqual(
+                {evidence_lanes[item] for item in plans[1].evidence_ids},
+                {"website_read_model"},
+            )
+            contract = parse_ordinary_chat_response_contract(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "taskId": plans[0].task_id,
+                                "text": (
+                                    "The Journal said the queue rehearsal "
+                                    "stayed read-only."
+                                ),
+                                "supportKind": plans[0].support_kind,
+                                "evidenceIds": list(
+                                    plans[0].evidence_ids
+                                ),
+                            },
+                            {
+                                "taskId": plans[1].task_id,
+                                "text": "The queue is closed right now.",
+                                "supportKind": plans[1].support_kind,
+                                "evidenceIds": list(
+                                    plans[1].evidence_ids
+                                ),
+                            },
+                        ]
+                    }
+                )
+            )
+            validation = validate_ordinary_chat_response_contract(
+                basis,
+                contract,
+            )
+            self.assertTrue(validation.valid)
+            self.assertEqual(validation.covered_task_count, 2)
+            accepted_run = begin_single_packet_run(
+                self.conn,
+                basis,
+                prompt_ready=True,
+                frame_revalidation_status=frame_revalidation.status,
+                environ=flags,
+                journal_control_snapshot=snapshot,
+                journal_control_snapshot_provided=True,
+                operational_context_snapshot=queue_snapshot,
+                operational_context_snapshot_provided=True,
+            )
+            accepted = evaluate_single_packet_response(
+                self.conn,
+                accepted_run,
+                response=contract.response,
+                response_contract=contract,
+                typed_contract_required=True,
+                provider_call_count=1,
+                corrective_call_count=0,
+                environ=flags,
+                journal_control_snapshot=snapshot,
+                journal_control_snapshot_provided=True,
+                operational_context_snapshot=queue_snapshot,
+                operational_context_snapshot_provided=True,
+            )
+            self.assertTrue(accepted.candidate_selected)
+            self.assertEqual(accepted.typed_task_coverage_count, 2)
+
+            run = begin_single_packet_run(
+                self.conn,
+                basis,
+                prompt_ready=True,
+                frame_revalidation_status=frame_revalidation.status,
+                environ=flags,
+                journal_control_snapshot=snapshot,
+                journal_control_snapshot_provided=True,
+                operational_context_snapshot=queue_snapshot,
+                operational_context_snapshot_provided=True,
+            )
+            self.assertTrue(run.prompt_applied)
+            decision = evaluate_single_packet_response(
+                self.conn,
+                run,
+                response=contract.response,
+                response_contract=contract,
+                typed_contract_required=True,
+                provider_call_count=1,
+                corrective_call_count=0,
+                environ=flags,
+                journal_control_snapshot=snapshot,
+                journal_control_snapshot_provided=True,
+                operational_context_snapshot=changed_queue_snapshot,
+                operational_context_snapshot_provided=True,
+            )
+            self.assertFalse(decision.candidate_selected)
+            self.assertEqual(
+                decision.fallback_reason,
+                "post_generation_source_changed",
+            )
+            self.assertEqual(decision.typed_contract_status, "valid")
+            self.assertEqual(decision.typed_task_coverage_count, 2)
 
     def test_natural_relay_question_reaches_the_publication_packet(self):
         self.add_relay(
