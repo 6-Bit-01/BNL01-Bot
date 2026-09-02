@@ -443,6 +443,182 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         memory_builder.assert_called_once()
         broadcast_builder.assert_called_once()
 
+    def test_journal_topic_keeps_packet_owner_over_queue_context(self):
+        text = "What did the Journal say about the queue?"
+        frame = bnl01_bot.build_situation_frame_v1(
+            route_allowed=True,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=text,
+            current_speaker_user_ids=(101,),
+            response_act="answer",
+        )
+        orchestration = bnl01_bot.ConversationOrchestrationDecision(
+            response_act="answer",
+            reason="direct_request",
+            response_required=True,
+            address_kind="discord_mention",
+            continuity_required=False,
+            referent_status="not_requested",
+            referent_candidate_count=0,
+            referent_candidate_labels=(),
+            moment_situation_state="none",
+            moment_topic_coherent=False,
+            moment_participant_overlap=False,
+            moment_human_entry_count=0,
+            moment_model_entry_count=0,
+            engagement_decision="respond",
+            engagement_reason="direct_request",
+            influence_mode="sealed_canary",
+            packet_version="test",
+            packet_revision="test",
+            governed_memory_state="owner_not_requested",
+            relationship_state="owner_tone_only",
+            canon_state="owner_not_requested",
+            source_control_state="route_policy_only",
+            situation_frame=frame,
+        )
+        flags = {
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+            "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "101",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "303",
+            "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+            "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+            "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+        }
+        packet = object()
+        assessment = SimpleNamespace()
+        ordinary_basis = object()
+        visual_basis = SimpleNamespace(status="not_requested")
+        assessment_calls = []
+
+        def assessment_builder(**kwargs):
+            assessment_calls.append(kwargs)
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        with (
+            mock.patch.dict(os.environ, flags, clear=False),
+            mock.patch.object(
+                bnl01_bot,
+                "get_user_profile",
+                return_value=("Member 1", ""),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "should_allow_greeting",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "choose_response_style",
+                return_value=("balanced", "Respond naturally."),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_conversation_prompt_source_basis",
+                return_value=None,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_broadcast_memory_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_queue_artist_memory_context",
+                return_value="QUEUE OWNER SENTINEL",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_tiktok_show_evidence_context_for_turn",
+                return_value="SHOW OWNER SENTINEL",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "finalized_show_packet_owner_requested",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_community_visual_basis",
+                return_value=visual_basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "render_community_visual_basis_for_prompt",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=assessment_builder,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=ordinary_basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+                return_value=None,
+            ),
+        ):
+            metadata = {}
+            prompt, *_ = bnl01_bot.build_user_aware_prompt(
+                101,
+                1,
+                "Member 1",
+                text,
+                show_state_context="SHOW STATE OWNER SENTINEL",
+                channel_name="bnl-testing",
+                channel_id=303,
+                channel_policy="sealed_test",
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                is_direct_interaction=True,
+                website_read_model_context="WEBSITE QUEUE OWNER SENTINEL",
+                conversation_orchestration=orchestration,
+                prompt_metadata=metadata,
+            )
+
+        self.assertTrue(metadata["ordinary_chat_single_packet_applied"])
+        self.assertEqual(
+            metadata["ordinary_chat_single_packet_scope"].reason,
+            "eligible",
+        )
+        self.assertIs(
+            metadata["ordinary_chat_single_packet_basis"],
+            ordinary_basis,
+        )
+        self.assertEqual(len(assessment_calls), 1)
+        self.assertFalse(
+            assessment_calls[0]["website_read_model_present"]
+        )
+        self.assertFalse(assessment_calls[0]["show_state_present"])
+        self.assertNotIn(
+            "website_read_model",
+            assessment_calls[0]["prompt_lanes"],
+        )
+        self.assertNotIn(
+            "queue_artist_memory",
+            assessment_calls[0]["prompt_lanes"],
+        )
+        self.assertNotIn("WEBSITE QUEUE OWNER SENTINEL", prompt)
+        self.assertNotIn("SHOW STATE OWNER SENTINEL", prompt)
+        self.assertNotIn("QUEUE OWNER SENTINEL", prompt)
+        self.assertNotIn("SHOW OWNER SENTINEL", prompt)
+
     def test_bot_recorder_persists_only_aggregate_receipt(self):
         with mock.patch.object(
             bnl01_bot,

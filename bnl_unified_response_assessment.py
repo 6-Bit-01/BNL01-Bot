@@ -482,6 +482,16 @@ _CANON_SINGULAR_DEICTIC_RE = re.compile(
     r"character|entity))\b",
     re.I,
 )
+_PUBLICATION_DEICTIC_RE = re.compile(
+    r"\b(?:this|that|these|those)\s+"
+    r"(?:(?:last|previous|earlier)\s+)?"
+    r"(?:journal(?:\s+entr(?:y|ies))?|daily\s+entr(?:y|ies)|"
+    r"weekly\s+entr(?:y|ies)|relay(?:\s+(?:message|publication))?)\b|"
+    r"\b(?:this|that|these|those)\s+"
+    r"(?:entr(?:y|ies)|publication|message)\b.{0,40}"
+    r"\b(?:journal|relay)\b",
+    re.I,
+)
 _PACKET_AUTHORITY_OBJECTS = frozenset(
     {
         "journal",
@@ -1170,6 +1180,12 @@ def build_situation_frame_v1(
     if normalized_referent in {"ambiguous", "unresolved"}:
         ambiguity.append("referent_%s" % normalized_referent)
         competing.append("nearby_referent_candidates")
+    if (
+        _PUBLICATION_DEICTIC_RE.search(text)
+        and normalized_referent != "resolved"
+    ):
+        ambiguity.append("publication_referent_unresolved")
+        competing.append("publication_referent_candidates")
     referenced_subject_indexes = {
         subject_index
         for task in tasks
