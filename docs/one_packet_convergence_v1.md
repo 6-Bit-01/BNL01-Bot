@@ -84,6 +84,13 @@ diagnostics. Its typed task contract is the single response-selection
 boundary; later checks can block changed source, frame, control, quote, or
 delivery state but do not reclassify the selected prose.
 
+The v12 synthesis receipt migration is additive and idempotent. Ten new
+content-free latency, token, cost, and bounded error fields default to zero or
+blank on historical v11 rows; those defaults mean telemetry was not recorded
+for the old run. Local zero-call failures retain an error category without
+being counted as provider errors. A code rollback leaves the extra SQLite
+columns present and unused rather than destructively rebuilding the table.
+
 The ordinary-chat contract defaults to the accepted one-guild, one-user,
 one-channel private scope. Multi-user or multi-channel rollout requires the
 independent scoped-expansion gate and remains capped at one guild, eight

@@ -136,6 +136,14 @@ response-sent state, live-application state, typed-contract status, task
 coverage counts, support-reference counts, provider latency, token breakdown,
 priced-cost estimate, and bounded provider-error category/code.
 
+The v11-to-v12 initializer adds ten content-free telemetry columns in place
+and is idempotent. Existing rows are not rewritten: their new numeric zero and
+blank string defaults mean "not measured by v11," not an observed zero-cost or
+error-free provider result. `candidate_error_category` may describe a local
+pre-provider failure, while `candidate_provider_error_count` and
+`candidate_provider_error_code` are populated only when a physical provider
+attempt occurred.
+
 No prompt, packet text, source text, response text, participant IDs, or source
 references are stored. Aggregate diagnostics expose ordinary-run totals,
 provider/corrective call totals, call-count violations, typed-contract
@@ -149,6 +157,11 @@ Full rollback requires no database deletion:
 1. Set `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED=false` or remove it.
 2. Restart the bot.
 3. Confirm the ordinary-chat capability is requested/effective `off`.
+
+Rolling code back does not remove the additive v12 SQLite columns. They are
+content-free, defaulted, and inert to v11 code; removing them would require a
+separate destructive table migration and is not part of the operational
+rollback.
 
 Expansion-only rollback keeps the accepted private canary available:
 

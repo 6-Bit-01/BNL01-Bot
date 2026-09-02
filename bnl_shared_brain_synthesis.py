@@ -7578,6 +7578,9 @@ def evaluate_single_packet_response(
         )
     calls = max(0, int(provider_call_count or 0))
     corrective_calls = max(0, int(corrective_call_count or 0))
+    provider_error_observed = bool(
+        calls > 0 and (error_category or provider_error_code)
+    )
     fallback_reason = ""
     if not run.prompt_applied:
         fallback_reason = "prompt_not_applied"
@@ -7642,9 +7645,13 @@ def evaluate_single_packet_response(
             max(0, int(cached_tokens or 0)),
             max(0, int(estimated_cost_nanos or 0)),
             int(bool(cost_priced)),
-            int(bool(error_category or provider_error_code)),
+            int(provider_error_observed),
             str(error_category or "")[:80],
-            str(provider_error_code or "")[:80],
+            (
+                str(provider_error_code or "")[:80]
+                if provider_error_observed
+                else ""
+            ),
             coherence.status,
             coverage.total_item_count,
             int(output_leak),

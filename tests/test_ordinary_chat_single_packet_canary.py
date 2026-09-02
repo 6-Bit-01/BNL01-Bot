@@ -2959,6 +2959,64 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(report["ordinaryCallCountViolationRuns"], 1)
         self.assertEqual(report["ordinaryCorrectiveCallViolationRuns"], 1)
 
+    def test_provider_error_receipt_requires_physical_provider_attempt(self):
+        local_run = self._begin()
+        local = evaluate_single_packet_response(
+            self.conn,
+            local_run,
+            response="",
+            provider_call_count=0,
+            corrective_call_count=0,
+            error_category="local_model_budget_exhausted",
+            provider_error_code="local_model_budget_exhausted",
+            environ=self.flags,
+        )
+        self.assertFalse(local.candidate_selected)
+        self.assertEqual(
+            local.fallback_reason,
+            "provider_call_count_invalid",
+        )
+        local_receipt = self.conn.execute(
+            """
+            SELECT provider_call_count,candidate_provider_error_count,
+                   candidate_error_category,candidate_provider_error_code
+            FROM memory_governance_shared_brain_synthesis_runs
+            WHERE run_id=?
+            """,
+            (local_run.run_id,),
+        ).fetchone()
+        self.assertEqual(
+            local_receipt,
+            (0, 0, "local_model_budget_exhausted", ""),
+        )
+
+        provider_run = self._begin()
+        provider = evaluate_single_packet_response(
+            self.conn,
+            provider_run,
+            response="",
+            provider_call_count=1,
+            corrective_call_count=0,
+            error_category="provider_timeout",
+            provider_error_code="504",
+            environ=self.flags,
+        )
+        self.assertFalse(provider.candidate_selected)
+        self.assertEqual(provider.fallback_reason, "generation_failed")
+        provider_receipt = self.conn.execute(
+            """
+            SELECT provider_call_count,candidate_provider_error_count,
+                   candidate_error_category,candidate_provider_error_code
+            FROM memory_governance_shared_brain_synthesis_runs
+            WHERE run_id=?
+            """,
+            (provider_run.run_id,),
+        ).fetchone()
+        self.assertEqual(
+            provider_receipt,
+            (1, 1, "provider_timeout", "504"),
+        )
+
     def test_source_change_after_generation_rejects_without_fallback_candidate(self):
         run = self._begin()
         self.conn.execute(
