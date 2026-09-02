@@ -361,6 +361,11 @@ _JOURNAL_LATEST_RE = re.compile(
     re.IGNORECASE,
 )
 _JOURNAL_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+_JOURNAL_EXPLICIT_TITLE_RE = re.compile(
+    r"\b(?:title(?:d)?|called|named)\s*(?::|=|is)?\s*"
+    r"[\"“](?P<title>[^\"”\n]{3,300})[\"”]",
+    re.IGNORECASE,
+)
 _JOURNAL_QUERY_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
     "article",
     "called",
@@ -541,6 +546,11 @@ def _journal_query_identity(user_text: str) -> str:
     return ""
 
 
+def _journal_query_title(user_text: str) -> str:
+    match = _JOURNAL_EXPLICIT_TITLE_RE.search(str(user_text or ""))
+    return re.sub(r"\s+", " ", match.group("title")).strip() if match else ""
+
+
 def _journal_query_terms(user_text: str) -> set[str]:
     return {
         token
@@ -572,7 +582,7 @@ def _latest_published_journal_rows(
     guild_id: int,
     entry_id: str = "",
     publication_date: str = "",
-    containing_title_in: str = "",
+    exact_title: str = "",
     limit: int = JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT,
 ) -> list[dict[str, Any]]:
     if not table_exists(conn, "bnl_journal_entries"):
@@ -599,12 +609,12 @@ def _latest_published_journal_rows(
             "SUBSTR(COALESCE(e.published_at,e.created_at),1,10)=?"
         )
         params.append(publication_date)
-    if containing_title_in:
+    if exact_title:
         where.append(
             "LENGTH(TRIM(e.title))>=3 "
-            "AND INSTR(LOWER(?),LOWER(TRIM(e.title)))>0"
+            "AND LOWER(TRIM(e.title))=LOWER(TRIM(?))"
         )
-        params.append(containing_title_in)
+        params.append(exact_title)
     params.append(max(1, min(int(limit or 1), 500)))
     rows = conn.execute(
         "SELECT "
@@ -790,6 +800,7 @@ def select_published_journal_entries_on_connection(
         return JournalPublicationSelection("source_unavailable", requested_mode)
 
     identity = _journal_query_identity(user_text)
+    explicit_title = _journal_query_title(user_text)
     publication_date_match = _JOURNAL_DATE_RE.search(str(user_text or ""))
     publication_date = (
         publication_date_match.group(1) if publication_date_match else ""
@@ -805,11 +816,11 @@ def select_published_journal_entries_on_connection(
     else:
         title_rows = (
             []
-            if requested_mode == "latest"
+            if requested_mode == "latest" or not explicit_title
             else _latest_published_journal_rows(
                 conn,
                 guild_id=guild_id,
-                containing_title_in=str(user_text or ""),
+                exact_title=explicit_title,
                 limit=max(8, limit),
             )
         )

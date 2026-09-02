@@ -4990,12 +4990,10 @@ def _subject_independent_publication_lanes(
     publication_queries = {
         "journal": (
             str(diagnostics.journal_query_status or "").strip().lower(),
-            int(diagnostics.journal_candidate_count or 0),
             frozenset({"exact_identity", "exact_title", "exact_date"}),
         ),
         "relay": (
             str(diagnostics.relay_query_status or "").strip().lower(),
-            int(diagnostics.relay_candidate_count or 0),
             frozenset({"exact_identity", "exact_date"}),
         ),
     }
@@ -5012,10 +5010,10 @@ def _subject_independent_publication_lanes(
     lanes: set[str] = set()
     for task in request.frame_tasks:
         object_kind = str(task.object_kind or "").strip().lower()
-        query_status, candidate_count, concrete_query_modes = (
+        query_status, concrete_query_modes = (
             publication_queries.get(
                 object_kind,
-                ("not_requested", 0, frozenset()),
+                ("not_requested", frozenset()),
             )
         )
         lane = "%s_publication" % object_kind
@@ -5044,7 +5042,7 @@ def _subject_independent_publication_lanes(
             and not task.subject_indexes
             and object_kind in {"journal", "relay"}
             and query_status == "eligible"
-            and candidate_count == 1
+            and len(publication_items) == 1
             and query_mode in concrete_query_modes
         ):
             lanes.add(lane)

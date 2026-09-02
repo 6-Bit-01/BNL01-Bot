@@ -4,6 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import bnl_journal as journal
@@ -14,10 +15,13 @@ import bnl_website_relay_state as relay
 from bnl_shared_brain_synthesis import render_packet_context
 from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
+    PacketFrameSubject,
+    PacketFrameTask,
     build_evaluation_report,
     build_packet,
     revalidate_packet,
 )
+from bnl_unified_response_assessment import build_situation_frame_v1
 
 
 NOW = "2026-08-10T10:01:00Z"
@@ -243,6 +247,31 @@ class PublicationReadAdapterTests(unittest.TestCase):
         )
         self.assertEqual("exact_date", by_date.query_mode)
         self.assertEqual(entry_id, by_date.publications[0].entry_id)
+
+    def test_journal_exact_title_requires_explicit_selector_syntax(self):
+        self.add_journal("journal_old_entry", title="Old Entry")
+        snapshot = control_snapshot()
+        explicit = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text='show the Journal titled "Old Entry"',
+            control_snapshot=snapshot,
+            now=NOW,
+        )
+        self.assertEqual("exact_title", explicit.query_mode)
+        self.assertEqual(
+            ("journal_old_entry",),
+            tuple(item.entry_id for item in explicit.publications),
+        )
+
+        deictic = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text="What did that old entry in the Journal say?",
+            control_snapshot=snapshot,
+            now=NOW,
+        )
+        self.assertEqual("topic", deictic.query_mode)
 
     def test_explicit_latest_journal_prefers_publication_time_over_topic_density(self):
         self.add_journal(
@@ -552,6 +581,155 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             journal_control_snapshot=snapshot,
             journal_control_status=control_status,
         )
+
+    def framed_request(self, text, *, snapshot=None, control_status="valid"):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text=text,
+            current_speaker_user_ids=(7,),
+            subject_entity_refs=("cache_back", "call_em_bini"),
+            response_act="answer",
+        )
+        self.assertEqual("ambiguous", frame.status)
+        self.assertEqual(
+            ("multiple_subject_candidates",),
+            frame.ambiguity_reasons,
+        )
+        return replace(
+            self.request(
+                text,
+                snapshot=snapshot,
+                control_status=control_status,
+            ),
+            frame_schema_version=frame.schema_version,
+            frame_revision=frame.frame_revision,
+            frame_input_evidence_digest=frame.input_evidence_digest,
+            frame_status=frame.status,
+            frame_ambiguity_reasons=frame.ambiguity_reasons,
+            frame_subject_requirement=frame.subject_requirement,
+            frame_subjects=tuple(
+                PacketFrameSubject(
+                    user_id=subject.user_id,
+                    entity_ref=subject.entity_ref,
+                    label_hint=subject.label_hint,
+                    binding_method=subject.binding_method,
+                    confidence=subject.confidence,
+                    role_hints=subject.role_hints,
+                    domain_hints=subject.domain_hints,
+                )
+                for subject in frame.subjects
+            ),
+            frame_tasks=tuple(
+                PacketFrameTask(
+                    task_id=task.task_id,
+                    text_digest=task.text_digest,
+                    task_kind=task.task_kind,
+                    object_kind=task.object_kind,
+                    authority_scope=task.authority_scope,
+                    temporal_scope=task.temporal_scope,
+                    currentness=task.currentness,
+                    required_response_act=task.required_response_act,
+                    subject_requirement=task.subject_requirement,
+                    subject_indexes=task.subject_indexes,
+                )
+                for task in frame.tasks
+            ),
+            frame_role_hints=frame.role_hints,
+            frame_domain_hints=frame.domain_hints,
+            frame_event_ref=frame.event_ref,
+            frame_event_relation=frame.event_relation,
+            frame_task_kind=frame.task_kind,
+            frame_object_kind=frame.object_kind,
+            frame_phase=frame.phase,
+            frame_temporal_scope=frame.temporal_scope,
+            frame_currentness=frame.currentness,
+        )
+
+    def test_ambiguous_frame_exception_uses_production_title_selector(self):
+        entry_id = "journal_legacy_entry"
+        self.add_journal(entry_id, title="Legacy Entry")
+        snapshot = control_snapshot()
+        exact = build_packet(
+            self.conn,
+            self.framed_request(
+                'Show me the Journal entry titled "Legacy Entry". '
+                "What did it say?",
+                snapshot=snapshot,
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual("ambiguous", exact.subject_resolution.status)
+        self.assertEqual(
+            ("journal:%s:1" % entry_id,),
+            tuple(
+                item.source_ref
+                for item in exact.items
+                if item.lane == "journal_publication"
+            ),
+        )
+        self.assertEqual("passed", exact.diagnostics.revalidation_status)
+        self.assertFalse(exact.diagnostics.invalid_invariants)
+
+        deictic = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did that Legacy Entry in the Journal say?",
+                snapshot=snapshot,
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual("ambiguous", deictic.subject_resolution.status)
+        self.assertEqual("eligible", deictic.diagnostics.journal_query_status)
+        self.assertFalse(
+            any(item.lane == "journal_publication" for item in deictic.items)
+        )
+        self.assertGreaterEqual(
+            deictic.diagnostics.excluded_by_reason.get(
+                "frame_subject_ambiguous",
+                0,
+            ),
+            1,
+        )
+
+    def test_ambiguous_exact_date_uses_one_eligible_publication(self):
+        self.add_journal(
+            "journal_date_visible",
+            title="Visible Date Entry",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        self.add_journal(
+            "journal_date_hidden",
+            title="Hidden Date Entry",
+            published_at="2026-08-04T02:00:00Z",
+        )
+        snapshot = control_snapshot(
+            public_excluded=("journal_date_hidden",),
+        )
+        packet = build_packet(
+            self.conn,
+            self.framed_request(
+                "What did the Journal publish on 2026-08-04?",
+                snapshot=snapshot,
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(2, packet.diagnostics.journal_candidate_count)
+        self.assertEqual(
+            ("journal:journal_date_visible:1",),
+            tuple(
+                item.source_ref
+                for item in packet.items
+                if item.lane == "journal_publication"
+            ),
+        )
+        self.assertEqual("passed", packet.diagnostics.revalidation_status)
+        self.assertFalse(packet.diagnostics.invalid_invariants)
 
     def test_packet_adapters_are_publication_only_and_revalidate_mutation(self):
         journal_id = "journal_packet_001"
