@@ -191,6 +191,7 @@ from bnl_shared_brain_synthesis import (
     ordinary_chat_configuration,
     ordinary_chat_deterministic_response_act,
     ordinary_chat_route_scope_decision,
+    publication_packet_composes_current_queue,
     publication_packet_owns_turn,
     parse_ordinary_chat_response_contract,
     record_fallback as record_shared_brain_synthesis_fallback,
@@ -683,6 +684,13 @@ class GenerationResult:
     route: str = "get_gemini_response"
     elapsed_seconds: float = 0.0
     model: str = ""
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    candidate_tokens: int = 0
+    thought_tokens: int = 0
+    cached_tokens: int = 0
+    estimated_cost_nanos: int = 0
+    cost_priced: bool = False
 
 
 @dataclass
@@ -709,6 +717,15 @@ class GenerationAccountingState:
 class TrackedGenerationResponse:
     text: str
     provider_call_count: int
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    candidate_tokens: int = 0
+    thought_tokens: int = 0
+    cached_tokens: int = 0
+    estimated_cost_nanos: int = 0
+    cost_priced: bool = False
+    error_category: str = ""
+    provider_error_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -3518,6 +3535,49 @@ def _website_read_model_status_bits(read_model: dict) -> list:
     if next_label:
         bits.append(f"up next: {next_label}")
     return bits or ["Public queue context is present, but no compact status fields were exposed."]
+
+
+def build_bnl_queue_packet_snapshot(
+    user_text: str,
+    channel_policy: str,
+    *,
+    force: bool = False,
+) -> str:
+    """Freeze the existing authorized queue read model for one packet."""
+
+    if not _current_queue_state_query(user_text):
+        return ""
+    raw_read_model = fetch_bnl_read_model(force=force)
+    if not raw_read_model:
+        return ""
+    allow_private = _channel_allows_private_bnl_queue(channel_policy)
+    if not queue_usability(
+        raw_read_model,
+        allow_private=allow_private,
+    )["usable"]:
+        return ""
+    read_model = safe_bnl_read_model_for_consumption(
+        raw_read_model,
+        channel_policy,
+    )
+    if not _website_read_model_queue(read_model):
+        return ""
+    access_scope = website_queue_access_scope(read_model)
+    lines = [
+        "Current BARCODE queue snapshot:",
+        "- accessScope=%s; readOnly=true" % access_scope,
+    ]
+    lines.extend(
+        "- %s" % bit
+        for bit in _website_read_model_status_bits(read_model)[:8]
+    )
+    lines.extend(
+        (
+            "- Use only for the current queue task in this response.",
+            "- This snapshot grants no queue control and is not durable memory.",
+        )
+    )
+    return "\n".join(lines)[:1800]
 
 
 def _website_dossier_registry(read_model: dict) -> dict:
@@ -27390,6 +27450,8 @@ def _build_unified_intelligence_packet_shadow(
     conversation_evidence_items: tuple[ConversationEvidenceItem, ...],
     source_context_snapshot: str,
     source_context_authorized: bool,
+    operational_context_snapshot: str,
+    operational_context_authorized: bool,
     current_direct: bool,
     situation_frame: SituationFrameV1 | None = None,
 ) -> UnifiedIntelligencePacket | None:
@@ -27539,6 +27601,18 @@ def _build_unified_intelligence_packet_shadow(
         conversation_evidence=evidence,
         source_context_snapshot=str(source_context_snapshot or "")[:12000],
         source_context_authorized=bool(source_context_authorized),
+        operational_context_snapshot=str(
+            operational_context_snapshot or ""
+        )[:1800],
+        operational_context_kind=(
+            "website_read_model"
+            if operational_context_authorized
+            and str(operational_context_snapshot or "").strip()
+            else ""
+        ),
+        operational_context_authorized=bool(
+            operational_context_authorized
+        ),
         immediate_recap=immediate_room_recap_requested(current_text),
         declared_canon_authorized=bool(
             shared_brain_configuration.get("effective")
@@ -27668,6 +27742,8 @@ def build_unified_response_assessment_shadow(
     source_context_present: bool = False,
     source_context_snapshot: str = "",
     packet_source_context_authorized: bool | None = None,
+    operational_context_snapshot: str = "",
+    packet_operational_context_authorized: bool = False,
     current_direct: bool = True,
     broadcast_memory_present: bool = False,
     intelligence_packet_out: dict | None = None,
@@ -27812,6 +27888,10 @@ def build_unified_response_assessment_shadow(
             bool(source_context_present)
             if packet_source_context_authorized is None
             else bool(packet_source_context_authorized)
+        ),
+        operational_context_snapshot=operational_context_snapshot,
+        operational_context_authorized=bool(
+            packet_operational_context_authorized
         ),
         current_direct=current_direct,
         situation_frame=situation_frame,
@@ -28741,6 +28821,29 @@ def _shared_brain_journal_revalidation_snapshot(
     return snapshot, True
 
 
+def _shared_brain_operational_revalidation_snapshot(
+    basis: SharedBrainSynthesisBasis,
+) -> tuple[str, bool]:
+    request = basis.packet.request
+    requested = bool(
+        str(request.operational_context_kind or "").strip().lower()
+        == "website_read_model"
+        and str(request.operational_context_snapshot or "").strip()
+    )
+    if not requested:
+        return "", False
+    # An empty fresh result is explicitly supplied so packet revalidation
+    # rejects disappearance instead of reusing the frozen source silently.
+    return (
+        build_bnl_queue_packet_snapshot(
+            request.user_text,
+            request.channel_policy,
+            force=True,
+        ),
+        True,
+    )
+
+
 def refresh_prompt_source_basis(
     basis: PromptSourceBasis,
 ) -> tuple[PromptSourceBasis, bool]:
@@ -28750,12 +28853,19 @@ def refresh_prompt_source_basis(
             snapshot, provided = (
                 _shared_brain_journal_revalidation_snapshot(basis)
             )
+            operational_snapshot, operational_provided = (
+                _shared_brain_operational_revalidation_snapshot(basis)
+            )
             with sqlite3.connect(DB_FILE, timeout=0.25) as synthesis_conn:
                 valid, _status = revalidate_shared_brain_synthesis_basis(
                     synthesis_conn,
                     basis,
                     journal_control_snapshot=snapshot,
                     journal_control_snapshot_provided=provided,
+                    operational_context_snapshot=operational_snapshot,
+                    operational_context_snapshot_provided=(
+                        operational_provided
+                    ),
                 )
             return basis, not valid
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
@@ -29421,13 +29531,51 @@ async def _generate_gemini_content_result_async(
             )
         model = getattr(response, "model_name", GEMINI_MODEL)
         text, _tokens = _extract_text_and_tokens(response)
+        breakdown = _extract_token_usage_breakdown(response)
+        cost_estimate = _estimate_breakdown_cost(
+            breakdown,
+            model,
+            _pacific_usage_date(),
+        )
+        usage_fields = {
+            "total_tokens": breakdown.total_tokens,
+            "prompt_tokens": breakdown.prompt_tokens,
+            "candidate_tokens": breakdown.candidate_tokens,
+            "thought_tokens": breakdown.thought_tokens,
+            "cached_tokens": breakdown.cached_tokens,
+            "estimated_cost_nanos": max(
+                0,
+                int(cost_estimate.estimated_cost_nanos or 0),
+            ),
+            "cost_priced": bool(cost_estimate.priced),
+        }
         elapsed = time.monotonic() - started
         if not text:
             cat, code, safe_msg = classify_generation_error(empty_response=True)
-            result = GenerationResult(False, "", cat, code, safe_msg, route, elapsed, model)
+            result = GenerationResult(
+                False,
+                "",
+                cat,
+                code,
+                safe_msg,
+                route,
+                elapsed,
+                model,
+                **usage_fields,
+            )
             record_generation_result_status(result)
             return result
-        result = GenerationResult(True, text.strip(), "", "", "", route, elapsed, model)
+        result = GenerationResult(
+            True,
+            text.strip(),
+            "",
+            "",
+            "",
+            route,
+            elapsed,
+            model,
+            **usage_fields,
+        )
         record_generation_result_status(result)
         return result
     except Exception as exc:
@@ -30531,6 +30679,7 @@ async def get_gemini_response(
     source_context_available: bool = False,
     attempt_counter: ProviderAttemptCounter | None = None,
     raise_on_generation_failure: bool = False,
+    generation_result_out: dict | None = None,
 ):
     try:
         one_call_packet_route = (
@@ -30548,6 +30697,8 @@ async def get_gemini_response(
                 GEMINI_MODEL,
             )
             record_generation_result_status(result)
+            if generation_result_out is not None:
+                generation_result_out["result"] = result
             if raise_on_generation_failure:
                 raise BackgroundGenerationUnavailable(result)
             return ""
@@ -30634,6 +30785,8 @@ async def get_gemini_response(
                 route,
                 attempt_counter=attempt_counter,
             )
+        if generation_result_out is not None:
+            generation_result_out["result"] = generation_result
         if not generation_result.success:
             if raise_on_generation_failure:
                 raise BackgroundGenerationUnavailable(generation_result)
@@ -30964,17 +31117,19 @@ async def get_gemini_response(
         raise
     except Exception as e:
         logging.error(f"❌ Gemini API error: {e}")
+        result = GenerationResult(
+            False,
+            "",
+            GENERATION_ERROR_PROVIDER_UNKNOWN,
+            GENERATION_ERROR_PROVIDER_UNKNOWN,
+            type(e).__name__,
+            route,
+            0.0,
+            GEMINI_MODEL,
+        )
+        if generation_result_out is not None:
+            generation_result_out["result"] = result
         if raise_on_generation_failure:
-            result = GenerationResult(
-                False,
-                "",
-                GENERATION_ERROR_PROVIDER_UNKNOWN,
-                GENERATION_ERROR_PROVIDER_UNKNOWN,
-                type(e).__name__,
-                route,
-                0.0,
-                GEMINI_MODEL,
-            )
             raise BackgroundGenerationUnavailable(result) from e
         return ""
 
@@ -33670,6 +33825,7 @@ async def get_gemini_response_with_optional_typing(
     *,
     source_context_available: bool = False,
     attempt_counter: ProviderAttemptCounter | None = None,
+    generation_result_out: dict | None = None,
 ):
     """Run Gemini generation with an optional, cooldown-protected Discord typing indicator."""
 
@@ -33681,6 +33837,7 @@ async def get_gemini_response_with_optional_typing(
                 guild_id,
                 route=route,
                 source_context_available=source_context_available,
+                generation_result_out=generation_result_out,
             )
         return await get_gemini_response(
             prompt,
@@ -33689,6 +33846,7 @@ async def get_gemini_response_with_optional_typing(
             route=route,
             source_context_available=source_context_available,
             attempt_counter=attempt_counter,
+            generation_result_out=generation_result_out,
         )
 
     if not BNL_TYPING_INDICATOR_ENABLED or channel is None:
@@ -33740,6 +33898,7 @@ async def get_tracked_gemini_response_with_optional_typing(
     """Return text plus physical provider attempts for acceptance receipts."""
 
     attempt_counter = ProviderAttemptCounter()
+    generation_result_out: dict[str, GenerationResult] = {}
     text = await get_gemini_response_with_optional_typing(
         channel,
         prompt,
@@ -33748,10 +33907,52 @@ async def get_tracked_gemini_response_with_optional_typing(
         route=route,
         source_context_available=source_context_available,
         attempt_counter=attempt_counter,
+        generation_result_out=generation_result_out,
     )
+    generation_result = generation_result_out.get("result")
     return TrackedGenerationResponse(
         text=str(text or ""),
         provider_call_count=max(0, int(attempt_counter.count or 0)),
+        total_tokens=max(
+            0,
+            int(getattr(generation_result, "total_tokens", 0) or 0),
+        ),
+        prompt_tokens=max(
+            0,
+            int(getattr(generation_result, "prompt_tokens", 0) or 0),
+        ),
+        candidate_tokens=max(
+            0,
+            int(getattr(generation_result, "candidate_tokens", 0) or 0),
+        ),
+        thought_tokens=max(
+            0,
+            int(getattr(generation_result, "thought_tokens", 0) or 0),
+        ),
+        cached_tokens=max(
+            0,
+            int(getattr(generation_result, "cached_tokens", 0) or 0),
+        ),
+        estimated_cost_nanos=max(
+            0,
+            int(
+                getattr(
+                    generation_result,
+                    "estimated_cost_nanos",
+                    0,
+                )
+                or 0
+            ),
+        ),
+        cost_priced=bool(
+            getattr(generation_result, "cost_priced", False)
+        ),
+        error_category=str(
+            getattr(generation_result, "error_category", "") or ""
+        )[:80],
+        provider_error_code=str(
+            getattr(generation_result, "provider_error_code", "") or ""
+        )[:80],
     )
 
 
@@ -38422,13 +38623,32 @@ def build_user_aware_prompt(
         clean_content,
         tiktok_show_evidence_context,
     )
-    publication_packet_owns_current_turn = publication_packet_owns_turn(
+    frozen_situation_frame = (
         conversation_orchestration.situation_frame
         if isinstance(
             conversation_orchestration,
             ConversationOrchestrationDecision,
         )
         else None
+    )
+    publication_packet_owns_current_turn = publication_packet_owns_turn(
+        frozen_situation_frame
+    )
+    publication_queue_composition = (
+        publication_packet_composes_current_queue(frozen_situation_frame)
+    )
+    operational_queue_packet_snapshot = (
+        build_bnl_queue_packet_snapshot(
+            clean_content,
+            channel_policy,
+            force=False,
+        )
+        if publication_queue_composition and website_read_model_context
+        else ""
+    )
+    publication_queue_packet_ready = bool(
+        publication_queue_composition
+        and operational_queue_packet_snapshot
     )
     assessment_broadcast_context_present = bool(
         broadcast_context
@@ -38455,11 +38675,16 @@ def build_user_aware_prompt(
         or (
             show_state_context
             and not publication_packet_owns_current_turn
+            and not publication_queue_packet_ready
         )
-        or assessment_website_read_model_present
+        or (
+            assessment_website_read_model_present
+            and not publication_queue_packet_ready
+        )
         or (
             queue_artist_memory_context
             and not publication_packet_owns_current_turn
+            and not publication_queue_packet_ready
         )
         or community_visual_prompt_block
     )
@@ -38509,6 +38734,7 @@ def build_user_aware_prompt(
                     bool(
                         show_state_context
                         and not publication_packet_owns_current_turn
+                        and not publication_queue_packet_ready
                     ),
                 ),
                 (
@@ -38520,6 +38746,7 @@ def build_user_aware_prompt(
                     bool(
                         queue_artist_memory_context
                         and not publication_packet_owns_current_turn
+                        and not publication_queue_packet_ready
                     ),
                 ),
                 (
@@ -38568,6 +38795,7 @@ def build_user_aware_prompt(
                         bool(
                             show_state_context
                             and not publication_packet_owns_current_turn
+                            and not publication_queue_packet_ready
                         ),
                     ),
                     (
@@ -38579,6 +38807,7 @@ def build_user_aware_prompt(
                         bool(
                             queue_artist_memory_context
                             and not publication_packet_owns_current_turn
+                            and not publication_queue_packet_ready
                         ),
                     ),
                     (
@@ -38629,6 +38858,7 @@ def build_user_aware_prompt(
         show_state_present=bool(
             show_state_context
             and not publication_packet_owns_current_turn
+            and not publication_queue_packet_ready
         ),
         website_read_model_present=(
             assessment_website_read_model_present
@@ -38640,15 +38870,14 @@ def build_user_aware_prompt(
         ),
         source_context_snapshot=source_context_block,
         packet_source_context_authorized=bool(source_context_block),
+        operational_context_snapshot=operational_queue_packet_snapshot,
+        packet_operational_context_authorized=bool(
+            publication_queue_packet_ready
+        ),
         broadcast_memory_present=assessment_broadcast_context_present,
         intelligence_packet_out=intelligence_packet_out,
         situation_frame=(
-            conversation_orchestration.situation_frame
-            if isinstance(
-                conversation_orchestration,
-                ConversationOrchestrationDecision,
-            )
-            else None
+            frozen_situation_frame
         ),
     )
     unified_moment_canary_basis = (
@@ -42053,6 +42282,9 @@ def _begin_ordinary_chat_single_packet_receipt(
     snapshot, snapshot_provided = (
         _shared_brain_journal_revalidation_snapshot(basis)
     )
+    operational_snapshot, operational_provided = (
+        _shared_brain_operational_revalidation_snapshot(basis)
+    )
     with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
         run = begin_single_packet_run(
             conn,
@@ -42062,6 +42294,8 @@ def _begin_ordinary_chat_single_packet_receipt(
             frame_revalidation_status=frame_revalidation_status,
             journal_control_snapshot=snapshot,
             journal_control_snapshot_provided=snapshot_provided,
+            operational_context_snapshot=operational_snapshot,
+            operational_context_snapshot_provided=operational_provided,
         )
         conn.commit()
         return run
@@ -42074,11 +42308,23 @@ def _evaluate_ordinary_chat_single_packet_receipt(
     provider_call_count: int,
     corrective_call_count: int,
     generation_latency_ms: int,
+    total_tokens: int = 0,
+    prompt_tokens: int = 0,
+    output_tokens: int = 0,
+    thought_tokens: int = 0,
+    cached_tokens: int = 0,
+    estimated_cost_nanos: int = 0,
+    cost_priced: bool = False,
+    error_category: str = "",
+    provider_error_code: str = "",
     response_contract=None,
     typed_contract_required: bool = False,
 ) -> SynthesisCanaryDecision:
     snapshot, snapshot_provided = (
         _shared_brain_journal_revalidation_snapshot(run.basis)
+    )
+    operational_snapshot, operational_provided = (
+        _shared_brain_operational_revalidation_snapshot(run.basis)
     )
     with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
         decision = evaluate_single_packet_response(
@@ -42088,10 +42334,21 @@ def _evaluate_ordinary_chat_single_packet_receipt(
             provider_call_count=provider_call_count,
             corrective_call_count=corrective_call_count,
             generation_latency_ms=generation_latency_ms,
+            total_tokens=total_tokens,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+            thought_tokens=thought_tokens,
+            cached_tokens=cached_tokens,
+            estimated_cost_nanos=estimated_cost_nanos,
+            cost_priced=cost_priced,
+            error_category=error_category,
+            provider_error_code=provider_error_code,
             response_contract=response_contract,
             typed_contract_required=typed_contract_required,
             journal_control_snapshot=snapshot,
             journal_control_snapshot_provided=snapshot_provided,
+            operational_context_snapshot=operational_snapshot,
+            operational_context_snapshot_provided=operational_provided,
         )
         conn.commit()
         return decision
@@ -42613,6 +42870,7 @@ async def maybe_generate_ordinary_chat_single_packet(
 
     generation_started = time.monotonic()
     provider_call_count = 0
+    tracked_generation = TrackedGenerationResponse("", 0)
     try:
         tracked_generation = await get_tracked_gemini_response_with_optional_typing(
             channel,
@@ -42634,6 +42892,12 @@ async def maybe_generate_ordinary_chat_single_packet(
         )
         candidate = ""
         response_contract = parse_ordinary_chat_response_contract("")
+        tracked_generation = TrackedGenerationResponse(
+            "",
+            provider_call_count,
+            error_category="local_generation_exception",
+            provider_error_code=type(exc).__name__[:80],
+        )
     generation_latency_ms = max(
         0,
         int(round((time.monotonic() - generation_started) * 1000)),
@@ -42646,6 +42910,19 @@ async def maybe_generate_ordinary_chat_single_packet(
             provider_call_count=provider_call_count,
             corrective_call_count=0,
             generation_latency_ms=generation_latency_ms,
+            total_tokens=tracked_generation.total_tokens,
+            prompt_tokens=tracked_generation.prompt_tokens,
+            output_tokens=tracked_generation.candidate_tokens,
+            thought_tokens=tracked_generation.thought_tokens,
+            cached_tokens=tracked_generation.cached_tokens,
+            estimated_cost_nanos=(
+                tracked_generation.estimated_cost_nanos
+            ),
+            cost_priced=tracked_generation.cost_priced,
+            error_category=tracked_generation.error_category,
+            provider_error_code=(
+                tracked_generation.provider_error_code
+            ),
             response_contract=response_contract,
             typed_contract_required=True,
         )
@@ -42716,65 +42993,10 @@ def ordinary_chat_legacy_baseline_fallback_allowed(
     situation_frame: SituationFrameV1 | None,
     request_text: str = "",
 ) -> bool:
-    """Allow the established prompt only before a low-risk packet call.
+    """The single-packet route never switches to a second factual prompt."""
 
-    The packet route remains authoritative whenever it generated a candidate or
-    actually entered provider generation. The legacy prompt is available only
-    for local packet/preflight failures, never as a substitute publication
-    owner, and never for typed live/current holds.
-    """
-
-    if execution is None or execution.candidate_active:
-        return False
-    if execution.provider_call_count or execution.corrective_call_count:
-        return False
-    decision = execution.decision
-    run = getattr(decision, "run", None) if decision is not None else None
-    if bool(getattr(run, "prompt_applied", False)):
-        return False
-
-    block_reason = str(execution.block_reason or "").strip().lower()
-    if (
-        "current_fact" in block_reason
-        or block_reason.startswith("pre_generation_")
-    ):
-        return False
-    if (
-        "ambiguous" in block_reason
-        or "deterministic_task_clarify" in block_reason
-        or "deterministic_task_refuse" in block_reason
-    ):
-        return False
-    if str(getattr(situation_frame, "status", "") or "").lower() == (
-        "ambiguous"
-    ):
-        return False
-
-    tasks = tuple(getattr(situation_frame, "tasks", ()) or ())
-    if _ordinary_chat_packet_publication_kind(situation_frame):
-        return False
-    for task in tasks:
-        authority_scope = str(
-            getattr(task, "authority_scope", "") or ""
-        ).strip().lower()
-        currentness = str(
-            getattr(task, "currentness", "") or ""
-        ).strip().lower()
-        required_act = str(
-            getattr(task, "required_response_act", "") or ""
-        ).strip().lower()
-        if authority_scope == "external_current":
-            return False
-        if currentness == "current" and required_act == "hold":
-            return False
-        if required_act in {"clarify", "refuse"}:
-            return False
-
-    if not tasks and _ORDINARY_CHAT_VOLATILE_FALLBACK_RE.search(
-        request_text or ""
-    ):
-        return False
-    return True
+    del execution, situation_frame, request_text
+    return False
 
 
 def _build_ordinary_chat_legacy_baseline_prompt(

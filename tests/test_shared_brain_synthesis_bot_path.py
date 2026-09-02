@@ -1107,6 +1107,13 @@ class SharedBrainSynthesisBotPathTests(
                     ']}'
                 ),
                 provider_call_count=1,
+                total_tokens=321,
+                prompt_tokens=200,
+                candidate_tokens=100,
+                thought_tokens=21,
+                cached_tokens=9,
+                estimated_cost_nanos=123_456,
+                cost_priced=True,
             )
         )
         evaluate = mock.Mock(return_value=decision)
@@ -1176,6 +1183,16 @@ class SharedBrainSynthesisBotPathTests(
         )
         self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 1)
         self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
+        self.assertEqual(evaluate.call_args.kwargs["total_tokens"], 321)
+        self.assertEqual(evaluate.call_args.kwargs["prompt_tokens"], 200)
+        self.assertEqual(evaluate.call_args.kwargs["output_tokens"], 100)
+        self.assertEqual(evaluate.call_args.kwargs["thought_tokens"], 21)
+        self.assertEqual(evaluate.call_args.kwargs["cached_tokens"], 9)
+        self.assertEqual(
+            evaluate.call_args.kwargs["estimated_cost_nanos"],
+            123_456,
+        )
+        self.assertTrue(evaluate.call_args.kwargs["cost_priced"])
         self.assertTrue(evaluate.call_args.kwargs["typed_contract_required"])
 
     async def test_single_packet_preprovider_exit_records_zero_calls(self):
@@ -1501,7 +1518,7 @@ class SharedBrainSynthesisBotPathTests(
             "Do you mean Mac Modem or Cache Back?",
         )
 
-    def test_low_risk_zero_call_packet_block_allows_legacy_baseline(self):
+    def test_zero_call_packet_block_does_not_open_legacy_baseline(self):
         run = SimpleNamespace(prompt_applied=False)
         decision = SimpleNamespace(run=run)
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
@@ -1524,7 +1541,7 @@ class SharedBrainSynthesisBotPathTests(
             )
         )
 
-        self.assertTrue(
+        self.assertFalse(
             bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
                 execution,
                 situation_frame=frame,
@@ -1682,7 +1699,7 @@ class SharedBrainSynthesisBotPathTests(
             )
         )
 
-    async def test_zero_call_block_rebuilds_and_generates_legacy_baseline(self):
+    async def test_zero_call_block_never_generates_legacy_baseline(self):
         run = SimpleNamespace(prompt_applied=False, run_id="packet-run")
         decision = SimpleNamespace(run=run, candidate_selected=False)
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
@@ -1771,39 +1788,9 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertIsNotNone(fallback)
-        self.assertEqual(
-            fallback.response,
-            "DJ Floppydisc is BARCODE's signal and audio engineer.",
-        )
-        self.assertTrue(fallback.packet_execution.legacy_baseline_active)
-        self.assertFalse(fallback.packet_execution.candidate_active)
-        self.assertEqual(
-            fallback.packet_execution.provider_call_count,
-            0,
-        )
-        self.assertEqual(
-            fallback.packet_execution.legacy_baseline_generation_provider_call_count,
-            1,
-        )
-        self.assertIs(fallback.packet_execution.decision, decision)
-        self.assertIsNone(
-            fallback.prompt_metadata["shared_brain_synthesis_canary_basis"]
-        )
-        self.assertEqual(
-            fallback.packet_execution.prompt_source_bases,
-            ("canon-basis", "room-basis"),
-        )
-        self.assertFalse(
-            builder.call_args.kwargs[
-                "_ordinary_chat_single_packet_enabled_override"
-            ]
-        )
-        provider.assert_awaited_once()
-        self.assertEqual(
-            provider.await_args.kwargs["route"],
-            bnl01_bot.ORDINARY_CHAT_LEGACY_BASELINE_ROUTE,
-        )
+        self.assertIsNone(fallback)
+        builder.assert_not_called()
+        provider.assert_not_awaited()
 
     async def test_legacy_baseline_failure_returns_to_packet_block(self):
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(

@@ -2776,6 +2776,97 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             {item.source_ref for item in packet.items},
         )
 
+    def test_mixed_queue_snapshot_is_packet_owned_and_revalidated(self):
+        snapshot = (
+            "Current BARCODE queue snapshot:\n"
+            "- accessScope=public; readOnly=true\n"
+            "- queue open: false"
+        )
+        request = replace(
+            self.public_request(
+                text=(
+                    "What did the Journal say about the queue, and is the "
+                    "queue open right now?"
+                )
+            ),
+            operational_context_snapshot=snapshot,
+            operational_context_kind="website_read_model",
+            operational_context_authorized=True,
+            frame_schema_version="situation_frame_v1",
+            frame_revision="sf_journal_queue_mixed",
+            frame_input_evidence_digest="d" * 64,
+            frame_status="resolved",
+            frame_subject_requirement="not_applicable",
+            frame_subjects=(),
+            frame_tasks=(
+                PacketFrameTask(
+                    task_id="T1",
+                    text_digest="a" * 64,
+                    task_kind="retrieve_publication",
+                    object_kind="journal",
+                    authority_scope="packet",
+                    temporal_scope="historical",
+                    currentness="historical",
+                    required_response_act="answer",
+                    subject_requirement="not_applicable",
+                ),
+                PacketFrameTask(
+                    task_id="T2",
+                    text_digest="b" * 64,
+                    task_kind="answer",
+                    object_kind="queue",
+                    authority_scope="packet",
+                    temporal_scope="current",
+                    currentness="current",
+                    required_response_act="answer",
+                    subject_requirement="not_applicable",
+                ),
+            ),
+            frame_object_kind="multiple",
+            frame_currentness="mixed",
+        )
+        with mock.patch.object(
+            packet_module,
+            "_journal_publication_items",
+            return_value=[],
+        ):
+            packet = build_packet(
+                self.conn,
+                request,
+                persist=False,
+                environ=self.flags,
+            )
+
+        operational = tuple(
+            item
+            for item in packet.items
+            if item.lane == "website_read_model"
+        )
+        self.assertEqual(len(operational), 1)
+        self.assertEqual(
+            operational[0].usage,
+            "temporary_operational_context",
+        )
+        self.assertFalse(packet.diagnostics.invalid_invariants)
+        self.assertTrue(
+            revalidate_packet(
+                self.conn,
+                packet,
+                environ=self.flags,
+                operational_context_snapshot=snapshot,
+                operational_context_snapshot_provided=True,
+            ).valid
+        )
+        changed = revalidate_packet(
+            self.conn,
+            packet,
+            environ=self.flags,
+            operational_context_snapshot=snapshot.replace("false", "true"),
+            operational_context_snapshot_provided=True,
+        )
+        self.assertFalse(changed.valid)
+        self.assertEqual(changed.status, "source_changed")
+
     def test_publication_task_survives_only_unrelated_subject_ambiguity(self):
         publication = IntelligencePacketItem(
             lane="journal_publication",

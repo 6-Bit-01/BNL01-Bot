@@ -26,6 +26,7 @@ from bnl_shared_brain_synthesis import (
     ordinary_chat_deterministic_response_act,
     ordinary_chat_route_scope_decision,
     ordinary_chat_task_support_plan,
+    publication_packet_composes_current_queue,
     publication_packet_owns_turn,
     parse_ordinary_chat_response_contract,
     record_single_packet_block,
@@ -829,6 +830,11 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(publication_packet_owns_turn(journal_topic))
         self.assertFalse(
             publication_packet_owns_turn(mixed_current_queue)
+        )
+        self.assertTrue(
+            publication_packet_composes_current_queue(
+                mixed_current_queue
+            )
         )
 
     def test_packet_owned_prompt_rejects_legacy_and_nonpacket_owners(self):
@@ -1664,6 +1670,13 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             provider_call_count=1,
             corrective_call_count=0,
             generation_latency_ms=42,
+            total_tokens=321,
+            prompt_tokens=200,
+            output_tokens=100,
+            thought_tokens=21,
+            cached_tokens=9,
+            estimated_cost_nanos=123_456,
+            cost_priced=True,
             environ=self.flags,
         )
         self.assertTrue(decision.candidate_selected)
@@ -1683,7 +1696,14 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                    provider_call_count,corrective_call_count,
                    frame_revision,frame_input_evidence_digest,
                    source_snapshot_digest,frame_revalidation_status,
-                   source_revalidation_status,response_sent,live_applied
+                   source_revalidation_status,
+                   candidate_generation_latency_ms,
+                   candidate_total_tokens,candidate_prompt_tokens,
+                   candidate_output_tokens,candidate_thought_tokens,
+                   candidate_cached_tokens,candidate_estimated_cost_nanos,
+                   candidate_cost_priced,candidate_provider_error_count,
+                   candidate_error_category,candidate_provider_error_code,
+                   response_sent,live_applied
             FROM memory_governance_shared_brain_synthesis_runs
             WHERE run_id=?
             """,
@@ -1697,7 +1717,24 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(row[7])
         self.assertEqual(row[8], "valid")
         self.assertTrue(str(row[9]).startswith("passed"))
-        self.assertEqual(row[10:], (1, 1))
+        self.assertEqual(
+            row[10:],
+            (
+                42,
+                321,
+                200,
+                100,
+                21,
+                9,
+                123_456,
+                1,
+                0,
+                "",
+                "",
+                1,
+                1,
+            ),
+        )
 
         columns = {
             str(column[1])

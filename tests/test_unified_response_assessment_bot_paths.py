@@ -443,8 +443,11 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         memory_builder.assert_called_once()
         broadcast_builder.assert_called_once()
 
-    def test_journal_topic_keeps_packet_owner_over_queue_context(self):
-        text = "What did the Journal say about the queue?"
+    def test_journal_and_current_queue_compose_in_one_packet(self):
+        text = (
+            "What did the Journal say about the queue, and is the queue "
+            "open right now?"
+        )
         frame = bnl01_bot.build_situation_frame_v1(
             route_allowed=True,
             route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
@@ -541,6 +544,11 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
+                "build_bnl_queue_packet_snapshot",
+                return_value="CURRENT QUEUE SNAPSHOT",
+            ) as queue_snapshot,
+            mock.patch.object(
+                bnl01_bot,
                 "build_tiktok_show_evidence_context_for_turn",
                 return_value="SHOW OWNER SENTINEL",
             ),
@@ -602,17 +610,31 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             ordinary_basis,
         )
         self.assertEqual(len(assessment_calls), 1)
-        self.assertFalse(
+        self.assertTrue(
             assessment_calls[0]["website_read_model_present"]
         )
         self.assertFalse(assessment_calls[0]["show_state_present"])
-        self.assertNotIn(
+        self.assertIn(
             "website_read_model",
             assessment_calls[0]["prompt_lanes"],
         )
         self.assertNotIn(
             "queue_artist_memory",
             assessment_calls[0]["prompt_lanes"],
+        )
+        self.assertEqual(
+            assessment_calls[0]["operational_context_snapshot"],
+            "CURRENT QUEUE SNAPSHOT",
+        )
+        self.assertTrue(
+            assessment_calls[0][
+                "packet_operational_context_authorized"
+            ]
+        )
+        queue_snapshot.assert_called_once_with(
+            text,
+            "sealed_test",
+            force=False,
         )
         self.assertNotIn("WEBSITE QUEUE OWNER SENTINEL", prompt)
         self.assertNotIn("SHOW STATE OWNER SENTINEL", prompt)

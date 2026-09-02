@@ -129,15 +129,12 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
     )
     if normalized_route == "ordinary_chat_single_packet_canary":
         # The accepted cutover path is one logical and physical provider
-        # attempt: no retry multiplication and no model fallback.
+        # attempt: no retry multiplication and no model fallback.  Its typed
+        # reply is short by contract, so keep the existing output allowance
+        # bounded to avoid spending latency on unused generation headroom.
         return GeminiRoutePolicy(
             lane="protected",
-            max_output_tokens=_bounded_env_int(
-                "BNL_GEMINI_CONVERSATION_MAX_OUTPUT_TOKENS",
-                4_096,
-                minimum=1_024,
-                maximum=16_384,
-            ),
+            max_output_tokens=1_024,
             legacy_thinking_budget=_bounded_env_int(
                 "BNL_GEMINI_CONVERSATION_LEGACY_THINKING_BUDGET",
                 2_048,

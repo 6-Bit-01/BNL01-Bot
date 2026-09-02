@@ -60,7 +60,7 @@ SCHEMA_VERSION = "shared_brain_synthesis_v12"
 CAPABILITY_NAME = "shared_brain_public_broad_recall"
 CAPABILITY_CONTRACT_VERSION = "hybrid_shared_brain_v1"
 CAPABILITY_RECEIPT_VERSION = "shared_brain_capability_receipt_v1"
-_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v11"
+_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v12"
 _EXPECTED_CLAIM_CONTRACT_VERSION = "hybrid_canon_claim_v1"
 _EXPECTED_ASSESSMENT_VERSION = "unified_response_assessment_v8"
 _EXPECTED_IDENTITY_CONTRACT_VERSION = "canon_entity_account_binding_v1"
@@ -131,6 +131,7 @@ _RENDERABLE_LANES = {
     "canon",
     "journal_publication",
     "relay_publication",
+    "website_read_model",
     "source_file",
 }
 _PROFILE_MEMBER_LANES = frozenset(
@@ -179,6 +180,7 @@ _LANE_LABELS = {
     "canon": "approved canon",
     "journal_publication": "canonical Journal publication",
     "relay_publication": "accepted Relay publication",
+    "website_read_model": "current BARCODE site read model",
     "source_file": "authorized source context",
 }
 _CONTROL_MARKERS = (
@@ -230,6 +232,7 @@ _EVIDENCE_STOPWORDS = {
 _LANE_RENDER_PRIORITY = {
     "journal_publication": 0,
     "relay_publication": 0,
+    "website_read_model": 0,
     "approved_fact": 0,
     "atomic_knowledge": 1,
     "recurring_theme": 1,
@@ -1925,6 +1928,44 @@ def publication_packet_owns_turn(situation_frame: Any) -> bool:
     return publication_task_present
 
 
+def publication_packet_composes_current_queue(situation_frame: Any) -> bool:
+    """Allow one packet to compose publication history with queue-now state."""
+
+    tasks = tuple(getattr(situation_frame, "tasks", ()) or ())
+    if not tasks:
+        return False
+    publication_task_present = False
+    current_queue_task_present = False
+    for task in tasks:
+        authority_scope = str(
+            getattr(task, "authority_scope", "") or ""
+        ).strip().lower()
+        object_kind = str(
+            getattr(task, "object_kind", "") or ""
+        ).strip().lower()
+        task_kind = str(
+            getattr(task, "task_kind", "") or ""
+        ).strip().lower()
+        currentness = str(
+            getattr(task, "currentness", "") or ""
+        ).strip().lower()
+        if (
+            authority_scope == "packet"
+            and task_kind == "retrieve_publication"
+            and object_kind in {"journal", "relay"}
+        ):
+            publication_task_present = True
+        elif (
+            authority_scope in {"packet", "external_current"}
+            and object_kind == "queue"
+            and currentness == "current"
+        ):
+            current_queue_task_present = True
+        else:
+            return False
+    return publication_task_present and current_queue_task_present
+
+
 def ordinary_chat_route_scope_enabled(**kwargs: Any) -> bool:
     return ordinary_chat_route_scope_decision(**kwargs).eligible
 
@@ -2792,6 +2833,10 @@ def render_packet_context(
                 "; exact published prose; publication continuity only; "
                 "zero independent fact or recurrence weight"
             )
+        elif item.lane == "website_read_model":
+            qualifier = (
+                "; current read-only snapshot; temporary operational context"
+            )
         line = "[E%s | %s%s] %s" % (
             len(lines) + 1,
             label,
@@ -3121,9 +3166,9 @@ def _ordinary_frame_tasks(
 def _ordinary_task_allowed_lanes(task: Any) -> frozenset[str]:
     object_kind = str(getattr(task, "object_kind", "") or "").lower()
     if object_kind == "queue":
-        # A usable native queue read model is a specialized owner and never
-        # reaches this packet-only path.  With that owner unavailable, no
-        # unrelated packet lane may be cited as current queue-state evidence.
+        # The existing native queue read model may be frozen inside a mixed
+        # publication packet. With that item unavailable, no unrelated packet
+        # lane may be cited as current queue-state evidence.
         # A finalized historical show ledger may still answer what the queue
         # did during a completed show; knowledge never grants queue control.
         historical = bool(
@@ -3132,7 +3177,11 @@ def _ordinary_task_allowed_lanes(task: Any) -> frozenset[str]:
             or str(getattr(task, "temporal_scope", "") or "").lower()
             == "historical"
         )
-        return frozenset({"show_episode"}) if historical else frozenset()
+        return (
+            frozenset({"show_episode"})
+            if historical
+            else frozenset({"website_read_model"})
+        )
     if object_kind == "journal":
         return frozenset({"journal_publication"})
     if object_kind == "relay":
@@ -3193,7 +3242,12 @@ def ordinary_chat_task_support_plan(
         if required_act == "clarify":
             plans.append(OrdinaryChatTaskSupportPlan(task_id, "clarify"))
             continue
-        if required_act == "hold" or authority == "external_current":
+        if required_act == "hold":
+            plans.append(OrdinaryChatTaskSupportPlan(task_id, "hold"))
+            continue
+        if authority == "external_current" and str(
+            getattr(task, "object_kind", "") or ""
+        ).strip().lower() != "queue":
             plans.append(OrdinaryChatTaskSupportPlan(task_id, "hold"))
             continue
         if required_act == "refuse":
@@ -3223,7 +3277,7 @@ def ordinary_chat_task_support_plan(
                 )
             )
             continue
-        if authority != "packet":
+        if authority not in {"packet", "external_current"}:
             plans.append(OrdinaryChatTaskSupportPlan(task_id, ""))
             continue
 
@@ -3561,6 +3615,21 @@ def ordinary_chat_deterministic_response_act(
     return "hold"
 
 
+def _ordinary_blocking_factual_owner_lanes(
+    assessment: UnifiedResponseAssessment,
+    packet: UnifiedIntelligencePacket,
+) -> tuple[str, ...]:
+    """Treat a selected packet projection as packet-owned for this run."""
+
+    blocking = set(assessment.selected_lanes) & set(
+        _NON_PACKET_FACTUAL_OWNER_LANES
+    )
+    packet_lanes = {str(item.lane or "") for item in packet.items}
+    if "website_read_model" in packet_lanes:
+        blocking.discard("website_read_model")
+    return tuple(sorted(blocking))
+
+
 def build_ordinary_chat_basis(
     *,
     guild_id: int,
@@ -3598,11 +3667,9 @@ def build_ordinary_chat_basis(
     rendered, lane_counts, item_count, source_digests = (
         _ordinary_packet_context(packet)
     )
-    blocking_lanes = tuple(
-        sorted(
-            set(assessment.selected_lanes)
-            & _NON_PACKET_FACTUAL_OWNER_LANES
-        )
+    blocking_lanes = _ordinary_blocking_factual_owner_lanes(
+        assessment,
+        packet,
     )
     profile = getattr(packet, "profile_sufficiency", None)
     rendered_evidence_refs = _ordinary_rendered_evidence_refs(
@@ -3800,6 +3867,8 @@ def revalidate_basis(
     environ: Mapping[str, str] | None = None,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
+    operational_context_snapshot: str = "",
+    operational_context_snapshot_provided: bool = False,
 ) -> tuple[bool, str]:
     env = os.environ if environ is None else environ
     if basis.ordinary_chat_single_packet:
@@ -3841,11 +3910,9 @@ def revalidate_basis(
             or fresh_evidence_refs != basis.rendered_evidence_refs
             or basis.competing_factual_contexts
             or basis.blocking_factual_owner_lanes
-            or tuple(
-                sorted(
-                    set(basis.assessment.selected_lanes)
-                    & _NON_PACKET_FACTUAL_OWNER_LANES
-                )
+            or _ordinary_blocking_factual_owner_lanes(
+                basis.assessment,
+                basis.packet,
             )
         ):
             return False, "scope_or_basis_changed"
@@ -3856,6 +3923,10 @@ def revalidate_basis(
             journal_control_snapshot=journal_control_snapshot,
             journal_control_snapshot_provided=(
                 journal_control_snapshot_provided
+            ),
+            operational_context_snapshot=operational_context_snapshot,
+            operational_context_snapshot_provided=(
+                operational_context_snapshot_provided
             ),
         )
         return result.valid, result.status
@@ -3947,6 +4018,10 @@ def revalidate_basis(
         journal_control_snapshot=journal_control_snapshot,
         journal_control_snapshot_provided=(
             journal_control_snapshot_provided
+        ),
+        operational_context_snapshot=operational_context_snapshot,
+        operational_context_snapshot_provided=(
+            operational_context_snapshot_provided
         ),
     )
     return result.valid, result.status
@@ -6927,6 +7002,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             baseline_response_length INTEGER NOT NULL DEFAULT 0,
             candidate_response_length INTEGER NOT NULL DEFAULT 0,
             candidate_generation_latency_ms INTEGER NOT NULL DEFAULT 0,
+            candidate_total_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_output_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_thought_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_cached_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_estimated_cost_nanos INTEGER NOT NULL DEFAULT 0,
+            candidate_cost_priced INTEGER NOT NULL DEFAULT 0,
+            candidate_provider_error_count INTEGER NOT NULL DEFAULT 0,
+            candidate_error_category TEXT NOT NULL DEFAULT '',
+            candidate_provider_error_code TEXT NOT NULL DEFAULT '',
             final_response_length INTEGER NOT NULL DEFAULT 0,
             comparison_status TEXT NOT NULL DEFAULT 'not_evaluated',
             baseline_coherence_status TEXT NOT NULL DEFAULT 'not_evaluated',
@@ -7010,6 +7095,22 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
     for column, definition in (
         ("validation_item_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("candidate_total_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("candidate_prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("candidate_output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("candidate_thought_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("candidate_cached_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "candidate_estimated_cost_nanos",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("candidate_cost_priced", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "candidate_provider_error_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("candidate_error_category", "TEXT NOT NULL DEFAULT ''"),
+        ("candidate_provider_error_code", "TEXT NOT NULL DEFAULT ''"),
         (
             "baseline_member_point_coverage_count",
             "INTEGER NOT NULL DEFAULT 0",
@@ -7154,6 +7255,8 @@ def begin_run(
     environ: Mapping[str, str] | None = None,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
+    operational_context_snapshot: str = "",
+    operational_context_snapshot_provided: bool = False,
 ) -> SynthesisCanaryRun:
     ensure_schema(conn)
     run_id = "sbsr_" + uuid.uuid4().hex
@@ -7164,6 +7267,10 @@ def begin_run(
         journal_control_snapshot=journal_control_snapshot,
         journal_control_snapshot_provided=(
             journal_control_snapshot_provided
+        ),
+        operational_context_snapshot=operational_context_snapshot,
+        operational_context_snapshot_provided=(
+            operational_context_snapshot_provided
         ),
     )
     prompt_applied = bool(
@@ -7297,6 +7404,8 @@ def begin_single_packet_run(
     environ: Mapping[str, str] | None = None,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
+    operational_context_snapshot: str = "",
+    operational_context_snapshot_provided: bool = False,
 ) -> SynthesisCanaryRun:
     """Open the one-call receipt only after deterministic preflight checks."""
 
@@ -7327,6 +7436,10 @@ def begin_single_packet_run(
         journal_control_snapshot=journal_control_snapshot,
         journal_control_snapshot_provided=(
             journal_control_snapshot_provided
+        ),
+        operational_context_snapshot=operational_context_snapshot,
+        operational_context_snapshot_provided=(
+            operational_context_snapshot_provided
         ),
     )
     lane_counts = Counter(item.lane or "unknown" for item in basis.packet.items)
@@ -7400,11 +7513,22 @@ def evaluate_single_packet_response(
     provider_call_count: int,
     corrective_call_count: int = 0,
     generation_latency_ms: int | None = None,
+    total_tokens: int = 0,
+    prompt_tokens: int = 0,
+    output_tokens: int = 0,
+    thought_tokens: int = 0,
+    cached_tokens: int = 0,
+    estimated_cost_nanos: int = 0,
+    cost_priced: bool = False,
+    error_category: str = "",
+    provider_error_code: str = "",
     response_contract: OrdinaryChatResponseContract | None = None,
     typed_contract_required: bool = False,
     environ: Mapping[str, str] | None = None,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
+    operational_context_snapshot: str = "",
+    operational_context_snapshot_provided: bool = False,
 ) -> SynthesisCanaryDecision:
     """Validate one generated response; this path has no baseline fallback."""
 
@@ -7416,6 +7540,10 @@ def evaluate_single_packet_response(
         journal_control_snapshot=journal_control_snapshot,
         journal_control_snapshot_provided=(
             journal_control_snapshot_provided
+        ),
+        operational_context_snapshot=operational_context_snapshot,
+        operational_context_snapshot_provided=(
+            operational_context_snapshot_provided
         ),
     )
     coherence = assess_response_coherence(run.basis.assessment, candidate)
@@ -7475,6 +7603,11 @@ def evaluate_single_packet_response(
         UPDATE memory_governance_shared_brain_synthesis_runs
         SET candidate_generated=?,candidate_response_hash=?,
             candidate_response_length=?,candidate_generation_latency_ms=?,
+            candidate_total_tokens=?,candidate_prompt_tokens=?,
+            candidate_output_tokens=?,candidate_thought_tokens=?,
+            candidate_cached_tokens=?,candidate_estimated_cost_nanos=?,
+            candidate_cost_priced=?,candidate_provider_error_count=?,
+            candidate_error_category=?,candidate_provider_error_code=?,
             comparison_status='single_packet',
             baseline_coherence_status='not_evaluated',
             candidate_coherence_status=?,
@@ -7502,6 +7635,16 @@ def evaluate_single_packet_response(
             _digest(candidate),
             len(candidate),
             max(0, int(generation_latency_ms or 0)),
+            max(0, int(total_tokens or 0)),
+            max(0, int(prompt_tokens or 0)),
+            max(0, int(output_tokens or 0)),
+            max(0, int(thought_tokens or 0)),
+            max(0, int(cached_tokens or 0)),
+            max(0, int(estimated_cost_nanos or 0)),
+            int(bool(cost_priced)),
+            int(bool(error_category or provider_error_code)),
+            str(error_category or "")[:80],
+            str(provider_error_code or "")[:80],
             coherence.status,
             coverage.total_item_count,
             int(output_leak),

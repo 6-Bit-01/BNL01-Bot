@@ -1,6 +1,6 @@
 # One-Packet Convergence v1
 
-`unified_intelligence_packet_v11` is the single factual owner for gated broad
+`unified_intelligence_packet_v12` is the single factual owner for gated broad
 self-profile synthesis and the separately gated ordinary-chat cutover. It
 consumes the immutable Situation Frame revision and resolves each governed
 task subject before source scoring. A true multi-subject ordinary request runs
@@ -53,13 +53,13 @@ by original human or declaration roots. Every durable selection is re-read
 before candidate use. A changed or invalid source forces the established
 response fallback on comparison routes, and blocks or suppresses the
 separately gated ordinary-chat candidate after packet generation without a
-second generation attempt. Before packet prompt application, an otherwise
-eligible stable and unambiguous turn may relinquish packet ownership and
-rebuild the established context-rich route; live-current and clarification
-tasks cannot use that handoff. Broad-profile prompts have one factual packet
-owner, while
+second generation attempt. An eligible ordinary-chat turn never relinquishes
+packet ownership to a second factual prompt. Broad-profile prompts have one
+factual packet owner, while
 current turn, exact reply context, persona, and bounded additive canon remain.
-Specialized operational routes stay outside this cutover.
+Specialized operational routes stay outside this cutover, except that a mixed
+publication/current-queue request may freeze the existing authorized read-only
+queue projection inside the same packet and revalidate it before selection.
 
 For frame-backed turns, a stable Discord account binding outranks typed canon
 aliases; exact approved aliases may identify canon-only subjects but display
@@ -94,9 +94,9 @@ allowlists without exposing their IDs.
 
 All gates remain default-off. Once the ordinary-chat packet prompt is applied,
 the route permits one provider attempt, zero retries, no model fallback, and
-no corrective generation. A zero-packet-call baseline-preservation handoff is
-an established-route recovery, not a packet retry. This version performs no
-deployment, historical
+no corrective generation. A zero-call preflight failure returns the existing
+deterministic block and never opens a legacy factual prompt. This version
+performs no deployment, historical
 promotion, live activation, member-facing correction inference, or knowledge
 edit/delete function. It does not change Journal or Relay generation,
 publication, scheduling, or lifecycle behavior.

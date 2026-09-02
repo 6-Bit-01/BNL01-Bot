@@ -97,7 +97,7 @@ from bnl_website_relay_state import (
 )
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v11"
+SCHEMA_VERSION = "unified_intelligence_packet_v12"
 SUBJECT_RESOLUTION_VERSION = "governed_packet_subject_resolution_v1"
 SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v2"
 JOURNAL_PUBLICATION_SOURCE_CLASS = "journal_publication_projection"
@@ -172,6 +172,7 @@ _LANE_CAPS = {
     "canon": 4,
     "journal_publication": 4,
     "relay_publication": 4,
+    "website_read_model": 1,
     "source_file": 2,
     "relationship_posture": 1,
 }
@@ -203,6 +204,7 @@ _VALIDATION_SUPPORT_LANES = frozenset(
         "canon",
         "journal_publication",
         "relay_publication",
+        "website_read_model",
         "source_file",
     }
 )
@@ -266,6 +268,7 @@ _ASSESSMENT_LANE_MAP = {
     "canon": "canon",
     "source_file": "source_context",
     "relationship_posture": "relationship",
+    "website_read_model": "website_read_model",
 }
 _ADDITIVE_PREDICATES = {
     "open_loop",
@@ -478,6 +481,9 @@ class IntelligencePacketRequest:
     conversation_evidence: tuple[PacketConversationEvidence, ...] = ()
     source_context_snapshot: str = ""
     source_context_authorized: bool = False
+    operational_context_snapshot: str = ""
+    operational_context_kind: str = ""
+    operational_context_authorized: bool = False
     immediate_recap: bool = False
     now: str = ""
     declared_canon_authorized: bool = False
@@ -4533,6 +4539,80 @@ def _source_file_items(
     ]
 
 
+def _operational_context_items(
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+) -> list[IntelligencePacketItem]:
+    """Project the existing public queue read model into a mixed packet.
+
+    This is intentionally not a second queue owner.  The caller supplies the
+    already-authorized, read-only website projection, and the packet freezes
+    it so the existing packet source revalidation can fail closed if it moves.
+    """
+
+    snapshot = str(request.operational_context_snapshot or "").strip()
+    if not snapshot:
+        return []
+    diagnostics.candidates_by_lane["website_read_model"] = (
+        diagnostics.candidates_by_lane.get("website_read_model", 0) + 1
+    )
+    publication_task_present = any(
+        str(task.authority_scope or "").strip().lower() == "packet"
+        and str(task.task_kind or "").strip().lower()
+        == "retrieve_publication"
+        and str(task.object_kind or "").strip().lower()
+        in {"journal", "relay"}
+        for task in request.frame_tasks
+    )
+    current_queue_task_present = any(
+        str(task.authority_scope or "").strip().lower()
+        in {"packet", "external_current"}
+        and str(task.object_kind or "").strip().lower() == "queue"
+        and str(task.currentness or "").strip().lower() == "current"
+        for task in request.frame_tasks
+    )
+    if (
+        not request.operational_context_authorized
+        or str(request.operational_context_kind or "").strip().lower()
+        != "website_read_model"
+        or not publication_task_present
+        or not current_queue_task_present
+    ):
+        _add_exclusion(
+            diagnostics,
+            exclusions,
+            lane="website_read_model",
+            reason="operational_context_not_authorized",
+            source_class=SourceClass.RUNTIME_OBSERVATION.value,
+        )
+        return []
+    source_digest = _digest("website_read_model_snapshot_v1", snapshot)
+    return [
+        IntelligencePacketItem(
+            lane="website_read_model",
+            source_class=SourceClass.RUNTIME_OBSERVATION.value,
+            source_type="authorized_website_read_model_snapshot",
+            source_ref="website_read_model:%s" % source_digest[:32],
+            source_digest=source_digest,
+            subject_key="",
+            predicate_key="current_queue_snapshot",
+            text=snapshot[:1800],
+            visibility=_visibility_for_policy(request.channel_policy),
+            confidence=Confidence.HIGH.value,
+            lifecycle="current",
+            authority=_AUTHORITY_RANK[SourceClass.RUNTIME_OBSERVATION.value],
+            observed_at=request.now or _now(),
+            usage="temporary_operational_context",
+            score=96.0,
+            revalidation_kind="operational_snapshot",
+            revalidation_key=source_digest,
+            attribution_mode="authorized_read_model_projection",
+            uncertainty_status="current_read_only_snapshot",
+        )
+    ]
+
+
 def _relationship_items(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
@@ -5230,6 +5310,7 @@ def _select_items(
         "current_intent": 0,
         "journal_publication": 1,
         "relay_publication": 1,
+        "website_read_model": 1,
         "approved_fact": 1,
         "recurring_theme": 2,
         "atomic_knowledge": 3,
@@ -5262,6 +5343,7 @@ def _select_items(
         "current_intent": 0,
         "journal_publication": 1,
         "relay_publication": 1,
+        "website_read_model": 1,
         "approved_fact": 1,
         "atomic_knowledge": 1,
         "recurring_theme": 1,
@@ -6114,6 +6196,8 @@ def _revalidate_multi_packet_in_snapshot(
     environ: Mapping[str, str] | None = None,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
+    operational_context_snapshot: str = "",
+    operational_context_snapshot_provided: bool = False,
 ) -> PacketRevalidationResult:
     components = tuple(packet.component_packets)
     changed = 0
@@ -6136,6 +6220,10 @@ def _revalidate_multi_packet_in_snapshot(
             journal_control_snapshot=journal_control_snapshot,
             journal_control_snapshot_provided=(
                 journal_control_snapshot_provided
+            ),
+            operational_context_snapshot=operational_context_snapshot,
+            operational_context_snapshot_provided=(
+                operational_context_snapshot_provided
             ),
         )
         changed += int(result.changed_source_count or 0)
@@ -6167,6 +6255,8 @@ def _revalidate_packet_in_snapshot(
     environ: Mapping[str, str] | None = None,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
+    operational_context_snapshot: str = "",
+    operational_context_snapshot_provided: bool = False,
 ) -> PacketRevalidationResult:
     """Re-read every durable source without applying packet content live."""
     if packet.component_packets:
@@ -6177,6 +6267,10 @@ def _revalidate_packet_in_snapshot(
             journal_control_snapshot=journal_control_snapshot,
             journal_control_snapshot_provided=(
                 journal_control_snapshot_provided
+            ),
+            operational_context_snapshot=operational_context_snapshot,
+            operational_context_snapshot_provided=(
+                operational_context_snapshot_provided
             ),
         )
     changed = 0
@@ -6370,6 +6464,20 @@ def _revalidate_packet_in_snapshot(
                     query_mode=str(payload.get("queryMode") or ""),
                     user_text=packet.request.user_text,
                 )
+            elif item.revalidation_kind == "operational_snapshot":
+                snapshot = (
+                    operational_context_snapshot
+                    if operational_context_snapshot_provided
+                    else packet.request.operational_context_snapshot
+                )
+                current = (
+                    _digest(
+                        "website_read_model_snapshot_v1",
+                        str(snapshot or "").strip(),
+                    )
+                    if str(snapshot or "").strip()
+                    else ""
+                )
             elif item.revalidation_kind in {"current", "snapshot"}:
                 current = item.revalidation_key
             else:
@@ -6390,7 +6498,7 @@ def _revalidate_packet_in_snapshot(
     elif changed:
         status = "source_changed"
     elif any(
-        item.revalidation_kind == "snapshot"
+        item.revalidation_kind in {"snapshot", "operational_snapshot"}
         for item in revalidation_items
     ):
         status = "passed_with_provider_snapshot"
@@ -6412,6 +6520,8 @@ def revalidate_packet(
     environ: Mapping[str, str] | None = None,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
+    operational_context_snapshot: str = "",
+    operational_context_snapshot_provided: bool = False,
 ) -> PacketRevalidationResult:
     """Revalidate every source against one coherent database snapshot."""
 
@@ -6426,6 +6536,10 @@ def revalidate_packet(
             journal_control_snapshot=journal_control_snapshot,
             journal_control_snapshot_provided=(
                 journal_control_snapshot_provided
+            ),
+            operational_context_snapshot=operational_context_snapshot,
+            operational_context_snapshot_provided=(
+                operational_context_snapshot_provided
             ),
         )
     finally:
@@ -6577,6 +6691,24 @@ def _packet_invariants(
             )
         ):
             invalid.append("publication_projection_authority_violation")
+        if item.lane == "website_read_model" and not (
+            item.source_class == SourceClass.RUNTIME_OBSERVATION.value
+            and item.source_type == "authorized_website_read_model_snapshot"
+            and item.predicate_key == "current_queue_snapshot"
+            and item.lifecycle == "current"
+            and item.usage == "temporary_operational_context"
+            and item.revalidation_kind == "operational_snapshot"
+            and item.revalidation_key == item.source_digest
+            and item.visibility in _INTERNAL_VISIBILITIES
+            and not item.subject_key
+            and not item.root_identities
+            and not item.occurrence_identities
+            and not item.point_identity
+            and not item.canon_status
+            and not item.canon_domain
+            and not item.canon_claim_kind
+        ):
+            invalid.append("operational_snapshot_authority_violation")
         if item.revalidation_kind in {"atomic", "recurring_theme"} and item.lifecycle not in {
             "established",
             "provisional",
@@ -7325,6 +7457,9 @@ def build_packet(
                 request_terms=request_terms,
                 environ=environ,
             )
+        )
+        candidates.extend(
+            _operational_context_items(request, diagnostics, exclusions)
         )
         candidates.extend(
             _source_file_items(request, diagnostics, exclusions)

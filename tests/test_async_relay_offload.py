@@ -222,6 +222,11 @@ class GeminiOffloadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.text, "")
         self.assertEqual(result.provider_call_count, 0)
+        self.assertEqual(
+            result.error_category,
+            bnl01_bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+        )
+        self.assertEqual(result.total_tokens, 0)
         generate.assert_not_called()
 
     async def test_provider_counter_marks_successful_physical_invocation(self):

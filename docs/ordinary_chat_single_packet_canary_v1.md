@@ -5,10 +5,9 @@ single factual prompt owner and a single provider attempt. It is disabled by
 default and is separate from the broad-profile comparison canary and
 public-home recall owner. The default remains the original private acceptance
 scope; contract v4 adds a second gate for controlled multi-user or
-multi-channel expansion. A bounded pre-provider recovery boundary preserves
-the established context-rich route when the replacement packet cannot be
-constructed locally; it does not turn a rejected packet answer into a second
-generation attempt.
+multi-channel expansion. An eligible turn either uses its one packet-owned
+prompt or returns its existing deterministic clarification/refusal/block; it
+never switches to a second factual prompt.
 
 ## Default-off private acceptance scope
 
@@ -28,8 +27,10 @@ behavior.
 The route is limited to direct, text-only `normal_chat` turns in
 `sealed_test`, `public_home`, or `public_context`. Direct-payload tasks, simple
 greetings, show/status answers, media turns, commands, Journal/Relay controls,
-website read-model answers, Broadcast-memory answers, and community-visual
-owners stay on their established routes.
+standalone website read-model answers, Broadcast-memory answers, and
+community-visual owners stay on their established routes. A mixed request for
+published Journal/Relay prose and the current queue may compose the existing
+authorized read-only queue projection into that same packet.
 
 The capability fails closed when packet or response-assessment shadows are
 unavailable, a prerequisite schema version differs, a global Memory
@@ -63,7 +64,7 @@ the allowlists or expansion authorization changes. IDs are not exposed.
 
 ## One factual owner and one call
 
-The immutable Situation Frame v3 and `unified_intelligence_packet_v11` are
+The immutable Situation Frame v3 and `unified_intelligence_packet_v12` are
 frozen before generation. The packet renderer supplies the sole BARCODE,
 member, identity, relationship, episode, publication, canon, and
 stored-history factual view. The current request and verified exact-reply or
@@ -124,35 +125,6 @@ rejected candidate never falls back to a second generated response.
 Specialized owners are excluded before cutover rather than treated as a
 fallback.
 
-## Established-baseline preservation boundary
-
-The packet cutover must not erase working context before it has a usable
-replacement. If an otherwise eligible, non-ambiguous, non-live turn fails
-locally before any packet provider invocation—for example because the packet,
-assessment, prompt, or receipt cannot be assembled—the route relinquishes
-factual ownership and rebuilds the same established prompt that would have
-been used with the cutover disabled. That rebuild restores eligible room
-context, durable memory, Relationship tone, canon/lore, Broadcast memory, and
-authorized source blocks under their existing route rules.
-
-This is a route handoff, not a packet correction:
-
-- the packet provider and corrective-call counts remain zero;
-- the established path performs its normal generation and existing guards;
-- the older comparison canary is not run on top of that recovery generation;
-- the original packet receipt, when one exists, is finalized as
-  `single_packet_legacy_baseline_sent` with the local block reason and a
-  separate initial baseline-generation provider count; and
-- debug state identifies the handoff as
-  `ordinary_chat_legacy_baseline_fallback`.
-
-The handoff is prohibited after packet prompt application or any packet
-provider/corrective call. It is also prohibited for an ambiguous/clarify task,
-an `external_current` task, a current task requiring `hold`, or a recognizable
-live-current request when no typed frame tasks are available. Those turns keep
-their deterministic clarification or current-fact hold and cannot revive a
-stale baseline answer.
-
 ## Content-free receipts
 
 `shared_brain_synthesis_v12` receipts retain only hashes, counts, bounded
@@ -161,7 +133,8 @@ digest, packet/source snapshot digests, selected lane/status/domain counts,
 prompt-applied state, provider and corrective call counts, candidate-selected
 state, separate frame/source revalidation statuses, guard/fallback reason,
 response-sent state, live-application state, typed-contract status, task
-coverage counts, and support-reference counts.
+coverage counts, support-reference counts, provider latency, token breakdown,
+priced-cost estimate, and bounded provider-error category/code.
 
 No prompt, packet text, source text, response text, participant IDs, or source
 references are stored. Aggregate diagnostics expose ordinary-run totals,

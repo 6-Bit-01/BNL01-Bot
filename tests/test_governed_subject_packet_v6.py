@@ -138,7 +138,7 @@ class GovernedSubjectPacketV6Tests(unittest.TestCase):
         )
 
     def test_packet_schema_is_v11_and_alias_matrix_stays_distinct(self):
-        self.assertEqual(SCHEMA_VERSION, "unified_intelligence_packet_v11")
+        self.assertEqual(SCHEMA_VERSION, "unified_intelligence_packet_v12")
         cases = {
             "Who is Mac Mod3m?": ("mac_modem",),
             "Tell me about DJ Floppy Disc.": ("dj_floppydisc",),

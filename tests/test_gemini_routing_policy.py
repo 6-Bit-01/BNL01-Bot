@@ -50,6 +50,7 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             "ordinary_chat_single_packet_canary"
         )
         self.assertEqual(policy.lane, "protected")
+        self.assertEqual(policy.max_output_tokens, 1_024)
         self.assertEqual(policy.provider_retries, 0)
         self.assertFalse(policy.allow_fallback)
         self.assertEqual(
