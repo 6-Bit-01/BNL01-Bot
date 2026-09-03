@@ -589,6 +589,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 channel_policy="sealed_test",
                 route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
                 is_direct_interaction=True,
+                room_context="RECENT ROOM SENTINEL",
                 website_read_model_context="WEBSITE QUEUE OWNER SENTINEL",
                 conversation_orchestration=orchestration,
                 prompt_metadata=metadata,
@@ -630,7 +631,8 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             "sealed_test",
             force=False,
         )
-        self.assertIn("WEBSITE QUEUE OWNER SENTINEL", prompt)
+        self.assertNotIn("WEBSITE QUEUE OWNER SENTINEL", prompt)
+        self.assertIn("RECENT ROOM SENTINEL", prompt)
         self.assertIn("SHOW STATE OWNER SENTINEL", prompt)
         self.assertIn("QUEUE OWNER SENTINEL", prompt)
         self.assertIn("SHOW OWNER SENTINEL", prompt)
@@ -639,9 +641,15 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 "competing_factual_contexts"
             ]
         )
-        self.assertTrue(
+        self.assertFalse(
             any(
                 "WEBSITE QUEUE OWNER SENTINEL" in context
+                for context in competing_contexts
+            )
+        )
+        self.assertTrue(
+            any(
+                "RECENT ROOM SENTINEL" in context
                 for context in competing_contexts
             )
         )

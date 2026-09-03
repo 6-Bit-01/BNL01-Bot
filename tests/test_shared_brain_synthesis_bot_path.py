@@ -1086,6 +1086,8 @@ class SharedBrainSynthesisBotPathTests(
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
+        conversation_basis = object()
+        memory_basis = object()
         run = SimpleNamespace(
             prompt_applied=True,
             fallback_reason="",
@@ -1163,6 +1165,7 @@ class SharedBrainSynthesisBotPathTests(
                     guild_id=1,
                     user_display_name="Test Member",
                     source_context_available=True,
+                    prompt_source_bases=(conversation_basis, memory_basis),
                 )
             )
 
@@ -1170,6 +1173,10 @@ class SharedBrainSynthesisBotPathTests(
         self.assertEqual(execution.response, "One generated answer.")
         self.assertEqual(execution.provider_call_count, 1)
         self.assertEqual(execution.corrective_call_count, 0)
+        self.assertEqual(
+            execution.prompt_source_bases,
+            (conversation_basis, memory_basis, basis),
+        )
         provider.assert_awaited_once()
         self.assertEqual(
             provider.await_args.kwargs["route"],

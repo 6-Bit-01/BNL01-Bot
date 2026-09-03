@@ -36051,7 +36051,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             )
             batch_website_read_model_prompt_block = ""
-            if batch_website_read_model_context:
+            if (
+                batch_website_read_model_context
+                and not batch_publication_queue_packet_ready
+            ):
                 batch_website_read_model_prompt_block = (
                     "\n\nAuthoritative current live-show context for this "
                     "request:\n"
@@ -36455,6 +36458,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     competing_factual_contexts=tuple(
                         block
                         for block in (
+                            recent_room_prompt,
                             batch_memory_prompt_block,
                             batch_website_read_model_prompt_block,
                             batch_tiktok_show_evidence_prompt_block,
@@ -36638,6 +36642,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         if collapsed_items
                         else ""
                     ),
+                    prompt_source_bases=tuple(batch_prompt_source_bases),
                     source_context_available=bool(
                         batch_ordinary_chat_basis
                         or batch_source_context_available
@@ -38908,6 +38913,8 @@ def build_user_aware_prompt(
         publication_queue_composition
         and operational_queue_packet_snapshot
     )
+    if publication_queue_packet_ready:
+        website_read_model_prompt_block = ""
     broadcast_context_eligible = bool(
         broadcast_context
         and not finalized_show_packet_owner
@@ -39202,6 +39209,7 @@ def build_user_aware_prompt(
             competing_factual_contexts=tuple(
                 block
                 for block in (
+                    room_context,
                     (
                         f"Durable memory context:\n{memory_context}\n"
                         if memory_context
@@ -43003,6 +43011,7 @@ async def maybe_generate_ordinary_chat_single_packet(
     guild_id: int,
     user_display_name: str,
     source_context_available: bool,
+    prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
 ) -> OrdinaryChatSinglePacketExecution | None:
     """Generate one natural response from the shared packet when available.
 
@@ -43155,7 +43164,7 @@ async def maybe_generate_ordinary_chat_single_packet(
             decision=decision,
             response=candidate,
             prompt=packet_prompt.prompt,
-            prompt_source_bases=(basis,),
+            prompt_source_bases=(*tuple(prompt_source_bases or ()), basis),
             candidate_active=bool(decision.candidate_selected),
             provider_call_count=provider_call_count,
             corrective_call_count=0,
@@ -45699,11 +45708,17 @@ async def on_message(message: discord.Message):
                     guild_id=message.guild.id,
                     user_display_name=message.author.display_name,
                     source_context_available=source_context_available,
+                    prompt_source_bases=tuple(
+                        prompt_metadata.get("prompt_source_bases") or ()
+                    ),
                 )
             )
             if ordinary_chat_execution is not None:
                 response = ordinary_chat_execution.response
                 prompt = ordinary_chat_execution.prompt
+                prompt_metadata["prompt_source_bases"] = (
+                    ordinary_chat_execution.prompt_source_bases
+                )
                 show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
             else:  # optional typing wrapper handles Discord 429 safely
                 logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
@@ -46218,11 +46233,17 @@ async def on_message(message: discord.Message):
                 guild_id=message.guild.id,
                 user_display_name=message.author.display_name,
                 source_context_available=source_context_available,
+                prompt_source_bases=tuple(
+                    prompt_metadata.get("prompt_source_bases") or ()
+                ),
             )
         )
         if ordinary_chat_execution is not None:
             response = ordinary_chat_execution.response
             prompt = ordinary_chat_execution.prompt
+            prompt_metadata["prompt_source_bases"] = (
+                ordinary_chat_execution.prompt_source_bases
+            )
             show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
         else:  # optional typing wrapper handles Discord 429 safely
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
@@ -46680,11 +46701,17 @@ async def on_message(message: discord.Message):
                 guild_id=message.guild.id,
                 user_display_name=message.author.display_name,
                 source_context_available=source_context_available,
+                prompt_source_bases=tuple(
+                    prompt_metadata.get("prompt_source_bases") or ()
+                ),
             )
         )
         if ordinary_chat_execution is not None:
             response = ordinary_chat_execution.response
             prompt = ordinary_chat_execution.prompt
+            prompt_metadata["prompt_source_bases"] = (
+                ordinary_chat_execution.prompt_source_bases
+            )
             show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
         else:  # optional typing wrapper handles Discord 429 safely
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")

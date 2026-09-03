@@ -3503,15 +3503,19 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         competing_contexts = ordinary_basis.call_args.kwargs[
             "competing_factual_contexts"
         ]
-        self.assertTrue(
+        self.assertFalse(
             any("PUBLIC WEBSITE QUEUE: open" in item for item in competing_contexts)
         )
         self.assertTrue(
             any("DURABLE MEMORY SENTINEL" in item for item in competing_contexts)
         )
         base_prompt = ordinary_generation.await_args.kwargs["prompt"]
-        self.assertIn("PUBLIC WEBSITE QUEUE: open", base_prompt)
+        self.assertNotIn("PUBLIC WEBSITE QUEUE: open", base_prompt)
         self.assertIn("DURABLE MEMORY SENTINEL", base_prompt)
+        self.assertEqual(
+            ordinary_generation.await_args.kwargs["prompt_source_bases"],
+            (memory_basis,),
+        )
         self.assertNotIn("ground that answer cleanly", channel.sent[0])
 
     async def test_late_fragment_stales_batch_single_packet_without_second_call(

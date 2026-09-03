@@ -12,6 +12,7 @@ import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
 import bnl_website_relay_state as relay
 from bnl_shared_brain_synthesis import (
+    audit_ordinary_chat_candidate_claims,
     begin_single_packet_run,
     build_ordinary_chat_basis,
     evaluate_single_packet_response,
@@ -966,6 +967,98 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             )
             self.assertTrue(validation.valid)
             self.assertEqual(validation.covered_task_count, 2)
+            natural_response = (
+                "The Journal said the queue rehearsal stayed read-only. "
+                "The queue is closed right now."
+            )
+            natural_run = begin_single_packet_run(
+                self.conn,
+                basis,
+                prompt_ready=True,
+                frame_revalidation_status=frame_revalidation.status,
+                environ=flags,
+                journal_control_snapshot=snapshot,
+                journal_control_snapshot_provided=True,
+                operational_context_snapshot=queue_snapshot,
+                operational_context_snapshot_provided=True,
+            )
+            natural = evaluate_single_packet_response(
+                self.conn,
+                natural_run,
+                response=natural_response,
+                typed_contract_required=False,
+                provider_call_count=1,
+                corrective_call_count=0,
+                environ=flags,
+                journal_control_snapshot=snapshot,
+                journal_control_snapshot_provided=True,
+                operational_context_snapshot=queue_snapshot,
+                operational_context_snapshot_provided=True,
+            )
+            self.assertTrue(natural.candidate_selected, natural)
+            self.assertEqual(
+                natural.candidate_claim_classifications,
+                (
+                    "authorized_evidence_supported",
+                    "authorized_evidence_supported",
+                ),
+            )
+            contracted, unsupported = audit_ordinary_chat_candidate_claims(
+                basis,
+                "The queue isn't open right now.",
+            )
+            self.assertEqual(unsupported, 0)
+            self.assertEqual(
+                contracted,
+                ("authorized_evidence_supported",),
+            )
+            combined, unsupported = audit_ordinary_chat_candidate_claims(
+                basis,
+                (
+                    "The Journal said the queue rehearsal stayed read-only "
+                    "and the queue is closed right now."
+                ),
+            )
+            self.assertEqual(unsupported, 0)
+            self.assertEqual(
+                combined,
+                ("authorized_evidence_supported",),
+            )
+            contradictory_run = begin_single_packet_run(
+                self.conn,
+                basis,
+                prompt_ready=True,
+                frame_revalidation_status=frame_revalidation.status,
+                environ=flags,
+                journal_control_snapshot=snapshot,
+                journal_control_snapshot_provided=True,
+                operational_context_snapshot=queue_snapshot,
+                operational_context_snapshot_provided=True,
+            )
+            contradictory = evaluate_single_packet_response(
+                self.conn,
+                contradictory_run,
+                response=(
+                    "The Journal said the queue rehearsal stayed read-only. "
+                    "The queue is open right now."
+                ),
+                typed_contract_required=False,
+                provider_call_count=1,
+                corrective_call_count=0,
+                environ=flags,
+                journal_control_snapshot=snapshot,
+                journal_control_snapshot_provided=True,
+                operational_context_snapshot=queue_snapshot,
+                operational_context_snapshot_provided=True,
+            )
+            self.assertFalse(
+                contradictory.candidate_selected,
+                contradictory,
+            )
+            self.assertEqual(
+                contradictory.fallback_reason,
+                "unsupported_packet_domain_claim",
+            )
             accepted_run = begin_single_packet_run(
                 self.conn,
                 basis,

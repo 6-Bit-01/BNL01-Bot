@@ -6610,6 +6610,231 @@ def _ordinary_chat_supported_claim_has_packet_tail(
     )
 
 
+def _ordinary_chat_authorized_support_terms(value: str) -> frozenset[str]:
+    """Normalize bounded paraphrases already present in authorized evidence."""
+
+    relation_aliases = {
+        "describe": "report",
+        "keep": "remain",
+        "kept": "remain",
+        "note": "report",
+        "record": "report",
+        "report": "report",
+        "say": "report",
+        "stay": "remain",
+        "write": "report",
+    }
+    return frozenset(
+        relation_aliases.get(term, term)
+        for raw_term in _normalized_relation_terms(value)
+        for term in (raw_term.strip("'’"),)
+        if term
+    )
+
+
+def _ordinary_chat_queue_open_state(value: str) -> bool | None:
+    """Read only the existing queue snapshot's stable open/closed field."""
+
+    text = _ordinary_chat_plain_text(value)
+    snapshot_match = re.search(
+        r"\bqueue\s+open\s*[:=]\s*(true|false)\b",
+        text,
+        re.I,
+    )
+    if snapshot_match is not None:
+        return snapshot_match.group(1).casefold() == "true"
+    if re.search(
+        r"\bqueue\b[^.?!\n]{0,80}\b(?:is|are|was|were)n['’]?t"
+        r"(?:\s+\w+){0,2}\s+closed\b",
+        text,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\bqueue\b[^.?!\n]{0,80}\b(?:closed|"
+        r"not(?:\s+\w+){0,2}\s+open|"
+        r"(?:is|are|was|were)n['’]?t(?:\s+\w+){0,2}\s+open)\b",
+        text,
+        re.I,
+    ):
+        return False
+    if re.search(
+        r"\bqueue\b[^.?!\n]{0,80}\bopen\b",
+        text,
+        re.I,
+    ):
+        return True
+    return None
+
+
+def _ordinary_chat_authorized_support_segments(
+    basis: SharedBrainSynthesisBasis,
+) -> tuple[str, ...]:
+    """Return only evidence rendered to the model plus retained prompt context."""
+
+    rendered_refs = {
+        (str(lane or ""), str(source_digest or ""))
+        for _evidence_id, lane, source_digest, _subject_indexes in (
+            basis.rendered_evidence_refs
+        )
+    }
+    packet_items = tuple(
+        dict.fromkeys(
+            (
+                str(getattr(item, "lane", "") or ""),
+                str(getattr(item, "source_digest", "") or ""),
+                str(getattr(item, "text", "") or ""),
+            )
+            for item in tuple(getattr(basis.packet, "items", ()) or ())
+            if (
+                str(getattr(item, "lane", "") or ""),
+                str(getattr(item, "source_digest", "") or ""),
+            )
+            in rendered_refs
+        )
+    )
+    segments: list[str] = []
+    for lane, _source_digest, item_text in packet_items:
+        label = _LANE_LABELS.get(lane, lane.replace("_", " "))
+        if item_text.strip():
+            segments.append(f"{label}: {item_text}")
+    for context in basis.competing_factual_contexts:
+        for line in str(context or "").splitlines():
+            line = line.strip()
+            if not line or line.endswith(":"):
+                continue
+            units = _candidate_claim_units(line)
+            segments.extend(units or (line,))
+    return tuple(dict.fromkeys(segments))
+
+
+def _ordinary_chat_claim_support_parts(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+    *,
+    packet_context: bool,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> tuple[str, ...]:
+    """Split only when a second governed subject begins a factual tail."""
+
+    core = _ordinary_chat_claim_core(claim)
+    starts = [0]
+    for boundary in _PACKET_CLAUSE_TAIL_BOUNDARY_RE.finditer(core):
+        tail = core[boundary.end() :]
+        if (
+            _ordinary_chat_claim_has_packet_subject(
+                basis,
+                tail,
+                packet_context=packet_context,
+                selected_labels=selected_labels,
+                global_labels=global_labels,
+            )
+            or _ordinary_chat_queue_open_state(tail) is not None
+        ):
+            starts.append(boundary.end())
+    if len(starts) == 1:
+        return (claim,)
+    starts.append(len(core))
+    return tuple(
+        core[start:end].strip(" ,;:—–")
+        for start, end in zip(starts, starts[1:])
+        if core[start:end].strip(" ,;:—–")
+    )
+
+
+def _ordinary_chat_claim_part_supported(
+    claim: str,
+    support_segments: Sequence[str],
+) -> bool:
+    claim_terms = (
+        _ordinary_chat_authorized_support_terms(claim)
+        - _PROFILE_GENERIC_TERMS
+        - _PROFILE_SUPPORT_GENERIC_TERMS
+        - _CLAIM_GENERIC_TERMS
+    )
+    claim_names = frozenset(
+        term.strip("'’") for term in _concrete_relation_name_terms(claim)
+    )
+    claim_material = claim_terms - claim_names
+    if len(claim_material) < 2:
+        return False
+    hard_tokens = frozenset(
+        token.casefold().rstrip(".,;:!?")
+        for token in re.findall(
+            r"https?://[^\s)>\]]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
+            r"\b\d+(?:[./:-]\d+)*\b",
+            claim,
+            re.I,
+        )
+    )
+    claim_queue_state = _ordinary_chat_queue_open_state(claim)
+    queue_state_terms = {
+        "clos",
+        "current",
+        "currently",
+        "isn't",
+        "isn’t",
+        "live",
+        "now",
+        "open",
+        "queue",
+        "right",
+        "today",
+    }
+    for support in support_segments:
+        support_terms = (
+            _ordinary_chat_authorized_support_terms(support)
+            - _PROFILE_GENERIC_TERMS
+            - _PROFILE_SUPPORT_GENERIC_TERMS
+            - _CLAIM_GENERIC_TERMS
+        )
+        if claim_names and not claim_names.issubset(support_terms):
+            continue
+        if hard_tokens and not all(
+            token in support.casefold() for token in hard_tokens
+        ):
+            continue
+        support_queue_state = _ordinary_chat_queue_open_state(support)
+        if (
+            claim_queue_state is not None
+            and support_queue_state is not None
+            and claim_material.issubset(queue_state_terms)
+        ):
+            if claim_queue_state == support_queue_state:
+                return True
+            continue
+        if _relation_polarity(claim) != _relation_polarity(support):
+            continue
+        if claim_material.issubset(support_terms):
+            return True
+    return False
+
+
+def _ordinary_chat_claim_supported_by_authorized_evidence(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+    *,
+    support_segments: Sequence[str],
+    packet_context: bool,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> bool:
+    """Recognize grounded facts from the evidence already authorized in prompt."""
+
+    parts = _ordinary_chat_claim_support_parts(
+        basis,
+        claim,
+        packet_context=packet_context,
+        selected_labels=selected_labels,
+        global_labels=global_labels,
+    )
+    return bool(parts) and all(
+        _ordinary_chat_claim_part_supported(part, support_segments)
+        for part in parts
+    )
+
+
 def audit_ordinary_chat_candidate_claims(
     basis: SharedBrainSynthesisBasis,
     response: str,
@@ -6629,6 +6854,9 @@ def audit_ordinary_chat_candidate_claims(
     classifications = tuple(profile.claim_classifications)
     packet_context = _ordinary_chat_packet_domain_context_active(basis)
     selected_labels, global_labels = _ordinary_chat_packet_domain_labels(
+        basis
+    )
+    authorized_support_segments = _ordinary_chat_authorized_support_segments(
         basis
     )
     if len(claims) != len(classifications):
@@ -6813,12 +7041,33 @@ def audit_ordinary_chat_candidate_claims(
         ):
             audited.append("external_public_knowledge")
             continue
-        packet_subject = _ordinary_chat_claim_has_packet_subject(
+        if _ordinary_chat_claim_supported_by_authorized_evidence(
             basis,
             claim,
+            support_segments=authorized_support_segments,
             packet_context=packet_context,
             selected_labels=selected_labels,
             global_labels=global_labels,
+        ):
+            audited.append("authorized_evidence_supported")
+            continue
+        packet_subject = bool(
+            _ordinary_chat_claim_has_packet_subject(
+                basis,
+                claim,
+                packet_context=packet_context,
+                selected_labels=selected_labels,
+                global_labels=global_labels,
+            )
+            or (
+                _ordinary_chat_queue_open_state(claim) is not None
+                and any(
+                    lane == "website_read_model"
+                    for _evidence_id, lane, _digest, _subjects in (
+                        basis.rendered_evidence_refs
+                    )
+                )
+            )
         )
         if packet_subject:
             audited.append("unsupported_packet_domain")

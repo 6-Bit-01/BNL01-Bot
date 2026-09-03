@@ -1830,6 +1830,53 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     decision.candidate_claim_classifications,
                 )
 
+    def test_retained_authorized_context_supports_only_its_grounded_fact(self):
+        retained_context = (
+            "Durable memory context:\n"
+            "Test Member designs modular synth patches for live sets."
+        )
+        context_basis = build_ordinary_chat_basis(
+            guild_id=1,
+            user_id=7,
+            channel_id=10,
+            route_mode="normal_chat",
+            channel_policy="public_context",
+            current_direct=True,
+            user_text=self.text,
+            packet=self.packet,
+            assessment=self.assessment,
+            competing_factual_contexts=(retained_context,),
+            environ=self.flags,
+        )
+        self.assertIsNotNone(context_basis)
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You design modular synth patches for live sets.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+        invented, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(invented, ("unsupported_packet_domain",))
+
+        appended, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            (
+                "You design modular synth patches for live sets and founded "
+                "BARCODE in 1999."
+            ),
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertIn("unsupported_packet_domain", appended)
+
     def test_external_public_knowledge_is_not_made_packet_authority(self):
         external_packet = replace(
             self.packet,

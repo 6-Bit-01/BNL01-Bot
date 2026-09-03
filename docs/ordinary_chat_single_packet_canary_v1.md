@@ -86,7 +86,10 @@ or incomplete task-to-subject map fails closed before generation.
 The composed prompt retains relevant authorized Conversation Context, durable
 memory, Relationship tone, Broadcast/show/site/source context, and canon that
 the existing prompt builder already supplied. Packet evidence is added to that
-same prompt. Exact Journal/Relay publication retrieval and current public
+same prompt. When a mixed publication/current-queue packet freezes the current
+site projection, that projection is represented by the revalidated packet item
+instead of being appended a second time; the other authorized context remains
+in place. Exact Journal/Relay publication retrieval and current public
 queue state remain source-bound, and an explicitly requested publication or
 current queue source is selected before optional background can consume the
 existing packet budget.
@@ -101,8 +104,8 @@ For an eligible turn:
    prose, the existing generation path rewrites it naturally. This is a repair
    of the same response obligation, not a second factual owner or canned
    fallback.
-4. The packet and frame are independently revalidated after generation and
-   immediately before send.
+4. The packet, frame, and retained conversation/memory source bases are
+   independently revalidated after generation and immediately before send.
 5. The provider returns visible natural prose, not a typed JSON envelope.
    Every task must be answered coherently. A task with unavailable current
    evidence states that specific uncertainty while the rest of the request is
@@ -117,8 +120,9 @@ invocation boundary. Local quota refusal, budget-reservation failure, client
 construction failure, and other pre-provider exits remain zero-attempt runs;
 a provider invocation that starts and then fails remains one attempt.
 
-The response receipt audits coverage against the frozen task list and rendered
-packet evidence map without turning that audit into response authority.
+The response receipt audits coverage against the frozen task list, rendered
+packet evidence map, and retained authorized factual context without turning
+that audit into response authority.
 Unsupported packet-domain facts, control leakage, incoherence, and changed
 evidence require repair. Stable public knowledge may still supply ordinary
 common sense; volatile current facts are stated only when current evidence is
