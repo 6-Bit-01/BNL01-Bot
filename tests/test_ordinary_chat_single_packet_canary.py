@@ -29,7 +29,7 @@ from bnl_shared_brain_synthesis import (
     publication_packet_composes_current_queue,
     publication_packet_owns_turn,
     parse_ordinary_chat_response_contract,
-    record_single_packet_block,
+    record_single_packet_review,
     render_ordinary_chat_task_contract,
     render_packet_context,
     validate_ordinary_chat_response_contract,
@@ -845,11 +845,36 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         owned = build_packet_owned_prompt(base_prompt, self.basis)
         self.assertTrue(owned.ready)
         self.assertIn("PACKET-OWNED RESPONSE CONTRACT", owned.prompt)
-        self.assertIn("TYPED TURN TASK CONTRACT", owned.prompt)
-        self.assertIn("PROVIDER OUTPUT CONTRACT", owned.prompt)
+        self.assertIn("TURN RESPONSE PLAN", owned.prompt)
+        self.assertIn("VISIBLE RESPONSE CONTRACT", owned.prompt)
+        self.assertIn("Write one natural BNL reply, not JSON", owned.prompt)
+        self.assertNotIn("Return only this exact JSON template", owned.prompt)
         self.assertIn(self.basis.rendered_context, owned.prompt)
         self.assertEqual(owned.prompt.count(self.basis.rendered_context), 1)
         self.assertNotIn("Durable memory context:", owned.prompt)
+
+        legacy_context = "Durable memory context: old view"
+        replacement_basis = build_ordinary_chat_basis(
+            guild_id=1,
+            user_id=7,
+            channel_id=10,
+            route_mode="normal_chat",
+            channel_policy="public_context",
+            current_direct=True,
+            user_text=self.text,
+            packet=self.packet,
+            assessment=self.assessment,
+            competing_factual_contexts=(legacy_context,),
+            environ=self.flags,
+        )
+        replaced = build_packet_owned_prompt(
+            base_prompt + "\n" + legacy_context,
+            replacement_basis,
+        )
+        self.assertTrue(replaced.ready)
+        self.assertEqual(replaced.replaced_factual_context_count, 1)
+        self.assertNotIn(legacy_context, replaced.prompt)
+        self.assertIn(self.basis.rendered_context, replaced.prompt)
 
         legacy = build_packet_owned_prompt(
             base_prompt + "\nDurable memory context: old view",
@@ -1007,7 +1032,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         rendered = render_ordinary_chat_task_contract(crowded_basis)
         self.assertIn(
-            '"evidenceIds":["E1","E2","E3","E4","E5","E6","E7","E8"]',
+            'evidenceIds=["E1","E2","E3","E4","E5","E6","E7","E8"]',
             rendered,
         )
 
@@ -1420,7 +1445,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertTrue(all(plan.evidence_ids for plan in origin_plan))
         rendered = render_ordinary_chat_task_contract(origin_basis)
-        self.assertIn("Support metadata is system-owned", rendered)
+        self.assertIn("Write one natural BNL reply, not JSON", rendered)
         self.assertIn(
             'request="Who is Cache Back"',
             rendered,
@@ -1434,16 +1459,16 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "Answer only that task line's request value",
+            "Answer every task in order",
             rendered,
         )
         for plan in origin_plan:
             self.assertIn(
-                '"taskId":"%s"' % plan.task_id,
+                "- %s |" % plan.task_id,
                 rendered,
             )
             self.assertIn(
-                '"evidenceIds":%s'
+                "evidenceIds=%s"
                 % json.dumps(list(plan.evidence_ids), separators=(",", ":")),
                 rendered,
             )
@@ -3051,7 +3076,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row, (1, 0, "source_changed", 0))
 
-    def test_processing_block_preserves_call_accounting(self):
+    def test_draft_review_preserves_call_accounting(self):
         run = self._begin()
         decision = evaluate_single_packet_response(
             self.conn,
@@ -3061,15 +3086,15 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             corrective_call_count=0,
             environ=self.flags,
         )
-        blocked = record_single_packet_block(
+        reviewed = record_single_packet_review(
             self.conn,
             decision,
-            reason="single_packet_guard_suppressed",
+            reason="single_packet_response_rewritten_after_guard",
             provider_call_count=1,
             corrective_call_count=0,
             frame_revalidation_status="stale",
         )
-        self.assertFalse(blocked.candidate_selected)
+        self.assertFalse(reviewed.candidate_selected)
         row = self.conn.execute(
             """
             SELECT provider_call_count,corrective_call_count,
@@ -3081,7 +3106,10 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             (run.run_id,),
         ).fetchone()
         self.assertEqual(row[:4], (1, 0, "stale", 0))
-        self.assertEqual(row[4], "single_packet_guard_suppressed")
+        self.assertEqual(
+            row[4],
+            "single_packet_response_rewritten_after_guard",
+        )
 
 
 if __name__ == "__main__":

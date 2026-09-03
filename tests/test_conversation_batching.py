@@ -3356,6 +3356,164 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "batch_single_packet_candidate_sent",
         )
 
+    async def test_mixed_journal_and_current_queue_batch_uses_one_natural_packet(
+        self,
+    ):
+        channel = self._channel(8136)
+        request = (
+            "BNL, what did the Journal say about the queue, and is the "
+            "queue open right now?"
+        )
+        basis = object()
+        packet = object()
+        assessment = object()
+        memory_basis = object()
+        decision = SimpleNamespace(candidate_selected=True)
+        answer = (
+            "The Journal described the queue as BARCODE's public handoff "
+            "for submissions. Right now, the live queue is open."
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response=answer,
+            prompt="packet-owned mixed Journal and queue prompt",
+            prompt_source_bases=(basis,),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        ordinary_generation = mock.AsyncMock(return_value=execution)
+        assessment_calls = []
+        scope_calls = []
+
+        def build_assessment(*_args, **kwargs):
+            assessment_calls.append(kwargs)
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        def scope_decision(**kwargs):
+            scope_calls.append(kwargs)
+            return SimpleNamespace(
+                eligible=not kwargs.get("specialized_owner_present", False),
+                reason="eligible",
+            )
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError(
+                "the composed mixed request must not bypass the packet"
+            )
+
+        self._prime_flush(channel, request)
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.object(
+                bnl01_bot,
+                "publication_packet_owns_turn",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "publication_packet_composes_current_queue",
+                return_value=True,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value="PUBLIC WEBSITE QUEUE: open",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_bnl_queue_packet_snapshot",
+                return_value="CURRENT QUEUE SNAPSHOT: open",
+            ) as queue_snapshot,
+            mock.patch.object(
+                bnl01_bot,
+                "build_tiktok_show_evidence_context_for_turn",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value="DURABLE MEMORY SENTINEL",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_memory_prompt_source_basis",
+                return_value=memory_basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "ordinary_chat_route_scope_decision",
+                side_effect=scope_decision,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=build_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=basis,
+            ) as ordinary_basis,
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_single_packet",
+                new=ordinary_generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+                return_value=None,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(channel.sent, [answer])
+        self.assertTrue(scope_calls)
+        self.assertFalse(scope_calls[-1]["specialized_owner_present"])
+        queue_snapshot.assert_called_once_with(
+            request,
+            "sealed_test",
+            force=False,
+        )
+        self.assertEqual(len(assessment_calls), 1)
+        self.assertEqual(
+            assessment_calls[0]["operational_context_snapshot"],
+            "CURRENT QUEUE SNAPSHOT: open",
+        )
+        self.assertTrue(
+            assessment_calls[0]["packet_operational_context_authorized"]
+        )
+        competing_contexts = ordinary_basis.call_args.kwargs[
+            "competing_factual_contexts"
+        ]
+        self.assertTrue(
+            any("PUBLIC WEBSITE QUEUE: open" in item for item in competing_contexts)
+        )
+        self.assertTrue(
+            any("DURABLE MEMORY SENTINEL" in item for item in competing_contexts)
+        )
+        base_prompt = ordinary_generation.await_args.kwargs["prompt"]
+        self.assertIn("PUBLIC WEBSITE QUEUE: open", base_prompt)
+        self.assertIn("DURABLE MEMORY SENTINEL", base_prompt)
+        self.assertNotIn("ground that answer cleanly", channel.sent[0])
+
     async def test_late_fragment_stales_batch_single_packet_without_second_call(
         self,
     ):
@@ -3433,7 +3591,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ) as shared_generation,
             mock.patch.object(
                 bnl01_bot,
-                "safely_record_ordinary_chat_single_packet_block",
+                "safely_record_ordinary_chat_single_packet_review",
                 new=block,
             ),
             mock.patch.object(
@@ -3546,7 +3704,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
-                "safely_record_ordinary_chat_single_packet_block",
+                "safely_record_ordinary_chat_single_packet_review",
                 new=block,
             ),
             mock.patch.object(

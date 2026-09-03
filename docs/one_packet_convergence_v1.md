@@ -51,10 +51,11 @@ Member-specific `approved_fact`, Living, conversation, and Open evidence is
 ranked before additive project canon. Render-equivalent projections collapse
 by original human or declaration roots. Every durable selection is re-read
 before candidate use. A changed or invalid source forces the established
-response fallback on comparison routes, and blocks or suppresses the
-separately gated ordinary-chat candidate after packet generation without a
-second generation attempt. An eligible ordinary-chat turn never relinquishes
-packet ownership to a second factual prompt. Broad-profile prompts have one
+response selection on comparison routes. On the separately gated
+ordinary-chat route it triggers a natural source-neutral rewrite that preserves
+answerable tasks and states only the specific uncertainty. An eligible
+ordinary-chat turn never relinquishes packet ownership to a second factual
+prompt or emits a canned blocker. Broad-profile prompts have one
 factual packet owner, while
 current turn, exact reply context, persona, and bounded additive canon remain.
 Specialized operational routes stay outside this cutover, except that a mixed
@@ -78,11 +79,11 @@ scope, prerequisite, or version conflict fails closed. The owner-only preview
 adds content-free candidate/selected counts by canon status and domain plus the
 existing exclusion and root-collapse reasons. The independent ordinary-chat
 capability uses `shared_brain_synthesis_v12` content-free receipts with frame,
-packet/source, selected lane/status/domain, provider/corrective call, guard,
-revalidation, typed task/support coverage, send, and fallback/block
-diagnostics. Its typed task contract is the single response-selection
-boundary; later checks can block changed source, frame, control, quote, or
-delivery state but do not reclassify the selected prose.
+packet/source, selected lane/status/domain, provider/corrective call, review,
+revalidation, task/support coverage, send, and delivery diagnostics. The task
+plan guides one natural response. Later checks can require a grounded rewrite
+for changed source, frame, control, or quote state, but cannot cancel an
+authorized ordinary-chat response act.
 
 The v12 synthesis receipt migration is additive and idempotent. Ten new
 content-free latency, token, cost, and bounded error fields default to zero or
@@ -100,9 +101,10 @@ construction. The scope digest binds both the authorization mode and exact
 allowlists without exposing their IDs.
 
 All gates remain default-off. Once the ordinary-chat packet prompt is applied,
-the route permits one provider attempt, zero retries, no model fallback, and
-no corrective generation. A zero-call preflight failure returns the existing
-deterministic block and never opens a legacy factual prompt. This version
+the packet remains the factual owner through any required natural rewrite. A
+preflight packet failure leaves the established context-rich generation path
+responsible for the reply; it does not emit a deterministic blocker or open a
+parallel factual authority. This version
 performs no deployment, historical
 promotion, live activation, member-facing correction inference, or knowledge
 edit/delete function. It does not change Journal or Relay generation,

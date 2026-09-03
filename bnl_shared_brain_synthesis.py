@@ -3351,7 +3351,7 @@ def ordinary_chat_task_support_plan(
 def render_ordinary_chat_task_contract(
     basis: SharedBrainSynthesisBasis,
 ) -> str:
-    """Render ordered task/support instructions for the one provider call."""
+    """Render ordered task/support guidance for one natural BNL response."""
 
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
@@ -3407,43 +3407,24 @@ def render_ordinary_chat_task_contract(
             subject_indexes,
         ) in basis.rendered_evidence_refs
     ]
-    exact_template = json.dumps(
-        {
-            "tasks": [
-                {
-                    "taskId": plan.task_id,
-                    "text": "visible answer for %s only" % plan.task_id,
-                    "supportKind": plan.support_kind or "invalid",
-                    "evidenceIds": list(plan.evidence_ids),
-                }
-                for plan in support_plans
-            ]
-        },
-        separators=(",", ":"),
-    )
     return (
-        "TYPED TURN TASK CONTRACT:\n"
+        "TURN RESPONSE PLAN:\n"
         + "\n".join(task_lines)
         + "\nSUPPORT REFERENCES:\n"
         + ("\n".join(evidence_lines) if evidence_lines else "- none")
         + "\n- PUBLIC may support stable general public knowledge only.\n"
         + "- REQUEST may support a non-factual conversational response only.\n"
-        + "PROVIDER OUTPUT CONTRACT:\n"
-        + "Return only this exact JSON template, replacing each visible "
-        + "answer placeholder and no other value: "
-        + exact_template
-        + ".\nReturn every task exactly once and in order. Support metadata is "
-        + "system-owned: copy each task line's supportKind and evidenceIds "
-        + "values exactly into its JSON object. Do not choose, substitute, "
-        + "add, remove, or reorder support references. Generate only each "
-        + "task's visible text. Answer only that task line's request value; "
-        + "do not repeat, summarize, or include another task's answer in it. "
-        + "For response=refuse, refuse the requested "
-        + "disclosure in that text. For supportKind=hold or clarify, make the "
-        + "visible text perform that act. The text fields become the visible "
-        + "reply. "
-        + "Do not include Markdown fences, task labels, citations, internal "
-        + "terms, or any text outside the JSON object."
+        + "VISIBLE RESPONSE CONTRACT:\n"
+        + "Write one natural BNL reply, not JSON. Answer every task in order "
+        + "and combine them coherently instead of treating one task as a "
+        + "reason to drop another. Use only that task's listed support for "
+        + "BARCODE, member, publication, history, or current-state facts. "
+        + "For supportKind=hold, state only the specific fact that cannot be "
+        + "verified and continue answering the remaining tasks. For "
+        + "response=clarify, ask the natural clarification the task requires. "
+        + "For response=refuse, answer naturally without revealing the "
+        + "protected values. Never mention task IDs, support kinds, evidence "
+        + "IDs, packets, lanes, contracts, validators, or internal controls."
     )
 
 
@@ -3642,6 +3623,7 @@ def build_ordinary_chat_basis(
     packet: UnifiedIntelligencePacket | None,
     assessment: UnifiedResponseAssessment | None,
     has_media: bool = False,
+    competing_factual_contexts: Sequence[str] = (),
     environ: Mapping[str, str] | None = None,
 ) -> SharedBrainSynthesisBasis | None:
     """Freeze one packet-owned basis for the one-call ordinary-chat route."""
@@ -3678,6 +3660,13 @@ def build_ordinary_chat_basis(
     )
     if source_digests and not rendered_evidence_refs:
         return None
+    factual_contexts = tuple(
+        dict.fromkeys(
+            str(value or "")
+            for value in competing_factual_contexts or ()
+            if str(value or "")
+        )
+    )[:8]
     return SharedBrainSynthesisBasis(
         packet=packet,
         assessment=assessment,
@@ -3695,6 +3684,10 @@ def build_ordinary_chat_basis(
         authority_mode=ORDINARY_CHAT_AUTHORITY,
         route_family=ORDINARY_CHAT_ROUTE_FAMILY,
         ordinary_chat_single_packet=True,
+        competing_factual_contexts=factual_contexts,
+        competing_factual_context_digests=tuple(
+            _digest(value) for value in factual_contexts
+        ),
         blocking_factual_owner_lanes=blocking_lanes,
         profile_sufficiency_status=str(
             getattr(profile, "status", "not_applicable")
@@ -3908,7 +3901,11 @@ def revalidate_basis(
             or fresh_item_count != basis.rendered_item_count
             or fresh_digests != basis.rendered_source_digests
             or fresh_evidence_refs != basis.rendered_evidence_refs
-            or basis.competing_factual_contexts
+            or tuple(
+                _digest(value)
+                for value in basis.competing_factual_contexts
+            )
+            != basis.competing_factual_context_digests
             or basis.blocking_factual_owner_lanes
             or _ordinary_blocking_factual_owner_lanes(
                 basis.assessment,
@@ -4054,17 +4051,46 @@ def build_packet_owned_prompt(
                 ready=False,
                 reason="nonpacket_factual_owner_selected",
             )
-        if basis.competing_factual_contexts:
+        replaced = 0
+        for context in basis.competing_factual_contexts:
+            value = str(context or "")
+            if not value:
+                continue
+            start = updated.rfind(value)
+            if start < 0:
+                return PacketOwnedPrompt(
+                    prompt=updated,
+                    ready=False,
+                    reason="competing_factual_context_missing",
+                    replaced_factual_context_count=replaced,
+                )
+            updated = (
+                updated[:start]
+                + _PACKET_FACTUAL_OWNER_REPLACEMENT
+                + updated[start + len(value):]
+            )
+            replaced += 1
+        if any(
+            context and context in updated
+            for context in basis.competing_factual_contexts
+        ):
             return PacketOwnedPrompt(
                 prompt=updated,
                 ready=False,
-                reason="competing_factual_context_present",
+                reason="competing_factual_context_retained",
+                replaced_factual_context_count=replaced,
             )
+        prompt_contract_suffix = updated
+        if "\nIdentity-label rule:" in prompt_contract_suffix:
+            prompt_contract_suffix = prompt_contract_suffix.split(
+                "\nIdentity-label rule:",
+                1,
+            )[1]
         forbidden = next(
             (
                 marker
                 for marker in _ORDINARY_CHAT_FORBIDDEN_PROMPT_MARKERS
-                if marker.casefold() in updated.casefold()
+                if marker.casefold() in prompt_contract_suffix.casefold()
             ),
             "",
         )
@@ -4103,7 +4129,7 @@ def build_packet_owned_prompt(
                 + task_contract
             ),
             ready=True,
-            replaced_factual_context_count=0,
+            replaced_factual_context_count=replaced,
         )
     if basis.honest_empty_profile_fallback:
         return PacketOwnedPrompt(
@@ -7407,19 +7433,25 @@ def begin_single_packet_run(
     operational_context_snapshot: str = "",
     operational_context_snapshot_provided: bool = False,
 ) -> SynthesisCanaryRun:
-    """Open the one-call receipt only after deterministic preflight checks."""
+    """Open the response receipt after source and prompt preflight checks.
 
-    frame_valid = str(frame_revalidation_status or "") == "valid"
+    An ambiguous frame is still usable for generation because its owned task
+    asks BNL to clarify naturally. Ambiguity is not permission to suppress the
+    response obligation.
+    """
+
+    frame_status = str(frame_revalidation_status or "")
+    frame_usable = frame_status in {"valid", "ambiguous"}
     candidate_ready = bool(
         basis.ordinary_chat_single_packet
         and prompt_ready
-        and frame_valid
+        and frame_usable
     )
     failure = (
         str(prompt_failure_reason or "")
         if not prompt_ready
         else "frame_%s" % str(frame_revalidation_status or "invalid")
-        if not frame_valid
+        if not frame_usable
         else "ordinary_chat_basis_required"
         if not basis.ordinary_chat_single_packet
         else ""
@@ -7485,26 +7517,6 @@ def begin_single_packet_run(
     return run
 
 
-def blocked_single_packet_decision(
-    run: SynthesisCanaryRun,
-    *,
-    reason: str = "deterministic_block",
-) -> SynthesisCanaryDecision:
-    """Represent a zero-provider deterministic block without a fallback."""
-
-    return SynthesisCanaryDecision(
-        run=run,
-        response="",
-        candidate_selected=False,
-        fallback_reason=str(reason or run.fallback_reason or "blocked")[:160],
-        comparison_status="not_comparable",
-        baseline_coherence_status="not_evaluated",
-        candidate_coherence_status="not_evaluated",
-        candidate_evidence_coverage_count=0,
-        revalidation_status=run.revalidation_status,
-    )
-
-
 def evaluate_single_packet_response(
     conn: sqlite3.Connection,
     run: SynthesisCanaryRun,
@@ -7530,7 +7542,12 @@ def evaluate_single_packet_response(
     operational_context_snapshot: str = "",
     operational_context_snapshot_provided: bool = False,
 ) -> SynthesisCanaryDecision:
-    """Validate one generated response; this path has no baseline fallback."""
+    """Audit one generated response and persist its evidence receipt.
+
+    Selection is a draft-quality result, not authority to cancel the ordinary
+    response act. Callers rewrite a rejected draft through the same shared
+    brain route and keep this receipt as the reason for that repair.
+    """
 
     candidate = str(response or "").strip()
     valid, source_status = revalidate_basis(
@@ -8094,7 +8111,7 @@ def record_fallback(
     )
 
 
-def record_single_packet_block(
+def record_single_packet_review(
     conn: sqlite3.Connection,
     decision: SynthesisCanaryDecision,
     *,
@@ -8105,9 +8122,9 @@ def record_single_packet_block(
     source_revalidation_status: str = "",
     processing_error: bool = False,
 ) -> SynthesisCanaryDecision:
-    """Record a cutover block without storing prompt or response content."""
+    """Record why a single-packet draft needed repair or was not delivered."""
 
-    blocked = record_fallback(conn, decision, reason=reason)
+    reviewed = record_fallback(conn, decision, reason=reason)
     conn.execute(
         """
         UPDATE memory_governance_shared_brain_synthesis_runs
@@ -8137,7 +8154,7 @@ def record_single_packet_block(
             ORDINARY_CHAT_AUTHORITY,
         ),
     )
-    return blocked
+    return reviewed
 
 
 def finalize_run(

@@ -1454,6 +1454,19 @@ class LeakGuardTests(unittest.TestCase):
         self.assertTrue(bnl01_bot.is_substantive_current_request("Crow asks: what happened with BARCODE this week?"))
         self.assertTrue(bnl01_bot.is_generic_non_answer_response("I’m here, Crow. What do you need?", "Crow"))
         self.assertTrue(bnl01_bot.is_generic_non_answer_response("What can I help with?"))
+        self.assertTrue(
+            bnl01_bot.is_generic_non_answer_response(
+                "I can’t ground that answer cleanly in the current scope. "
+                "Give me one specific target or question and I’ll take "
+                "another pass."
+            )
+        )
+        self.assertFalse(
+            bnl01_bot.is_generic_non_answer_response(
+                "I can’t verify whether the public queue is open right now, "
+                "but the Journal described its submission-review handoff."
+            )
+        )
         self.assertFalse(bnl01_bot.is_generic_non_answer_response("Yeah — BARCODE is back this week, but the slot still needs confirmation."))
 
     def test_media_only_text_is_not_substantive(self):
@@ -1941,7 +1954,7 @@ class RecentMediaRoomContextTests(unittest.TestCase):
         self.assertNotIn("durable", event["visibility"])
 
 
-    def test_bare_media_fallback_detection_and_suppression_without_current_media(self):
+    def test_bare_media_detection_helper_never_erases_the_response(self):
         fallback = "I saw your recent gif as gif embed (embed_type=gifv; provider=Tenor; preview=yes); gif link preview (host=tenor.com), but I do not have a detailed visual description stored for that one."
         self.assertTrue(bnl01_bot.is_bare_media_fallback_text(fallback))
         self.assertEqual(
@@ -1950,10 +1963,10 @@ class RecentMediaRoomContextTests(unittest.TestCase):
                 current_text="what is BARCODE Radio doing next?",
                 current_has_media=False,
             ),
-            "",
+            fallback,
         )
 
-    def test_current_media_reference_can_acknowledge_once_but_not_repeat(self):
+    def test_current_media_reference_helper_never_authors_a_duplicate_message(self):
         fallback = "I saw your recent gif as gif embed (provider=Tenor; preview=yes), but I do not have a detailed visual description stored for that one."
         old_db = bnl01_bot.DB_FILE
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
@@ -1985,7 +1998,7 @@ class RecentMediaRoomContextTests(unittest.TestCase):
                         guild_id=1,
                         channel_id=2,
                     ),
-                    "",
+                    fallback,
                 )
             finally:
                 bnl01_bot.DB_FILE = old_db
@@ -2026,7 +2039,7 @@ class RecentMediaRoomContextTests(unittest.TestCase):
         self.assertNotIn("Recent media context", no_ref)
         self.assertIn("Recent media context", with_ref)
 
-    def test_repeat_guard_replaces_non_media_duplicate(self):
+    def test_repeat_detection_helper_does_not_replace_the_model_response(self):
         old_db = bnl01_bot.DB_FILE
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
             bnl01_bot.DB_FILE = tmp.name
@@ -2039,8 +2052,7 @@ class RecentMediaRoomContextTests(unittest.TestCase):
                         (101, "BNL-01", 1, 2, "model", previous),
                     )
                 replacement = bnl01_bot.suppress_stale_media_fallback(previous, current_text="repeat?", user_id=101, guild_id=1, channel_id=2)
-                self.assertNotEqual(replacement, previous)
-                self.assertNotIn("gif", replacement.lower())
+                self.assertEqual(replacement, previous)
             finally:
                 bnl01_bot.DB_FILE = old_db
 
@@ -2401,16 +2413,26 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_validation_only_guard_failure_recovers_nonempty_reply(self):
         candidate = "What can I help with?"
-        response = await bnl01_bot.validate_deterministic_normal_chat_response(
-            candidate,
-            user_id=101,
-            guild_id=1,
-            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
-            channel_policy="sealed_test",
-            current_user_text="Keep going.",
+        natural_reply = (
+            "The timeout is still the useful signal. Compare the proxy "
+            "request ID, then rerun the failed call once."
         )
-        self.assertTrue(response)
-        self.assertNotEqual(response, candidate)
+        provider = mock.AsyncMock(return_value=natural_reply)
+        with mock.patch.object(
+            bnl01_bot,
+            "get_gemini_response_with_optional_typing",
+            provider,
+        ):
+            response = await bnl01_bot.validate_deterministic_normal_chat_response(
+                candidate,
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="sealed_test",
+                current_user_text="Keep going.",
+            )
+        self.assertEqual(natural_reply, response)
+        provider.assert_awaited_once()
 
     async def test_explicit_status_question_allows_literal_operational_answer(self):
         for user_text in (
@@ -2651,6 +2673,41 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(diagnostics["suppressed"])
         self.assertTrue(diagnostics["generic_non_answer_triggered"])
         self.assertFalse(bnl01_bot.is_generic_non_answer_response(response, "Crow"))
+
+    async def test_unrelated_old_media_draft_regenerates_instead_of_disappearing(self):
+        stale_media = (
+            "I saw your recent gif as gif embed (provider=Tenor; preview=yes), "
+            "but I do not have a detailed visual description stored for that one."
+        )
+        natural_reply = (
+            "BARCODE Radio's next move is not confirmed in the current public "
+            "schedule yet."
+        )
+        provider = mock.AsyncMock(return_value=natural_reply)
+        with mock.patch.object(
+            bnl01_bot,
+            "get_gemini_response_with_optional_typing",
+            provider,
+        ):
+            response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                stale_media,
+                prompt=(
+                    "Current user request: What is BARCODE Radio doing next?"
+                ),
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="public_home",
+                user_display_name="Crow",
+                current_user_text="What is BARCODE Radio doing next?",
+                has_media=False,
+            )
+
+        self.assertEqual(natural_reply, response)
+        self.assertTrue(diagnostics["stale_media_response_guard_triggered"])
+        self.assertTrue(diagnostics["stale_media_response_regenerated"])
+        self.assertFalse(diagnostics["suppressed"])
+        provider.assert_awaited_once()
 
     async def test_media_only_generic_response_suppresses(self):
         media_text = bnl01_bot.append_media_context_to_text("", {"items": ["gif embed"], "prompt_text": "- gif embed"})

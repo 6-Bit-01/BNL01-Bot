@@ -374,7 +374,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
         self.assertEqual(result, "")
         fake_client.models.generate_content.assert_not_called()
 
-    def test_hard_limit_single_packet_uses_existing_visible_local_fallback(self):
+    def test_hard_limit_single_packet_does_not_emit_canned_response(self):
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
@@ -439,7 +439,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
                     prompt="base prompt",
                     basis=basis,
                     scope_applied=True,
-                    preflight_block_reason="",
+                    preflight_reason="",
                     situation_frame=SimpleNamespace(),
                     situation_frame_current_text="Answer this.",
                     route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
@@ -452,15 +452,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
                 )
             )
 
-        self.assertFalse(execution.candidate_active)
-        self.assertEqual(execution.provider_call_count, 0)
-        self.assertTrue(execution.response)
-        self.assertEqual(
-            execution.response,
-            bnl01_bot._ordinary_chat_single_packet_block_response(
-                "provider_call_count_invalid"
-            ),
-        )
+        self.assertIsNone(execution)
         fake_client.models.generate_content.assert_not_called()
 
     def test_unknown_active_model_is_unpriced_and_never_called(self):

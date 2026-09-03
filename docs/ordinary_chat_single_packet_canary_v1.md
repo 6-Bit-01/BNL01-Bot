@@ -1,13 +1,14 @@
 # Ordinary-Chat Single-Packet Canary and Scoped Expansion
 
 This capability cuts an explicitly bounded ordinary-chat scope over to a
-single factual prompt owner and a single provider attempt. It is disabled by
+single factual prompt owner and one natural response obligation. It is disabled by
 default and is separate from the broad-profile comparison canary and
 public-home recall owner. The default remains the original private acceptance
 scope; contract v4 adds a second gate for controlled multi-user or
-multi-channel expansion. An eligible turn either uses its one packet-owned
-prompt or returns its existing deterministic clarification/refusal/block; it
-never switches to a second factual prompt.
+multi-channel expansion. An eligible turn uses its packet-owned prompt when it
+is available. If packet preparation is unavailable, the established
+context-rich generation path still answers the user. Neither path emits a
+deterministic blocker or canned fallback message.
 
 ## Default-off private acceptance scope
 
@@ -32,11 +33,13 @@ community-visual owners stay on their established routes. A mixed request for
 published Journal/Relay prose and the current queue may compose the existing
 authorized read-only queue projection into that same packet.
 
-The capability fails closed when packet or response-assessment shadows are
+Packet authority stays inactive when packet or response-assessment shadows are
 unavailable, a prerequisite schema version differs, a global Memory
 Governance/Relationship/Active Engagement live gate is active, or either
-older shared-brain synthesis authority is requested. Its independent rollback
-switch is `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED`.
+older shared-brain synthesis authority is requested. Those conditions do not
+cancel the ordinary-chat response obligation; they leave the established
+context-rich generation path in place. The independent rollback switch is
+`BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED`.
 
 ## Separately gated bounded expansion
 
@@ -52,17 +55,17 @@ The expanded contract remains limited to:
 
 The expansion gate never supplies or infers IDs. An empty allowlist remains
 incomplete, more than one guild or an over-limit user/channel list fails with
-`scope_limit_exceeded`, and a non-allowlisted request still fails before prompt
-construction or provider use. The primary ordinary-chat kill switch, global
-live-gate conflicts, specialized-owner exclusions, one-provider-call limit,
-and zero-corrective-call limit are unchanged.
+`scope_limit_exceeded`, and a non-allowlisted request remains outside packet
+authority. The primary ordinary-chat kill switch, global live-gate conflicts,
+and specialized-owner exclusions are unchanged. Ordinary generation remains
+responsible for the reply when packet authority is not active.
 
 Content-free configuration diagnostics expose the private or
 `bounded_expansion` scope mode, allowlist counts, hard caps, expansion-gate
 state, expansion-effective state, and a scope digest that changes when either
 the allowlists or expansion authorization changes. IDs are not exposed.
 
-## One factual owner and one call
+## One factual owner and one response
 
 The immutable Situation Frame v3 and `unified_intelligence_packet_v12` are
 frozen before generation. The packet renderer supplies the sole BARCODE,
@@ -71,8 +74,8 @@ stored-history factual view. The current request and verified exact-reply or
 referent text remain task evidence. Persona, style, route behavior, and safety
 remain expression owners but cannot create facts.
 
-A true multi-subject request is still one governed packet and one provider
-attempt. Each frozen task names its required subject indexes. The packet runs
+A true multi-subject request is still one governed packet and one coherent
+response. Each frozen task names its required subject indexes. The packet runs
 the existing single-subject resolution and selection path once per referenced
 subject, then merges those immutable component packets into a task-scoped
 composite. An extra unscoped candidate, unresolved component, changed binding,
@@ -88,42 +91,41 @@ For an eligible turn:
 
 1. Deterministic scope, frame, packet, prompt-owner, and source checks run
    before generation.
-2. The route makes at most one provider attempt with zero provider retries and
-   no model fallback.
-3. Glitch rewrites, cross-universe rewrites, payload-completion corrections,
-   grounding repairs, and other corrective provider calls are disabled.
+2. The route asks BNL for one natural response that uses the complete
+   authorized packet as one understanding of the turn.
+3. If review finds unsafe, stale, internally leaked, generic, or incomplete
+   prose, the existing generation path rewrites it naturally. This is a repair
+   of the same response obligation, not a second factual owner or canned
+   fallback.
 4. The packet and frame are independently revalidated after generation and
    immediately before send.
-5. The provider must return one typed task/result envelope. Every task must
-   appear exactly once and in order, with packet evidence identifiers, the
-   stable-public `PUBLIC` marker, the current-request `REQUEST` marker, or an
-   explicit hold/clarify act as required by the frozen task. Packet answers
-   must cover every subject required by that task and cannot borrow another
-   task's subject evidence.
-6. A candidate is selected once at that typed boundary. It is not
-   semantically reclassified by the legacy prose guard; independent packet,
-   source, frame, control-leak, exact-quote, and delivery checks can still
-   block it without another provider call.
+5. The provider returns visible natural prose, not a typed JSON envelope.
+   Every task must be answered coherently. A task with unavailable current
+   evidence states that specific uncertainty while the rest of the request is
+   still answered; ambiguity becomes a useful clarification; privacy becomes
+   a natural refusal without disclosure.
+6. Packet, source, frame, control-leak, exact-quote, and delivery checks may
+   require a grounded or source-neutral rewrite. They do not veto the
+   authorized response act or substitute a generic message.
 
 Provider-call receipts increment only at the physical `generate_content`
 invocation boundary. Local quota refusal, budget-reservation failure, client
 construction failure, and other pre-provider exits remain zero-attempt runs;
 a provider invocation that starts and then fails remains one attempt.
 
-Before candidate selection, the response contract is validated against the
-frozen task list and the exact rendered packet evidence map. Packet-owned
-tasks require applicable selected evidence identifiers. Stable external
-public knowledge requires `PUBLIC`; volatile/current external facts must be
-held; non-factual current-request responses require `REQUEST`. Missing,
-duplicate, reordered, malformed, cross-lane, or unsupported references block
-the entire candidate.
+The response receipt audits coverage against the frozen task list and rendered
+packet evidence map without turning that audit into response authority.
+Unsupported packet-domain facts, control leakage, incoherence, and changed
+evidence require repair. Stable public knowledge may still supply ordinary
+common sense; volatile current facts are stated only when current evidence is
+available.
 
-Preflight ambiguity or invalid source state uses zero provider calls and a
-bounded clarification/block response. Deliberate ambiguity and volatile or
-live-current tasks retain that fail-closed behavior. A failed generation or
-rejected candidate never falls back to a second generated response.
-Specialized owners are excluded before cutover rather than treated as a
-fallback.
+Preflight ambiguity is generated as a natural clarification. Invalid or
+changed source state produces a natural, specific uncertainty while preserving
+the answerable parts of the request. Specialized owners remain outside the
+cutover rather than becoming parallel factual prompts. A genuine provider or
+Discord transport failure can prevent delivery, but no governance result is
+converted into a canned blocker.
 
 ## Content-free receipts
 
@@ -131,8 +133,8 @@ fallback.
 statuses, and timing. Ordinary-chat rows include the frame revision and input
 digest, packet/source snapshot digests, selected lane/status/domain counts,
 prompt-applied state, provider and corrective call counts, candidate-selected
-state, separate frame/source revalidation statuses, guard/fallback reason,
-response-sent state, live-application state, typed-contract status, task
+state, separate frame/source revalidation statuses, review reason,
+response-sent state, live-application state, task-plan status and task
 coverage counts, support-reference counts, provider latency, token breakdown,
 priced-cost estimate, and bounded provider-error category/code.
 

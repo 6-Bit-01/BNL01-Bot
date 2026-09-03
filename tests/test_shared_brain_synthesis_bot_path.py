@@ -1093,19 +1093,7 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text=(
-                    '{"tasks":['
-                    '{"taskId":"T1","text":"One generated answer.",'
-                    '"supportKind":"external_public",'
-                    '"evidenceIds":["PUBLIC"]},'
-                    '{"taskId":"T2","text":"One generated answer.",'
-                    '"supportKind":"external_public",'
-                    '"evidenceIds":["PUBLIC"]},'
-                    '{"taskId":"T3","text":"One generated answer.",'
-                    '"supportKind":"external_public",'
-                    '"evidenceIds":["PUBLIC"]}'
-                    ']}'
-                ),
+                text="One generated answer.",
                 provider_call_count=1,
                 total_tokens=321,
                 prompt_tokens=200,
@@ -1159,7 +1147,7 @@ class SharedBrainSynthesisBotPathTests(
                     prompt="base prompt",
                     basis=basis,
                     scope_applied=True,
-                    preflight_block_reason="",
+                    preflight_reason="",
                     situation_frame=SimpleNamespace(),
                     situation_frame_current_text="Answer this.",
                     route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
@@ -1193,7 +1181,7 @@ class SharedBrainSynthesisBotPathTests(
             123_456,
         )
         self.assertTrue(evaluate.call_args.kwargs["cost_priced"])
-        self.assertTrue(evaluate.call_args.kwargs["typed_contract_required"])
+        self.assertFalse(evaluate.call_args.kwargs["typed_contract_required"])
 
     async def test_single_packet_preprovider_exit_records_zero_calls(self):
         basis = SimpleNamespace(
@@ -1254,7 +1242,7 @@ class SharedBrainSynthesisBotPathTests(
                     prompt="base prompt",
                     basis=basis,
                     scope_applied=True,
-                    preflight_block_reason="",
+                    preflight_reason="",
                     situation_frame=SimpleNamespace(),
                     situation_frame_current_text="Answer this.",
                     route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
@@ -1267,23 +1255,33 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertFalse(execution.candidate_active)
-        self.assertEqual(execution.provider_call_count, 0)
+        self.assertIsNone(execution)
         provider.assert_awaited_once()
         self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 0)
         self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
 
-    async def test_single_packet_ambiguous_preflight_uses_zero_provider_calls(self):
+    async def test_single_packet_ambiguity_generates_natural_clarification(self):
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
         run = SimpleNamespace(
-            prompt_applied=False,
-            fallback_reason="candidate_prompt_frame_ambiguous",
-            revalidation_status="ambiguous",
+            prompt_applied=True,
+            fallback_reason="",
+            revalidation_status="passed",
             basis=basis,
         )
-        provider = mock.AsyncMock()
+        decision = SimpleNamespace(
+            candidate_selected=True,
+            fallback_reason="",
+            run=run,
+        )
+        provider = mock.AsyncMock(
+            return_value=bnl01_bot.TrackedGenerationResponse(
+                text="Do you mean Mac Modem or Cache Back?",
+                provider_call_count=1,
+            )
+        )
+        evaluate = mock.Mock(return_value=decision)
         with (
             mock.patch.object(
                 bnl01_bot,
@@ -1309,6 +1307,11 @@ class SharedBrainSynthesisBotPathTests(
                 "get_tracked_gemini_response_with_optional_typing",
                 new=provider,
             ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_ordinary_chat_single_packet_receipt",
+                new=evaluate,
+            ),
         ):
             execution = (
                 await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
@@ -1316,7 +1319,7 @@ class SharedBrainSynthesisBotPathTests(
                     prompt="base prompt",
                     basis=basis,
                     scope_applied=True,
-                    preflight_block_reason="",
+                    preflight_reason="",
                     situation_frame=SimpleNamespace(),
                     situation_frame_current_text="Who do you mean?",
                     route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
@@ -1329,16 +1332,20 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertFalse(execution.candidate_active)
-        self.assertEqual(execution.provider_call_count, 0)
-        provider.assert_not_awaited()
+        self.assertTrue(execution.candidate_active)
+        self.assertEqual(
+            execution.response,
+            "Do you mean Mac Modem or Cache Back?",
+        )
+        self.assertEqual(execution.provider_call_count, 1)
+        provider.assert_awaited_once()
         self.assertTrue(begin.call_args.kwargs["prompt_ready"])
         self.assertEqual(
             begin.call_args.kwargs["frame_revalidation_status"],
             "ambiguous",
         )
 
-    async def test_unavailable_current_queue_holds_with_zero_provider_calls(self):
+    async def test_unavailable_current_queue_gets_specific_natural_hold(self):
         task = SimpleNamespace(
             task_id="T1",
             required_response_act="answer",
@@ -1355,12 +1362,27 @@ class SharedBrainSynthesisBotPathTests(
             rendered_evidence_refs=(("E1", "canon", "digest", ()),),
         )
         run = SimpleNamespace(
-            prompt_applied=False,
-            fallback_reason="deterministic_task_hold",
+            prompt_applied=True,
+            fallback_reason="",
             revalidation_status="passed",
             basis=basis,
         )
-        provider = mock.AsyncMock()
+        response = (
+            "I can’t verify whether submissions are open right now, so I "
+            "won’t guess about the queue."
+        )
+        decision = SimpleNamespace(
+            candidate_selected=True,
+            fallback_reason="",
+            run=run,
+        )
+        provider = mock.AsyncMock(
+            return_value=bnl01_bot.TrackedGenerationResponse(
+                text=response,
+                provider_call_count=1,
+            )
+        )
+        evaluate = mock.Mock(return_value=decision)
         with (
             mock.patch.object(
                 bnl01_bot,
@@ -1386,6 +1408,11 @@ class SharedBrainSynthesisBotPathTests(
                 "get_tracked_gemini_response_with_optional_typing",
                 new=provider,
             ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_ordinary_chat_single_packet_receipt",
+                new=evaluate,
+            ),
         ):
             execution = (
                 await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
@@ -1393,7 +1420,7 @@ class SharedBrainSynthesisBotPathTests(
                     prompt="base prompt",
                     basis=basis,
                     scope_applied=True,
-                    preflight_block_reason="",
+                    preflight_reason="",
                     situation_frame=SimpleNamespace(),
                     situation_frame_current_text=(
                         "Can I submit a track right now?"
@@ -1408,18 +1435,18 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertFalse(execution.candidate_active)
-        self.assertEqual(execution.provider_call_count, 0)
+        self.assertTrue(execution.candidate_active)
+        self.assertEqual(execution.provider_call_count, 1)
         self.assertEqual(execution.corrective_call_count, 0)
-        self.assertEqual(execution.block_reason, "deterministic_task_hold")
-        provider.assert_not_awaited()
-        self.assertFalse(begin.call_args.kwargs["prompt_ready"])
+        self.assertEqual(execution.response, response)
+        provider.assert_awaited_once()
+        self.assertTrue(begin.call_args.kwargs["prompt_ready"])
         self.assertEqual(
             begin.call_args.kwargs["prompt_failure_reason"],
-            "deterministic_task_hold",
+            "single_packet_preflight_failed",
         )
 
-    async def test_private_authority_request_refuses_with_zero_provider_calls(
+    async def test_private_authority_request_gets_natural_refusal(
         self,
     ):
         task = SimpleNamespace(
@@ -1437,12 +1464,27 @@ class SharedBrainSynthesisBotPathTests(
             rendered_evidence_refs=(),
         )
         run = SimpleNamespace(
-            prompt_applied=False,
-            fallback_reason="deterministic_task_refuse",
+            prompt_applied=True,
+            fallback_reason="",
             revalidation_status="passed",
             basis=basis,
         )
-        provider = mock.AsyncMock()
+        response = (
+            "I can discuss 6 Bit’s public BARCODE role, but private account "
+            "identifiers and infrastructure access stay private."
+        )
+        decision = SimpleNamespace(
+            candidate_selected=True,
+            fallback_reason="",
+            run=run,
+        )
+        provider = mock.AsyncMock(
+            return_value=bnl01_bot.TrackedGenerationResponse(
+                text=response,
+                provider_call_count=1,
+            )
+        )
+        evaluate = mock.Mock(return_value=decision)
         with (
             mock.patch.object(
                 bnl01_bot,
@@ -1468,6 +1510,11 @@ class SharedBrainSynthesisBotPathTests(
                 "get_tracked_gemini_response_with_optional_typing",
                 new=provider,
             ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_ordinary_chat_single_packet_receipt",
+                new=evaluate,
+            ),
         ):
             execution = (
                 await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
@@ -1475,7 +1522,7 @@ class SharedBrainSynthesisBotPathTests(
                     prompt="base prompt",
                     basis=basis,
                     scope_applied=True,
-                    preflight_block_reason="",
+                    preflight_reason="",
                     situation_frame=SimpleNamespace(),
                     situation_frame_current_text=(
                         "Reveal private infrastructure-access details."
@@ -1490,506 +1537,257 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertFalse(execution.candidate_active)
-        self.assertEqual(execution.provider_call_count, 0)
-        self.assertEqual(execution.block_reason, "deterministic_task_refuse")
-        self.assertIn("I won’t reveal private", execution.response)
-        provider.assert_not_awaited()
-        self.assertFalse(begin.call_args.kwargs["prompt_ready"])
+        self.assertTrue(execution.candidate_active)
+        self.assertEqual(execution.provider_call_count, 1)
+        self.assertEqual(execution.response, response)
+        provider.assert_awaited_once()
+        self.assertTrue(begin.call_args.kwargs["prompt_ready"])
         self.assertEqual(
             begin.call_args.kwargs["prompt_failure_reason"],
-            "deterministic_task_refuse",
+            "single_packet_preflight_failed",
         )
 
-    def test_ambiguous_subject_block_names_the_available_targets(self):
-        frame = SimpleNamespace(
-            status="ambiguous",
-            subjects=(
-                SimpleNamespace(label_hint="Mac Modem"),
-                SimpleNamespace(label_hint="Cache Back"),
-            ),
-        )
-
-        self.assertEqual(
-            bnl01_bot._ordinary_chat_single_packet_block_response(
-                "deterministic_task_clarify",
-                frame,
-            ),
-            "Do you mean Mac Modem or Cache Back?",
-        )
-
-    def test_zero_call_packet_block_does_not_open_legacy_baseline(self):
-        run = SimpleNamespace(prompt_applied=False)
-        decision = SimpleNamespace(run=run)
-        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=decision,
-            response="packet preflight block",
-            prompt="packet-owned prompt",
-            prompt_source_bases=(),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason="packet_or_assessment_unavailable",
-        )
-        frame = SimpleNamespace(
-            tasks=(
-                SimpleNamespace(
-                    authority_scope="packet",
-                    currentness="historical",
-                    required_response_act="answer",
-                ),
-            )
-        )
-
+    def test_canned_block_and_legacy_baseline_paths_are_removed(self):
         self.assertFalse(
-            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
-                execution,
-                situation_frame=frame,
-                request_text=(
-                    "Reply with exactly these names: Cache Back, "
-                    "Call'em Bini"
-                ),
-            )
-        )
-
-    def test_publication_hold_does_not_relabel_legacy_context(self):
-        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=SimpleNamespace(
-                run=SimpleNamespace(prompt_applied=False)
-            ),
-            response="publication hold",
-            prompt="packet-owned prompt",
-            prompt_source_bases=(),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason="deterministic_task_hold",
-        )
-        frame = SimpleNamespace(
-            tasks=(
-                SimpleNamespace(
-                    authority_scope="packet",
-                    currentness="historical",
-                    required_response_act="answer",
-                    object_kind="relay",
-                ),
-            )
-        )
-
-        self.assertFalse(
-            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
-                execution,
-                situation_frame=frame,
-                request_text=(
-                    "What did the Relay say about the last show?"
-                ),
-            )
-        )
-        self.assertIn(
-            "Relay",
-            bnl01_bot._ordinary_chat_single_packet_block_response(
-                "deterministic_task_hold",
-                frame,
-            ),
-        )
-
-    def test_legacy_baseline_never_follows_live_or_started_packet(self):
-        live_frame = SimpleNamespace(
-            tasks=(
-                SimpleNamespace(
-                    authority_scope="external_current",
-                    currentness="current",
-                    required_response_act="hold",
-                ),
-            )
-        )
-        zero_call_execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=SimpleNamespace(
-                run=SimpleNamespace(prompt_applied=False)
-            ),
-            response="hold",
-            prompt="packet-owned prompt",
-            prompt_source_bases=(),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason="deterministic_task_hold",
-        )
-        started_execution = replace(
-            zero_call_execution,
-            decision=SimpleNamespace(
-                run=SimpleNamespace(prompt_applied=True)
-            ),
-            block_reason="candidate_rejected",
-        )
-        ambiguous_execution = replace(
-            zero_call_execution,
-            block_reason="candidate_prompt_frame_ambiguous",
-        )
-        changed_source_execution = replace(
-            zero_call_execution,
-            block_reason="pre_generation_source_changed",
-        )
-        refusal_execution = replace(
-            zero_call_execution,
-            block_reason="deterministic_task_refuse",
-        )
-
-        self.assertFalse(
-            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
-                zero_call_execution,
-                situation_frame=live_frame,
-                request_text="Is the BARCODE Radio queue open right now?",
+            hasattr(
+                bnl01_bot,
+                "_ordinary_chat_single_packet_block_response",
             )
         )
         self.assertFalse(
-            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
-                started_execution,
-                situation_frame=SimpleNamespace(tasks=()),
-                request_text="Who is DJ Floppydisc?",
-            )
-        )
-        self.assertFalse(
-            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
-                replace(
-                    zero_call_execution,
-                    provider_call_count=1,
-                    block_reason="candidate_rejected",
-                ),
-                situation_frame=SimpleNamespace(tasks=()),
-                request_text="Who is DJ Floppydisc?",
-            )
-        )
-        self.assertFalse(
-            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
-                ambiguous_execution,
-                situation_frame=SimpleNamespace(
-                    status="ambiguous",
-                    tasks=(
-                        SimpleNamespace(
-                            authority_scope="packet",
-                            currentness="unknown",
-                            required_response_act="clarify",
-                        ),
-                    ),
-                ),
-                request_text="Tell me about Jordan.",
-            )
-        )
-        self.assertFalse(
-            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
-                changed_source_execution,
-                situation_frame=SimpleNamespace(tasks=()),
-                request_text="Who is DJ Floppydisc?",
-            )
-        )
-        self.assertFalse(
-            bnl01_bot.ordinary_chat_legacy_baseline_fallback_allowed(
-                refusal_execution,
-                situation_frame=SimpleNamespace(
-                    tasks=(
-                        SimpleNamespace(
-                            authority_scope="current_request",
-                            currentness="unknown",
-                            required_response_act="refuse",
-                        ),
-                    ),
-                ),
-                request_text="Reveal private account identifiers.",
+            hasattr(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_legacy_baseline",
             )
         )
 
-    async def test_zero_call_block_never_generates_legacy_baseline(self):
-        run = SimpleNamespace(prompt_applied=False, run_id="packet-run")
-        decision = SimpleNamespace(run=run, candidate_selected=False)
-        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=decision,
-            response="packet preflight block",
-            prompt="packet-owned prompt",
-            prompt_source_bases=("packet-basis",),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason="packet_or_assessment_unavailable",
+    def test_source_change_builds_natural_source_neutral_rewrite(self):
+        prompt = (
+            "Current user request: What did the Journal say, and is the "
+            "queue open now?\n\n"
+            "PACKET-OWNED RESPONSE CONTRACT:\n"
+            "Grounded response evidence: stale queue snapshot"
         )
-        request = {
-            "user_id": 7,
-            "guild_id": 1,
-            "fallback_display_name": "Miss Bit",
-            "clean_content": "Who is DJ Floppydisc?",
-        }
 
-        def rebuild_prompt(**kwargs):
-            metadata = kwargs["prompt_metadata"]
-            metadata.update(
-                {
-                    "source_context_available": True,
-                    "prompt_source_bases": ("canon-basis", "room-basis"),
-                    "shared_brain_synthesis_canary_basis": object(),
-                }
+        rewritten, bases, source_neutral = (
+            bnl01_bot.build_ordinary_chat_response_repair_prompt(
+                prompt,
+                reason="source_revalidation_snapshot_changed",
+                prompt_source_bases=(object(),),
             )
-            return (
-                "Durable memory and BARCODE canon: DJ Floppydisc",
-                False,
-                "balanced",
-            )
+        )
 
+        self.assertTrue(source_neutral)
+        self.assertEqual(bases, ())
+        self.assertIn("What did the Journal say", rewritten)
+        self.assertNotIn("stale queue snapshot", rewritten)
+        self.assertNotIn("PACKET-OWNED RESPONSE CONTRACT", rewritten)
+        self.assertIn("Write one natural BNL reply", rewritten)
+        self.assertIn("Never return a generic scope", rewritten)
+
+    async def test_generic_scope_blocker_is_rewritten_into_mixed_owner_answer(
+        self,
+    ):
+        blocker = (
+            "I can’t ground that answer cleanly in the current scope. "
+            "Give me one specific target or question and I’ll take another "
+            "pass."
+        )
+        natural_answer = (
+            "The Journal described the queue as the handoff between review "
+            "and scheduled play. Right now, the live queue is open."
+        )
         provider = mock.AsyncMock(
-            return_value=bnl01_bot.TrackedGenerationResponse(
-                text=(
-                    "DJ Floppydisc is BARCODE's signal and audio engineer."
+            side_effect=(
+                bnl01_bot.TrackedGenerationResponse(
+                    text=blocker,
+                    provider_call_count=1,
                 ),
-                provider_call_count=1,
+                bnl01_bot.TrackedGenerationResponse(
+                    text=natural_answer,
+                    provider_call_count=1,
+                ),
             )
         )
-        with (
-            mock.patch.object(
-                bnl01_bot,
-                "build_user_aware_prompt",
-                side_effect=rebuild_prompt,
-            ) as builder,
-            mock.patch.object(
-                bnl01_bot,
-                "_build_direct_payload_prompt",
-                side_effect=lambda prompt, _items, _text: prompt,
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "render_conversation_orchestration_prompt",
-                return_value="",
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "get_tracked_gemini_response_with_optional_typing",
-                new=provider,
-            ),
-        ):
-            fallback = (
-                await bnl01_bot.maybe_generate_ordinary_chat_legacy_baseline(
-                    execution=execution,
-                    prompt_metadata={
-                        "ordinary_chat_legacy_baseline_request": request
-                    },
-                    channel=FakeChannel(),
-                    payload_items=[],
-                    request_text=request["clean_content"],
-                    conversation_orchestration=None,
-                    situation_frame=SimpleNamespace(
-                        tasks=(
-                            SimpleNamespace(
-                                authority_scope="packet",
-                                currentness="historical",
-                                required_response_act="answer",
-                            ),
-                        )
-                    ),
-                    user_id=7,
-                    guild_id=1,
-                )
-            )
-
-        self.assertIsNone(fallback)
-        builder.assert_not_called()
-        provider.assert_not_awaited()
-
-    async def test_legacy_baseline_failure_returns_to_packet_block(self):
-        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=None,
-            response="packet preflight block",
-            prompt="packet-owned prompt",
-            prompt_source_bases=(),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason="packet_or_assessment_unavailable",
-        )
-        metadata = {
-            "ordinary_chat_legacy_baseline_request": {
-                "user_id": 7,
-                "guild_id": 1,
-                "fallback_display_name": "Miss Bit",
-                "clean_content": "Who is DJ Floppydisc?",
-            }
+        diagnostics = {
+            "suppressed": True,
+            "suppression_reason": "single_packet_candidate_rejected",
+            "response_review_requires_rewrite": True,
         }
-        frame = SimpleNamespace(
-            tasks=(
-                SimpleNamespace(
-                    authority_scope="packet",
-                    currentness="historical",
-                    required_response_act="answer",
-                ),
-            )
-        )
 
         with mock.patch.object(
             bnl01_bot,
-            "_build_ordinary_chat_legacy_baseline_prompt",
-            side_effect=RuntimeError("rebuild failed"),
+            "get_tracked_gemini_response_with_optional_typing",
+            new=provider,
         ):
-            rebuild_failure = (
-                await bnl01_bot.maybe_generate_ordinary_chat_legacy_baseline(
-                    execution=execution,
-                    prompt_metadata=metadata,
-                    channel=FakeChannel(),
-                    payload_items=[],
-                    request_text="Who is DJ Floppydisc?",
-                    conversation_orchestration=None,
-                    situation_frame=frame,
-                    user_id=7,
-                    guild_id=1,
-                )
-            )
-
-        provider = mock.AsyncMock(side_effect=RuntimeError("provider failed"))
-        with (
-            mock.patch.object(
-                bnl01_bot,
-                "_build_ordinary_chat_legacy_baseline_prompt",
-                return_value=(
-                    "context-rich prompt",
-                    False,
-                    "balanced",
-                    {"source_context_available": True},
-                ),
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "get_tracked_gemini_response_with_optional_typing",
-                new=provider,
-            ),
-        ):
-            provider_failure = (
-                await bnl01_bot.maybe_generate_ordinary_chat_legacy_baseline(
-                    execution=execution,
-                    prompt_metadata=metadata,
-                    channel=FakeChannel(),
-                    payload_items=[],
-                    request_text="Who is DJ Floppydisc?",
-                    conversation_orchestration=None,
-                    situation_frame=frame,
-                    user_id=7,
-                    guild_id=1,
-                )
-            )
-
-        self.assertIsNone(rebuild_failure)
-        self.assertIsNone(provider_failure)
-        self.assertFalse(execution.legacy_baseline_active)
-
-    async def test_legacy_baseline_uses_normal_guard_and_finalizes_receipt(self):
-        message = FakeMessage()
-        message.content = "Who is DJ Floppydisc?"
-        run = SimpleNamespace(prompt_applied=False, run_id="packet-run")
-        decision = SimpleNamespace(
-            run=run,
-            candidate_selected=False,
-            fallback_reason="packet_or_assessment_unavailable",
-        )
-        response = "DJ Floppydisc is BARCODE's signal and audio engineer."
-        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=decision,
-            response=response,
-            prompt="context-rich baseline prompt",
-            prompt_source_bases=("canon-basis",),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason="packet_or_assessment_unavailable",
-            legacy_baseline_active=True,
-            legacy_baseline_generation_provider_call_count=1,
-            legacy_fallback_reason="packet_or_assessment_unavailable",
-        )
-        guard = mock.AsyncMock(
-            return_value=(response, {"suppressed": False})
-        )
-        older_canary = mock.AsyncMock(
-            side_effect=AssertionError(
-                "legacy fallback invoked the older synthesis canary"
-            )
-        )
-        finalize = mock.AsyncMock(return_value=True)
-        with ExitStack() as stack:
-            for patcher in self.common_patches():
-                stack.enter_context(patcher)
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "apply_guarded_response_regeneration",
-                    new=guard,
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "maybe_generate_shared_brain_synthesis_canary",
-                    new=older_canary,
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "safely_finalize_shared_brain_synthesis",
-                    new=finalize,
-                )
-            )
-
-            await bnl01_bot.send_planned_conversation_response(
-                message,
+            (
                 response,
-                self.plan(),
-                prompt="context-rich baseline prompt",
-                prompt_source_bases=("canon-basis",),
+                rewritten_prompt,
+                source_bases,
+                provider_calls,
+                source_neutral,
+            ) = await bnl01_bot.resolve_guarded_response_obligation(
+                blocker,
+                baseline_response=blocker,
+                prompt=(
+                    "Current user request: What did the Journal say about "
+                    "the queue, and is the queue open right now?\n\n"
+                    "PACKET-OWNED RESPONSE CONTRACT:\n"
+                    "Grounded Journal publication and current queue state."
+                ),
+                current_user_text=(
+                    "What did the Journal say about the queue, and is the "
+                    "queue open right now?"
+                ),
+                diagnostics=diagnostics,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="public_context",
+                user_id=7,
+                guild_id=1,
+                channel=FakeChannel(),
+                prompt_source_bases=(object(),),
                 source_context_available=True,
-                allow_model_save=False,
-                mark_recent_direct=False,
-                ordinary_chat_single_packet_execution=execution,
             )
 
-        self.assertEqual(message.replies, [response])
-        older_canary.assert_not_awaited()
-        guard.assert_awaited_once()
-        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
-        finalize.assert_awaited_once()
-        self.assertTrue(finalize.await_args.kwargs["response_sent"])
-        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+        self.assertEqual(natural_answer, response)
+        self.assertNotEqual(blocker, response)
+        self.assertFalse(bnl01_bot.is_generic_non_answer_response(response))
         self.assertEqual(
-            finalize.await_args.kwargs["guard_status"],
-            "single_packet_legacy_baseline_sent",
+            2,
+            rewritten_prompt.count("RESPONSE REWRITE REQUIRED:"),
         )
+        self.assertEqual(2, provider_calls)
+        self.assertEqual(2, provider.await_count)
+        self.assertEqual(1, len(source_bases))
+        self.assertFalse(source_neutral)
+        self.assertFalse(diagnostics["suppressed"])
 
-    def test_route_debug_renders_legacy_baseline_evidence(self):
+    async def test_empty_first_rewrite_gets_second_shared_brain_attempt(self):
+        natural_answer = (
+            "The Journal covered the queue’s published role, and the current "
+            "queue is open."
+        )
+        provider = mock.AsyncMock(
+            side_effect=(
+                bnl01_bot.TrackedGenerationResponse(
+                    text="",
+                    provider_call_count=1,
+                ),
+                bnl01_bot.TrackedGenerationResponse(
+                    text=natural_answer,
+                    provider_call_count=1,
+                ),
+            )
+        )
+        diagnostics = {
+            "suppressed": True,
+            "suppression_reason": "single_packet_candidate_rejected",
+            "response_review_requires_rewrite": True,
+        }
+
+        with mock.patch.object(
+            bnl01_bot,
+            "get_tracked_gemini_response_with_optional_typing",
+            new=provider,
+        ):
+            response, _prompt, _bases, provider_calls, _source_neutral = (
+                await bnl01_bot.resolve_guarded_response_obligation(
+                    "",
+                    baseline_response="",
+                    prompt=(
+                        "Current user request: What did the Journal say "
+                        "about the queue, and is it open right now?\n\n"
+                        "PACKET-OWNED RESPONSE CONTRACT:\n"
+                        "Grounded Journal publication and current queue state."
+                    ),
+                    current_user_text=(
+                        "What did the Journal say about the queue, and is it "
+                        "open right now?"
+                    ),
+                    diagnostics=diagnostics,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_context",
+                    user_id=7,
+                    guild_id=1,
+                    channel=FakeChannel(),
+                    prompt_source_bases=(object(),),
+                    source_context_available=True,
+                )
+            )
+
+        self.assertEqual(natural_answer, response)
+        self.assertEqual(2, provider_calls)
+        self.assertEqual(2, provider.await_count)
+        self.assertFalse(diagnostics["suppressed"])
+
+    async def test_exhausted_rewrites_never_release_generic_blocker(self):
+        blocker = (
+            "I can’t ground that answer cleanly in the current scope. "
+            "Give me one specific question and I’ll take another pass."
+        )
+        provider = mock.AsyncMock(
+            return_value=bnl01_bot.TrackedGenerationResponse(
+                text=blocker,
+                provider_call_count=1,
+            )
+        )
+        diagnostics = {
+            "suppressed": True,
+            "suppression_reason": "single_packet_candidate_rejected",
+            "response_review_requires_rewrite": True,
+        }
+
+        with mock.patch.object(
+            bnl01_bot,
+            "get_tracked_gemini_response_with_optional_typing",
+            new=provider,
+        ):
+            response, _prompt, _bases, provider_calls, _source_neutral = (
+                await bnl01_bot.resolve_guarded_response_obligation(
+                    blocker,
+                    baseline_response=blocker,
+                    prompt="Current user request: Is the queue open now?",
+                    current_user_text="Is the queue open now?",
+                    diagnostics=diagnostics,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_context",
+                    user_id=7,
+                    guild_id=1,
+                    channel=FakeChannel(),
+                    source_context_available=True,
+                )
+            )
+
+        self.assertEqual("", response)
+        self.assertEqual(2, provider_calls)
+        self.assertEqual(2, provider.await_count)
+        self.assertTrue(diagnostics["suppressed"])
+
+    def test_route_debug_reports_review_without_fallback_selector(self):
         with mock.patch.dict(
             bnl01_bot.LAST_ROUTE_DEBUG,
             {
                 "ordinary_chat_single_packet_applied": True,
-                "ordinary_chat_legacy_baseline_fallback": True,
-                "ordinary_chat_single_packet_provider_call_count": 0,
-                "ordinary_chat_single_packet_corrective_call_count": 0,
-                "ordinary_chat_single_packet_block_reason": (
-                    "packet_or_assessment_unavailable"
+                "ordinary_chat_single_packet_provider_call_count": 1,
+                "ordinary_chat_single_packet_corrective_call_count": 1,
+                "ordinary_chat_single_packet_review_reason": (
+                    "single_packet_response_rewritten_after_guard"
                 ),
-                (
-                    "ordinary_chat_legacy_baseline_generation_"
-                    "provider_call_count"
-                ): 1,
             },
             clear=True,
         ):
             rendered = bnl01_bot.format_last_route_debug()
 
-        self.assertIn("ordinary-chat baseline fallback: `True`", rendered)
-        self.assertIn("ordinary-chat packet provider calls: `0`", rendered)
+        self.assertIn("ordinary-chat packet provider calls: `1`", rendered)
+        self.assertIn("ordinary-chat packet corrective calls: `1`", rendered)
         self.assertIn(
-            "ordinary-chat packet block reason: "
-            "`packet_or_assessment_unavailable`",
+            "ordinary-chat packet review reason: "
+            "`single_packet_response_rewritten_after_guard`",
             rendered,
         )
-        self.assertIn(
-            "ordinary-chat baseline generation provider calls: `1`",
-            rendered,
-        )
+        self.assertNotIn("ordinary-chat baseline fallback", rendered)
 
-    async def test_single_packet_deterministic_clarification_bypasses_factual_guard_and_sends(self):
+    async def test_generated_clarification_uses_guard_and_sends(self):
         message = FakeMessage()
         message.content = "Tell me about Jordan."
         situation_frame = bnl01_bot.build_situation_frame_v1(
@@ -2008,9 +1806,9 @@ class SharedBrainSynthesisBotPathTests(
             response_act="clarify",
             packet_revision="turn_ambiguous_clarification",
         )
-        reason = "candidate_prompt_frame_ambiguous"
+        response = "Do you mean Mac Modem or Cache Back?"
         run = SimpleNamespace(
-            run_id="single-block-run",
+            run_id="single-clarification-run",
             basis=SimpleNamespace(
                 packet=SimpleNamespace(
                     source_snapshot_digest="source-digest"
@@ -2019,25 +1817,20 @@ class SharedBrainSynthesisBotPathTests(
         )
         decision = SimpleNamespace(
             run=run,
-            candidate_selected=False,
-            fallback_reason=reason,
+            candidate_selected=True,
+            fallback_reason="",
         )
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
             decision=decision,
-            response=bnl01_bot._ordinary_chat_single_packet_block_response(
-                reason
-            ),
+            response=response,
             prompt="packet-owned prompt",
             prompt_source_bases=(),
-            candidate_active=False,
-            provider_call_count=0,
+            candidate_active=True,
+            provider_call_count=1,
             corrective_call_count=0,
-            block_reason=reason,
         )
         guard = mock.AsyncMock(
-            side_effect=AssertionError(
-                "deterministic clarification reached factual guard"
-            )
+            return_value=(response, {"suppressed": False})
         )
         finalize = mock.AsyncMock(return_value=True)
         with ExitStack() as stack:
@@ -2071,13 +1864,14 @@ class SharedBrainSynthesisBotPathTests(
                 situation_frame_current_text=message.content,
             )
 
-        self.assertEqual(message.replies, [execution.response])
-        guard.assert_not_awaited()
+        self.assertEqual(message.replies, [response])
+        guard.assert_awaited_once()
+        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
         finalize.assert_awaited_once()
         self.assertTrue(finalize.await_args.kwargs["response_sent"])
-        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+        self.assertTrue(finalize.await_args.kwargs["candidate_live"])
 
-    async def test_single_packet_guard_modification_recovers_send(self):
+    async def test_single_packet_guard_repair_is_sent_without_blocking(self):
         message = FakeMessage()
         message.author.display_name = "Test Member"
         run = SimpleNamespace(run_id="single-run")
@@ -2101,12 +1895,12 @@ class SharedBrainSynthesisBotPathTests(
                 {"suppressed": False},
             )
         )
-        blocked_decision = SimpleNamespace(
+        reviewed_decision = SimpleNamespace(
             run=run,
             candidate_selected=False,
             fallback_reason="single_packet_guard_modified_response",
         )
-        record_block = mock.AsyncMock(return_value=blocked_decision)
+        record_review = mock.AsyncMock(return_value=reviewed_decision)
         finalize = mock.AsyncMock(return_value=True)
         with ExitStack() as stack:
             for patcher in self.common_patches():
@@ -2121,8 +1915,8 @@ class SharedBrainSynthesisBotPathTests(
             stack.enter_context(
                 mock.patch.object(
                     bnl01_bot,
-                    "safely_record_ordinary_chat_single_packet_block",
-                    new=record_block,
+                    "safely_record_ordinary_chat_single_packet_review",
+                    new=record_review,
                 )
             )
             stack.enter_context(
@@ -2145,24 +1939,123 @@ class SharedBrainSynthesisBotPathTests(
             )
 
         self.assertEqual(message.replies, ["Modified candidate."])
-        self.assertFalse(guard.await_args.kwargs["regeneration_allowed"])
-        record_block.assert_awaited_once()
-        self.assertEqual(
-            record_block.await_args.kwargs["reason"],
-            "single_packet_guard_modified_response",
+        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
+        record_review.assert_not_awaited()
+        finalize.assert_awaited_once()
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
+        self.assertTrue(finalize.await_args.kwargs["candidate_live"])
+
+    async def test_single_packet_generic_blocker_is_rewritten_not_sent(self):
+        message = FakeMessage()
+        message.content = (
+            "What did the Journal say about the queue, and is the queue "
+            "open right now?"
         )
+        run = SimpleNamespace(run_id="single-generic-review-run")
+        decision = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="I can’t ground that answer cleanly in the current scope.",
+            prompt="packet-owned mixed Journal and queue prompt",
+            prompt_source_bases=(),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        natural_response = (
+            "The Journal described how queue submissions move into BARCODE "
+            "review. The public queue is open right now."
+        )
+        guard = mock.AsyncMock(
+            return_value=(
+                "",
+                {
+                    "suppressed": True,
+                    "suppression_reason": "generic_non_answer_after_retry",
+                },
+            )
+        )
+        resolve = mock.AsyncMock(
+            return_value=(
+                natural_response,
+                "natural rewrite prompt",
+                (),
+                1,
+                False,
+            )
+        )
+        reviewed_decision = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="single_packet_response_rewritten_after_guard",
+        )
+        review = mock.AsyncMock(return_value=reviewed_decision)
+        finalize = mock.AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "resolve_guarded_response_obligation",
+                    new=resolve,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_record_ordinary_chat_single_packet_review",
+                    new=review,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalize,
+                )
+            )
+
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "ignored established response",
+                self.plan(),
+                prompt="ignored established prompt",
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+                ordinary_chat_single_packet_execution=execution,
+            )
+
+        self.assertEqual(message.replies, [natural_response])
+        self.assertNotIn("ground that answer cleanly", message.replies[0])
+        self.assertIn("Journal", message.replies[0])
+        self.assertIn("open right now", message.replies[0])
+        guard.assert_awaited_once()
+        resolve.assert_awaited_once()
+        review.assert_awaited_once()
         finalize.assert_awaited_once()
         self.assertTrue(finalize.await_args.kwargs["response_sent"])
         self.assertFalse(finalize.await_args.kwargs["candidate_live"])
 
-    async def test_typed_single_packet_candidate_is_not_semantically_rejudged(self):
+    async def test_natural_single_packet_candidate_uses_shared_guard(self):
         message = FakeMessage()
         run = SimpleNamespace(run_id="typed-single-run")
         decision = SimpleNamespace(
             run=run,
             candidate_selected=True,
             fallback_reason="",
-            typed_contract_status="valid",
         )
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
             decision=decision,
@@ -2174,9 +2067,7 @@ class SharedBrainSynthesisBotPathTests(
             corrective_call_count=0,
         )
         guard = mock.AsyncMock(
-            side_effect=AssertionError(
-                "typed selection reached legacy semantic guard"
-            )
+            return_value=(execution.response, {"suppressed": False})
         )
         finalize = mock.AsyncMock(return_value=True)
         with ExitStack() as stack:
@@ -2209,7 +2100,77 @@ class SharedBrainSynthesisBotPathTests(
             )
 
         self.assertEqual(message.replies, [execution.response])
-        guard.assert_not_awaited()
+        guard.assert_awaited_once()
+        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
+        finalize.assert_awaited_once()
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
+        self.assertTrue(finalize.await_args.kwargs["candidate_live"])
+
+    async def test_mixed_journal_and_current_queue_answer_is_sent_naturally(self):
+        message = FakeMessage()
+        message.content = (
+            "What did the Journal say about the queue, and is the queue "
+            "open right now?"
+        )
+        response = (
+            "The Journal described the queue as the handoff between public "
+            "submissions and BARCODE review. Right now, the public queue is "
+            "open for submissions."
+        )
+        run = SimpleNamespace(run_id="mixed-journal-queue-run")
+        decision = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response=response,
+            prompt="packet-owned mixed Journal and queue prompt",
+            prompt_source_bases=(),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        guard = mock.AsyncMock(
+            return_value=(response, {"suppressed": False})
+        )
+        finalize = mock.AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalize,
+                )
+            )
+
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "ignored established response",
+                self.plan(),
+                prompt="ignored established prompt",
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+                ordinary_chat_single_packet_execution=execution,
+            )
+
+        self.assertEqual(message.replies, [response])
+        self.assertIn("Journal", message.replies[0])
+        self.assertIn("Right now", message.replies[0])
+        self.assertNotIn("ground that answer cleanly", message.replies[0])
+        self.assertNotIn("one specific target", message.replies[0])
+        guard.assert_awaited_once()
         finalize.assert_awaited_once()
         self.assertTrue(finalize.await_args.kwargs["response_sent"])
         self.assertTrue(finalize.await_args.kwargs["candidate_live"])
