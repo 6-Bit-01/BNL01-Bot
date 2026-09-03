@@ -6699,6 +6699,31 @@ def _ordinary_chat_queue_open_state(value: str) -> bool | None:
     return None
 
 
+def _ordinary_chat_current_queue_state_claim(value: str) -> bool:
+    """Distinguish a current queue assertion from historical queue prose."""
+
+    text = _ordinary_chat_plain_text(value)
+    if _ordinary_chat_queue_open_state(text) is None:
+        return False
+    if re.search(
+        r"\b(?:current(?:ly)?|live|now|right\s+now|today)\b",
+        text,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\b(?:at\s+the\s+time|during|historically|previously|then|"
+        r"used\s+to|was|were|yesterday)\b|"
+        r"\blast\s+(?:night|week|month|year|show|rehearsal)\b",
+        text,
+        re.I,
+    ):
+        return False
+    # A bare present-tense/open-state response answers the live state unless
+    # it carries an explicit historical scope.
+    return True
+
+
 def _ordinary_chat_bound_member_labels(
     basis: SharedBrainSynthesisBasis,
 ) -> dict[str, str]:
@@ -6796,11 +6821,20 @@ def _ordinary_chat_retained_clause_units(
     speaker_label: str,
     speaker_subject_key: str,
     bound_member_labels: Mapping[str, str],
+    default_subject_key: str = "",
 ) -> tuple[tuple[str, str], ...]:
-    """Split a retained room line only where an explicit subject restarts."""
+    """Split a retained line only where an explicit subject restarts."""
 
     results: list[tuple[str, str]] = []
-    for unit in _candidate_claim_units(value) or (value,):
+    retained_value = re.sub(
+        r"^\[Derived (?:current-participant contribution|"
+        r"participant contribution|moment) gist;[^\]\n]{1,160}\]\s*",
+        "",
+        str(value or ""),
+        count=1,
+        flags=re.I,
+    )
+    for unit in _candidate_claim_units(retained_value) or (retained_value,):
         core = _ordinary_chat_claim_core(unit)
         clause_values: list[str] = []
         clause_start = 0
@@ -6824,7 +6858,8 @@ def _ordinary_chat_retained_clause_units(
                 speaker_subject_key=speaker_subject_key,
                 bound_member_labels=bound_member_labels,
             )
-            if subject_key and re.match(
+            subject_key = subject_key or str(default_subject_key or "")
+            if subject_key and speaker_label and re.match(
                 r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
                 part,
                 re.I,
@@ -6834,10 +6869,41 @@ def _ordinary_chat_retained_clause_units(
     return tuple(results)
 
 
+def _ordinary_chat_retained_context_lane(value: str) -> str:
+    """Keep the existing current-site classification on retained context."""
+
+    lines = tuple(
+        line.strip().casefold()
+        for line in str(value or "").splitlines()
+        if line.strip()
+    )
+    if not lines:
+        return ""
+    if lines[0].startswith(
+        (
+            "website public read model context:",
+            "website private queue read model context:",
+            "current barcode queue snapshot:",
+        )
+    ):
+        return "website_read_model"
+    if lines[0].startswith("authoritative current live-show context") and any(
+        line.startswith(
+            (
+                "website public read model context:",
+                "website private queue read model context:",
+            )
+        )
+        for line in lines[1:]
+    ):
+        return "website_read_model"
+    return ""
+
+
 def _ordinary_chat_authorized_support_segments(
     basis: SharedBrainSynthesisBasis,
-) -> tuple[tuple[str, str], ...]:
-    """Return rendered evidence with its already-resolved member subject."""
+) -> tuple[tuple[str, str, str], ...]:
+    """Return rendered evidence with its resolved subject and source lane."""
 
     bound_member_labels = _ordinary_chat_bound_member_labels(basis)
 
@@ -6863,27 +6929,74 @@ def _ordinary_chat_authorized_support_segments(
             in rendered_refs
         )
     )
-    segments: list[tuple[str, str]] = []
+    segments: list[tuple[str, str, str]] = []
     for lane, _source_digest, item_text, subject_key in packet_items:
         label = _LANE_LABELS.get(lane, lane.replace("_", " "))
         if item_text.strip():
-            segments.append((f"{label}: {item_text}", subject_key))
+            segments.append((f"{label}: {item_text}", subject_key, lane))
     for context in basis.competing_factual_contexts:
         context_value = str(context or "")
+        context_lines = context_value.splitlines()
         context_kind = (
-            context_value.splitlines()[0].strip().casefold()
-            if context_value
-            else ""
+            next(
+                (
+                    line.strip().casefold()
+                    for line in context_lines
+                    if line.strip()
+                ),
+                "",
+            )
         )
         room_context = context_kind.startswith("recent room context")
-        default_subject_key = (
+        durable_memory_context = context_kind.startswith(
+            "durable memory context"
+        )
+        requester_subject_key = (
             subject_key_for_user(basis.user_id)
-            if context_kind.startswith("durable memory context")
-            and int(basis.user_id or 0) > 0
+            if int(basis.user_id or 0) > 0
             else ""
         )
-        for line in context_value.splitlines():
+        resolved_frame_subject_keys = {
+            str(resolution.subject_key or resolution.entity_ref or "")
+            for resolution in packet_subject_resolutions(basis.packet)
+            if str(resolution.status or "").lower() == "resolved"
+            and str(
+                resolution.subject_key or resolution.entity_ref or ""
+            ).strip()
+        }
+        resolved_frame_subject_key = (
+            next(iter(resolved_frame_subject_keys))
+            if len(resolved_frame_subject_keys) == 1
+            else ""
+        )
+        context_lane = _ordinary_chat_retained_context_lane(context_value)
+        memory_section_subject_key = ""
+        derived_memory_hints = False
+        for line in context_lines:
             line = line.strip()
+            line_kind = line.casefold()
+            if line_kind.startswith("derived memory summaries"):
+                derived_memory_hints = True
+                memory_section_subject_key = ""
+                continue
+            if derived_memory_hints:
+                continue
+            if durable_memory_context and line.endswith(":"):
+                if line_kind.startswith(
+                    (
+                        "approved direct self-reports:",
+                        "recent relationship journal:",
+                        "durable memory (governed):",
+                    )
+                ):
+                    memory_section_subject_key = requester_subject_key
+                elif line_kind.startswith(
+                    "moment-based continuity gist for the uniquely "
+                    "targeted member"
+                ):
+                    memory_section_subject_key = resolved_frame_subject_key
+                else:
+                    memory_section_subject_key = ""
             if (
                 not line
                 or line.endswith(":")
@@ -6900,7 +7013,6 @@ def _ordinary_chat_authorized_support_segments(
                 r"(?P<label>[^:\n]{1,120}):\s*(?P<body>.+)$",
                 line,
             )
-            subject_key = default_subject_key
             if room_context and attributed is not None:
                 speaker_label = re.sub(
                     r"\s+",
@@ -6916,7 +7028,12 @@ def _ordinary_chat_authorized_support_segments(
                     str(attributed.group("body") or "")
                 )
                 segments.extend(
-                    _ordinary_chat_retained_clause_units(
+                    (
+                        part,
+                        subject_key,
+                        context_lane,
+                    )
+                    for part, subject_key in _ordinary_chat_retained_clause_units(
                         body,
                         speaker_label=speaker_label,
                         speaker_subject_key=speaker_subject_key,
@@ -6924,9 +7041,28 @@ def _ordinary_chat_authorized_support_segments(
                     )
                 )
                 continue
-            units = _candidate_claim_units(line)
+            line_subject_key = memory_section_subject_key
+            if durable_memory_context and line_kind.startswith(
+                ("relationship state:", "observed habits:")
+            ):
+                line_subject_key = requester_subject_key
+            if durable_memory_context and line_kind.startswith(
+                "[derived current-participant contribution gist;"
+            ):
+                line_subject_key = requester_subject_key
             segments.extend(
-                (unit, subject_key) for unit in (units or (line,))
+                (
+                    part,
+                    subject_key,
+                    context_lane,
+                )
+                for part, subject_key in _ordinary_chat_retained_clause_units(
+                    line,
+                    speaker_label="",
+                    speaker_subject_key=line_subject_key,
+                    bound_member_labels=bound_member_labels,
+                    default_subject_key=line_subject_key,
+                )
             )
     return tuple(dict.fromkeys(segments))
 
@@ -7088,7 +7224,7 @@ def _ordinary_chat_claim_support_parts(
 def _ordinary_chat_claim_part_supported(
     basis: SharedBrainSynthesisBasis,
     claim: str,
-    support_segments: Sequence[tuple[str, str]],
+    support_segments: Sequence[tuple[str, str, str]],
     *,
     inherited_subject_key: str | None = None,
 ) -> bool:
@@ -7111,24 +7247,45 @@ def _ordinary_chat_claim_part_supported(
     hard_tokens = _ordinary_chat_hard_evidence_tokens(claim)
     claim_queue_state = _ordinary_chat_queue_open_state(claim)
     queue_state_terms = {
+        "accept",
+        "available",
         "clos",
         "current",
         "currently",
+        "entry",
+        "for",
         "isn't",
         "isn’t",
         "live",
+        "new",
         "not",
         "now",
         "open",
         "queue",
         "right",
+        "submission",
+        "take",
         "today",
+        "track",
     }
     required_subject_key = (
         _ordinary_chat_claim_support_subject_key(basis, claim)
         or inherited_subject_key
     )
-    for support, support_subject_key in support_segments:
+    direct_queue_state_claim = bool(
+        claim_queue_state is not None
+        and claim_material.issubset(queue_state_terms)
+    )
+    current_queue_state_claim = bool(
+        direct_queue_state_claim
+        and _ordinary_chat_current_queue_state_claim(claim)
+    )
+    for support, support_subject_key, support_lane in support_segments:
+        if (
+            current_queue_state_claim
+            and support_lane != "website_read_model"
+        ):
+            continue
         if (
             required_subject_key is not None
             and not _ordinary_chat_support_subject_matches(
@@ -7152,9 +7309,8 @@ def _ordinary_chat_claim_part_supported(
             continue
         support_queue_state = _ordinary_chat_queue_open_state(support)
         if (
-            claim_queue_state is not None
+            direct_queue_state_claim
             and support_queue_state is not None
-            and claim_material.issubset(queue_state_terms)
         ):
             if claim_queue_state == support_queue_state:
                 return True
@@ -7170,7 +7326,7 @@ def _ordinary_chat_claim_supported_by_authorized_evidence(
     basis: SharedBrainSynthesisBasis,
     claim: str,
     *,
-    support_segments: Sequence[tuple[str, str]],
+    support_segments: Sequence[tuple[str, str, str]],
     packet_context: bool,
     selected_labels: Sequence[str],
     global_labels: Sequence[str],

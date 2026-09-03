@@ -1947,6 +1947,166 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 1)
         self.assertIn("unsupported_packet_domain", appended)
 
+    def test_current_queue_state_uses_only_live_read_model_support(self):
+        base_item = next(
+            item
+            for item in self.packet.items
+            if item.lane == "approved_fact"
+        )
+        journal_item = replace(
+            base_item,
+            lane="journal_publication",
+            source_digest="1" * 64,
+            text=(
+                "The Journal reported that the queue was open during "
+                "rehearsal."
+            ),
+            subject_key="",
+        )
+        website_item = replace(
+            base_item,
+            lane="website_read_model",
+            source_digest="2" * 64,
+            text=(
+                "Current BARCODE queue snapshot:\n"
+                "- accessScope=public; readOnly=true\n"
+                "- queue open: false"
+            ),
+            subject_key="",
+        )
+        context_basis = replace(
+            self.basis,
+            packet=replace(
+                self.packet,
+                items=(journal_item, website_item),
+            ),
+            rendered_evidence_refs=(
+                (
+                    "E1",
+                    "journal_publication",
+                    "1" * 64,
+                    (),
+                ),
+                (
+                    "E2",
+                    "website_read_model",
+                    "2" * 64,
+                    (),
+                ),
+            ),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "The public queue is closed to new submissions right now.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "The public queue is open for track submissions right now.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "The queue was open during rehearsal.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+    def test_derived_memory_summaries_are_not_factual_support(self):
+        retained_context = (
+            "Durable memory context:\n"
+            "Derived memory summaries (neither exact prior messages nor "
+            "verified personal facts):\n"
+            "Use these only as lower-authority relevance hints.\n"
+            "- Test Member founded BARCODE in 1999."
+        )
+        context_basis = replace(
+            self.basis,
+            competing_factual_contexts=(retained_context,),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+    def test_durable_moment_subject_is_not_assumed_to_be_requester(self):
+        request = replace(
+            self.packet.request,
+            conversation_evidence=(
+                *self.packet.request.conversation_evidence,
+                PacketConversationEvidence(
+                    text="I said hello earlier.",
+                    source_id=999,
+                    speaker_user_id=99,
+                    speaker_label="Bob",
+                ),
+            ),
+        )
+        retained_context = (
+            "Durable memory context:\n"
+            "Moment-based continuity gist (derived from eligible public "
+            "conversation; paraphrase only, never exact wording):\n"
+            "[Derived moment gist; paraphrase only, never exact wording] "
+            "Bob founded BARCODE in 1999."
+        )
+        context_basis = replace(
+            self.basis,
+            packet=replace(self.packet, request=request),
+            competing_factual_contexts=(retained_context,),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "Bob founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+    def test_governed_durable_memory_keeps_its_scoped_subject(self):
+        retained_context = (
+            "Durable memory context:\n"
+            "Durable memory (governed):\n"
+            "- Builds custom modular synth cabinets for live sets."
+        )
+        context_basis = replace(
+            self.basis,
+            competing_factual_contexts=(retained_context,),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You build custom modular synth cabinets for live sets.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
     def test_retained_conversation_support_stays_bound_to_its_speaker(self):
         retained_context = (
             "Recent room context from this channel:\n"
