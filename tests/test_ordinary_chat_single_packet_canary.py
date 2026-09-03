@@ -2064,7 +2064,75 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
 
         for response in (
             "He photographs analog synth rigs for live sets.",
+            "They photograph analog synth rigs for live sets.",
             "That member photographs analog synth rigs for live sets.",
+            "The selected member photographs analog synth rigs for live sets.",
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 0)
+                self.assertEqual(
+                    classifications,
+                    ("authorized_evidence_supported",),
+                )
+
+        for response in (
+            "He designs modular synth patches for live sets.",
+            "It designs modular synth patches for live sets.",
+            "Another member designs modular synth patches for live sets.",
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 1)
+                self.assertEqual(
+                    classifications,
+                    ("unsupported_packet_domain",),
+                )
+
+        unresolved_basis = replace(
+            context_basis,
+            packet=replace(
+                context_basis.packet,
+                subject_resolution=PacketSubjectResolution(
+                    status="ambiguous",
+                ),
+                subject_resolutions=(),
+            ),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            unresolved_basis,
+            "He photographs analog synth rigs for live sets.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+    def test_retained_coordinated_clauses_resolve_subject_separately(self):
+        context_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    99,
+                    "Alice",
+                    (
+                        "I joined the room earlier and Bob founded "
+                        "BARCODE in 1999."
+                    ),
+                ),
+            )
+        )
+
+        for response in (
+            "Alice joined the room earlier.",
+            "Bob founded BARCODE in 1999.",
         ):
             with self.subTest(response=response):
                 classifications, unsupported = (
@@ -2081,24 +2149,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
 
         classifications, unsupported = audit_ordinary_chat_candidate_claims(
             context_basis,
-            "He designs modular synth patches for live sets.",
-        )
-        self.assertEqual(unsupported, 1)
-        self.assertEqual(classifications, ("unsupported_packet_domain",))
-
-        unresolved_basis = replace(
-            context_basis,
-            packet=replace(
-                context_basis.packet,
-                subject_resolution=PacketSubjectResolution(
-                    status="ambiguous",
-                ),
-                subject_resolutions=(),
-            ),
-        )
-        classifications, unsupported = audit_ordinary_chat_candidate_claims(
-            unresolved_basis,
-            "He photographs analog synth rigs for live sets.",
+            "Alice founded BARCODE in 1999.",
         )
         self.assertEqual(unsupported, 1)
         self.assertEqual(classifications, ("unsupported_packet_domain",))
@@ -2130,6 +2181,41 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertEqual(unsupported, 1)
         self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+        signed_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    "I calibrated the modular synth output to -5 decibels.",
+                ),
+            )
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            signed_basis,
+            "You calibrated the modular synth output to -5 decibels.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+        for response in (
+            "You calibrated the modular synth output to 5 decibels.",
+            "You calibrated the modular synth output to +5 decibels.",
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        signed_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 1)
+                self.assertEqual(
+                    classifications,
+                    ("unsupported_packet_domain",),
+                )
 
     def test_retained_support_recognizes_contracted_negation(self):
         context_basis = self._basis_with_retained_room_context(

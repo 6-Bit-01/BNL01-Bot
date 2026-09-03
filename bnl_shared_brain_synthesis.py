@@ -1162,6 +1162,34 @@ _CLAIM_GENERIC_TERMS = frozenset(
         "signal",
     }
 )
+_ORDINARY_CHAT_CLAIM_REFERENT_TERMS = frozenset(
+    {
+        "he",
+        "her",
+        "hers",
+        "him",
+        "his",
+        "individual",
+        "it",
+        "its",
+        "me",
+        "mine",
+        "my",
+        "person",
+        "requester",
+        "select",
+        "she",
+        "their",
+        "theirs",
+        "them",
+        "they",
+        "user",
+        "we",
+        "you",
+        "your",
+        "yours",
+    }
+)
 _MAX_RENDERED_SUPPORTING_OBSERVATIONS = 8
 _MAX_RENDERED_SUPPORTING_OBSERVATION_CHARS = 1440
 
@@ -6709,6 +6737,103 @@ def _ordinary_chat_bound_member_labels(
     }
 
 
+def _ordinary_chat_retained_clause_subject_key(
+    value: str,
+    *,
+    speaker_subject_key: str,
+    bound_member_labels: Mapping[str, str],
+) -> str:
+    """Resolve only the explicit subject at the start of one retained clause."""
+
+    core = _ordinary_chat_claim_core(value)
+    if re.match(
+        r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        return str(speaker_subject_key or "")
+    subject_keys = {
+        subject_key
+        for label, subject_key in bound_member_labels.items()
+        if re.match(
+            r"^%s(?:['’]s)?(?:\W|$)" % re.escape(label),
+            core,
+            re.I,
+        )
+    }
+    return next(iter(subject_keys)) if len(subject_keys) == 1 else ""
+
+
+def _ordinary_chat_retained_clause_starts_explicit_subject(
+    value: str,
+    *,
+    speaker_subject_key: str,
+    bound_member_labels: Mapping[str, str],
+) -> bool:
+    """Recognize a new clause subject even when its identity is not bound."""
+
+    if _ordinary_chat_retained_clause_subject_key(
+        value,
+        speaker_subject_key=speaker_subject_key,
+        bound_member_labels=bound_member_labels,
+    ):
+        return True
+    core = _ordinary_chat_claim_core(value)
+    return bool(
+        _PACKET_REFERENT_RE.match(core)
+        or re.match(
+            r"^[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3}(?:['’]s)?\s+"
+            r"(?!(?:and|at|by|for|from|in|near|of|on|or|to|with)\b)"
+            r"[a-z][\w'’-]*\b",
+            core,
+        )
+    )
+
+
+def _ordinary_chat_retained_clause_units(
+    value: str,
+    *,
+    speaker_label: str,
+    speaker_subject_key: str,
+    bound_member_labels: Mapping[str, str],
+) -> tuple[tuple[str, str], ...]:
+    """Split a retained room line only where an explicit subject restarts."""
+
+    results: list[tuple[str, str]] = []
+    for unit in _candidate_claim_units(value) or (value,):
+        core = _ordinary_chat_claim_core(unit)
+        clause_values: list[str] = []
+        clause_start = 0
+        for boundary in _PACKET_CLAUSE_TAIL_BOUNDARY_RE.finditer(core):
+            if _ordinary_chat_retained_clause_starts_explicit_subject(
+                core[boundary.end() :],
+                speaker_subject_key=speaker_subject_key,
+                bound_member_labels=bound_member_labels,
+            ):
+                clause_values.append(
+                    core[clause_start : boundary.start()]
+                )
+                clause_start = boundary.end()
+        clause_values.append(core[clause_start:])
+        for clause_value in clause_values:
+            part = clause_value.strip(" ,;:—–")
+            if not part:
+                continue
+            subject_key = _ordinary_chat_retained_clause_subject_key(
+                part,
+                speaker_subject_key=speaker_subject_key,
+                bound_member_labels=bound_member_labels,
+            )
+            if subject_key and re.match(
+                r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
+                part,
+                re.I,
+            ):
+                part = f"{speaker_label}: {part}"
+            results.append((part, subject_key))
+    return tuple(results)
+
+
 def _ordinary_chat_authorized_support_segments(
     basis: SharedBrainSynthesisBasis,
 ) -> tuple[tuple[str, str], ...]:
@@ -6777,38 +6902,28 @@ def _ordinary_chat_authorized_support_segments(
             )
             subject_key = default_subject_key
             if room_context and attributed is not None:
-                label = re.sub(
+                speaker_label = re.sub(
                     r"\s+",
                     " ",
                     str(attributed.group("label") or "")
-                    .strip()
-                    .casefold(),
+                    .strip(),
                 )
-                speaker_subject_key = bound_member_labels.get(label, "")
+                speaker_subject_key = bound_member_labels.get(
+                    speaker_label.casefold(),
+                    "",
+                )
                 body = _ordinary_chat_claim_core(
                     str(attributed.group("body") or "")
                 )
-                if re.match(
-                    r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
-                    body,
-                    re.I,
-                ):
-                    subject_key = speaker_subject_key
-                else:
-                    body_subject_keys = {
-                        candidate_subject_key
-                        for candidate, candidate_subject_key in (
-                            bound_member_labels.items()
-                        )
-                        if re.match(
-                            r"^%s(?:['’]s)?(?:\W|$)"
-                            % re.escape(candidate),
-                            body,
-                            re.I,
-                        )
-                    }
-                    if len(body_subject_keys) == 1:
-                        subject_key = next(iter(body_subject_keys))
+                segments.extend(
+                    _ordinary_chat_retained_clause_units(
+                        body,
+                        speaker_label=speaker_label,
+                        speaker_subject_key=speaker_subject_key,
+                        bound_member_labels=bound_member_labels,
+                    )
+                )
+                continue
             units = _candidate_claim_units(line)
             segments.extend(
                 (unit, subject_key) for unit in (units or (line,))
@@ -6844,8 +6959,13 @@ def _ordinary_chat_claim_support_subject_key(
     ):
         return "bnl_response_speaker"
     if re.match(
-        r"^(?:(?:he|she|they|him|his|her|hers|them|their|theirs)"
-        r"|(?:the|this|that)\s+(?:individual|member|person|requester|user))"
+        r"^(?:one|another)\s+(?:individual|member|person|user)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        return "response_subject_unresolved"
+    if _PACKET_REFERENT_RE.match(core) is not None or re.match(
+        r"^(?:the|this|that)\s+(?:individual|person|selected\s+member)"
         r"(?:\W|$)",
         core,
         re.I,
@@ -6895,7 +7015,7 @@ def _ordinary_chat_hard_evidence_tokens(value: str) -> frozenset[str]:
         token.casefold().rstrip(".,;:!?")
         for token in re.findall(
             r"https?://[^\s)>\]]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
-            r"\b\d+(?:[./:-]\d+)*\b",
+            r"(?<!\w)[+-]?\d+(?:[./:-]\d+)*\b",
             str(value or ""),
             re.I,
         )
@@ -6980,8 +7100,12 @@ def _ordinary_chat_claim_part_supported(
     )
     claim_names = frozenset(
         term.strip("'’") for term in _concrete_relation_name_terms(claim)
+    ) - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+    claim_material = (
+        claim_terms
+        - claim_names
+        - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
     )
-    claim_material = claim_terms - claim_names
     if len(claim_material) < 2:
         return False
     hard_tokens = _ordinary_chat_hard_evidence_tokens(claim)
