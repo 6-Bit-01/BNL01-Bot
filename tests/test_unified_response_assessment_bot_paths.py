@@ -369,7 +369,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 bnl01_bot,
                 "build_ordinary_chat_basis",
                 return_value=ordinary_basis,
-            ),
+            ) as ordinary_basis_builder,
             mock.patch.object(
                 bnl01_bot,
                 "build_shared_brain_synthesis_basis",
@@ -390,8 +390,8 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 prompt_metadata=metadata,
             )
 
-            broadcast_builder.assert_not_called()
-            memory_builder.assert_not_called()
+            broadcast_builder.assert_called_once()
+            memory_builder.assert_called_once()
             self.assertEqual(len(assessment_calls), 1)
             self.assertFalse(
                 assessment_calls[0]["broadcast_memory_present"]
@@ -411,35 +411,29 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 metadata["ordinary_chat_single_packet_scope"].reason,
                 "eligible",
             )
-            baseline_request = metadata[
-                "ordinary_chat_legacy_baseline_request"
-            ]
-            self.assertEqual(baseline_request["clean_content"], text)
-            self.assertEqual(baseline_request["user_id"], 202)
-            self.assertEqual(baseline_request["guild_id"], 1)
-            self.assertEqual(baseline_request["channel_id"], 303)
-            self.assertTrue(baseline_request["is_direct_interaction"])
-            self.assertNotIn("Broadcast memory context:", prompt)
-
-            rebuilt = bnl01_bot._build_ordinary_chat_legacy_baseline_prompt(
+            self.assertNotIn(
+                "ordinary_chat_legacy_baseline_request",
                 metadata,
-                payload_items=[],
-                request_text=text,
-                conversation_orchestration=None,
+            )
+            self.assertIn("Broadcast memory context:", prompt)
+            self.assertIn("Durable memory context:", prompt)
+            ordinary_basis_call = ordinary_basis_builder.call_args.kwargs
+            competing_contexts = ordinary_basis_call[
+                "competing_factual_contexts"
+            ]
+            self.assertTrue(
+                any(
+                    "Broadcast memory context:" in context
+                    for context in competing_contexts
+                )
+            )
+            self.assertTrue(
+                any(
+                    "Durable memory context:" in context
+                    for context in competing_contexts
+                )
             )
 
-        self.assertIsNotNone(rebuilt)
-        rebuilt_prompt, _allow, _style, rebuilt_metadata = rebuilt
-        self.assertIn("Durable memory context:", rebuilt_prompt)
-        self.assertIn("Established memory sentinel", rebuilt_prompt)
-        self.assertIn("Broadcast memory context:", rebuilt_prompt)
-        self.assertIn("DJ Floppy Disc", rebuilt_prompt)
-        self.assertFalse(
-            rebuilt_metadata["ordinary_chat_single_packet_applied"]
-        )
-        self.assertIsNone(
-            rebuilt_metadata["shared_brain_synthesis_canary_basis"]
-        )
         memory_builder.assert_called_once()
         broadcast_builder.assert_called_once()
 
@@ -576,7 +570,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 bnl01_bot,
                 "build_ordinary_chat_basis",
                 return_value=ordinary_basis,
-            ),
+            ) as ordinary_basis_builder,
             mock.patch.object(
                 bnl01_bot,
                 "build_shared_brain_synthesis_basis",
@@ -636,10 +630,27 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             "sealed_test",
             force=False,
         )
-        self.assertNotIn("WEBSITE QUEUE OWNER SENTINEL", prompt)
-        self.assertNotIn("SHOW STATE OWNER SENTINEL", prompt)
-        self.assertNotIn("QUEUE OWNER SENTINEL", prompt)
-        self.assertNotIn("SHOW OWNER SENTINEL", prompt)
+        self.assertIn("WEBSITE QUEUE OWNER SENTINEL", prompt)
+        self.assertIn("SHOW STATE OWNER SENTINEL", prompt)
+        self.assertIn("QUEUE OWNER SENTINEL", prompt)
+        self.assertIn("SHOW OWNER SENTINEL", prompt)
+        competing_contexts = (
+            ordinary_basis_builder.call_args.kwargs[
+                "competing_factual_contexts"
+            ]
+        )
+        self.assertTrue(
+            any(
+                "WEBSITE QUEUE OWNER SENTINEL" in context
+                for context in competing_contexts
+            )
+        )
+        self.assertTrue(
+            any(
+                "SHOW STATE OWNER SENTINEL" in context
+                for context in competing_contexts
+            )
+        )
 
     def test_bot_recorder_persists_only_aggregate_receipt(self):
         with mock.patch.object(

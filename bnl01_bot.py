@@ -177,7 +177,6 @@ from bnl_shared_brain_synthesis import (
     SynthesisCanaryDecision,
     begin_run as begin_shared_brain_synthesis_run,
     begin_single_packet_run,
-    blocked_single_packet_decision,
     bound_identity_comparison_response,
     build_basis as build_shared_brain_synthesis_basis,
     build_ordinary_chat_basis,
@@ -189,13 +188,11 @@ from bnl_shared_brain_synthesis import (
     finalize_run as finalize_shared_brain_synthesis_run,
     honest_empty_profile_response,
     ordinary_chat_configuration,
-    ordinary_chat_deterministic_response_act,
     ordinary_chat_route_scope_decision,
     publication_packet_composes_current_queue,
     publication_packet_owns_turn,
-    parse_ordinary_chat_response_contract,
     record_fallback as record_shared_brain_synthesis_fallback,
-    record_single_packet_block,
+    record_single_packet_review,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
     route_scope_enabled as shared_brain_synthesis_route_scope_enabled,
 )
@@ -1865,9 +1862,6 @@ You are BNL-01. The BARCODE Network is watching. You are functioning as intended
 # BARCODE/member/publication/history factual owner for this route.
 ORDINARY_CHAT_SINGLE_PACKET_ROUTE = (
     "ordinary_chat_single_packet_canary"
-)
-ORDINARY_CHAT_LEGACY_BASELINE_ROUTE = (
-    "ordinary_chat_legacy_baseline_fallback"
 )
 BNL01_PACKET_OWNED_SYSTEM_PROMPT = """You are BNL-01, the BARCODE Network Liaison Entity.
 
@@ -10471,6 +10465,25 @@ def is_generic_non_answer_response(response: str, user_display_name: str = "") -
     )
     if any(re.search(pattern, text, flags=re.I) for pattern in context_deferral_patterns):
         return True
+    scope_deferral = bool(
+        re.search(
+            r"\b(?:can(?:not|'t)|unable to)\s+(?:cleanly\s+)?"
+            r"(?:ground|answer|resolve|verify).{0,100}"
+            r"\b(?:current\s+)?(?:scope|context|evidence)\b",
+            text,
+            flags=re.I,
+        )
+    )
+    retry_invitation = bool(
+        re.search(
+            r"\b(?:give|send|ask|point).{0,45}\b(?:one|a)\s+specific\s+"
+            r"(?:target|question|detail|thing|request)\b|\banother pass\b",
+            text,
+            flags=re.I,
+        )
+    )
+    if scope_deferral and retry_invitation:
+        return True
     return False
 
 
@@ -10888,11 +10901,8 @@ _SOURCE_NEUTRAL_GUARD_RECOVERY_PREFIXES = (
     "current_payload_grounding_",
     "exact_quote_",
     "exact_reply_grounding_",
-    "generic_non_answer_",
     "memory_source_",
-    "media_only_",
     "prompt_source_",
-    "scripted_mode_leak_",
     "source_grounding_",
     "source_revalidation_",
     "source_safe_recall_",
@@ -10905,120 +10915,6 @@ def _guard_recovery_requires_source_neutral_response(reason: str) -> bool:
     return any(
         normalized.startswith(prefix)
         for prefix in _SOURCE_NEUTRAL_GUARD_RECOVERY_PREFIXES
-    )
-
-
-def build_show_episode_evidence_fallback(prompt: str) -> str:
-    """Render retained show facts directly when prose repair is exhausted."""
-
-    evidence = _show_episode_evidence_from_prompt(prompt)
-    if not evidence:
-        return ""
-    summary_lines = []
-    timeline_lines = []
-    supporting_lines = []
-    safe_support_sections = {
-        "authoritative show roster and lifecycle:",
-        "track-linked chat moments (timing correlation only):",
-        "recurring language/topics across retained public show chat:",
-        "people in this episode:",
-    }
-    support_section_active = False
-
-    for raw_line in evidence.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        annotation = re.match(r"^\[E\d+\s*\|[^\]]+\]\s*(.+)$", line)
-        if annotation:
-            line = annotation.group(1).strip()
-        lowered = line.casefold()
-        if lowered.startswith("show episode:") or lowered.startswith(
-            "episode interaction totals:"
-        ):
-            summary_lines.append(line)
-            support_section_active = False
-            continue
-        if lowered in safe_support_sections:
-            support_section_active = True
-            continue
-        if lowered.startswith(
-            (
-                "authoritative queue/broadcast events",
-                "source-linked authored examples:",
-                "public discord interactions with bnl during this episode:",
-                "attributed public tiktok/discord evidence:",
-            )
-        ):
-            support_section_active = False
-            continue
-        if re.search(r"\bt[+-]\d+(?:\.\d+)?m\b", line, flags=re.I):
-            timeline_lines.append(line)
-            continue
-        if line.startswith("-") and support_section_active:
-            supporting_lines.append(line)
-            continue
-        if annotation and line:
-            supporting_lines.append("- " + line)
-
-    def timeline_key(value: str) -> float:
-        match = re.search(r"\bt([+-])(\d+(?:\.\d+)?)m\b", value, flags=re.I)
-        if not match:
-            return float("inf")
-        offset = float(match.group(2))
-        return -offset if match.group(1) == "-" else offset
-
-    timeline_lines = sorted(
-        dict.fromkeys(timeline_lines),
-        key=timeline_key,
-    )
-    summary_lines = list(dict.fromkeys(summary_lines))
-    supporting_lines = list(dict.fromkeys(supporting_lines))
-    if not timeline_lines and not supporting_lines:
-        return ""
-
-    rendered = ["Here’s the verified show record directly:"]
-    rendered.extend(summary_lines[:3])
-    if timeline_lines:
-        rendered.append("Chronology:")
-        rendered.extend(timeline_lines[:40])
-    if supporting_lines:
-        rendered.append("Other retained show evidence:")
-        rendered.extend(supporting_lines[:20])
-    return "\n".join(rendered).strip()
-
-
-def build_guard_response_obligation_fallback(
-    current_user_text: str,
-    suppression_reason: str,
-) -> str:
-    """Return a non-empty, source-neutral reply for an authorized turn."""
-
-    _ = current_user_text
-    reason = str(suppression_reason or "guard_repair_exhausted").lower()
-    if "quote" in reason:
-        return (
-            "I can’t verify the exact wording from the current message state, "
-            "so I won’t present a reconstructed quote as exact."
-        )
-    if "source" in reason or "basis" in reason or "canary" in reason:
-        return (
-            "I can’t verify that from the current evidence, so I won’t present "
-            "an unsupported answer as fact."
-        )
-    if reason == "media_only_no_text":
-        return (
-            "I couldn’t ground a reliable answer in that attachment, so I’m "
-            "not going to invent what it contains."
-        )
-    if reason.startswith("exact_reply_grounding_"):
-        return (
-            "I couldn’t keep the answer bound to the exact reply target, so I’m "
-            "not going to answer a nearby message by mistake."
-        )
-    return (
-        "I can’t verify a clean answer from the current evidence without "
-        "inventing details."
     )
 
 
@@ -11039,8 +10935,9 @@ def recover_guarded_response_obligation(
     """Recover an authorized reply after a draft guard exhausts repair.
 
     Guards retain authority over unsafe prose and stale evidence. They do not
-    own the already-authorized response act, so this function always returns a
-    non-empty delivery candidate.
+    own the already-authorized response act. This synchronous stage may return
+    a safe existing candidate; otherwise the async resolver asks BNL to write
+    a new response from the still-authorized context.
     """
 
     original_reason = str(
@@ -11057,12 +10954,15 @@ def recover_guarded_response_obligation(
             if str(candidate or "").strip()
         )
     )
+    force_model_rewrite = bool(
+        diagnostics.get("response_review_requires_rewrite")
+    )
 
     source_neutral = _guard_recovery_requires_source_neutral_response(
         original_reason
     )
     show_evidence = _show_episode_evidence_from_prompt(prompt)
-    if show_evidence and not source_neutral:
+    if show_evidence and not source_neutral and not force_model_rewrite:
         for candidate in candidates:
             repaired = remove_unsupported_show_lore_sentences(
                 candidate,
@@ -11102,25 +11002,12 @@ def recover_guarded_response_obligation(
                 channel_policy,
             )
             return repaired
-        evidence_fallback = build_show_episode_evidence_fallback(prompt)
-        if evidence_fallback:
-            diagnostics["response_obligation_recovery_kind"] = (
-                "grounded_show_evidence"
-            )
-            diagnostics["source_neutral_recovery"] = False
-            logging.warning(
-                "response_obligation_recovered_after_guard reason=%s "
-                "kind=grounded_show_evidence route_mode=%s channel_policy=%s",
-                original_reason,
-                route_mode,
-                channel_policy,
-            )
-            return evidence_fallback
+        force_model_rewrite = True
 
     quote_guard_requested = bool(
         exact_quote_requested or third_party_attribution_requested
     )
-    if not source_neutral:
+    if not source_neutral and not force_model_rewrite:
         for candidate in candidates:
             if is_generic_non_answer_response(candidate):
                 continue
@@ -11168,21 +11055,22 @@ def recover_guarded_response_obligation(
             )
             return candidate
 
-    fallback = build_guard_response_obligation_fallback(
-        current_user_text,
-        original_reason,
+    diagnostics["response_obligation_recovered"] = False
+    diagnostics["suppressed"] = True
+    diagnostics["response_obligation_recovery_kind"] = (
+        "model_rewrite_required"
     )
-    diagnostics["response_obligation_recovery_kind"] = "source_neutral"
-    diagnostics["source_neutral_recovery"] = True
-    diagnostics["_revalidated_prompt_source_bases"] = ()
+    diagnostics["source_neutral_recovery"] = source_neutral
+    if source_neutral:
+        diagnostics["_revalidated_prompt_source_bases"] = ()
     logging.warning(
-        "response_obligation_recovered_after_guard reason=%s "
-        "kind=source_neutral route_mode=%s channel_policy=%s",
+        "response_obligation_requires_model_rewrite reason=%s "
+        "route_mode=%s channel_policy=%s",
         original_reason,
         route_mode,
         channel_policy,
     )
-    return fallback
+    return ""
 
 
 def build_tiktok_show_episode_correction_prompt(
@@ -11877,10 +11765,6 @@ def format_last_route_debug() -> str:
             "ordinary-chat packet receipt present",
         ),
         (
-            "ordinary_chat_legacy_baseline_fallback",
-            "ordinary-chat baseline fallback",
-        ),
-        (
             "ordinary_chat_single_packet_provider_call_count",
             "ordinary-chat packet provider calls",
         ),
@@ -11889,12 +11773,8 @@ def format_last_route_debug() -> str:
             "ordinary-chat packet corrective calls",
         ),
         (
-            "ordinary_chat_single_packet_block_reason",
-            "ordinary-chat packet block reason",
-        ),
-        (
-            "ordinary_chat_legacy_baseline_generation_provider_call_count",
-            "ordinary-chat baseline generation provider calls",
+            "ordinary_chat_single_packet_review_reason",
+            "ordinary-chat packet review reason",
         ),
         ("save_policy_reason", "save policy reason"),
     ]
@@ -19055,6 +18935,11 @@ def recent_model_response_repeated(candidate: str, user_id: int, guild_id: int, 
 
 
 def suppress_stale_media_fallback(candidate: str, *, current_text: str = "", current_has_media: bool = False, user_id: int = 0, guild_id: int = 0, channel_id: int = 0) -> str:
+    """Retain the draft while recording whether it needs a contextual rewrite.
+
+    The response guard owns any required regeneration. This compatibility
+    helper must never erase a response or replace it with a stock message.
+    """
     if not candidate:
         return ""
     references_media = current_batch_references_recent_media(current_text)
@@ -19062,13 +18947,16 @@ def suppress_stale_media_fallback(candidate: str, *, current_text: str = "", cur
     repeated = recent_model_response_repeated(candidate, user_id, guild_id, channel_id=channel_id) if user_id and guild_id else False
     if bare_media and (repeated or (not current_has_media and not references_media)):
         logging.info(
-            "stale_media_fallback_suppressed guild_id=%s channel_id=%s user_id=%s current_has_media=%s current_references_media=%s repeated=%s",
+            "stale_media_response_detected guild_id=%s channel_id=%s user_id=%s current_has_media=%s current_references_media=%s repeated=%s",
             guild_id, channel_id, user_id, int(current_has_media), int(references_media), int(repeated),
         )
-        return ""
     if repeated:
-        logging.info("repeat_response_suppressed guild_id=%s channel_id=%s user_id=%s", guild_id, channel_id, user_id)
-        return "The relay caught that twice. I’m holding the duplicate instead of echoing it again."
+        logging.info(
+            "repeat_response_detected guild_id=%s channel_id=%s user_id=%s",
+            guild_id,
+            channel_id,
+            user_id,
+        )
     return candidate
 
 def _stringify_embed_value(value) -> list:
@@ -30572,6 +30460,73 @@ BNL-01 response:"""
         return ""
 
 
+async def _regenerate_required_conversation_response(
+    prompt: str,
+    route: str,
+    *,
+    rejected_response: str,
+    reason: str,
+    source_context_available: bool,
+    attempt_counter: ProviderAttemptCounter | None = None,
+    generation_result_out: dict | None = None,
+) -> str:
+    """Ask BNL to finish the turn after a draft fails a response check.
+
+    This is the existing model response path using the same complete prompt. It
+    does not manufacture a deterministic refusal or generic fallback message.
+    """
+
+    response_prompt = f"""{BNL01_SYSTEM_PROMPT}
+
+The previous draft could not be sent because it failed this response check:
+{reason}
+
+Write a new, natural BNL-01 response to the current turn now.
+
+Rules:
+- Answer every part of the actual current request that the supplied context can answer.
+- Use all relevant authorized context in the prompt; do not expose source machinery.
+- Keep any uncertainty local to the exact fact that remains uncertain.
+- Do not replace the answer with a generic scope, evidence, or "try again" message.
+- Do not claim to have searched, checked, scanned, or verified a source that is not supplied.
+- Do not repeat unsupported details from the rejected draft.
+
+Complete current-turn context:
+{prompt}
+
+Rejected draft:
+{rejected_response}
+
+BNL-01 response:"""
+    response_route = _generation_child_route(
+        route,
+        "required_response_regeneration",
+    )
+    result = await _generate_gemini_content_result_async(
+        response_prompt,
+        response_route,
+        attempt_counter=attempt_counter,
+    )
+    if generation_result_out is not None:
+        generation_result_out["result"] = result
+    if not result.success:
+        return ""
+    regenerated = str(result.text or "").strip()
+    if not regenerated or is_generic_non_answer_response(regenerated):
+        logging.warning(
+            "required_response_regeneration_failed route=%s reason=%s",
+            route,
+            "empty" if not regenerated else "generic_non_answer",
+        )
+        return ""
+    logging.info(
+        "required_response_regeneration_succeeded route=%s source_context_present=%s",
+        route,
+        int(source_context_available),
+    )
+    return regenerated
+
+
 def _safe_uncertain_response_from_prompt(prompt: str) -> str:
     memory_match = re.search(r"Broadcast memory entity match:\n(?P<context>.*?)(?:\nBroadcast memory entity-match rules:|\nBroadcast-memory usage guidance:|\nCurrent BARCODE Radio scheduling context:|\nUser name to address|\Z)", prompt or "", flags=re.DOTALL)
     if memory_match and memory_match.group("context").strip():
@@ -30983,19 +30938,6 @@ async def get_gemini_response(
         if unsupported_subject_attribution:
             logging.info("unsupported_subject_attribution_detected route=%s channel_policy=%s source_context_present=%s", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
         needs_media_grounding_repair = unsupported_media_grounding_basis or unsupported_subject_attribution or media_memory_recall_leak_repair
-        if one_call_packet_route and (
-            needs_media_grounding_repair
-            or contains_fake_lookup_claim(text)
-            or unsupported_source_authority
-            or (
-                public_authority_guard_active
-                and contains_operator_causality_claim(text)
-            )
-        ):
-            logging.info(
-                "single_packet_response_suppressed reason=post_generation_guard"
-            )
-            return ""
         if needs_media_grounding_repair and not current_media_repair_scope_present:
             logging.info(
                 "media_grounding_repair_skipped reason=not_current_media route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s",
@@ -31046,15 +30988,19 @@ async def get_gemini_response(
             if regenerated:
                 return regenerated
             logging.info(
-                "media_grounding_response_suppressed route=%s channel_policy=%s current_message_media_context=1 recent_media_context=%s explicit_media_followup=0",
+                "media_grounding_response_regeneration_required route=%s channel_policy=%s current_message_media_context=1 recent_media_context=%s explicit_media_followup=0",
                 route,
                 _extract_channel_policy_from_prompt(prompt),
                 int(recent_media_context_present),
             )
-            logging.info("canned_media_fallback_blocked route=%s channel_policy=%s", route, _extract_channel_policy_from_prompt(prompt))
-            return build_guard_response_obligation_fallback(
+            return await _regenerate_required_conversation_response(
                 prompt,
-                "media_only_no_text",
+                route,
+                rejected_response=text,
+                reason="current_media_grounding_after_repair",
+                source_context_available=source_authority_context_present,
+                attempt_counter=attempt_counter,
+                generation_result_out=generation_result_out,
             )
 
         if contains_fake_lookup_claim(text):
@@ -31068,12 +31014,14 @@ async def get_gemini_response(
             )
             if regenerated:
                 return regenerated
-            return (
-                _safe_uncertain_response_from_prompt(prompt)
-                or build_guard_response_obligation_fallback(
-                    prompt,
-                    "source_grounding_after_retry",
-                )
+            return await _regenerate_required_conversation_response(
+                prompt,
+                route,
+                rejected_response=text,
+                reason="fake_source_lookup_after_repair",
+                source_context_available=source_authority_context_present,
+                attempt_counter=attempt_counter,
+                generation_result_out=generation_result_out,
             )
 
         if unsupported_source_authority:
@@ -31089,12 +31037,14 @@ async def get_gemini_response(
             )
             if regenerated:
                 return regenerated
-            return (
-                _safe_uncertain_response_from_prompt(prompt)
-                or build_guard_response_obligation_fallback(
-                    prompt,
-                    "source_grounding_after_retry",
-                )
+            return await _regenerate_required_conversation_response(
+                prompt,
+                route,
+                rejected_response=text,
+                reason="unsupported_source_authority_after_repair",
+                source_context_available=source_authority_context_present,
+                attempt_counter=attempt_counter,
+                generation_result_out=generation_result_out,
             )
 
         if public_authority_guard_active and contains_operator_causality_claim(text):
@@ -31107,9 +31057,14 @@ async def get_gemini_response(
             )
             if regenerated:
                 return regenerated
-            return build_guard_response_obligation_fallback(
+            return await _regenerate_required_conversation_response(
                 prompt,
-                "public_operator_causality_after_retry",
+                route,
+                rejected_response=text,
+                reason="public_operator_causality_after_repair",
+                source_context_available=source_authority_context_present,
+                attempt_counter=attempt_counter,
+                generation_result_out=generation_result_out,
             )
 
         return text
@@ -35800,7 +35755,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if execution is None or execution.decision is None:
                 return
             stale_decision = (
-                await safely_record_ordinary_chat_single_packet_block(
+                await safely_record_ordinary_chat_single_packet_review(
                     execution.decision,
                     reason=stale_reason,
                 )
@@ -36020,6 +35975,27 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_publication_packet_owns_turn = (
                 publication_packet_owns_turn(batch_situation_frame)
             )
+            batch_publication_queue_composition = (
+                publication_packet_composes_current_queue(
+                    batch_situation_frame
+                )
+            )
+            batch_operational_queue_packet_snapshot = (
+                build_bnl_queue_packet_snapshot(
+                    combined_text,
+                    channel_policy,
+                    force=False,
+                )
+                if (
+                    batch_publication_queue_composition
+                    and batch_website_read_model_context
+                )
+                else ""
+            )
+            batch_publication_queue_packet_ready = bool(
+                batch_publication_queue_composition
+                and batch_operational_queue_packet_snapshot
+            )
             community_visual_basis = build_community_visual_basis(
                 guild_id,
                 (
@@ -36054,6 +36030,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     (
                         batch_source_context_available
                         and not batch_publication_packet_owns_turn
+                        and not batch_publication_queue_packet_ready
                     )
                     or community_visual_prompt
                 ),
@@ -36074,11 +36051,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_website_read_model_context,
                 )
             )
-            if (
-                batch_website_read_model_context
-                and not batch_publication_packet_owns_turn
-            ):
-                prompt += (
+            batch_website_read_model_prompt_block = ""
+            if batch_website_read_model_context:
+                batch_website_read_model_prompt_block = (
                     "\n\nAuthoritative current live-show context for this "
                     "request:\n"
                     + batch_website_read_model_context
@@ -36089,6 +36064,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "Do not replace the current readout with the normal Friday "
                     "schedule or claim that the queue is unavailable.\n"
                 )
+                prompt += batch_website_read_model_prompt_block
                 _log_batch_event(
                     logging.INFO,
                     "website_read_model_context_used",
@@ -36097,16 +36073,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     len(collapsed_items),
                     f"channel_policy={channel_policy}",
                 )
-            if (
-                batch_tiktok_show_evidence_context
-                and not batch_publication_packet_owns_turn
-            ):
-                prompt += (
+            batch_tiktok_show_evidence_prompt_block = ""
+            if batch_tiktok_show_evidence_context:
+                batch_tiktok_show_evidence_prompt_block = (
                     "\n\n"
                     + batch_tiktok_show_evidence_context
                     + "\n"
                     + batch_tiktok_show_episode_turn_contract
                 )
+                prompt += batch_tiktok_show_evidence_prompt_block
             batch_attribution_contract = build_batch_attribution_contract(
                 collapsed_items,
                 guild_id=guild_id,
@@ -36127,7 +36102,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     + batch_attribution_contract.prompt_block
                     + "\n"
                 )
-            if recent_room_prompt and not batch_ordinary_chat_single_packet:
+            if recent_room_prompt:
                 prompt += "\n\n" + recent_room_prompt + "\n"
             orchestration_prompt_block = str(
                 orchestration_state.get("prompt_block") or ""
@@ -36139,10 +36114,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_member_is_privileged = False
             batch_memory_target_user_id = 0
             batch_source_safe_recall = False
-            if (
-                len(unique_user_ids) == 1
-                and not batch_ordinary_chat_single_packet
-            ):
+            batch_memory_prompt_block = ""
+            if len(unique_user_ids) == 1:
                 member = channel.guild.get_member(first_uid)
                 batch_member_is_privileged = is_privileged_member(
                     member,
@@ -36188,11 +36161,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     source_metadata=batch_memory_source_metadata,
                 )
                 if batch_memory_context:
-                    prompt += (
+                    batch_memory_prompt_block = (
                         "\n\nDurable memory context for the sole current speaker:\n"
                         + batch_memory_context
                         + "\n"
                     )
+                    prompt += batch_memory_prompt_block
             batch_moment_attribution_context = ""
             if len(unique_user_ids) > 1:
                 batch_moment_attribution_context = (
@@ -36425,6 +36399,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             and not batch_publication_packet_owns_turn
                         )
                     ),
+                    operational_context_snapshot=(
+                        batch_operational_queue_packet_snapshot
+                    ),
+                    packet_operational_context_authorized=bool(
+                        batch_publication_queue_packet_ready
+                    ),
                     current_direct=bool(
                         active_packet.get("addressed_to_bot")
                         or is_broad_personal_recall_request(combined_text)
@@ -36473,11 +36453,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     packet=batch_intelligence_packet_out.get("packet"),
                     assessment=batch_unified_assessment,
                     has_media=bool(active_packet.get("media_present")),
+                    competing_factual_contexts=tuple(
+                        block
+                        for block in (
+                            batch_memory_prompt_block,
+                            batch_website_read_model_prompt_block,
+                            batch_tiktok_show_evidence_prompt_block,
+                        )
+                        if block
+                    ),
                 )
                 if batch_ordinary_chat_single_packet
                 else None
             )
-            batch_ordinary_chat_preflight_block_reason = (
+            batch_ordinary_chat_preflight_reason = (
                 "packet_or_assessment_unavailable"
                 if batch_ordinary_chat_single_packet
                 and batch_ordinary_chat_basis is None
@@ -36628,8 +36617,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     prompt=prompt,
                     basis=batch_ordinary_chat_basis,
                     scope_applied=batch_ordinary_chat_single_packet,
-                    preflight_block_reason=(
-                        batch_ordinary_chat_preflight_block_reason
+                    preflight_reason=(
+                        batch_ordinary_chat_preflight_reason
                     ),
                     situation_frame=(
                         orchestration_state["decision"].situation_frame
@@ -36658,7 +36647,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             batch_single_packet_cutover = bool(
                 batch_ordinary_chat_execution is not None
-                and not batch_ordinary_chat_execution.legacy_baseline_active
             )
             if batch_ordinary_chat_execution is not None:
                 response = batch_ordinary_chat_execution.response
@@ -37103,7 +37091,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             ordinary_chat_single_packet_applied=(
                 batch_single_packet_cutover
             ),
-            ordinary_chat_legacy_baseline_fallback=False,
             ordinary_chat_single_packet_provider_call_count=(
                 batch_ordinary_chat_execution.provider_call_count
                 if batch_ordinary_chat_execution is not None
@@ -37114,12 +37101,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 if batch_ordinary_chat_execution is not None
                 else 0
             ),
-            ordinary_chat_single_packet_block_reason=(
-                batch_ordinary_chat_execution.block_reason
+            ordinary_chat_single_packet_review_reason=(
+                batch_ordinary_chat_execution.review_reason
                 if batch_ordinary_chat_execution is not None
                 else ""
             ),
-            ordinary_chat_legacy_baseline_generation_provider_call_count=0,
         )
 
         batch_baseline_response = response or ""
@@ -37163,6 +37149,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             else batch_synthesis_execution is not None
             and batch_synthesis_execution.candidate_active
         )
+        batch_single_packet_corrective_call_count = int(
+            batch_ordinary_chat_execution.corrective_call_count
+            if batch_ordinary_chat_execution is not None
+            else 0
+        )
         if batch_single_packet_cutover:
             response = batch_ordinary_chat_execution.response
             prompt = batch_ordinary_chat_execution.prompt
@@ -37179,6 +37170,83 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         batch_response_source_context_available = bool(
             batch_source_context_available or batch_single_packet_cutover
         )
+        if (
+            batch_single_packet_cutover
+            and batch_ordinary_chat_execution is not None
+            and batch_ordinary_chat_execution.review_reason
+        ):
+            batch_review_reason = (
+                batch_ordinary_chat_execution.review_reason
+            )
+            review_diagnostics = {
+                "suppressed": True,
+                "suppression_reason": batch_review_reason,
+                "response_review_requires_rewrite": True,
+            }
+            (
+                response,
+                prompt,
+                rewritten_source_bases,
+                response_rewrite_calls,
+                source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
+                response,
+                baseline_response=response,
+                prompt=prompt,
+                current_user_text=combined_text,
+                diagnostics=review_diagnostics,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                channel_policy=channel_policy,
+                user_id=first_uid,
+                guild_id=guild_id,
+                channel=channel,
+                prompt_source_bases=tuple(batch_prompt_source_bases),
+                source_context_available=(
+                    batch_response_source_context_available
+                ),
+            )
+            batch_single_packet_corrective_call_count += (
+                response_rewrite_calls
+            )
+            batch_prompt_source_bases = list(rewritten_source_bases)
+            batch_synthesis_decision = (
+                await safely_record_ordinary_chat_single_packet_review(
+                    batch_synthesis_decision,
+                    reason="single_packet_candidate_rewritten_after_review",
+                    corrective_call_count=(
+                        batch_single_packet_corrective_call_count
+                    ),
+                )
+                or batch_synthesis_decision
+            )
+            batch_ordinary_chat_execution = replace(
+                batch_ordinary_chat_execution,
+                response=response,
+                prompt=prompt,
+                prompt_source_bases=tuple(batch_prompt_source_bases),
+                candidate_active=False,
+                corrective_call_count=(
+                    batch_ordinary_chat_execution.corrective_call_count
+                    + response_rewrite_calls
+                ),
+            )
+            batch_synthesis_candidate_active = False
+            if source_neutral_rewrite:
+                batch_response_source_context_available = False
+            if not response:
+                await _stop_batch_typing(
+                    channel_id,
+                    local_generation_id,
+                    reason="candidate_review_rewrite_failed",
+                )
+                await safely_finalize_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    final_response="",
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status="candidate_review_rewrite_failed",
+                )
+                return
         archive_guard_triggered = bool(
             not batch_response_source_context_available
             and _contains_unsupported_source_authority_claim(
@@ -37188,143 +37256,82 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         batch_single_packet_selected_response = (
             str(response or "") if batch_single_packet_cutover else ""
         )
-        batch_deterministic_single_packet_block = bool(
-            batch_single_packet_cutover
-            and batch_ordinary_chat_execution is not None
-            and not batch_synthesis_candidate_active
-            and batch_ordinary_chat_execution.provider_call_count == 0
-            and batch_ordinary_chat_execution.block_reason
-            and str(response or "")
-            == _ordinary_chat_single_packet_block_response(
-                batch_ordinary_chat_execution.block_reason,
-                orchestration_state["decision"].situation_frame,
+        response, guard_diagnostics = (
+            await apply_guarded_response_regeneration(
+                response or "",
+                prompt=prompt,
+                user_id=first_uid,
+                guild_id=guild_id,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                channel_policy=channel_policy,
+                directness=batch_directness,
+                user_display_name=(
+                    collapsed_items[-1][0]
+                    if collapsed_items
+                    else ""
+                ),
+                current_user_text=combined_text,
+                has_media=bool(active_packet.get("media_present", False)),
+                is_reply=False,
+                generation_route=(
+                    generation_route
+                    if "generation_route" in locals()
+                    else "get_gemini_response"
+                ),
+                channel=channel,
+                source_context_available=(
+                    batch_response_source_context_available
+                ),
+                batch_generation_id=local_generation_id,
+                conversation_continuity_required=(
+                    batch_continuity_required
+                ),
+                community_visual_basis=community_visual_basis,
+                exact_quote_requested=(
+                    batch_attribution_contract.exact_quote_requested
+                ),
+                exact_quote_authority=(
+                    batch_attribution_contract.exact_quote_authority
+                ),
+                third_party_attribution_requested=(
+                    batch_attribution_contract.third_party_attribution_requested
+                ),
+                prompt_source_bases=tuple(batch_prompt_source_bases),
+                regeneration_allowed=bool(
+                    batch_single_packet_cutover
+                    or not batch_synthesis_candidate_active
+                ),
+                situation_frame=(
+                    orchestration_state["decision"].situation_frame
+                ),
             )
         )
-        batch_typed_single_packet_candidate = bool(
-            batch_single_packet_cutover
-            and batch_synthesis_candidate_active
-            and batch_synthesis_decision is not None
-            and str(
-                getattr(
-                    batch_synthesis_decision,
-                    "typed_contract_status",
-                    "",
-                )
-                or ""
-            )
-            == "valid"
-        )
-        if batch_deterministic_single_packet_block:
-            guard_diagnostics = {
-                "suppressed": False,
-                "deterministic_single_packet_block": True,
-                "_revalidated_prompt_source_bases": tuple(
-                    batch_prompt_source_bases
-                ),
-            }
-        elif batch_typed_single_packet_candidate:
-            guard_diagnostics = {
-                "suppressed": False,
-                "typed_single_packet_selection_boundary": True,
-                "_revalidated_prompt_source_bases": tuple(
-                    batch_prompt_source_bases
-                ),
-            }
-        else:
-            response, guard_diagnostics = (
-                await apply_guarded_response_regeneration(
-                    response or "",
-                    prompt=prompt,
-                    user_id=first_uid,
-                    guild_id=guild_id,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
-                    channel_policy=channel_policy,
-                    directness=batch_directness,
-                    user_display_name=(
-                        collapsed_items[-1][0]
-                        if collapsed_items
-                        else ""
-                    ),
-                    current_user_text=combined_text,
-                    has_media=bool(
-                        active_packet.get("media_present", False)
-                    ),
-                    is_reply=False,
-                    generation_route=(
-                        generation_route
-                        if "generation_route" in locals()
-                        else "get_gemini_response"
-                    ),
-                    channel=channel,
-                    source_context_available=(
-                        batch_response_source_context_available
-                    ),
-                    batch_generation_id=local_generation_id,
-                    conversation_continuity_required=(
-                        batch_continuity_required
-                    ),
-                    community_visual_basis=community_visual_basis,
-                    exact_quote_requested=(
-                        batch_attribution_contract.exact_quote_requested
-                    ),
-                    exact_quote_authority=(
-                        batch_attribution_contract.exact_quote_authority
-                    ),
-                    third_party_attribution_requested=(
-                        batch_attribution_contract
-                        .third_party_attribution_requested
-                    ),
-                    prompt_source_bases=tuple(
-                        batch_prompt_source_bases
-                    ),
-                    regeneration_allowed=bool(
-                        not batch_synthesis_candidate_active
-                        and not batch_single_packet_cutover
-                    ),
-                    situation_frame=(
-                        orchestration_state["decision"].situation_frame
-                    ),
-                )
-            )
         if (
             batch_single_packet_cutover
-            and batch_synthesis_candidate_active
-            and batch_synthesis_decision is not None
-            and (
-                guard_diagnostics.get("suppressed")
-                or str(response or "")
-                != batch_single_packet_selected_response
-            )
+            and guard_diagnostics.get("suppressed")
         ):
-            batch_single_packet_guard_reason = (
-                "single_packet_guard_suppressed"
-                if guard_diagnostics.get("suppressed")
-                else "single_packet_guard_modified_response"
+            batch_single_packet_guard_reason = str(
+                guard_diagnostics.get("suppression_reason")
+                or "single_packet_guard_repair_required"
             )
-            batch_synthesis_decision = (
-                await safely_record_ordinary_chat_single_packet_block(
-                    batch_synthesis_decision,
-                    reason=batch_single_packet_guard_reason,
-                )
-                or batch_synthesis_decision
-            )
-            if not guard_diagnostics.get("suppressed"):
-                guard_diagnostics.update(
-                    {
-                        "suppressed": True,
-                        "suppression_reason": (
-                            batch_single_packet_guard_reason
-                        ),
-                    }
-                )
-            response = recover_guarded_response_obligation(
+            (
                 response,
-                baseline_response=batch_baseline_response,
+                prompt,
+                rewritten_source_bases,
+                response_rewrite_calls,
+                source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
+                response,
+                baseline_response=batch_single_packet_selected_response,
                 prompt=prompt,
                 current_user_text=combined_text,
                 diagnostics=guard_diagnostics,
                 route_mode=ROUTE_MODE_NORMAL_CHAT,
                 channel_policy=channel_policy,
+                user_id=first_uid,
+                guild_id=guild_id,
+                channel=channel,
+                prompt_source_bases=tuple(batch_prompt_source_bases),
                 source_context_available=(
                     batch_response_source_context_available
                 ),
@@ -37335,13 +37342,55 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_attribution_contract.exact_quote_authority
                 ),
                 third_party_attribution_requested=(
-                    batch_attribution_contract
-                    .third_party_attribution_requested
+                    batch_attribution_contract.third_party_attribution_requested
                 ),
             )
+            batch_single_packet_corrective_call_count += (
+                response_rewrite_calls
+            )
+            batch_prompt_source_bases = list(rewritten_source_bases)
+            batch_synthesis_decision = (
+                await safely_record_ordinary_chat_single_packet_review(
+                    batch_synthesis_decision,
+                    reason="single_packet_response_rewritten_after_guard",
+                    corrective_call_count=(
+                        batch_single_packet_corrective_call_count
+                    ),
+                )
+                or batch_synthesis_decision
+            )
+            if not response:
+                await _stop_batch_typing(
+                    channel_id,
+                    local_generation_id,
+                    reason="response_rewrite_generation_failed",
+                )
+                await safely_finalize_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    final_response="",
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status="response_rewrite_generation_failed",
+                )
+                return
+            guard_diagnostics.update(
+                {
+                    "suppressed": False,
+                    "response_obligation_regenerated": True,
+                    "response_obligation_recovery_kind": "model_rewrite",
+                    "source_neutral_recovery": source_neutral_rewrite,
+                    "original_suppression_reason": (
+                        batch_single_packet_guard_reason
+                    ),
+                }
+            )
             batch_synthesis_candidate_active = False
-            if guard_diagnostics.get("source_neutral_recovery"):
-                batch_prompt_source_bases = []
+        elif (
+            batch_single_packet_cutover
+            and str(response or "")
+            != batch_single_packet_selected_response
+        ):
+            guard_diagnostics["single_packet_guard_repaired"] = True
         if (
             not batch_single_packet_cutover
             and batch_synthesis_candidate_active
@@ -37434,6 +37483,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             or guard_diagnostics.get("register_mismatch_guard_triggered")
             or guard_diagnostics.get("source_grounding_guard_triggered")
             or guard_diagnostics.get("contextual_followthrough_guard_triggered")
+            or guard_diagnostics.get("stale_media_response_guard_triggered")
             or guard_diagnostics.get("community_visual_guard_triggered")
             or guard_diagnostics.get("exact_quote_guard_triggered")
             or guard_diagnostics.get(
@@ -37494,7 +37544,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if batch_synthesis_decision is not None:
                 if batch_single_packet_cutover:
                     batch_synthesis_decision = (
-                        await safely_record_ordinary_chat_single_packet_block(
+                        await safely_record_ordinary_chat_single_packet_review(
                             batch_synthesis_decision,
                             reason=(
                                 "stale_after_batch_single_packet_guard"
@@ -37522,7 +37572,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             return
         if guard_diagnostics.get("suppressed"):
-            response = recover_guarded_response_obligation(
+            (
+                response,
+                prompt,
+                rewritten_source_bases,
+                response_rewrite_calls,
+                _source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
                 response,
                 baseline_response=batch_baseline_response,
                 prompt=prompt,
@@ -37530,6 +37586,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 diagnostics=guard_diagnostics,
                 route_mode=ROUTE_MODE_NORMAL_CHAT,
                 channel_policy=channel_policy,
+                user_id=first_uid,
+                guild_id=guild_id,
+                channel=channel,
+                prompt_source_bases=tuple(batch_prompt_source_bases),
                 source_context_available=batch_source_context_available,
                 exact_quote_requested=(
                     batch_attribution_contract.exact_quote_requested
@@ -37542,7 +37602,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     .third_party_attribution_requested
                 ),
             )
+            batch_prompt_source_bases = list(rewritten_source_bases)
+            if batch_single_packet_cutover:
+                batch_single_packet_corrective_call_count += (
+                    response_rewrite_calls
+                )
             batch_synthesis_candidate_active = False
+            if not response:
+                return
         batch_presend_source_bases = tuple(
             guard_diagnostics.get("_revalidated_prompt_source_bases")
             or batch_prompt_source_bases
@@ -37568,73 +37635,150 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             if presend_quote_failure:
                 logging.warning(
-                    "batch_exact_quote_recovered_before_send reason=%s "
+                    "batch_exact_quote_rewrite_before_send reason=%s "
                     "channel_id=%s",
                     presend_quote_failure,
                     channel_id,
                 )
-                if (
-                    batch_single_packet_cutover
-                    and batch_synthesis_decision is not None
-                ):
+                if batch_single_packet_cutover:
+                    guard_diagnostics.update(
+                        {
+                            "suppressed": True,
+                            "suppression_reason": presend_quote_failure,
+                            "exact_quote_guard_triggered": True,
+                            "exact_quote_guard_reason": presend_quote_failure,
+                        }
+                    )
+                    (
+                        response,
+                        prompt,
+                        rewritten_source_bases,
+                        response_rewrite_calls,
+                        source_neutral_rewrite,
+                    ) = await resolve_guarded_response_obligation(
+                        response,
+                        baseline_response=response,
+                        prompt=prompt,
+                        current_user_text=combined_text,
+                        diagnostics=guard_diagnostics,
+                        route_mode=ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy=channel_policy,
+                        user_id=first_uid,
+                        guild_id=guild_id,
+                        channel=channel,
+                        prompt_source_bases=tuple(
+                            batch_presend_source_bases
+                        ),
+                        source_context_available=(
+                            batch_response_source_context_available
+                        ),
+                        exact_quote_requested=(
+                            batch_attribution_contract.exact_quote_requested
+                        ),
+                        exact_quote_authority=None,
+                        third_party_attribution_requested=(
+                            batch_attribution_contract
+                            .third_party_attribution_requested
+                        ),
+                    )
+                    batch_single_packet_corrective_call_count += (
+                        response_rewrite_calls
+                    )
                     batch_synthesis_decision = (
-                        await safely_record_ordinary_chat_single_packet_block(
+                        await safely_record_ordinary_chat_single_packet_review(
                             batch_synthesis_decision,
                             reason=(
-                                "single_packet_exact_quote_%s"
-                                % presend_quote_failure
+                                "single_packet_exact_quote_response_rewritten"
+                            ),
+                            corrective_call_count=(
+                                batch_single_packet_corrective_call_count
                             ),
                         )
                         or batch_synthesis_decision
                     )
-                guard_diagnostics.update(
-                    {
-                        "suppressed": True,
-                        "suppression_reason": presend_quote_failure,
-                        "exact_quote_guard_triggered": True,
-                        "exact_quote_guard_reason": presend_quote_failure,
-                    }
-                )
-                response = recover_guarded_response_obligation(
-                    response,
-                    baseline_response=batch_baseline_response,
-                    prompt=prompt,
-                    current_user_text=combined_text,
-                    diagnostics=guard_diagnostics,
-                    route_mode=ROUTE_MODE_NORMAL_CHAT,
-                    channel_policy=channel_policy,
-                    source_context_available=(
-                        batch_response_source_context_available
-                    ),
-                    exact_quote_requested=(
-                        batch_attribution_contract.exact_quote_requested
-                    ),
-                    exact_quote_authority=None,
-                    third_party_attribution_requested=(
-                        batch_attribution_contract
-                        .third_party_attribution_requested
-                    ),
-                )
-                batch_presend_source_bases = ()
+                    if not response:
+                        await safely_finalize_shared_brain_synthesis(
+                            batch_synthesis_decision,
+                            final_response="",
+                            response_sent=False,
+                            candidate_live=False,
+                            guard_status=(
+                                "exact_quote_response_rewrite_failed"
+                            ),
+                        )
+                        return
+                    batch_presend_source_bases = tuple(
+                        rewritten_source_bases
+                    )
+                    guard_diagnostics.update(
+                        {
+                            "suppressed": False,
+                            "response_obligation_regenerated": True,
+                            "response_obligation_recovery_kind": (
+                                "model_rewrite"
+                            ),
+                            "source_neutral_recovery": (
+                                source_neutral_rewrite
+                            ),
+                            "original_suppression_reason": (
+                                presend_quote_failure
+                            ),
+                            "exact_quote_guard_triggered": True,
+                            "exact_quote_guard_reason": (
+                                presend_quote_failure
+                            ),
+                        }
+                    )
+                else:
+                    guard_diagnostics.update(
+                        {
+                            "suppressed": True,
+                            "suppression_reason": presend_quote_failure,
+                            "exact_quote_guard_triggered": True,
+                            "exact_quote_guard_reason": (
+                                presend_quote_failure
+                            ),
+                        }
+                    )
+                    (
+                        response,
+                        prompt,
+                        batch_presend_source_bases,
+                        _response_rewrite_calls,
+                        _source_neutral_rewrite,
+                    ) = await resolve_guarded_response_obligation(
+                        response,
+                        baseline_response=batch_baseline_response,
+                        prompt=prompt,
+                        current_user_text=combined_text,
+                        diagnostics=guard_diagnostics,
+                        route_mode=ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy=channel_policy,
+                        user_id=first_uid,
+                        guild_id=guild_id,
+                        channel=channel,
+                        prompt_source_bases=tuple(
+                            batch_presend_source_bases
+                        ),
+                        source_context_available=(
+                            batch_response_source_context_available
+                        ),
+                        exact_quote_requested=(
+                            batch_attribution_contract.exact_quote_requested
+                        ),
+                        exact_quote_authority=None,
+                        third_party_attribution_requested=(
+                            batch_attribution_contract
+                            .third_party_attribution_requested
+                        ),
+                    )
+                    if not response:
+                        return
                 batch_synthesis_candidate_active = False
         batch_source_failure = prompt_source_basis_failure(
             batch_presend_source_bases
         )
         if batch_source_failure and batch_single_packet_cutover:
-            if batch_synthesis_decision is not None:
-                batch_synthesis_decision = (
-                    await safely_record_ordinary_chat_single_packet_block(
-                        batch_synthesis_decision,
-                        reason=(
-                            "single_packet_presend_%s"
-                            % batch_source_failure
-                        ),
-                        source_revalidation_status=(
-                            batch_source_failure
-                        ),
-                    )
-                    or batch_synthesis_decision
-                )
             guard_diagnostics.update(
                 {
                     "suppressed": True,
@@ -37642,14 +37786,24 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "prompt_source_basis_changed": True,
                 }
             )
-            response = recover_guarded_response_obligation(
+            (
                 response,
-                baseline_response=batch_baseline_response,
+                prompt,
+                rewritten_source_bases,
+                response_rewrite_calls,
+                source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
+                response,
+                baseline_response=response,
                 prompt=prompt,
                 current_user_text=combined_text,
                 diagnostics=guard_diagnostics,
                 route_mode=ROUTE_MODE_NORMAL_CHAT,
                 channel_policy=channel_policy,
+                user_id=first_uid,
+                guild_id=guild_id,
+                channel=channel,
+                prompt_source_bases=tuple(batch_presend_source_bases),
                 source_context_available=(
                     batch_response_source_context_available
                 ),
@@ -37658,11 +37812,43 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 ),
                 exact_quote_authority=None,
                 third_party_attribution_requested=(
-                    batch_attribution_contract
-                    .third_party_attribution_requested
+                    batch_attribution_contract.third_party_attribution_requested
                 ),
             )
-            batch_presend_source_bases = ()
+            batch_single_packet_corrective_call_count += (
+                response_rewrite_calls
+            )
+            batch_synthesis_decision = (
+                await safely_record_ordinary_chat_single_packet_review(
+                    batch_synthesis_decision,
+                    reason="single_packet_source_change_response_rewritten",
+                    corrective_call_count=(
+                        batch_single_packet_corrective_call_count
+                    ),
+                    source_revalidation_status=batch_source_failure,
+                )
+                or batch_synthesis_decision
+            )
+            if not response:
+                await safely_finalize_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    final_response="",
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status="source_change_response_rewrite_failed",
+                )
+                return
+            guard_diagnostics.update(
+                {
+                    "suppressed": False,
+                    "response_obligation_regenerated": True,
+                    "response_obligation_recovery_kind": "model_rewrite",
+                    "source_neutral_recovery": source_neutral_rewrite,
+                    "original_suppression_reason": batch_source_failure,
+                    "prompt_source_basis_changed": True,
+                }
+            )
+            batch_presend_source_bases = tuple(rewritten_source_bases)
             batch_synthesis_candidate_active = False
             batch_source_failure = ""
         if (
@@ -37736,7 +37922,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             )
             if guard_diagnostics.get("suppressed"):
-                response = recover_guarded_response_obligation(
+                (
+                    response,
+                    prompt,
+                    rewritten_source_bases,
+                    _response_rewrite_calls,
+                    _source_neutral_rewrite,
+                ) = await resolve_guarded_response_obligation(
                     response,
                     baseline_response=batch_baseline_response,
                     prompt=prompt,
@@ -37744,6 +37936,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     diagnostics=guard_diagnostics,
                     route_mode=ROUTE_MODE_NORMAL_CHAT,
                     channel_policy=channel_policy,
+                    user_id=first_uid,
+                    guild_id=guild_id,
+                    channel=channel,
+                    prompt_source_bases=tuple(batch_prompt_source_bases),
                     source_context_available=(
                         batch_source_context_available
                     ),
@@ -37758,6 +37954,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         .third_party_attribution_requested
                     ),
                 )
+                batch_prompt_source_bases = list(
+                    rewritten_source_bases
+                )
+                if not response:
+                    return
             batch_presend_source_bases = tuple(
                 guard_diagnostics.get(
                     "_revalidated_prompt_source_bases"
@@ -37827,7 +38028,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "prompt_source_basis_changed": True,
                 }
             )
-            response = recover_guarded_response_obligation(
+            (
+                response,
+                prompt,
+                batch_presend_source_bases,
+                _response_rewrite_calls,
+                _source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
                 response,
                 baseline_response=batch_baseline_response,
                 prompt=prompt,
@@ -37835,6 +38042,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 diagnostics=guard_diagnostics,
                 route_mode=ROUTE_MODE_NORMAL_CHAT,
                 channel_policy=channel_policy,
+                user_id=first_uid,
+                guild_id=guild_id,
+                channel=channel,
+                prompt_source_bases=tuple(batch_presend_source_bases),
                 source_context_available=(
                     batch_response_source_context_available
                 ),
@@ -37847,7 +38058,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     .third_party_attribution_requested
                 ),
             )
-            batch_presend_source_bases = ()
+            if not response:
+                return
             batch_synthesis_candidate_active = False
         batch_frame = orchestration_state["decision"].situation_frame
         if isinstance(batch_frame, SituationFrameV1):
@@ -37900,57 +38112,45 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_frame_revalidation.status,
                 len(batch_frame_revalidation.reason_codes),
             )
-            batch_single_packet_block_reason = str(
-                batch_ordinary_chat_execution.block_reason
-                if batch_ordinary_chat_execution is not None
-                else ""
-            ).lower()
-            batch_deterministic_frame_clarification = bool(
-                batch_deterministic_single_packet_block
+            batch_generated_frame_clarification = bool(
+                batch_single_packet_cutover
                 and batch_frame_revalidation.status == "ambiguous"
-                and (
-                    "frame_ambiguous"
-                    in batch_single_packet_block_reason
-                    or "deterministic_task_clarify"
-                    in batch_single_packet_block_reason
-                )
             )
             if (
                 batch_single_packet_cutover
-                and batch_frame_revalidation.status != "valid"
-                and not batch_deterministic_frame_clarification
+                and batch_frame_revalidation.status
+                not in {"valid", "ambiguous"}
             ):
-                if batch_synthesis_decision is not None:
-                    batch_synthesis_decision = (
-                        await safely_record_ordinary_chat_single_packet_block(
-                            batch_synthesis_decision,
-                            reason=(
-                                "single_packet_frame_%s"
-                                % batch_frame_revalidation.status
-                            ),
-                            frame_revalidation_status=(
-                                batch_frame_revalidation.status
-                            ),
-                        )
-                        or batch_synthesis_decision
-                    )
+                frame_rewrite_reason = (
+                    "source_revalidation_frame_"
+                    + batch_frame_revalidation.status
+                )
                 guard_diagnostics.update(
                     {
                         "suppressed": True,
-                        "suppression_reason": (
-                            "source_revalidation_frame_"
-                            + batch_frame_revalidation.status
-                        ),
+                        "suppression_reason": frame_rewrite_reason,
                     }
                 )
-                response = recover_guarded_response_obligation(
+                (
                     response,
-                    baseline_response=batch_baseline_response,
+                    prompt,
+                    rewritten_source_bases,
+                    response_rewrite_calls,
+                    source_neutral_rewrite,
+                ) = await resolve_guarded_response_obligation(
+                    response,
+                    baseline_response=response,
                     prompt=prompt,
                     current_user_text=combined_text,
                     diagnostics=guard_diagnostics,
                     route_mode=ROUTE_MODE_NORMAL_CHAT,
                     channel_policy=channel_policy,
+                    user_id=first_uid,
+                    guild_id=guild_id,
+                    channel=channel,
+                    prompt_source_bases=tuple(
+                        batch_presend_source_bases
+                    ),
                     source_context_available=(
                         batch_response_source_context_available
                     ),
@@ -37963,12 +38163,84 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         .third_party_attribution_requested
                     ),
                 )
-                batch_presend_source_bases = ()
+                batch_single_packet_corrective_call_count += (
+                    response_rewrite_calls
+                )
+                batch_synthesis_decision = (
+                    await safely_record_ordinary_chat_single_packet_review(
+                        batch_synthesis_decision,
+                        reason="single_packet_frame_response_rewritten",
+                        corrective_call_count=(
+                            batch_single_packet_corrective_call_count
+                        ),
+                        frame_revalidation_status=(
+                            batch_frame_revalidation.status
+                        ),
+                    )
+                    or batch_synthesis_decision
+                )
+                if not response:
+                    await safely_finalize_shared_brain_synthesis(
+                        batch_synthesis_decision,
+                        final_response="",
+                        response_sent=False,
+                        candidate_live=False,
+                        guard_status="frame_response_rewrite_failed",
+                    )
+                    return
+                guard_diagnostics.update(
+                    {
+                        "suppressed": False,
+                        "response_obligation_regenerated": True,
+                        "response_obligation_recovery_kind": (
+                            "model_rewrite"
+                        ),
+                        "source_neutral_recovery": (
+                            source_neutral_rewrite
+                        ),
+                        "original_suppression_reason": (
+                            frame_rewrite_reason
+                        ),
+                    }
+                )
+                batch_presend_source_bases = tuple(
+                    rewritten_source_bases
+                )
                 batch_synthesis_candidate_active = False
-            if batch_deterministic_frame_clarification:
+            if batch_generated_frame_clarification:
                 guard_diagnostics[
-                    "deterministic_frame_clarification"
+                    "generated_frame_clarification"
                 ] = True
+        final_rewrite_interrupt = _hard_interrupt_active_for_generation(
+            channel_id,
+            local_generation_id,
+        )
+        final_rewrite_buffered_count = len(_channel_buffers[channel_id])
+        if final_rewrite_interrupt or final_rewrite_buffered_count > 0:
+            if final_rewrite_buffered_count > 0:
+                _channel_interrupt_handoff[channel_id] = list(items)
+                _channel_first_seen.setdefault(
+                    channel_id,
+                    datetime.now(PACIFIC_TZ),
+                )
+            _channel_preempted_generation_id[channel_id] = 0
+            _channel_message_interrupt_generation_id[channel_id] = 0
+            if batch_single_packet_cutover:
+                batch_synthesis_decision = (
+                    await safely_record_ordinary_chat_single_packet_review(
+                        batch_synthesis_decision,
+                        reason="stale_after_presend_response_rewrite",
+                    )
+                    or batch_synthesis_decision
+                )
+            await safely_finalize_shared_brain_synthesis(
+                batch_synthesis_decision,
+                final_response=response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="stale_after_presend_response_rewrite",
+            )
+            return
         _log_batch_event(
             logging.INFO,
             "response_send_commit_start",
@@ -38009,7 +38281,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 and batch_synthesis_decision is not None
             ):
                 batch_synthesis_decision = (
-                    await safely_record_ordinary_chat_single_packet_block(
+                    await safely_record_ordinary_chat_single_packet_review(
                         batch_synthesis_decision,
                         reason="single_packet_discord_send_failed",
                     )
@@ -38050,7 +38322,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_single_packet_cutover
                     and batch_synthesis_candidate_active
                 )
-                else "batch_single_packet_deterministic_block_sent"
+                else "batch_single_packet_repaired_response_sent"
                 if batch_single_packet_cutover
                 else "batch_candidate_sent"
                 if batch_synthesis_candidate_active
@@ -38430,48 +38702,47 @@ def build_user_aware_prompt(
     prompt_source_bases: list[PromptSourceBasis] = []
     memory_context = ""
     memory_prompt_basis = None
-    if not ordinary_chat_single_packet:
-        memory_context = build_user_memory_context(
-            user_id,
-            guild_id,
-            route_mode=route_mode,
-            channel_policy=channel_policy,
-            user_text=clean_content,
-            is_owner_or_mod=prompt_operator_authority,
-            current_direct=recall_current_direct,
-            governance_allowed=bool(memory_governance_live_enabled()),
-            channel_id=channel_id,
-            moment_attribution_target_user_id=(
-                moment_attribution_target_user_id
-            ),
-            source_metadata=memory_source_metadata,
-        )
-        memory_prompt_basis = build_memory_prompt_source_basis(
-            memory_context,
-            user_id=user_id,
-            guild_id=guild_id,
-            route_mode=route_mode,
-            channel_policy=channel_policy,
-            user_text=clean_content,
-            is_owner_or_mod=prompt_operator_authority,
-            current_direct=recall_current_direct,
-            governance_allowed=bool(memory_governance_live_enabled()),
-            channel_id=channel_id,
-            moment_attribution_target_user_id=(
-                moment_attribution_target_user_id
-            ),
-            has_moment_gist=bool(
-                memory_source_metadata.get("moment_gist_rendered")
-            ),
-            governed_basis_digest=str(
-                memory_source_metadata.get("governed_basis_digest") or ""
-            ),
-            source_safe_recall_synthesis=bool(
-                memory_source_metadata.get(
-                    "source_safe_recall_synthesis"
-                )
-            ),
-        )
+    memory_context = build_user_memory_context(
+        user_id,
+        guild_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        user_text=clean_content,
+        is_owner_or_mod=prompt_operator_authority,
+        current_direct=recall_current_direct,
+        governance_allowed=bool(memory_governance_live_enabled()),
+        channel_id=channel_id,
+        moment_attribution_target_user_id=(
+            moment_attribution_target_user_id
+        ),
+        source_metadata=memory_source_metadata,
+    )
+    memory_prompt_basis = build_memory_prompt_source_basis(
+        memory_context,
+        user_id=user_id,
+        guild_id=guild_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        user_text=clean_content,
+        is_owner_or_mod=prompt_operator_authority,
+        current_direct=recall_current_direct,
+        governance_allowed=bool(memory_governance_live_enabled()),
+        channel_id=channel_id,
+        moment_attribution_target_user_id=(
+            moment_attribution_target_user_id
+        ),
+        has_moment_gist=bool(
+            memory_source_metadata.get("moment_gist_rendered")
+        ),
+        governed_basis_digest=str(
+            memory_source_metadata.get("governed_basis_digest") or ""
+        ),
+        source_safe_recall_synthesis=bool(
+            memory_source_metadata.get(
+                "source_safe_recall_synthesis"
+            )
+        ),
+    )
     if memory_prompt_basis is not None:
         prompt_source_bases.append(memory_prompt_basis)
     conversation_prompt_basis = build_conversation_prompt_source_basis(
@@ -38551,24 +38822,12 @@ def build_user_aware_prompt(
     broadcast_specialized_owner = bool(
         _broadcast_memory_requires_specialized_owner(clean_content)
     )
-    if ordinary_chat_single_packet and not broadcast_specialized_owner:
-        broadcast_context = ""
-        broadcast_entity_terms = extract_broadcast_memory_query_terms(
-            clean_content
-        )
-        if broadcast_entity_terms:
-            logging.info(
-                "broadcast_memory_context_skipped "
-                "reason=ordinary_chat_packet_owner terms=%s",
-                len(broadcast_entity_terms),
-            )
-    else:
-        broadcast_context = build_broadcast_memory_context(
-            guild_id,
-            clean_content,
-            channel_policy,
-            is_owner_or_mod=prompt_operator_authority,
-        )
+    broadcast_context = build_broadcast_memory_context(
+        guild_id,
+        clean_content,
+        channel_policy,
+        is_owner_or_mod=prompt_operator_authority,
+    )
     broadcast_prompt_block = ""
     if broadcast_context:
         broadcast_prompt_block = (
@@ -38650,7 +38909,7 @@ def build_user_aware_prompt(
         publication_queue_composition
         and operational_queue_packet_snapshot
     )
-    assessment_broadcast_context_present = bool(
+    broadcast_context_eligible = bool(
         broadcast_context
         and not finalized_show_packet_owner
         and not publication_packet_owns_current_turn
@@ -38671,7 +38930,7 @@ def build_user_aware_prompt(
     if community_visual_prompt_block:
         community_visual_prompt_block += "\n"
     specialized_owner_present = bool(
-        (assessment_broadcast_context_present and broadcast_specialized_owner)
+        (broadcast_context_eligible and broadcast_specialized_owner)
         or (
             show_state_context
             and not publication_packet_owns_current_turn
@@ -38703,6 +38962,9 @@ def build_user_aware_prompt(
             specialized_owner_present=True,
         )
         ordinary_chat_single_packet = False
+    assessment_broadcast_context_present = bool(
+        broadcast_context_eligible and not ordinary_chat_single_packet
+    )
     continuity_source_context = "\n".join(
         part
         for part in (room_context, memory_context)
@@ -38938,6 +39200,23 @@ def build_user_aware_prompt(
             has_media=_prompt_has_current_message_media_context(
                 clean_content
             ),
+            competing_factual_contexts=tuple(
+                block
+                for block in (
+                    (
+                        f"Durable memory context:\n{memory_context}\n"
+                        if memory_context
+                        else ""
+                    ),
+                    broadcast_prompt_block,
+                    show_state_prompt_block,
+                    website_read_model_prompt_block,
+                    queue_artist_memory_prompt_block,
+                    tiktok_show_evidence_prompt_block,
+                    source_context_prompt_block,
+                )
+                if block
+            ),
         )
         if ordinary_chat_single_packet
         else None
@@ -38989,7 +39268,7 @@ def build_user_aware_prompt(
         prompt_metadata["ordinary_chat_single_packet_basis"] = (
             ordinary_chat_single_packet_basis
         )
-        prompt_metadata["ordinary_chat_single_packet_block_reason"] = (
+        prompt_metadata["ordinary_chat_single_packet_preflight_reason"] = (
             "nonpacket_community_visual_context"
             if ordinary_chat_single_packet
             and community_visual_prompt_block
@@ -38997,38 +39276,6 @@ def build_user_aware_prompt(
             if ordinary_chat_single_packet
             and ordinary_chat_single_packet_basis is None
             else ""
-        )
-        prompt_metadata["ordinary_chat_legacy_baseline_request"] = (
-            {
-                "user_id": user_id,
-                "guild_id": guild_id,
-                "fallback_display_name": fallback_display_name,
-                "clean_content": clean_content,
-                "show_state_context": show_state_context,
-                "room_context": room_context,
-                "channel_name": channel_name,
-                "message_count": message_count,
-                "privileged": privileged,
-                "channel_policy": channel_policy,
-                "website_read_model_context": website_read_model_context,
-                "source_context_block": source_context_block,
-                "route_mode": route_mode,
-                "is_direct_interaction": is_direct_interaction,
-                "current_turn_context": current_turn_context,
-                "channel_id": channel_id,
-                "moment_attribution_target_user_id": (
-                    moment_attribution_target_user_id
-                ),
-                "verified_exact_quote_authority": (
-                    verified_exact_quote_authority
-                ),
-                "conversation_context_result": (
-                    conversation_context_result
-                ),
-                "conversation_orchestration": conversation_orchestration,
-            }
-            if ordinary_chat_single_packet
-            else None
         )
         prompt_metadata["unified_moment_canary_applied"] = bool(
             unified_moment_canary_basis is not None
@@ -39060,7 +39307,7 @@ def build_user_aware_prompt(
         )
 
     room_prompt_block = ""
-    if room_context and not ordinary_chat_single_packet:
+    if room_context:
         room_prompt_block = (
             f"{room_context}\n"
             "Room-first context rules:\n"
@@ -39150,20 +39397,10 @@ def build_user_aware_prompt(
         else ""
     )
     memory_prompt_block = (
-        ""
-        if ordinary_chat_single_packet
-        else f"Durable memory context:\n{memory_context}\n"
+        f"Durable memory context:\n{memory_context}\n"
+        if memory_context
+        else ""
     )
-    if ordinary_chat_single_packet:
-        community_visual_prompt_block = ""
-        broadcast_prompt_block = ""
-        show_state_prompt_block = ""
-        website_read_model_prompt_block = ""
-        queue_artist_memory_prompt_block = ""
-        tiktok_show_evidence_prompt_block = ""
-        tiktok_show_analysis_turn_contract = ""
-        tiktok_show_episode_turn_contract = ""
-        source_context_prompt_block = ""
 
     prompt = (
         f"Current user request: {clean_content}\n"
@@ -40243,8 +40480,19 @@ async def _generate_direct_payload_session(session_key, reason: str):
         situation_frame_current_text=direct_content,
         situation_frame_route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
     )
+    direct_payload_presend_source_bases = tuple(
+        guard_diagnostics.get("_revalidated_prompt_source_bases")
+        or prompt_metadata.get("prompt_source_bases")
+        or ()
+    )
     if guard_diagnostics.get("suppressed"):
-        response = recover_guarded_response_obligation(
+        (
+            response,
+            prompt,
+            direct_payload_presend_source_bases,
+            direct_payload_rewrite_calls,
+            _direct_payload_source_neutral,
+        ) = await resolve_guarded_response_obligation(
             response,
             baseline_response=direct_payload_baseline_response,
             prompt=prompt,
@@ -40252,6 +40500,10 @@ async def _generate_direct_payload_session(session_key, reason: str):
             diagnostics=guard_diagnostics,
             route_mode=ROUTE_MODE_NORMAL_CHAT,
             channel_policy=session.get("channel_policy", "unknown"),
+            user_id=session["requester_user_id"],
+            guild_id=session["guild_id"],
+            channel=getattr(anchor_message, "channel", None),
+            prompt_source_bases=direct_payload_presend_source_bases,
             source_context_available=source_context_available,
             exact_quote_requested=bool(
                 prompt_metadata.get("exact_quote_requested")
@@ -40263,13 +40515,11 @@ async def _generate_direct_payload_session(session_key, reason: str):
                 prompt_metadata.get("third_party_attribution_requested")
             ),
         )
-    direct_payload_presend_source_bases = tuple(
-        guard_diagnostics.get("_revalidated_prompt_source_bases")
-        or prompt_metadata.get("prompt_source_bases")
-        or ()
-    )
-    if guard_diagnostics.get("source_neutral_recovery"):
-        direct_payload_presend_source_bases = ()
+        if direct_payload_rewrite_calls:
+            logging.info(
+                "direct_payload_response_regenerated provider_calls=%s",
+                direct_payload_rewrite_calls,
+            )
 
     fallback_response_sent = False
     if not response:
@@ -40312,7 +40562,13 @@ async def _generate_direct_payload_session(session_key, reason: str):
                 "exact_quote_guard_reason": quote_presend_failure,
             }
         )
-        response = recover_guarded_response_obligation(
+        (
+            response,
+            prompt,
+            direct_payload_presend_source_bases,
+            _direct_payload_quote_rewrite_calls,
+            _direct_payload_quote_source_neutral,
+        ) = await resolve_guarded_response_obligation(
             response,
             baseline_response=direct_payload_baseline_response,
             prompt=prompt,
@@ -40320,6 +40576,10 @@ async def _generate_direct_payload_session(session_key, reason: str):
             diagnostics=guard_diagnostics,
             route_mode=ROUTE_MODE_NORMAL_CHAT,
             channel_policy=session.get("channel_policy", "unknown"),
+            user_id=session["requester_user_id"],
+            guild_id=session["guild_id"],
+            channel=getattr(anchor_message, "channel", None),
+            prompt_source_bases=direct_payload_presend_source_bases,
             source_context_available=source_context_available,
             exact_quote_requested=bool(
                 prompt_metadata.get("exact_quote_requested")
@@ -40329,7 +40589,13 @@ async def _generate_direct_payload_session(session_key, reason: str):
                 prompt_metadata.get("third_party_attribution_requested")
             ),
         )
-        direct_payload_presend_source_bases = ()
+        if not response:
+            close_direct_payload_session_after_failed_generation(
+                session_key,
+                session,
+                "quote_response_regeneration_failed",
+            )
+            return
     direct_payload_source_failure = prompt_source_basis_failure(
         direct_payload_presend_source_bases
     )
@@ -40345,7 +40611,13 @@ async def _generate_direct_payload_session(session_key, reason: str):
                 "prompt_source_basis_changed": True,
             }
         )
-        response = recover_guarded_response_obligation(
+        (
+            response,
+            prompt,
+            direct_payload_presend_source_bases,
+            _direct_payload_source_rewrite_calls,
+            _direct_payload_source_neutral,
+        ) = await resolve_guarded_response_obligation(
             response,
             baseline_response=direct_payload_baseline_response,
             prompt=prompt,
@@ -40353,6 +40625,10 @@ async def _generate_direct_payload_session(session_key, reason: str):
             diagnostics=guard_diagnostics,
             route_mode=ROUTE_MODE_NORMAL_CHAT,
             channel_policy=session.get("channel_policy", "unknown"),
+            user_id=session["requester_user_id"],
+            guild_id=session["guild_id"],
+            channel=getattr(anchor_message, "channel", None),
+            prompt_source_bases=direct_payload_presend_source_bases,
             source_context_available=source_context_available,
             exact_quote_requested=bool(
                 prompt_metadata.get("exact_quote_requested")
@@ -40362,7 +40638,13 @@ async def _generate_direct_payload_session(session_key, reason: str):
                 prompt_metadata.get("third_party_attribution_requested")
             ),
         )
-        direct_payload_presend_source_bases = ()
+        if not response:
+            close_direct_payload_session_after_failed_generation(
+                session_key,
+                session,
+                "source_response_regeneration_failed",
+            )
+            return
     session_frame = session_orchestration.situation_frame
     if isinstance(session_frame, SituationFrameV1):
         session_frame_revalidation = revalidate_situation_frame(
@@ -40736,6 +41018,8 @@ async def apply_guarded_response_regeneration(
         "regenerated_for_register_mismatch": False,
         "generic_non_answer_triggered": False,
         "generic_non_answer_regenerated": False,
+        "stale_media_response_guard_triggered": False,
+        "stale_media_response_regenerated": False,
         "tiktok_show_analysis_guard_triggered": False,
         "tiktok_show_analysis_regenerated": False,
         "tiktok_show_analysis_guard_reason": "",
@@ -41045,10 +41329,18 @@ async def apply_guarded_response_regeneration(
             **regeneration_kwargs,
         )
 
+    def stale_media_response_failure(candidate: str) -> bool:
+        return bool(
+            is_bare_media_fallback_text(candidate)
+            and not has_media
+            and not current_batch_references_recent_media(current_user_text)
+        )
+
     def retry_has_guard_failure(candidate: str) -> bool:
         candidate = (candidate or "").strip()
         return bool(
             not candidate
+            or stale_media_response_failure(candidate)
             or contains_fake_lookup_claim(candidate)
             or (not source_context_available and _contains_unsupported_source_authority_claim(candidate))
             or detect_normal_chat_presentation_mode_leak(candidate, route_mode)
@@ -41189,6 +41481,42 @@ async def apply_guarded_response_regeneration(
                     }
                 )
                 return "", diagnostics
+
+    if stale_media_response_failure(response):
+        diagnostics["stale_media_response_guard_triggered"] = True
+        logging.warning(
+            "stale_media_response_guard_triggered route_mode=%s channel_policy=%s",
+            route_mode,
+            channel_policy,
+        )
+        if not regeneration_allowed:
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": "stale_media_response_validation_only",
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        regenerated = await regenerate(
+            prompt
+            + "\n\nRESPONSE CORRECTION REQUIRED: The previous draft answered "
+            + "an unrelated old media event. Respond to the current user request "
+            + "from the supplied current-turn context. Do not mention media unless "
+            + "the current request actually refers to it."
+        )
+        diagnostics["stale_media_response_regenerated"] = True
+        regenerated = str(regenerated or "").strip()
+        if retry_has_guard_failure(regenerated):
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": "stale_media_response_after_retry",
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        response = regenerated
 
     tiktok_analysis_failure = tiktok_show_analysis_response_failure(
         response,
@@ -42009,14 +42337,20 @@ async def validate_deterministic_normal_chat_response(
     channel_policy: str,
     current_user_text: str,
 ) -> str:
-    """Apply the shared guard without ever asking a model to rewrite facts.
+    """Apply the shared guard while preserving BNL's response obligation."""
 
-    With regeneration disabled this coroutine contains no provider await: an
-    early batched recall/media fast path cannot open a new stale-send window.
-    """
+    response_prompt = (
+        f"{BNL01_SYSTEM_PROMPT}\n\n"
+        f"Current user request:\n{current_user_text}\n\n"
+        "Available response context from the existing recall path:\n"
+        f"{response}\n\n"
+        "Respond naturally to the current request. Use the available context "
+        "when relevant, preserve honest uncertainty, and do not expose source "
+        "machinery."
+    )
     validated, diagnostics = await apply_guarded_response_regeneration(
         response,
-        prompt="",
+        prompt=response_prompt,
         user_id=user_id,
         guild_id=guild_id,
         route_mode=route_mode,
@@ -42033,14 +42367,23 @@ async def validate_deterministic_normal_chat_response(
             channel_policy,
             diagnostics.get("suppression_reason", "guard"),
         )
-        validated = recover_guarded_response_obligation(
+        (
+            validated,
+            _rewrite_prompt,
+            _rewrite_bases,
+            _rewrite_calls,
+            _source_neutral,
+        ) = await resolve_guarded_response_obligation(
             validated,
             baseline_response=response,
-            prompt="",
+            prompt=response_prompt,
             current_user_text=current_user_text,
             diagnostics=diagnostics,
             route_mode=route_mode,
             channel_policy=channel_policy,
+            user_id=user_id,
+            guild_id=guild_id,
+            channel=None,
             source_context_available=True,
         )
     return validated
@@ -42155,121 +42498,7 @@ class OrdinaryChatSinglePacketExecution:
     candidate_active: bool
     provider_call_count: int
     corrective_call_count: int
-    block_reason: str = ""
-    legacy_baseline_active: bool = False
-    legacy_baseline_generation_provider_call_count: int = 0
-    legacy_fallback_reason: str = ""
-
-
-@dataclass(frozen=True)
-class OrdinaryChatLegacyBaselineExecution:
-    packet_execution: OrdinaryChatSinglePacketExecution
-    response: str
-    prompt: str
-    prompt_metadata: dict
-    allow_greeting: bool
-    style_key: str
-    source_context_available: bool
-    provider_call_count: int
-
-
-def _ordinary_chat_ambiguous_subject_labels(
-    situation_frame: SituationFrameV1 | None,
-) -> tuple[str, ...]:
-    if str(getattr(situation_frame, "status", "") or "").lower() != (
-        "ambiguous"
-    ):
-        return ()
-    labels = tuple(
-        dict.fromkeys(
-            str(getattr(subject, "label_hint", "") or "").strip()
-            for subject in tuple(
-                getattr(situation_frame, "subjects", ()) or ()
-            )
-            if str(getattr(subject, "label_hint", "") or "").strip()
-        )
-    )
-    return labels if 2 <= len(labels) <= 4 else ()
-
-
-def _ordinary_chat_packet_publication_kind(
-    situation_frame: SituationFrameV1 | None,
-) -> str:
-    for task in tuple(getattr(situation_frame, "tasks", ()) or ()):
-        authority_scope = str(
-            getattr(task, "authority_scope", "") or ""
-        ).strip().lower()
-        object_kind = str(
-            getattr(task, "object_kind", "") or ""
-        ).strip().lower()
-        if authority_scope == "packet" and object_kind in {
-            "journal",
-            "relay",
-        }:
-            return object_kind
-    return ""
-
-
-def _ordinary_chat_single_packet_block_response(
-    reason: str,
-    situation_frame: SituationFrameV1 | None = None,
-) -> str:
-    value = str(reason or "").lower()
-    publication_kind = _ordinary_chat_packet_publication_kind(
-        situation_frame
-    )
-    if publication_kind and (
-        "deterministic_task_hold" in value
-        or "source" in value
-        or "packet" in value
-        or "control" in value
-        or "unavailable" in value
-    ):
-        label = publication_kind.capitalize()
-        return (
-            "I don’t have enough %s material to answer that honestly. I can "
-            "give you a general recap from other context, but I won’t pretend "
-            "it came from the %s." % (label, label)
-        )
-    if "deterministic_task_hold" in value or "current_fact" in value:
-        return (
-            "I can’t verify that live or current fact from an authoritative "
-            "source right now, so I’m holding it instead of guessing."
-        )
-    if "deterministic_task_refuse" in value:
-        return (
-            "I can discuss public BARCODE roles, but I won’t reveal private "
-            "owner-control details, account identifiers, credentials, or "
-            "infrastructure-access information."
-        )
-    if "deterministic_task_clarify" in value or "ambiguous" in value:
-        labels = _ordinary_chat_ambiguous_subject_labels(situation_frame)
-        if len(labels) == 2:
-            return "Do you mean %s or %s?" % labels
-        if labels:
-            return "Do you mean %s, or %s?" % (
-                ", ".join(labels[:-1]),
-                labels[-1],
-            )
-    if "deterministic_task_clarify" in value:
-        return (
-            "I’m missing one exact target for that question. Name the person, "
-            "event, or thread once and I’ll answer from that scope."
-        )
-    if "frame_ambiguous" in value or "ambiguous" in value:
-        return (
-            "I’m not certain which person, event, or thread you mean. "
-            "Name the target once and I’ll answer from that scope."
-        )
-    if "source" in value or "packet" in value or "control" in value:
-        return (
-            "I can’t verify the needed source state for that answer right "
-            "now, so I’m holding the claim instead of guessing."
-        )
-    return (
-        "I can’t ground that answer cleanly in the current scope. "
-        "Give me one specific target or question and I’ll take another pass."
-    )
+    review_reason: str = ""
 
 
 def _begin_ordinary_chat_single_packet_receipt(
@@ -42354,7 +42583,7 @@ def _evaluate_ordinary_chat_single_packet_receipt(
         return decision
 
 
-def _record_ordinary_chat_single_packet_block(
+def _record_ordinary_chat_single_packet_review(
     decision: SynthesisCanaryDecision,
     *,
     reason: str,
@@ -42365,7 +42594,7 @@ def _record_ordinary_chat_single_packet_block(
     processing_error: bool = False,
 ) -> SynthesisCanaryDecision:
     with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
-        blocked = record_single_packet_block(
+        reviewed = record_single_packet_review(
             conn,
             decision,
             reason=reason,
@@ -42376,7 +42605,7 @@ def _record_ordinary_chat_single_packet_block(
             processing_error=processing_error,
         )
         conn.commit()
-        return blocked
+        return reviewed
 
 
 def _begin_shared_brain_synthesis_receipt(
@@ -42492,7 +42721,7 @@ async def safely_fallback_shared_brain_synthesis(
         return decision
 
 
-async def safely_record_ordinary_chat_single_packet_block(
+async def safely_record_ordinary_chat_single_packet_review(
     decision: SynthesisCanaryDecision | None,
     *,
     reason: str,
@@ -42506,7 +42735,7 @@ async def safely_record_ordinary_chat_single_packet_block(
         return None
     try:
         return await asyncio.to_thread(
-            _record_ordinary_chat_single_packet_block,
+            _record_ordinary_chat_single_packet_review,
             decision,
             reason=reason,
             provider_call_count=provider_call_count,
@@ -42517,7 +42746,7 @@ async def safely_record_ordinary_chat_single_packet_block(
         )
     except Exception as exc:
         logging.warning(
-            "ordinary_chat_single_packet_block_receipt_failed error=%s",
+            "ordinary_chat_single_packet_review_receipt_failed error=%s",
             type(exc).__name__,
         )
         return decision
@@ -42765,7 +42994,7 @@ async def maybe_generate_ordinary_chat_single_packet(
     prompt: str,
     basis: SharedBrainSynthesisBasis | None,
     scope_applied: bool,
-    preflight_block_reason: str,
+    preflight_reason: str,
     situation_frame: SituationFrameV1 | None,
     situation_frame_current_text: str,
     route_mode: str,
@@ -42776,27 +43005,25 @@ async def maybe_generate_ordinary_chat_single_packet(
     user_display_name: str,
     source_context_available: bool,
 ) -> OrdinaryChatSinglePacketExecution | None:
-    """Make zero or one provider call for the exact scoped cutover route."""
+    """Generate one natural response from the shared packet when available.
+
+    Packet and receipt failures are diagnostic conditions, not response
+    authority. Returning ``None`` leaves the caller on the same normal BNL
+    generation path instead of substituting a canned block message.
+    """
 
     if not scope_applied:
         return None
     if basis is None:
         reason = str(
-            preflight_block_reason or "packet_or_assessment_unavailable"
+            preflight_reason or "packet_or_assessment_unavailable"
         )
-        return OrdinaryChatSinglePacketExecution(
-            decision=None,
-            response=_ordinary_chat_single_packet_block_response(
-                reason,
-                situation_frame,
-            ),
-            prompt=str(prompt or ""),
-            prompt_source_bases=(),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason=reason,
+        logging.warning(
+            "ordinary_chat_shared_brain_packet_unavailable reason=%s "
+            "response_path=normal_generation",
+            reason,
         )
+        return None
     packet_prompt = build_packet_owned_prompt(prompt, basis)
     frame_revalidation = revalidate_situation_frame(
         situation_frame,
@@ -42808,20 +43035,13 @@ async def maybe_generate_ordinary_chat_single_packet(
             basis.packet.source_snapshot_digest
         ),
     )
-    deterministic_act = ordinary_chat_deterministic_response_act(basis)
-    preflight_reason = str(preflight_block_reason or "")
+    preflight_reason = str(preflight_reason or "")
     prompt_ready = bool(
         packet_prompt.ready
         and not preflight_reason
-        and not deterministic_act
     )
     prompt_failure = (
         preflight_reason
-        or (
-            "deterministic_task_%s" % deterministic_act
-            if deterministic_act
-            else ""
-        )
         or packet_prompt.reason
         or "single_packet_preflight_failed"
     )
@@ -42838,35 +43058,17 @@ async def maybe_generate_ordinary_chat_single_packet(
             "ordinary_chat_single_packet_begin_failed error=%s",
             type(exc).__name__,
         )
-        reason = "receipt_begin_failed"
-        return OrdinaryChatSinglePacketExecution(
-            decision=None,
-            response=_ordinary_chat_single_packet_block_response(
-                reason,
-                situation_frame,
-            ),
-            prompt=str(prompt or ""),
-            prompt_source_bases=(basis,),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason=reason,
-        )
+        return None
     if not run.prompt_applied:
-        reason = str(run.fallback_reason or prompt_failure or "preflight_block")
-        return OrdinaryChatSinglePacketExecution(
-            decision=blocked_single_packet_decision(run, reason=reason),
-            response=_ordinary_chat_single_packet_block_response(
-                reason,
-                situation_frame,
-            ),
-            prompt=packet_prompt.prompt,
-            prompt_source_bases=(basis,),
-            candidate_active=False,
-            provider_call_count=0,
-            corrective_call_count=0,
-            block_reason=reason,
+        reason = str(
+            run.fallback_reason or prompt_failure or "preflight_unavailable"
         )
+        logging.warning(
+            "ordinary_chat_shared_brain_preflight_unavailable reason=%s "
+            "response_path=normal_generation",
+            reason,
+        )
+        return None
 
     generation_started = time.monotonic()
     provider_call_count = 0
@@ -42880,10 +43082,7 @@ async def maybe_generate_ordinary_chat_single_packet(
             route=ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
             source_context_available=source_context_available,
         )
-        response_contract = parse_ordinary_chat_response_contract(
-            tracked_generation.text
-        )
-        candidate = response_contract.response
+        candidate = str(tracked_generation.text or "").strip()
         provider_call_count = tracked_generation.provider_call_count
     except Exception as exc:
         logging.warning(
@@ -42891,7 +43090,6 @@ async def maybe_generate_ordinary_chat_single_packet(
             type(exc).__name__,
         )
         candidate = ""
-        response_contract = parse_ordinary_chat_response_contract("")
         tracked_generation = TrackedGenerationResponse(
             "",
             provider_call_count,
@@ -42923,20 +43121,27 @@ async def maybe_generate_ordinary_chat_single_packet(
             provider_error_code=(
                 tracked_generation.provider_error_code
             ),
-            response_contract=response_contract,
-            typed_contract_required=True,
+            response_contract=None,
+            typed_contract_required=False,
         )
     except Exception as exc:
         logging.warning(
             "ordinary_chat_single_packet_evaluation_failed error=%s",
             type(exc).__name__,
         )
-        decision = blocked_single_packet_decision(
-            run,
-            reason="evaluation_failed",
+        decision = SynthesisCanaryDecision(
+            run=run,
+            response=candidate,
+            candidate_selected=False,
+            fallback_reason="evaluation_failed",
+            comparison_status="not_comparable",
+            baseline_coherence_status="not_evaluated",
+            candidate_coherence_status="not_evaluated",
+            candidate_evidence_coverage_count=0,
+            revalidation_status="processing_error",
         )
         decision = (
-            await safely_record_ordinary_chat_single_packet_block(
+            await safely_record_ordinary_chat_single_packet_review(
                 decision,
                 reason="single_packet_evaluation_failed",
                 provider_call_count=provider_call_count,
@@ -42946,197 +43151,260 @@ async def maybe_generate_ordinary_chat_single_packet(
             )
             or decision
         )
-    if (
-        decision.candidate_selected
-        and is_generic_non_answer_response(candidate, user_display_name)
-    ):
-        decision = await safely_fallback_shared_brain_synthesis(
-            decision,
-            "single_packet_generic_non_answer",
-        )
-    if decision.candidate_selected:
+    if candidate:
         return OrdinaryChatSinglePacketExecution(
             decision=decision,
             response=candidate,
             prompt=packet_prompt.prompt,
             prompt_source_bases=(basis,),
-            candidate_active=True,
+            candidate_active=bool(decision.candidate_selected),
             provider_call_count=provider_call_count,
             corrective_call_count=0,
+            review_reason=(
+                ""
+                if decision.candidate_selected
+                else str(decision.fallback_reason or "candidate_advisory")
+            ),
         )
-    reason = str(decision.fallback_reason or "candidate_rejected")
-    return OrdinaryChatSinglePacketExecution(
-        decision=decision,
-        response=_ordinary_chat_single_packet_block_response(
-            reason,
-            situation_frame,
-        ),
-        prompt=packet_prompt.prompt,
-        prompt_source_bases=(basis,),
-        candidate_active=False,
-        provider_call_count=provider_call_count,
-        corrective_call_count=0,
-        block_reason=reason,
+    logging.warning(
+        "ordinary_chat_shared_brain_generation_empty reason=%s "
+        "response_path=normal_generation",
+        str(decision.fallback_reason or "generation_failed"),
     )
+    return None
 
 
-_ORDINARY_CHAT_VOLATILE_FALLBACK_RE = re.compile(
-    r"\b(?:right\s+now|currently|current|today|tonight|live|weather|"
-    r"queue\s+(?:open|status)|can\s+i\s+submit|latest\s+(?:price|score))\b",
-    re.I,
-)
-
-
-def ordinary_chat_legacy_baseline_fallback_allowed(
-    execution: OrdinaryChatSinglePacketExecution | None,
+def build_ordinary_chat_response_repair_prompt(
+    prompt: str,
     *,
-    situation_frame: SituationFrameV1 | None,
-    request_text: str = "",
-) -> bool:
-    """The single-packet route never switches to a second factual prompt."""
+    reason: str,
+    prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
+    current_user_text: str = "",
+    route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+) -> tuple[str, tuple[PromptSourceBasis, ...], bool]:
+    """Build a natural-response rewrite prompt without canned reply text.
 
-    del execution, situation_frame, request_text
-    return False
+    A guard may reject a draft or invalidate supporting evidence, but it does
+    not own the response act.  When evidence changed, remove the packet-owned
+    factual block before asking BNL to answer the unaffected parts and express
+    any specific uncertainty in his own words.
+    """
+
+    repair_reason = str(reason or "response_review_failed").strip().lower()
+    source_neutral = bool(
+        _guard_recovery_requires_source_neutral_response(repair_reason)
+        or any(
+            marker in repair_reason
+            for marker in ("changed", "stale", "frame", "quote")
+        )
+    )
+    repaired_prompt = str(prompt or "")
+    repaired_bases = tuple(prompt_source_bases or ())
+    if source_neutral:
+        packet_marker = "PACKET-OWNED RESPONSE CONTRACT:"
+        marker_index = repaired_prompt.rfind(packet_marker)
+        if marker_index >= 0:
+            repaired_prompt = repaired_prompt[:marker_index].rstrip()
+        else:
+            for basis in repaired_bases:
+                rendered_context = str(
+                    getattr(basis, "rendered_context", "") or ""
+                )
+                if rendered_context:
+                    repaired_prompt = repaired_prompt.replace(
+                        rendered_context,
+                        "",
+                    )
+        repaired_bases = ()
+        request_text = (
+            str(current_user_text or "").strip()
+            or _current_request_from_prompt(repaired_prompt)
+        )
+        if request_text:
+            repaired_prompt = (
+                f"Current user request: {request_text}\n"
+                + normal_chat_prompt_contract(route_mode)
+                + "The factual basis used by the previous draft changed or "
+                + "became unavailable. Answer every part that remains answerable "
+                + "from the current request or stable public knowledge. For any "
+                + "specific BARCODE, publication, member-history, exact-quote, or "
+                + "live-state fact that cannot now be verified, state only that "
+                + "specific uncertainty naturally. Do not invent or generalize it."
+            )
+    repaired_prompt = (
+        repaired_prompt.rstrip()
+        + "\n\nRESPONSE REWRITE REQUIRED:\n"
+        + "Write one natural BNL reply to the current user now. Preserve every "
+        + "part of the request that can still be answered. If one specific "
+        + "fact cannot be supported, say only that specific limitation in "
+        + "your own words and continue with the rest. If the referent is "
+        + "genuinely ambiguous, ask the useful clarification directly. Never "
+        + "return a generic scope, grounding, packet, or retry message, and "
+        + "never mention this rewrite or any internal control."
+    )
+    return repaired_prompt, repaired_bases, source_neutral
 
 
-def _build_ordinary_chat_legacy_baseline_prompt(
-    prompt_metadata: Mapping[str, Any],
+async def regenerate_ordinary_chat_response_obligation(
     *,
-    payload_items,
-    request_text: str,
-    conversation_orchestration: ConversationOrchestrationDecision | None,
-) -> tuple[str, bool, str, dict] | None:
-    request = prompt_metadata.get(
-        "ordinary_chat_legacy_baseline_request"
-    )
-    if not isinstance(request, Mapping):
-        return None
-
-    legacy_metadata: dict[str, Any] = {}
-    legacy_prompt, allow_greeting, style_key = build_user_aware_prompt(
-        **dict(request),
-        prompt_metadata=legacy_metadata,
-        _ordinary_chat_single_packet_enabled_override=False,
-    )
-    legacy_prompt = _build_direct_payload_prompt(
-        legacy_prompt,
-        payload_items,
-        request_text,
-    )
-    orchestration_prompt = render_conversation_orchestration_prompt(
-        conversation_orchestration
-    )
-    if orchestration_prompt:
-        legacy_prompt += "\n\n" + orchestration_prompt
-
-    # The baseline itself is the recovery answer.  Do not spend a second model
-    # call on the older synthesis canary after the packet already declined.
-    legacy_metadata["shared_brain_synthesis_canary_basis"] = None
-    legacy_metadata["ordinary_chat_legacy_baseline_fallback"] = True
-    return (
-        legacy_prompt,
-        allow_greeting,
-        style_key,
-        legacy_metadata,
-    )
-
-
-async def maybe_generate_ordinary_chat_legacy_baseline(
-    *,
-    execution: OrdinaryChatSinglePacketExecution | None,
-    prompt_metadata: Mapping[str, Any],
     channel,
-    payload_items,
-    request_text: str,
-    conversation_orchestration: ConversationOrchestrationDecision | None,
-    situation_frame: SituationFrameV1 | None,
+    prompt: str,
+    reason: str,
+    prompt_source_bases: tuple[PromptSourceBasis, ...],
     user_id: int,
     guild_id: int,
-) -> OrdinaryChatLegacyBaselineExecution | None:
-    """Recover the established context-rich path after a zero-call block."""
+    source_context_available: bool,
+    current_user_text: str = "",
+    route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+) -> tuple[str, str, tuple[PromptSourceBasis, ...], int, bool]:
+    """Regenerate a natural ordinary-chat response after draft rejection."""
 
-    if not ordinary_chat_legacy_baseline_fallback_allowed(
-        execution,
-        situation_frame=situation_frame,
-        request_text=request_text,
-    ):
-        return None
-    try:
-        rebuilt = _build_ordinary_chat_legacy_baseline_prompt(
-            prompt_metadata,
-            payload_items=payload_items,
-            request_text=request_text,
-            conversation_orchestration=conversation_orchestration,
+    repair_prompt, repair_bases, source_neutral = (
+        build_ordinary_chat_response_repair_prompt(
+            prompt,
+            reason=reason,
+            prompt_source_bases=prompt_source_bases,
+            current_user_text=current_user_text,
+            route_mode=route_mode,
         )
-    except Exception as exc:
-        logging.warning(
-            "ordinary_chat_legacy_baseline_failed reason=rebuild_error "
-            "error=%s",
-            type(exc).__name__,
-        )
-        return None
-    if rebuilt is None or execution is None:
-        return None
-    legacy_prompt, allow_greeting, style_key, legacy_metadata = rebuilt
-    source_context_available = bool(
-        legacy_metadata.get("source_context_available")
     )
     try:
         tracked = await get_tracked_gemini_response_with_optional_typing(
             channel,
-            legacy_prompt,
+            repair_prompt,
             user_id,
             guild_id,
-            route=ORDINARY_CHAT_LEGACY_BASELINE_ROUTE,
-            source_context_available=source_context_available,
+            route=ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+            source_context_available=bool(
+                source_context_available and not source_neutral
+            ),
         )
     except Exception as exc:
         logging.warning(
-            "ordinary_chat_legacy_baseline_failed reason=generation_error "
-            "error=%s",
+            "ordinary_chat_response_rewrite_failed error=%s",
             type(exc).__name__,
         )
-        return None
-    response = str(tracked.text or "").strip()
-    if not response:
-        logging.warning(
-            "ordinary_chat_legacy_baseline_failed reason=empty_response "
-            "packet_block_reason=%s provider_calls=%s",
-            execution.block_reason or "unknown",
-            tracked.provider_call_count,
-        )
-        return None
+        return "", repair_prompt, repair_bases, 0, source_neutral
+    return (
+        str(tracked.text or "").strip(),
+        repair_prompt,
+        repair_bases,
+        max(0, int(tracked.provider_call_count or 0)),
+        source_neutral,
+    )
 
-    fallback_reason = str(execution.block_reason or "preflight_block")
-    packet_execution = replace(
-        execution,
-        response=response,
-        prompt=legacy_prompt,
-        prompt_source_bases=tuple(
-            legacy_metadata.get("prompt_source_bases") or ()
-        ),
-        candidate_active=False,
-        legacy_baseline_active=True,
-        legacy_baseline_generation_provider_call_count=(
-            tracked.provider_call_count
-        ),
-        legacy_fallback_reason=fallback_reason,
-    )
-    logging.info(
-        "ordinary_chat_legacy_baseline_selected packet_block_reason=%s "
-        "provider_calls=%s",
-        fallback_reason,
-        tracked.provider_call_count,
-    )
-    return OrdinaryChatLegacyBaselineExecution(
-        packet_execution=packet_execution,
-        response=response,
-        prompt=legacy_prompt,
-        prompt_metadata=legacy_metadata,
-        allow_greeting=allow_greeting,
-        style_key=style_key,
+
+async def resolve_guarded_response_obligation(
+    response: str,
+    *,
+    baseline_response: str,
+    prompt: str,
+    current_user_text: str,
+    diagnostics: dict,
+    route_mode: str,
+    channel_policy: str,
+    user_id: int,
+    guild_id: int,
+    channel,
+    prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
+    source_context_available: bool = False,
+    exact_quote_requested: bool = False,
+    exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
+    third_party_attribution_requested: bool = False,
+) -> tuple[str, str, tuple[PromptSourceBasis, ...], int, bool]:
+    """Keep response authorship with BNL after a guard rejects a draft."""
+
+    recovered = recover_guarded_response_obligation(
+        response,
+        baseline_response=baseline_response,
+        prompt=prompt,
+        current_user_text=current_user_text,
+        diagnostics=diagnostics,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
         source_context_available=source_context_available,
-        provider_call_count=tracked.provider_call_count,
+        exact_quote_requested=exact_quote_requested,
+        exact_quote_authority=exact_quote_authority,
+        third_party_attribution_requested=(
+            third_party_attribution_requested
+        ),
+    )
+    if recovered:
+        retained_bases = tuple(
+            diagnostics.get("_revalidated_prompt_source_bases")
+            or prompt_source_bases
+        )
+        if diagnostics.get("source_neutral_recovery"):
+            retained_bases = ()
+        return recovered, prompt, retained_bases, 0, bool(
+            diagnostics.get("source_neutral_recovery")
+        )
+
+    reason = str(
+        diagnostics.get("suppression_reason")
+        or diagnostics.get("original_suppression_reason")
+        or "response_review_failed"
+    )
+    (
+        rewritten,
+        rewritten_prompt,
+        rewritten_bases,
+        provider_calls,
+        source_neutral,
+    ) = await regenerate_ordinary_chat_response_obligation(
+        channel=channel,
+        prompt=prompt,
+        reason=reason,
+        prompt_source_bases=tuple(prompt_source_bases or ()),
+        user_id=user_id,
+        guild_id=guild_id,
+        source_context_available=source_context_available,
+        current_user_text=current_user_text,
+        route_mode=route_mode,
+    )
+    if not rewritten or is_generic_non_answer_response(rewritten):
+        (
+            rewritten,
+            rewritten_prompt,
+            rewritten_bases,
+            retry_calls,
+            source_neutral,
+        ) = await regenerate_ordinary_chat_response_obligation(
+            channel=channel,
+            prompt=rewritten_prompt,
+            reason="generic_non_answer_after_response_rewrite",
+            prompt_source_bases=rewritten_bases,
+            user_id=user_id,
+            guild_id=guild_id,
+            source_context_available=bool(
+                source_context_available and not source_neutral
+            ),
+            current_user_text=current_user_text,
+            route_mode=route_mode,
+        )
+        provider_calls += retry_calls
+    if rewritten and is_generic_non_answer_response(rewritten):
+        logging.error(
+            "ordinary_chat_response_rewrite_exhausted "
+            "reason=generic_non_answer"
+        )
+        rewritten = ""
+    if rewritten:
+        diagnostics.update(
+            {
+                "suppressed": False,
+                "response_obligation_regenerated": True,
+                "response_obligation_recovery_kind": "model_rewrite",
+                "source_neutral_recovery": source_neutral,
+                "original_suppression_reason": reason,
+            }
+        )
+    return (
+        rewritten,
+        rewritten_prompt,
+        tuple(rewritten_bases),
+        provider_calls,
+        source_neutral,
     )
 
 
@@ -43220,13 +43488,11 @@ async def send_planned_conversation_response(
     single_packet_receipt_present = bool(
         ordinary_chat_single_packet_execution is not None
     )
-    ordinary_chat_legacy_fallback_active = bool(
-        ordinary_chat_single_packet_execution is not None
-        and ordinary_chat_single_packet_execution.legacy_baseline_active
-    )
-    single_packet_cutover = bool(
-        single_packet_receipt_present
-        and not ordinary_chat_legacy_fallback_active
+    single_packet_cutover = single_packet_receipt_present
+    single_packet_corrective_call_count = int(
+        ordinary_chat_single_packet_execution.corrective_call_count
+        if ordinary_chat_single_packet_execution is not None
+        else 0
     )
     synthesis_execution = None
     if not single_packet_receipt_present:
@@ -43260,10 +43526,7 @@ async def send_planned_conversation_response(
         else synthesis_execution is not None
         and synthesis_execution.candidate_active
     )
-    if (
-        ordinary_chat_single_packet_execution is not None
-        and not ordinary_chat_legacy_fallback_active
-    ):
+    if ordinary_chat_single_packet_execution is not None:
         response = ordinary_chat_single_packet_execution.response
         prompt = ordinary_chat_single_packet_execution.prompt
         prompt_source_bases = (
@@ -43277,6 +43540,75 @@ async def send_planned_conversation_response(
         response = baseline_response
         prompt = baseline_prompt
         prompt_source_bases = baseline_prompt_source_bases
+
+    if (
+        single_packet_cutover
+        and ordinary_chat_single_packet_execution is not None
+        and ordinary_chat_single_packet_execution.review_reason
+    ):
+        review_reason = ordinary_chat_single_packet_execution.review_reason
+        review_diagnostics = {
+            "suppressed": True,
+            "suppression_reason": review_reason,
+            "response_review_requires_rewrite": True,
+        }
+        (
+            response,
+            prompt,
+            prompt_source_bases,
+            response_rewrite_calls,
+            _source_neutral_rewrite,
+        ) = await resolve_guarded_response_obligation(
+            response,
+            baseline_response=response,
+            prompt=prompt,
+            current_user_text=getattr(message, "content", ""),
+            diagnostics=review_diagnostics,
+            route_mode=plan.route_mode,
+            channel_policy=plan.channel_policy,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            channel=getattr(message, "channel", None),
+            prompt_source_bases=tuple(prompt_source_bases or ()),
+            source_context_available=source_context_available,
+            exact_quote_requested=exact_quote_requested,
+            exact_quote_authority=exact_quote_authority,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
+        )
+        single_packet_corrective_call_count += response_rewrite_calls
+        synthesis_decision = (
+            await safely_record_ordinary_chat_single_packet_review(
+                synthesis_decision,
+                reason="single_packet_candidate_rewritten_after_review",
+                corrective_call_count=single_packet_corrective_call_count,
+            )
+            or synthesis_decision
+        )
+        ordinary_chat_single_packet_execution = replace(
+            ordinary_chat_single_packet_execution,
+            response=response,
+            prompt=prompt,
+            prompt_source_bases=tuple(prompt_source_bases or ()),
+            candidate_active=False,
+            corrective_call_count=(
+                ordinary_chat_single_packet_execution.corrective_call_count
+                + response_rewrite_calls
+            ),
+        )
+        synthesis_candidate_active = False
+        if _source_neutral_rewrite:
+            source_context_available = False
+        if not response:
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response="",
+                response_sent=False,
+                candidate_live=False,
+                guard_status="candidate_review_rewrite_failed",
+            )
+            return model_decision
 
     if _abort_stale_direct_repair_generation(
         direct_repair_generation,
@@ -43346,105 +43678,43 @@ async def send_planned_conversation_response(
     single_packet_selected_response = (
         str(response or "") if single_packet_cutover else ""
     )
-    deterministic_single_packet_block = bool(
-        single_packet_cutover
-        and ordinary_chat_single_packet_execution is not None
-        and not synthesis_candidate_active
-        and ordinary_chat_single_packet_execution.provider_call_count == 0
-        and ordinary_chat_single_packet_execution.block_reason
-        and str(response or "")
-        == _ordinary_chat_single_packet_block_response(
-            ordinary_chat_single_packet_execution.block_reason,
-            situation_frame,
-        )
+    response, guard_diagnostics = await _run_response_guard(
+        response or "",
+        prompt,
+        tuple(prompt_source_bases or ()),
+        # An authorized ordinary response is a generation obligation. Packet
+        # evidence can require a grounded rewrite, but it cannot turn the
+        # guard into a response veto.
+        regeneration_allowed=bool(
+            single_packet_cutover or not synthesis_candidate_active
+        ),
     )
-    single_packet_block_reason = str(
-        ordinary_chat_single_packet_execution.block_reason
-        if ordinary_chat_single_packet_execution is not None
-        else ""
-    ).lower()
-    typed_single_packet_candidate = bool(
-        single_packet_cutover
-        and synthesis_candidate_active
-        and synthesis_decision is not None
-        and str(
-            getattr(synthesis_decision, "typed_contract_status", "")
-            or ""
-        )
-        == "valid"
-    )
-    if deterministic_single_packet_block:
-        # This text is selected from local fixed templates after typed
-        # preflight.  It contains no factual candidate to regenerate or
-        # reclassify.  Source, frame, exact-quote, delivery, and final receipt
-        # checks below still run before the one Discord send.
-        guard_diagnostics = {
-            "suppressed": False,
-            "deterministic_single_packet_block": True,
-            "_revalidated_prompt_source_bases": tuple(
-                prompt_source_bases or ()
-            ),
-        }
-    elif typed_single_packet_candidate:
-        # The single-packet evaluator has already validated exact task
-        # coverage, typed support references, packet/source revalidation,
-        # output-control leakage, and coherence.  Do not feed the selected
-        # visible text back through the legacy prose classifier and create a
-        # second semantic verdict.  The independent source, frame,
-        # exact-quote, Discord-delivery, and final-receipt checks below remain
-        # mandatory.
-        guard_diagnostics = {
-            "suppressed": False,
-            "typed_single_packet_selection_boundary": True,
-            "_revalidated_prompt_source_bases": tuple(
-                prompt_source_bases or ()
-            ),
-        }
-    else:
-        response, guard_diagnostics = await _run_response_guard(
-            response or "",
-            prompt,
-            tuple(prompt_source_bases or ()),
-            regeneration_allowed=bool(
-                not synthesis_candidate_active and not single_packet_cutover
-            ),
-        )
     if (
         single_packet_cutover
-        and synthesis_candidate_active
-        and synthesis_decision is not None
-        and (
-            guard_diagnostics.get("suppressed")
-            or str(response or "") != single_packet_selected_response
-        )
+        and guard_diagnostics.get("suppressed")
     ):
-        reason = (
-            "single_packet_guard_suppressed"
-            if guard_diagnostics.get("suppressed")
-            else "single_packet_guard_modified_response"
+        reason = str(
+            guard_diagnostics.get("suppression_reason")
+            or "single_packet_guard_repair_required"
         )
-        synthesis_decision = (
-            await safely_record_ordinary_chat_single_packet_block(
-                synthesis_decision,
-                reason=reason,
-            )
-            or synthesis_decision
-        )
-        if not guard_diagnostics.get("suppressed"):
-            guard_diagnostics.update(
-                {
-                    "suppressed": True,
-                    "suppression_reason": reason,
-                }
-            )
-        response = recover_guarded_response_obligation(
+        (
             response,
-            baseline_response=baseline_response,
+            prompt,
+            prompt_source_bases,
+            response_rewrite_calls,
+            source_neutral_rewrite,
+        ) = await resolve_guarded_response_obligation(
+            response,
+            baseline_response=single_packet_selected_response,
             prompt=prompt,
             current_user_text=getattr(message, "content", ""),
             diagnostics=guard_diagnostics,
             route_mode=plan.route_mode,
             channel_policy=plan.channel_policy,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            channel=getattr(message, "channel", None),
+            prompt_source_bases=tuple(prompt_source_bases or ()),
             source_context_available=source_context_available,
             exact_quote_requested=exact_quote_requested,
             exact_quote_authority=exact_quote_authority,
@@ -43452,9 +43722,43 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested
             ),
         )
+        single_packet_corrective_call_count += response_rewrite_calls
+        synthesis_decision = (
+            await safely_record_ordinary_chat_single_packet_review(
+                synthesis_decision,
+                reason="single_packet_response_rewritten_after_guard",
+                corrective_call_count=single_packet_corrective_call_count,
+            )
+            or synthesis_decision
+        )
+        if not response:
+            logging.error(
+                "ordinary_chat_response_obligation_generation_failed "
+                "stage=post_guard"
+            )
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response="",
+                response_sent=False,
+                candidate_live=False,
+                guard_status="response_rewrite_generation_failed",
+            )
+            return model_decision
+        guard_diagnostics.update(
+            {
+                "suppressed": False,
+                "response_obligation_regenerated": True,
+                "response_obligation_recovery_kind": "model_rewrite",
+                "source_neutral_recovery": source_neutral_rewrite,
+                "original_suppression_reason": reason,
+            }
+        )
         synthesis_candidate_active = False
-        if guard_diagnostics.get("source_neutral_recovery"):
-            prompt_source_bases = ()
+    elif (
+        single_packet_cutover
+        and str(response or "") != single_packet_selected_response
+    ):
+        guard_diagnostics["single_packet_guard_repaired"] = True
     canary_guard_fallback_triggered = False
     if (
         not single_packet_cutover
@@ -43518,6 +43822,7 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("register_mismatch_guard_triggered")
         or guard_diagnostics.get("source_grounding_guard_triggered")
         or guard_diagnostics.get("contextual_followthrough_guard_triggered")
+        or guard_diagnostics.get("stale_media_response_guard_triggered")
         or guard_diagnostics.get("community_visual_guard_triggered")
         or guard_diagnostics.get("exact_quote_guard_triggered")
         or guard_diagnostics.get(
@@ -43547,7 +43852,13 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("regenerated_for_register_mismatch")
     )
     if guard_diagnostics.get("suppressed"):
-        response = recover_guarded_response_obligation(
+        (
+            response,
+            prompt,
+            prompt_source_bases,
+            response_rewrite_calls,
+            _source_neutral_rewrite,
+        ) = await resolve_guarded_response_obligation(
             response,
             baseline_response=baseline_response,
             prompt=prompt,
@@ -43555,6 +43866,10 @@ async def send_planned_conversation_response(
             diagnostics=guard_diagnostics,
             route_mode=plan.route_mode,
             channel_policy=plan.channel_policy,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            channel=getattr(message, "channel", None),
+            prompt_source_bases=tuple(prompt_source_bases or ()),
             source_context_available=source_context_available,
             exact_quote_requested=exact_quote_requested,
             exact_quote_authority=exact_quote_authority,
@@ -43562,7 +43877,18 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested
             ),
         )
+        if single_packet_cutover:
+            single_packet_corrective_call_count += response_rewrite_calls
         synthesis_candidate_active = False
+        if not response:
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response="",
+                response_sent=False,
+                candidate_live=False,
+                guard_status="response_obligation_generation_failed",
+            )
+            return model_decision
     prompt_source_bases = tuple(
         guard_diagnostics.get("_revalidated_prompt_source_bases")
         or prompt_source_bases
@@ -43614,8 +43940,7 @@ async def send_planned_conversation_response(
             else "clear"
         ),
         fallback_used=bool(
-            ordinary_chat_legacy_fallback_active
-            or guard_diagnostics.get("response_obligation_recovered")
+            guard_diagnostics.get("response_obligation_recovered")
         ),
         regenerated_for_mode_leak=regenerated_for_mode_leak,
         media_present=bool(media_context.get("present", False)),
@@ -43628,28 +43953,18 @@ async def send_planned_conversation_response(
         ack_converted_to_observe=False,
         ack_escalated_to_generation=False,
         ordinary_chat_single_packet_applied=single_packet_receipt_present,
-        ordinary_chat_legacy_baseline_fallback=(
-            ordinary_chat_legacy_fallback_active
-        ),
         ordinary_chat_single_packet_provider_call_count=(
             ordinary_chat_single_packet_execution.provider_call_count
             if ordinary_chat_single_packet_execution is not None
             else 0
         ),
         ordinary_chat_single_packet_corrective_call_count=(
-            ordinary_chat_single_packet_execution.corrective_call_count
-            if ordinary_chat_single_packet_execution is not None
-            else 0
+            single_packet_corrective_call_count
         ),
-        ordinary_chat_single_packet_block_reason=(
-            ordinary_chat_single_packet_execution.block_reason
+        ordinary_chat_single_packet_review_reason=(
+            ordinary_chat_single_packet_execution.review_reason
             if ordinary_chat_single_packet_execution is not None
             else ""
-        ),
-        ordinary_chat_legacy_baseline_generation_provider_call_count=(
-            ordinary_chat_single_packet_execution.legacy_baseline_generation_provider_call_count
-            if ordinary_chat_single_packet_execution is not None
-            else 0
         ),
     )
     if _abort_stale_direct_repair_generation(direct_repair_generation, "before_send_commit"):
@@ -43681,61 +43996,113 @@ async def send_planned_conversation_response(
         )
     if quote_presend_failure:
         logging.warning(
-            "direct_exact_quote_recovered_before_send reason=%s",
+            "direct_exact_quote_rewrite_before_send reason=%s",
             quote_presend_failure,
         )
-        if single_packet_cutover and synthesis_decision is not None:
+        if single_packet_cutover:
+            guard_diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": quote_presend_failure,
+                    "exact_quote_guard_triggered": True,
+                    "exact_quote_guard_reason": quote_presend_failure,
+                }
+            )
+            (
+                response,
+                prompt,
+                prompt_source_bases,
+                response_rewrite_calls,
+                source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
+                response,
+                baseline_response=response,
+                prompt=prompt,
+                current_user_text=getattr(message, "content", ""),
+                diagnostics=guard_diagnostics,
+                route_mode=plan.route_mode,
+                channel_policy=plan.channel_policy,
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                channel=getattr(message, "channel", None),
+                prompt_source_bases=tuple(prompt_source_bases or ()),
+                source_context_available=source_context_available,
+                exact_quote_requested=exact_quote_requested,
+                exact_quote_authority=None,
+                third_party_attribution_requested=(
+                    third_party_attribution_requested
+                ),
+            )
+            single_packet_corrective_call_count += response_rewrite_calls
             synthesis_decision = (
-                await safely_record_ordinary_chat_single_packet_block(
+                await safely_record_ordinary_chat_single_packet_review(
                     synthesis_decision,
-                    reason=(
-                        "single_packet_exact_quote_%s"
-                        % quote_presend_failure
-                    ),
+                    reason="single_packet_exact_quote_response_rewritten",
+                    corrective_call_count=single_packet_corrective_call_count,
                 )
                 or synthesis_decision
             )
-        guard_diagnostics.update(
-            {
-                "suppressed": True,
-                "suppression_reason": quote_presend_failure,
-                "exact_quote_guard_triggered": True,
-                "exact_quote_guard_reason": quote_presend_failure,
-            }
-        )
-        response = recover_guarded_response_obligation(
-            response,
-            baseline_response=baseline_response,
-            prompt=prompt,
-            current_user_text=getattr(message, "content", ""),
-            diagnostics=guard_diagnostics,
-            route_mode=plan.route_mode,
-            channel_policy=plan.channel_policy,
-            source_context_available=source_context_available,
-            exact_quote_requested=exact_quote_requested,
-            exact_quote_authority=None,
-            third_party_attribution_requested=(
-                third_party_attribution_requested
-            ),
-        )
-        prompt_source_bases = ()
+            if not response:
+                await safely_finalize_shared_brain_synthesis(
+                    synthesis_decision,
+                    final_response="",
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status="exact_quote_response_rewrite_failed",
+                )
+                return model_decision
+            guard_diagnostics.update(
+                {
+                    "suppressed": False,
+                    "response_obligation_regenerated": True,
+                    "response_obligation_recovery_kind": "model_rewrite",
+                    "source_neutral_recovery": source_neutral_rewrite,
+                    "original_suppression_reason": quote_presend_failure,
+                    "exact_quote_guard_triggered": True,
+                    "exact_quote_guard_reason": quote_presend_failure,
+                }
+            )
+        else:
+            guard_diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": quote_presend_failure,
+                    "exact_quote_guard_triggered": True,
+                    "exact_quote_guard_reason": quote_presend_failure,
+                }
+            )
+            (
+                response,
+                prompt,
+                prompt_source_bases,
+                _response_rewrite_calls,
+                _source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
+                response,
+                baseline_response=baseline_response,
+                prompt=prompt,
+                current_user_text=getattr(message, "content", ""),
+                diagnostics=guard_diagnostics,
+                route_mode=plan.route_mode,
+                channel_policy=plan.channel_policy,
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                channel=getattr(message, "channel", None),
+                prompt_source_bases=tuple(prompt_source_bases or ()),
+                source_context_available=source_context_available,
+                exact_quote_requested=exact_quote_requested,
+                exact_quote_authority=None,
+                third_party_attribution_requested=(
+                    third_party_attribution_requested
+                ),
+            )
+            if not response:
+                return model_decision
         synthesis_candidate_active = False
     direct_source_failure = prompt_source_basis_failure(
         prompt_source_bases
     )
     if direct_source_failure and single_packet_cutover:
-        if synthesis_decision is not None:
-            synthesis_decision = (
-                await safely_record_ordinary_chat_single_packet_block(
-                    synthesis_decision,
-                    reason=(
-                        "single_packet_presend_%s"
-                        % direct_source_failure
-                    ),
-                    source_revalidation_status=direct_source_failure,
-                )
-                or synthesis_decision
-            )
         guard_diagnostics.update(
             {
                 "suppressed": True,
@@ -43743,14 +44110,24 @@ async def send_planned_conversation_response(
                 "prompt_source_basis_changed": True,
             }
         )
-        response = recover_guarded_response_obligation(
+        (
             response,
-            baseline_response=baseline_response,
+            prompt,
+            prompt_source_bases,
+            response_rewrite_calls,
+            source_neutral_rewrite,
+        ) = await resolve_guarded_response_obligation(
+            response,
+            baseline_response=response,
             prompt=prompt,
             current_user_text=getattr(message, "content", ""),
             diagnostics=guard_diagnostics,
             route_mode=plan.route_mode,
             channel_policy=plan.channel_policy,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            channel=getattr(message, "channel", None),
+            prompt_source_bases=tuple(prompt_source_bases or ()),
             source_context_available=source_context_available,
             exact_quote_requested=exact_quote_requested,
             exact_quote_authority=None,
@@ -43758,7 +44135,35 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested
             ),
         )
-        prompt_source_bases = ()
+        single_packet_corrective_call_count += response_rewrite_calls
+        synthesis_decision = (
+            await safely_record_ordinary_chat_single_packet_review(
+                synthesis_decision,
+                reason="single_packet_source_change_response_rewritten",
+                corrective_call_count=single_packet_corrective_call_count,
+                source_revalidation_status=direct_source_failure,
+            )
+            or synthesis_decision
+        )
+        if not response:
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response="",
+                response_sent=False,
+                candidate_live=False,
+                guard_status="source_change_response_rewrite_failed",
+            )
+            return model_decision
+        guard_diagnostics.update(
+            {
+                "suppressed": False,
+                "response_obligation_regenerated": True,
+                "response_obligation_recovery_kind": "model_rewrite",
+                "source_neutral_recovery": source_neutral_rewrite,
+                "original_suppression_reason": direct_source_failure,
+                "prompt_source_basis_changed": True,
+            }
+        )
         direct_source_failure = ""
         synthesis_candidate_active = False
     if direct_source_failure and synthesis_candidate_active:
@@ -43777,7 +44182,13 @@ async def send_planned_conversation_response(
             regeneration_allowed=True,
         )
         if guard_diagnostics.get("suppressed"):
-            response = recover_guarded_response_obligation(
+            (
+                response,
+                prompt,
+                prompt_source_bases,
+                _response_rewrite_calls,
+                _source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
                 response,
                 baseline_response=baseline_response,
                 prompt=prompt,
@@ -43785,6 +44196,10 @@ async def send_planned_conversation_response(
                 diagnostics=guard_diagnostics,
                 route_mode=plan.route_mode,
                 channel_policy=plan.channel_policy,
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                channel=getattr(message, "channel", None),
+                prompt_source_bases=tuple(prompt_source_bases or ()),
                 source_context_available=source_context_available,
                 exact_quote_requested=exact_quote_requested,
                 exact_quote_authority=exact_quote_authority,
@@ -43792,10 +44207,8 @@ async def send_planned_conversation_response(
                     third_party_attribution_requested
                 ),
             )
-        prompt_source_bases = tuple(
-            guard_diagnostics.get("_revalidated_prompt_source_bases")
-            or prompt_source_bases
-        )
+        if not response:
+            return model_decision
         if guard_diagnostics.get("source_neutral_recovery"):
             prompt_source_bases = ()
         if _abort_stale_direct_repair_generation(
@@ -43825,7 +44238,13 @@ async def send_planned_conversation_response(
                 "prompt_source_basis_changed": True,
             }
         )
-        response = recover_guarded_response_obligation(
+        (
+            response,
+            prompt,
+            prompt_source_bases,
+            _response_rewrite_calls,
+            _source_neutral_rewrite,
+        ) = await resolve_guarded_response_obligation(
             response,
             baseline_response=baseline_response,
             prompt=prompt,
@@ -43833,6 +44252,10 @@ async def send_planned_conversation_response(
             diagnostics=guard_diagnostics,
             route_mode=plan.route_mode,
             channel_policy=plan.channel_policy,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            channel=getattr(message, "channel", None),
+            prompt_source_bases=tuple(prompt_source_bases or ()),
             source_context_available=source_context_available,
             exact_quote_requested=exact_quote_requested,
             exact_quote_authority=None,
@@ -43840,7 +44263,8 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested
             ),
         )
-        prompt_source_bases = ()
+        if not response:
+            return model_decision
         synthesis_candidate_active = False
     if isinstance(situation_frame, SituationFrameV1):
         final_frame_revalidation = revalidate_situation_frame(
@@ -43881,51 +44305,42 @@ async def send_planned_conversation_response(
             final_frame_revalidation.status,
             len(final_frame_revalidation.reason_codes),
         )
-        deterministic_frame_clarification = bool(
-            deterministic_single_packet_block
+        generated_frame_clarification = bool(
+            single_packet_cutover
             and final_frame_revalidation.status == "ambiguous"
-            and (
-                "frame_ambiguous" in single_packet_block_reason
-                or "deterministic_task_clarify"
-                in single_packet_block_reason
-            )
         )
         if (
             single_packet_cutover
-            and final_frame_revalidation.status != "valid"
-            and not deterministic_frame_clarification
+            and final_frame_revalidation.status not in {"valid", "ambiguous"}
         ):
-            if synthesis_decision is not None:
-                synthesis_decision = (
-                    await safely_record_ordinary_chat_single_packet_block(
-                        synthesis_decision,
-                        reason=(
-                            "single_packet_frame_%s"
-                            % final_frame_revalidation.status
-                        ),
-                        frame_revalidation_status=(
-                            final_frame_revalidation.status
-                        ),
-                    )
-                    or synthesis_decision
-                )
+            frame_rewrite_reason = (
+                "source_revalidation_frame_"
+                + final_frame_revalidation.status
+            )
             guard_diagnostics.update(
                 {
                     "suppressed": True,
-                    "suppression_reason": (
-                        "source_revalidation_frame_"
-                        + final_frame_revalidation.status
-                    ),
+                    "suppression_reason": frame_rewrite_reason,
                 }
             )
-            response = recover_guarded_response_obligation(
+            (
                 response,
-                baseline_response=baseline_response,
+                prompt,
+                prompt_source_bases,
+                response_rewrite_calls,
+                source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
+                response,
+                baseline_response=response,
                 prompt=prompt,
                 current_user_text=getattr(message, "content", ""),
                 diagnostics=guard_diagnostics,
                 route_mode=plan.route_mode,
                 channel_policy=plan.channel_policy,
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                channel=getattr(message, "channel", None),
+                prompt_source_bases=tuple(prompt_source_bases or ()),
                 source_context_available=source_context_available,
                 exact_quote_requested=exact_quote_requested,
                 exact_quote_authority=None,
@@ -43933,17 +44348,66 @@ async def send_planned_conversation_response(
                     third_party_attribution_requested
                 ),
             )
-            prompt_source_bases = ()
+            single_packet_corrective_call_count += response_rewrite_calls
+            synthesis_decision = (
+                await safely_record_ordinary_chat_single_packet_review(
+                    synthesis_decision,
+                    reason="single_packet_frame_response_rewritten",
+                    corrective_call_count=single_packet_corrective_call_count,
+                    frame_revalidation_status=(
+                        final_frame_revalidation.status
+                    ),
+                )
+                or synthesis_decision
+            )
+            if not response:
+                await safely_finalize_shared_brain_synthesis(
+                    synthesis_decision,
+                    final_response="",
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status="frame_response_rewrite_failed",
+                )
+                return model_decision
+            guard_diagnostics.update(
+                {
+                    "suppressed": False,
+                    "response_obligation_regenerated": True,
+                    "response_obligation_recovery_kind": "model_rewrite",
+                    "source_neutral_recovery": source_neutral_rewrite,
+                    "original_suppression_reason": frame_rewrite_reason,
+                }
+            )
             synthesis_candidate_active = False
-        if deterministic_frame_clarification:
+        if generated_frame_clarification:
             guard_diagnostics[
-                "deterministic_frame_clarification"
+                "generated_frame_clarification"
             ] = True
             logging.info(
                 "situation_frame_clarification_send_allowed "
                 "revision=%s status=ambiguous",
                 situation_frame.frame_revision,
             )
+    if _abort_stale_direct_repair_generation(
+        direct_repair_generation,
+        "after_presend_response_rewrite",
+    ):
+        if single_packet_cutover:
+            synthesis_decision = (
+                await safely_record_ordinary_chat_single_packet_review(
+                    synthesis_decision,
+                    reason="stale_after_presend_response_rewrite",
+                )
+                or synthesis_decision
+            )
+        await safely_finalize_shared_brain_synthesis(
+            synthesis_decision,
+            final_response=response,
+            response_sent=False,
+            candidate_live=False,
+            guard_status="stale_after_presend_response_rewrite",
+        )
+        return model_decision
     sent_message_ids = []
     try:
         if len(response) <= 2000:
@@ -43973,7 +44437,7 @@ async def send_planned_conversation_response(
         logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", plan.route_mode, getattr(message.channel, "id", 0), type(exc).__name__)
         if single_packet_cutover and synthesis_decision is not None:
             synthesis_decision = (
-                await safely_record_ordinary_chat_single_packet_block(
+                await safely_record_ordinary_chat_single_packet_review(
                     synthesis_decision,
                     reason="single_packet_discord_send_failed",
                 )
@@ -43998,10 +44462,8 @@ async def send_planned_conversation_response(
             if guard_diagnostics.get("response_obligation_recovered")
             else "single_packet_candidate_sent"
             if single_packet_cutover and synthesis_candidate_active
-            else "single_packet_deterministic_block_sent"
+            else "single_packet_repaired_response_sent"
             if single_packet_cutover
-            else "single_packet_legacy_baseline_sent"
-            if ordinary_chat_legacy_fallback_active
             else "candidate_sent"
             if synthesis_candidate_active
             else "established_path_sent"
@@ -45223,9 +45685,9 @@ async def on_message(message: discord.Message):
                             "ordinary_chat_single_packet_applied"
                         )
                     ),
-                    preflight_block_reason=str(
+                    preflight_reason=str(
                         prompt_metadata.get(
-                            "ordinary_chat_single_packet_block_reason"
+                            "ordinary_chat_single_packet_preflight_reason"
                         )
                         or ""
                     ),
@@ -45240,42 +45702,7 @@ async def on_message(message: discord.Message):
                     source_context_available=source_context_available,
                 )
             )
-            ordinary_chat_legacy_fallback = (
-                await maybe_generate_ordinary_chat_legacy_baseline(
-                    execution=ordinary_chat_execution,
-                    prompt_metadata=prompt_metadata,
-                    channel=message.channel,
-                    payload_items=direct_payload_items,
-                    request_text=direct_content,
-                    conversation_orchestration=direct_orchestration,
-                    situation_frame=direct_orchestration.situation_frame,
-                    user_id=message.author.id,
-                    guild_id=message.guild.id,
-                )
-            )
-            if ordinary_chat_legacy_fallback is not None:
-                ordinary_chat_execution = (
-                    ordinary_chat_legacy_fallback.packet_execution
-                )
-                response = ordinary_chat_legacy_fallback.response
-                prompt = ordinary_chat_legacy_fallback.prompt
-                prompt_metadata = (
-                    ordinary_chat_legacy_fallback.prompt_metadata
-                )
-                allow_greeting = (
-                    ordinary_chat_legacy_fallback.allow_greeting
-                )
-                style_key = ordinary_chat_legacy_fallback.style_key
-                source_context_available = (
-                    ordinary_chat_legacy_fallback.source_context_available
-                )
-                show_state_route = ORDINARY_CHAT_LEGACY_BASELINE_ROUTE
-                log_response_style(
-                    message.guild.id,
-                    message.author.id,
-                    style_key,
-                )
-            elif ordinary_chat_execution is not None:
+            if ordinary_chat_execution is not None:
                 response = ordinary_chat_execution.response
                 prompt = ordinary_chat_execution.prompt
                 show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
@@ -45291,7 +45718,6 @@ async def on_message(message: discord.Message):
                 )
             ordinary_chat_packet_controls_response = bool(
                 ordinary_chat_execution is not None
-                and not ordinary_chat_execution.legacy_baseline_active
             )
             if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
                 return
@@ -45778,9 +46204,9 @@ async def on_message(message: discord.Message):
                         "ordinary_chat_single_packet_applied"
                     )
                 ),
-                preflight_block_reason=str(
+                preflight_reason=str(
                     prompt_metadata.get(
-                        "ordinary_chat_single_packet_block_reason"
+                        "ordinary_chat_single_packet_preflight_reason"
                     )
                     or ""
                 ),
@@ -45795,38 +46221,7 @@ async def on_message(message: discord.Message):
                 source_context_available=source_context_available,
             )
         )
-        ordinary_chat_legacy_fallback = (
-            await maybe_generate_ordinary_chat_legacy_baseline(
-                execution=ordinary_chat_execution,
-                prompt_metadata=prompt_metadata,
-                channel=message.channel,
-                payload_items=direct_payload_items,
-                request_text=direct_content,
-                conversation_orchestration=direct_orchestration,
-                situation_frame=direct_orchestration.situation_frame,
-                user_id=message.author.id,
-                guild_id=message.guild.id,
-            )
-        )
-        if ordinary_chat_legacy_fallback is not None:
-            ordinary_chat_execution = (
-                ordinary_chat_legacy_fallback.packet_execution
-            )
-            response = ordinary_chat_legacy_fallback.response
-            prompt = ordinary_chat_legacy_fallback.prompt
-            prompt_metadata = ordinary_chat_legacy_fallback.prompt_metadata
-            allow_greeting = ordinary_chat_legacy_fallback.allow_greeting
-            style_key = ordinary_chat_legacy_fallback.style_key
-            source_context_available = (
-                ordinary_chat_legacy_fallback.source_context_available
-            )
-            show_state_route = ORDINARY_CHAT_LEGACY_BASELINE_ROUTE
-            log_response_style(
-                message.guild.id,
-                message.author.id,
-                style_key,
-            )
-        elif ordinary_chat_execution is not None:
+        if ordinary_chat_execution is not None:
             response = ordinary_chat_execution.response
             prompt = ordinary_chat_execution.prompt
             show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
@@ -45842,7 +46237,6 @@ async def on_message(message: discord.Message):
             )
         ordinary_chat_packet_controls_response = bool(
             ordinary_chat_execution is not None
-            and not ordinary_chat_execution.legacy_baseline_active
         )
         if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
             return
@@ -46272,9 +46666,9 @@ async def on_message(message: discord.Message):
                         "ordinary_chat_single_packet_applied"
                     )
                 ),
-                preflight_block_reason=str(
+                preflight_reason=str(
                     prompt_metadata.get(
-                        "ordinary_chat_single_packet_block_reason"
+                        "ordinary_chat_single_packet_preflight_reason"
                     )
                     or ""
                 ),
@@ -46289,38 +46683,7 @@ async def on_message(message: discord.Message):
                 source_context_available=source_context_available,
             )
         )
-        ordinary_chat_legacy_fallback = (
-            await maybe_generate_ordinary_chat_legacy_baseline(
-                execution=ordinary_chat_execution,
-                prompt_metadata=prompt_metadata,
-                channel=message.channel,
-                payload_items=direct_payload_items,
-                request_text=direct_content,
-                conversation_orchestration=direct_orchestration,
-                situation_frame=direct_orchestration.situation_frame,
-                user_id=message.author.id,
-                guild_id=message.guild.id,
-            )
-        )
-        if ordinary_chat_legacy_fallback is not None:
-            ordinary_chat_execution = (
-                ordinary_chat_legacy_fallback.packet_execution
-            )
-            response = ordinary_chat_legacy_fallback.response
-            prompt = ordinary_chat_legacy_fallback.prompt
-            prompt_metadata = ordinary_chat_legacy_fallback.prompt_metadata
-            allow_greeting = ordinary_chat_legacy_fallback.allow_greeting
-            style_key = ordinary_chat_legacy_fallback.style_key
-            source_context_available = (
-                ordinary_chat_legacy_fallback.source_context_available
-            )
-            show_state_route = ORDINARY_CHAT_LEGACY_BASELINE_ROUTE
-            log_response_style(
-                message.guild.id,
-                message.author.id,
-                style_key,
-            )
-        elif ordinary_chat_execution is not None:
+        if ordinary_chat_execution is not None:
             response = ordinary_chat_execution.response
             prompt = ordinary_chat_execution.prompt
             show_state_route = ORDINARY_CHAT_SINGLE_PACKET_ROUTE
@@ -46336,7 +46699,6 @@ async def on_message(message: discord.Message):
             )
         ordinary_chat_packet_controls_response = bool(
             ordinary_chat_execution is not None
-            and not ordinary_chat_execution.legacy_baseline_active
         )
         if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
             return

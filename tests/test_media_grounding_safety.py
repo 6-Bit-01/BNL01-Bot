@@ -363,7 +363,7 @@ class MediaGroundingRepairTests(unittest.IsolatedAsyncioTestCase):
             ["free_speak_media_generation", "media_response_grounding_repair", "media_grounding_strict_regeneration"],
         )
 
-    async def test_current_media_repair_and_strict_regeneration_failure_returns_safe_reply(self):
+    async def test_current_media_repairs_exhausted_regenerates_natural_reply(self):
         prompt = (
             "Current channel policy: sealed_test\n"
             "Current user request: [Current message media context:\n- gif embed (title=confused office)\n]\n"
@@ -372,6 +372,7 @@ class MediaGroundingRepairTests(unittest.IsolatedAsyncioTestCase):
             gemini_response("Archival records indicate this is about his weekly broadcast deployments.", 10),
             gemini_response("Still his weekly deployments inside the records.", 8),
             gemini_response("The core memory confirms his weekly deployments.", 8),
+            gemini_response("That GIF is pure confused-office energy. The red panel accepts the incident report.", 8),
         ]
 
         async def fake_generate(_contents, _route):
@@ -385,11 +386,16 @@ class MediaGroundingRepairTests(unittest.IsolatedAsyncioTestCase):
             text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
 
         self.assertTrue(text)
-        self.assertIn("couldn’t ground a reliable answer", text)
+        self.assertIn("confused-office energy", text)
         self.assertNotIn("weekly deployments", text)
         self.assertEqual(
             [call.args[1] for call in generate.await_args_list],
-            ["free_speak_media_generation", "media_response_grounding_repair", "media_grounding_strict_regeneration"],
+            [
+                "free_speak_media_generation",
+                "media_response_grounding_repair",
+                "media_grounding_strict_regeneration",
+                "required_response_regeneration",
+            ],
         )
 
     def test_canned_media_fallback_string_is_not_publicly_returned(self):
@@ -681,10 +687,11 @@ class ConversationContinuityRegenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotRegex(text.lower(), r"archives?|point me at|reliable record")
         self.assertEqual([call.args[1] for call in generate.await_args_list], ["normal_chat", "conversation_grounding_regeneration"])
 
-    async def test_failed_grounded_retry_returns_source_neutral_reply(self):
+    async def test_failed_grounded_retry_regenerates_from_current_context(self):
         responses = [
             gemini_response("The Network archives yielded no results for the tag.", 9),
             gemini_response("I do have relevant recent conversation; point me at the specific bit.", 8),
+            gemini_response("Right—Mind Fanatic tagged 6 Bit, not me. I intercepted somebody else's ping.", 8),
         ]
 
         async def fake_generate(_contents, _route):
@@ -698,7 +705,7 @@ class ConversationContinuityRegenerationTests(unittest.IsolatedAsyncioTestCase):
             text = await bnl01_bot.get_gemini_response(self.prompt(), 101, 1, route="normal_chat")
 
         self.assertTrue(text)
-        self.assertIn("can’t verify that from the current evidence", text)
+        self.assertIn("Mind Fanatic tagged 6 Bit, not me", text)
         self.assertNotRegex(text.lower(), r"archives?|point me at|reliable record")
 
 

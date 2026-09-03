@@ -1,5 +1,7 @@
+import asyncio
 import os
 import unittest
+from unittest import mock
 
 
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
@@ -197,7 +199,7 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
             "grounded_show_candidate",
         )
 
-    def test_response_obligation_recovery_renders_evidence_when_draft_is_unusable(self):
+    def test_unusable_show_draft_returns_to_shared_brain_with_evidence(self):
         diagnostics = {
             "suppressed": True,
             "suppression_reason": "tiktok_show_episode_after_retry",
@@ -214,16 +216,15 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
             channel_policy="public_home",
             source_context_available=True,
         )
-        self.assertIn("verified show record", recovered)
-        self.assertIn("t+1.2m", recovered)
-        self.assertIn("t+4.5m", recovered)
-        self.assertNotIn("Cliff", recovered)
+        self.assertEqual("", recovered)
+        self.assertTrue(diagnostics["suppressed"])
+        self.assertFalse(diagnostics["response_obligation_recovered"])
         self.assertEqual(
             diagnostics["response_obligation_recovery_kind"],
-            "grounded_show_evidence",
+            "model_rewrite_required",
         )
 
-    def test_source_guard_recovery_returns_nonempty_source_neutral_reply(self):
+    def test_source_guard_recovery_regenerates_a_natural_reply(self):
         diagnostics = {
             "suppressed": True,
             "suppression_reason": "source_grounding_after_retry",
@@ -238,9 +239,56 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
             channel_policy="public_home",
             source_context_available=False,
         )
-        self.assertTrue(recovered)
-        self.assertNotIn("private archive", recovered)
+        self.assertEqual("", recovered)
         self.assertTrue(diagnostics["source_neutral_recovery"])
+        self.assertTrue(diagnostics["suppressed"])
+        self.assertEqual(
+            "model_rewrite_required",
+            diagnostics["response_obligation_recovery_kind"],
+        )
+
+        natural_reply = (
+            "Which event do you mean? I can answer once I know what “what "
+            "happened” points to."
+        )
+        tracked = bnl01_bot.TrackedGenerationResponse(
+            text=natural_reply,
+            provider_call_count=1,
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "get_tracked_gemini_response_with_optional_typing",
+            new=mock.AsyncMock(return_value=tracked),
+        ):
+            (
+                regenerated,
+                _prompt,
+                source_bases,
+                provider_calls,
+                source_neutral,
+            ) = asyncio.run(
+                bnl01_bot.resolve_guarded_response_obligation(
+                    "",
+                    baseline_response=(
+                        "I checked the private archive and confirmed it."
+                    ),
+                    prompt="Current user request: What happened?",
+                    current_user_text="What happened?",
+                    diagnostics=diagnostics,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_home",
+                    user_id=101,
+                    guild_id=1,
+                    channel=None,
+                    source_context_available=False,
+                )
+            )
+
+        self.assertEqual(natural_reply, regenerated)
+        self.assertNotIn("private archive", regenerated)
+        self.assertEqual((), source_bases)
+        self.assertEqual(1, provider_calls)
+        self.assertTrue(source_neutral)
         self.assertFalse(diagnostics["suppressed"])
 
     def test_packet_evidence_uses_the_same_guard(self):

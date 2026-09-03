@@ -413,9 +413,16 @@ class GeneralConversationContinuityGuardTests(unittest.IsolatedAsyncioTestCase):
         retry_prompt = provider.await_args.args[1]
         self.assertIn("perform the user's requested conversational act now", retry_prompt)
 
-    async def test_second_process_only_draft_is_suppressed(self):
+    async def test_second_process_only_draft_is_regenerated_naturally(self):
+        natural_reply = (
+            "The timeout is still the useful signal. Match the proxy request "
+            "ID, then rerun the failed call once."
+        )
         provider = mock.AsyncMock(
-            return_value="Continuation output pending. Awaiting further input."
+            side_effect=(
+                "Continuation output pending. Awaiting further input.",
+                natural_reply,
+            )
         )
 
         with mock.patch.object(
@@ -446,21 +453,40 @@ class GeneralConversationContinuityGuardTests(unittest.IsolatedAsyncioTestCase):
         )
         provider.assert_awaited_once()
 
-        recovered = bnl01_bot.recover_guarded_response_obligation(
-            response,
-            baseline_response=(
-                "Scenario parameters updated. Continuation input logged."
-            ),
-            prompt=CONTINUITY_PROMPT,
-            current_user_text="Keep going.",
-            diagnostics=diagnostics,
-            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
-            channel_policy="sealed_test",
-            source_context_available=True,
+        tracked = bnl01_bot.TrackedGenerationResponse(
+            text=natural_reply,
+            provider_call_count=1,
         )
-        self.assertTrue(recovered)
+        with mock.patch.object(
+            bnl01_bot,
+            "get_tracked_gemini_response_with_optional_typing",
+            new=mock.AsyncMock(return_value=tracked),
+        ):
+            (
+                recovered,
+                _prompt,
+                _source_bases,
+                _provider_calls,
+                _source_neutral,
+            ) = await bnl01_bot.resolve_guarded_response_obligation(
+                response,
+                baseline_response=(
+                    "Scenario parameters updated. Continuation input logged."
+                ),
+                prompt=CONTINUITY_PROMPT,
+                current_user_text="Keep going.",
+                diagnostics=diagnostics,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="sealed_test",
+                user_id=101,
+                guild_id=1,
+                channel=None,
+                source_context_available=True,
+            )
+        self.assertEqual(natural_reply, recovered)
         self.assertNotIn("parameters updated", recovered.lower())
         self.assertFalse(diagnostics["suppressed"])
+        self.assertEqual(1, provider.await_count)
 
     async def test_substantive_technical_and_mechanical_answers_pass_unchanged(self):
         candidates = (

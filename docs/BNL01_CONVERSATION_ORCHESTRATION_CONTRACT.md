@@ -22,13 +22,18 @@ that an upstream stage already discarded.
 | Relationship Engine | Tone and interpersonal framing | Whether BNL responds, raw evidence selection |
 | Engagement classifier | Optional participation recommendation for ambient room activity | Vetoing a confirmed address or unresolved direct referent |
 | Canon and source controls | Applicability, route, visibility, and source-authority boundaries | Conversation routing, raw-context selection, social tone |
-| Conversation coordinator | One final response act per immutable packet revision from typed evidence: answer, clarify, acknowledge, observe, or block | New storage, duplicate retrieval, generation prose |
+| Conversation coordinator | One final response act per immutable packet revision from typed evidence: answer, clarify, acknowledge, observe, or refuse | New storage, duplicate retrieval, generation prose |
 | Generation and delivery | A natural BNL response from the coordinated packet, followed by a successful send | Retroactively changing the coordinator's route or evidence |
 
 Route, safety, visibility, and third-party-only boundaries remain higher
 authority than the content of an ordinary response. Once the coordinator has
 authorized an answer, those boundaries may reject, repair, or replace unsafe
 prose with a source-neutral reply; they do not cancel the response act.
+Ambiguity, missing current evidence, changed sources, and privacy limits shape
+that natural reply. They never authorize a generic scope/grounding message or
+a deterministic response block. Passive ambient non-participation and a
+superseded stale draft are not authorized direct-response acts and remain
+separate from this rule.
 Relationship evidence may shape tone after a response is authorized, but it
 cannot silence or force the turn.
 
