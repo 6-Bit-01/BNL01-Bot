@@ -6691,7 +6691,8 @@ def _ordinary_chat_queue_open_state(value: str) -> bool | None:
     if snapshot_match is not None:
         return snapshot_match.group(1).casefold() == "true"
     if re.search(
-        r"\bqueue\b[^.?!\n]{0,80}\b(?:is|are|was|were)n['’]?t"
+        r"\bqueue\b[^.?!\n]{0,80}\b(?:is|are|was|were)"
+        r"(?:n['’]?t|\s+not)"
         r"(?:\s+\w+){0,2}\s+closed\b",
         text,
         re.I,
@@ -6987,6 +6988,17 @@ def _ordinary_chat_retained_context_lane(value: str) -> str:
     return ""
 
 
+def _ordinary_chat_bnl_room_label(value: str) -> bool:
+    """Recognize the existing rendered label for prior BNL output."""
+
+    label = re.sub(
+        r"\s*\([^\n)]{1,160}\)\s*$",
+        "",
+        str(value or "").strip(),
+    )
+    return bool(re.fullmatch(r"BNL(?:[\W_]*0?1)", label, re.I))
+
+
 def _ordinary_chat_authorized_support_segments(
     basis: SharedBrainSynthesisBasis,
 ) -> tuple[tuple[str, str, str], ...]:
@@ -7107,6 +7119,12 @@ def _ordinary_chat_authorized_support_segments(
                     str(attributed.group("label") or "")
                     .strip(),
                 )
+                # Prior model output remains available to the provider as
+                # conversational continuity, but it cannot corroborate a
+                # later factual claim. The room renderer reserves this label
+                # for rows whose existing conversation role is model/BNL.
+                if _ordinary_chat_bnl_room_label(speaker_label):
+                    continue
                 speaker_subject_key = bound_member_labels.get(
                     speaker_label.casefold(),
                     "",

@@ -2020,6 +2020,13 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 1)
         self.assertEqual(classifications, ("unsupported_packet_domain",))
 
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "The queue is not closed right now.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
         live_open_basis = replace(
             context_basis,
             packet=replace(
@@ -2039,6 +2046,16 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         classifications, unsupported = audit_ordinary_chat_candidate_claims(
             live_open_basis,
             "The queue is open and welcomes track submissions.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            live_open_basis,
+            "The queue is not closed right now.",
         )
         self.assertEqual(unsupported, 0)
         self.assertEqual(
@@ -2246,6 +2263,52 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 0)
         self.assertEqual(
             explicit_subjects,
+            ("authorized_evidence_supported",),
+        )
+
+    def test_bnl_authored_room_lines_are_not_factual_support(self):
+        for label in (
+            "BNL-01",
+            "BNL-01 (reply to Test Member)",
+        ):
+            with self.subTest(label=label):
+                context_basis = self._basis_with_retained_room_context(
+                    (
+                        (
+                            0,
+                            label,
+                            "Test Member founded BARCODE in 1999.",
+                        ),
+                    )
+                )
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        "You founded BARCODE in 1999.",
+                    )
+                )
+                self.assertEqual(unsupported, 1)
+                self.assertEqual(
+                    classifications,
+                    ("unsupported_packet_domain",),
+                )
+
+        human_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    "I founded BARCODE in 1999.",
+                ),
+            )
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            human_basis,
+            "You founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
             ("authorized_evidence_supported",),
         )
 
