@@ -2661,6 +2661,132 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 1)
         self.assertEqual(classifications, ("unsupported_packet_domain",))
 
+    def test_retained_same_polarity_predicates_keep_their_objects(self):
+        context_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    (
+                        "I designed modular synths and built wooden "
+                        "cabinets."
+                    ),
+                ),
+            )
+        )
+
+        for response in (
+            "You designed modular synths and built wooden cabinets.",
+            "You built wooden cabinets.",
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 0)
+                self.assertEqual(
+                    classifications,
+                    ("authorized_evidence_supported",),
+                )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You designed wooden cabinets and built modular synths.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+    def test_retained_quantities_stay_bound_to_their_objects(self):
+        context_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    "I played 10 modular synth shows in 20 cities.",
+                ),
+            )
+        )
+
+        for response in (
+            "You played 10 modular synth shows in 20 cities.",
+            "You played 10 modular synth shows.",
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 0)
+                self.assertEqual(
+                    classifications,
+                    ("authorized_evidence_supported",),
+                )
+
+        for response in (
+            "You played 20 modular synth shows in 10 cities.",
+            "You played 20 modular synth shows.",
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 1)
+                self.assertEqual(
+                    classifications,
+                    ("unsupported_packet_domain",),
+                )
+
+    def test_retained_support_preserves_aspectual_qualifiers(self):
+        for evidence, qualified_response in (
+            (
+                "I stopped building modular synth cabinets.",
+                "You stopped building modular synth cabinets.",
+            ),
+            (
+                "I used to build modular synth cabinets.",
+                "You used to build modular synth cabinets.",
+            ),
+            (
+                "I almost built modular synth cabinets.",
+                "You almost built modular synth cabinets.",
+            ),
+        ):
+            with self.subTest(evidence=evidence):
+                context_basis = self._basis_with_retained_room_context(
+                    ((7, "Test Member", evidence),)
+                )
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        qualified_response,
+                    )
+                )
+                self.assertEqual(unsupported, 0)
+                self.assertEqual(
+                    classifications,
+                    ("authorized_evidence_supported",),
+                )
+
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        "You build modular synth cabinets.",
+                    )
+                )
+                self.assertEqual(unsupported, 1)
+                self.assertEqual(
+                    classifications,
+                    ("unsupported_packet_domain",),
+                )
+
     def test_retained_support_compares_hard_tokens_exactly(self):
         context_basis = self._basis_with_retained_room_context(
             (

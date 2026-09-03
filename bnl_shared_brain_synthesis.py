@@ -589,7 +589,7 @@ _RETAINED_DIRECT_SUBJECT_TAIL_RE = re.compile(
     r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3})\s+"
     r"(?P<tail>[\s\S]+)$",
 )
-_RETAINED_NONACTUAL_MODE_RES = (
+_RETAINED_RELATION_MODE_RES = (
     (
         "possibility",
         re.compile(r"^(?:could|may|might)\b", re.I),
@@ -632,6 +632,32 @@ _RETAINED_NONACTUAL_MODE_RES = (
             re.I,
         ),
     ),
+    (
+        "cessation",
+        re.compile(
+            r"^(?:(?:have|has|had)\s+)?"
+            r"(?:ceas(?:e|ed|es|ing)|finish(?:ed|es|ing)?|"
+            r"quit(?:s|ting)?|stop(?:ped|ping|s)?)\b",
+            re.I,
+        ),
+    ),
+    (
+        "former",
+        re.compile(r"^(?:formerly|used\s+to)\b", re.I),
+    ),
+    (
+        "near_miss",
+        re.compile(r"^(?:almost|nearly)\b", re.I),
+    ),
+)
+_RETAINED_NUMERIC_EVIDENCE_RE = re.compile(
+    r"(?<![\w.])[+-]?(?:\d+(?:[./:-]\d+)*|\.\d+)\b",
+    re.I,
+)
+_RETAINED_QUANTITY_PHRASE_BOUNDARY_RE = re.compile(
+    r"[,;:—–]|\b(?:and|at|by|for|from|in|into|near|of|on|onto|"
+    r"per|to|with)\b",
+    re.I,
 )
 _AMBIGUOUS_PACKET_SUBJECT_RE = re.compile(
     r"^(?:(?:an?|the|this|that|these|those)\s+)?"
@@ -6779,7 +6805,7 @@ def _ordinary_chat_possessive_subject_marker_terms(
 
 
 def _ordinary_chat_relation_mode_markers(value: str) -> frozenset[str]:
-    """Read non-actual modality only when it leads the factual predicate."""
+    """Read non-current or non-actual modes leading a factual predicate."""
 
     body = _ordinary_chat_attributed_clause_body(value)
     possessive_match = _RETAINED_POSSESSIVE_SUBJECT_MARKER_RE.match(
@@ -6813,10 +6839,62 @@ def _ordinary_chat_relation_mode_markers(value: str) -> frozenset[str]:
         )
         modes.update(
             mode
-            for mode, pattern in _RETAINED_NONACTUAL_MODE_RES
+            for mode, pattern in _RETAINED_RELATION_MODE_RES
             if pattern.search(tail)
         )
     return frozenset(modes)
+
+
+def _ordinary_chat_numeric_evidence_anchors(
+    value: str,
+) -> dict[str, frozenset[str]]:
+    """Bind each quantitative token to its following object phrase."""
+
+    body = _PACKET_DOMAIN_LINK_OR_ADDRESS_RE.sub(
+        " ",
+        _ordinary_chat_attributed_clause_body(value),
+    )
+    matches = tuple(_RETAINED_NUMERIC_EVIDENCE_RE.finditer(body))
+    anchors: dict[str, set[str]] = {}
+    for index, match in enumerate(matches):
+        phrase_end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(body)
+        )
+        phrase = body[match.end() : phrase_end]
+        boundary = _RETAINED_QUANTITY_PHRASE_BOUNDARY_RE.search(phrase)
+        if boundary is not None:
+            phrase = phrase[: boundary.start()]
+        token = str(match.group(0) or "").casefold().rstrip(".,;:!?")
+        phrase_terms = (
+            _ordinary_chat_authorized_support_terms(phrase)
+            - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+        )
+        anchors.setdefault(token, set()).update(phrase_terms)
+    return {
+        token: frozenset(terms)
+        for token, terms in anchors.items()
+        if token
+    }
+
+
+def _ordinary_chat_numeric_evidence_anchors_align(
+    claim: str,
+    support: str,
+) -> bool:
+    """Keep multiple retained quantities attached to matching objects."""
+
+    claim_anchors = _ordinary_chat_numeric_evidence_anchors(claim)
+    support_anchors = _ordinary_chat_numeric_evidence_anchors(support)
+    if len(claim_anchors) < 2 and len(support_anchors) < 2:
+        return True
+    return all(
+        not claim_terms
+        or not support_anchors.get(token)
+        or bool(claim_terms.intersection(support_anchors[token]))
+        for token, claim_terms in claim_anchors.items()
+    )
 
 
 def _ordinary_chat_queue_open_state(value: str) -> bool | None:
@@ -6900,7 +6978,7 @@ def _ordinary_chat_polarity_clause_units(
     *,
     retained_support: bool = False,
 ) -> tuple[str, ...]:
-    """Split mixed polarity only into independently factual predicates."""
+    """Split coordinated predicates only when each is independently factual."""
 
     core = _ordinary_chat_claim_core(value)
     parts = tuple(
@@ -6908,8 +6986,9 @@ def _ordinary_chat_polarity_clause_units(
         for part in _RETAINED_POLARITY_CLAUSE_RE.split(core)
         if part.strip(" ,;:—–")
     )
-    if len(parts) < 2 or len({_relation_polarity(part) for part in parts}) < 2:
+    if len(parts) < 2:
         return (value,)
+    polarities = {_relation_polarity(part) for part in parts}
     safe_parts = []
     for part in parts:
         material = (
@@ -6923,6 +7002,8 @@ def _ordinary_chat_polarity_clause_units(
             safe_parts.append(part)
     if len(safe_parts) == len(parts):
         return parts
+    if len(polarities) < 2:
+        return (value,)
     # Retained evidence may still support its independently explicit clause.
     # A candidate with an unresolved elliptical clause cannot silently drop
     # that clause and pass as though it were never asserted.
@@ -7608,6 +7689,11 @@ def _ordinary_chat_claim_part_supported(
                 continue
             if hard_tokens and not hard_tokens.issubset(
                 _ordinary_chat_hard_evidence_tokens(support_part)
+            ):
+                continue
+            if not _ordinary_chat_numeric_evidence_anchors_align(
+                claim,
+                support_part,
             ):
                 continue
             support_queue_state = _ordinary_chat_queue_open_state(
