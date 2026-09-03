@@ -30,6 +30,7 @@ from bnl_shared_brain_synthesis import (
     publication_packet_owns_turn,
     parse_ordinary_chat_response_contract,
     record_single_packet_review,
+    revalidate_basis,
     render_ordinary_chat_task_contract,
     render_packet_context,
     validate_ordinary_chat_response_contract,
@@ -837,7 +838,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             )
         )
 
-    def test_packet_owned_prompt_rejects_legacy_and_nonpacket_owners(self):
+    def test_packet_prompt_keeps_authorized_context_without_owner_veto(self):
         base_prompt = (
             "Current user request: What do you remember about me?\n"
             "Current exact reply evidence: Test Member asked directly."
@@ -872,19 +873,16 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             replacement_basis,
         )
         self.assertTrue(replaced.ready)
-        self.assertEqual(replaced.replaced_factual_context_count, 1)
-        self.assertNotIn(legacy_context, replaced.prompt)
+        self.assertEqual(replaced.replaced_factual_context_count, 0)
+        self.assertIn(legacy_context, replaced.prompt)
         self.assertIn(self.basis.rendered_context, replaced.prompt)
 
         legacy = build_packet_owned_prompt(
             base_prompt + "\nDurable memory context: old view",
             self.basis,
         )
-        self.assertFalse(legacy.ready)
-        self.assertEqual(
-            legacy.reason,
-            "legacy_factual_prompt_marker_present",
-        )
+        self.assertTrue(legacy.ready)
+        self.assertIn("Durable memory context: old view", legacy.prompt)
 
         blocked_assessment = replace(
             self.assessment,
@@ -903,9 +901,16 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             environ=self.flags,
         )
         self.assertIsNotNone(blocked_basis)
+        self.assertEqual(blocked_basis.blocking_factual_owner_lanes, ())
         blocked = build_packet_owned_prompt(base_prompt, blocked_basis)
-        self.assertFalse(blocked.ready)
-        self.assertEqual(blocked.reason, "nonpacket_factual_owner_selected")
+        self.assertTrue(blocked.ready)
+        valid, status = revalidate_basis(
+            self.conn,
+            blocked_basis,
+            environ=self.flags,
+        )
+        self.assertTrue(valid)
+        self.assertEqual(status, "passed")
 
     def test_bnl_self_identity_prompt_keeps_subject_scoped_canon(self):
         basis = self._multi_subject_basis(

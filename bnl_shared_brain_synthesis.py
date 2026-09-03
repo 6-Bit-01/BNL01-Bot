@@ -326,25 +326,14 @@ _PACKET_FACTUAL_OWNER_REPLACEMENT = (
 _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT = (
     "PACKET-OWNED RESPONSE CONTRACT:\n"
     "- The current request and exact reply/referent evidence govern the task.\n"
-    "- For BARCODE, member, publication, episode, relationship, identity, or "
-    "stored-history claims, use only the selected evidence below.\n"
+    "- Use the authorized context already assembled in this prompt together "
+    "with the selected evidence below as one understanding of the turn.\n"
     "- A publication projection is exact published prose only; it adds no "
     "independent fact, recurrence, canon, identity, or relationship weight.\n"
-    "- If selected evidence is absent or insufficient for a requested stored "
-    "claim, say so or ask one focused clarification. Do not reconstruct a "
-    "legacy memory, archive, dossier, source, Journal, Relay, or canon view.\n"
+    "- Keep historical publication context separate from current operational "
+    "state; do not infer a current state from an older publication.\n"
     "- General public knowledge may answer ordinary external questions, but it "
     "must not be presented as BARCODE memory or private system evidence."
-)
-_ORDINARY_CHAT_FORBIDDEN_PROMPT_MARKERS = (
-    "Durable memory context:",
-    "Durable BARCODE Radio show episode memory:",
-    "Broadcast memory context:",
-    "Public website read model",
-    "Website read model",
-    "SOURCE FILE CONTEXT",
-    "Source-file context",
-    "UNIFIED MOMENT CANARY CONTEXT",
 )
 _HONEST_EMPTY_PROFILE_RESPONSE = (
     "I do not have enough reliable public history to summarize you without "
@@ -3417,8 +3406,10 @@ def render_ordinary_chat_task_contract(
         + "VISIBLE RESPONSE CONTRACT:\n"
         + "Write one natural BNL reply, not JSON. Answer every task in order "
         + "and combine them coherently instead of treating one task as a "
-        + "reason to drop another. Use only that task's listed support for "
-        + "BARCODE, member, publication, history, or current-state facts. "
+        + "reason to drop another. Use each task's listed packet support "
+        + "together with relevant authorized context already present in this "
+        + "prompt for BARCODE, member, publication, history, or current-state "
+        + "facts. "
         + "For supportKind=hold, state only the specific fact that cannot be "
         + "verified and continue answering the remaining tasks. For "
         + "response=clarify, ask the natural clarification the task requires. "
@@ -3596,21 +3587,6 @@ def ordinary_chat_deterministic_response_act(
     return "hold"
 
 
-def _ordinary_blocking_factual_owner_lanes(
-    assessment: UnifiedResponseAssessment,
-    packet: UnifiedIntelligencePacket,
-) -> tuple[str, ...]:
-    """Treat a selected packet projection as packet-owned for this run."""
-
-    blocking = set(assessment.selected_lanes) & set(
-        _NON_PACKET_FACTUAL_OWNER_LANES
-    )
-    packet_lanes = {str(item.lane or "") for item in packet.items}
-    if "website_read_model" in packet_lanes:
-        blocking.discard("website_read_model")
-    return tuple(sorted(blocking))
-
-
 def build_ordinary_chat_basis(
     *,
     guild_id: int,
@@ -3649,10 +3625,6 @@ def build_ordinary_chat_basis(
     rendered, lane_counts, item_count, source_digests = (
         _ordinary_packet_context(packet)
     )
-    blocking_lanes = _ordinary_blocking_factual_owner_lanes(
-        assessment,
-        packet,
-    )
     profile = getattr(packet, "profile_sufficiency", None)
     rendered_evidence_refs = _ordinary_rendered_evidence_refs(
         packet,
@@ -3688,7 +3660,7 @@ def build_ordinary_chat_basis(
         competing_factual_context_digests=tuple(
             _digest(value) for value in factual_contexts
         ),
-        blocking_factual_owner_lanes=blocking_lanes,
+        blocking_factual_owner_lanes=(),
         profile_sufficiency_status=str(
             getattr(profile, "status", "not_applicable")
             or "not_applicable"
@@ -3906,11 +3878,6 @@ def revalidate_basis(
                 for value in basis.competing_factual_contexts
             )
             != basis.competing_factual_context_digests
-            or basis.blocking_factual_owner_lanes
-            or _ordinary_blocking_factual_owner_lanes(
-                basis.assessment,
-                basis.packet,
-            )
         ):
             return False, "scope_or_basis_changed"
         result = revalidate_packet(
@@ -4028,13 +3995,7 @@ def build_packet_owned_prompt(
     prompt: str,
     basis: SharedBrainSynthesisBasis,
 ) -> PacketOwnedPrompt:
-    """Replace competing factual memory views before adding the packet.
-
-    The current request, persona/canon, Conversation Context, and route/style
-    contracts stay byte-identical. Only exact, caller-supplied factual memory
-    contexts are replaced, using the last occurrence so matching user text
-    cannot redirect the replacement.
-    """
+    """Add packet evidence to the already-authorized response context."""
 
     updated = str(prompt or "")
     if basis.ordinary_chat_single_packet:
@@ -4045,91 +4006,17 @@ def build_packet_owned_prompt(
                 ready=False,
                 reason="single_packet_prompt_missing",
             )
-        if basis.blocking_factual_owner_lanes:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="nonpacket_factual_owner_selected",
-            )
-        replaced = 0
-        for context in basis.competing_factual_contexts:
-            value = str(context or "")
-            if not value:
-                continue
-            start = updated.rfind(value)
-            if start < 0:
-                return PacketOwnedPrompt(
-                    prompt=updated,
-                    ready=False,
-                    reason="competing_factual_context_missing",
-                    replaced_factual_context_count=replaced,
-                )
-            updated = (
-                updated[:start]
-                + _PACKET_FACTUAL_OWNER_REPLACEMENT
-                + updated[start + len(value):]
-            )
-            replaced += 1
-        if any(
-            context and context in updated
-            for context in basis.competing_factual_contexts
-        ):
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="competing_factual_context_retained",
-                replaced_factual_context_count=replaced,
-            )
-        prompt_contract_suffix = updated
-        if "\nIdentity-label rule:" in prompt_contract_suffix:
-            prompt_contract_suffix = prompt_contract_suffix.split(
-                "\nIdentity-label rule:",
-                1,
-            )[1]
-        forbidden = next(
-            (
-                marker
-                for marker in _ORDINARY_CHAT_FORBIDDEN_PROMPT_MARKERS
-                if marker.casefold() in prompt_contract_suffix.casefold()
-            ),
-            "",
-        )
-        if forbidden:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="legacy_factual_prompt_marker_present",
-            )
-        if not basis.rendered_context:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="packet_context_unavailable",
-            )
-        if not task_contract:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="typed_task_contract_unavailable",
-            )
-        if basis.rendered_context in updated:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="packet_context_already_present",
-            )
+        additions = []
+        if _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT not in updated:
+            additions.append(_ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT)
+        if basis.rendered_context and basis.rendered_context not in updated:
+            additions.append(basis.rendered_context)
+        if task_contract and task_contract not in updated:
+            additions.append(task_contract)
         return PacketOwnedPrompt(
-            prompt=(
-                updated.rstrip()
-                + "\n\n"
-                + _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT
-                + "\n\n"
-                + basis.rendered_context
-                + "\n\n"
-                + task_contract
-            ),
+            prompt="\n\n".join((updated.rstrip(), *additions)),
             ready=True,
-            replaced_factual_context_count=replaced,
+            replaced_factual_context_count=0,
         )
     if basis.honest_empty_profile_fallback:
         return PacketOwnedPrompt(

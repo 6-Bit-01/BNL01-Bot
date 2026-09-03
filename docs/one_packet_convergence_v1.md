@@ -1,7 +1,8 @@
 # One-Packet Convergence v1
 
-`unified_intelligence_packet_v12` is the single factual owner for gated broad
-self-profile synthesis and the separately gated ordinary-chat cutover. It
+`unified_intelligence_packet_v12` is the selected-evidence owner for gated
+broad self-profile synthesis and an evidence input to the separately gated
+ordinary-chat shared brain. It
 consumes the immutable Situation Frame revision and resolves each governed
 task subject before source scoring. A true multi-subject ordinary request runs
 the existing single-subject path once per scoped subject and freezes those
@@ -54,10 +55,11 @@ before candidate use. A changed or invalid source forces the established
 response selection on comparison routes. On the separately gated
 ordinary-chat route it triggers a natural source-neutral rewrite that preserves
 answerable tasks and states only the specific uncertainty. An eligible
-ordinary-chat turn never relinquishes packet ownership to a second factual
-prompt or emits a canned blocker. Broad-profile prompts have one
-factual packet owner, while
-current turn, exact reply context, persona, and bounded additive canon remain.
+ordinary-chat turn uses one composed provider prompt containing all relevant
+authorized context already assembled for the turn plus selected packet
+evidence; packet selection and assessment bookkeeping cannot veto that reply
+or emit a canned blocker. Broad-profile prompts retain one factual packet
+owner, while ordinary chat remains a shared-brain composition.
 Specialized operational routes stay outside this cutover, except that a mixed
 publication/current-queue request may freeze the existing authorized read-only
 queue projection inside the same packet and revalidate it before selection.
@@ -100,11 +102,13 @@ missing allowlists, or any over-limit scope fail closed before prompt
 construction. The scope digest binds both the authorization mode and exact
 allowlists without exposing their IDs.
 
-All gates remain default-off. Once the ordinary-chat packet prompt is applied,
-the packet remains the factual owner through any required natural rewrite. A
-preflight packet failure leaves the established context-rich generation path
-responsible for the reply; it does not emit a deterministic blocker or open a
-parallel factual authority. This version
+All gates remain default-off. Once the ordinary-chat shared-brain prompt is
+applied, its authorized context and selected packet evidence remain one
+understanding through any required natural rewrite. An explicitly requested
+publication or current public queue source is selected before optional
+background can consume the existing packet budget. A packet or assessment
+diagnostic cannot cancel the ordinary-chat response obligation or substitute a
+deterministic blocker. This version
 performs no deployment, historical
 promotion, live activation, member-facing correction inference, or knowledge
 edit/delete function. It does not change Journal or Relay generation,

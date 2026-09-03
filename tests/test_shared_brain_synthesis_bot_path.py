@@ -980,7 +980,7 @@ class SharedBrainSynthesisBotPathTests(
         evaluate.assert_not_called()
         finalize.assert_not_called()
 
-    async def test_single_packet_provider_wrapper_has_no_history_or_repair_call(self):
+    async def test_single_packet_provider_keeps_composed_context_without_duplicate_history(self):
         generated = mock.AsyncMock(
             return_value=SimpleNamespace(
                 success=True,
@@ -1019,6 +1019,7 @@ class SharedBrainSynthesisBotPathTests(
         ):
             response = await bnl01_bot.get_gemini_response(
                 "Current user request: answer this.\n"
+                "Authorized Conversation Context: prior relevant exchange.\n"
                 "PACKET-OWNED RESPONSE CONTRACT:\n"
                 "Use the selected evidence.",
                 7,
@@ -1033,7 +1034,12 @@ class SharedBrainSynthesisBotPathTests(
         strict_repair.assert_not_awaited()
         media_repair.assert_not_awaited()
         request_contents = generated.await_args.args[0]
-        self.assertIn("sole authority for BARCODE", request_contents)
+        self.assertIn(
+            "Authorized Conversation Context: prior relevant exchange.",
+            request_contents,
+        )
+        self.assertIn("one coherent understanding", request_contents)
+        self.assertNotIn("sole authority for BARCODE", request_contents)
         self.assertNotIn("Conversation history:", request_contents)
         self.assertNotIn("THE FORBIDDEN REFERENCE", request_contents)
 

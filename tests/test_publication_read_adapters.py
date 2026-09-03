@@ -720,7 +720,7 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         self.assertFalse(changed.valid)
         self.assertEqual("source_changed", changed.status)
 
-    def test_mixed_journal_queue_full_chain_rejects_changed_queue(self):
+    def test_mixed_journal_queue_full_chain_survives_live_budget(self):
         text = (
             "What did the Journal say about the queue, and is the queue "
             "open right now?"
@@ -787,7 +787,7 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
                 user_text=text,
                 participant_user_ids=(7,),
                 direct_state="direct",
-                budget_chars=8000,
+                budget_chars=2400,
                 conversation_evidence=(
                     PacketConversationEvidence(
                         text=text,
