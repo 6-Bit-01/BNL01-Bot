@@ -1575,9 +1575,15 @@ class SharedBrainSynthesisBotPathTests(
         )
 
     def test_source_change_builds_natural_source_neutral_rewrite(self):
+        retained_context = (
+            "Recent room context from this channel:\n"
+            "- Alice: The queue is open right now."
+        )
         prompt = (
             "Current user request: What did the Journal say, and is the "
             "queue open now?\n\n"
+            + retained_context
+            + "\n\n"
             "PACKET-OWNED RESPONSE CONTRACT:\n"
             "Grounded response evidence: stale queue snapshot"
         )
@@ -1586,13 +1592,16 @@ class SharedBrainSynthesisBotPathTests(
             bnl01_bot.build_ordinary_chat_response_repair_prompt(
                 prompt,
                 reason="source_revalidation_snapshot_changed",
-                prompt_source_bases=(object(),),
+                prompt_source_bases=(
+                    SimpleNamespace(rendered_context=retained_context),
+                ),
             )
         )
 
         self.assertTrue(source_neutral)
         self.assertEqual(bases, ())
         self.assertIn("What did the Journal say", rewritten)
+        self.assertNotIn(retained_context, rewritten)
         self.assertNotIn("stale queue snapshot", rewritten)
         self.assertNotIn("PACKET-OWNED RESPONSE CONTRACT", rewritten)
         self.assertIn("Write one natural BNL reply", rewritten)

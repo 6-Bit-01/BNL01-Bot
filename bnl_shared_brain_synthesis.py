@@ -575,6 +575,64 @@ _RETAINED_POLARITY_CLAUSE_RE = re.compile(
     r"\s+\b(?:and|but|while|whereas|yet)\b\s+",
     re.I,
 )
+_RETAINED_ATTRIBUTION_PREFIX_RE = re.compile(
+    r"^[^:/\n]{1,120}:\s+",
+)
+_RETAINED_POSSESSIVE_SUBJECT_MARKER_RE = re.compile(
+    r"^(?:(?i:my|our|your|his|her|their|its)|"
+    r"[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,3}['’]s)\s+"
+    r"(?P<marker>[A-Za-z][\w'’-]*)\b",
+)
+_RETAINED_DIRECT_SUBJECT_TAIL_RE = re.compile(
+    r"^(?:(?i:i|we|you|he|she|they)"
+    r"(?:['’](?:d|ll|m|re|s|ve))?|<@!?\d+>|"
+    r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3})\s+"
+    r"(?P<tail>[\s\S]+)$",
+)
+_RETAINED_NONACTUAL_MODE_RES = (
+    (
+        "possibility",
+        re.compile(r"^(?:could|may|might)\b", re.I),
+    ),
+    (
+        "capability",
+        re.compile(
+            r"^(?:can(?:not)?|can['’]t)\b|"
+            r"^(?:(?:am|are|is|was|were)\s+)?(?:un)?able\s+to\b",
+            re.I,
+        ),
+    ),
+    (
+        "conditional",
+        re.compile(r"^(?:should|would)\b", re.I),
+    ),
+    (
+        "intent",
+        re.compile(
+            r"^(?:(?:am|are|is|was|were|have|has|had)\s+){0,2}"
+            r"(?:aim(?:ed|ing|s)?|hope(?:d|ing|s)?|"
+            r"intend(?:ed|ing|s)?|plan(?:ned|ning|s)?|"
+            r"want(?:ed|ing|s)?)\s+to\b",
+            re.I,
+        ),
+    ),
+    (
+        "future",
+        re.compile(
+            r"^(?:will|shall)\b|"
+            r"^(?:am|are|is|was|were)\s+going\s+to\b",
+            re.I,
+        ),
+    ),
+    (
+        "obligation",
+        re.compile(
+            r"^(?:must|ought\s+to|need(?:ed|s)?\s+to|"
+            r"(?:have|has|had)\s+to)\b",
+            re.I,
+        ),
+    ),
+)
 _AMBIGUOUS_PACKET_SUBJECT_RE = re.compile(
     r"^(?:(?:an?|the|this|that|these|those)\s+)?"
     r"(?:(?:archival|assistant|cached|confidential|conversation|current|"
@@ -6690,6 +6748,77 @@ def _ordinary_chat_authorized_support_terms(value: str) -> frozenset[str]:
     )
 
 
+def _ordinary_chat_attributed_clause_body(value: str) -> str:
+    """Remove only the retained renderer's leading speaker attribution."""
+
+    return _RETAINED_ATTRIBUTION_PREFIX_RE.sub(
+        "",
+        _ordinary_chat_claim_core(value),
+        count=1,
+    ).strip()
+
+
+def _ordinary_chat_possessive_subject_marker_terms(
+    value: str,
+) -> frozenset[str]:
+    """Keep a possessed grammatical subject attached to its factual claim."""
+
+    match = _RETAINED_POSSESSIVE_SUBJECT_MARKER_RE.match(
+        _ordinary_chat_attributed_clause_body(value)
+    )
+    if match is None:
+        return frozenset()
+    marker = _relation_term_stem(str(match.group("marker") or ""))
+    return frozenset(
+        {
+            marker,
+        }
+        - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+        - {""}
+    )
+
+
+def _ordinary_chat_relation_mode_markers(value: str) -> frozenset[str]:
+    """Read non-actual modality only when it leads the factual predicate."""
+
+    body = _ordinary_chat_attributed_clause_body(value)
+    possessive_match = _RETAINED_POSSESSIVE_SUBJECT_MARKER_RE.match(
+        body
+    )
+    if possessive_match is not None:
+        remainder = body[possessive_match.end() :].strip()
+        words = tuple(_EXTERNAL_WORD_RE.finditer(remainder))
+        tails = tuple(
+            remainder[word.start() :]
+            for word in words[:4]
+        )
+    else:
+        subject_match = _RETAINED_DIRECT_SUBJECT_TAIL_RE.match(
+            body
+        )
+        tails = (
+            (str(subject_match.group("tail") or "").strip(),)
+            if subject_match is not None
+            else ()
+        )
+    modes = set()
+    for raw_tail in tails:
+        tail = re.sub(
+            r"^(?:(?:currently|eventually|maybe|perhaps|possibly|probably|"
+            r"really|still)\s+){0,2}",
+            "",
+            raw_tail,
+            count=1,
+            flags=re.I,
+        )
+        modes.update(
+            mode
+            for mode, pattern in _RETAINED_NONACTUAL_MODE_RES
+            if pattern.search(tail)
+        )
+    return frozenset(modes)
+
+
 def _ordinary_chat_queue_open_state(value: str) -> bool | None:
     """Read only the existing queue snapshot's stable open/closed field."""
 
@@ -7373,8 +7502,9 @@ def _ordinary_chat_claim_part_supported(
     *,
     inherited_subject_key: str | None = None,
 ) -> bool:
+    claim_all_terms = _ordinary_chat_authorized_support_terms(claim)
     claim_terms = (
-        _ordinary_chat_authorized_support_terms(claim)
+        claim_all_terms
         - _PROFILE_GENERIC_TERMS
         - _PROFILE_SUPPORT_GENERIC_TERMS
         - _CLAIM_GENERIC_TERMS
@@ -7389,6 +7519,7 @@ def _ordinary_chat_claim_part_supported(
     )
     if len(claim_material) < 2:
         return False
+    claim_relation_modes = _ordinary_chat_relation_mode_markers(claim)
     hard_tokens = _ordinary_chat_hard_evidence_tokens(claim)
     claim_queue_state = _ordinary_chat_queue_open_state(claim)
     queue_state_terms = {
@@ -7459,6 +7590,22 @@ def _ordinary_chat_claim_part_supported(
                 - _PROFILE_SUPPORT_GENERIC_TERMS
                 - _CLAIM_GENERIC_TERMS
             )
+            possessed_subject_terms = (
+                _ordinary_chat_possessive_subject_marker_terms(
+                    support_part
+                )
+            )
+            if possessed_subject_terms and not (
+                possessed_subject_terms.issubset(claim_all_terms)
+            ):
+                continue
+            support_relation_modes = (
+                _ordinary_chat_relation_mode_markers(support_part)
+            )
+            if not support_relation_modes.issubset(
+                claim_relation_modes
+            ):
+                continue
             if hard_tokens and not hard_tokens.issubset(
                 _ordinary_chat_hard_evidence_tokens(support_part)
             ):

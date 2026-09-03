@@ -2283,6 +2283,34 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             ("authorized_evidence_supported",),
         )
 
+    def test_retained_possessive_subject_cannot_be_dropped(self):
+        context_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    99,
+                    "Alice",
+                    "My brother founded BARCODE in 1999.",
+                ),
+            )
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "Alice's brother founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "Alice founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
     def test_bnl_authored_room_lines_are_not_factual_support(self):
         for label in (
             "BNL-01",
@@ -2565,6 +2593,70 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 "You designed modular synths but not cabinets and "
                 "Alice founded BARCODE in 1999."
             ),
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+    def test_retained_support_preserves_nonactual_modality(self):
+        for evidence, qualified_response in (
+            (
+                "I might build modular synth cabinets.",
+                "You might build modular synth cabinets.",
+            ),
+            (
+                "I plan to build modular synth cabinets.",
+                "You plan to build modular synth cabinets.",
+            ),
+        ):
+            with self.subTest(evidence=evidence):
+                context_basis = self._basis_with_retained_room_context(
+                    ((7, "Test Member", evidence),)
+                )
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        qualified_response,
+                    )
+                )
+                self.assertEqual(unsupported, 0)
+                self.assertEqual(
+                    classifications,
+                    ("authorized_evidence_supported",),
+                )
+
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        "You build modular synth cabinets.",
+                    )
+                )
+                self.assertEqual(unsupported, 1)
+                self.assertEqual(
+                    classifications,
+                    ("unsupported_packet_domain",),
+                )
+
+        possessive_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    "My brother might build modular synth cabinets.",
+                ),
+            )
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            possessive_basis,
+            "Your brother might build modular synth cabinets.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            possessive_basis,
+            "Your brother builds modular synth cabinets.",
         )
         self.assertEqual(unsupported, 1)
         self.assertEqual(classifications, ("unsupported_packet_domain",))
