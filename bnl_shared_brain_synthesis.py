@@ -549,6 +549,21 @@ _PACKET_CLAUSE_TAIL_BOUNDARY_RE = re.compile(
     r"whereas|yet)\b)\s+",
     re.I,
 )
+_RETAINED_REPORTED_FACT_RE = re.compile(
+    r"^(?:(?:i|me|we|us|you|he|she|they|<@!?\d+>)|"
+    r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3})(?:['’]s)?\s+"
+    r"(?:(?:have|has|had)\s+)?(?:claim(?:ed|s)?|hear(?:d|s)?|"
+    r"knew|know(?:s)?|learn(?:ed|s)?|mention(?:ed|s)?|"
+    r"notic(?:ed|es)|observ(?:ed|es)|recall(?:ed|s)?|"
+    r"remember(?:ed|s)?|report(?:ed|s)?|said|says?|saw|see(?:s)?|"
+    r"thought|think(?:s)?|wrote|writes?)\s+(?:that\s+)?"
+    r"(?P<fact>[\s\S]+)$",
+    re.I,
+)
+_RETAINED_POLARITY_CLAUSE_RE = re.compile(
+    r"\s+\b(?:and|but|while|whereas|yet)\b\s+",
+    re.I,
+)
 _AMBIGUOUS_PACKET_SUBJECT_RE = re.compile(
     r"^(?:(?:an?|the|this|that|these|those)\s+)?"
     r"(?:(?:archival|assistant|cached|confidential|conversation|current|"
@@ -6724,6 +6739,43 @@ def _ordinary_chat_current_queue_state_claim(value: str) -> bool:
     return True
 
 
+def _ordinary_chat_reported_fact(value: str) -> str:
+    """Return an explicitly subject-led fact embedded after a report verb."""
+
+    match = _RETAINED_REPORTED_FACT_RE.match(
+        _ordinary_chat_claim_core(value)
+    )
+    return (
+        str(match.group("fact") or "").strip()
+        if match is not None
+        else ""
+    )
+
+
+def _ordinary_chat_polarity_clause_units(value: str) -> tuple[str, ...]:
+    """Split coordinated factual predicates only when their polarity differs."""
+
+    core = _ordinary_chat_claim_core(value)
+    parts = tuple(
+        part.strip(" ,;:—–")
+        for part in _RETAINED_POLARITY_CLAUSE_RE.split(core)
+        if part.strip(" ,;:—–")
+    )
+    if len(parts) < 2 or len({_relation_polarity(part) for part in parts}) < 2:
+        return (value,)
+    for part in parts:
+        material = (
+            _ordinary_chat_authorized_support_terms(part)
+            - _PROFILE_GENERIC_TERMS
+            - _PROFILE_SUPPORT_GENERIC_TERMS
+            - _CLAIM_GENERIC_TERMS
+            - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+        )
+        if len(material) < 2 or not _concrete_relation_action_terms(part):
+            return (value,)
+    return parts
+
+
 def _ordinary_chat_bound_member_labels(
     basis: SharedBrainSynthesisBasis,
 ) -> dict[str, str]:
@@ -6762,21 +6814,43 @@ def _ordinary_chat_bound_member_labels(
     }
 
 
-def _ordinary_chat_retained_clause_subject_key(
+def _ordinary_chat_retained_clause_subject(
     value: str,
     *,
     speaker_subject_key: str,
     bound_member_labels: Mapping[str, str],
-) -> str:
-    """Resolve only the explicit subject at the start of one retained clause."""
+) -> tuple[str, bool]:
+    """Resolve one explicit subject, including an embedded reported fact."""
 
     core = _ordinary_chat_claim_core(value)
+    reported_fact = _ordinary_chat_reported_fact(core)
+    if reported_fact:
+        reported_subject_key, reported_subject_explicit = (
+            _ordinary_chat_retained_clause_subject(
+                reported_fact,
+                speaker_subject_key="",
+                bound_member_labels=bound_member_labels,
+            )
+        )
+        if reported_subject_explicit:
+            return reported_subject_key, True
+    mention = re.match(r"^<@!?(\d+)>(?:\W|$)", core)
+    if mention is not None:
+        return subject_key_for_user(int(mention.group(1) or 0)), True
     if re.match(
         r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
         core,
         re.I,
     ):
-        return str(speaker_subject_key or "")
+        return str(speaker_subject_key or ""), True
+    if re.match(
+        r"^(?:you|you're|you've|you'd|you'll|your|yours)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        # A room speaker's "you" is not that speaker. A requester-scoped
+        # durable section can still apply its existing default binding.
+        return "", False
     subject_keys = {
         subject_key
         for label, subject_key in bound_member_labels.items()
@@ -6786,7 +6860,27 @@ def _ordinary_chat_retained_clause_subject_key(
             re.I,
         )
     }
-    return next(iter(subject_keys)) if len(subject_keys) == 1 else ""
+    if subject_keys:
+        return (
+            next(iter(subject_keys)) if len(subject_keys) == 1 else "",
+            True,
+        )
+    if _PACKET_REFERENT_RE.match(core):
+        return "", True
+    proper_subject = re.match(
+        r"^(?P<subject>[A-Z][\w'’-]*"
+        r"(?:\s+[A-Z][\w'’-]*){0,3})(?:['’]s)?\s+"
+        r"(?!(?:and|at|by|for|from|in|near|of|on|or|to|with)\b)"
+        r"(?P<predicate>[a-z][\w'’-]*)\b",
+        core,
+    )
+    if proper_subject is not None and (
+        _ordinary_chat_external_token_is_finite_predicate(
+            str(proper_subject.group("predicate") or "")
+        )
+    ):
+        return "", True
+    return "", False
 
 
 def _ordinary_chat_retained_clause_starts_explicit_subject(
@@ -6797,22 +6891,12 @@ def _ordinary_chat_retained_clause_starts_explicit_subject(
 ) -> bool:
     """Recognize a new clause subject even when its identity is not bound."""
 
-    if _ordinary_chat_retained_clause_subject_key(
+    _subject_key, explicit = _ordinary_chat_retained_clause_subject(
         value,
         speaker_subject_key=speaker_subject_key,
         bound_member_labels=bound_member_labels,
-    ):
-        return True
-    core = _ordinary_chat_claim_core(value)
-    return bool(
-        _PACKET_REFERENT_RE.match(core)
-        or re.match(
-            r"^[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3}(?:['’]s)?\s+"
-            r"(?!(?:and|at|by|for|from|in|near|of|on|or|to|with)\b)"
-            r"[a-z][\w'’-]*\b",
-            core,
-        )
     )
+    return explicit
 
 
 def _ordinary_chat_retained_clause_units(
@@ -6853,13 +6937,16 @@ def _ordinary_chat_retained_clause_units(
             part = clause_value.strip(" ,;:—–")
             if not part:
                 continue
-            subject_key = _ordinary_chat_retained_clause_subject_key(
-                part,
-                speaker_subject_key=speaker_subject_key,
-                bound_member_labels=bound_member_labels,
+            subject_key, explicit_subject = (
+                _ordinary_chat_retained_clause_subject(
+                    part,
+                    speaker_subject_key=speaker_subject_key,
+                    bound_member_labels=bound_member_labels,
+                )
             )
-            subject_key = subject_key or str(default_subject_key or "")
-            if subject_key and speaker_label and re.match(
+            if not explicit_subject:
+                subject_key = str(default_subject_key or "")
+            if speaker_label and re.match(
                 r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
                 part,
                 re.I,
@@ -7074,6 +7161,16 @@ def _ordinary_chat_claim_support_subject_key(
     """Bind personal claims without inventing a new referent."""
 
     core = _ordinary_chat_claim_core(claim)
+    reported_fact = _ordinary_chat_reported_fact(core)
+    if reported_fact and _ordinary_chat_retained_clause_starts_explicit_subject(
+        reported_fact,
+        speaker_subject_key="",
+        bound_member_labels=_ordinary_chat_bound_member_labels(basis),
+    ):
+        return _ordinary_chat_claim_support_subject_key(
+            basis,
+            reported_fact,
+        )
     mention = re.match(r"^<@!?(\d+)>(?:\W|$)", core)
     if mention is not None:
         return subject_key_for_user(int(mention.group(1) or 0))
@@ -7211,13 +7308,20 @@ def _ordinary_chat_claim_support_parts(
             or _ordinary_chat_queue_open_state(tail) is not None
         ):
             starts.append(boundary.end())
-    if len(starts) == 1:
-        return (claim,)
-    starts.append(len(core))
+    subject_parts = (claim,)
+    if len(starts) > 1:
+        starts.append(len(core))
+        subject_parts = tuple(
+            core[start:end].strip(" ,;:—–")
+            for start, end in zip(starts, starts[1:])
+            if core[start:end].strip(" ,;:—–")
+        )
     return tuple(
-        core[start:end].strip(" ,;:—–")
-        for start, end in zip(starts, starts[1:])
-        if core[start:end].strip(" ,;:—–")
+        polarity_part
+        for subject_part in subject_parts
+        for polarity_part in _ordinary_chat_polarity_clause_units(
+            subject_part
+        )
     )
 
 
@@ -7267,6 +7371,7 @@ def _ordinary_chat_claim_part_supported(
         "take",
         "today",
         "track",
+        "welcome",
     }
     required_subject_key = (
         _ordinary_chat_claim_support_subject_key(basis, claim)
@@ -7277,7 +7382,7 @@ def _ordinary_chat_claim_part_supported(
         and claim_material.issubset(queue_state_terms)
     )
     current_queue_state_claim = bool(
-        direct_queue_state_claim
+        claim_queue_state is not None
         and _ordinary_chat_current_queue_state_claim(claim)
     )
     for support, support_subject_key, support_lane in support_segments:
@@ -7295,30 +7400,41 @@ def _ordinary_chat_claim_part_supported(
             )
         ):
             continue
-        support_terms = (
+        support_all_terms = (
             _ordinary_chat_authorized_support_terms(support)
             - _PROFILE_GENERIC_TERMS
             - _PROFILE_SUPPORT_GENERIC_TERMS
             - _CLAIM_GENERIC_TERMS
         )
-        if claim_names and not claim_names.issubset(support_terms):
+        if claim_names and not claim_names.issubset(support_all_terms):
             continue
-        if hard_tokens and not hard_tokens.issubset(
-            _ordinary_chat_hard_evidence_tokens(support)
-        ):
-            continue
-        support_queue_state = _ordinary_chat_queue_open_state(support)
-        if (
-            direct_queue_state_claim
-            and support_queue_state is not None
-        ):
-            if claim_queue_state == support_queue_state:
+        for support_part in _ordinary_chat_polarity_clause_units(support):
+            support_terms = (
+                _ordinary_chat_authorized_support_terms(support_part)
+                - _PROFILE_GENERIC_TERMS
+                - _PROFILE_SUPPORT_GENERIC_TERMS
+                - _CLAIM_GENERIC_TERMS
+            )
+            if hard_tokens and not hard_tokens.issubset(
+                _ordinary_chat_hard_evidence_tokens(support_part)
+            ):
+                continue
+            support_queue_state = _ordinary_chat_queue_open_state(
+                support_part
+            )
+            if (
+                direct_queue_state_claim
+                and support_queue_state is not None
+            ):
+                if claim_queue_state == support_queue_state:
+                    return True
+                continue
+            if _relation_polarity(claim) != _relation_polarity(
+                support_part
+            ):
+                continue
+            if claim_material.issubset(support_terms):
                 return True
-            continue
-        if _relation_polarity(claim) != _relation_polarity(support):
-            continue
-        if claim_material.issubset(support_terms):
-            return True
     return False
 
 
