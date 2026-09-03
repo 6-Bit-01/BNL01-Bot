@@ -6667,10 +6667,50 @@ def _ordinary_chat_queue_open_state(value: str) -> bool | None:
     return None
 
 
+def _ordinary_chat_bound_member_labels(
+    basis: SharedBrainSynthesisBasis,
+) -> dict[str, str]:
+    """Map unambiguous prompt labels to existing Discord subject keys."""
+
+    candidates = (
+        *(
+            (evidence.speaker_label, evidence.speaker_user_id)
+            for evidence in tuple(
+                basis.packet.request.conversation_evidence or ()
+            )
+            if not evidence.current_turn
+        ),
+        *(
+            (subject.label_hint, subject.user_id)
+            for subject in tuple(
+                basis.packet.request.frame_subjects or ()
+            )
+        ),
+    )
+    label_subject_keys: dict[str, set[str]] = {}
+    for raw_label, subject_user_id in candidates:
+        label = re.sub(
+            r"\s+",
+            " ",
+            str(raw_label or "").strip().casefold(),
+        )
+        if label and int(subject_user_id or 0) > 0:
+            label_subject_keys.setdefault(label, set()).add(
+                subject_key_for_user(int(subject_user_id or 0))
+            )
+    return {
+        label: next(iter(subject_keys))
+        for label, subject_keys in label_subject_keys.items()
+        if len(subject_keys) == 1
+    }
+
+
 def _ordinary_chat_authorized_support_segments(
     basis: SharedBrainSynthesisBasis,
-) -> tuple[str, ...]:
-    """Return only evidence rendered to the model plus retained prompt context."""
+) -> tuple[tuple[str, str], ...]:
+    """Return rendered evidence with its already-resolved member subject."""
+
+    bound_member_labels = _ordinary_chat_bound_member_labels(basis)
 
     rendered_refs = {
         (str(lane or ""), str(source_digest or ""))
@@ -6684,6 +6724,7 @@ def _ordinary_chat_authorized_support_segments(
                 str(getattr(item, "lane", "") or ""),
                 str(getattr(item, "source_digest", "") or ""),
                 str(getattr(item, "text", "") or ""),
+                str(getattr(item, "subject_key", "") or ""),
             )
             for item in tuple(getattr(basis.packet, "items", ()) or ())
             if (
@@ -6693,19 +6734,130 @@ def _ordinary_chat_authorized_support_segments(
             in rendered_refs
         )
     )
-    segments: list[str] = []
-    for lane, _source_digest, item_text in packet_items:
+    segments: list[tuple[str, str]] = []
+    for lane, _source_digest, item_text, subject_key in packet_items:
         label = _LANE_LABELS.get(lane, lane.replace("_", " "))
         if item_text.strip():
-            segments.append(f"{label}: {item_text}")
+            segments.append((f"{label}: {item_text}", subject_key))
     for context in basis.competing_factual_contexts:
-        for line in str(context or "").splitlines():
+        context_value = str(context or "")
+        context_kind = (
+            context_value.splitlines()[0].strip().casefold()
+            if context_value
+            else ""
+        )
+        room_context = context_kind.startswith("recent room context")
+        default_subject_key = (
+            subject_key_for_user(basis.user_id)
+            if context_kind.startswith("durable memory context")
+            and int(basis.user_id or 0) > 0
+            else ""
+        )
+        for line in context_value.splitlines():
             line = line.strip()
-            if not line or line.endswith(":"):
+            if (
+                not line
+                or line.endswith(":")
+                or (
+                    room_context
+                    and line.casefold().startswith(
+                        "active participants in recent room context"
+                    )
+                )
+            ):
                 continue
+            attributed = re.match(
+                r"^\s*(?:[-*•▪◦]+|\d+[.)])\s+"
+                r"(?P<label>[^:\n]{1,120}):\s*(?P<body>.+)$",
+                line,
+            )
+            subject_key = default_subject_key
+            if room_context and attributed is not None:
+                label = re.sub(
+                    r"\s+",
+                    " ",
+                    str(attributed.group("label") or "")
+                    .strip()
+                    .casefold(),
+                )
+                speaker_subject_key = bound_member_labels.get(label, "")
+                body = _ordinary_chat_claim_core(
+                    str(attributed.group("body") or "")
+                )
+                if re.match(
+                    r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
+                    body,
+                    re.I,
+                ):
+                    subject_key = speaker_subject_key
+                else:
+                    body_subject_keys = {
+                        candidate_subject_key
+                        for candidate, candidate_subject_key in (
+                            bound_member_labels.items()
+                        )
+                        if re.match(
+                            r"^%s(?:['’]s)?(?:\W|$)"
+                            % re.escape(candidate),
+                            body,
+                            re.I,
+                        )
+                    }
+                    if len(body_subject_keys) == 1:
+                        subject_key = next(iter(body_subject_keys))
             units = _candidate_claim_units(line)
-            segments.extend(units or (line,))
+            segments.extend(
+                (unit, subject_key) for unit in (units or (line,))
+            )
     return tuple(dict.fromkeys(segments))
+
+
+def _ordinary_chat_claim_support_subject_key(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+) -> str | None:
+    """Bind first-/second-person claims without inventing a new referent."""
+
+    core = _ordinary_chat_claim_core(claim)
+    mention = re.match(r"^<@!?(\d+)>(?:\W|$)", core)
+    if mention is not None:
+        return subject_key_for_user(int(mention.group(1) or 0))
+    if re.match(
+        r"^(?:you|you're|you've|you'd|you'll|your|yours)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        return (
+            subject_key_for_user(basis.user_id)
+            if int(basis.user_id or 0) > 0
+            else "response_subject_unresolved"
+        )
+    if re.match(
+        r"^(?:i|i'm|i've|i'd|i'll|me|my|mine|we|we're|we've|"
+        r"we'd|we'll|us|our|ours)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        return "bnl_response_speaker"
+    label_subject_keys = {
+        subject_key
+        for label, subject_key in _ordinary_chat_bound_member_labels(
+            basis
+        ).items()
+        if re.match(
+            r"^%s(?:['’]s)?(?:\W|$)" % re.escape(label),
+            core,
+            re.I,
+        )
+    }
+    if label_subject_keys:
+        return (
+            next(iter(label_subject_keys))
+            if len(label_subject_keys) == 1
+            else "response_subject_unresolved"
+        )
+
+    return None
 
 
 def _ordinary_chat_claim_support_parts(
@@ -6744,8 +6896,11 @@ def _ordinary_chat_claim_support_parts(
 
 
 def _ordinary_chat_claim_part_supported(
+    basis: SharedBrainSynthesisBasis,
     claim: str,
-    support_segments: Sequence[str],
+    support_segments: Sequence[tuple[str, str]],
+    *,
+    inherited_subject_key: str | None = None,
 ) -> bool:
     claim_terms = (
         _ordinary_chat_authorized_support_terms(claim)
@@ -6782,7 +6937,16 @@ def _ordinary_chat_claim_part_supported(
         "right",
         "today",
     }
-    for support in support_segments:
+    required_subject_key = (
+        _ordinary_chat_claim_support_subject_key(basis, claim)
+        or inherited_subject_key
+    )
+    for support, support_subject_key in support_segments:
+        if (
+            required_subject_key is not None
+            and str(support_subject_key or "") != required_subject_key
+        ):
+            continue
         support_terms = (
             _ordinary_chat_authorized_support_terms(support)
             - _PROFILE_GENERIC_TERMS
@@ -6815,7 +6979,7 @@ def _ordinary_chat_claim_supported_by_authorized_evidence(
     basis: SharedBrainSynthesisBasis,
     claim: str,
     *,
-    support_segments: Sequence[str],
+    support_segments: Sequence[tuple[str, str]],
     packet_context: bool,
     selected_labels: Sequence[str],
     global_labels: Sequence[str],
@@ -6829,8 +6993,17 @@ def _ordinary_chat_claim_supported_by_authorized_evidence(
         selected_labels=selected_labels,
         global_labels=global_labels,
     )
+    inherited_subject_key = _ordinary_chat_claim_support_subject_key(
+        basis,
+        claim,
+    )
     return bool(parts) and all(
-        _ordinary_chat_claim_part_supported(part, support_segments)
+        _ordinary_chat_claim_part_supported(
+            basis,
+            part,
+            support_segments,
+            inherited_subject_key=inherited_subject_key,
+        )
         for part in parts
     )
 

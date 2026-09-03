@@ -38914,6 +38914,7 @@ def build_user_aware_prompt(
         and operational_queue_packet_snapshot
     )
     if publication_queue_packet_ready:
+        show_state_prompt_block = ""
         website_read_model_prompt_block = ""
     broadcast_context_eligible = bool(
         broadcast_context

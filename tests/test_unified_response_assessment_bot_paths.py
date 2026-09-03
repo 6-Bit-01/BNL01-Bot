@@ -633,7 +633,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         )
         self.assertNotIn("WEBSITE QUEUE OWNER SENTINEL", prompt)
         self.assertIn("RECENT ROOM SENTINEL", prompt)
-        self.assertIn("SHOW STATE OWNER SENTINEL", prompt)
+        self.assertNotIn("SHOW STATE OWNER SENTINEL", prompt)
         self.assertIn("QUEUE OWNER SENTINEL", prompt)
         self.assertIn("SHOW OWNER SENTINEL", prompt)
         competing_contexts = (
@@ -653,7 +653,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 for context in competing_contexts
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             any(
                 "SHOW STATE OWNER SENTINEL" in context
                 for context in competing_contexts

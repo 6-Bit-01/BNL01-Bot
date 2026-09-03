@@ -1877,6 +1877,104 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 1)
         self.assertIn("unsupported_packet_domain", appended)
 
+    def test_retained_conversation_support_stays_bound_to_its_speaker(self):
+        retained_context = (
+            "Recent room context from this channel:\n"
+            "- Test Member: I design modular synth patches for live sets.\n"
+            "- Alice: I joined the room earlier.\n"
+            "- Test Member: Alice founded BARCODE in 1999.\n"
+            "Active participants in recent room context: Test Member, Alice"
+        )
+        packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                conversation_evidence=(
+                    PacketConversationEvidence(
+                        text=(
+                            "I design modular synth patches for live sets."
+                        ),
+                        source_id=910,
+                        speaker_user_id=7,
+                        speaker_label="Test Member",
+                    ),
+                    PacketConversationEvidence(
+                        text="I joined the room earlier.",
+                        source_id=911,
+                        speaker_user_id=99,
+                        speaker_label="Alice",
+                    ),
+                    PacketConversationEvidence(
+                        text="Alice founded BARCODE in 1999.",
+                        source_id=912,
+                        speaker_user_id=7,
+                        speaker_label="Test Member",
+                    ),
+                    PacketConversationEvidence(
+                        text=self.text,
+                        speaker_user_id=7,
+                        speaker_label="Test Member",
+                        current_turn=True,
+                    ),
+                ),
+            ),
+        )
+        context_basis = replace(
+            self.basis,
+            packet=packet,
+            competing_factual_contexts=(retained_context,),
+        )
+
+        grounded, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You design modular synth patches for live sets.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(grounded, ("authorized_evidence_supported",))
+
+        named, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "Alice founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(named, ("authorized_evidence_supported",))
+
+        for response in (
+            "You founded BARCODE in 1999.",
+            "I founded BARCODE in 1999.",
+            (
+                "You design modular synth patches for live sets and "
+                "founded BARCODE in 1999."
+            ),
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 1)
+                self.assertEqual(
+                    classifications,
+                    ("unsupported_packet_domain",),
+                )
+
+        explicit_subjects, unsupported = (
+            audit_ordinary_chat_candidate_claims(
+                context_basis,
+                (
+                    "You design modular synth patches for live sets and "
+                    "Alice founded BARCODE in 1999."
+                ),
+            )
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            explicit_subjects,
+            ("authorized_evidence_supported",),
+        )
+
     def test_external_public_knowledge_is_not_made_packet_authority(self):
         external_packet = replace(
             self.packet,

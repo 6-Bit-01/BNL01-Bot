@@ -63,9 +63,9 @@ owner, while ordinary chat remains a shared-brain composition.
 Specialized operational routes stay outside this cutover, except that a mixed
 publication/current-queue request may freeze the existing authorized read-only
 queue projection inside the same packet and revalidate it before selection.
-That frozen queue item replaces only the duplicate prompt rendering of the
-same site snapshot; retained conversation and memory sources keep their
-existing pre-send revalidation.
+That frozen queue item replaces the duplicate prompt rendering of the same
+site snapshot and its overlapping mutable show-state block; retained
+conversation and memory sources keep their existing pre-send revalidation.
 
 For frame-backed turns, a stable Discord account binding outranks typed canon
 aliases; exact approved aliases may identify canon-only subjects but display
