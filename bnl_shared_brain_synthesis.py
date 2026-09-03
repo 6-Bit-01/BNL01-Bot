@@ -5255,7 +5255,7 @@ def _relation_polarity(value: str) -> str:
         "negative"
         if re.search(
             r"\b(?:never|no|not|cannot|can't|don't|doesn't|didn't|"
-            r"won't|wouldn't|shouldn't)\b",
+            r"won't|wouldn't|shouldn't|[a-z]+n['’]t)\b",
             str(value or ""),
             re.I,
         )
@@ -6625,7 +6625,11 @@ def _ordinary_chat_authorized_support_terms(value: str) -> frozenset[str]:
         "write": "report",
     }
     return frozenset(
-        relation_aliases.get(term, term)
+        (
+            "not"
+            if re.fullmatch(r"[a-z]+n['’]t", term, re.I)
+            else relation_aliases.get(term, term)
+        )
         for raw_term in _normalized_relation_terms(value)
         for term in (raw_term.strip("'’"),)
         if term
@@ -6816,7 +6820,7 @@ def _ordinary_chat_claim_support_subject_key(
     basis: SharedBrainSynthesisBasis,
     claim: str,
 ) -> str | None:
-    """Bind first-/second-person claims without inventing a new referent."""
+    """Bind personal claims without inventing a new referent."""
 
     core = _ordinary_chat_claim_core(claim)
     mention = re.match(r"^<@!?(\d+)>(?:\W|$)", core)
@@ -6839,6 +6843,30 @@ def _ordinary_chat_claim_support_subject_key(
         re.I,
     ):
         return "bnl_response_speaker"
+    if re.match(
+        r"^(?:(?:he|she|they|him|his|her|hers|them|their|theirs)"
+        r"|(?:the|this|that)\s+(?:individual|member|person|requester|user))"
+        r"(?:\W|$)",
+        core,
+        re.I,
+    ):
+        frame_subject_keys = {
+            str(resolution.subject_key or resolution.entity_ref or "")
+            for resolution in packet_subject_resolutions(basis.packet)
+            if str(resolution.status or "").lower() == "resolved"
+            and str(
+                resolution.subject_key or resolution.entity_ref or ""
+            ).strip()
+        }
+        return (
+            next(iter(frame_subject_keys))
+            if (
+                str(basis.packet.request.frame_status or "").lower()
+                == "resolved"
+                and len(frame_subject_keys) == 1
+            )
+            else "response_subject_unresolved"
+        )
     label_subject_keys = {
         subject_key
         for label, subject_key in _ordinary_chat_bound_member_labels(
@@ -6858,6 +6886,48 @@ def _ordinary_chat_claim_support_subject_key(
         )
 
     return None
+
+
+def _ordinary_chat_hard_evidence_tokens(value: str) -> frozenset[str]:
+    """Return exact normalized URLs, addresses, dates, and numbers."""
+
+    return frozenset(
+        token.casefold().rstrip(".,;:!?")
+        for token in re.findall(
+            r"https?://[^\s)>\]]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
+            r"\b\d+(?:[./:-]\d+)*\b",
+            str(value or ""),
+            re.I,
+        )
+    )
+
+
+def _ordinary_chat_support_subject_matches(
+    basis: SharedBrainSynthesisBasis,
+    required_subject_key: str,
+    support_subject_key: str,
+) -> bool:
+    """Match equivalent keys from one existing resolved subject binding."""
+
+    required = str(required_subject_key or "")
+    support = str(support_subject_key or "")
+    if required == support:
+        return True
+    if not required or not support or required in {
+        "bnl_response_speaker",
+        "response_subject_unresolved",
+    }:
+        return False
+    for resolution in packet_subject_resolutions(basis.packet):
+        if str(resolution.status or "").lower() != "resolved":
+            continue
+        identities = {
+            str(resolution.subject_key or ""),
+            str(resolution.entity_ref or ""),
+        } - {""}
+        if required in identities and support in identities:
+            return True
+    return False
 
 
 def _ordinary_chat_claim_support_parts(
@@ -6914,15 +6984,7 @@ def _ordinary_chat_claim_part_supported(
     claim_material = claim_terms - claim_names
     if len(claim_material) < 2:
         return False
-    hard_tokens = frozenset(
-        token.casefold().rstrip(".,;:!?")
-        for token in re.findall(
-            r"https?://[^\s)>\]]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
-            r"\b\d+(?:[./:-]\d+)*\b",
-            claim,
-            re.I,
-        )
-    )
+    hard_tokens = _ordinary_chat_hard_evidence_tokens(claim)
     claim_queue_state = _ordinary_chat_queue_open_state(claim)
     queue_state_terms = {
         "clos",
@@ -6931,6 +6993,7 @@ def _ordinary_chat_claim_part_supported(
         "isn't",
         "isn’t",
         "live",
+        "not",
         "now",
         "open",
         "queue",
@@ -6944,7 +7007,11 @@ def _ordinary_chat_claim_part_supported(
     for support, support_subject_key in support_segments:
         if (
             required_subject_key is not None
-            and str(support_subject_key or "") != required_subject_key
+            and not _ordinary_chat_support_subject_matches(
+                basis,
+                required_subject_key,
+                support_subject_key,
+            )
         ):
             continue
         support_terms = (
@@ -6955,8 +7022,8 @@ def _ordinary_chat_claim_part_supported(
         )
         if claim_names and not claim_names.issubset(support_terms):
             continue
-        if hard_tokens and not all(
-            token in support.casefold() for token in hard_tokens
+        if hard_tokens and not hard_tokens.issubset(
+            _ordinary_chat_hard_evidence_tokens(support)
         ):
             continue
         support_queue_state = _ordinary_chat_queue_open_state(support)

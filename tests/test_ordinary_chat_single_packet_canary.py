@@ -534,6 +534,76 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         return replace(self.basis, packet=packet)
 
+    def _basis_with_retained_room_context(
+        self,
+        entries,
+        *,
+        frame_subject=None,
+    ):
+        evidence = tuple(
+            PacketConversationEvidence(
+                text=text,
+                source_id=910 + index,
+                speaker_user_id=user_id,
+                speaker_label=label,
+            )
+            for index, (user_id, label, text) in enumerate(entries)
+        )
+        request = replace(
+            self.packet.request,
+            conversation_evidence=(
+                *evidence,
+                PacketConversationEvidence(
+                    text=self.text,
+                    speaker_user_id=7,
+                    speaker_label="Test Member",
+                    current_turn=True,
+                ),
+            ),
+        )
+        packet_changes = {"request": request}
+        if frame_subject is not None:
+            subject_user_id, subject_label = frame_subject
+            packet_changes["request"] = replace(
+                request,
+                subject_user_id=subject_user_id,
+                subject_display_name=subject_label,
+                frame_status="resolved",
+                frame_subject_requirement="required",
+                frame_subjects=(
+                    PacketFrameSubject(
+                        user_id=subject_user_id,
+                        label_hint=subject_label,
+                        binding_method="stable_discord_account",
+                        confidence="authoritative",
+                    ),
+                ),
+            )
+            packet_changes["subject_resolution"] = PacketSubjectResolution(
+                status="resolved",
+                subject_user_id=subject_user_id,
+                subject_key=ledger.subject_key_for_user(subject_user_id),
+                binding_method="stable_discord_account",
+                confidence="authoritative",
+                candidate_count=1,
+            )
+            packet_changes["subject_resolutions"] = ()
+        packet = replace(self.packet, **packet_changes)
+        labels = tuple(dict.fromkeys(label for _, label, _ in entries))
+        retained_context = "\n".join(
+            (
+                "Recent room context from this channel:",
+                *(f"- {label}: {text}" for _, label, text in entries),
+                "Active participants in recent room context: "
+                + ", ".join(labels),
+            )
+        )
+        return replace(
+            self.basis,
+            packet=packet,
+            competing_factual_contexts=(retained_context,),
+        )
+
     def test_configuration_is_default_off_private_scope_and_conflict_closed(self):
         disabled = ordinary_chat_configuration(
             {
@@ -1974,6 +2044,120 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             explicit_subjects,
             ("authorized_evidence_supported",),
         )
+
+    def test_third_person_support_uses_the_resolved_frame_subject(self):
+        context_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    99,
+                    "Alice",
+                    "I design modular synth patches for live sets.",
+                ),
+                (
+                    100,
+                    "Bob",
+                    "I photograph analog synth rigs for live sets.",
+                ),
+            ),
+            frame_subject=(100, "Bob"),
+        )
+
+        for response in (
+            "He photographs analog synth rigs for live sets.",
+            "That member photographs analog synth rigs for live sets.",
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        context_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 0)
+                self.assertEqual(
+                    classifications,
+                    ("authorized_evidence_supported",),
+                )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "He designs modular synth patches for live sets.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+        unresolved_basis = replace(
+            context_basis,
+            packet=replace(
+                context_basis.packet,
+                subject_resolution=PacketSubjectResolution(
+                    status="ambiguous",
+                ),
+                subject_resolutions=(),
+            ),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            unresolved_basis,
+            "He photographs analog synth rigs for live sets.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+    def test_retained_support_compares_hard_tokens_exactly(self):
+        context_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    "I played modular synths in 199 shows.",
+                ),
+            )
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You played modular synths in 199 shows.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You played modular synths in 99 shows.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+    def test_retained_support_recognizes_contracted_negation(self):
+        context_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    "I wasn't a founding BARCODE artist.",
+                ),
+            )
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You weren't a founding BARCODE artist.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "You were a founding BARCODE artist.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
 
     def test_external_public_knowledge_is_not_made_packet_authority(self):
         external_packet = replace(
