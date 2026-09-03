@@ -549,6 +549,17 @@ _PACKET_CLAUSE_TAIL_BOUNDARY_RE = re.compile(
     r"whereas|yet)\b)\s+",
     re.I,
 )
+_RETAINED_TOLD_FACT_RE = re.compile(
+    r"^(?:(?:i|me|we|us|you|he|she|they|<@!?\d+>)|"
+    r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3})(?:['’]s)?\s+"
+    r"(?:(?:have|has|had)\s+)?(?:tell(?:s)?|told)\s+"
+    r"(?:(?:anybody|anyone|everybody|everyone|her|him|me|somebody|"
+    r"someone|them|us|you|the\s+(?:channel|group|room|team))\s+"
+    r"(?:that\s+)?|(?:<@!?\d+>|[A-Z][\w'’-]*"
+    r"(?:\s+[A-Z][\w'’-]*){0,3})\s+that\s+)"
+    r"(?P<fact>[\s\S]+)$",
+    re.I,
+)
 _RETAINED_REPORTED_FACT_RE = re.compile(
     r"^(?:(?:i|me|we|us|you|he|she|they|<@!?\d+>)|"
     r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3})(?:['’]s)?\s+"
@@ -6700,6 +6711,7 @@ def _ordinary_chat_queue_open_state(value: str) -> bool | None:
         return True
     if re.search(
         r"\bqueue\b[^.?!\n]{0,80}\b(?:closed|"
+        r"no(?:\s+\w+){0,2}\s+open|"
         r"not(?:\s+\w+){0,2}\s+open|"
         r"(?:is|are|was|were)n['’]?t(?:\s+\w+){0,2}\s+open)\b",
         text,
@@ -6743,18 +6755,23 @@ def _ordinary_chat_current_queue_state_claim(value: str) -> bool:
 def _ordinary_chat_reported_fact(value: str) -> str:
     """Return an explicitly subject-led fact embedded after a report verb."""
 
-    match = _RETAINED_REPORTED_FACT_RE.match(
-        _ordinary_chat_claim_core(value)
-    )
-    return (
-        str(match.group("fact") or "").strip()
-        if match is not None
-        else ""
-    )
+    core = _ordinary_chat_claim_core(value)
+    for pattern in (
+        _RETAINED_TOLD_FACT_RE,
+        _RETAINED_REPORTED_FACT_RE,
+    ):
+        match = pattern.match(core)
+        if match is not None:
+            return str(match.group("fact") or "").strip()
+    return ""
 
 
-def _ordinary_chat_polarity_clause_units(value: str) -> tuple[str, ...]:
-    """Split coordinated factual predicates only when their polarity differs."""
+def _ordinary_chat_polarity_clause_units(
+    value: str,
+    *,
+    retained_support: bool = False,
+) -> tuple[str, ...]:
+    """Split mixed polarity only into independently factual predicates."""
 
     core = _ordinary_chat_claim_core(value)
     parts = tuple(
@@ -6764,6 +6781,7 @@ def _ordinary_chat_polarity_clause_units(value: str) -> tuple[str, ...]:
     )
     if len(parts) < 2 or len({_relation_polarity(part) for part in parts}) < 2:
         return (value,)
+    safe_parts = []
     for part in parts:
         material = (
             _ordinary_chat_authorized_support_terms(part)
@@ -6772,9 +6790,14 @@ def _ordinary_chat_polarity_clause_units(value: str) -> tuple[str, ...]:
             - _CLAIM_GENERIC_TERMS
             - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
         )
-        if len(material) < 2 or not _concrete_relation_action_terms(part):
-            return (value,)
-    return parts
+        if len(material) >= 2 and _concrete_relation_action_terms(part):
+            safe_parts.append(part)
+    if len(safe_parts) == len(parts):
+        return parts
+    # Retained evidence may still support its independently explicit clause.
+    # A candidate with an unresolved elliptical clause cannot silently drop
+    # that clause and pass as though it were never asserted.
+    return tuple(safe_parts) if retained_support else ()
 
 
 def _ordinary_chat_bound_member_labels(
@@ -7266,7 +7289,7 @@ def _ordinary_chat_hard_evidence_tokens(value: str) -> frozenset[str]:
         token.casefold().rstrip(".,;:!?")
         for token in re.findall(
             r"https?://[^\s)>\]]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
-            r"(?<!\w)[+-]?\d+(?:[./:-]\d+)*\b",
+            r"(?<![\w.])[+-]?(?:\d+(?:[./:-]\d+)*|\.\d+)\b",
             str(value or ""),
             re.I,
         )
@@ -7334,13 +7357,13 @@ def _ordinary_chat_claim_support_parts(
             for start, end in zip(starts, starts[1:])
             if core[start:end].strip(" ,;:—–")
         )
-    return tuple(
-        polarity_part
-        for subject_part in subject_parts
-        for polarity_part in _ordinary_chat_polarity_clause_units(
-            subject_part
-        )
-    )
+    polarity_parts = []
+    for subject_part in subject_parts:
+        units = _ordinary_chat_polarity_clause_units(subject_part)
+        if not units:
+            return ()
+        polarity_parts.extend(units)
+    return tuple(polarity_parts)
 
 
 def _ordinary_chat_claim_part_supported(
@@ -7426,7 +7449,10 @@ def _ordinary_chat_claim_part_supported(
         )
         if claim_names and not claim_names.issubset(support_all_terms):
             continue
-        for support_part in _ordinary_chat_polarity_clause_units(support):
+        for support_part in _ordinary_chat_polarity_clause_units(
+            support,
+            retained_support=True,
+        ):
             support_terms = (
                 _ordinary_chat_authorized_support_terms(support_part)
                 - _PROFILE_GENERIC_TERMS

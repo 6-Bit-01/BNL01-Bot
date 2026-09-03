@@ -2027,6 +2027,16 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 1)
         self.assertEqual(classifications, ("unsupported_packet_domain",))
 
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            context_basis,
+            "The queue has no open submissions right now.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
         live_open_basis = replace(
             context_basis,
             packet=replace(
@@ -2052,6 +2062,13 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             classifications,
             ("authorized_evidence_supported",),
         )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            live_open_basis,
+            "The queue has no open submissions right now.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
 
         classifications, unsupported = audit_ordinary_chat_candidate_claims(
             live_open_basis,
@@ -2421,6 +2438,31 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 1)
         self.assertEqual(classifications, ("unsupported_packet_domain",))
 
+        told_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    99,
+                    "Alice",
+                    "I told everyone Bob founded BARCODE in 1999.",
+                ),
+            )
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            told_basis,
+            "Bob founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            told_basis,
+            "Alice founded BARCODE in 1999.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
     def test_retained_reported_fact_uses_its_embedded_subject(self):
         context_basis = self._basis_with_retained_room_context(
             (
@@ -2487,6 +2529,46 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 1)
         self.assertEqual(classifications, ("unsupported_packet_domain",))
 
+        elliptical_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    "I designed modular synths but not cabinets.",
+                ),
+                (
+                    99,
+                    "Alice",
+                    "I founded BARCODE in 1999.",
+                ),
+            )
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            elliptical_basis,
+            "You designed modular synths.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            elliptical_basis,
+            "You did not design modular synths.",
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            elliptical_basis,
+            (
+                "You designed modular synths but not cabinets and "
+                "Alice founded BARCODE in 1999."
+            ),
+        )
+        self.assertEqual(unsupported, 1)
+        self.assertEqual(classifications, ("unsupported_packet_domain",))
+
     def test_retained_support_compares_hard_tokens_exactly(self):
         context_basis = self._basis_with_retained_room_context(
             (
@@ -2541,6 +2623,42 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 classifications, unsupported = (
                     audit_ordinary_chat_candidate_claims(
                         signed_basis,
+                        response,
+                    )
+                )
+                self.assertEqual(unsupported, 1)
+                self.assertEqual(
+                    classifications,
+                    ("unsupported_packet_domain",),
+                )
+
+        leading_decimal_basis = self._basis_with_retained_room_context(
+            (
+                (
+                    7,
+                    "Test Member",
+                    "I calibrated the modular synth output to .5 decibels.",
+                ),
+            )
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            leading_decimal_basis,
+            "You calibrated the modular synth output to .5 decibels.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+        for response in (
+            "You calibrated the modular synth output to 5 decibels.",
+            "You calibrated the modular synth output to -.5 decibels.",
+            "You calibrated the modular synth output to +.5 decibels.",
+        ):
+            with self.subTest(response=response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        leading_decimal_basis,
                         response,
                     )
                 )
