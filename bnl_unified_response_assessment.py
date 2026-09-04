@@ -543,7 +543,7 @@ _SITUATION_NEGATED_NEW_EVENT_RE = re.compile(
     r"aren(?:'|’)t|weren(?:'|’)t)\s+"
     r"(?:(?:a|an|the)\s+)?|"
     r"(?:(?:do|should)(?:n['’]t|\s+not)|"
-    r"let(?:['’]s|\s+us)\s+not)\s+"
+    r"let(?:['’]s|\s+us)\s+not|never)\s+"
     r"(?:(?:start|begin|open|create)\s+|"
     r"(?:treat|regard|count|consider|call)\s+"
     r"(?:this|that|it)\s+as\s+)(?:(?:a|an|the)\s+)?)"
@@ -554,7 +554,12 @@ _SITUATION_NEGATED_NEW_EVENT_RE = re.compile(
 _SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE = re.compile(
     r"^\s*(?:(?:can|could|would|will|should)\s+(?:you|we)\s+"
     r"(?:please\s+)?|please\s+)?"
-    r"(?:start|begin|open|create)\b",
+    r"(?:(?:start|begin|open|create)\b|"
+    r"(?:(?:treat|regard|count|call)\s+"
+    r"(?:this|that|it)\s+as\b|"
+    r"consider\s+(?:this|that|it)\s+(?:as\s+)?"
+    r"(?=(?:(?:a|an|the)\s+)?"
+    r"(?:new|different|separate|another)\b)))",
     re.I,
 )
 _SITUATION_NEW_EVENT_UNCERTAINTY_RE = re.compile(

@@ -768,6 +768,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             "Do not treat this as a separate task.",
             "We should not start a new task; continue this incident.",
             "Let's not start a new task.",
+            "Never start a new task; continue this incident.",
         ):
             with self.subTest(current_turn_text=current_turn_text):
                 self.assertIsNotNone(
@@ -802,6 +803,8 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             "Okay, can you start another task?",
             "Before we continue, can you start a new task?",
             "This is a separate task: what should we do next?",
+            "Can we treat this as a new task?",
+            "Could you consider this a separate task?",
         ):
             with self.subTest(current_turn_text=current_turn_text):
                 self.assertIsNone(

@@ -520,6 +520,10 @@ class SituationFrameV1Tests(unittest.TestCase):
                 "same_event",
             ),
             (
+                "Never start a new task; continue this incident.",
+                "resume",
+            ),
+            (
                 "Is this a separate task, or should we continue?",
                 "resume",
             ),
@@ -565,6 +569,14 @@ class SituationFrameV1Tests(unittest.TestCase):
             ),
             (
                 "Before we continue, can you start a new task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Can we treat this as a new task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Could you consider this a separate task?",
                 "new_event_same_participant",
             ),
             (
