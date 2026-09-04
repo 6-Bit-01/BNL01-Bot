@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -360,6 +361,175 @@ class ExactDiscordReplyPacketRegressionTests(unittest.TestCase):
                 serialized_receipts = repr(receipt_rows).casefold()
                 self.assertNotIn("cobalt", serialized_receipts)
                 self.assertNotIn("amber", serialized_receipts)
+
+    def test_no_store_operational_reply_is_turn_local_exact_referent(self):
+        reply_text = (
+            "The Journal described the August 8 queue trial. "
+            "The queue is closed, and the August 28 session is archived."
+        )
+        result_out = {}
+        with sqlite3.connect(self.db_path) as conn:
+            rows_before = conn.execute(
+                "SELECT COUNT(*) FROM conversations"
+            ).fetchone()[0]
+
+        rendered_context = bnl01_bot.build_conversation_context_v2_for_prompt(
+            guild_id=1,
+            current_user_id=7,
+            channel_id=10,
+            channel_name="bnl-testing",
+            channel_policy="sealed_test",
+            route_mode="normal_chat",
+            conversation_surface="mention_or_reply",
+            current_texts=(
+                "What part came from the Journal, and what part is the "
+                "current status?",
+            ),
+            current_participants={7},
+            is_direct_target=True,
+            is_reply_to_bnl=True,
+            referenced_message_ids={9001},
+            transient_reply_sources=(
+                bnl01_bot.TransientDiscordReplySource(
+                    message_id=9001,
+                    content=reply_text,
+                    channel_id=10,
+                ),
+            ),
+            now=self.now,
+            route_allowed_sources={"conversation_continuity"},
+            result_out=result_out,
+        )
+        context_result = result_out["result"]
+
+        self.assertEqual(context_result.referent_status, "resolved")
+        self.assertEqual(context_result.selected_row_ids, ())
+        self.assertEqual(
+            context_result.transient_referent_message_ids,
+            (9001,),
+        )
+        self.assertIn(reply_text, rendered_context)
+
+        basis = bnl01_bot.build_conversation_prompt_source_basis(
+            rendered_context,
+            guild_id=1,
+            current_user_id=7,
+            channel_id=10,
+            channel_name="bnl-testing",
+            channel_policy="sealed_test",
+            context_result=context_result,
+        )
+        self.assertIsNotNone(basis)
+        self.assertEqual(basis.source_row_ids, ())
+        self.assertEqual(
+            basis.revalidation_row_ids,
+            tuple(
+                sorted(
+                    set(context_result.referent_selected_row_ids)
+                    | set(context_result.referent_competing_row_ids)
+                )
+            ),
+        )
+        self.assertNotIn(9001, basis.revalidation_row_ids)
+        self.assertEqual(basis.transient_referent_message_ids, (9001,))
+        self.assertEqual(
+            tuple(item.text for item in basis.referent_source_evidence_items),
+            (reply_text,),
+        )
+        refreshed, changed = bnl01_bot.refresh_prompt_source_basis(basis)
+        self.assertFalse(changed)
+        self.assertEqual(refreshed.expected_digest, basis.expected_digest)
+        self.assertTrue(
+            bnl01_bot.turn_local_discord_reply_requires_no_store((basis,))
+        )
+        self.assertFalse(
+            bnl01_bot.model_response_persistence_allowed_with_website_context(
+                "What part was the current status?",
+                "sealed_test",
+                "",
+                prompt_source_bases=(basis,),
+            )
+        )
+
+        delivered = "The first sentence was the Journal summary; the second was the status portion."
+        message = SimpleNamespace(
+            content="What part was the current status?",
+            author=SimpleNamespace(id=7, display_name="Test Member A"),
+            guild=SimpleNamespace(id=1),
+            channel=SimpleNamespace(id=10, name="bnl-testing"),
+            reply=mock.AsyncMock(return_value=SimpleNamespace(id=9002)),
+        )
+        plan = bnl01_bot.plan_conversation_response(
+            message.content,
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            real_direct_target=True,
+            batching_enabled=True,
+            conversation_surface="mention_or_reply",
+        )
+        save_model = mock.Mock()
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "_apply_direct_response_pacing",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=mock.AsyncMock(return_value=None),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=mock.AsyncMock(
+                    return_value=(delivered, {"suppressed": False})
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_message_media_context",
+                return_value={"present": False},
+            ),
+            mock.patch.object(bnl01_bot, "update_last_route_debug"),
+            mock.patch.object(
+                bnl01_bot,
+                "save_model_message",
+                new=save_model,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "persist_bnl_self_name_decision_after_send_async",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            decision = asyncio.run(
+                bnl01_bot.send_planned_conversation_response(
+                    message,
+                    delivered,
+                    plan,
+                    prompt=rendered_context,
+                    source_context_available=True,
+                    prompt_source_bases=(basis,),
+                    mark_recent_direct=False,
+                )
+            )
+
+        message.reply.assert_awaited_once()
+        save_model.assert_not_called()
+        self.assertFalse(decision.save_conversation)
+
+        with sqlite3.connect(self.db_path) as conn:
+            rows_after = conn.execute(
+                "SELECT COUNT(*) FROM conversations"
+            ).fetchone()[0]
+        self.assertEqual(rows_after, rows_before)
 
     def test_exact_name_echo_delivery_becomes_pronoun_reply_source(self):
         seed = (

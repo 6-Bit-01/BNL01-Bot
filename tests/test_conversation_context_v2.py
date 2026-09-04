@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
+    TransientDiscordReplySource,
     assess_payload_grounding,
     assemble_conversation_context_v2,
     classify_thread_focus,
@@ -1472,6 +1473,50 @@ class ConversationContextV2QueueBoundaryExpandedTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assert_model_excluded(text)
+
+    def test_unsaved_exact_bnl_reply_is_transient_referent_only(self):
+        reply_text = (
+            "The Journal described the August 8 queue trial. "
+            "The queue is closed, and the August 28 session is archived."
+        )
+        res = assemble_conversation_context_v2(
+            [
+                row(900, "user", "queue status?", mid=8100),
+                row(
+                    901,
+                    "model",
+                    "The queue is open.",
+                    mid=8101,
+                ),
+            ],
+            req(
+                current_texts=(
+                    "What part came from the Journal, and what part is the "
+                    "current status?",
+                ),
+                referenced_message_ids=frozenset({9001}),
+                transient_reply_sources=(
+                    TransientDiscordReplySource(
+                        message_id=9001,
+                        content=reply_text,
+                        channel_id=10,
+                    ),
+                ),
+                is_reply_to_bnl=True,
+            ),
+        )
+
+        self.assertEqual(res.referent_status, "resolved")
+        self.assertEqual(res.referent_reason, "discord_reply_source")
+        self.assertEqual(res.thread_focus_mode, "exact_discord_reply")
+        self.assertEqual(res.selected_row_ids, ())
+        self.assertEqual(res.referent_selected_row_ids, ())
+        self.assertEqual(res.transient_referent_message_ids, (9001,))
+        self.assertEqual(res.transient_referent_texts, (reply_text,))
+        self.assertIn("exact Discord reply source", res.rendered_context)
+        self.assertIn("The queue is closed", res.rendered_context)
+        self.assertNotIn("The queue is open", res.rendered_context)
+        self.assertIn("not canon/current-state evidence", res.rendered_context)
 
     def test_ordinary_queue_discussion_is_allowed(self):
         for text in (
