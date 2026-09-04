@@ -3005,7 +3005,7 @@ def _episode_text_explicit_new_event(value: str) -> bool:
             for boundary in ".!?;\n"
         ) + 1
         clause_tail = unnegated[match.end() :]
-        clause_boundary = re.search(r"[.!?;\n]", clause_tail)
+        clause_boundary = re.search(r"[:.!?;\n]", clause_tail)
         clause_end = (
             match.end() + clause_boundary.end()
             if clause_boundary is not None
@@ -4287,10 +4287,7 @@ def active_episode_for_assessment(
         current_turn_text is not None
         and (
             _EPISODE_RESUME_RE.search(boundary_text or "")
-            or (
-                _EPISODE_EXPLICIT_NEW_EVENT_RE.search(boundary_text or "")
-                and not explicit_new_event
-            )
+            or _EPISODE_NEGATED_NEW_EVENT_RE.search(boundary_text or "")
         )
     )
     expected_id = str(expected_episode_id or "").strip()

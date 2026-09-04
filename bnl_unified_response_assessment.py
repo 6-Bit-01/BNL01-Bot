@@ -1020,7 +1020,7 @@ def _situation_explicit_new_event(text: str) -> bool:
             for boundary in ".!?;\n"
         ) + 1
         clause_tail = unnegated[match.end() :]
-        clause_boundary = re.search(r"[.!?;\n]", clause_tail)
+        clause_boundary = re.search(r"[:.!?;\n]", clause_tail)
         clause_end = (
             match.end() + clause_boundary.end()
             if clause_boundary is not None

@@ -744,6 +744,26 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             "Does this count as a separate task?",
             "Is the decoder work a separate task?",
             "This is a separate task, right?",
+        ):
+            with self.subTest(current_turn_text=current_turn_text):
+                self.assertIsNotNone(
+                    moments.active_episode_for_assessment(
+                        self.conn,
+                        guild_id=1,
+                        channel_id=10,
+                        channel_policy="sealed_test",
+                        route_mode="normal_chat",
+                        topic_text=(
+                            "The synth routing and decoder remain active.\n"
+                            + current_turn_text
+                        ),
+                        current_turn_text=current_turn_text,
+                        participant_keys=("discord_user:1",),
+                        now=self.timestamp(minutes=4),
+                    )
+                )
+
+        for current_turn_text in (
             "Don't start a new task; continue this incident.",
             "Do not treat this as a separate task.",
             "We should not start a new task; continue this incident.",
@@ -781,6 +801,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
         for current_turn_text in (
             "Okay, can you start another task?",
             "Before we continue, can you start a new task?",
+            "This is a separate task: what should we do next?",
         ):
             with self.subTest(current_turn_text=current_turn_text):
                 self.assertIsNone(
@@ -796,6 +817,23 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
                         now=self.timestamp(minutes=4),
                     )
                 )
+
+        unrelated_uncertain = (
+            "Maybe the pizza launch is a separate task"
+        )
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=unrelated_uncertain,
+                current_turn_text=unrelated_uncertain,
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            )
+        )
 
         self.assertIsNone(
             moments.active_episode_for_assessment(

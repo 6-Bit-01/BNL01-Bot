@@ -576,6 +576,10 @@ class SituationFrameV1Tests(unittest.TestCase):
                 "new_event_same_participant",
             ),
             (
+                "This is a separate task: what should we do next?",
+                "new_event_same_participant",
+            ),
+            (
                 "Meanwhile, keep the synth retest running in parallel.",
                 "concurrent_activity",
             ),
