@@ -6576,6 +6576,13 @@ def _ordinary_chat_packet_domain_context_active(
     packet = basis.packet
     request = packet.request
     request_text = str(request.user_text or "")
+    request_subject_text = re.sub(
+        r"^\s*(?:<@!?\d+>|@BNL-01)\s*[,;:!?—–-]*\s*",
+        "",
+        request_text,
+        count=1,
+        flags=re.I,
+    )
     frame_tasks = tuple(request.frame_tasks or ())
     typed_external_request = bool(
         str(request.frame_revision or "").strip()
@@ -6590,6 +6597,11 @@ def _ordinary_chat_packet_domain_context_active(
             for task in frame_tasks
         )
         and not str(request.frame_event_ref or "").strip()
+        and not _ordinary_chat_claim_has_project_brand(request_subject_text)
+        and not _ordinary_chat_claim_has_scoped_title(
+            basis,
+            request_subject_text,
+        )
     )
     if typed_external_request:
         return False

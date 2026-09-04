@@ -3017,6 +3017,30 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     classifications,
                 )
 
+        barcode_request_packet = replace(
+            external_packet,
+            request=replace(
+                external_packet.request,
+                user_text="@BNL-01 When was BARCODE founded?",
+            ),
+        )
+        for unsupported_response in (
+            "It was founded in 1999.",
+            "The project was founded in 1999.",
+        ):
+            with self.subTest(unsupported_response=unsupported_response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        replace(self.basis, packet=barcode_request_packet),
+                        unsupported_response,
+                    )
+                )
+                self.assertGreaterEqual(unsupported, 1)
+                self.assertIn(
+                    "unsupported_packet_domain",
+                    classifications,
+                )
+
         current_request_packet = replace(
             external_packet,
             request=replace(
