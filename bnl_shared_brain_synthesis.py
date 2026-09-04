@@ -3103,8 +3103,12 @@ def render_packet_context(
         else "- Lead with the directly applicable approved identity "
         "relationship. Do not claim or imply a Discord activity history.\n"
         if identity_canon_only
-        else "- Lead with the requested show finding from the finalized show "
-        "evidence. Do not lead with data availability, routing, or lore.\n"
+        else "- When the current request specifically asks for a show finding, "
+        "lead with that finding from the finalized show evidence. For a member "
+        "profile or personal-recall question, treat the member's attributed "
+        "show evidence as one supporting part of the profile rather than the "
+        "answer's organizing frame. Do not lead with data availability, "
+        "routing, or lore.\n"
         if show_episode_present
         else "- Lead with member-specific substance. Relevant BARCODE canon "
         "may add one concise context anchor afterward, but can never "
