@@ -28162,16 +28162,28 @@ def record_unified_response_assessment_shadow(
     response_sent: bool = True,
 ) -> str:
     """Persist one content-free receipt; never affect response delivery."""
+    diagnostics = guard_diagnostics or {}
     for basis in tuple(
-        (guard_diagnostics or {}).get(
-            "_revalidated_prompt_source_bases"
-        )
+        diagnostics.get("_revalidated_prompt_source_bases")
         or ()
     ):
         if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
             assessment = basis.assessment
             break
-    frame_revalidation = (guard_diagnostics or {}).get(
+    if (
+        assessment is not None
+        and diagnostics.get("source_neutral_recovery")
+    ):
+        assessment = with_prompt_lane_presence(
+            replace(
+                assessment,
+                active_episode_id="",
+                active_episode_source_moment_ids=(),
+            ),
+            "active_episode",
+            present=False,
+        )
+    frame_revalidation = diagnostics.get(
         "_situation_frame_revalidation"
     )
     if (
@@ -28301,6 +28313,7 @@ def _render_unified_moment_canary_context(
     ):
         return "", False, assessment
     episode_context = ""
+    episode_reference: ActiveEpisodeReference | None = None
     if (
         DB_FILE != ":memory:"
         and os.path.exists(DB_FILE)
@@ -28312,6 +28325,7 @@ def _render_unified_moment_canary_context(
             if int(user_id or 0) > 0
         )
         try:
+            reference_out: dict[str, ActiveEpisodeReference] = {}
             with sqlite3.connect(
                 "file:%s?mode=ro" % DB_FILE,
                 uri=True,
@@ -28325,11 +28339,28 @@ def _render_unified_moment_canary_context(
                     route_mode=str(route_mode or "unknown"),
                     topic_text=str(topic_text or "")[:8000],
                     participant_keys=participant_keys,
+                    expected_episode_id=assessment.active_episode_id,
+                    reference_out=reference_out,
                 )
+            episode_reference = reference_out.get("reference")
         except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
             episode_context = ""
-    reconciled_assessment = with_prompt_lane_presence(
+            episode_reference = None
+    reconciled_assessment = replace(
         assessment,
+        active_episode_id=(
+            episode_reference.episode_id
+            if episode_context and episode_reference is not None
+            else ""
+        ),
+        active_episode_source_moment_ids=(
+            episode_reference.source_moment_ids
+            if episode_context and episode_reference is not None
+            else ()
+        ),
+    )
+    reconciled_assessment = with_prompt_lane_presence(
+        reconciled_assessment,
         "active_episode",
         present=bool(episode_context),
     )
@@ -28965,6 +28996,10 @@ def refresh_prompt_source_basis(
             fresh.expected_digest != basis.expected_digest
             or fresh.episode_context_present
             != basis.episode_context_present
+            or fresh.assessment.active_episode_id
+            != basis.assessment.active_episode_id
+            or fresh.assessment.active_episode_source_moment_ids
+            != basis.assessment.active_episode_source_moment_ids
         )
     if isinstance(basis, MemoryPromptSourceBasis):
         source_metadata: dict = {}

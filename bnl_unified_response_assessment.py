@@ -287,10 +287,13 @@ _SITUATION_PHASE_PATTERNS = (
     (
         "diagnosis",
         re.compile(
-            r"\b(?:isolat(?:e|ed|ing|ion)|"
+            r"(?:\b(?:isolat(?:e|ed|ing|ion)|"
             r"locali[sz](?:e|ed|ing|ation)|"
-            r"narrow(?:ed|ing)?|trac(?:e|ed|ing))\b"
-            r".{0,48}\b(?:to|at)\b",
+            r"trac(?:e|ed|ing))\b"
+            r".{0,48}\b(?:to|at)\b|"
+            r"\bnarrow(?:ed|ing)\b[^.!?\n]{0,48}"
+            r"\b(?:failure|issue|problem|defect|bug|fault|error|"
+            r"crash|regression)\b[^.!?\n]{0,24}\b(?:to|at)\b)",
             re.I,
         ),
     ),
@@ -536,6 +539,22 @@ _SITUATION_NEGATED_NEW_EVENT_RE = re.compile(
     r"weren(?:'|’)t)\s+(?:(?:a|an|the)\s+)?"
     r"(?:new|different|separate|another)\s+"
     r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
+    re.I,
+)
+_SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE = re.compile(
+    r"^\s*(?:(?:can|could|would|will|should)\s+(?:you|we)\s+"
+    r"(?:please\s+)?|please\s+)?"
+    r"(?:start|begin|open|create)\b",
+    re.I,
+)
+_SITUATION_NEW_EVENT_UNCERTAINTY_RE = re.compile(
+    r"(?:^\s*(?:maybe|perhaps|possibly|whether|if|"
+    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+"
+    r"(?:not\s+)?sure|"
+    r"(?:(?:i|we)\s+wonder|"
+    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+wondering)"
+    r"\s+(?:if|whether))\b|"
+    r"\b(?:this|that|it)\s+(?:may|might|could|would)\s+be\b)",
     re.I,
 )
 _SITUATION_CONCURRENT_RE = re.compile(
@@ -985,7 +1004,37 @@ def _situation_temporal_scope(text: str) -> Tuple[str, str]:
 
 def _situation_explicit_new_event(text: str) -> bool:
     unnegated = _SITUATION_NEGATED_NEW_EVENT_RE.sub("", text or "")
-    return bool(_SITUATION_EXPLICIT_NEW_EVENT_RE.search(unnegated))
+    for match in _SITUATION_EXPLICIT_NEW_EVENT_RE.finditer(unnegated):
+        clause_start = max(
+            unnegated.rfind(boundary, 0, match.start())
+            for boundary in ".!?;\n"
+        ) + 1
+        clause_tail = unnegated[match.end() :]
+        clause_boundary = re.search(r"[.!?;\n]", clause_tail)
+        clause_end = (
+            match.end() + clause_boundary.end()
+            if clause_boundary is not None
+            else len(unnegated)
+        )
+        clause = unnegated[clause_start:clause_end]
+        assertion_start = max(
+            clause_start,
+            max(
+                unnegated.rfind(boundary, clause_start, match.start())
+                for boundary in ",:—"
+            )
+            + 1,
+        )
+        cue_prefix = unnegated[assertion_start : match.end()]
+        if (
+            clause.rstrip().endswith("?")
+            and not _SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(clause)
+        ):
+            continue
+        if _SITUATION_NEW_EVENT_UNCERTAINTY_RE.search(cue_prefix):
+            continue
+        return True
+    return False
 
 
 def _situation_event_relation(

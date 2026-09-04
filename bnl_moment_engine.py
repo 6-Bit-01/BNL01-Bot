@@ -87,6 +87,22 @@ _EPISODE_NEGATED_NEW_EVENT_RE = re.compile(
     r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
     re.I,
 )
+_EPISODE_NEW_EVENT_DIRECTIVE_QUESTION_RE = re.compile(
+    r"^\s*(?:(?:can|could|would|will|should)\s+(?:you|we)\s+"
+    r"(?:please\s+)?|please\s+)?"
+    r"(?:start|begin|open|create)\b",
+    re.I,
+)
+_EPISODE_NEW_EVENT_UNCERTAINTY_RE = re.compile(
+    r"(?:^\s*(?:maybe|perhaps|possibly|whether|if|"
+    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+"
+    r"(?:not\s+)?sure|"
+    r"(?:(?:i|we)\s+wonder|"
+    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+wondering)"
+    r"\s+(?:if|whether))\b|"
+    r"\b(?:this|that|it)\s+(?:may|might|could|would)\s+be\b)",
+    re.I,
+)
 _EPISODE_RELATED_RE = re.compile(
     r"\b(?:combine|connect|link|tie)\b.{0,36}"
     r"\b(?:thread|topic|discussion|conversation|idea|plan|moment)s?\b"
@@ -2977,7 +2993,37 @@ def _episode_resume_requested(rows: list[SourceEntry]) -> bool:
 
 def _episode_text_explicit_new_event(value: str) -> bool:
     unnegated = _EPISODE_NEGATED_NEW_EVENT_RE.sub("", value or "")
-    return bool(_EPISODE_EXPLICIT_NEW_EVENT_RE.search(unnegated))
+    for match in _EPISODE_EXPLICIT_NEW_EVENT_RE.finditer(unnegated):
+        clause_start = max(
+            unnegated.rfind(boundary, 0, match.start())
+            for boundary in ".!?;\n"
+        ) + 1
+        clause_tail = unnegated[match.end() :]
+        clause_boundary = re.search(r"[.!?;\n]", clause_tail)
+        clause_end = (
+            match.end() + clause_boundary.end()
+            if clause_boundary is not None
+            else len(unnegated)
+        )
+        clause = unnegated[clause_start:clause_end]
+        assertion_start = max(
+            clause_start,
+            max(
+                unnegated.rfind(boundary, clause_start, match.start())
+                for boundary in ",:—"
+            )
+            + 1,
+        )
+        cue_prefix = unnegated[assertion_start : match.end()]
+        if (
+            clause.rstrip().endswith("?")
+            and not _EPISODE_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(clause)
+        ):
+            continue
+        if _EPISODE_NEW_EVENT_UNCERTAINTY_RE.search(cue_prefix):
+            continue
+        return True
+    return False
 
 
 def _episode_explicit_new_event(rows: list[SourceEntry]) -> bool:
@@ -4213,20 +4259,33 @@ def active_episode_for_assessment(
     current_turn_text: str | None = None,
     participant_keys: tuple[str, ...] = (),
     now: str | None = None,
+    expected_episode_id: str = "",
 ) -> ActiveEpisodeReference | None:
     """Select one active episode without creating schema or changing state."""
 
+    boundary_text = (
+        topic_text if current_turn_text is None else current_turn_text
+    )
+    explicit_new_event = _episode_text_explicit_new_event(boundary_text)
     if (
         not shadow_enabled()
         or not ledger_shadow_enabled()
         or not _table_exists(conn, "memory_moment_episodes")
-        or _episode_text_explicit_new_event(
-            topic_text if current_turn_text is None else current_turn_text
-        )
+        or explicit_new_event
     ):
         return None
-    candidates = conn.execute(
-        """
+    continuity_probe = bool(
+        current_turn_text is not None
+        and (
+            _EPISODE_RESUME_RE.search(boundary_text or "")
+            or (
+                _EPISODE_EXPLICIT_NEW_EVENT_RE.search(boundary_text or "")
+                and not explicit_new_event
+            )
+        )
+    )
+    expected_id = str(expected_episode_id or "").strip()
+    candidate_query = """
         SELECT episode_id,guild_id,channel_id,channel_policy,route_mode,
                visibility,topic_family,topic_signature,lifecycle_status,
                opened_at,last_activity_at,open_loop_count,public_usable,
@@ -4234,15 +4293,18 @@ def active_episode_for_assessment(
         FROM memory_moment_episodes
         WHERE guild_id=? AND channel_id=? AND channel_policy=?
           AND route_mode=? AND lifecycle_status='active'
-        ORDER BY last_activity_at DESC,episode_id
-        """,
-        (
-            int(guild_id or 0),
-            int(channel_id or 0),
-            str(channel_policy or "unknown"),
-            str(route_mode or "unknown"),
-        ),
-    ).fetchall()
+    """
+    candidate_params: tuple[Any, ...] = (
+        int(guild_id or 0),
+        int(channel_id or 0),
+        str(channel_policy or "unknown"),
+        str(route_mode or "unknown"),
+    )
+    if expected_id:
+        candidate_query += " AND episode_id=?"
+        candidate_params = (*candidate_params, expected_id)
+    candidate_query += " ORDER BY last_activity_at DESC,episode_id"
+    candidates = conn.execute(candidate_query, candidate_params).fetchall()
     if len(candidates) != 1:
         return None
     candidate = candidates[0]
@@ -4253,11 +4315,16 @@ def active_episode_for_assessment(
         return None
     signature = _topic_signature(topic_text, "conversation")
     family = _topic_family(topic_text, "conversation")
-    if signature and not _coherent(
-        family,
-        signature,
-        str(candidate[6] or ""),
-        _load_sig(str(candidate[7] or "[]")),
+    if (
+        not expected_id
+        and not continuity_probe
+        and signature
+        and not _coherent(
+            family,
+            signature,
+            str(candidate[6] or ""),
+            _load_sig(str(candidate[7] or "[]")),
+        )
     ):
         return None
     scoped_participant_keys = tuple(
@@ -4544,6 +4611,8 @@ def render_active_episode_canary_context(
     topic_text: str,
     participant_keys: tuple[str, ...] = (),
     now: str | None = None,
+    expected_episode_id: str = "",
+    reference_out: dict[str, ActiveEpisodeReference] | None = None,
 ) -> str:
     """Render source-revalidated aggregate episode context for sealed testing.
 
@@ -4553,6 +4622,8 @@ def render_active_episode_canary_context(
     participant names, ids, Moment ids, or episode ids.
     """
 
+    if reference_out is not None:
+        reference_out.clear()
     if (
         str(channel_policy or "").strip().lower() != "sealed_test"
         or int(guild_id or 0) <= 0
@@ -4569,6 +4640,7 @@ def render_active_episode_canary_context(
         current_turn_text=str(topic_text or "")[:8000],
         participant_keys=participant_keys,
         now=now,
+        expected_episode_id=expected_episode_id,
     )
     if reference is None:
         return ""
@@ -4708,6 +4780,8 @@ def render_active_episode_canary_context(
         if reference.semantic_types
         else "ongoing discussion"
     )
+    if reference_out is not None:
+        reference_out["reference"] = reference
     return (
         "[Active same-channel episode signal; aggregate continuity only, "
         "never quotation or durable-fact authority]\n"

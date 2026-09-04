@@ -106,7 +106,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
         return moment_id, tuple(sources)
 
     def test_sealed_canary_renders_only_revalidated_aggregate_episode(self):
-        _moment_id, sources = self.finalize_shared_moment(
+        moment_id, sources = self.finalize_shared_moment(
             95,
             (
                 "Let's build the synth routing for the chorus",
@@ -116,6 +116,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             users=(1, 2, 3),
             policy="sealed_test",
         )
+        reference_out = {}
         rendered = moments.render_active_episode_canary_context(
             self.conn,
             guild_id=1,
@@ -125,10 +126,38 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             topic_text="How should we continue the synth routing?",
             participant_keys=("discord_user:1",),
             now=self.timestamp(minutes=4),
+            reference_out=reference_out,
         )
         self.assertIn("Active same-channel episode signal", rendered)
         self.assertIn("Shared human participants: 3", rendered)
         self.assertIn("Unresolved open loops:", rendered)
+        self.assertEqual(
+            reference_out["reference"].source_moment_ids,
+            (moment_id,),
+        )
+        question_reference_out = {}
+        question_rendered = moments.render_active_episode_canary_context(
+            self.conn,
+            guild_id=1,
+            channel_id=10,
+            channel_policy="sealed_test",
+            route_mode="normal_chat",
+            topic_text="Is this a separate task, or should we continue?",
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(minutes=4),
+            expected_episode_id=(
+                reference_out["reference"].episode_id
+            ),
+            reference_out=question_reference_out,
+        )
+        self.assertIn(
+            "Active same-channel episode signal",
+            question_rendered,
+        )
+        self.assertEqual(
+            question_reference_out["reference"].source_moment_ids,
+            (moment_id,),
+        )
         for forbidden in (
             "Member 1",
             "Member 2",
@@ -625,6 +654,81 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
         self.assertIsNotNone(reference)
         self.assertEqual(reference.source_moment_ids, (moment_id,))
 
+        uncertain_reference = moments.active_episode_for_assessment(
+            self.conn,
+            guild_id=1,
+            channel_id=10,
+            channel_policy="sealed_test",
+            route_mode="normal_chat",
+            topic_text=(
+                "Is this a separate task, or should we continue?"
+            ),
+            current_turn_text=(
+                "Is this a separate task, or should we continue?"
+            ),
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(minutes=4),
+        )
+        self.assertIsNotNone(uncertain_reference)
+        self.assertEqual(
+            uncertain_reference.source_moment_ids,
+            (moment_id,),
+        )
+
+        for current_turn_text in (
+            "Maybe this is a separate task; I am not sure yet.",
+            "Isn't this a separate task?",
+            "Does this count as a separate task?",
+            "Is the decoder work a separate task?",
+            "This is a separate task, right?",
+        ):
+            with self.subTest(current_turn_text=current_turn_text):
+                self.assertIsNotNone(
+                    moments.active_episode_for_assessment(
+                        self.conn,
+                        guild_id=1,
+                        channel_id=10,
+                        channel_policy="sealed_test",
+                        route_mode="normal_chat",
+                        topic_text=current_turn_text,
+                        current_turn_text=current_turn_text,
+                        participant_keys=("discord_user:1",),
+                        now=self.timestamp(minutes=4),
+                    )
+                )
+
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text="synth routing chorus",
+                current_turn_text="Can you start another task?",
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            )
+        )
+
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=(
+                    "Even if it looks similar, this is a separate incident."
+                ),
+                current_turn_text=(
+                    "Even if it looks similar, this is a separate incident."
+                ),
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            )
+        )
+
         self.assertIsNone(
             moments.active_episode_for_assessment(
                 self.conn,
@@ -639,6 +743,57 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
                 participant_keys=("discord_user:1",),
                 now=self.timestamp(minutes=4),
             )
+        )
+
+    def test_interrogative_boundary_does_not_split_episode(self):
+        first_moment, _ = self.finalize_shared_moment(
+            297,
+            (
+                "The Copper Kite antenna calibration is still active",
+                "The Copper Kite indicator remains stable",
+                "Archiving the Copper Kite notes remains open",
+            ),
+        )
+        episode_id = self.conn.execute(
+            "SELECT episode_id FROM memory_moment_episodes"
+        ).fetchone()[0]
+
+        second_moment, _ = self.finalize_shared_moment(
+            307,
+            (
+                "The Copper Kite antenna calibration is still active. "
+                "Does this count as a separate task?",
+                "The Copper Kite indicator remains stable",
+                "The Copper Kite notes remain unarchived",
+            ),
+            minutes=10,
+        )
+
+        episode = self.conn.execute(
+            """
+            SELECT episode_id,lifecycle_status,moment_count
+            FROM memory_moment_episodes
+            """
+        ).fetchone()
+        self.assertEqual(episode, (episode_id, "active", 2))
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    """
+                    SELECT moment_id FROM memory_moment_episode_moments
+                    WHERE episode_id=?
+                    """,
+                    (episode_id,),
+                )
+            },
+            {first_moment, second_moment},
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memory_moment_episode_lineage"
+            ).fetchone()[0],
+            0,
         )
 
     def test_unique_explicit_resume_reopens_source_backed_episode(self):
