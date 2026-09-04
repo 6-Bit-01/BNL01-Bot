@@ -84,7 +84,9 @@ _EPISODE_NEGATED_NEW_EVENT_RE = re.compile(
     r"\b(?:(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|"
     r"aren(?:'|’)t|weren(?:'|’)t)\s+"
     r"(?:(?:a|an|the)\s+)?|"
-    r"do(?:n['’]t|\s+not)\s+(?:(?:start|begin|open|create)\s+|"
+    r"(?:(?:do|should)(?:n['’]t|\s+not)|"
+    r"let(?:['’]s|\s+us)\s+not)\s+"
+    r"(?:(?:start|begin|open|create)\s+|"
     r"(?:treat|regard|count|consider|call)\s+"
     r"(?:this|that|it)\s+as\s+)(?:(?:a|an|the)\s+)?)"
     r"(?:new|different|separate|another)\s+"
@@ -4307,14 +4309,13 @@ def active_episode_for_assessment(
         str(channel_policy or "unknown"),
         str(route_mode or "unknown"),
     )
-    if expected_id:
-        candidate_query += " AND episode_id=?"
-        candidate_params = (*candidate_params, expected_id)
     candidate_query += " ORDER BY last_activity_at DESC,episode_id"
     candidates = conn.execute(candidate_query, candidate_params).fetchall()
     if len(candidates) != 1:
         return None
     candidate = candidates[0]
+    if expected_id and str(candidate[0]) != expected_id:
+        return None
     if (
         _parse_ts(now or _now())
         - _parse_ts(str(candidate[10] or ""))

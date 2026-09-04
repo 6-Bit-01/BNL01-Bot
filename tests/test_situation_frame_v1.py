@@ -512,6 +512,14 @@ class SituationFrameV1Tests(unittest.TestCase):
                 "same_event",
             ),
             (
+                "We should not start a new task; continue this incident.",
+                "resume",
+            ),
+            (
+                "Let's not start a new task.",
+                "same_event",
+            ),
+            (
                 "Is this a separate task, or should we continue?",
                 "resume",
             ),
