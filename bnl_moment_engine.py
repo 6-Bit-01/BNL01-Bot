@@ -135,7 +135,7 @@ _EPISODE_NEGATED_CLOSE_RE = re.compile(
 _EPISODE_ACTION_RE = re.compile(
     r"\b(?:i|we|you|they|he|she)\s+(?:will|plan(?:ned)?\s+to|"
     r"intend(?:ed)?\s+to|need(?:ed)?\s+to|should|could)\b"
-    r"|\b(?:let(?:'|’)s|implement|build|fix|test|send|write|create|"
+    r"|\b(?:let(?:'|’)s|implement|perform|build|fix|test|send|write|create|"
     r"change|update|deploy|review|check|run)\b",
     re.I,
 )
@@ -2606,7 +2606,12 @@ def observe_ledger_entry(conn: sqlite3.Connection, ledger_entry_id: str) -> Mome
         if source.source_table != "conversations" or source.lifecycle_status not in {"active", "review_only"} or source.entry_type not in {"observation", "derived_summary"}:
             conn.execute("RELEASE moment_observe")
             return MomentObservationResult(reason_code="ineligible_source", ledger_entry_id=source.entry_id)
-        if _contains_sensitive_moment_source(
+        # Human-authored content remains the authority-bearing privacy
+        # boundary. Model turns are retained only as structural conversation
+        # evidence and never become public content authority; applying the
+        # opaque-code detector to them can drop BNL's intentional alphanumeric
+        # glitch markers and prevent an otherwise valid Moment from forming.
+        if source.is_human and _contains_sensitive_moment_source(
             source.normalized_value,
             source.predicate_key,
         ):

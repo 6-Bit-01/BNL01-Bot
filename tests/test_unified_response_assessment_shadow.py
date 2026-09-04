@@ -7,6 +7,7 @@ from bnl_unified_response_assessment import (
     assess_response_coherence,
     build_conversation_evidence_item,
     build_evaluation_report,
+    build_situation_frame_v1,
     build_unified_response_assessment,
     ensure_schema,
     persist_shadow_run,
@@ -700,6 +701,98 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
         self.assertEqual(coherent.status, "passed")
         self.assertEqual(coherent.conclusion_status, "consistent")
         self.assertEqual(coherent.criterion_status, "covered")
+
+    def test_resolved_new_event_does_not_inherit_interrupted_criteria(self):
+        glass_prompt = (
+            "Sealed acceptance fixture: Project Glass Harbor is in "
+            "rehearsal. The amber signal failed, and the open question is "
+            "whether to test the relay or the decoder first. Which should "
+            "we test first?"
+        )
+        copper_prompt = (
+            "Sealed acceptance fixture: this is a separate task. Project "
+            "Copper Kite has a stable blue indicator, and the antenna "
+            "calibration must be completed before its notes are archived. "
+            "What is the current task, and what remains open?"
+        )
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=copper_prompt,
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="glass-moment",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=False,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+        evidence = (
+            build_conversation_evidence_item(
+                text=glass_prompt,
+                source_id=1,
+                speaker_user_id=101,
+                speaker_label="Test Member",
+            ),
+            build_conversation_evidence_item(
+                text=copper_prompt,
+                source_id=2,
+                speaker_user_id=101,
+                speaker_label="Test Member",
+                current_turn=True,
+            ),
+        )
+
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="sealed_test",
+            current_speaker_user_ids=(101,),
+            participant_user_ids=(101,),
+            speaker_labels=("Test Member",),
+            current_exchange_source_ids=(2,),
+            prompt_lanes=("current_exchange", "conversation_context"),
+            continuity_required=True,
+            current_text=copper_prompt,
+            conversation_evidence_items=evidence,
+            situation_frame=frame,
+        )
+        response = (
+            "The current task is antenna calibration for Project "
+            "Copper Kite. Archiving the notes remains open."
+        )
+        coherence = assess_response_coherence(assessment, response)
+
+        self.assertEqual(frame.event_relation, "new_event_same_participant")
+        self.assertEqual(
+            tuple(
+                criterion.source_id
+                for criterion in assessment.attributed_criteria
+            ),
+            (2,),
+        )
+        self.assertEqual(len(assessment.conversation_evidence_items), 2)
+        self.assertEqual(coherence.status, "passed")
+        self.assertEqual(coherence.criterion_status, "covered")
+        self.assertNotIn(
+            "attributed_criterion_partial",
+            coherence.reason_codes,
+        )
+        conn = sqlite3.connect(":memory:")
+        try:
+            persist_shadow_run(conn, assessment, response=response)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT response_alignment FROM "
+                    "unified_response_assessment_shadow_runs"
+                ).fetchone()[0],
+                "guard_clear",
+            )
+        finally:
+            conn.close()
 
     def test_semantic_frame_is_domain_neutral_across_conversation_shapes(self):
         cases = (

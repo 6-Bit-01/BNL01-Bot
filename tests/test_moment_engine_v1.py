@@ -603,6 +603,41 @@ class MomentEngineV1Tests(unittest.TestCase):
                 0,
             )
 
+    def test_model_glitch_marker_remains_structural_moment_evidence(self):
+        source = self.add(
+            450,
+            0,
+            "model",
+            (
+                "[BNL-01 // SIGNAL_STAGING_04] Antenna calibration is "
+                "current; archiving remains open."
+            ),
+            policy="sealed_test",
+            observe=False,
+        )
+
+        result = moments.observe_ledger_entry(self.conn, source.entry_id)
+
+        self.assertEqual(result.outcome, "observed")
+        self.assertEqual(result.reason_code, "ok")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memory_moment_members "
+                "WHERE ledger_entry_id=?",
+                (source.entry_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memory_moment_diagnostics "
+                "WHERE ledger_entry_id=? AND "
+                "event_type='moment_processing_skipped'",
+                (source.entry_id,),
+            ).fetchone()[0],
+            0,
+        )
+
     def test_legacy_remembered_number_quarantine_is_complete_and_idempotent(self):
         raw=self.add(
             501,

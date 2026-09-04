@@ -2477,7 +2477,19 @@ def build_unified_response_assessment(
     objective = _current_objective(current_text)
     current_options = _unique_strings(current_payload_anchors)[:8]
     resolved_thread_focus = _thread_focus_mode(thread_focus_mode)
-    criteria = _criterion_items(evidence_items)
+    criterion_evidence_items = evidence_items
+    if (
+        situation_frame is not None
+        and situation_frame.status == "resolved"
+        and situation_frame.event_relation == "new_event_same_participant"
+    ):
+        # A resolved explicit event boundary keeps nearby history available
+        # for attribution and audit, but criteria from the interrupted event
+        # must not be imposed on the new task.
+        criterion_evidence_items = tuple(
+            item for item in evidence_items if item.current_turn
+        )
+    criteria = _criterion_items(criterion_evidence_items)
     objective_kind = _objective_kind(
         objective=objective,
         current_options=current_options,
