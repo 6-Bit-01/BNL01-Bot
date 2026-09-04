@@ -106,7 +106,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
         return moment_id, tuple(sources)
 
     def test_sealed_canary_renders_only_revalidated_aggregate_episode(self):
-        _moment_id, sources = self.finalize_shared_moment(
+        moment_id, sources = self.finalize_shared_moment(
             95,
             (
                 "Let's build the synth routing for the chorus",
@@ -116,6 +116,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             users=(1, 2, 3),
             policy="sealed_test",
         )
+        reference_out = {}
         rendered = moments.render_active_episode_canary_context(
             self.conn,
             guild_id=1,
@@ -125,10 +126,38 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             topic_text="How should we continue the synth routing?",
             participant_keys=("discord_user:1",),
             now=self.timestamp(minutes=4),
+            reference_out=reference_out,
         )
         self.assertIn("Active same-channel episode signal", rendered)
         self.assertIn("Shared human participants: 3", rendered)
         self.assertIn("Unresolved open loops:", rendered)
+        self.assertEqual(
+            reference_out["reference"].source_moment_ids,
+            (moment_id,),
+        )
+        question_reference_out = {}
+        question_rendered = moments.render_active_episode_canary_context(
+            self.conn,
+            guild_id=1,
+            channel_id=10,
+            channel_policy="sealed_test",
+            route_mode="normal_chat",
+            topic_text="Is this a separate task, or should we continue?",
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(minutes=4),
+            expected_episode_id=(
+                reference_out["reference"].episode_id
+            ),
+            reference_out=question_reference_out,
+        )
+        self.assertIn(
+            "Active same-channel episode signal",
+            question_rendered,
+        )
+        self.assertEqual(
+            question_reference_out["reference"].source_moment_ids,
+            (moment_id,),
+        )
         for forbidden in (
             "Member 1",
             "Member 2",
@@ -174,6 +203,69 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             ),
             "",
         )
+
+    def test_sealed_canary_expected_episode_rejects_scope_ambiguity(self):
+        self.finalize_shared_moment(
+            105,
+            (
+                "Let's build the synth routing for the chorus",
+                "The synth drum patch needs a bass answer",
+                "Which synth layer should we test next?",
+            ),
+            users=(1, 2, 3),
+            policy="sealed_test",
+        )
+        old_episode_id = self.conn.execute(
+            "SELECT episode_id FROM memory_moment_episodes"
+        ).fetchone()[0]
+        self.finalize_shared_moment(
+            115,
+            (
+                "Pizza dough needs a hotter oven stone",
+                "Pizza sauce works with the dough structure",
+                "The pizza oven should keep the crust crisp",
+            ),
+            minutes=10,
+            policy="sealed_test",
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_moment_episodes
+            SET lifecycle_status='active',finalized_at=NULL,
+                finalization_reason=''
+            WHERE episode_id=?
+            """,
+            (old_episode_id,),
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT COUNT(*) FROM memory_moment_episodes
+                WHERE guild_id=1 AND channel_id=10
+                  AND channel_policy='sealed_test'
+                  AND route_mode='normal_chat'
+                  AND lifecycle_status='active'
+                """
+            ).fetchone()[0],
+            2,
+        )
+        reference_out = {"reference": object()}
+        self.assertEqual(
+            moments.render_active_episode_canary_context(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text="Is this a separate task, or should we continue?",
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=14),
+                expected_episode_id=old_episode_id,
+                reference_out=reference_out,
+            ),
+            "",
+        )
+        self.assertEqual(reference_out, {})
 
     def test_coherent_moments_extend_one_shared_episode_with_any_participant_count(self):
         first_moment, _ = self.finalize_shared_moment(
@@ -406,6 +498,429 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
                 (new[0], old[0]),
             ).fetchone(),
             ("interrupted_from", new_moment_id, new_sources[0].entry_id),
+        )
+
+    def test_explicit_separate_task_overrides_broad_topic_overlap(self):
+        glass_messages = (
+            (
+                "Sealed acceptance fixture: Project Glass Harbor is in "
+                "rehearsal. The amber signal failed, and the open question "
+                "is whether to test the relay or the decoder first. Which "
+                "should we test first?",
+                "Test the relay first; decoder diagnostics remain open.",
+            ),
+            (
+                "For Project Glass Harbor, commit the plan: test the relay "
+                "first, then investigate the amber signal. The decoder "
+                "remains an open follow-up. Recap the current phase and "
+                "open loop.",
+                "The relay test is current and decoder diagnostics remain open.",
+            ),
+        )
+        row_id = 260
+        for human_text, model_text in glass_messages:
+            self.add(
+                row_id,
+                1,
+                human_text,
+                policy="sealed_test",
+            )
+            self.add(
+                row_id + 1,
+                0,
+                model_text,
+                policy="sealed_test",
+                role="model",
+                name="BNL-01",
+            )
+            row_id += 2
+        moments.sweep_expired_windows(
+            self.conn,
+            now=self.timestamp(minutes=3),
+        )
+        glass_episode_id = self.conn.execute(
+            "SELECT episode_id FROM memory_moment_episodes"
+        ).fetchone()[0]
+
+        copper_prompt = (
+            "Sealed acceptance fixture: this is a separate task. Project "
+            "Copper Kite has a stable blue indicator, and the antenna "
+            "calibration must be completed before its notes are archived. "
+            "What is the current task, and what remains open?"
+        )
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=copper_prompt,
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=10),
+            )
+        )
+        self.assertEqual(
+            moments.render_active_episode_canary_context(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=copper_prompt,
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=10),
+            ),
+            "",
+        )
+
+        copper_messages = (
+            (
+                copper_prompt,
+                "Antenna calibration is current; archiving remains open.",
+            ),
+            (
+                "This remains a separate task: Project Copper Kite. Commit "
+                "the plan: perform antenna calibration first, leave notes "
+                "unarchived, and keep archiving as the open follow-up.",
+                "Calibration is current and note archiving remains open.",
+            ),
+        )
+        for human_text, model_text in copper_messages:
+            self.add(
+                row_id,
+                1,
+                human_text,
+                minutes=10,
+                policy="sealed_test",
+            )
+            self.add(
+                row_id + 1,
+                0,
+                model_text,
+                minutes=10,
+                policy="sealed_test",
+                role="model",
+                name="BNL-01",
+            )
+            row_id += 2
+        moments.sweep_expired_windows(
+            self.conn,
+            now=self.timestamp(minutes=13),
+        )
+
+        episodes = self.conn.execute(
+            """
+            SELECT episode_id,lifecycle_status,finalization_reason
+            FROM memory_moment_episodes ORDER BY opened_at,episode_id
+            """
+        ).fetchall()
+        self.assertEqual(len(episodes), 2)
+        old = next(row for row in episodes if row[0] == glass_episode_id)
+        new = next(row for row in episodes if row[0] != glass_episode_id)
+        self.assertEqual(old[1:], ("finalized", "topic_interruption"))
+        self.assertEqual(new[1], "active")
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT link_role FROM memory_moment_episode_moments
+                WHERE episode_id=?
+                """,
+                (new[0],),
+            ).fetchone()[0],
+            "opened",
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT to_episode_id,relation_type
+                FROM memory_moment_episode_lineage
+                WHERE from_episode_id=?
+                """,
+                (new[0],),
+            ).fetchone(),
+            (glass_episode_id, "interrupted_from"),
+        )
+
+    def test_negated_separate_task_preserves_active_episode(self):
+        first_moment, _ = self.finalize_shared_moment(
+            280,
+            (
+                "Let's calibrate the Copper Kite antenna",
+                "The Copper Kite indicator is still flickering",
+                "Archiving the Copper Kite notes remains open",
+            ),
+        )
+        episode_id = self.conn.execute(
+            "SELECT episode_id FROM memory_moment_episodes"
+        ).fetchone()[0]
+
+        second_moment, _ = self.finalize_shared_moment(
+            290,
+            (
+                "This is not a separate task; continue the same Copper "
+                "Kite incident",
+                "The Copper Kite antenna calibration is still active",
+                "The Copper Kite notes remain unarchived",
+            ),
+            minutes=10,
+        )
+
+        episode = self.conn.execute(
+            """
+            SELECT episode_id,lifecycle_status,moment_count
+            FROM memory_moment_episodes
+            """
+        ).fetchone()
+        self.assertEqual(episode, (episode_id, "active", 2))
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    """
+                    SELECT moment_id FROM memory_moment_episode_moments
+                    WHERE episode_id=?
+                    """,
+                    (episode_id,),
+                )
+            },
+            {first_moment, second_moment},
+        )
+
+    def test_active_episode_boundary_uses_only_current_turn_text(self):
+        moment_id, _ = self.finalize_shared_moment(
+            295,
+            (
+                "Let's build the synth routing and test the chorus",
+                "The synth drum patch needs a bass answer",
+                "Which synth layer should we test next?",
+            ),
+            policy="sealed_test",
+        )
+        historical_and_current = (
+            "This is a separate task: synth routing.\n"
+            "Correction: the synth routing should use the warmer patch."
+        )
+        reference = moments.active_episode_for_assessment(
+            self.conn,
+            guild_id=1,
+            channel_id=10,
+            channel_policy="sealed_test",
+            route_mode="normal_chat",
+            topic_text=historical_and_current,
+            current_turn_text=(
+                "Correction: the synth routing should use the warmer patch."
+            ),
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(minutes=4),
+        )
+        self.assertIsNotNone(reference)
+        self.assertEqual(reference.source_moment_ids, (moment_id,))
+
+        uncertain_reference = moments.active_episode_for_assessment(
+            self.conn,
+            guild_id=1,
+            channel_id=10,
+            channel_policy="sealed_test",
+            route_mode="normal_chat",
+            topic_text=(
+                "Is this a separate task, or should we continue?"
+            ),
+            current_turn_text=(
+                "Is this a separate task, or should we continue?"
+            ),
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(minutes=4),
+        )
+        self.assertIsNotNone(uncertain_reference)
+        self.assertEqual(
+            uncertain_reference.source_moment_ids,
+            (moment_id,),
+        )
+
+        for current_turn_text in (
+            "Maybe this is a separate task; I am not sure yet.",
+            "Isn't this a separate task?",
+            "Does this count as a separate task?",
+            "Is the decoder work a separate task?",
+            "This is a separate task, right?",
+        ):
+            with self.subTest(current_turn_text=current_turn_text):
+                self.assertIsNotNone(
+                    moments.active_episode_for_assessment(
+                        self.conn,
+                        guild_id=1,
+                        channel_id=10,
+                        channel_policy="sealed_test",
+                        route_mode="normal_chat",
+                        topic_text=(
+                            "The synth routing and decoder remain active.\n"
+                            + current_turn_text
+                        ),
+                        current_turn_text=current_turn_text,
+                        participant_keys=("discord_user:1",),
+                        now=self.timestamp(minutes=4),
+                    )
+                )
+
+        for current_turn_text in (
+            "Don't start a new task; continue this incident.",
+            "Do not treat this as a separate task.",
+            "We should not start a new task; continue this incident.",
+            "Let's not start a new task.",
+            "Never start a new task; continue this incident.",
+        ):
+            with self.subTest(current_turn_text=current_turn_text):
+                self.assertIsNotNone(
+                    moments.active_episode_for_assessment(
+                        self.conn,
+                        guild_id=1,
+                        channel_id=10,
+                        channel_policy="sealed_test",
+                        route_mode="normal_chat",
+                        topic_text=current_turn_text,
+                        current_turn_text=current_turn_text,
+                        participant_keys=("discord_user:1",),
+                        now=self.timestamp(minutes=4),
+                    )
+                )
+
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text="synth routing chorus",
+                current_turn_text="Can you start another task?",
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            )
+        )
+
+        for current_turn_text in (
+            "Okay, can you start another task?",
+            "Before we continue, can you start a new task?",
+            "This is a separate task: what should we do next?",
+            "Can we treat this as a new task?",
+            "Could you consider this a separate task?",
+        ):
+            with self.subTest(current_turn_text=current_turn_text):
+                self.assertIsNone(
+                    moments.active_episode_for_assessment(
+                        self.conn,
+                        guild_id=1,
+                        channel_id=10,
+                        channel_policy="sealed_test",
+                        route_mode="normal_chat",
+                        topic_text=current_turn_text,
+                        current_turn_text=current_turn_text,
+                        participant_keys=("discord_user:1",),
+                        now=self.timestamp(minutes=4),
+                    )
+                )
+
+        unrelated_uncertain = (
+            "Maybe the pizza launch is a separate task"
+        )
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=unrelated_uncertain,
+                current_turn_text=unrelated_uncertain,
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            )
+        )
+
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=(
+                    "Even if it looks similar, this is a separate incident."
+                ),
+                current_turn_text=(
+                    "Even if it looks similar, this is a separate incident."
+                ),
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            )
+        )
+
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=historical_and_current,
+                current_turn_text=(
+                    "This is a separate task: Project Silver Compass."
+                ),
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            )
+        )
+
+    def test_interrogative_boundary_does_not_split_episode(self):
+        first_moment, _ = self.finalize_shared_moment(
+            297,
+            (
+                "The Copper Kite antenna calibration is still active",
+                "The Copper Kite indicator remains stable",
+                "Archiving the Copper Kite notes remains open",
+            ),
+        )
+        episode_id = self.conn.execute(
+            "SELECT episode_id FROM memory_moment_episodes"
+        ).fetchone()[0]
+
+        second_moment, _ = self.finalize_shared_moment(
+            307,
+            (
+                "The Copper Kite antenna calibration is still active. "
+                "Does this count as a separate task?",
+                "The Copper Kite indicator remains stable",
+                "The Copper Kite notes remain unarchived",
+            ),
+            minutes=10,
+        )
+
+        episode = self.conn.execute(
+            """
+            SELECT episode_id,lifecycle_status,moment_count
+            FROM memory_moment_episodes
+            """
+        ).fetchone()
+        self.assertEqual(episode, (episode_id, "active", 2))
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    """
+                    SELECT moment_id FROM memory_moment_episode_moments
+                    WHERE episode_id=?
+                    """,
+                    (episode_id,),
+                )
+            },
+            {first_moment, second_moment},
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memory_moment_episode_lineage"
+            ).fetchone()[0],
+            0,
         )
 
     def test_unique_explicit_resume_reopens_source_backed_episode(self):

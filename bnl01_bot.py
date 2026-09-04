@@ -121,6 +121,7 @@ from bnl_memory_governance import (
     view_member_memory,
 )
 from bnl_moment_engine import (
+    ActiveEpisodeReference,
     MomentSituationReference,
     active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
@@ -26484,16 +26485,17 @@ def _canon_relevant_to_response(text: str) -> bool:
     return bool(_UNIFIED_ASSESSMENT_CANON_RELEVANCE_RE.search(text or ""))
 
 
-def _active_episode_id_for_unified_assessment(
+def _active_episode_reference_for_unified_assessment(
     *,
     guild_id: int,
     channel_id: int,
     channel_policy: str,
     route_mode: str,
     topic_text: str,
+    current_turn_text: str,
     participant_user_ids: tuple[int, ...],
-) -> str:
-    """Read one opaque episode id for shadow comparison only."""
+) -> ActiveEpisodeReference | None:
+    """Read one source-validated active episode for shadow comparison."""
 
     if (
         not moment_engine_shadow_enabled()
@@ -26502,7 +26504,7 @@ def _active_episode_id_for_unified_assessment(
         or DB_FILE == ":memory:"
         or not os.path.exists(DB_FILE)
     ):
-        return ""
+        return None
     participant_keys = tuple(
         "discord_user:%s" % int(user_id)
         for user_id in participant_user_ids
@@ -26521,11 +26523,12 @@ def _active_episode_id_for_unified_assessment(
                 channel_policy=str(channel_policy or "unknown"),
                 route_mode=str(route_mode or "unknown"),
                 topic_text=str(topic_text or "")[:8000],
+                current_turn_text=str(current_turn_text or "")[:8000],
                 participant_keys=participant_keys,
             )
-        return reference.episode_id if reference is not None else ""
+        return reference
     except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
-        return ""
+        return None
 
 
 def _recent_moment_situation_for_turn(
@@ -27824,8 +27827,11 @@ def build_unified_response_assessment_shadow(
     active_episode_id = str(
         memory_meta.get("active_episode_id") or ""
     ).strip()
+    active_episode_source_moment_ids = tuple(
+        memory_meta.get("active_episode_source_moment_ids") or ()
+    )
     if not active_episode_id:
-        active_episode_id = _active_episode_id_for_unified_assessment(
+        active_episode_reference = _active_episode_reference_for_unified_assessment(
             guild_id=guild_id,
             channel_id=channel_id,
             channel_policy=channel_policy,
@@ -27835,8 +27841,21 @@ def build_unified_response_assessment_shadow(
                 for item in semantic_evidence_items
                 if str(item.text or "").strip()
             ),
+            current_turn_text=current_text,
             participant_user_ids=participant_user_ids,
         )
+        if active_episode_reference is not None:
+            active_episode_id = active_episode_reference.episode_id
+            active_episode_source_moment_ids = (
+                active_episode_reference.source_moment_ids
+            )
+    if (
+        isinstance(situation_frame, SituationFrameV1)
+        and situation_frame.event_relation
+        in {"new_event_same_participant", "new_event_or_uncertain"}
+    ):
+        active_episode_id = ""
+        active_episode_source_moment_ids = ()
     current_payload_anchors = extract_current_payload_anchors(
         current_text,
         conversation_contexts,
@@ -27994,6 +28013,9 @@ def build_unified_response_assessment_shadow(
         speaker_labels=speaker_labels,
         current_exchange_source_ids=current_exchange_source_ids,
         active_episode_id=active_episode_id,
+        active_episode_source_moment_ids=(
+            active_episode_source_moment_ids
+        ),
         prior_moment_ids=assessment_moment_refs,
         governed_entry_ids=assessment_governed_refs,
         relationship_candidate_keys=assessment_relationship_refs,
@@ -28140,16 +28162,28 @@ def record_unified_response_assessment_shadow(
     response_sent: bool = True,
 ) -> str:
     """Persist one content-free receipt; never affect response delivery."""
+    diagnostics = guard_diagnostics or {}
     for basis in tuple(
-        (guard_diagnostics or {}).get(
-            "_revalidated_prompt_source_bases"
-        )
+        diagnostics.get("_revalidated_prompt_source_bases")
         or ()
     ):
         if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
             assessment = basis.assessment
             break
-    frame_revalidation = (guard_diagnostics or {}).get(
+    if (
+        assessment is not None
+        and diagnostics.get("source_neutral_recovery")
+    ):
+        assessment = with_prompt_lane_presence(
+            replace(
+                assessment,
+                active_episode_id="",
+                active_episode_source_moment_ids=(),
+            ),
+            "active_episode",
+            present=False,
+        )
+    frame_revalidation = diagnostics.get(
         "_situation_frame_revalidation"
     )
     if (
@@ -28279,6 +28313,7 @@ def _render_unified_moment_canary_context(
     ):
         return "", False, assessment
     episode_context = ""
+    episode_reference: ActiveEpisodeReference | None = None
     if (
         DB_FILE != ":memory:"
         and os.path.exists(DB_FILE)
@@ -28290,6 +28325,7 @@ def _render_unified_moment_canary_context(
             if int(user_id or 0) > 0
         )
         try:
+            reference_out: dict[str, ActiveEpisodeReference] = {}
             with sqlite3.connect(
                 "file:%s?mode=ro" % DB_FILE,
                 uri=True,
@@ -28303,11 +28339,28 @@ def _render_unified_moment_canary_context(
                     route_mode=str(route_mode or "unknown"),
                     topic_text=str(topic_text or "")[:8000],
                     participant_keys=participant_keys,
+                    expected_episode_id=assessment.active_episode_id,
+                    reference_out=reference_out,
                 )
+            episode_reference = reference_out.get("reference")
         except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
             episode_context = ""
-    reconciled_assessment = with_prompt_lane_presence(
+            episode_reference = None
+    reconciled_assessment = replace(
         assessment,
+        active_episode_id=(
+            episode_reference.episode_id
+            if episode_context and episode_reference is not None
+            else ""
+        ),
+        active_episode_source_moment_ids=(
+            episode_reference.source_moment_ids
+            if episode_context and episode_reference is not None
+            else ()
+        ),
+    )
+    reconciled_assessment = with_prompt_lane_presence(
+        reconciled_assessment,
         "active_episode",
         present=bool(episode_context),
     )
@@ -28943,6 +28996,10 @@ def refresh_prompt_source_basis(
             fresh.expected_digest != basis.expected_digest
             or fresh.episode_context_present
             != basis.episode_context_present
+            or fresh.assessment.active_episode_id
+            != basis.assessment.active_episode_id
+            or fresh.assessment.active_episode_source_moment_ids
+            != basis.assessment.active_episode_source_moment_ids
         )
     if isinstance(basis, MemoryPromptSourceBasis):
         source_metadata: dict = {}

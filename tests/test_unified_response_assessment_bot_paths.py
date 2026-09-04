@@ -85,6 +85,292 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             assessment.excluded_lanes,
         )
 
+    def test_bot_adapter_carries_active_episode_source_moments(self):
+        historical_marker = bnl01_bot.build_conversation_evidence_item(
+            text="This is a separate task: Project Copper Kite.",
+            source_id=41,
+            speaker_user_id=101,
+            speaker_label="Member 1",
+            current_turn=False,
+        )
+        basis = self.conversation_basis(1)
+        basis = bnl01_bot.replace(
+            basis,
+            evidence_items=(historical_marker,),
+        )
+        active_episode_reader = mock.Mock(
+            return_value=SimpleNamespace(
+                episode_id="episode-one",
+                source_moment_ids=("moment-one",),
+            )
+        )
+        current_text = "Is this a separate task, or should we continue?"
+        situation_frame = bnl01_bot.build_situation_frame_v1(
+            route_allowed=True,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=current_text,
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment-one",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+        self.assertEqual(situation_frame.event_relation, "resume")
+        with mock.patch.object(
+            bnl01_bot,
+            "unified_response_assessment_shadow_enabled",
+            return_value=True,
+        ), mock.patch.object(
+            bnl01_bot,
+            "_active_episode_reference_for_unified_assessment",
+            new=active_episode_reader,
+        ), mock.patch.object(
+            bnl01_bot,
+            "_build_unified_intelligence_packet_shadow",
+            return_value=None,
+        ):
+            assessment = bnl01_bot.build_unified_response_assessment_shadow(
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="sealed_test",
+                conversation_surface="test",
+                current_text=current_text,
+                current_speaker_user_ids=(101,),
+                current_speaker_labels=("Member 1",),
+                channel_id=303,
+                prompt_source_bases=(basis,),
+                prompt_lanes=("current_exchange", "active_episode"),
+                continuity_required=True,
+                situation_frame=situation_frame,
+            )
+
+        self.assertIsNotNone(assessment)
+        self.assertEqual(assessment.active_episode_id, "episode-one")
+        self.assertEqual(
+            assessment.active_episode_source_moment_ids,
+            ("moment-one",),
+        )
+        reader_kwargs = active_episode_reader.call_args.kwargs
+        self.assertIn("separate task", reader_kwargs["topic_text"])
+        self.assertEqual(
+            reader_kwargs["current_turn_text"],
+            current_text,
+        )
+
+    def test_canary_refresh_reconciles_episode_source_moments(self):
+        stale_assessment = bnl01_bot.build_unified_response_assessment(
+            guild_id=1,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="sealed_test",
+            conversation_surface="sealed_test",
+            current_speaker_user_ids=(101,),
+            participant_user_ids=(101,),
+            active_episode_id="episode-one",
+            active_episode_source_moment_ids=("moment-one",),
+            prompt_lanes=("current_exchange", "active_episode"),
+            continuity_required=True,
+            current_text="What changed, and what remains open?",
+        )
+        fresh_reference = bnl01_bot.ActiveEpisodeReference(
+            episode_id="episode-one",
+            lifecycle_status="active",
+            source_moment_ids=("moment-one", "moment-two"),
+            participant_count=1,
+            open_loop_count=1,
+            semantic_types=("action", "open_loop"),
+        )
+        episode_context = (
+            "[Active same-channel episode signal]\n"
+            "- Shared human participants: 1."
+        )
+
+        expected_episode_ids = []
+
+        def render_validated_episode(*_args, reference_out=None, **kwargs):
+            expected_episode_ids.append(kwargs["expected_episode_id"])
+            reference_out["reference"] = fresh_reference
+            return episode_context
+
+        with tempfile.NamedTemporaryFile() as database_file, mock.patch.object(
+            bnl01_bot,
+            "DB_FILE",
+            database_file.name,
+        ), mock.patch.object(
+            bnl01_bot,
+            "unified_moment_canary_enabled",
+            return_value=True,
+        ), mock.patch.object(
+            bnl01_bot,
+            "render_active_episode_canary_context",
+            side_effect=render_validated_episode,
+        ):
+            rendered, present, reconciled = (
+                bnl01_bot._render_unified_moment_canary_context(
+                    stale_assessment,
+                    guild_id=1,
+                    channel_id=303,
+                    channel_policy="sealed_test",
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    topic_text="What changed, and what remains open?",
+                    participant_user_ids=(101,),
+                )
+            )
+            basis = bnl01_bot.UnifiedMomentCanaryPromptSourceBasis(
+                expected_digest=bnl01_bot._prompt_source_digest(rendered),
+                rendered_context=rendered,
+                assessment=stale_assessment,
+                guild_id=1,
+                channel_id=303,
+                channel_policy="sealed_test",
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                topic_text="What changed, and what remains open?",
+                participant_user_ids=(101,),
+                episode_context_present=True,
+            )
+            fresh_basis, changed = bnl01_bot.refresh_prompt_source_basis(
+                basis
+            )
+
+            self.assertTrue(present)
+            self.assertTrue(changed)
+            self.assertEqual(
+                reconciled.active_episode_source_moment_ids,
+                ("moment-one", "moment-two"),
+            )
+            self.assertEqual(
+                fresh_basis.assessment.active_episode_source_moment_ids,
+                ("moment-one", "moment-two"),
+            )
+            self.assertEqual(
+                expected_episode_ids,
+                ["episode-one", "episode-one"],
+            )
+
+        with tempfile.NamedTemporaryFile() as receipt_file, mock.patch.object(
+            bnl01_bot,
+            "DB_FILE",
+            receipt_file.name,
+        ):
+            run_id = bnl01_bot.record_unified_response_assessment_shadow(
+                stale_assessment,
+                response="The phase changed; one action remains open.",
+                guard_diagnostics={
+                    "_revalidated_prompt_source_bases": (fresh_basis,),
+                },
+            )
+            receipt_db = sqlite3.connect(receipt_file.name)
+            try:
+                receipt = receipt_db.execute(
+                    """
+                    SELECT active_episode_present,prior_moment_count
+                    FROM unified_response_assessment_shadow_runs
+                    WHERE run_id=?
+                    """,
+                    (run_id,),
+                ).fetchone()
+            finally:
+                receipt_db.close()
+        self.assertEqual(receipt, (1, 2))
+
+    def test_canary_refresh_clears_rejected_episode_sources(self):
+        stale_assessment = bnl01_bot.build_unified_response_assessment(
+            guild_id=1,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="sealed_test",
+            conversation_surface="sealed_test",
+            current_speaker_user_ids=(101,),
+            active_episode_id="episode-one",
+            active_episode_source_moment_ids=("moment-one",),
+            prompt_lanes=("current_exchange", "active_episode"),
+            continuity_required=True,
+            current_text="What changed, and what remains open?",
+        )
+        with tempfile.NamedTemporaryFile() as database_file, mock.patch.object(
+            bnl01_bot,
+            "DB_FILE",
+            database_file.name,
+        ), mock.patch.object(
+            bnl01_bot,
+            "unified_moment_canary_enabled",
+            return_value=True,
+        ), mock.patch.object(
+            bnl01_bot,
+            "render_active_episode_canary_context",
+            return_value="",
+        ):
+            rendered, present, reconciled = (
+                bnl01_bot._render_unified_moment_canary_context(
+                    stale_assessment,
+                    guild_id=1,
+                    channel_id=303,
+                    channel_policy="sealed_test",
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    topic_text="What changed, and what remains open?",
+                    participant_user_ids=(101,),
+                )
+            )
+
+        self.assertFalse(present)
+        self.assertEqual(reconciled.active_episode_id, "")
+        self.assertEqual(reconciled.active_episode_source_moment_ids, ())
+        self.assertNotIn("active_episode", reconciled.prompt_lanes)
+        rejected_basis = bnl01_bot.UnifiedMomentCanaryPromptSourceBasis(
+            expected_digest=bnl01_bot._prompt_source_digest(rendered),
+            rendered_context=rendered,
+            assessment=reconciled,
+            guild_id=1,
+            channel_id=303,
+            channel_policy="sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            topic_text="What changed, and what remains open?",
+            participant_user_ids=(101,),
+            episode_context_present=False,
+        )
+
+        with tempfile.NamedTemporaryFile() as receipt_file, mock.patch.object(
+            bnl01_bot,
+            "DB_FILE",
+            receipt_file.name,
+        ):
+            rejected_run_id = (
+                bnl01_bot.record_unified_response_assessment_shadow(
+                    stale_assessment,
+                    response="The phase changed; one action remains open.",
+                    guard_diagnostics={
+                        "_revalidated_prompt_source_bases": (
+                            rejected_basis,
+                        ),
+                    },
+                )
+            )
+            source_neutral_run_id = (
+                bnl01_bot.record_unified_response_assessment_shadow(
+                    stale_assessment,
+                    response="Current-turn answer without episode support.",
+                    guard_diagnostics={
+                        "_revalidated_prompt_source_bases": (),
+                        "source_neutral_recovery": True,
+                    },
+                )
+            )
+            receipt_db = sqlite3.connect(receipt_file.name)
+            try:
+                receipts = receipt_db.execute(
+                """
+                SELECT active_episode_present,prior_moment_count
+                FROM unified_response_assessment_shadow_runs
+                WHERE run_id IN (?,?) ORDER BY run_id
+                """,
+                    (rejected_run_id, source_neutral_run_id),
+                ).fetchall()
+            finally:
+                receipt_db.close()
+        self.assertEqual(receipts, [(0, 0), (0, 0)])
+
     def test_direct_prompt_is_byte_identical_with_shadow_on_or_off(self):
         visual_basis = SimpleNamespace(status="not_requested")
         conversation_basis = self.conversation_basis(3)
@@ -216,8 +502,11 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             return_value=True,
         ), mock.patch.object(
             bnl01_bot,
-            "_active_episode_id_for_unified_assessment",
-            return_value="mep_opaque_shadow_reference",
+            "_active_episode_reference_for_unified_assessment",
+            return_value=SimpleNamespace(
+                episode_id="mep_opaque_shadow_reference",
+                source_moment_ids=(),
+            ),
         ), mock.patch.object(
             bnl01_bot,
             "_build_unified_intelligence_packet_shadow",

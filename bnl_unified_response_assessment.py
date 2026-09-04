@@ -285,6 +285,23 @@ _SITUATION_PHASE_PATTERNS = (
         ),
     ),
     (
+        "diagnosis",
+        re.compile(
+            r"(?:\b(?:isolat(?:e|ed|ing|ion)|"
+            r"locali[sz](?:e|ed|ing|ation)|"
+            r"trac(?:e|ed|ing)|narrow(?:ed|ing)?)\b"
+            r"[^.!?\n]{0,48}"
+            r"\b(?:failure|issue|problem|defect|bug|fault|error|"
+            r"crash|regression)\b[^.!?\n]{0,24}\b(?:to|at)\b|"
+            r"\b(?:failure|issue|problem|defect|bug|fault|error|"
+            r"crash|regression)\b[^.!?\n]{0,24}"
+            r"\b(?:is|are|was|were|has\s+been|had\s+been)\b"
+            r"[^.!?\n]{0,16}\b(?:isolated|localized|localised|"
+            r"traced|narrowed)\b[^.!?\n]{0,24}\b(?:to|at)\b)",
+            re.I,
+        ),
+    ),
+    (
         "failure",
         re.compile(
             r"\b(?:failed?|failure|broken|crash(?:ed)?|error|"
@@ -519,6 +536,40 @@ _SITUATION_EXPLICIT_NEW_EVENT_RE = re.compile(
     r"\b(?:new|different|separate|another)\s+"
     r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b|"
     r"\bnot\s+(?:the\s+)?same\s+(?:event|incident|thread|case)\b",
+    re.I,
+)
+_SITUATION_NEGATED_NEW_EVENT_RE = re.compile(
+    r"\b(?:(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|"
+    r"aren(?:'|’)t|weren(?:'|’)t)\s+"
+    r"(?:(?:a|an|the)\s+)?|"
+    r"(?:(?:do|should)(?:n['’]t|\s+not)|"
+    r"let(?:['’]s|\s+us)\s+not|never)\s+"
+    r"(?:(?:start|begin|open|create)\s+|"
+    r"(?:treat|regard|count|consider|call)\s+"
+    r"(?:this|that|it)\s+as\s+)(?:(?:a|an|the)\s+)?)"
+    r"(?:new|different|separate|another)\s+"
+    r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
+    re.I,
+)
+_SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE = re.compile(
+    r"^\s*(?:(?:can|could|would|will|should)\s+(?:you|we)\s+"
+    r"(?:please\s+)?|please\s+)?"
+    r"(?:(?:start|begin|open|create)\b|"
+    r"(?:(?:treat|regard|count|call)\s+"
+    r"(?:this|that|it)\s+as\b|"
+    r"consider\s+(?:this|that|it)\s+(?:as\s+)?"
+    r"(?=(?:(?:a|an|the)\s+)?"
+    r"(?:new|different|separate|another)\b)))",
+    re.I,
+)
+_SITUATION_NEW_EVENT_UNCERTAINTY_RE = re.compile(
+    r"(?:^\s*(?:maybe|perhaps|possibly|whether|if|"
+    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+"
+    r"(?:not\s+)?sure|"
+    r"(?:(?:i|we)\s+wonder|"
+    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+wondering)"
+    r"\s+(?:if|whether))\b|"
+    r"\b(?:this|that|it)\s+(?:may|might|could|would)\s+be\b)",
     re.I,
 )
 _SITUATION_CONCURRENT_RE = re.compile(
@@ -966,6 +1017,44 @@ def _situation_temporal_scope(text: str) -> Tuple[str, str]:
     return "unspecified", "unknown"
 
 
+def _situation_explicit_new_event(text: str) -> bool:
+    unnegated = _SITUATION_NEGATED_NEW_EVENT_RE.sub("", text or "")
+    for match in _SITUATION_EXPLICIT_NEW_EVENT_RE.finditer(unnegated):
+        clause_start = max(
+            unnegated.rfind(boundary, 0, match.start())
+            for boundary in ".!?;\n"
+        ) + 1
+        clause_tail = unnegated[match.end() :]
+        clause_boundary = re.search(r"[:.!?;\n]", clause_tail)
+        clause_end = (
+            match.end() + clause_boundary.end()
+            if clause_boundary is not None
+            else len(unnegated)
+        )
+        clause = unnegated[clause_start:clause_end]
+        assertion_start = max(
+            clause_start,
+            max(
+                unnegated.rfind(boundary, clause_start, match.start())
+                for boundary in ",:—"
+            )
+            + 1,
+        )
+        cue_prefix = unnegated[assertion_start : match.end()]
+        assertion = unnegated[assertion_start:clause_end]
+        if (
+            clause.rstrip().endswith("?")
+            and not _SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(
+                assertion
+            )
+        ):
+            continue
+        if _SITUATION_NEW_EVENT_UNCERTAINTY_RE.search(cue_prefix):
+            continue
+        return True
+    return False
+
+
 def _situation_event_relation(
     *,
     current_text: str,
@@ -976,7 +1065,7 @@ def _situation_event_relation(
 ) -> str:
     state = str(moment_situation_state or "none").strip().lower()
     text = str(current_text or "")
-    if _SITUATION_EXPLICIT_NEW_EVENT_RE.search(text):
+    if _situation_explicit_new_event(text):
         return (
             "new_event_same_participant"
             if moment_participant_overlap
@@ -2301,6 +2390,7 @@ class UnifiedResponseAssessment:
     profile_sufficiency_reasons: Tuple[str, ...] = ()
     situation_frame: SituationFrameV1 | None = None
     frame_revalidation: FrameSourceRevalidationResult | None = None
+    active_episode_source_moment_ids: Tuple[str, ...] = ()
 
 
 def build_unified_response_assessment(
@@ -2315,6 +2405,7 @@ def build_unified_response_assessment(
     speaker_labels: Sequence[str] = (),
     current_exchange_source_ids: Sequence[int] = (),
     active_episode_id: str = "",
+    active_episode_source_moment_ids: Sequence[str] = (),
     prior_moment_ids: Sequence[str] = (),
     governed_entry_ids: Sequence[str] = (),
     relationship_candidate_keys: Sequence[str] = (),
@@ -2369,6 +2460,9 @@ def build_unified_response_assessment(
     )
     labels = _unique_strings(speaker_labels)
     exchange_ids = _unique_positive_ints(current_exchange_source_ids)
+    episode_source_moment_ids = _unique_strings(
+        active_episode_source_moment_ids
+    )
     moment_ids = _unique_strings(prior_moment_ids)
     governed_ids = _unique_strings(governed_entry_ids)
     relationship_keys = _unique_strings(relationship_candidate_keys)
@@ -2739,6 +2833,7 @@ def build_unified_response_assessment(
             )
             else None
         ),
+        active_episode_source_moment_ids=episode_source_moment_ids,
     )
 
 
@@ -3811,7 +3906,14 @@ def persist_shadow_run(
         len(assessment.participant_user_ids),
         len(assessment.current_exchange_source_ids),
         int(bool(assessment.active_episode_id)),
-        len(assessment.prior_moment_ids),
+        len(
+            _unique_strings(
+                (
+                    *assessment.prior_moment_ids,
+                    *assessment.active_episode_source_moment_ids,
+                )
+            )
+        ),
         assessment.moment_candidate_count,
         len(assessment.governed_entry_ids),
         assessment.governed_candidate_count,

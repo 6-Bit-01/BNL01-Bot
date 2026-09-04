@@ -496,6 +496,102 @@ class SituationFrameV1Tests(unittest.TestCase):
                 "new_event_same_participant",
             ),
             (
+                "This is not a separate task; continue the same incident.",
+                "resume",
+            ),
+            (
+                "No new task here; keep working on the same incident.",
+                "same_event",
+            ),
+            (
+                "Don't start a new task; continue this incident.",
+                "resume",
+            ),
+            (
+                "Do not treat this as a separate task.",
+                "same_event",
+            ),
+            (
+                "We should not start a new task; continue this incident.",
+                "resume",
+            ),
+            (
+                "Let's not start a new task.",
+                "same_event",
+            ),
+            (
+                "Never start a new task; continue this incident.",
+                "resume",
+            ),
+            (
+                "Is this a separate task, or should we continue?",
+                "resume",
+            ),
+            (
+                "So, is this a separate task?",
+                "same_event",
+            ),
+            (
+                "Isn't this a separate task?",
+                "same_event",
+            ),
+            (
+                "This is a separate task?",
+                "same_event",
+            ),
+            (
+                "Does this count as a separate task?",
+                "same_event",
+            ),
+            (
+                "Is the decoder work a separate task?",
+                "same_event",
+            ),
+            (
+                "This is a separate task, right?",
+                "same_event",
+            ),
+            (
+                "Maybe this is a separate task; I am not sure yet.",
+                "same_event",
+            ),
+            (
+                "It might be a separate task.",
+                "same_event",
+            ),
+            (
+                "Can you start another task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Okay, can you start another task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Before we continue, can you start a new task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Can we treat this as a new task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Could you consider this a separate task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Even if it looks similar, this is a separate incident.",
+                "new_event_same_participant",
+            ),
+            (
+                "This is a separate task. What remains open?",
+                "new_event_same_participant",
+            ),
+            (
+                "This is a separate task: what should we do next?",
+                "new_event_same_participant",
+            ),
+            (
                 "Meanwhile, keep the synth retest running in parallel.",
                 "concurrent_activity",
             ),
@@ -533,6 +629,152 @@ class SituationFrameV1Tests(unittest.TestCase):
         self.assertEqual(unresolved.status, "ambiguous")
         self.assertIn("resume_target_unresolved", unresolved.ambiguity_reasons)
         self.assertIn("resume_episode_candidates", unresolved.competing_frames)
+
+    def test_isolated_failure_is_a_diagnosis_phase_transition(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=(
+                "Project Glass Harbor update: the relay test passed, so the "
+                "transport route is clean. The amber failure is now isolated "
+                "to the decoder input. What changed, and what is still "
+                "unresolved?"
+            ),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment_glass_harbor",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.phase, "diagnosis")
+        self.assertEqual(frame.event_relation, "same_event_new_phase")
+        self.assertEqual(frame.status, "resolved")
+
+    def test_narrow_execution_window_is_not_a_diagnosis(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=(
+                "There is a narrow window to deploy the decoder fix."
+            ),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment_glass_harbor",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.phase, "execution")
+        self.assertEqual(frame.tasks[0].task_kind, "execution")
+        self.assertEqual(frame.event_relation, "same_event")
+
+        diagnosis = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=(
+                "We narrowed the amber failure to the decoder input."
+            ),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment_glass_harbor",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+        self.assertEqual(diagnosis.phase, "diagnosis")
+        self.assertEqual(diagnosis.tasks[0].task_kind, "diagnosis")
+        self.assertEqual(
+            diagnosis.event_relation,
+            "same_event_new_phase",
+        )
+
+        narrowing = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=(
+                "We are narrowing the crash to the decoder input."
+            ),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment_glass_harbor",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+        self.assertEqual(narrowing.phase, "diagnosis")
+
+        deployment_window = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=(
+                "After the failure, we narrowed the deployment window "
+                "to ten minutes."
+            ),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment_glass_harbor",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+        self.assertNotEqual(deployment_window.phase, "diagnosis")
+
+        for ordinary_text in (
+            "The artist is isolated at home, so start the broadcast.",
+            "We traced the route to the venue and started the broadcast.",
+        ):
+            with self.subTest(ordinary_text=ordinary_text):
+                ordinary = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="sealed_test",
+                    channel_policy="sealed_test",
+                    current_text=ordinary_text,
+                    current_speaker_user_ids=(101,),
+                    subject_user_ids=(101,),
+                    moment_id="moment_glass_harbor",
+                    moment_situation_state="recent_active",
+                    moment_topic_coherent=True,
+                    moment_participant_overlap=True,
+                    response_act="answer",
+                )
+                self.assertNotEqual(ordinary.phase, "diagnosis")
+
+        passive_diagnosis = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=(
+                "The amber failure is now isolated to the decoder input."
+            ),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment_glass_harbor",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+        self.assertEqual(passive_diagnosis.phase, "diagnosis")
 
     def test_revalidation_is_separate_and_fails_closed_by_state(self):
         frame = build_situation_frame_v1(
