@@ -118,6 +118,8 @@ class SituationFrameV1Tests(unittest.TestCase):
             "What do you know about me?",
             "Tell me who I am.",
             "What patterns keep recurring for me?",
+            "What recurring themes keep coming up for me?",
+            "Sealed acceptance fixture: based only on memory, what recurring themes keep coming up for me?",
         )
         for text in cases:
             with self.subTest(text=text):
@@ -143,6 +145,12 @@ class SituationFrameV1Tests(unittest.TestCase):
                     "third_party_subject_unresolved",
                     frame.ambiguity_reasons,
                 )
+                self.assertEqual(frame.subject_requirement, "required")
+                self.assertEqual(
+                    frame.tasks[0].subject_requirement,
+                    "required",
+                )
+                self.assertEqual(frame.tasks[0].subject_indexes, (0,))
 
     def test_bnl_self_questions_bind_the_existing_canon_entity(self):
         cases = (

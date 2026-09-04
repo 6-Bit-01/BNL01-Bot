@@ -1261,6 +1261,35 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertIn("Alex (@alex.signal)", broad)
             self.assertIn("queue/wheel", broad)
 
+            personal_recurrence_query = (
+                "Sealed acceptance fixture: based only on memory, what "
+                "recurring themes keep coming up for me?"
+            )
+            personal_recurrence_context = build_tiktok_show_evidence_context(
+                db_file,
+                guild_id=77,
+                user_text=personal_recurrence_query,
+                subject_user_id=42,
+            )
+            self.assertIn(
+                "Durable BARCODE Radio show episode memory:",
+                personal_recurrence_context,
+            )
+            conn = sqlite3.connect(db_file)
+            personal_recurrence_items = select_tiktok_show_episode_context_items(
+                conn,
+                guild_id=77,
+                user_text=personal_recurrence_query,
+                subject_user_id=42,
+                allow_subject_continuity=True,
+            )
+            conn.close()
+            self.assertTrue(personal_recurrence_items)
+            self.assertIn(
+                "community",
+                {item.kind for item in personal_recurrence_items},
+            )
+
             topic_excerpt = build_tiktok_show_evidence_context(
                 db_file,
                 guild_id=77,

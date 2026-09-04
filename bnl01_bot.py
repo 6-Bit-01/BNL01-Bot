@@ -36272,11 +36272,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 len(unique_user_ids) == 1
                 and batch_ordinary_chat_scope.eligible
             )
-            batch_source_no_store_reason = (
-                "finalized_show_evidence_no_store"
-                if batch_tiktok_show_evidence_context
-                else "website_read_model_no_store"
-            )
             batch_public_tiktok_memory_allowed = (
                 public_tiktok_interaction_memory_allowed(
                     combined_text,
@@ -36284,6 +36279,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_website_read_model_context,
                 )
             )
+            batch_model_persistence_allowed = (
+                model_response_persistence_allowed_with_website_context(
+                    combined_text,
+                    channel_policy,
+                    batch_website_read_model_context,
+                )
+            )
+            batch_source_no_store_reason = "website_read_model_no_store"
             batch_website_read_model_prompt_block = ""
             if (
                 batch_website_read_model_context
@@ -37287,12 +37290,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 get_route_mode_contract(
                     ROUTE_MODE_NORMAL_CHAT
                 ).save_behavior
-                if batch_public_tiktok_memory_allowed
+                if batch_model_persistence_allowed
                 else "none"
-                if batch_source_context_available
-                else get_route_mode_contract(
-                    ROUTE_MODE_NORMAL_CHAT
-                ).save_behavior
             ),
             source_analysis_context_injected=(
                 batch_source_context_available
@@ -37308,6 +37307,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             save_policy_reason=(
                 "public_tiktok_interaction_normal_memory"
                 if batch_public_tiktok_memory_allowed
+                else "public_memory_sources_normal_memory"
+                if batch_model_persistence_allowed
+                and batch_source_context_available
                 else batch_source_no_store_reason
                 if batch_source_context_available
                 else "batch_model_save_pending"
@@ -38533,10 +38535,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="batch_discord_send_failed",
             )
             return
-        if (
-            batch_source_context_available
-            and not batch_public_tiktok_memory_allowed
-        ):
+        if not batch_model_persistence_allowed:
             logging.info(
                 "batch_response_persistence_skipped "
                 "reason=%s channel_policy=%s",

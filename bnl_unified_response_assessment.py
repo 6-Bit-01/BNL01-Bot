@@ -381,7 +381,7 @@ _SELF_SUBJECT_CUE_RE = re.compile(
     r"\b(?:what\s+(?:am\s+i|do\s+you\s+(?:know|remember)\s+about\s+me)|"
     r"tell\s+me\s+(?:what|who)\s+i\s+am|about\s+me|my\s+(?:profile|"
     r"history|role|work|music|preferences?|goals?|memory|story)|"
-    r"remember\s+me|what\s+(?:patterns?|themes?)\s+(?:keep\s+)?"
+    r"remember\s+me|what\s+(?:recurring\s+)?(?:patterns?|themes?)\s+(?:keep\s+)?"
     r"(?:recurring|coming\s+up)\s+for\s+me|"
     r"what\s+keeps\s+(?:recurring|coming\s+up)\s+for\s+me)\b",
     re.I,
