@@ -3425,6 +3425,73 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
             self.assertTrue(addressing.directly_targets_bnl)
             self.assertGreater(addressing.reply_conversation_row_id, 0)
 
+    def test_resolved_unsaved_bnl_reply_carries_turn_local_source_text(self):
+        reply_text = (
+            "The Journal described the queue trial. The queue is closed now."
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            message = SimpleNamespace(
+                id=9100,
+                content=(
+                    "What part came from the Journal, and what part is the "
+                    "current status?"
+                ),
+                author=SimpleNamespace(id=44, display_name="Member"),
+                guild=SimpleNamespace(id=77, members=[]),
+                channel=SimpleNamespace(
+                    id=700,
+                    name="home",
+                    category=None,
+                    guild=SimpleNamespace(id=77),
+                ),
+                raw_mentions=[],
+                mentions=[],
+                reference=SimpleNamespace(
+                    resolved=SimpleNamespace(
+                        id=9001,
+                        content=reply_text,
+                        author=SimpleNamespace(
+                            id=999,
+                            display_name="BNL-01",
+                        ),
+                        channel=SimpleNamespace(id=700),
+                    ),
+                    message_id=9001,
+                ),
+            )
+            with (
+                mock.patch.object(bnl01_bot, "DB_FILE", db_path),
+                mock.patch.object(
+                    bnl01_bot,
+                    "_load_bnl_self_name_records",
+                    return_value=(),
+                ),
+                mock.patch.object(
+                    bnl01_bot.client._connection,
+                    "user",
+                    SimpleNamespace(id=999, display_name="BNL-01"),
+                ),
+            ):
+                addressing = bnl01_bot.resolve_discord_turn_addressing(
+                    message
+                )
+
+        self.assertTrue(addressing.reply_targets_bnl)
+        self.assertEqual(addressing.reply_conversation_row_id, 0)
+        self.assertEqual(addressing.reply_source_text, reply_text)
+        self.assertEqual(addressing.reply_source_channel_id, 700)
+        self.assertEqual(
+            bnl01_bot.transient_discord_reply_sources((addressing,)),
+            (
+                bnl01_bot.TransientDiscordReplySource(
+                    message_id=9001,
+                    content=reply_text,
+                    channel_id=700,
+                ),
+            ),
+        )
+
     def test_unresolved_discord_reference_to_member_stays_third_party_only(
         self,
     ):

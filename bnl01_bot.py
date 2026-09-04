@@ -148,6 +148,7 @@ from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
     ConversationContextResult,
+    TransientDiscordReplySource,
     assess_payload_grounding,
     assess_reply_referent_grounding,
     assemble_conversation_context_v2,
@@ -3238,10 +3239,40 @@ def public_tiktok_interaction_memory_allowed(
     )
 
 
+def turn_local_discord_reply_requires_no_store(
+    prompt_source_bases=(),
+) -> bool:
+    """Keep replies derived from an unsaved Discord referent turn-local."""
+
+    return any(
+        bool(
+            tuple(
+                getattr(
+                    basis,
+                    "transient_referent_message_ids",
+                    (),
+                )
+                or ()
+            )
+            or tuple(
+                getattr(
+                    basis,
+                    "transient_referent_texts",
+                    (),
+                )
+                or ()
+            )
+        )
+        for basis in tuple(prompt_source_bases or ())
+    )
+
+
 def model_response_persistence_allowed_with_website_context(
     user_text: str,
     channel_policy: str,
     website_read_model_context: str,
+    *,
+    prompt_source_bases=(),
 ) -> bool:
     """Keep ordinary continuity while excluding injected website snapshots.
 
@@ -3252,6 +3283,8 @@ def model_response_persistence_allowed_with_website_context(
     writer.
     """
 
+    if turn_local_discord_reply_requires_no_store(prompt_source_bases):
+        return False
     context = str(website_read_model_context or "")
     return bool(
         not context
@@ -13293,6 +13326,8 @@ class DiscordTurnAddressing:
     source_message_id: int = 0
     reply_message_id: int = 0
     reply_conversation_row_id: int = 0
+    reply_source_text: str = ""
+    reply_source_channel_id: int = 0
     speaker_user_id: int = 0
     explicit_tag_user_ids: tuple[int, ...] = ()
     reply_target_user_id: int = 0
@@ -13328,6 +13363,35 @@ class DiscordTurnAddressing:
         if self.bnl_name_state not in {"", "none", "other_human", "denied"}:
             return "self_name_%s" % self.bnl_name_state
         return "none"
+
+
+def transient_discord_reply_sources(
+    addressings: tuple[DiscordTurnAddressing, ...],
+) -> tuple[TransientDiscordReplySource, ...]:
+    """Carry unsaved exact BNL replies through one prompt, never into storage."""
+
+    sources = []
+    seen_message_ids = set()
+    for addressing in addressings:
+        message_id = int(addressing.reply_message_id or 0)
+        content = str(addressing.reply_source_text or "").strip()
+        if (
+            not addressing.reply_targets_bnl
+            or int(addressing.reply_conversation_row_id or 0) > 0
+            or message_id <= 0
+            or message_id in seen_message_ids
+            or not content
+        ):
+            continue
+        seen_message_ids.add(message_id)
+        sources.append(
+            TransientDiscordReplySource(
+                message_id=message_id,
+                content=content,
+                channel_id=int(addressing.reply_source_channel_id or 0),
+            )
+        )
+    return tuple(sources)
 
 
 _CANONICAL_BNL_NAME_RE = re.compile(
@@ -14735,6 +14799,26 @@ def resolve_discord_turn_addressing(
         ),
         message_id=reply_message_id,
     )
+    resolved_reply_is_bnl = bool(
+        reply_author and bot_id and reply_author_id == bot_id
+    )
+    reply_source_text = (
+        str(getattr(resolved_reference, "content", "") or "").strip()[:4000]
+        if resolved_reply_is_bnl and reply_conversation_row_id <= 0
+        else ""
+    )
+    reply_source_channel_id = (
+        int(
+            getattr(
+                getattr(resolved_reference, "channel", None),
+                "id",
+                0,
+            )
+            or 0
+        )
+        if reply_source_text
+        else 0
+    )
     reply_target = "none"
     if reply_author:
         reply_target = "BNL-01" if bot_id and reply_author_id == bot_id else _safe_discord_display_name(reply_author)
@@ -14845,6 +14929,8 @@ def resolve_discord_turn_addressing(
         source_message_id=int(getattr(message, "id", 0) or 0),
         reply_message_id=reply_message_id,
         reply_conversation_row_id=reply_conversation_row_id,
+        reply_source_text=reply_source_text,
+        reply_source_channel_id=reply_source_channel_id,
         speaker_user_id=int(
             getattr(getattr(message, "author", None), "id", 0) or 0
         ),
@@ -21335,6 +21421,7 @@ def build_conversation_context_v2_for_prompt(
     current_participants: set[int] | None = None, is_direct_target: bool = False, is_reply_to_bnl: bool = False,
     referenced_message_ids: set[int] | None = None,
     referenced_conversation_row_ids: set[int] | None = None,
+    transient_reply_sources: tuple[TransientDiscordReplySource, ...] | None = None,
     is_batch: bool = False,
     is_deferred_payload_session: bool = False, now=None, route_allowed_sources=None,
     result_out: dict | None = None,
@@ -21369,6 +21456,7 @@ def build_conversation_context_v2_for_prompt(
             for x in (referenced_conversation_row_ids or set())
             if x
         ),
+        transient_reply_sources=tuple(transient_reply_sources or ()),
         is_direct_target=bool(is_direct_target), is_reply_to_bnl=bool(is_reply_to_bnl), is_batch=bool(is_batch),
         is_deferred_payload_session=bool(is_deferred_payload_session), now=now or datetime.now(timezone.utc),
         route_allowed_sources=frozenset(route_allowed_sources or getattr(get_route_mode_contract(route_mode), "allowed_context_sources", frozenset())),
@@ -21544,7 +21632,7 @@ def format_room_context_for_prompt(rows: list[dict], current_user_name: str = ""
     return "\n".join(rendered)
 
 
-def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct", current_text: str = "", current_has_media: bool = False, *, current_user_id: int = 0, current_message_ids: set[int] | None = None, referenced_message_ids: set[int] | None = None, referenced_conversation_row_ids: set[int] | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, conversation_surface: str = "unknown", is_direct_target: bool = False, is_reply_to_bnl: bool = False, is_batch: bool = False, is_deferred_payload_session: bool = False, context_result_out: dict | None = None) -> str:
+def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct", current_text: str = "", current_has_media: bool = False, *, current_user_id: int = 0, current_message_ids: set[int] | None = None, referenced_message_ids: set[int] | None = None, referenced_conversation_row_ids: set[int] | None = None, transient_reply_sources: tuple[TransientDiscordReplySource, ...] | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, conversation_surface: str = "unknown", is_direct_target: bool = False, is_reply_to_bnl: bool = False, is_batch: bool = False, is_deferred_payload_session: bool = False, context_result_out: dict | None = None) -> str:
     if conversation_context_v2_enabled():
         formatted = build_conversation_context_v2_for_prompt(
             guild_id=guild_id,
@@ -21561,6 +21649,7 @@ def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name
             referenced_conversation_row_ids=(
                 referenced_conversation_row_ids or set()
             ),
+            transient_reply_sources=transient_reply_sources or (),
             is_direct_target=is_direct_target,
             is_reply_to_bnl=is_reply_to_bnl,
             is_batch=is_batch,
@@ -26342,6 +26431,8 @@ class ConversationPromptSourceBasis:
         ConversationEvidenceItem, ...
     ] = ()
     referent_scope_expanded: bool = False
+    transient_referent_message_ids: tuple[int, ...] = ()
+    transient_referent_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -28451,6 +28542,39 @@ def build_memory_prompt_source_basis(
     )
 
 
+def _conversation_prompt_basis_digest(
+    source_digest: str,
+    transient_message_ids: tuple[int, ...],
+    transient_texts: tuple[str, ...],
+) -> str:
+    """Bind turn-local Discord referents into the immutable prompt basis."""
+
+    if not transient_message_ids and not transient_texts:
+        return source_digest
+    return _prompt_source_digest(
+        json.dumps(
+            {
+                "conversation_source_digest": source_digest,
+                "transient_discord_referents": [
+                    {
+                        "message_id": int(message_id or 0),
+                        "content_digest": hashlib.sha256(
+                            str(text or "").encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    for message_id, text in zip(
+                        transient_message_ids,
+                        transient_texts,
+                    )
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
 def build_conversation_prompt_source_basis(
     rendered_context: str,
     *,
@@ -28484,6 +28608,25 @@ def build_conversation_prompt_source_basis(
             getattr(context_result, "referent_competing_row_ids", ()) or ()
         )
         if int(row_id or 0) > 0
+    )
+    transient_referent_message_ids = tuple(
+        int(message_id or 0)
+        for message_id in (
+            getattr(
+                context_result,
+                "transient_referent_message_ids",
+                (),
+            )
+            or ()
+        )
+        if int(message_id or 0) > 0
+    )
+    transient_referent_texts = tuple(
+        str(text or "").strip()
+        for text in (
+            getattr(context_result, "transient_referent_texts", ()) or ()
+        )
+        if str(text or "").strip()
     )
     tracked_referent_row_ids = set(
         (*referent_source_row_ids, *referent_competing_row_ids)
@@ -28589,6 +28732,15 @@ def build_conversation_prompt_source_basis(
             for row_id in referent_source_row_ids
             for row in (rows_by_id.get(row_id),)
             if row is not None and str(row.get("content") or "").strip()
+        ) + tuple(
+            build_conversation_evidence_item(
+                text=text,
+                source_id=0,
+                speaker_user_id=0,
+                speaker_label="BNL-01",
+                current_turn=False,
+            )
+            for text in transient_referent_texts
         )
         referent_competing_evidence_items = tuple(
             build_conversation_evidence_item(
@@ -28613,7 +28765,7 @@ def build_conversation_prompt_source_basis(
         # Hand-built/test continuity blocks can lack resolvable rows. Preserve
         # the older conservative candidate digest for that compatibility path;
         # production-rendered v2 blocks carry exact source ids.
-        digest = (
+        source_digest = (
             _prompt_source_digest(
                 json.dumps(
                     [
@@ -28632,6 +28784,11 @@ def build_conversation_prompt_source_basis(
                 channel_name=channel_name,
                 channel_policy=channel_policy,
             )
+        )
+        digest = _conversation_prompt_basis_digest(
+            source_digest,
+            transient_referent_message_ids,
+            transient_referent_texts,
         )
     except sqlite3.Error:
         return None
@@ -28662,6 +28819,8 @@ def build_conversation_prompt_source_basis(
         referent_scope_expanded=bool(
             getattr(context_result, "referent_scope_expanded", False)
         ),
+        transient_referent_message_ids=transient_referent_message_ids,
+        transient_referent_texts=transient_referent_texts,
     )
 
 
@@ -28844,7 +29003,7 @@ def refresh_prompt_source_basis(
     tracked_conversation_row_ids = (
         basis.revalidation_row_ids or basis.source_row_ids
     )
-    fresh_digest = (
+    source_digest = (
         _conversation_prompt_selected_digest(
             guild_id=basis.guild_id,
             source_row_ids=tracked_conversation_row_ids,
@@ -28857,6 +29016,11 @@ def refresh_prompt_source_basis(
             channel_name=basis.channel_name,
             channel_policy=basis.channel_policy,
         )
+    )
+    fresh_digest = _conversation_prompt_basis_digest(
+        source_digest,
+        basis.transient_referent_message_ids,
+        basis.transient_referent_texts,
     )
     fresh = replace(basis, expected_digest=fresh_digest)
     return fresh, fresh.expected_digest != basis.expected_digest
@@ -35308,8 +35472,21 @@ def build_active_batch_conversation_context_v2_prompt(
                 or 0
             )
         },
+        transient_reply_sources=transient_discord_reply_sources(
+            tuple(
+                addressing
+                for item in current_items
+                for addressing in (getattr(item, "addressing", None),)
+                if isinstance(addressing, DiscordTurnAddressing)
+            )
+        ),
         is_batch=True,
         is_direct_target=bool(active_packet.get("addressed_to_bot")),
+        is_reply_to_bnl=any(
+            isinstance(getattr(item, "addressing", None), DiscordTurnAddressing)
+            and bool(item.addressing.reply_targets_bnl)
+            for item in current_items
+        ),
         is_deferred_payload_session=bool(pending_state or pending_anchor),
         result_out=result_out,
     )
@@ -38347,18 +38524,28 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         if active_packet.get("media_present"):
             mark_recent_media_events_response_state(guild_id, channel_id, set(unique_user_ids), channel_policy, "responded")
 
-        await asyncio.to_thread(
-            save_model_message,
-            first_uid,
-            channel.guild.id,
-            response,
-            channel_name=getattr(channel, "name", ""),
-            channel_policy=channel_policy,
-            channel_id=channel_id,
-            route_mode=ROUTE_MODE_NORMAL_CHAT,
-            conversation_target_user_ids=tuple(unique_user_ids),
-            discord_message_ids=tuple(sent_message_ids),
-        )
+        if turn_local_discord_reply_requires_no_store(
+            batch_presend_source_bases
+        ):
+            logging.info(
+                "batch_response_persistence_skipped "
+                "reason=turn_local_discord_reply_no_store "
+                "channel_policy=%s",
+                channel_policy,
+            )
+        else:
+            await asyncio.to_thread(
+                save_model_message,
+                first_uid,
+                channel.guild.id,
+                response,
+                channel_name=getattr(channel, "name", ""),
+                channel_policy=channel_policy,
+                channel_id=channel_id,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                conversation_target_user_ids=tuple(unique_user_ids),
+                discord_message_ids=tuple(sent_message_ids),
+            )
         await persist_batch_bnl_self_name_decision_after_send_async(
             items,
             response=response,
@@ -40297,6 +40484,9 @@ async def _generate_direct_payload_session(session_key, reason: str):
         }
         if session_addressing.reply_conversation_row_id
         else set(),
+        transient_reply_sources=transient_discord_reply_sources(
+            (session_addressing,)
+        ),
         route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
         is_direct_target=True,
         is_deferred_payload_session=True,
@@ -40723,6 +40913,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
             direct_content,
             session.get("channel_policy", "unknown"),
             website_read_model_context,
+            prompt_source_bases=direct_payload_presend_source_bases,
         )
     )
     if direct_payload_model_persistence_allowed:
@@ -40737,10 +40928,22 @@ async def _generate_direct_payload_session(session_key, reason: str):
             route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
             discord_message_ids=tuple(sent_message_ids),
         )
-    elif website_read_model_context:
+    elif (
+        website_read_model_context
+        or turn_local_discord_reply_requires_no_store(
+            direct_payload_presend_source_bases
+        )
+    ):
         logging.info(
             "direct_payload_response_persistence_skipped "
-            "reason=website_read_model_no_store channel_policy=%s",
+            "reason=%s channel_policy=%s",
+            (
+                "turn_local_discord_reply_no_store"
+                if turn_local_discord_reply_requires_no_store(
+                    direct_payload_presend_source_bases
+                )
+                else "website_read_model_no_store"
+            ),
             session.get("channel_policy", "unknown"),
         )
     await persist_bnl_self_name_decision_after_send_async(
@@ -44494,6 +44697,7 @@ async def send_planned_conversation_response(
             getattr(message, "content", ""),
             plan.channel_policy,
             website_read_model_context,
+            prompt_source_bases=prompt_source_bases,
         )
     )
     if direct_model_persistence_allowed:
@@ -44509,10 +44713,22 @@ async def send_planned_conversation_response(
             discord_message_ids=tuple(sent_message_ids),
         )
         logging.info("model_conversation_row_after_send route=%s channel_policy=%s saved=%s reason=%s", plan.route_mode, plan.channel_policy, int(bool(getattr(model_decision, "save_conversation", False))), getattr(model_decision, "reason", "unknown"))
-    elif allow_model_save and website_read_model_context:
+    elif allow_model_save and (
+        website_read_model_context
+        or turn_local_discord_reply_requires_no_store(
+            prompt_source_bases
+        )
+    ):
         logging.info(
             "direct_response_persistence_skipped "
-            "reason=website_read_model_no_store channel_policy=%s",
+            "reason=%s channel_policy=%s",
+            (
+                "turn_local_discord_reply_no_store"
+                if turn_local_discord_reply_requires_no_store(
+                    prompt_source_bases
+                )
+                else "website_read_model_no_store"
+            ),
             plan.channel_policy,
         )
     await persist_bnl_self_name_decision_after_send_async(
@@ -45556,6 +45772,9 @@ async def on_message(message: discord.Message):
                 }
                 if turn_addressing.reply_conversation_row_id
                 else set(),
+                transient_reply_sources=transient_discord_reply_sources(
+                    (turn_addressing,)
+                ),
                 route_mode=route_mode,
                 conversation_surface=conversation_surface,
                 is_direct_target=turn_addressing.addresses_bnl,
@@ -46075,6 +46294,9 @@ async def on_message(message: discord.Message):
             }
             if turn_addressing.reply_conversation_row_id
             else set(),
+            transient_reply_sources=transient_discord_reply_sources(
+                (turn_addressing,)
+            ),
             route_mode=route_mode,
             conversation_surface=conversation_surface,
             is_direct_target=turn_addressing.addresses_bnl,
@@ -46543,6 +46765,9 @@ async def on_message(message: discord.Message):
             }
             if turn_addressing.reply_conversation_row_id
             else set(),
+            transient_reply_sources=transient_discord_reply_sources(
+                (turn_addressing,)
+            ),
             route_mode=route_mode,
             conversation_surface=conversation_surface,
             is_direct_target=turn_addressing.addresses_bnl,

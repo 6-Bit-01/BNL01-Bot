@@ -209,6 +209,15 @@ WHEEL_STATE_RE = re.compile(r"\bwheel spins?\b|\bwheel\b(?=.*\b(?:owed|enabled|c
 UNSAFE_HISTORY_RE = re.compile(r"(?:\b(?:provider|host|preview|embed|media_buffer|media-storage|media storage|storage_diagnostic|storage diagnostic)\s*=|\bstored[- ]visual[- ]description\b|\binternal diagnostic\b|\bsource-mode\b|\bmode contamination\b)", re.I)
 
 @dataclass(frozen=True)
+class TransientDiscordReplySource:
+    """One resolved Discord reply target carried only for the current turn."""
+
+    message_id: int
+    content: str
+    channel_id: int = 0
+
+
+@dataclass(frozen=True)
 class ConversationContextRequest:
     guild_id: int
     current_user_id: int
@@ -224,6 +233,7 @@ class ConversationContextRequest:
     referenced_conversation_row_ids: frozenset[int] = field(
         default_factory=frozenset
     )
+    transient_reply_sources: tuple[TransientDiscordReplySource, ...] = ()
     is_direct_target: bool = False
     is_reply_to_bnl: bool = False
     is_batch: bool = False
@@ -256,6 +266,8 @@ class ConversationContextResult:
     referent_candidate_labels: tuple[str, ...] = ()
     referent_reason: str = ""
     referent_scope_expanded: bool = False
+    transient_referent_message_ids: tuple[int, ...] = ()
+    transient_referent_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1036,8 +1048,62 @@ def _unsafe_row(row: dict) -> bool:
     if UNSAFE_HISTORY_RE.search(content):
         return True
     if role in {"model", "assistant", "bnl"} and _unsafe_operational_state_assertion(content):
-        return True
+        # A resolved Discord reply to BNL may carry the exact visible wording of
+        # a no-store operational answer. It is eligible only as the structural
+        # referent for this turn; the rendered contract explicitly forbids using
+        # it as current-state evidence. Ordinary stored history remains blocked.
+        return not bool(row.get("_transient_exact_reply_source"))
     return False
+
+
+def _transient_exact_reply_rows(
+    req: ConversationContextRequest,
+) -> list[dict]:
+    """Normalize exact Discord reply targets without creating conversation rows."""
+
+    referenced_message_ids = {
+        int(message_id)
+        for message_id in req.referenced_message_ids
+        if int(message_id or 0) > 0
+    }
+    rows = []
+    seen_message_ids = set()
+    for source in req.transient_reply_sources:
+        if not isinstance(source, TransientDiscordReplySource):
+            continue
+        message_id = int(source.message_id or 0)
+        source_channel_id = int(source.channel_id or 0)
+        content = str(source.content or "").strip()
+        if (
+            message_id <= 0
+            or message_id not in referenced_message_ids
+            or message_id in seen_message_ids
+            or not content
+            or (
+                source_channel_id > 0
+                and int(req.channel_id or 0) > 0
+                and source_channel_id != int(req.channel_id or 0)
+            )
+        ):
+            continue
+        seen_message_ids.add(message_id)
+        rows.append(
+            {
+                "id": 0,
+                "role": "model",
+                "content": content,
+                "user_id": 0,
+                "user_name": "BNL-01",
+                "channel_id": int(req.channel_id or source_channel_id or 0),
+                "channel_name": str(req.channel_name or ""),
+                "channel_policy": str(req.channel_policy or "unknown"),
+                "timestamp": req.now.isoformat(),
+                "message_id": message_id,
+                "prompt_history_excluded": False,
+                "_transient_exact_reply_source": True,
+            }
+        )
+    return rows
 
 
 def nearby_contribution_referent_requested(text: str) -> bool:
@@ -1538,6 +1604,7 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     current_norms = {normalize_text(t) for t in req.current_texts if normalize_text(t)}
     current_text = " ".join(req.current_texts)
     source_rows = list(rows)
+    transient_reply_rows = _transient_exact_reply_rows(req)
     paired_all, unpaired_all, orphan_models = _pair_rows([dict(row) for row in source_rows])
     dupes, excluded = 0, 0
 
@@ -1655,6 +1722,9 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         ok, same = _eligible_row(row)
         if ok and same:
             referent_eligible_rows.append(dict(row, _same_room=True))
+    referent_eligible_rows.extend(
+        dict(row, _same_room=True) for row in transient_reply_rows
+    )
     excluded += len(orphan_models)
     scored_same, scored_cross = [], []
     for pair in pairs:
@@ -1922,7 +1992,8 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                 ("structural_referent", referent_resolution.reason),
             )
         )
-        candidate_row_ids.add(row_id)
+        if row_id > 0:
+            candidate_row_ids.add(row_id)
     for row in open_unpaired:
         reason = str(row.get("_unpaired_reason") or "open_loop_unpaired")
         if int(row.get("id") or 0) in candidate_row_ids:
@@ -1996,6 +2067,8 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     reasons: list[str] = [focus_reason] if focus_reason else []
     rendered_same = rendered_cross = rendered_unpaired = 0
     rendered_row_ids: set[int] = set()
+    rendered_transient_message_ids: set[int] = set()
+    rendered_transient_texts: list[str] = []
     if candidates:
         if not _append_block(lines, header, MAX_RENDERED_CHARS):
             lines = []
@@ -2085,7 +2158,18 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                 reasons.extend(why)
             elif kind in {"referent_user", "referent_model"}:
                 row_id = int(item.get("id") or 0)
-                if row_id in rendered_row_ids:
+                transient_exact_reply = bool(
+                    item.get("_transient_exact_reply_source")
+                )
+                transient_message_id = int(item.get("message_id") or 0)
+                if (
+                    (row_id > 0 and row_id in rendered_row_ids)
+                    or (
+                        transient_exact_reply
+                        and transient_message_id
+                        in rendered_transient_message_ids
+                    )
+                ):
                     continue
                 exact_discord_reply = (
                     referent_resolution.reason == "discord_reply_source"
@@ -2111,8 +2195,14 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                 ]
                 if not _append_block(lines, block, MAX_RENDERED_CHARS):
                     continue
-                row_ids.append(row_id)
-                rendered_row_ids.add(row_id)
+                if transient_exact_reply:
+                    rendered_transient_message_ids.add(transient_message_id)
+                    rendered_transient_texts.append(
+                        str(item.get("content") or "").strip()
+                    )
+                else:
+                    row_ids.append(row_id)
+                    rendered_row_ids.add(row_id)
                 rendered_unpaired += 1
                 reasons.extend(why)
     resolved_referent_ids = tuple(
@@ -2120,15 +2210,30 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         for row in referent_resolution.selected
         if int(row.get("id") or 0) > 0
     )
+    resolved_transient_message_ids = tuple(
+        int(row.get("message_id") or 0)
+        for row in referent_resolution.selected
+        if row.get("_transient_exact_reply_source")
+        and int(row.get("message_id") or 0) > 0
+    )
     final_referent_status = referent_resolution.status
     final_referent_reason = referent_resolution.reason
     if (
         final_referent_status == "resolved"
         and (
-            not resolved_referent_ids
-            or not all(
-                row_id in rendered_row_ids
-                for row_id in resolved_referent_ids
+            not (
+                resolved_referent_ids
+                and all(
+                    row_id in rendered_row_ids
+                    for row_id in resolved_referent_ids
+                )
+            )
+            and not (
+                resolved_transient_message_ids
+                and all(
+                    message_id in rendered_transient_message_ids
+                    for message_id in resolved_transient_message_ids
+                )
             )
         )
     ):
@@ -2183,4 +2288,8 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         ),
         referent_reason=final_referent_reason,
         referent_scope_expanded=exact_reply_scope_expanded,
+        transient_referent_message_ids=tuple(
+            sorted(rendered_transient_message_ids)
+        ),
+        transient_referent_texts=tuple(rendered_transient_texts),
     )
