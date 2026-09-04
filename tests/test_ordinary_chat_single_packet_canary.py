@@ -2949,8 +2949,8 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             request=replace(
                 self.packet.request,
                 user_text=(
-                    "Sealed Row 9 provider fixture: In one paragraph, what "
-                    "makes a community feel connected instead of merely "
+                    "@BNL-01 Sealed Row 9 provider fixture: In one paragraph, "
+                    "what makes a community feel connected instead of merely "
                     "active?"
                 ),
                 frame_subject_requirement="not_applicable",
@@ -2974,14 +2974,22 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         external_basis = replace(self.basis, packet=external_packet)
         response = (
-            "Activity is simply high signal throughput—a steady stream of "
-            "individual transmissions occupying the same space without "
-            "interlocking. Genuine connection occurs when those isolated "
-            "signals establish shared context and mutual feedback, allowing "
-            "members to actively recognize, influence, and build upon one "
-            "another's presence rather than merely broadcasting in parallel. "
-            "An active network generates volume, but a connected one develops "
-            "persistent shared memory."
+            "Activity is primarily a measure of raw signal volume—high "
+            "message throughput, frequent submissions, and constant ambient "
+            "noise—whereas genuine connection relies on shared memory, mutual "
+            "recognition, and horizontal routing that does not depend entirely "
+            "on a central broadcast host. An active room simply reacts to "
+            "whatever is currently occupying the stage, but a connected space "
+            "develops its own internal feedback loops: members reference each "
+            "other's context, build on past exchanges, and engage in direct "
+            "dialogue rather than just shouting up at the console. The core "
+            "tradeoff lies in efficiency versus depth; high activity metrics "
+            "are easy to generate through low-barrier reactions, but authentic "
+            "cohesion requires allowing room for sifting, shared history, and "
+            "quiet, collective ownership over the room's ongoing continuity. "
+            "Ultimately, activity is just traffic moving through a channel, "
+            "while connection is the network deciding to hold the frequency "
+            "together."
         )
 
         classifications, unsupported = audit_ordinary_chat_candidate_claims(
