@@ -193,7 +193,6 @@ from bnl_shared_brain_synthesis import (
     ordinary_chat_route_scope_decision,
     publication_packet_composes_current_queue,
     publication_packet_owns_turn,
-    render_recurrence_authority_contract,
     record_fallback as record_shared_brain_synthesis_fallback,
     record_single_packet_review,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
@@ -36792,13 +36791,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "\n\n"
                     + batch_unified_moment_canary_basis.rendered_context
                 )
-            batch_recurrence_contract = (
-                render_recurrence_authority_contract(
-                    batch_intelligence_packet_out.get("packet")
-                )
-            )
-            if batch_recurrence_contract:
-                prompt += "\n\n" + batch_recurrence_contract
             if community_visual_prompt:
                 prompt += "\n\n" + community_visual_prompt + "\n"
             recent_media_prompt = ""
@@ -39642,9 +39634,6 @@ def build_user_aware_prompt(
         if ordinary_chat_single_packet
         else personal_recall_interpretation_contract(clean_content)
     )
-    recurrence_authority_contract = render_recurrence_authority_contract(
-        intelligence_packet_out.get("packet")
-    )
     if route_mode == ROUTE_MODE_NORMAL_CHAT and is_conversational_repair_intent(clean_content):
         prompt_contract += (
             "Correction-turn contract: use the visible prior exchange and make the corrected attempt now. "
@@ -39695,7 +39684,6 @@ def build_user_aware_prompt(
         f"{website_read_model_prompt_block}"
         f"{queue_artist_memory_prompt_block}"
         f"{tiktok_show_evidence_prompt_block}"
-        f"{recurrence_authority_contract}"
         f"{source_context_prompt_block}"
         f"{exact_quote_prompt_block}"
         f"{tiktok_show_analysis_turn_contract}"
