@@ -1275,6 +1275,15 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 "Durable BARCODE Radio show episode memory:",
                 personal_recurrence_context,
             )
+            self.assertIn(
+                "Repeated language/topics within this selected episode "
+                "(not independent recurrence):",
+                personal_recurrence_context,
+            )
+            self.assertNotIn(
+                "Recurring language/topics across retained public show chat:",
+                personal_recurrence_context,
+            )
             conn = sqlite3.connect(db_file)
             personal_recurrence_items = select_tiktok_show_episode_context_items(
                 conn,
