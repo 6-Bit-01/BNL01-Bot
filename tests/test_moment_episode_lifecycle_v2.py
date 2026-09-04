@@ -577,7 +577,10 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
         copper_messages = (
             (
                 copper_prompt,
-                "Antenna calibration is current; archiving remains open.",
+                (
+                    "[BNL-01 // SIGNAL_STAGING_04] Antenna calibration is "
+                    "current; archiving remains open."
+                ),
             ),
             (
                 "This remains a separate task: Project Copper Kite. Commit "
@@ -620,6 +623,29 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
         new = next(row for row in episodes if row[0] != glass_episode_id)
         self.assertEqual(old[1:], ("finalized", "topic_interruption"))
         self.assertEqual(new[1], "active")
+        self.assertGreaterEqual(
+            self.conn.execute(
+                "SELECT action_count FROM memory_moment_episodes "
+                "WHERE episode_id=?",
+                (new[0],),
+            ).fetchone()[0],
+            1,
+        )
+        copper_moment = self.conn.execute(
+            """
+            SELECT window.human_entry_count,window.model_entry_count,
+                   COUNT(member.ledger_entry_id)
+            FROM memory_moment_episode_moments AS link
+            JOIN memory_moment_windows AS window
+              ON window.moment_id=link.moment_id
+            JOIN memory_moment_members AS member
+              ON member.moment_id=window.moment_id
+            WHERE link.episode_id=?
+            GROUP BY window.moment_id
+            """,
+            (new[0],),
+        ).fetchone()
+        self.assertEqual(copper_moment, (2, 2, 4))
         self.assertEqual(
             self.conn.execute(
                 """
