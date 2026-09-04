@@ -6575,6 +6575,26 @@ def _ordinary_chat_packet_domain_context_active(
 
     packet = basis.packet
     request = packet.request
+    request_text = str(request.user_text or "")
+    frame_tasks = tuple(request.frame_tasks or ())
+    typed_external_request = bool(
+        str(request.frame_revision or "").strip()
+        and frame_tasks
+        and str(request.frame_subject_requirement or "").strip().lower()
+        in {"not_applicable", "not_required"}
+        and all(
+            str(task.authority_scope or "").strip().lower()
+            == "external_public"
+            and str(task.subject_requirement or "").strip().lower()
+            in {"", "not_applicable", "not_required"}
+            for task in frame_tasks
+        )
+        and not str(request.frame_event_ref or "").strip()
+        and not _ordinary_chat_claim_has_project_brand(request_text)
+        and not _ordinary_chat_claim_has_scoped_title(basis, request_text)
+    )
+    if typed_external_request:
+        return False
     resolution = packet.subject_resolution
     if resolution.status == "resolved" and bool(
         int(resolution.subject_user_id or 0)
@@ -6591,7 +6611,6 @@ def _ordinary_chat_packet_domain_context_active(
         return True
     if str(request.frame_event_ref or "").strip():
         return True
-    request_text = str(request.user_text or "")
     return bool(
         _ordinary_chat_claim_has_project_brand(request_text)
         or _ordinary_chat_claim_has_scoped_title(basis, request_text)
@@ -6701,7 +6720,10 @@ def _ordinary_chat_claim_has_packet_subject(
             )
             for governed_lead_in in governed_lead_ins
         )
-        or _ordinary_chat_claim_has_embedded_packet_clause(basis, core)
+        or (
+            packet_context
+            and _ordinary_chat_claim_has_embedded_packet_clause(basis, core)
+        )
         or _CLAIM_LEADING_DIRECT_PACKET_SUBJECT_RE.search(core)
         or re.search(r"<@!?\d+>", core)
         or re.search(
