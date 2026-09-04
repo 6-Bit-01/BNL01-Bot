@@ -36187,16 +36187,18 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     ),
                 )
             )
-            batch_tiktok_show_episode_turn_contract = (
-                build_tiktok_show_episode_turn_contract(
-                    batch_tiktok_show_evidence_context
-                )
-            )
             batch_finalized_show_packet_owner = (
                 finalized_show_packet_owner_requested(
                     combined_text,
                     batch_tiktok_show_evidence_context,
                 )
+            )
+            batch_tiktok_show_episode_turn_contract = (
+                build_tiktok_show_episode_turn_contract(
+                    batch_tiktok_show_evidence_context
+                )
+                if batch_finalized_show_packet_owner
+                else ""
             )
             batch_source_context_available = bool(
                 batch_website_read_model_context
@@ -36261,7 +36263,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 has_media=bool(active_packet.get("media_present")),
                 specialized_owner_present=bool(
                     (
-                        batch_source_context_available
+                        batch_website_read_model_context
                         and not batch_publication_packet_owns_turn
                         and not batch_publication_queue_packet_ready
                     )
@@ -36734,14 +36736,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_attribution_contract
                         .third_party_attribution_requested
                     ),
-                    competing_factual_contexts=(
-                        (batch_memory_context,)
-                        if batch_memory_context
-                        else ()
+                    competing_factual_contexts=tuple(
+                        context
+                        for context in (
+                            batch_memory_context,
+                            batch_tiktok_show_evidence_prompt_block,
+                        )
+                        if context
                     ),
                 )
                 if len(unique_user_ids) == 1
-                and not batch_source_context_available
+                and not batch_website_read_model_context
                 and not batch_ordinary_chat_single_packet
                 else None
             )
@@ -37373,7 +37378,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_source_context_available
                     ),
                 )
-                if not batch_source_context_available
+                if not batch_website_read_model_context
                 else None
             )
         batch_synthesis_decision = (
@@ -39120,14 +39125,16 @@ def build_user_aware_prompt(
         if tiktok_show_evidence_context
         else ""
     )
+    finalized_show_packet_owner = finalized_show_packet_owner_requested(
+        clean_content,
+        tiktok_show_evidence_context,
+    )
     tiktok_show_episode_turn_contract = (
         build_tiktok_show_episode_turn_contract(
             tiktok_show_evidence_context
         )
-    )
-    finalized_show_packet_owner = finalized_show_packet_owner_requested(
-        clean_content,
-        tiktok_show_evidence_context,
+        if finalized_show_packet_owner
+        else ""
     )
     frozen_situation_frame = (
         conversation_orchestration.situation_frame
@@ -39431,8 +39438,13 @@ def build_user_aware_prompt(
         third_party_attribution_requested=(
             third_party_attribution_requested
         ),
-        competing_factual_contexts=(
-            (memory_context,) if memory_context else ()
+        competing_factual_contexts=tuple(
+            context
+            for context in (
+                memory_context,
+                tiktok_show_evidence_prompt_block,
+            )
+            if context
         ),
         )
     )

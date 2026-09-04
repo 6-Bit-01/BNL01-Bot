@@ -89,7 +89,9 @@ _COMMUNITY_BASELINE_QUERY_RE = re.compile(
 _SUBJECT_CONTINUITY_QUERY_RE = re.compile(
     r"\b(?:remember me|know me|about me|my history|my activity|my messages?|"
     r"what did i|when did i|did i|have i|was i|where was i|"
-    r"what do you think of me|your (?:read|opinion|impression) of me)\b",
+    r"what do you think of me|your (?:read|opinion|impression) of me|"
+    r"what (?:recurring )?(?:patterns?|themes?) (?:keep )?"
+    r"(?:coming up|recurring) for me)\b",
     re.IGNORECASE,
 )
 _RELATIVE_SHOW_DATE_SCOPE_RE = re.compile(
@@ -2068,6 +2070,12 @@ def _document_relevance(
             participant_matches.append(participant)
             evidence_query_overlap = True
             score += 90
+    if (
+        subject_ref
+        and _subject_continuity_requested(query)
+        and not direct_subject_candidates
+    ):
+        return 0, []
     for track in ledger.get("trackMoments") or ():
         if isinstance(track, Mapping) and _phrase_in_query(
             query,
@@ -2698,21 +2706,12 @@ def _dialogue_episode_context_item(
                 evidence_boosts={},
             ),
         )
-        if participant_refs:
-            authored = [
+        if participant_refs and _subject_continuity_requested(user_text):
+            return [
                 item
                 for item in ranked
                 if str(item.get("subjectRef") or "") in participant_refs
             ]
-            related = [
-                item
-                for item in ranked
-                if str(item.get("subjectRef") or "") not in participant_refs
-                and query_terms.intersection(
-                    _query_terms(str(item.get("text") or ""))
-                )
-            ]
-            return authored + related
         if query_terms:
             matches = [
                 item
@@ -2924,8 +2923,9 @@ def select_tiktok_show_episode_context_items(
     ]
     items: list[TikTokShowEpisodeContextItem] = []
     if (
-        _show_episode_scope_requested(user_text)
-        or participant_matches
+        _show_episode_scope_requested(user_text) or participant_matches
+    ) and not (
+        participant_matches and _subject_continuity_requested(user_text)
     ):
         items.append(
             _community_episode_context_item(
@@ -3172,8 +3172,13 @@ def build_tiktok_show_evidence_context(
                     topic.get("supportEventIds") or (),
                     (60 if topic_named else 42) + breadth_boost,
                 )
-        if topics and (wants_topics or not participant_matches):
-            lines.append("Recurring language/topics across retained public show chat:")
+        if topics and (wants_topics or not participant_matches) and not (
+            participant_matches and _subject_continuity_requested(user_text)
+        ):
+            lines.append(
+                "Repeated language/topics within this selected episode "
+                "(not independent recurrence):"
+            )
             for topic in topics[:8]:
                 lines.append(
                     f"- {json.dumps(str(topic.get('term') or ''), ensure_ascii=False)}: "
@@ -3298,19 +3303,12 @@ def build_tiktok_show_evidence_context(
                 evidence_boosts=evidence_boosts,
             ),
         )
-        if participant_refs:
-            authored = [
+        if participant_refs and _subject_continuity_requested(user_text):
+            relevant_messages = [
                 item
                 for item in relevant_messages
                 if str(item.get("subjectRef") or "") in participant_refs
             ]
-            other_relevant = [
-                item
-                for item in relevant_messages
-                if str(item.get("subjectRef") or "") not in participant_refs
-                and query_terms.intersection(_query_terms(str(item.get("text") or "")))
-            ]
-            relevant_messages = authored + other_relevant
         elif query_terms:
             query_matches = [
                 item
@@ -3379,7 +3377,14 @@ def build_tiktok_show_evidence_context(
             exchange_score += 10 * len(
                 query_terms.intersection(_query_terms(exchange_text))
             )
-            if exchange_score > 0 or _RECAP_QUERY_RE.search(user_text or ""):
+            if participant_refs and _subject_continuity_requested(user_text):
+                exchange_relevant = exchange_subject in participant_refs
+            else:
+                exchange_relevant = bool(
+                    exchange_score > 0
+                    or _RECAP_QUERY_RE.search(user_text or "")
+                )
+            if exchange_relevant:
                 relevant_exchanges.append((exchange_score, exchange))
         relevant_exchanges.sort(
             key=lambda item: (

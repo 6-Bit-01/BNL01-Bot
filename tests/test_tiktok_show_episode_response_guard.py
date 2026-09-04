@@ -331,15 +331,16 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
                         context,
                     )
                 )
-        for live_request in (
+        for non_historical_owner_request in (
             "What are people saying in TikTok chat right now?",
             "Is the queue open right now?",
             "What is currently in the BARCODE Radio queue?",
+            "Based only on memory, what recurring themes keep coming up for me?",
         ):
-            with self.subTest(live_request=live_request):
+            with self.subTest(request=non_historical_owner_request):
                 self.assertFalse(
                     bnl01_bot.finalized_show_packet_owner_requested(
-                        live_request,
+                        non_historical_owner_request,
                         context,
                     )
                 )

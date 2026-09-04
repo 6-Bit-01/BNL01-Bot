@@ -1260,6 +1260,15 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertIn('"green visuals": 3 messages / 3 participants', broad)
             self.assertIn("Alex (@alex.signal)", broad)
             self.assertIn("queue/wheel", broad)
+            self.assertIn(
+                "Repeated language/topics within this selected episode "
+                "(not independent recurrence):",
+                broad,
+            )
+            self.assertNotIn(
+                "Recurring language/topics across retained public show chat:",
+                broad,
+            )
 
             personal_recurrence_query = (
                 "Sealed acceptance fixture: based only on memory, what "
@@ -1275,6 +1284,23 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 "Durable BARCODE Radio show episode memory:",
                 personal_recurrence_context,
             )
+            self.assertIn("Alex (@alex.signal)", personal_recurrence_context)
+            self.assertIn(
+                "BNL, the green visuals during this song are wild.",
+                personal_recurrence_context,
+            )
+            self.assertNotIn(
+                "Those green visuals changed again.",
+                personal_recurrence_context,
+            )
+            self.assertNotIn(
+                "The green visuals made that moment hit.",
+                personal_recurrence_context,
+            )
+            self.assertNotIn(
+                "Repeated language/topics within this selected episode",
+                personal_recurrence_context,
+            )
             conn = sqlite3.connect(db_file)
             personal_recurrence_items = select_tiktok_show_episode_context_items(
                 conn,
@@ -1285,9 +1311,36 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             )
             conn.close()
             self.assertTrue(personal_recurrence_items)
-            self.assertIn(
-                "community",
+            self.assertEqual(
                 {item.kind for item in personal_recurrence_items},
+                {"dialogue"},
+            )
+            self.assertTrue(
+                all(
+                    item.subject_key == "discord_user:42"
+                    for item in personal_recurrence_items
+                )
+            )
+            personal_packet_text = " ".join(
+                item.text for item in personal_recurrence_items
+            )
+            self.assertIn("Alex", personal_packet_text)
+            self.assertNotIn(
+                "Those green visuals changed again.",
+                personal_packet_text,
+            )
+            self.assertNotIn(
+                "The green visuals made that moment hit.",
+                personal_packet_text,
+            )
+            self.assertEqual(
+                build_tiktok_show_evidence_context(
+                    db_file,
+                    guild_id=77,
+                    user_text=personal_recurrence_query,
+                    subject_user_id=999,
+                ),
+                "",
             )
 
             topic_excerpt = build_tiktok_show_evidence_context(

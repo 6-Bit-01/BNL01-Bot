@@ -2009,6 +2009,19 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
+                "build_tiktok_show_evidence_context_for_turn",
+                return_value=(
+                    "Durable BARCODE Radio show episode memory:\n"
+                    "- REQUESTER SHOW EVIDENCE"
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "finalized_show_packet_owner_requested",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
                 "build_unified_response_assessment_shadow",
                 return_value=object(),
             ),
@@ -2016,7 +2029,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 bnl01_bot,
                 "build_shared_brain_synthesis_basis",
                 return_value=object(),
-            ),
+            ) as build_basis,
             mock.patch.object(
                 bnl01_bot,
                 "maybe_generate_shared_brain_synthesis_canary",
@@ -2046,7 +2059,19 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await bnl01_bot._flush_channel_buffer(channel)
 
         deterministic_governance.assert_not_called()
+        competing_contexts = build_basis.call_args.kwargs[
+            "competing_factual_contexts"
+        ]
+        self.assertTrue(
+            any("Derived memory summaries" in item for item in competing_contexts)
+        )
+        self.assertTrue(
+            any("REQUESTER SHOW EVIDENCE" in item for item in competing_contexts)
+        )
         synthesize.assert_awaited_once()
+        self.assertTrue(
+            synthesize.await_args.kwargs["source_context_available"]
+        )
         guard.assert_awaited_once()
         self.assertFalse(
             guard.await_args.kwargs["regeneration_allowed"]
@@ -2056,6 +2081,149 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         finalized.assert_awaited_once()
         self.assertTrue(finalized.await_args.kwargs["response_sent"])
         self.assertTrue(finalized.await_args.kwargs["candidate_live"])
+
+    async def test_batched_personal_recurrence_composes_requester_show_evidence(self):
+        channel = self._channel(8146)
+        request = (
+            "Sealed acceptance fixture: based only on memory, what recurring "
+            "themes keep coming up for me?"
+        )
+        answer = (
+            "You repeatedly combine hands-on broadcast oversight with precise "
+            "identity and system corrections. Your retained show questions "
+            "add a concrete habit of checking the room signal and queue while "
+            "the broader memory shows the same calibration instinct elsewhere."
+        )
+        packet = object()
+        assessment = object()
+        basis = object()
+        memory_basis = object()
+        decision = SimpleNamespace(candidate_selected=True)
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response=answer,
+            prompt="one composed requester-memory prompt",
+            prompt_source_bases=(memory_basis,),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        scope_calls = []
+
+        def build_assessment(*_args, **kwargs):
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        def scope_decision(**kwargs):
+            scope_calls.append(kwargs)
+            return SimpleNamespace(
+                eligible=not kwargs.get("specialized_owner_present", False),
+                reason="eligible",
+            )
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError(
+                "requester show evidence must join the existing packet"
+            )
+
+        self._prime_flush(channel, request)
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_tiktok_show_evidence_context_for_turn",
+                return_value=(
+                    "Durable BARCODE Radio show episode memory:\n"
+                    "- REQUESTER SHOW EVIDENCE"
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "finalized_show_packet_owner_requested",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_tiktok_show_episode_turn_contract",
+            ) as show_owner_contract,
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value="DURABLE MEMBER MEMORY",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_memory_prompt_source_basis",
+                return_value=memory_basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "ordinary_chat_route_scope_decision",
+                side_effect=scope_decision,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=build_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=basis,
+            ) as build_ordinary,
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_single_packet",
+                new=mock.AsyncMock(return_value=execution),
+            ) as generate_ordinary,
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+            ) as build_shared,
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=mock.AsyncMock(),
+            ) as generate_shared,
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(channel.sent, [answer])
+        self.assertTrue(scope_calls)
+        self.assertFalse(scope_calls[-1]["specialized_owner_present"])
+        show_owner_contract.assert_not_called()
+        competing_contexts = build_ordinary.call_args.kwargs[
+            "competing_factual_contexts"
+        ]
+        self.assertTrue(
+            any("DURABLE MEMBER MEMORY" in item for item in competing_contexts)
+        )
+        self.assertTrue(
+            any("REQUESTER SHOW EVIDENCE" in item for item in competing_contexts)
+        )
+        generate_ordinary.assert_awaited_once()
+        build_shared.assert_not_called()
+        generate_shared.assert_not_awaited()
 
     async def test_batched_packet_source_change_falls_back_to_normal_baseline(self):
         channel = self._channel(8127)
