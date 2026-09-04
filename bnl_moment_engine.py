@@ -80,6 +80,13 @@ _EPISODE_EXPLICIT_NEW_EVENT_RE = re.compile(
     r"\bnot\s+(?:the\s+)?same\s+(?:event|incident|thread|case)\b",
     re.I,
 )
+_EPISODE_NEGATED_NEW_EVENT_RE = re.compile(
+    r"\b(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|aren(?:'|’)t|"
+    r"weren(?:'|’)t)\s+(?:(?:a|an|the)\s+)?"
+    r"(?:new|different|separate|another)\s+"
+    r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
+    re.I,
+)
 _EPISODE_RELATED_RE = re.compile(
     r"\b(?:combine|connect|link|tie)\b.{0,36}"
     r"\b(?:thread|topic|discussion|conversation|idea|plan|moment)s?\b"
@@ -2968,12 +2975,15 @@ def _episode_resume_requested(rows: list[SourceEntry]) -> bool:
     )
 
 
+def _episode_text_explicit_new_event(value: str) -> bool:
+    unnegated = _EPISODE_NEGATED_NEW_EVENT_RE.sub("", value or "")
+    return bool(_EPISODE_EXPLICIT_NEW_EVENT_RE.search(unnegated))
+
+
 def _episode_explicit_new_event(rows: list[SourceEntry]) -> bool:
     return any(
         row.is_human
-        and _EPISODE_EXPLICIT_NEW_EVENT_RE.search(
-            row.normalized_value or ""
-        )
+        and _episode_text_explicit_new_event(row.normalized_value or "")
         for row in rows
     )
 
@@ -4200,6 +4210,7 @@ def active_episode_for_assessment(
     channel_policy: str,
     route_mode: str,
     topic_text: str,
+    current_turn_text: str | None = None,
     participant_keys: tuple[str, ...] = (),
     now: str | None = None,
 ) -> ActiveEpisodeReference | None:
@@ -4209,7 +4220,9 @@ def active_episode_for_assessment(
         not shadow_enabled()
         or not ledger_shadow_enabled()
         or not _table_exists(conn, "memory_moment_episodes")
-        or _EPISODE_EXPLICIT_NEW_EVENT_RE.search(topic_text or "")
+        or _episode_text_explicit_new_event(
+            topic_text if current_turn_text is None else current_turn_text
+        )
     ):
         return None
     candidates = conn.execute(
@@ -4553,6 +4566,7 @@ def render_active_episode_canary_context(
         channel_policy="sealed_test",
         route_mode=str(route_mode or "unknown"),
         topic_text=str(topic_text or "")[:8000],
+        current_turn_text=str(topic_text or "")[:8000],
         participant_keys=participant_keys,
         now=now,
     )

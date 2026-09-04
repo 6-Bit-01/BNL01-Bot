@@ -550,6 +550,97 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             (glass_episode_id, "interrupted_from"),
         )
 
+    def test_negated_separate_task_preserves_active_episode(self):
+        first_moment, _ = self.finalize_shared_moment(
+            280,
+            (
+                "Let's calibrate the Copper Kite antenna",
+                "The Copper Kite indicator is still flickering",
+                "Archiving the Copper Kite notes remains open",
+            ),
+        )
+        episode_id = self.conn.execute(
+            "SELECT episode_id FROM memory_moment_episodes"
+        ).fetchone()[0]
+
+        second_moment, _ = self.finalize_shared_moment(
+            290,
+            (
+                "This is not a separate task; continue the same Copper "
+                "Kite incident",
+                "The Copper Kite antenna calibration is still active",
+                "The Copper Kite notes remain unarchived",
+            ),
+            minutes=10,
+        )
+
+        episode = self.conn.execute(
+            """
+            SELECT episode_id,lifecycle_status,moment_count
+            FROM memory_moment_episodes
+            """
+        ).fetchone()
+        self.assertEqual(episode, (episode_id, "active", 2))
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    """
+                    SELECT moment_id FROM memory_moment_episode_moments
+                    WHERE episode_id=?
+                    """,
+                    (episode_id,),
+                )
+            },
+            {first_moment, second_moment},
+        )
+
+    def test_active_episode_boundary_uses_only_current_turn_text(self):
+        moment_id, _ = self.finalize_shared_moment(
+            295,
+            (
+                "Let's build the synth routing and test the chorus",
+                "The synth drum patch needs a bass answer",
+                "Which synth layer should we test next?",
+            ),
+            policy="sealed_test",
+        )
+        historical_and_current = (
+            "This is a separate task: synth routing.\n"
+            "Correction: the synth routing should use the warmer patch."
+        )
+        reference = moments.active_episode_for_assessment(
+            self.conn,
+            guild_id=1,
+            channel_id=10,
+            channel_policy="sealed_test",
+            route_mode="normal_chat",
+            topic_text=historical_and_current,
+            current_turn_text=(
+                "Correction: the synth routing should use the warmer patch."
+            ),
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(minutes=4),
+        )
+        self.assertIsNotNone(reference)
+        self.assertEqual(reference.source_moment_ids, (moment_id,))
+
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=historical_and_current,
+                current_turn_text=(
+                    "This is a separate task: Project Silver Compass."
+                ),
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            )
+        )
+
     def test_unique_explicit_resume_reopens_source_backed_episode(self):
         first_moment, _ = self.finalize_shared_moment(
             300,

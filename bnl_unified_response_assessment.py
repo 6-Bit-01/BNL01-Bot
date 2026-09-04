@@ -531,6 +531,13 @@ _SITUATION_EXPLICIT_NEW_EVENT_RE = re.compile(
     r"\bnot\s+(?:the\s+)?same\s+(?:event|incident|thread|case)\b",
     re.I,
 )
+_SITUATION_NEGATED_NEW_EVENT_RE = re.compile(
+    r"\b(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|aren(?:'|’)t|"
+    r"weren(?:'|’)t)\s+(?:(?:a|an|the)\s+)?"
+    r"(?:new|different|separate|another)\s+"
+    r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
+    re.I,
+)
 _SITUATION_CONCURRENT_RE = re.compile(
     r"\b(?:meanwhile|at\s+the\s+same\s+time|in\s+parallel|"
     r"concurrent(?:ly)?|separate\s+track|alongside)\b",
@@ -976,6 +983,11 @@ def _situation_temporal_scope(text: str) -> Tuple[str, str]:
     return "unspecified", "unknown"
 
 
+def _situation_explicit_new_event(text: str) -> bool:
+    unnegated = _SITUATION_NEGATED_NEW_EVENT_RE.sub("", text or "")
+    return bool(_SITUATION_EXPLICIT_NEW_EVENT_RE.search(unnegated))
+
+
 def _situation_event_relation(
     *,
     current_text: str,
@@ -986,7 +998,7 @@ def _situation_event_relation(
 ) -> str:
     state = str(moment_situation_state or "none").strip().lower()
     text = str(current_text or "")
-    if _SITUATION_EXPLICIT_NEW_EVENT_RE.search(text):
+    if _situation_explicit_new_event(text):
         return (
             "new_event_same_participant"
             if moment_participant_overlap

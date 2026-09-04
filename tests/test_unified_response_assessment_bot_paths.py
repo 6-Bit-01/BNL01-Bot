@@ -86,6 +86,24 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         )
 
     def test_bot_adapter_carries_active_episode_source_moments(self):
+        historical_marker = bnl01_bot.build_conversation_evidence_item(
+            text="This is a separate task: Project Copper Kite.",
+            source_id=41,
+            speaker_user_id=101,
+            speaker_label="Member 1",
+            current_turn=False,
+        )
+        basis = self.conversation_basis(1)
+        basis = bnl01_bot.replace(
+            basis,
+            evidence_items=(historical_marker,),
+        )
+        active_episode_reader = mock.Mock(
+            return_value=SimpleNamespace(
+                episode_id="episode-one",
+                source_moment_ids=("moment-one",),
+            )
+        )
         with mock.patch.object(
             bnl01_bot,
             "unified_response_assessment_shadow_enabled",
@@ -93,10 +111,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         ), mock.patch.object(
             bnl01_bot,
             "_active_episode_reference_for_unified_assessment",
-            return_value=SimpleNamespace(
-                episode_id="episode-one",
-                source_moment_ids=("moment-one",),
-            ),
+            new=active_episode_reader,
         ), mock.patch.object(
             bnl01_bot,
             "_build_unified_intelligence_packet_shadow",
@@ -111,6 +126,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 current_speaker_user_ids=(101,),
                 current_speaker_labels=("Member 1",),
                 channel_id=303,
+                prompt_source_bases=(basis,),
                 prompt_lanes=("current_exchange", "active_episode"),
                 continuity_required=True,
             )
@@ -120,6 +136,12 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         self.assertEqual(
             assessment.active_episode_source_moment_ids,
             ("moment-one",),
+        )
+        reader_kwargs = active_episode_reader.call_args.kwargs
+        self.assertIn("separate task", reader_kwargs["topic_text"])
+        self.assertEqual(
+            reader_kwargs["current_turn_text"],
+            "What changed, and what remains open?",
         )
 
     def test_direct_prompt_is_byte_identical_with_shadow_on_or_off(self):

@@ -26492,6 +26492,7 @@ def _active_episode_reference_for_unified_assessment(
     channel_policy: str,
     route_mode: str,
     topic_text: str,
+    current_turn_text: str,
     participant_user_ids: tuple[int, ...],
 ) -> ActiveEpisodeReference | None:
     """Read one source-validated active episode for shadow comparison."""
@@ -26522,6 +26523,7 @@ def _active_episode_reference_for_unified_assessment(
                 channel_policy=str(channel_policy or "unknown"),
                 route_mode=str(route_mode or "unknown"),
                 topic_text=str(topic_text or "")[:8000],
+                current_turn_text=str(current_turn_text or "")[:8000],
                 participant_keys=participant_keys,
             )
         return reference
@@ -27839,6 +27841,7 @@ def build_unified_response_assessment_shadow(
                 for item in semantic_evidence_items
                 if str(item.text or "").strip()
             ),
+            current_turn_text=current_text,
             participant_user_ids=participant_user_ids,
         )
         if active_episode_reference is not None:
