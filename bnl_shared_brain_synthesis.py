@@ -6578,13 +6578,19 @@ def _ordinary_chat_packet_domain_context_active(
     request_text = str(request.user_text or "")
     request_subject_text = re.sub(
         r"^\s*(?:(?:hey|hi|hello|yo|please|okay|ok|so)\b"
-        r"[\s,;:!?—–-]*)*(?:<@!?\d+>|@BNL-01)"
-        r"(?=\s|[,;:!?—–-]|$)\s*"
-        r"[,;:!?—–-]*\s*",
+        r"[\s.,;:!?—–-]*)*(?:<@!?\d+>|@BNL-01)"
+        r"(?!\s*['’]s\b)(?=\s|[.,;:!?—–-]|$)\s*"
+        r"[.,;:!?—–-]*\s*",
         "",
         request_text,
         count=1,
         flags=re.I,
+    )
+    request_referent_text = re.sub(
+        r"(?:'[^'\n]{0,240}'|\"[^\"\n]{0,240}\"|"
+        r"“[^”\n]{0,240}”|‘[^’\n]{0,240}’)",
+        "",
+        request_subject_text,
     )
     frame_tasks = tuple(request.frame_tasks or ())
     typed_external_request = bool(
@@ -6602,7 +6608,7 @@ def _ordinary_chat_packet_domain_context_active(
         and not str(request.frame_event_ref or "").strip()
         and not re.search(
             r"\b(?:you|your|yours|yourself)\b",
-            request_subject_text,
+            request_referent_text,
             re.I,
         )
         and not re.search(r"<@!?\d+>", request_subject_text)

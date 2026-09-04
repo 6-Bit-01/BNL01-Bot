@@ -3082,6 +3082,8 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         for possessive_request in (
             "@BNL-01's creator is who?",
             "<@7>'s birthday is when?",
+            "@BNL-01 's creator is who?",
+            "<@7> 's birthday is when?",
         ):
             with self.subTest(possessive_request=possessive_request):
                 possessive_packet = replace(
@@ -3132,6 +3134,34 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     "unsupported_packet_domain",
                     classifications,
                 )
+
+        quoted_word_packet = replace(
+            external_packet,
+            request=replace(
+                external_packet.request,
+                user_text="@BNL-01, what does the word 'you' mean?",
+            ),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            replace(self.basis, packet=quoted_word_packet),
+            "It is a second-person pronoun.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertNotIn("unsupported_packet_domain", classifications)
+
+        period_vocative_packet = replace(
+            external_packet,
+            request=replace(
+                external_packet.request,
+                user_text="@BNL-01. When did Apollo 11 land?",
+            ),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            replace(self.basis, packet=period_vocative_packet),
+            "It landed in 1969.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertNotIn("unsupported_packet_domain", classifications)
 
         current_request_packet = replace(
             external_packet,
