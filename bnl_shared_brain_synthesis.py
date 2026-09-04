@@ -6578,7 +6578,8 @@ def _ordinary_chat_packet_domain_context_active(
     request_text = str(request.user_text or "")
     request_subject_text = re.sub(
         r"^\s*(?:(?:hey|hi|hello|yo|please|okay|ok|so)\b"
-        r"[\s,;:!?—–-]*)*(?:<@!?\d+>|@BNL-01)\s*"
+        r"[\s,;:!?—–-]*)*(?:<@!?\d+>|@BNL-01)"
+        r"(?=\s|[,;:!?—–-]|$)\s*"
         r"[,;:!?—–-]*\s*",
         "",
         request_text,
@@ -6599,6 +6600,7 @@ def _ordinary_chat_packet_domain_context_active(
             for task in frame_tasks
         )
         and not str(request.frame_event_ref or "").strip()
+        and not re.search(r"<@!?\d+>", request_subject_text)
         and not _ordinary_chat_claim_has_project_brand(request_subject_text)
         and not _ordinary_chat_claim_has_scoped_title(
             basis,

@@ -3079,6 +3079,30 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertGreaterEqual(unsupported, 1)
         self.assertIn("unsupported_packet_domain", classifications)
 
+        for possessive_request in (
+            "@BNL-01's creator is who?",
+            "<@7>'s birthday is when?",
+        ):
+            with self.subTest(possessive_request=possessive_request):
+                possessive_packet = replace(
+                    external_packet,
+                    request=replace(
+                        external_packet.request,
+                        user_text=possessive_request,
+                    ),
+                )
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        replace(self.basis, packet=possessive_packet),
+                        "It is January 1.",
+                    )
+                )
+                self.assertGreaterEqual(unsupported, 1)
+                self.assertIn(
+                    "unsupported_packet_domain",
+                    classifications,
+                )
+
         current_request_packet = replace(
             external_packet,
             request=replace(
