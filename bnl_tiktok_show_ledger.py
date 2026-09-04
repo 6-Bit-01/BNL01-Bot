@@ -3173,10 +3173,7 @@ def build_tiktok_show_evidence_context(
                     (60 if topic_named else 42) + breadth_boost,
                 )
         if topics and (wants_topics or not participant_matches):
-            lines.append(
-                "Repeated language/topics within this selected episode "
-                "(not independent recurrence):"
-            )
+            lines.append("Recurring language/topics across retained public show chat:")
             for topic in topics[:8]:
                 lines.append(
                     f"- {json.dumps(str(topic.get('term') or ''), ensure_ascii=False)}: "

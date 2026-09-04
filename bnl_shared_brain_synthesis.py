@@ -3207,66 +3207,6 @@ def render_packet_context(
     )
 
 
-def render_recurrence_authority_contract(
-    packet: UnifiedIntelligencePacket | None,
-) -> str:
-    """Project the packet's existing recurrence verdict into response context."""
-
-    if packet is None:
-        return ""
-    diagnostics = getattr(packet, "diagnostics", None)
-    if diagnostics is None:
-        return ""
-    if (
-        getattr(diagnostics, "processing_errors", ())
-        or getattr(diagnostics, "invalid_invariants", ())
-        or not str(
-            getattr(diagnostics, "revalidation_status", "") or ""
-        ).startswith("passed")
-    ):
-        return ""
-    request = getattr(packet, "request", None)
-    object_kind = str(
-        getattr(request, "frame_object_kind", "") or ""
-    ).strip().lower()
-    subject_requirement = str(
-        getattr(request, "frame_subject_requirement", "") or ""
-    ).strip().lower()
-    if object_kind == "broadcast" or subject_requirement != "required":
-        return ""
-    status = str(
-        getattr(diagnostics, "theme_query_status", "not_requested")
-        or "not_requested"
-    ).strip().lower()
-    if status == "not_requested":
-        return ""
-    recurring_items = tuple(
-        item
-        for item in getattr(packet, "items", ())
-        if item.lane == "recurring_theme"
-    )
-    if status == "established" and recurring_items:
-        return (
-            "- Recurrence authority: only selected recurring-theme evidence "
-            "establishes a recurring pattern. Other eligible public, show, "
-            "and conversation memories remain additive context, not separate "
-            "proof of recurrence.\n"
-        )
-    if status == "provisional_single_occurrence":
-        return (
-            "- Recurrence authority: retained memory supports one occurrence "
-            "only, not a recurring theme. Say that plainly. Other eligible "
-            "public, show, and conversation memories remain additive examples, "
-            "but do not promote them into a pattern or habitual behavior.\n"
-        )
-    return (
-        "- Recurrence authority: retained memory does not establish a recurring "
-        "theme for this request. Say that plainly. Other eligible public, show, "
-        "and conversation memories remain additive examples, but do not promote "
-        "them into patterns or habitual behavior.\n"
-    )
-
-
 def _ordinary_packet_context(
     packet: UnifiedIntelligencePacket,
 ) -> tuple[str, tuple[tuple[str, int], ...], int, tuple[str, ...]]:
@@ -4196,9 +4136,6 @@ def build_packet_owned_prompt(
     """Add packet evidence to the already-authorized response context."""
 
     updated = str(prompt or "")
-    recurrence_contract = render_recurrence_authority_contract(
-        basis.packet
-    )
     if basis.ordinary_chat_single_packet:
         task_contract = render_ordinary_chat_task_contract(basis)
         if not updated.strip():
@@ -4212,12 +4149,6 @@ def build_packet_owned_prompt(
             additions.append(_ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT)
         if basis.rendered_context and basis.rendered_context not in updated:
             additions.append(basis.rendered_context)
-        if (
-            recurrence_contract
-            and recurrence_contract not in updated
-            and recurrence_contract not in basis.rendered_context
-        ):
-            additions.append(recurrence_contract)
         if task_contract and task_contract not in updated:
             additions.append(task_contract)
         return PacketOwnedPrompt(
@@ -4268,14 +4199,11 @@ def build_packet_owned_prompt(
             + updated[start + len(value):]
         )
         replaced += 1
-    additions = [basis.rendered_context]
-    if (
-        recurrence_contract
-        and recurrence_contract not in updated
-        and recurrence_contract not in basis.rendered_context
-    ):
-        additions.append(recurrence_contract)
-    candidate_prompt = "\n\n".join((updated.rstrip(), *additions))
+    candidate_prompt = (
+        updated.rstrip()
+        + "\n\n"
+        + basis.rendered_context
+    )
     if any(
         context and context in candidate_prompt
         for context in basis.competing_factual_contexts

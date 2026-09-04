@@ -1087,26 +1087,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         show_context = mock.Mock(return_value=show_evidence)
         save_model = mock.Mock()
         record_assessment = mock.AsyncMock()
-        build_assessment = (
-            bnl01_bot.build_unified_response_assessment_shadow
-        )
-
-        def build_with_recurrence_verdict(*args, **kwargs):
-            assessment = build_assessment(*args, **kwargs)
-            kwargs["intelligence_packet_out"]["packet"] = SimpleNamespace(
-                request=SimpleNamespace(
-                    frame_object_kind="memory",
-                    frame_subject_requirement="required",
-                ),
-                diagnostics=SimpleNamespace(
-                    processing_errors=(),
-                    invalid_invariants=(),
-                    revalidation_status="passed",
-                    theme_query_status="no_authoritative_theme",
-                ),
-                items=(),
-            )
-            return assessment
 
         async def generate(prompt, **kwargs):
             generation_calls.append((prompt, kwargs))
@@ -1137,11 +1117,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
-                "build_unified_response_assessment_shadow",
-                side_effect=build_with_recurrence_verdict,
-            ),
-            mock.patch.object(
-                bnl01_bot,
                 "save_model_message",
                 new=save_model,
             ),
@@ -1163,14 +1138,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(generation_calls), 1)
         self.assertTrue(generation_calls[0][1]["source_context_available"])
         self.assertIn(show_evidence, generation_calls[0][0])
-        self.assertIn(
-            "retained memory does not establish a recurring theme",
-            generation_calls[0][0],
-        )
-        self.assertIn(
-            "public, show, and conversation memories remain additive examples",
-            generation_calls[0][0],
-        )
         save_model.assert_called_once()
         self.assertEqual(save_model.call_args.args[2], answer)
         self.assertEqual(
