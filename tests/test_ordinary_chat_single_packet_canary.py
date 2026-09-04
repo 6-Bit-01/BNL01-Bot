@@ -2999,6 +2999,30 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 0)
         self.assertNotIn("unsupported_packet_domain", classifications)
 
+        for addressed_request in (
+            "Hey @BNL-01, when did Apollo 11 land?",
+            "Please, @BNL-01, when did Apollo 11 land?",
+        ):
+            with self.subTest(addressed_request=addressed_request):
+                addressed_packet = replace(
+                    external_packet,
+                    request=replace(
+                        external_packet.request,
+                        user_text=addressed_request,
+                    ),
+                )
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        replace(self.basis, packet=addressed_packet),
+                        "It landed in 1969.",
+                    )
+                )
+                self.assertEqual(unsupported, 0)
+                self.assertNotIn(
+                    "unsupported_packet_domain",
+                    classifications,
+                )
+
         for unsupported_response in (
             "Your birthday is 1999-01-01.",
             "BARCODE started in 1999.",
@@ -3040,6 +3064,20 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     "unsupported_packet_domain",
                     classifications,
                 )
+
+        bnl_subject_packet = replace(
+            external_packet,
+            request=replace(
+                external_packet.request,
+                user_text="When was @BNL-01 created?",
+            ),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            replace(self.basis, packet=bnl_subject_packet),
+            "It was created in 1999.",
+        )
+        self.assertGreaterEqual(unsupported, 1)
+        self.assertIn("unsupported_packet_domain", classifications)
 
         current_request_packet = replace(
             external_packet,

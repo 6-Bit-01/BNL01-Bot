@@ -6577,7 +6577,9 @@ def _ordinary_chat_packet_domain_context_active(
     request = packet.request
     request_text = str(request.user_text or "")
     request_subject_text = re.sub(
-        r"^\s*(?:<@!?\d+>|@BNL-01)\s*[,;:!?—–-]*\s*",
+        r"^\s*(?:(?:hey|hi|hello|yo|please|okay|ok|so)\b"
+        r"[\s,;:!?—–-]*)*(?:<@!?\d+>|@BNL-01)\s*"
+        r"[,;:!?—–-]*\s*",
         "",
         request_text,
         count=1,
