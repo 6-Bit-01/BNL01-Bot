@@ -6590,8 +6590,6 @@ def _ordinary_chat_packet_domain_context_active(
             for task in frame_tasks
         )
         and not str(request.frame_event_ref or "").strip()
-        and not _ordinary_chat_claim_has_project_brand(request_text)
-        and not _ordinary_chat_claim_has_scoped_title(basis, request_text)
     )
     if typed_external_request:
         return False
