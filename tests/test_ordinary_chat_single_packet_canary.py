@@ -2943,6 +2943,72 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 0)
         self.assertEqual(classifications, ("external_public_knowledge",))
 
+    def test_typed_external_task_overrides_default_requester_binding(self):
+        external_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                user_text=(
+                    "Sealed Row 9 provider fixture: In one paragraph, what "
+                    "makes a community feel connected instead of merely "
+                    "active?"
+                ),
+                frame_subject_requirement="not_applicable",
+                frame_subjects=(),
+                frame_tasks=(
+                    PacketFrameTask(
+                        task_id="T1",
+                        text_digest="e" * 64,
+                        task_kind="correction",
+                        object_kind="unknown",
+                        authority_scope="external_public",
+                        temporal_scope="unspecified",
+                        currentness="unknown",
+                        required_response_act="answer",
+                        subject_requirement="not_applicable",
+                    ),
+                ),
+                frame_event_ref="",
+                frame_event_relation="not_applicable",
+            ),
+        )
+        external_basis = replace(self.basis, packet=external_packet)
+        response = (
+            "Activity is simply high signal throughput—a steady stream of "
+            "individual transmissions occupying the same space without "
+            "interlocking. Genuine connection occurs when those isolated "
+            "signals establish shared context and mutual feedback, allowing "
+            "members to actively recognize, influence, and build upon one "
+            "another's presence rather than merely broadcasting in parallel. "
+            "An active network generates volume, but a connected one develops "
+            "persistent shared memory."
+        )
+
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            external_basis,
+            response,
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertNotIn("unsupported_packet_domain", classifications)
+
+        for unsupported_response in (
+            "Your birthday is 1999-01-01.",
+            "BARCODE started in 1999.",
+            "Test Member works at NASA.",
+        ):
+            with self.subTest(unsupported_response=unsupported_response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        external_basis,
+                        unsupported_response,
+                    )
+                )
+                self.assertGreaterEqual(unsupported, 1)
+                self.assertIn(
+                    "unsupported_packet_domain",
+                    classifications,
+                )
+
     def test_member_context_does_not_block_supported_external_knowledge(self):
         cases = (
             (
