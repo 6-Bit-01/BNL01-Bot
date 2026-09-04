@@ -3009,6 +3009,29 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     classifications,
                 )
 
+        current_request_packet = replace(
+            external_packet,
+            request=replace(
+                external_packet.request,
+                user_text=(
+                    "For Amber Compass, the project uses an amber signal. "
+                    "Restate that."
+                ),
+                frame_tasks=(
+                    replace(
+                        external_packet.request.frame_tasks[0],
+                        authority_scope="current_request",
+                    ),
+                ),
+            ),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            replace(self.basis, packet=current_request_packet),
+            "The project uses a blue signal.",
+        )
+        self.assertGreaterEqual(unsupported, 1)
+        self.assertIn("unsupported_packet_domain", classifications)
+
     def test_member_context_does_not_block_supported_external_knowledge(self):
         cases = (
             (

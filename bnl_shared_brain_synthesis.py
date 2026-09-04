@@ -6584,7 +6584,7 @@ def _ordinary_chat_packet_domain_context_active(
         in {"not_applicable", "not_required"}
         and all(
             str(task.authority_scope or "").strip().lower()
-            in {"external_public", "current_request"}
+            == "external_public"
             and str(task.subject_requirement or "").strip().lower()
             in {"", "not_applicable", "not_required"}
             for task in frame_tasks
