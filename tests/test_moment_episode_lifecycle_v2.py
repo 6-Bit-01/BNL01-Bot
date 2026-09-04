@@ -408,6 +408,148 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             ("interrupted_from", new_moment_id, new_sources[0].entry_id),
         )
 
+    def test_explicit_separate_task_overrides_broad_topic_overlap(self):
+        glass_messages = (
+            (
+                "Sealed acceptance fixture: Project Glass Harbor is in "
+                "rehearsal. The amber signal failed, and the open question "
+                "is whether to test the relay or the decoder first. Which "
+                "should we test first?",
+                "Test the relay first; decoder diagnostics remain open.",
+            ),
+            (
+                "For Project Glass Harbor, commit the plan: test the relay "
+                "first, then investigate the amber signal. The decoder "
+                "remains an open follow-up. Recap the current phase and "
+                "open loop.",
+                "The relay test is current and decoder diagnostics remain open.",
+            ),
+        )
+        row_id = 260
+        for human_text, model_text in glass_messages:
+            self.add(
+                row_id,
+                1,
+                human_text,
+                policy="sealed_test",
+            )
+            self.add(
+                row_id + 1,
+                0,
+                model_text,
+                policy="sealed_test",
+                role="model",
+                name="BNL-01",
+            )
+            row_id += 2
+        moments.sweep_expired_windows(
+            self.conn,
+            now=self.timestamp(minutes=3),
+        )
+        glass_episode_id = self.conn.execute(
+            "SELECT episode_id FROM memory_moment_episodes"
+        ).fetchone()[0]
+
+        copper_prompt = (
+            "Sealed acceptance fixture: this is a separate task. Project "
+            "Copper Kite has a stable blue indicator, and the antenna "
+            "calibration must be completed before its notes are archived. "
+            "What is the current task, and what remains open?"
+        )
+        self.assertIsNone(
+            moments.active_episode_for_assessment(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=copper_prompt,
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=10),
+            )
+        )
+        self.assertEqual(
+            moments.render_active_episode_canary_context(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text=copper_prompt,
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=10),
+            ),
+            "",
+        )
+
+        copper_messages = (
+            (
+                copper_prompt,
+                "Antenna calibration is current; archiving remains open.",
+            ),
+            (
+                "This remains a separate task: Project Copper Kite. Commit "
+                "the plan: perform antenna calibration first, leave notes "
+                "unarchived, and keep archiving as the open follow-up.",
+                "Calibration is current and note archiving remains open.",
+            ),
+        )
+        for human_text, model_text in copper_messages:
+            self.add(
+                row_id,
+                1,
+                human_text,
+                minutes=10,
+                policy="sealed_test",
+            )
+            self.add(
+                row_id + 1,
+                0,
+                model_text,
+                minutes=10,
+                policy="sealed_test",
+                role="model",
+                name="BNL-01",
+            )
+            row_id += 2
+        moments.sweep_expired_windows(
+            self.conn,
+            now=self.timestamp(minutes=13),
+        )
+
+        episodes = self.conn.execute(
+            """
+            SELECT episode_id,lifecycle_status,finalization_reason
+            FROM memory_moment_episodes ORDER BY opened_at,episode_id
+            """
+        ).fetchall()
+        self.assertEqual(len(episodes), 2)
+        old = next(row for row in episodes if row[0] == glass_episode_id)
+        new = next(row for row in episodes if row[0] != glass_episode_id)
+        self.assertEqual(old[1:], ("finalized", "topic_interruption"))
+        self.assertEqual(new[1], "active")
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT link_role FROM memory_moment_episode_moments
+                WHERE episode_id=?
+                """,
+                (new[0],),
+            ).fetchone()[0],
+            "opened",
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT to_episode_id,relation_type
+                FROM memory_moment_episode_lineage
+                WHERE from_episode_id=?
+                """,
+                (new[0],),
+            ).fetchone(),
+            (glass_episode_id, "interrupted_from"),
+        )
+
     def test_unique_explicit_resume_reopens_source_backed_episode(self):
         first_moment, _ = self.finalize_shared_moment(
             300,

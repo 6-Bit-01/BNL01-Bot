@@ -390,6 +390,46 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
         self.assertEqual(assessment.prompt_extra_lanes, ())
         self.assertEqual(assessment.prompt_missing_lanes, ())
 
+    def test_active_episode_source_moment_is_counted_without_extra_lane(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="sealed_test",
+            current_speaker_user_ids=(7,),
+            active_episode_id="episode-one",
+            active_episode_source_moment_ids=("moment-one",),
+            prompt_lanes=("current_exchange", "active_episode"),
+            continuity_required=True,
+            current_text="What changed, and what remains open?",
+        )
+        self.assertEqual(
+            assessment.active_episode_source_moment_ids,
+            ("moment-one",),
+        )
+        self.assertIn("active_episode", assessment.selected_lanes)
+        self.assertNotIn("prior_moment", assessment.selected_lanes)
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            run_id = persist_shadow_run(
+                conn,
+                assessment,
+                response="The current phase changed; one action remains open.",
+            )
+            receipt = conn.execute(
+                """
+                SELECT active_episode_present,prior_moment_count
+                FROM unified_response_assessment_shadow_runs
+                WHERE run_id=?
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(receipt, (1, 1))
+
     def test_semantic_frame_resolves_shared_objective_and_attribution(self):
         assessment = self.shared_choice_assessment()
 

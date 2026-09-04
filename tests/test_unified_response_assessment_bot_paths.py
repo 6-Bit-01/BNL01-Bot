@@ -85,6 +85,43 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             assessment.excluded_lanes,
         )
 
+    def test_bot_adapter_carries_active_episode_source_moments(self):
+        with mock.patch.object(
+            bnl01_bot,
+            "unified_response_assessment_shadow_enabled",
+            return_value=True,
+        ), mock.patch.object(
+            bnl01_bot,
+            "_active_episode_reference_for_unified_assessment",
+            return_value=SimpleNamespace(
+                episode_id="episode-one",
+                source_moment_ids=("moment-one",),
+            ),
+        ), mock.patch.object(
+            bnl01_bot,
+            "_build_unified_intelligence_packet_shadow",
+            return_value=None,
+        ):
+            assessment = bnl01_bot.build_unified_response_assessment_shadow(
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="sealed_test",
+                conversation_surface="test",
+                current_text="What changed, and what remains open?",
+                current_speaker_user_ids=(101,),
+                current_speaker_labels=("Member 1",),
+                channel_id=303,
+                prompt_lanes=("current_exchange", "active_episode"),
+                continuity_required=True,
+            )
+
+        self.assertIsNotNone(assessment)
+        self.assertEqual(assessment.active_episode_id, "episode-one")
+        self.assertEqual(
+            assessment.active_episode_source_moment_ids,
+            ("moment-one",),
+        )
+
     def test_direct_prompt_is_byte_identical_with_shadow_on_or_off(self):
         visual_basis = SimpleNamespace(status="not_requested")
         conversation_basis = self.conversation_basis(3)
@@ -216,8 +253,11 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             return_value=True,
         ), mock.patch.object(
             bnl01_bot,
-            "_active_episode_id_for_unified_assessment",
-            return_value="mep_opaque_shadow_reference",
+            "_active_episode_reference_for_unified_assessment",
+            return_value=SimpleNamespace(
+                episode_id="mep_opaque_shadow_reference",
+                source_moment_ids=(),
+            ),
         ), mock.patch.object(
             bnl01_bot,
             "_build_unified_intelligence_packet_shadow",

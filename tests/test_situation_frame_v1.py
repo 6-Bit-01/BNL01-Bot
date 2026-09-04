@@ -534,6 +534,31 @@ class SituationFrameV1Tests(unittest.TestCase):
         self.assertIn("resume_target_unresolved", unresolved.ambiguity_reasons)
         self.assertIn("resume_episode_candidates", unresolved.competing_frames)
 
+    def test_isolated_failure_is_a_diagnosis_phase_transition(self):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=(
+                "Project Glass Harbor update: the relay test passed, so the "
+                "transport route is clean. The amber failure is now isolated "
+                "to the decoder input. What changed, and what is still "
+                "unresolved?"
+            ),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment_glass_harbor",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+
+        self.assertEqual(frame.phase, "diagnosis")
+        self.assertEqual(frame.event_relation, "same_event_new_phase")
+        self.assertEqual(frame.status, "resolved")
+
     def test_revalidation_is_separate_and_fails_closed_by_state(self):
         frame = build_situation_frame_v1(
             route_allowed=True,

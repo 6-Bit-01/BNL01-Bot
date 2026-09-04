@@ -121,6 +121,7 @@ from bnl_memory_governance import (
     view_member_memory,
 )
 from bnl_moment_engine import (
+    ActiveEpisodeReference,
     MomentSituationReference,
     active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
@@ -26484,7 +26485,7 @@ def _canon_relevant_to_response(text: str) -> bool:
     return bool(_UNIFIED_ASSESSMENT_CANON_RELEVANCE_RE.search(text or ""))
 
 
-def _active_episode_id_for_unified_assessment(
+def _active_episode_reference_for_unified_assessment(
     *,
     guild_id: int,
     channel_id: int,
@@ -26492,8 +26493,8 @@ def _active_episode_id_for_unified_assessment(
     route_mode: str,
     topic_text: str,
     participant_user_ids: tuple[int, ...],
-) -> str:
-    """Read one opaque episode id for shadow comparison only."""
+) -> ActiveEpisodeReference | None:
+    """Read one source-validated active episode for shadow comparison."""
 
     if (
         not moment_engine_shadow_enabled()
@@ -26502,7 +26503,7 @@ def _active_episode_id_for_unified_assessment(
         or DB_FILE == ":memory:"
         or not os.path.exists(DB_FILE)
     ):
-        return ""
+        return None
     participant_keys = tuple(
         "discord_user:%s" % int(user_id)
         for user_id in participant_user_ids
@@ -26523,9 +26524,9 @@ def _active_episode_id_for_unified_assessment(
                 topic_text=str(topic_text or "")[:8000],
                 participant_keys=participant_keys,
             )
-        return reference.episode_id if reference is not None else ""
+        return reference
     except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
-        return ""
+        return None
 
 
 def _recent_moment_situation_for_turn(
@@ -27824,8 +27825,11 @@ def build_unified_response_assessment_shadow(
     active_episode_id = str(
         memory_meta.get("active_episode_id") or ""
     ).strip()
+    active_episode_source_moment_ids = tuple(
+        memory_meta.get("active_episode_source_moment_ids") or ()
+    )
     if not active_episode_id:
-        active_episode_id = _active_episode_id_for_unified_assessment(
+        active_episode_reference = _active_episode_reference_for_unified_assessment(
             guild_id=guild_id,
             channel_id=channel_id,
             channel_policy=channel_policy,
@@ -27837,6 +27841,18 @@ def build_unified_response_assessment_shadow(
             ),
             participant_user_ids=participant_user_ids,
         )
+        if active_episode_reference is not None:
+            active_episode_id = active_episode_reference.episode_id
+            active_episode_source_moment_ids = (
+                active_episode_reference.source_moment_ids
+            )
+    if (
+        isinstance(situation_frame, SituationFrameV1)
+        and situation_frame.event_relation
+        in {"new_event_same_participant", "new_event_or_uncertain"}
+    ):
+        active_episode_id = ""
+        active_episode_source_moment_ids = ()
     current_payload_anchors = extract_current_payload_anchors(
         current_text,
         conversation_contexts,
@@ -27994,6 +28010,9 @@ def build_unified_response_assessment_shadow(
         speaker_labels=speaker_labels,
         current_exchange_source_ids=current_exchange_source_ids,
         active_episode_id=active_episode_id,
+        active_episode_source_moment_ids=(
+            active_episode_source_moment_ids
+        ),
         prior_moment_ids=assessment_moment_refs,
         governed_entry_ids=assessment_governed_refs,
         relationship_candidate_keys=assessment_relationship_refs,

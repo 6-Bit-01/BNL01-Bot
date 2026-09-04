@@ -74,6 +74,12 @@ _EPISODE_RESUME_RE = re.compile(
     r"get\s+back\s+to|reopen)\b",
     re.I,
 )
+_EPISODE_EXPLICIT_NEW_EVENT_RE = re.compile(
+    r"\b(?:new|different|separate|another)\s+"
+    r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b|"
+    r"\bnot\s+(?:the\s+)?same\s+(?:event|incident|thread|case)\b",
+    re.I,
+)
 _EPISODE_RELATED_RE = re.compile(
     r"\b(?:combine|connect|link|tie)\b.{0,36}"
     r"\b(?:thread|topic|discussion|conversation|idea|plan|moment)s?\b"
@@ -2962,6 +2968,16 @@ def _episode_resume_requested(rows: list[SourceEntry]) -> bool:
     )
 
 
+def _episode_explicit_new_event(rows: list[SourceEntry]) -> bool:
+    return any(
+        row.is_human
+        and _EPISODE_EXPLICIT_NEW_EVENT_RE.search(
+            row.normalized_value or ""
+        )
+        for row in rows
+    )
+
+
 def _episode_related_link_requested(rows: list[SourceEntry]) -> bool:
     return any(
         row.is_human and _EPISODE_RELATED_RE.search(row.normalized_value or "")
@@ -3916,7 +3932,11 @@ def observe_finalized_moment_episode(
             )
             prior_episode = None
 
-        if prior_episode and _episode_topic_matches(prior_episode, basis):
+        if (
+            prior_episode
+            and not _episode_explicit_new_event(rows)
+            and _episode_topic_matches(prior_episode, basis)
+        ):
             episode_id = str(prior_episode[0])
             _insert_episode_moment(
                 conn,
@@ -4189,6 +4209,7 @@ def active_episode_for_assessment(
         not shadow_enabled()
         or not ledger_shadow_enabled()
         or not _table_exists(conn, "memory_moment_episodes")
+        or _EPISODE_EXPLICIT_NEW_EVENT_RE.search(topic_text or "")
     ):
         return None
     candidates = conn.execute(
