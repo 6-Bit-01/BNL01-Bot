@@ -6600,6 +6600,11 @@ def _ordinary_chat_packet_domain_context_active(
             for task in frame_tasks
         )
         and not str(request.frame_event_ref or "").strip()
+        and not re.search(
+            r"\b(?:you|your|yours|yourself)\b",
+            request_subject_text,
+            re.I,
+        )
         and not re.search(r"<@!?\d+>", request_subject_text)
         and not _ordinary_chat_claim_has_project_brand(request_subject_text)
         and not _ordinary_chat_claim_has_scoped_title(

@@ -3103,6 +3103,36 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     classifications,
                 )
 
+        for second_person_request, indirect_response in (
+            (
+                "@BNL-01, when were you created?",
+                "It was created in 1999.",
+            ),
+            (
+                "<@7>, when is your birthday?",
+                "It is January 1.",
+            ),
+        ):
+            with self.subTest(second_person_request=second_person_request):
+                second_person_packet = replace(
+                    external_packet,
+                    request=replace(
+                        external_packet.request,
+                        user_text=second_person_request,
+                    ),
+                )
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        replace(self.basis, packet=second_person_packet),
+                        indirect_response,
+                    )
+                )
+                self.assertGreaterEqual(unsupported, 1)
+                self.assertIn(
+                    "unsupported_packet_domain",
+                    classifications,
+                )
+
         current_request_packet = replace(
             external_packet,
             request=replace(
