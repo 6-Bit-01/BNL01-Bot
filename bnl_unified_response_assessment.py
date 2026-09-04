@@ -289,11 +289,15 @@ _SITUATION_PHASE_PATTERNS = (
         re.compile(
             r"(?:\b(?:isolat(?:e|ed|ing|ion)|"
             r"locali[sz](?:e|ed|ing|ation)|"
-            r"trac(?:e|ed|ing))\b"
-            r".{0,48}\b(?:to|at)\b|"
-            r"\bnarrow(?:ed|ing)\b[^.!?\n]{0,48}"
+            r"trac(?:e|ed|ing)|narrow(?:ed|ing)?)\b"
+            r"[^.!?\n]{0,48}"
             r"\b(?:failure|issue|problem|defect|bug|fault|error|"
-            r"crash|regression)\b[^.!?\n]{0,24}\b(?:to|at)\b)",
+            r"crash|regression)\b[^.!?\n]{0,24}\b(?:to|at)\b|"
+            r"\b(?:failure|issue|problem|defect|bug|fault|error|"
+            r"crash|regression)\b[^.!?\n]{0,24}"
+            r"\b(?:is|are|was|were|has\s+been|had\s+been)\b"
+            r"[^.!?\n]{0,16}\b(?:isolated|localized|localised|"
+            r"traced|narrowed)\b[^.!?\n]{0,24}\b(?:to|at)\b)",
             re.I,
         ),
     ),
@@ -535,8 +539,12 @@ _SITUATION_EXPLICIT_NEW_EVENT_RE = re.compile(
     re.I,
 )
 _SITUATION_NEGATED_NEW_EVENT_RE = re.compile(
-    r"\b(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|aren(?:'|’)t|"
-    r"weren(?:'|’)t)\s+(?:(?:a|an|the)\s+)?"
+    r"\b(?:(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|"
+    r"aren(?:'|’)t|weren(?:'|’)t)\s+"
+    r"(?:(?:a|an|the)\s+)?|"
+    r"do(?:n['’]t|\s+not)\s+(?:(?:start|begin|open|create)\s+|"
+    r"(?:treat|regard|count|consider|call)\s+"
+    r"(?:this|that|it)\s+as\s+)(?:(?:a|an|the)\s+)?)"
     r"(?:new|different|separate|another)\s+"
     r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
     re.I,
@@ -1026,9 +1034,12 @@ def _situation_explicit_new_event(text: str) -> bool:
             + 1,
         )
         cue_prefix = unnegated[assertion_start : match.end()]
+        assertion = unnegated[assertion_start:clause_end]
         if (
             clause.rstrip().endswith("?")
-            and not _SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(clause)
+            and not _SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(
+                assertion
+            )
         ):
             continue
         if _SITUATION_NEW_EVENT_UNCERTAINTY_RE.search(cue_prefix):

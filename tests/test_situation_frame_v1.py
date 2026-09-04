@@ -504,6 +504,14 @@ class SituationFrameV1Tests(unittest.TestCase):
                 "same_event",
             ),
             (
+                "Don't start a new task; continue this incident.",
+                "resume",
+            ),
+            (
+                "Do not treat this as a separate task.",
+                "same_event",
+            ),
+            (
                 "Is this a separate task, or should we continue?",
                 "resume",
             ),
@@ -541,6 +549,14 @@ class SituationFrameV1Tests(unittest.TestCase):
             ),
             (
                 "Can you start another task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Okay, can you start another task?",
+                "new_event_same_participant",
+            ),
+            (
+                "Before we continue, can you start a new task?",
                 "new_event_same_participant",
             ),
             (
@@ -696,6 +712,45 @@ class SituationFrameV1Tests(unittest.TestCase):
             response_act="answer",
         )
         self.assertNotEqual(deployment_window.phase, "diagnosis")
+
+        for ordinary_text in (
+            "The artist is isolated at home, so start the broadcast.",
+            "We traced the route to the venue and started the broadcast.",
+        ):
+            with self.subTest(ordinary_text=ordinary_text):
+                ordinary = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="sealed_test",
+                    channel_policy="sealed_test",
+                    current_text=ordinary_text,
+                    current_speaker_user_ids=(101,),
+                    subject_user_ids=(101,),
+                    moment_id="moment_glass_harbor",
+                    moment_situation_state="recent_active",
+                    moment_topic_coherent=True,
+                    moment_participant_overlap=True,
+                    response_act="answer",
+                )
+                self.assertNotEqual(ordinary.phase, "diagnosis")
+
+        passive_diagnosis = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="sealed_test",
+            channel_policy="sealed_test",
+            current_text=(
+                "The amber failure is now isolated to the decoder input."
+            ),
+            current_speaker_user_ids=(101,),
+            subject_user_ids=(101,),
+            moment_id="moment_glass_harbor",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+        self.assertEqual(passive_diagnosis.phase, "diagnosis")
 
     def test_revalidation_is_separate_and_fails_closed_by_state(self):
         frame = build_situation_frame_v1(

@@ -81,8 +81,12 @@ _EPISODE_EXPLICIT_NEW_EVENT_RE = re.compile(
     re.I,
 )
 _EPISODE_NEGATED_NEW_EVENT_RE = re.compile(
-    r"\b(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|aren(?:'|’)t|"
-    r"weren(?:'|’)t)\s+(?:(?:a|an|the)\s+)?"
+    r"\b(?:(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|"
+    r"aren(?:'|’)t|weren(?:'|’)t)\s+"
+    r"(?:(?:a|an|the)\s+)?|"
+    r"do(?:n['’]t|\s+not)\s+(?:(?:start|begin|open|create)\s+|"
+    r"(?:treat|regard|count|consider|call)\s+"
+    r"(?:this|that|it)\s+as\s+)(?:(?:a|an|the)\s+)?)"
     r"(?:new|different|separate|another)\s+"
     r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
     re.I,
@@ -3015,9 +3019,12 @@ def _episode_text_explicit_new_event(value: str) -> bool:
             + 1,
         )
         cue_prefix = unnegated[assertion_start : match.end()]
+        assertion = unnegated[assertion_start:clause_end]
         if (
             clause.rstrip().endswith("?")
-            and not _EPISODE_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(clause)
+            and not _EPISODE_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(
+                assertion
+            )
         ):
             continue
         if _EPISODE_NEW_EVENT_UNCERTAINTY_RE.search(cue_prefix):
