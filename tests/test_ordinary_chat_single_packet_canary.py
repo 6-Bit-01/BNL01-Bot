@@ -31,6 +31,7 @@ from bnl_shared_brain_synthesis import (
     parse_ordinary_chat_response_contract,
     record_single_packet_review,
     revalidate_basis,
+    render_recurrence_authority_contract,
     render_ordinary_chat_task_contract,
     render_packet_context,
     validate_ordinary_chat_response_contract,
@@ -981,6 +982,83 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertTrue(valid)
         self.assertEqual(status, "passed")
+
+    def test_recurrence_verdict_keeps_public_examples_without_inventing_pattern(self):
+        recurrence_request = replace(
+            self.packet.request,
+            user_text="What recurring themes keep coming up for me?",
+            frame_object_kind="memory",
+            frame_subject_requirement="required",
+        )
+        packet = replace(self.packet, request=recurrence_request)
+        packet.diagnostics.theme_query_status = "no_authoritative_theme"
+
+        contract = render_recurrence_authority_contract(packet)
+        self.assertIn(
+            "retained memory does not establish a recurring theme",
+            contract,
+        )
+        self.assertIn(
+            "public, show, and conversation memories remain additive examples",
+            contract,
+        )
+
+        packet.diagnostics.theme_query_status = (
+            "provisional_single_occurrence"
+        )
+        provisional = render_recurrence_authority_contract(packet)
+        self.assertIn("one occurrence only", provisional)
+        self.assertIn("remain additive examples", provisional)
+
+        empty_packet = replace(packet, items=())
+        empty_basis = replace(
+            self.basis,
+            packet=empty_packet,
+            rendered_context=(
+                "SELECTED EVIDENCE:\n"
+                "- No stored evidence was selected for this turn."
+            ),
+        )
+        owned = build_packet_owned_prompt("Current request.", empty_basis)
+        self.assertTrue(owned.ready)
+        self.assertIn("one occurrence only", owned.prompt)
+
+        packet.diagnostics.theme_query_status = "no_authoritative_theme"
+        show_packet = replace(
+            packet,
+            request=replace(
+                recurrence_request,
+                user_text="What recurring topics came up throughout the show?",
+                frame_object_kind="broadcast",
+                frame_subject_requirement="required",
+            ),
+        )
+        self.assertEqual(
+            render_recurrence_authority_contract(show_packet),
+            "",
+        )
+
+        failed_packet = replace(packet)
+        failed_packet.diagnostics.revalidation_status = "failed_stale_source"
+        self.assertEqual(
+            render_recurrence_authority_contract(failed_packet),
+            "",
+        )
+        failed_packet.diagnostics.revalidation_status = "passed"
+
+        established_packet = replace(
+            packet,
+            items=(replace(packet.items[0], lane="recurring_theme"),),
+        )
+        established_packet.diagnostics.theme_query_status = "established"
+        established = render_recurrence_authority_contract(
+            established_packet
+        )
+        self.assertIn(
+            "only selected recurring-theme evidence establishes",
+            established,
+        )
+        self.assertNotIn("does not establish", established)
 
     def test_bnl_self_identity_prompt_keeps_subject_scoped_canon(self):
         basis = self._multi_subject_basis(
