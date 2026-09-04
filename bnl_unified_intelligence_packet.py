@@ -5385,6 +5385,46 @@ def _select_items(
             item.source_ref,
         ),
     )
+    # The frozen frame already names the two public sources required by a
+    # mixed publication/current-queue request. Select one candidate for each
+    # of those tasks before optional historical background can spend the
+    # packet budget. This changes only ordering inside the existing selector;
+    # it does not add an owner, lane, gate, or source.
+    requested_public_lanes = []
+    for task in request.frame_tasks:
+        authority_scope = str(task.authority_scope or "").strip().lower()
+        object_kind = str(task.object_kind or "").strip().lower()
+        task_kind = str(task.task_kind or "").strip().lower()
+        currentness = str(task.currentness or "").strip().lower()
+        lane = ""
+        if (
+            authority_scope == "packet"
+            and task_kind == "retrieve_publication"
+            and object_kind in {"journal", "relay"}
+        ):
+            lane = "%s_publication" % object_kind
+        elif (
+            authority_scope in {"packet", "external_current"}
+            and object_kind == "queue"
+            and currentness == "current"
+        ):
+            lane = "website_read_model"
+        if lane and lane not in requested_public_lanes:
+            requested_public_lanes.append(lane)
+    requested_items = []
+    for lane in requested_public_lanes:
+        candidate = next(
+            (item for item in ordered if item.lane == lane),
+            None,
+        )
+        if candidate is not None:
+            requested_items.append(candidate)
+    if requested_items:
+        requested_ids = {id(item) for item in requested_items}
+        ordered = [
+            *requested_items,
+            *(item for item in ordered if id(item) not in requested_ids),
+        ]
     selected: list[IntelligencePacketItem] = []
     seen_text: set[str] = set()
     seen_profile_roots: set[str] = set()

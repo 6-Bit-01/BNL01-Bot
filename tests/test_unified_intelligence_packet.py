@@ -2867,6 +2867,91 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertFalse(changed.valid)
         self.assertEqual(changed.status, "source_changed")
 
+    def test_mixed_publication_and_queue_tasks_survive_budget_pressure(self):
+        request = replace(
+            self.public_request(
+                text=(
+                    "What did the Journal say about the queue, and is the "
+                    "queue open right now?"
+                )
+            ),
+            budget_chars=2400,
+            frame_schema_version="situation_frame_v1",
+            frame_revision="sf_journal_queue_budget",
+            frame_input_evidence_digest="d" * 64,
+            frame_status="resolved",
+            frame_subject_requirement="not_applicable",
+            frame_tasks=(
+                PacketFrameTask(
+                    task_id="T1",
+                    text_digest="a" * 64,
+                    task_kind="retrieve_publication",
+                    object_kind="journal",
+                    authority_scope="packet",
+                    temporal_scope="historical",
+                    currentness="historical",
+                    required_response_act="answer",
+                    subject_requirement="not_applicable",
+                ),
+                PacketFrameTask(
+                    task_id="T2",
+                    text_digest="b" * 64,
+                    task_kind="answer",
+                    object_kind="queue",
+                    authority_scope="packet",
+                    temporal_scope="current",
+                    currentness="current",
+                    required_response_act="answer",
+                    subject_requirement="not_applicable",
+                ),
+            ),
+            frame_object_kind="multiple",
+            frame_currentness="mixed",
+        )
+
+        def item(lane, index, score):
+            return IntelligencePacketItem(
+                lane=lane,
+                source_class="runtime_observation",
+                source_type="test_%s" % lane,
+                source_ref="%s:%s" % (lane, index),
+                source_digest=("%064x" % (index + 1))[-64:],
+                subject_key="",
+                predicate_key="test",
+                text=("%s evidence %s " % (lane, index)) * 60,
+                visibility="public_safe",
+                confidence="high",
+                lifecycle="current",
+                authority=100,
+                score=score,
+            )
+
+        candidates = [
+            item("show_episode", 1, 192.0),
+            item("show_episode", 2, 184.0),
+            item("show_episode", 3, 176.0),
+            item("journal_publication", 4, 135.0),
+            item("website_read_model", 5, 96.0),
+        ]
+        diagnostics = packet_module.IntelligencePacketDiagnostics(
+            candidates_by_lane={
+                "show_episode": 3,
+                "journal_publication": 1,
+                "website_read_model": 1,
+            }
+        )
+        selected, _profile, _validation = packet_module._select_items(
+            request,
+            packet_module.PacketSubjectResolution(status="not_applicable"),
+            candidates,
+            diagnostics,
+            [],
+        )
+
+        selected_lanes = {candidate.lane for candidate in selected}
+        self.assertIn("journal_publication", selected_lanes)
+        self.assertIn("website_read_model", selected_lanes)
+
     def test_publication_task_survives_only_unrelated_subject_ambiguity(self):
         publication = IntelligencePacketItem(
             lane="journal_publication",

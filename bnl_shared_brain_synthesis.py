@@ -326,25 +326,14 @@ _PACKET_FACTUAL_OWNER_REPLACEMENT = (
 _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT = (
     "PACKET-OWNED RESPONSE CONTRACT:\n"
     "- The current request and exact reply/referent evidence govern the task.\n"
-    "- For BARCODE, member, publication, episode, relationship, identity, or "
-    "stored-history claims, use only the selected evidence below.\n"
+    "- Use the authorized context already assembled in this prompt together "
+    "with the selected evidence below as one understanding of the turn.\n"
     "- A publication projection is exact published prose only; it adds no "
     "independent fact, recurrence, canon, identity, or relationship weight.\n"
-    "- If selected evidence is absent or insufficient for a requested stored "
-    "claim, say so or ask one focused clarification. Do not reconstruct a "
-    "legacy memory, archive, dossier, source, Journal, Relay, or canon view.\n"
+    "- Keep historical publication context separate from current operational "
+    "state; do not infer a current state from an older publication.\n"
     "- General public knowledge may answer ordinary external questions, but it "
     "must not be presented as BARCODE memory or private system evidence."
-)
-_ORDINARY_CHAT_FORBIDDEN_PROMPT_MARKERS = (
-    "Durable memory context:",
-    "Durable BARCODE Radio show episode memory:",
-    "Broadcast memory context:",
-    "Public website read model",
-    "Website read model",
-    "SOURCE FILE CONTEXT",
-    "Source-file context",
-    "UNIFIED MOMENT CANARY CONTEXT",
 )
 _HONEST_EMPTY_PROFILE_RESPONSE = (
     "I do not have enough reliable public history to summarize you without "
@@ -558,6 +547,116 @@ _PACKET_REFERENT_RE = re.compile(
 _PACKET_CLAUSE_TAIL_BOUNDARY_RE = re.compile(
     r"(?:[,;:—–]|\b(?:although|and|because|but|since|though|while|"
     r"whereas|yet)\b)\s+",
+    re.I,
+)
+_RETAINED_TOLD_FACT_RE = re.compile(
+    r"^(?:(?:i|me|we|us|you|he|she|they|<@!?\d+>)|"
+    r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3})(?:['’]s)?\s+"
+    r"(?:(?:have|has|had)\s+)?(?:tell(?:s)?|told)\s+"
+    r"(?:(?:anybody|anyone|everybody|everyone|her|him|me|somebody|"
+    r"someone|them|us|you|the\s+(?:channel|group|room|team))\s+"
+    r"(?:that\s+)?|(?:<@!?\d+>|[A-Z][\w'’-]*"
+    r"(?:\s+[A-Z][\w'’-]*){0,3})\s+that\s+)"
+    r"(?P<fact>[\s\S]+)$",
+    re.I,
+)
+_RETAINED_REPORTED_FACT_RE = re.compile(
+    r"^(?:(?:i|me|we|us|you|he|she|they|<@!?\d+>)|"
+    r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3})(?:['’]s)?\s+"
+    r"(?:(?:have|has|had)\s+)?(?:claim(?:ed|s)?|hear(?:d|s)?|"
+    r"knew|know(?:s)?|learn(?:ed|s)?|mention(?:ed|s)?|"
+    r"notic(?:ed|es)|observ(?:ed|es)|recall(?:ed|s)?|"
+    r"remember(?:ed|s)?|report(?:ed|s)?|said|says?|saw|see(?:s)?|"
+    r"thought|think(?:s)?|wrote|writes?)\s+(?:that\s+)?"
+    r"(?P<fact>[\s\S]+)$",
+    re.I,
+)
+_RETAINED_POLARITY_CLAUSE_RE = re.compile(
+    r"\s+\b(?:and|but|while|whereas|yet)\b\s+",
+    re.I,
+)
+_RETAINED_ATTRIBUTION_PREFIX_RE = re.compile(
+    r"^[^:/\n]{1,120}:\s+",
+)
+_RETAINED_POSSESSIVE_SUBJECT_MARKER_RE = re.compile(
+    r"^(?:(?i:my|our|your|his|her|their|its)|"
+    r"[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,3}['’]s)\s+"
+    r"(?P<marker>[A-Za-z][\w'’-]*)\b",
+)
+_RETAINED_DIRECT_SUBJECT_TAIL_RE = re.compile(
+    r"^(?:(?i:i|we|you|he|she|they)"
+    r"(?:['’](?:d|ll|m|re|s|ve))?|<@!?\d+>|"
+    r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*){0,3})\s+"
+    r"(?P<tail>[\s\S]+)$",
+)
+_RETAINED_RELATION_MODE_RES = (
+    (
+        "possibility",
+        re.compile(r"^(?:could|may|might)\b", re.I),
+    ),
+    (
+        "capability",
+        re.compile(
+            r"^(?:can(?:not)?|can['’]t)\b|"
+            r"^(?:(?:am|are|is|was|were)\s+)?(?:un)?able\s+to\b",
+            re.I,
+        ),
+    ),
+    (
+        "conditional",
+        re.compile(r"^(?:should|would)\b", re.I),
+    ),
+    (
+        "intent",
+        re.compile(
+            r"^(?:(?:am|are|is|was|were|have|has|had)\s+){0,2}"
+            r"(?:aim(?:ed|ing|s)?|hope(?:d|ing|s)?|"
+            r"intend(?:ed|ing|s)?|plan(?:ned|ning|s)?|"
+            r"want(?:ed|ing|s)?)\s+to\b",
+            re.I,
+        ),
+    ),
+    (
+        "future",
+        re.compile(
+            r"^(?:will|shall)\b|"
+            r"^(?:am|are|is|was|were)\s+going\s+to\b",
+            re.I,
+        ),
+    ),
+    (
+        "obligation",
+        re.compile(
+            r"^(?:must|ought\s+to|need(?:ed|s)?\s+to|"
+            r"(?:have|has|had)\s+to)\b",
+            re.I,
+        ),
+    ),
+    (
+        "cessation",
+        re.compile(
+            r"^(?:(?:have|has|had)\s+)?"
+            r"(?:ceas(?:e|ed|es|ing)|finish(?:ed|es|ing)?|"
+            r"quit(?:s|ting)?|stop(?:ped|ping|s)?)\b",
+            re.I,
+        ),
+    ),
+    (
+        "former",
+        re.compile(r"^(?:formerly|used\s+to)\b", re.I),
+    ),
+    (
+        "near_miss",
+        re.compile(r"^(?:almost|nearly)\b", re.I),
+    ),
+)
+_RETAINED_NUMERIC_EVIDENCE_RE = re.compile(
+    r"(?<![\w.])[+-]?(?:\d+(?:[./:-]\d+)*|\.\d+)\b",
+    re.I,
+)
+_RETAINED_QUANTITY_PHRASE_BOUNDARY_RE = re.compile(
+    r"[,;:—–]|\b(?:and|at|by|for|from|in|into|near|of|on|onto|"
+    r"per|to|with)\b",
     re.I,
 )
 _AMBIGUOUS_PACKET_SUBJECT_RE = re.compile(
@@ -1171,6 +1270,34 @@ _CLAIM_GENERIC_TERMS = frozenset(
         "okay",
         "profile",
         "signal",
+    }
+)
+_ORDINARY_CHAT_CLAIM_REFERENT_TERMS = frozenset(
+    {
+        "he",
+        "her",
+        "hers",
+        "him",
+        "his",
+        "individual",
+        "it",
+        "its",
+        "me",
+        "mine",
+        "my",
+        "person",
+        "requester",
+        "select",
+        "she",
+        "their",
+        "theirs",
+        "them",
+        "they",
+        "user",
+        "we",
+        "you",
+        "your",
+        "yours",
     }
 )
 _MAX_RENDERED_SUPPORTING_OBSERVATIONS = 8
@@ -3417,8 +3544,10 @@ def render_ordinary_chat_task_contract(
         + "VISIBLE RESPONSE CONTRACT:\n"
         + "Write one natural BNL reply, not JSON. Answer every task in order "
         + "and combine them coherently instead of treating one task as a "
-        + "reason to drop another. Use only that task's listed support for "
-        + "BARCODE, member, publication, history, or current-state facts. "
+        + "reason to drop another. Use each task's listed packet support "
+        + "together with relevant authorized context already present in this "
+        + "prompt for BARCODE, member, publication, history, or current-state "
+        + "facts. "
         + "For supportKind=hold, state only the specific fact that cannot be "
         + "verified and continue answering the remaining tasks. For "
         + "response=clarify, ask the natural clarification the task requires. "
@@ -3596,21 +3725,6 @@ def ordinary_chat_deterministic_response_act(
     return "hold"
 
 
-def _ordinary_blocking_factual_owner_lanes(
-    assessment: UnifiedResponseAssessment,
-    packet: UnifiedIntelligencePacket,
-) -> tuple[str, ...]:
-    """Treat a selected packet projection as packet-owned for this run."""
-
-    blocking = set(assessment.selected_lanes) & set(
-        _NON_PACKET_FACTUAL_OWNER_LANES
-    )
-    packet_lanes = {str(item.lane or "") for item in packet.items}
-    if "website_read_model" in packet_lanes:
-        blocking.discard("website_read_model")
-    return tuple(sorted(blocking))
-
-
 def build_ordinary_chat_basis(
     *,
     guild_id: int,
@@ -3649,10 +3763,6 @@ def build_ordinary_chat_basis(
     rendered, lane_counts, item_count, source_digests = (
         _ordinary_packet_context(packet)
     )
-    blocking_lanes = _ordinary_blocking_factual_owner_lanes(
-        assessment,
-        packet,
-    )
     profile = getattr(packet, "profile_sufficiency", None)
     rendered_evidence_refs = _ordinary_rendered_evidence_refs(
         packet,
@@ -3688,7 +3798,7 @@ def build_ordinary_chat_basis(
         competing_factual_context_digests=tuple(
             _digest(value) for value in factual_contexts
         ),
-        blocking_factual_owner_lanes=blocking_lanes,
+        blocking_factual_owner_lanes=(),
         profile_sufficiency_status=str(
             getattr(profile, "status", "not_applicable")
             or "not_applicable"
@@ -3906,11 +4016,6 @@ def revalidate_basis(
                 for value in basis.competing_factual_contexts
             )
             != basis.competing_factual_context_digests
-            or basis.blocking_factual_owner_lanes
-            or _ordinary_blocking_factual_owner_lanes(
-                basis.assessment,
-                basis.packet,
-            )
         ):
             return False, "scope_or_basis_changed"
         result = revalidate_packet(
@@ -4028,13 +4133,7 @@ def build_packet_owned_prompt(
     prompt: str,
     basis: SharedBrainSynthesisBasis,
 ) -> PacketOwnedPrompt:
-    """Replace competing factual memory views before adding the packet.
-
-    The current request, persona/canon, Conversation Context, and route/style
-    contracts stay byte-identical. Only exact, caller-supplied factual memory
-    contexts are replaced, using the last occurrence so matching user text
-    cannot redirect the replacement.
-    """
+    """Add packet evidence to the already-authorized response context."""
 
     updated = str(prompt or "")
     if basis.ordinary_chat_single_packet:
@@ -4045,91 +4144,17 @@ def build_packet_owned_prompt(
                 ready=False,
                 reason="single_packet_prompt_missing",
             )
-        if basis.blocking_factual_owner_lanes:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="nonpacket_factual_owner_selected",
-            )
-        replaced = 0
-        for context in basis.competing_factual_contexts:
-            value = str(context or "")
-            if not value:
-                continue
-            start = updated.rfind(value)
-            if start < 0:
-                return PacketOwnedPrompt(
-                    prompt=updated,
-                    ready=False,
-                    reason="competing_factual_context_missing",
-                    replaced_factual_context_count=replaced,
-                )
-            updated = (
-                updated[:start]
-                + _PACKET_FACTUAL_OWNER_REPLACEMENT
-                + updated[start + len(value):]
-            )
-            replaced += 1
-        if any(
-            context and context in updated
-            for context in basis.competing_factual_contexts
-        ):
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="competing_factual_context_retained",
-                replaced_factual_context_count=replaced,
-            )
-        prompt_contract_suffix = updated
-        if "\nIdentity-label rule:" in prompt_contract_suffix:
-            prompt_contract_suffix = prompt_contract_suffix.split(
-                "\nIdentity-label rule:",
-                1,
-            )[1]
-        forbidden = next(
-            (
-                marker
-                for marker in _ORDINARY_CHAT_FORBIDDEN_PROMPT_MARKERS
-                if marker.casefold() in prompt_contract_suffix.casefold()
-            ),
-            "",
-        )
-        if forbidden:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="legacy_factual_prompt_marker_present",
-            )
-        if not basis.rendered_context:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="packet_context_unavailable",
-            )
-        if not task_contract:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="typed_task_contract_unavailable",
-            )
-        if basis.rendered_context in updated:
-            return PacketOwnedPrompt(
-                prompt=updated,
-                ready=False,
-                reason="packet_context_already_present",
-            )
+        additions = []
+        if _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT not in updated:
+            additions.append(_ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT)
+        if basis.rendered_context and basis.rendered_context not in updated:
+            additions.append(basis.rendered_context)
+        if task_contract and task_contract not in updated:
+            additions.append(task_contract)
         return PacketOwnedPrompt(
-            prompt=(
-                updated.rstrip()
-                + "\n\n"
-                + _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT
-                + "\n\n"
-                + basis.rendered_context
-                + "\n\n"
-                + task_contract
-            ),
+            prompt="\n\n".join((updated.rstrip(), *additions)),
             ready=True,
-            replaced_factual_context_count=replaced,
+            replaced_factual_context_count=0,
         )
     if basis.honest_empty_profile_fallback:
         return PacketOwnedPrompt(
@@ -5368,7 +5393,7 @@ def _relation_polarity(value: str) -> str:
         "negative"
         if re.search(
             r"\b(?:never|no|not|cannot|can't|don't|doesn't|didn't|"
-            r"won't|wouldn't|shouldn't)\b",
+            r"won't|wouldn't|shouldn't|[a-z]+n['’]t)\b",
             str(value or ""),
             re.I,
         )
@@ -6723,6 +6748,1006 @@ def _ordinary_chat_supported_claim_has_packet_tail(
     )
 
 
+def _ordinary_chat_authorized_support_terms(value: str) -> frozenset[str]:
+    """Normalize bounded paraphrases already present in authorized evidence."""
+
+    relation_aliases = {
+        "describe": "report",
+        "keep": "remain",
+        "kept": "remain",
+        "note": "report",
+        "record": "report",
+        "report": "report",
+        "say": "report",
+        "stay": "remain",
+        "write": "report",
+    }
+    return frozenset(
+        (
+            "not"
+            if re.fullmatch(r"[a-z]+n['’]t", term, re.I)
+            else relation_aliases.get(term, term)
+        )
+        for raw_term in _normalized_relation_terms(value)
+        for term in (raw_term.strip("'’"),)
+        if term
+    )
+
+
+def _ordinary_chat_attributed_clause_body(value: str) -> str:
+    """Remove only the retained renderer's leading speaker attribution."""
+
+    return _RETAINED_ATTRIBUTION_PREFIX_RE.sub(
+        "",
+        _ordinary_chat_claim_core(value),
+        count=1,
+    ).strip()
+
+
+def _ordinary_chat_possessive_subject_marker_terms(
+    value: str,
+) -> frozenset[str]:
+    """Keep a possessed grammatical subject attached to its factual claim."""
+
+    match = _RETAINED_POSSESSIVE_SUBJECT_MARKER_RE.match(
+        _ordinary_chat_attributed_clause_body(value)
+    )
+    if match is None:
+        return frozenset()
+    marker = _relation_term_stem(str(match.group("marker") or ""))
+    return frozenset(
+        {
+            marker,
+        }
+        - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+        - {""}
+    )
+
+
+def _ordinary_chat_relation_mode_markers(value: str) -> frozenset[str]:
+    """Read non-current or non-actual modes leading a factual predicate."""
+
+    body = _ordinary_chat_attributed_clause_body(value)
+    possessive_match = _RETAINED_POSSESSIVE_SUBJECT_MARKER_RE.match(
+        body
+    )
+    if possessive_match is not None:
+        remainder = body[possessive_match.end() :].strip()
+        words = tuple(_EXTERNAL_WORD_RE.finditer(remainder))
+        tails = tuple(
+            remainder[word.start() :]
+            for word in words[:4]
+        )
+    else:
+        subject_match = _RETAINED_DIRECT_SUBJECT_TAIL_RE.match(
+            body
+        )
+        tails = (
+            (str(subject_match.group("tail") or "").strip(),)
+            if subject_match is not None
+            else ()
+        )
+    modes = set()
+    for raw_tail in tails:
+        tail = re.sub(
+            r"^(?:(?:currently|eventually|maybe|perhaps|possibly|probably|"
+            r"really|still)\s+){0,2}",
+            "",
+            raw_tail,
+            count=1,
+            flags=re.I,
+        )
+        modes.update(
+            mode
+            for mode, pattern in _RETAINED_RELATION_MODE_RES
+            if pattern.search(tail)
+        )
+    return frozenset(modes)
+
+
+def _ordinary_chat_numeric_evidence_anchors(
+    value: str,
+) -> dict[str, frozenset[str]]:
+    """Bind each quantitative token to its following object phrase."""
+
+    body = _PACKET_DOMAIN_LINK_OR_ADDRESS_RE.sub(
+        " ",
+        _ordinary_chat_attributed_clause_body(value),
+    )
+    matches = tuple(_RETAINED_NUMERIC_EVIDENCE_RE.finditer(body))
+    anchors: dict[str, set[str]] = {}
+    for index, match in enumerate(matches):
+        phrase_end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(body)
+        )
+        phrase = body[match.end() : phrase_end]
+        boundary = _RETAINED_QUANTITY_PHRASE_BOUNDARY_RE.search(phrase)
+        if boundary is not None:
+            phrase = phrase[: boundary.start()]
+        token = str(match.group(0) or "").casefold().rstrip(".,;:!?")
+        phrase_terms = (
+            _ordinary_chat_authorized_support_terms(phrase)
+            - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+        )
+        anchors.setdefault(token, set()).update(phrase_terms)
+    return {
+        token: frozenset(terms)
+        for token, terms in anchors.items()
+        if token
+    }
+
+
+def _ordinary_chat_numeric_evidence_anchors_align(
+    claim: str,
+    support: str,
+) -> bool:
+    """Keep multiple retained quantities attached to matching objects."""
+
+    claim_anchors = _ordinary_chat_numeric_evidence_anchors(claim)
+    support_anchors = _ordinary_chat_numeric_evidence_anchors(support)
+    if len(claim_anchors) < 2 and len(support_anchors) < 2:
+        return True
+    return all(
+        not claim_terms
+        or not support_anchors.get(token)
+        or bool(claim_terms.intersection(support_anchors[token]))
+        for token, claim_terms in claim_anchors.items()
+    )
+
+
+def _ordinary_chat_queue_open_state(value: str) -> bool | None:
+    """Read only the existing queue snapshot's stable open/closed field."""
+
+    text = _ordinary_chat_plain_text(value)
+    snapshot_match = re.search(
+        r"\bqueue\s+open\s*[:=]\s*(true|false)\b",
+        text,
+        re.I,
+    )
+    if snapshot_match is not None:
+        return snapshot_match.group(1).casefold() == "true"
+    if re.search(
+        r"\bqueue\b[^.?!\n]{0,80}\b(?:is|are|was|were)"
+        r"(?:n['’]?t|\s+not)"
+        r"(?:\s+\w+){0,2}\s+closed\b",
+        text,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\bqueue\b[^.?!\n]{0,80}\b(?:closed|"
+        r"no(?:\s+\w+){0,2}\s+open|"
+        r"not(?:\s+\w+){0,2}\s+open|"
+        r"(?:is|are|was|were)n['’]?t(?:\s+\w+){0,2}\s+open)\b",
+        text,
+        re.I,
+    ):
+        return False
+    if re.search(
+        r"\bqueue\b[^.?!\n]{0,80}\bopen\b",
+        text,
+        re.I,
+    ):
+        return True
+    return None
+
+
+def _ordinary_chat_current_queue_state_claim(value: str) -> bool:
+    """Distinguish a current queue assertion from historical queue prose."""
+
+    text = _ordinary_chat_plain_text(value)
+    if _ordinary_chat_queue_open_state(text) is None:
+        return False
+    if re.search(
+        r"\b(?:current(?:ly)?|live|now|right\s+now|today)\b",
+        text,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\b(?:at\s+the\s+time|during|historically|previously|then|"
+        r"used\s+to|was|were|yesterday)\b|"
+        r"\blast\s+(?:night|week|month|year|show|rehearsal)\b",
+        text,
+        re.I,
+    ):
+        return False
+    # A bare present-tense/open-state response answers the live state unless
+    # it carries an explicit historical scope.
+    return True
+
+
+def _ordinary_chat_reported_fact(value: str) -> str:
+    """Return an explicitly subject-led fact embedded after a report verb."""
+
+    core = _ordinary_chat_claim_core(value)
+    for pattern in (
+        _RETAINED_TOLD_FACT_RE,
+        _RETAINED_REPORTED_FACT_RE,
+    ):
+        match = pattern.match(core)
+        if match is not None:
+            return str(match.group("fact") or "").strip()
+    return ""
+
+
+def _ordinary_chat_polarity_clause_units(
+    value: str,
+    *,
+    retained_support: bool = False,
+) -> tuple[str, ...]:
+    """Split coordinated predicates only when each is independently factual."""
+
+    core = _ordinary_chat_claim_core(value)
+    parts = tuple(
+        part.strip(" ,;:—–")
+        for part in _RETAINED_POLARITY_CLAUSE_RE.split(core)
+        if part.strip(" ,;:—–")
+    )
+    if len(parts) < 2:
+        return (value,)
+    polarities = {_relation_polarity(part) for part in parts}
+    safe_parts = []
+    for part in parts:
+        material = (
+            _ordinary_chat_authorized_support_terms(part)
+            - _PROFILE_GENERIC_TERMS
+            - _PROFILE_SUPPORT_GENERIC_TERMS
+            - _CLAIM_GENERIC_TERMS
+            - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+        )
+        if len(material) >= 2 and _concrete_relation_action_terms(part):
+            safe_parts.append(part)
+    if len(safe_parts) == len(parts):
+        return parts
+    if len(polarities) < 2:
+        return (value,)
+    # Retained evidence may still support its independently explicit clause.
+    # A candidate with an unresolved elliptical clause cannot silently drop
+    # that clause and pass as though it were never asserted.
+    return tuple(safe_parts) if retained_support else ()
+
+
+def _ordinary_chat_bound_member_labels(
+    basis: SharedBrainSynthesisBasis,
+) -> dict[str, str]:
+    """Map unambiguous prompt labels to existing Discord subject keys."""
+
+    candidates = (
+        *(
+            (evidence.speaker_label, evidence.speaker_user_id)
+            for evidence in tuple(
+                basis.packet.request.conversation_evidence or ()
+            )
+            if not evidence.current_turn
+        ),
+        *(
+            (subject.label_hint, subject.user_id)
+            for subject in tuple(
+                basis.packet.request.frame_subjects or ()
+            )
+        ),
+    )
+    label_subject_keys: dict[str, set[str]] = {}
+    for raw_label, subject_user_id in candidates:
+        label = re.sub(
+            r"\s+",
+            " ",
+            str(raw_label or "").strip().casefold(),
+        )
+        if label and int(subject_user_id or 0) > 0:
+            label_subject_keys.setdefault(label, set()).add(
+                subject_key_for_user(int(subject_user_id or 0))
+            )
+    return {
+        label: next(iter(subject_keys))
+        for label, subject_keys in label_subject_keys.items()
+        if len(subject_keys) == 1
+    }
+
+
+def _ordinary_chat_retained_clause_subject(
+    value: str,
+    *,
+    speaker_subject_key: str,
+    bound_member_labels: Mapping[str, str],
+) -> tuple[str, bool]:
+    """Resolve one explicit subject, including an embedded reported fact."""
+
+    core = _ordinary_chat_claim_core(value)
+    reported_fact = _ordinary_chat_reported_fact(core)
+    if reported_fact:
+        reported_subject_key, reported_subject_explicit = (
+            _ordinary_chat_retained_clause_subject(
+                reported_fact,
+                speaker_subject_key="",
+                bound_member_labels=bound_member_labels,
+            )
+        )
+        if reported_subject_explicit:
+            return reported_subject_key, True
+    mention = re.match(r"^<@!?(\d+)>(?:\W|$)", core)
+    if mention is not None:
+        return subject_key_for_user(int(mention.group(1) or 0)), True
+    if re.match(
+        r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        return str(speaker_subject_key or ""), True
+    if re.match(
+        r"^(?:you|you're|you've|you'd|you'll|your|yours)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        # A room speaker's "you" is not that speaker. A requester-scoped
+        # durable section can still apply its existing default binding.
+        return "", False
+    subject_keys = {
+        subject_key
+        for label, subject_key in bound_member_labels.items()
+        if re.match(
+            r"^%s(?:['’]s)?(?:\W|$)" % re.escape(label),
+            core,
+            re.I,
+        )
+    }
+    if subject_keys:
+        return (
+            next(iter(subject_keys)) if len(subject_keys) == 1 else "",
+            True,
+        )
+    if _PACKET_REFERENT_RE.match(core):
+        return "", True
+    proper_subject = re.match(
+        r"^(?P<subject>[A-Z][\w'’-]*"
+        r"(?:\s+[A-Z][\w'’-]*){0,3})(?:['’]s)?\s+"
+        r"(?!(?:and|at|by|for|from|in|near|of|on|or|to|with)\b)"
+        r"(?P<predicate>[a-z][\w'’-]*)\b",
+        core,
+    )
+    if proper_subject is not None and (
+        _ordinary_chat_external_token_is_finite_predicate(
+            str(proper_subject.group("predicate") or "")
+        )
+    ):
+        return "", True
+    return "", False
+
+
+def _ordinary_chat_retained_clause_starts_explicit_subject(
+    value: str,
+    *,
+    speaker_subject_key: str,
+    bound_member_labels: Mapping[str, str],
+) -> bool:
+    """Recognize a new clause subject even when its identity is not bound."""
+
+    _subject_key, explicit = _ordinary_chat_retained_clause_subject(
+        value,
+        speaker_subject_key=speaker_subject_key,
+        bound_member_labels=bound_member_labels,
+    )
+    return explicit
+
+
+def _ordinary_chat_retained_clause_units(
+    value: str,
+    *,
+    speaker_label: str,
+    speaker_subject_key: str,
+    bound_member_labels: Mapping[str, str],
+    default_subject_key: str = "",
+) -> tuple[tuple[str, str], ...]:
+    """Split a retained line only where an explicit subject restarts."""
+
+    results: list[tuple[str, str]] = []
+    retained_value = re.sub(
+        r"^\[Derived (?:current-participant contribution|"
+        r"participant contribution|moment) gist;[^\]\n]{1,160}\]\s*",
+        "",
+        str(value or ""),
+        count=1,
+        flags=re.I,
+    )
+    for unit in _candidate_claim_units(retained_value) or (retained_value,):
+        core = _ordinary_chat_claim_core(unit)
+        clause_values: list[str] = []
+        clause_start = 0
+        for boundary in _PACKET_CLAUSE_TAIL_BOUNDARY_RE.finditer(core):
+            if _ordinary_chat_retained_clause_starts_explicit_subject(
+                core[boundary.end() :],
+                speaker_subject_key=speaker_subject_key,
+                bound_member_labels=bound_member_labels,
+            ):
+                clause_values.append(
+                    core[clause_start : boundary.start()]
+                )
+                clause_start = boundary.end()
+        clause_values.append(core[clause_start:])
+        for clause_value in clause_values:
+            part = clause_value.strip(" ,;:—–")
+            if not part:
+                continue
+            subject_key, explicit_subject = (
+                _ordinary_chat_retained_clause_subject(
+                    part,
+                    speaker_subject_key=speaker_subject_key,
+                    bound_member_labels=bound_member_labels,
+                )
+            )
+            if not explicit_subject:
+                subject_key = str(default_subject_key or "")
+            if speaker_label and re.match(
+                r"^(?:i|i'm|i've|i'd|i'll|me|my|mine)(?:\W|$)",
+                part,
+                re.I,
+            ):
+                part = f"{speaker_label}: {part}"
+            results.append((part, subject_key))
+    return tuple(results)
+
+
+def _ordinary_chat_retained_context_lane(value: str) -> str:
+    """Keep the existing current-site classification on retained context."""
+
+    lines = tuple(
+        line.strip().casefold()
+        for line in str(value or "").splitlines()
+        if line.strip()
+    )
+    if not lines:
+        return ""
+    if lines[0].startswith(
+        (
+            "website public read model context:",
+            "website private queue read model context:",
+            "current barcode queue snapshot:",
+        )
+    ):
+        return "website_read_model"
+    if lines[0].startswith("authoritative current live-show context") and any(
+        line.startswith(
+            (
+                "website public read model context:",
+                "website private queue read model context:",
+            )
+        )
+        for line in lines[1:]
+    ):
+        return "website_read_model"
+    return ""
+
+
+def _ordinary_chat_bnl_room_label(value: str) -> bool:
+    """Recognize the existing rendered label for prior BNL output."""
+
+    label = re.sub(
+        r"\s*\([^\n)]{1,160}\)\s*$",
+        "",
+        str(value or "").strip(),
+    )
+    return bool(re.fullmatch(r"BNL(?:[\W_]*0?1)", label, re.I))
+
+
+def _ordinary_chat_authorized_support_segments(
+    basis: SharedBrainSynthesisBasis,
+) -> tuple[tuple[str, str, str], ...]:
+    """Return rendered evidence with its resolved subject and source lane."""
+
+    bound_member_labels = _ordinary_chat_bound_member_labels(basis)
+
+    rendered_refs = {
+        (str(lane or ""), str(source_digest or ""))
+        for _evidence_id, lane, source_digest, _subject_indexes in (
+            basis.rendered_evidence_refs
+        )
+    }
+    packet_items = tuple(
+        dict.fromkeys(
+            (
+                str(getattr(item, "lane", "") or ""),
+                str(getattr(item, "source_digest", "") or ""),
+                str(getattr(item, "text", "") or ""),
+                str(getattr(item, "subject_key", "") or ""),
+            )
+            for item in tuple(getattr(basis.packet, "items", ()) or ())
+            if (
+                str(getattr(item, "lane", "") or ""),
+                str(getattr(item, "source_digest", "") or ""),
+            )
+            in rendered_refs
+        )
+    )
+    segments: list[tuple[str, str, str]] = []
+    for lane, _source_digest, item_text, subject_key in packet_items:
+        label = _LANE_LABELS.get(lane, lane.replace("_", " "))
+        if item_text.strip():
+            segments.append((f"{label}: {item_text}", subject_key, lane))
+    for context in basis.competing_factual_contexts:
+        context_value = str(context or "")
+        context_lines = context_value.splitlines()
+        context_kind = (
+            next(
+                (
+                    line.strip().casefold()
+                    for line in context_lines
+                    if line.strip()
+                ),
+                "",
+            )
+        )
+        room_context = context_kind.startswith("recent room context")
+        durable_memory_context = context_kind.startswith(
+            "durable memory context"
+        )
+        requester_subject_key = (
+            subject_key_for_user(basis.user_id)
+            if int(basis.user_id or 0) > 0
+            else ""
+        )
+        resolved_frame_subject_keys = {
+            str(resolution.subject_key or resolution.entity_ref or "")
+            for resolution in packet_subject_resolutions(basis.packet)
+            if str(resolution.status or "").lower() == "resolved"
+            and str(
+                resolution.subject_key or resolution.entity_ref or ""
+            ).strip()
+        }
+        resolved_frame_subject_key = (
+            next(iter(resolved_frame_subject_keys))
+            if len(resolved_frame_subject_keys) == 1
+            else ""
+        )
+        context_lane = _ordinary_chat_retained_context_lane(context_value)
+        memory_section_subject_key = ""
+        derived_memory_hints = False
+        for line in context_lines:
+            line = line.strip()
+            line_kind = line.casefold()
+            if line_kind.startswith("derived memory summaries"):
+                derived_memory_hints = True
+                memory_section_subject_key = ""
+                continue
+            if derived_memory_hints:
+                continue
+            if durable_memory_context and line.endswith(":"):
+                if line_kind.startswith(
+                    (
+                        "approved direct self-reports:",
+                        "recent relationship journal:",
+                        "durable memory (governed):",
+                    )
+                ):
+                    memory_section_subject_key = requester_subject_key
+                elif line_kind.startswith(
+                    "moment-based continuity gist for the uniquely "
+                    "targeted member"
+                ):
+                    memory_section_subject_key = resolved_frame_subject_key
+                else:
+                    memory_section_subject_key = ""
+            if (
+                not line
+                or line.endswith(":")
+                or (
+                    room_context
+                    and line.casefold().startswith(
+                        "active participants in recent room context"
+                    )
+                )
+            ):
+                continue
+            attributed = re.match(
+                r"^\s*(?:[-*•▪◦]+|\d+[.)])\s+"
+                r"(?P<label>[^:\n]{1,120}):\s*(?P<body>.+)$",
+                line,
+            )
+            if room_context and attributed is not None:
+                speaker_label = re.sub(
+                    r"\s+",
+                    " ",
+                    str(attributed.group("label") or "")
+                    .strip(),
+                )
+                # Prior model output remains available to the provider as
+                # conversational continuity, but it cannot corroborate a
+                # later factual claim. The room renderer reserves this label
+                # for rows whose existing conversation role is model/BNL.
+                if _ordinary_chat_bnl_room_label(speaker_label):
+                    continue
+                speaker_subject_key = bound_member_labels.get(
+                    speaker_label.casefold(),
+                    "",
+                )
+                body = _ordinary_chat_claim_core(
+                    str(attributed.group("body") or "")
+                )
+                segments.extend(
+                    (
+                        part,
+                        subject_key,
+                        context_lane,
+                    )
+                    for part, subject_key in _ordinary_chat_retained_clause_units(
+                        body,
+                        speaker_label=speaker_label,
+                        speaker_subject_key=speaker_subject_key,
+                        bound_member_labels=bound_member_labels,
+                    )
+                )
+                continue
+            line_subject_key = memory_section_subject_key
+            if durable_memory_context and line_kind.startswith(
+                ("relationship state:", "observed habits:")
+            ):
+                line_subject_key = requester_subject_key
+            if durable_memory_context and line_kind.startswith(
+                "[derived current-participant contribution gist;"
+            ):
+                line_subject_key = requester_subject_key
+            segments.extend(
+                (
+                    part,
+                    subject_key,
+                    context_lane,
+                )
+                for part, subject_key in _ordinary_chat_retained_clause_units(
+                    line,
+                    speaker_label="",
+                    speaker_subject_key=line_subject_key,
+                    bound_member_labels=bound_member_labels,
+                    default_subject_key=line_subject_key,
+                )
+            )
+    return tuple(dict.fromkeys(segments))
+
+
+def _ordinary_chat_claim_support_subject_key(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+) -> str | None:
+    """Bind personal claims without inventing a new referent."""
+
+    core = _ordinary_chat_claim_core(claim)
+    reported_fact = _ordinary_chat_reported_fact(core)
+    if reported_fact and _ordinary_chat_retained_clause_starts_explicit_subject(
+        reported_fact,
+        speaker_subject_key="",
+        bound_member_labels=_ordinary_chat_bound_member_labels(basis),
+    ):
+        return _ordinary_chat_claim_support_subject_key(
+            basis,
+            reported_fact,
+        )
+    mention = re.match(r"^<@!?(\d+)>(?:\W|$)", core)
+    if mention is not None:
+        return subject_key_for_user(int(mention.group(1) or 0))
+    if re.match(
+        r"^(?:you|you're|you've|you'd|you'll|your|yours)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        return (
+            subject_key_for_user(basis.user_id)
+            if int(basis.user_id or 0) > 0
+            else "response_subject_unresolved"
+        )
+    if re.match(
+        r"^(?:i|i'm|i've|i'd|i'll|me|my|mine|we|we're|we've|"
+        r"we'd|we'll|us|our|ours)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        return "bnl_response_speaker"
+    if re.match(
+        r"^(?:one|another)\s+(?:individual|member|person|user)(?:\W|$)",
+        core,
+        re.I,
+    ):
+        return "response_subject_unresolved"
+    if _PACKET_REFERENT_RE.match(core) is not None or re.match(
+        r"^(?:the|this|that)\s+(?:individual|person|selected\s+member)"
+        r"(?:\W|$)",
+        core,
+        re.I,
+    ):
+        frame_subject_keys = {
+            str(resolution.subject_key or resolution.entity_ref or "")
+            for resolution in packet_subject_resolutions(basis.packet)
+            if str(resolution.status or "").lower() == "resolved"
+            and str(
+                resolution.subject_key or resolution.entity_ref or ""
+            ).strip()
+        }
+        return (
+            next(iter(frame_subject_keys))
+            if (
+                str(basis.packet.request.frame_status or "").lower()
+                == "resolved"
+                and len(frame_subject_keys) == 1
+            )
+            else "response_subject_unresolved"
+        )
+    label_subject_keys = {
+        subject_key
+        for label, subject_key in _ordinary_chat_bound_member_labels(
+            basis
+        ).items()
+        if re.match(
+            r"^%s(?:['’]s)?(?:\W|$)" % re.escape(label),
+            core,
+            re.I,
+        )
+    }
+    if label_subject_keys:
+        return (
+            next(iter(label_subject_keys))
+            if len(label_subject_keys) == 1
+            else "response_subject_unresolved"
+        )
+
+    return None
+
+
+def _ordinary_chat_hard_evidence_tokens(value: str) -> frozenset[str]:
+    """Return exact normalized URLs, addresses, dates, and numbers."""
+
+    return frozenset(
+        token.casefold().rstrip(".,;:!?")
+        for token in re.findall(
+            r"https?://[^\s)>\]]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
+            r"(?<![\w.])[+-]?(?:\d+(?:[./:-]\d+)*|\.\d+)\b",
+            str(value or ""),
+            re.I,
+        )
+    )
+
+
+def _ordinary_chat_support_subject_matches(
+    basis: SharedBrainSynthesisBasis,
+    required_subject_key: str,
+    support_subject_key: str,
+) -> bool:
+    """Match equivalent keys from one existing resolved subject binding."""
+
+    required = str(required_subject_key or "")
+    support = str(support_subject_key or "")
+    if required == support:
+        return True
+    if not required or not support or required in {
+        "bnl_response_speaker",
+        "response_subject_unresolved",
+    }:
+        return False
+    for resolution in packet_subject_resolutions(basis.packet):
+        if str(resolution.status or "").lower() != "resolved":
+            continue
+        identities = {
+            str(resolution.subject_key or ""),
+            str(resolution.entity_ref or ""),
+        } - {""}
+        if required in identities and support in identities:
+            return True
+    return False
+
+
+def _ordinary_chat_claim_support_parts(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+    *,
+    packet_context: bool,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> tuple[str, ...]:
+    """Split only when a second governed subject begins a factual tail."""
+
+    core = _ordinary_chat_claim_core(claim)
+    starts = [0]
+    for boundary in _PACKET_CLAUSE_TAIL_BOUNDARY_RE.finditer(core):
+        tail = core[boundary.end() :]
+        if (
+            _ordinary_chat_claim_has_packet_subject(
+                basis,
+                tail,
+                packet_context=packet_context,
+                selected_labels=selected_labels,
+                global_labels=global_labels,
+            )
+            or _ordinary_chat_queue_open_state(tail) is not None
+        ):
+            starts.append(boundary.end())
+    subject_parts = (claim,)
+    if len(starts) > 1:
+        starts.append(len(core))
+        subject_parts = tuple(
+            core[start:end].strip(" ,;:—–")
+            for start, end in zip(starts, starts[1:])
+            if core[start:end].strip(" ,;:—–")
+        )
+    polarity_parts = []
+    for subject_part in subject_parts:
+        units = _ordinary_chat_polarity_clause_units(subject_part)
+        if not units:
+            return ()
+        polarity_parts.extend(units)
+    return tuple(polarity_parts)
+
+
+def _ordinary_chat_claim_part_supported(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+    support_segments: Sequence[tuple[str, str, str]],
+    *,
+    inherited_subject_key: str | None = None,
+) -> bool:
+    claim_all_terms = _ordinary_chat_authorized_support_terms(claim)
+    claim_terms = (
+        claim_all_terms
+        - _PROFILE_GENERIC_TERMS
+        - _PROFILE_SUPPORT_GENERIC_TERMS
+        - _CLAIM_GENERIC_TERMS
+    )
+    claim_names = frozenset(
+        term.strip("'’") for term in _concrete_relation_name_terms(claim)
+    ) - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+    claim_material = (
+        claim_terms
+        - claim_names
+        - _ORDINARY_CHAT_CLAIM_REFERENT_TERMS
+    )
+    if len(claim_material) < 2:
+        return False
+    claim_relation_modes = _ordinary_chat_relation_mode_markers(claim)
+    hard_tokens = _ordinary_chat_hard_evidence_tokens(claim)
+    claim_queue_state = _ordinary_chat_queue_open_state(claim)
+    queue_state_terms = {
+        "accept",
+        "available",
+        "clos",
+        "current",
+        "currently",
+        "entry",
+        "for",
+        "isn't",
+        "isn’t",
+        "live",
+        "new",
+        "not",
+        "now",
+        "open",
+        "queue",
+        "right",
+        "submission",
+        "take",
+        "today",
+        "track",
+        "welcome",
+    }
+    required_subject_key = (
+        _ordinary_chat_claim_support_subject_key(basis, claim)
+        or inherited_subject_key
+    )
+    direct_queue_state_claim = bool(
+        claim_queue_state is not None
+        and claim_material.issubset(queue_state_terms)
+    )
+    current_queue_state_claim = bool(
+        claim_queue_state is not None
+        and _ordinary_chat_current_queue_state_claim(claim)
+    )
+    for support, support_subject_key, support_lane in support_segments:
+        if (
+            current_queue_state_claim
+            and support_lane != "website_read_model"
+        ):
+            continue
+        if (
+            required_subject_key is not None
+            and not _ordinary_chat_support_subject_matches(
+                basis,
+                required_subject_key,
+                support_subject_key,
+            )
+        ):
+            continue
+        support_all_terms = (
+            _ordinary_chat_authorized_support_terms(support)
+            - _PROFILE_GENERIC_TERMS
+            - _PROFILE_SUPPORT_GENERIC_TERMS
+            - _CLAIM_GENERIC_TERMS
+        )
+        if claim_names and not claim_names.issubset(support_all_terms):
+            continue
+        for support_part in _ordinary_chat_polarity_clause_units(
+            support,
+            retained_support=True,
+        ):
+            support_terms = (
+                _ordinary_chat_authorized_support_terms(support_part)
+                - _PROFILE_GENERIC_TERMS
+                - _PROFILE_SUPPORT_GENERIC_TERMS
+                - _CLAIM_GENERIC_TERMS
+            )
+            possessed_subject_terms = (
+                _ordinary_chat_possessive_subject_marker_terms(
+                    support_part
+                )
+            )
+            if possessed_subject_terms and not (
+                possessed_subject_terms.issubset(claim_all_terms)
+            ):
+                continue
+            support_relation_modes = (
+                _ordinary_chat_relation_mode_markers(support_part)
+            )
+            if not support_relation_modes.issubset(
+                claim_relation_modes
+            ):
+                continue
+            if hard_tokens and not hard_tokens.issubset(
+                _ordinary_chat_hard_evidence_tokens(support_part)
+            ):
+                continue
+            if not _ordinary_chat_numeric_evidence_anchors_align(
+                claim,
+                support_part,
+            ):
+                continue
+            support_queue_state = _ordinary_chat_queue_open_state(
+                support_part
+            )
+            if (
+                direct_queue_state_claim
+                and support_queue_state is not None
+            ):
+                if claim_queue_state == support_queue_state:
+                    return True
+                continue
+            if _relation_polarity(claim) != _relation_polarity(
+                support_part
+            ):
+                continue
+            if claim_material.issubset(support_terms):
+                return True
+    return False
+
+
+def _ordinary_chat_claim_supported_by_authorized_evidence(
+    basis: SharedBrainSynthesisBasis,
+    claim: str,
+    *,
+    support_segments: Sequence[tuple[str, str, str]],
+    packet_context: bool,
+    selected_labels: Sequence[str],
+    global_labels: Sequence[str],
+) -> bool:
+    """Recognize grounded facts from the evidence already authorized in prompt."""
+
+    parts = _ordinary_chat_claim_support_parts(
+        basis,
+        claim,
+        packet_context=packet_context,
+        selected_labels=selected_labels,
+        global_labels=global_labels,
+    )
+    inherited_subject_key = _ordinary_chat_claim_support_subject_key(
+        basis,
+        claim,
+    )
+    return bool(parts) and all(
+        _ordinary_chat_claim_part_supported(
+            basis,
+            part,
+            support_segments,
+            inherited_subject_key=inherited_subject_key,
+        )
+        for part in parts
+    )
+
+
 def audit_ordinary_chat_candidate_claims(
     basis: SharedBrainSynthesisBasis,
     response: str,
@@ -6742,6 +7767,9 @@ def audit_ordinary_chat_candidate_claims(
     classifications = tuple(profile.claim_classifications)
     packet_context = _ordinary_chat_packet_domain_context_active(basis)
     selected_labels, global_labels = _ordinary_chat_packet_domain_labels(
+        basis
+    )
+    authorized_support_segments = _ordinary_chat_authorized_support_segments(
         basis
     )
     if len(claims) != len(classifications):
@@ -6926,12 +7954,33 @@ def audit_ordinary_chat_candidate_claims(
         ):
             audited.append("external_public_knowledge")
             continue
-        packet_subject = _ordinary_chat_claim_has_packet_subject(
+        if _ordinary_chat_claim_supported_by_authorized_evidence(
             basis,
             claim,
+            support_segments=authorized_support_segments,
             packet_context=packet_context,
             selected_labels=selected_labels,
             global_labels=global_labels,
+        ):
+            audited.append("authorized_evidence_supported")
+            continue
+        packet_subject = bool(
+            _ordinary_chat_claim_has_packet_subject(
+                basis,
+                claim,
+                packet_context=packet_context,
+                selected_labels=selected_labels,
+                global_labels=global_labels,
+            )
+            or (
+                _ordinary_chat_queue_open_state(claim) is not None
+                and any(
+                    lane == "website_read_model"
+                    for _evidence_id, lane, _digest, _subjects in (
+                        basis.rendered_evidence_refs
+                    )
+                )
+            )
         )
         if packet_subject:
             audited.append("unsupported_packet_domain")

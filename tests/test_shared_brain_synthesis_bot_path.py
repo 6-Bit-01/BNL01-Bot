@@ -980,7 +980,7 @@ class SharedBrainSynthesisBotPathTests(
         evaluate.assert_not_called()
         finalize.assert_not_called()
 
-    async def test_single_packet_provider_wrapper_has_no_history_or_repair_call(self):
+    async def test_single_packet_provider_keeps_composed_context_without_duplicate_history(self):
         generated = mock.AsyncMock(
             return_value=SimpleNamespace(
                 success=True,
@@ -1019,6 +1019,7 @@ class SharedBrainSynthesisBotPathTests(
         ):
             response = await bnl01_bot.get_gemini_response(
                 "Current user request: answer this.\n"
+                "Authorized Conversation Context: prior relevant exchange.\n"
                 "PACKET-OWNED RESPONSE CONTRACT:\n"
                 "Use the selected evidence.",
                 7,
@@ -1033,7 +1034,12 @@ class SharedBrainSynthesisBotPathTests(
         strict_repair.assert_not_awaited()
         media_repair.assert_not_awaited()
         request_contents = generated.await_args.args[0]
-        self.assertIn("sole authority for BARCODE", request_contents)
+        self.assertIn(
+            "Authorized Conversation Context: prior relevant exchange.",
+            request_contents,
+        )
+        self.assertIn("one coherent understanding", request_contents)
+        self.assertNotIn("sole authority for BARCODE", request_contents)
         self.assertNotIn("Conversation history:", request_contents)
         self.assertNotIn("THE FORBIDDEN REFERENCE", request_contents)
 
@@ -1080,6 +1086,8 @@ class SharedBrainSynthesisBotPathTests(
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
+        conversation_basis = object()
+        memory_basis = object()
         run = SimpleNamespace(
             prompt_applied=True,
             fallback_reason="",
@@ -1157,6 +1165,7 @@ class SharedBrainSynthesisBotPathTests(
                     guild_id=1,
                     user_display_name="Test Member",
                     source_context_available=True,
+                    prompt_source_bases=(conversation_basis, memory_basis),
                 )
             )
 
@@ -1164,6 +1173,10 @@ class SharedBrainSynthesisBotPathTests(
         self.assertEqual(execution.response, "One generated answer.")
         self.assertEqual(execution.provider_call_count, 1)
         self.assertEqual(execution.corrective_call_count, 0)
+        self.assertEqual(
+            execution.prompt_source_bases,
+            (conversation_basis, memory_basis, basis),
+        )
         provider.assert_awaited_once()
         self.assertEqual(
             provider.await_args.kwargs["route"],
@@ -1562,9 +1575,15 @@ class SharedBrainSynthesisBotPathTests(
         )
 
     def test_source_change_builds_natural_source_neutral_rewrite(self):
+        retained_context = (
+            "Recent room context from this channel:\n"
+            "- Alice: The queue is open right now."
+        )
         prompt = (
             "Current user request: What did the Journal say, and is the "
             "queue open now?\n\n"
+            + retained_context
+            + "\n\n"
             "PACKET-OWNED RESPONSE CONTRACT:\n"
             "Grounded response evidence: stale queue snapshot"
         )
@@ -1573,13 +1592,16 @@ class SharedBrainSynthesisBotPathTests(
             bnl01_bot.build_ordinary_chat_response_repair_prompt(
                 prompt,
                 reason="source_revalidation_snapshot_changed",
-                prompt_source_bases=(object(),),
+                prompt_source_bases=(
+                    SimpleNamespace(rendered_context=retained_context),
+                ),
             )
         )
 
         self.assertTrue(source_neutral)
         self.assertEqual(bases, ())
         self.assertIn("What did the Journal say", rewritten)
+        self.assertNotIn(retained_context, rewritten)
         self.assertNotIn("stale queue snapshot", rewritten)
         self.assertNotIn("PACKET-OWNED RESPONSE CONTRACT", rewritten)
         self.assertIn("Write one natural BNL reply", rewritten)

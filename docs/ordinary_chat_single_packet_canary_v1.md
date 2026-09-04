@@ -1,7 +1,7 @@
 # Ordinary-Chat Single-Packet Canary and Scoped Expansion
 
-This capability cuts an explicitly bounded ordinary-chat scope over to a
-single factual prompt owner and one natural response obligation. It is disabled by
+This capability cuts an explicitly bounded ordinary-chat scope over to one
+composed shared-brain prompt and one natural response obligation. It is disabled by
 default and is separate from the broad-profile comparison canary and
 public-home recall owner. The default remains the original private acceptance
 scope; contract v4 adds a second gate for controlled multi-user or
@@ -65,14 +65,16 @@ Content-free configuration diagnostics expose the private or
 state, expansion-effective state, and a scope digest that changes when either
 the allowlists or expansion authorization changes. IDs are not exposed.
 
-## One factual owner and one response
+## One shared understanding and one response
 
 The immutable Situation Frame v3 and `unified_intelligence_packet_v12` are
-frozen before generation. The packet renderer supplies the sole BARCODE,
-member, identity, relationship, episode, publication, canon, and
-stored-history factual view. The current request and verified exact-reply or
-referent text remain task evidence. Persona, style, route behavior, and safety
-remain expression owners but cannot create facts.
+frozen before generation. The shared brain receives the authorized context
+already assembled for the turn together with the packet's selected evidence
+as one prompt. The packet is an evidence selection and receipt boundary, not a
+replacement for Conversation Context, current public read models, approved
+canon, or other authorized context already available to the turn. The current
+request and verified exact-reply or referent text remain task evidence.
+Persona, style, route behavior, and safety cannot create facts.
 
 A true multi-subject request is still one governed packet and one coherent
 response. Each frozen task names its required subject indexes. The packet runs
@@ -81,24 +83,29 @@ subject, then merges those immutable component packets into a task-scoped
 composite. An extra unscoped candidate, unresolved component, changed binding,
 or incomplete task-to-subject map fails closed before generation.
 
-The cutover prompt omits legacy conversation history, durable memory tiers,
-Relationship facts/counters, duplicate Broadcast/show/site/source blocks,
-unselected Journal/Relay prose, and legacy canon/lore factual bodies. A
-selected source-file item may still appear through the packet's existing
-authorized source adapter; the raw source block is never duplicated.
+The composed prompt retains relevant authorized Conversation Context, durable
+memory, Relationship tone, Broadcast/show/site/source context, and canon that
+the existing prompt builder already supplied. Packet evidence is added to that
+same prompt. When a mixed publication/current-queue packet freezes the current
+site projection, that projection is represented by the revalidated packet item
+instead of being appended a second time; the other authorized context remains
+in place. Exact Journal/Relay publication retrieval and current public
+queue state remain source-bound, and an explicitly requested publication or
+current queue source is selected before optional background can consume the
+existing packet budget.
 
 For an eligible turn:
 
-1. Deterministic scope, frame, packet, prompt-owner, and source checks run
-   before generation.
+1. Existing scope, frame, packet, and source checks record what context was
+   available before generation; packet bookkeeping does not veto the reply.
 2. The route asks BNL for one natural response that uses the complete
    authorized packet as one understanding of the turn.
 3. If review finds unsafe, stale, internally leaked, generic, or incomplete
    prose, the existing generation path rewrites it naturally. This is a repair
    of the same response obligation, not a second factual owner or canned
    fallback.
-4. The packet and frame are independently revalidated after generation and
-   immediately before send.
+4. The packet, frame, and retained conversation/memory source bases are
+   independently revalidated after generation and immediately before send.
 5. The provider returns visible natural prose, not a typed JSON envelope.
    Every task must be answered coherently. A task with unavailable current
    evidence states that specific uncertainty while the rest of the request is
@@ -113,8 +120,9 @@ invocation boundary. Local quota refusal, budget-reservation failure, client
 construction failure, and other pre-provider exits remain zero-attempt runs;
 a provider invocation that starts and then fails remains one attempt.
 
-The response receipt audits coverage against the frozen task list and rendered
-packet evidence map without turning that audit into response authority.
+The response receipt audits coverage against the frozen task list, rendered
+packet evidence map, and retained authorized factual context without turning
+that audit into response authority.
 Unsupported packet-domain facts, control leakage, incoherence, and changed
 evidence require repair. Stable public knowledge may still supply ordinary
 common sense; volatile current facts are stated only when current evidence is
@@ -122,10 +130,11 @@ available.
 
 Preflight ambiguity is generated as a natural clarification. Invalid or
 changed source state produces a natural, specific uncertainty while preserving
-the answerable parts of the request. Specialized owners remain outside the
-cutover rather than becoming parallel factual prompts. A genuine provider or
-Discord transport failure can prevent delivery, but no governance result is
-converted into a canned blocker.
+the answerable parts of the request. Existing specialized source adapters feed
+the same composed understanding when the turn requests their information;
+they do not become rival response owners. A genuine provider or Discord
+transport failure can prevent delivery, but no governance result is converted
+into a canned blocker.
 
 ## Content-free receipts
 
