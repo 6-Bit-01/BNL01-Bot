@@ -3114,6 +3114,10 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 "<@7>, when is your birthday?",
                 "It is January 1.",
             ),
+            (
+                "@BNL-01, don't you know when you were created?",
+                "It was created in 1999.",
+            ),
         ):
             with self.subTest(second_person_request=second_person_request):
                 second_person_packet = replace(

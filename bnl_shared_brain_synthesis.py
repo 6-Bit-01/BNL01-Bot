@@ -6587,10 +6587,13 @@ def _ordinary_chat_packet_domain_context_active(
         flags=re.I,
     )
     request_referent_text = re.sub(
-        r"(?:'[^'\n]{0,240}'|\"[^\"\n]{0,240}\"|"
-        r"“[^”\n]{0,240}”|‘[^’\n]{0,240}’)",
+        r"(?:'\s*(?:you|your|yours|yourself)\s*'|"
+        r"\"\s*(?:you|your|yours|yourself)\s*\"|"
+        r"“\s*(?:you|your|yours|yourself)\s*”|"
+        r"‘\s*(?:you|your|yours|yourself)\s*’)",
         "",
         request_subject_text,
+        flags=re.I,
     )
     frame_tasks = tuple(request.frame_tasks or ())
     typed_external_request = bool(
