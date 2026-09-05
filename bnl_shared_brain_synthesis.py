@@ -4173,27 +4173,24 @@ def _ordinary_chat_current_request_text_is_scoped(
                 return False
             if choices and not choices.issubset(response_open[setting]):
                 return False
-    if advice and directive:
-        return True
-
     request_terms = set(_semantic_terms(request)) - set(
         _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
     )
-    response_terms = set(_semantic_terms(response)) - set(
-        _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
-    )
-    overlap = request_terms.intersection(response_terms)
-    if not overlap:
-        return False
-    # REQUEST is never authority for an unrelated stable-world assertion.
-    # A factual-looking clause is acceptable only when its subject/value is
-    # actually carried by the current request (for example a faithful recap).
     for claim in claims:
+        claim_terms = set(_semantic_terms(claim)) - set(
+            _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
+        )
+        directive_claim = bool(
+            advice
+            and _CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE.search(claim)
+        )
+        if not directive_claim and not claim_terms.intersection(request_terms):
+            return False
         if _ordinary_chat_claim_has_external_subject(claim):
-            claim_terms = set(_semantic_terms(claim)) - set(
-                _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
+            subject_terms = set(
+                _ordinary_chat_claim_external_subject_terms(claim)
             )
-            if not claim_terms.intersection(request_terms):
+            if subject_terms and not subject_terms.intersection(request_terms):
                 return False
     return True
 
@@ -7149,6 +7146,36 @@ def _ordinary_chat_claim_has_external_subject(value: str) -> bool:
         ):
             return True
     return False
+
+
+def _ordinary_chat_claim_external_subject_terms(
+    value: str,
+) -> tuple[str, ...]:
+    """Return the semantic terms in an external claim's noun subject."""
+
+    core = _ordinary_chat_claim_core(value)
+    matches = tuple(_EXTERNAL_WORD_RE.finditer(core))
+    if len(matches) < 2:
+        return ()
+    for index, match in enumerate(matches[1:], start=1):
+        if not _ordinary_chat_external_token_is_finite_predicate(
+            match.group(0)
+        ):
+            continue
+        subject = core[: match.start()].strip()
+        subject_tokens = tuple(
+            item.group(0) for item in matches[:index]
+        )
+        if _ordinary_chat_external_subject_is_positive(
+            subject,
+            subject_tokens,
+        ):
+            return tuple(
+                term
+                for term in _semantic_terms(subject)
+                if term not in _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
+            )
+    return ()
 
 
 def _ordinary_chat_claim_has_embedded_packet_clause(

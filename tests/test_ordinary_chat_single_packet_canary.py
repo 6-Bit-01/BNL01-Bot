@@ -1943,6 +1943,59 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             "request_support_invalid",
         )
 
+        advice = _contract_for_support_plan(
+            request_basis,
+            ("Test the slow pulse first. The moon is made of cheese.",),
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                request_basis,
+                advice,
+            ).status,
+            "task_text_unsupported",
+        )
+
+        dinner_packet = replace(
+            request_packet,
+            request=replace(
+                request_packet.request,
+                user_text="What should I cook for dinner?",
+            ),
+        )
+        dinner_basis = replace(self.basis, packet=dinner_packet)
+        dinner = _contract_for_support_plan(dinner_basis, ("Try pasta.",))
+        tainted_dinner = _contract_for_support_plan(
+            dinner_basis,
+            ("Try pasta. The moon is made of cheese.",),
+        )
+        pronoun_tainted_dinner = _contract_for_support_plan(
+            dinner_basis,
+            ("Try pasta. It was invented on Mars.",),
+        )
+        generated_subject_tainted_dinner = _contract_for_support_plan(
+            dinner_basis,
+            ("Try pasta. Pasta was invented on Mars.",),
+        )
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                dinner_basis,
+                dinner,
+            ).valid
+        )
+        for invalid in (
+            tainted_dinner,
+            pronoun_tainted_dinner,
+            generated_subject_tainted_dinner,
+        ):
+            with self.subTest(response=invalid.response):
+                self.assertEqual(
+                    validate_ordinary_chat_response_contract(
+                        dinner_basis,
+                        invalid,
+                    ).status,
+                    "task_text_unsupported",
+                )
+
     def test_typed_current_request_preserves_settings_and_open_choice(self):
         request_text = (
             "For Violet Lantern 499, the signal is amber, the pulse is slow, "
