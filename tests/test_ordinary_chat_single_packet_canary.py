@@ -3259,6 +3259,16 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 "current_request",
             ),
             (
+                "@BNL-01, how do you boil an egg?",
+                "Place the egg in boiling water for about ten minutes.",
+                "external_public",
+            ),
+            (
+                "`<@99>`, when did Apollo 11 land?",
+                "It landed in 1969.",
+                "external_public",
+            ),
+            (
                 "@BNL-01, what does the word 'you' mean?",
                 "It is a second-person pronoun.",
                 "external_public",
@@ -3298,6 +3308,11 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 (),
             ),
             (
+                "@BNL-01, don't you know your birthday isn't January 1?",
+                "It is January 1.",
+                (),
+            ),
+            (
                 "@BNL-01's creator is who?",
                 "It was Test Creator.",
                 (),
@@ -3330,6 +3345,11 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             (
                 "<@202> was created when?",
                 "They were created in 1999.",
+                (202,),
+            ),
+            (
+                "<@202> has what birthday?",
+                "It is January 1.",
                 (202,),
             ),
         )

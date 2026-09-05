@@ -55,6 +55,14 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 "current_request",
             ),
             (
+                "@BNL-01, how do you boil an egg?",
+                "external_public",
+            ),
+            (
+                "`<@99>`, when did Apollo 11 land?",
+                "external_public",
+            ),
+            (
                 "@BNL-01, what does the word 'you' mean?",
                 "external_public",
             ),
@@ -95,6 +103,10 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             ("@BNL-01 When was BARCODE founded?", "barcode"),
             ("@BNL-01, when were you created?", "bnl_01"),
             ("@BNL-01, don't you know when you were created?", "bnl_01"),
+            (
+                "@BNL-01, don't you know your birthday isn't January 1?",
+                "bnl_01",
+            ),
             ("@BNL-01, when'd you launch?", "bnl_01"),
             ("@BNL-01, what's your origin?", "bnl_01"),
             ("@BNL-01's creator is who?", "bnl_01"),
@@ -137,6 +149,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             "<@202>'s birthday is when?",
             "<@202> 's birthday is when?",
             "<@202> was created when?",
+            "<@202> has what birthday?",
         ):
             with self.subTest(member_text=text):
                 frame = build_situation_frame_v1(
