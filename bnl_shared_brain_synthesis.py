@@ -6589,7 +6589,6 @@ def _ordinary_chat_packet_domain_context_active(
             in {"", "not_applicable", "not_required"}
             for task in frame_tasks
         )
-        and not str(request.frame_event_ref or "").strip()
     )
     if typed_external_request:
         return False
