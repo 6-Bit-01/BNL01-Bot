@@ -52,6 +52,7 @@ from bnl_unified_response_assessment import (
     UnifiedResponseAssessment,
     assess_response_coherence,
     shadow_enabled as assessment_shadow_enabled,
+    situation_governed_dependency_kinds,
     situation_task_texts,
 )
 
@@ -542,6 +543,17 @@ _PACKET_REFERENT_RE = re.compile(
     r"you|your|yours)\b|"
     r"\b(?:he|she|they|him|his|her|hers|it|its|them|their|theirs)\b|"
     r"\b(?:the|this|that)\s+(?:event|member|project|requester|user)\b)",
+    re.I,
+)
+_PACKET_EVENT_CLAIM_SUBJECT_RE = re.compile(
+    r"^(?:(?:the|this|that|our)\s+)?"
+    r"(?:attendance|attendees?|participation|participants?|turnout|"
+    r"headcount|crowd|audience|event|moment|episode|session|test|run|"
+    r"show)\b|"
+    r"^(?:(?:about|around|approximately|roughly|nearly|over|under|"
+    r"more\s+than|fewer\s+than)\s+)?"
+    r"(?:\d+|[a-z]+(?:-[a-z]+)?)\s+"
+    r"(?:people|members|participants)\b",
     re.I,
 )
 _PACKET_CLAUSE_TAIL_BOUNDARY_RE = re.compile(
@@ -6577,6 +6589,10 @@ def _ordinary_chat_packet_domain_context_active(
     request = packet.request
     request_text = str(request.user_text or "")
     frame_tasks = tuple(request.frame_tasks or ())
+    governed_dependencies = situation_governed_dependency_kinds(
+        request_text,
+        event_ref=str(request.frame_event_ref or ""),
+    )
     typed_external_request = bool(
         str(request.frame_revision or "").strip()
         and frame_tasks
@@ -6589,9 +6605,12 @@ def _ordinary_chat_packet_domain_context_active(
             in {"", "not_applicable", "not_required"}
             for task in frame_tasks
         )
+        and not governed_dependencies
     )
     if typed_external_request:
         return False
+    if governed_dependencies:
+        return True
     resolution = packet.subject_resolution
     if resolution.status == "resolved" and bool(
         int(resolution.subject_user_id or 0)
@@ -6605,8 +6624,6 @@ def _ordinary_chat_packet_domain_context_active(
         not in {"", "none", "unresolved", "label_only"}
         for subject in tuple(request.frame_subjects or ())
     ):
-        return True
-    if str(request.frame_event_ref or "").strip():
         return True
     return bool(
         _ordinary_chat_claim_has_project_brand(request_text)
@@ -6697,6 +6714,13 @@ def _ordinary_chat_claim_has_packet_subject(
     attributive_member_at_start = bool(
         _PACKET_DOMAIN_ATTRIBUTIVE_MEMBER_RE.match(core)
     )
+    event_context = bool(
+        "event_referent"
+        in situation_governed_dependency_kinds(
+            basis.packet.request.user_text,
+            event_ref=basis.packet.request.frame_event_ref,
+        )
+    )
     return bool(
         _ordinary_chat_claim_has_project_brand(governed_without_links)
         or _ordinary_chat_claim_has_scoped_title(basis, governed_without_links)
@@ -6720,6 +6744,10 @@ def _ordinary_chat_claim_has_packet_subject(
         or (
             packet_context
             and _ordinary_chat_claim_has_embedded_packet_clause(basis, core)
+        )
+        or (
+            event_context
+            and _PACKET_EVENT_CLAIM_SUBJECT_RE.search(core)
         )
         or _CLAIM_LEADING_DIRECT_PACKET_SUBJECT_RE.search(core)
         or re.search(r"<@!?\d+>", core)

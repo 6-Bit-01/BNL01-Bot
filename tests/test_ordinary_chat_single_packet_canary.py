@@ -348,6 +348,123 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             environ=self.flags,
         )
 
+    def _basis_with_authority_frame(
+        self,
+        text,
+        *,
+        moment_id="",
+        subject_user_ids=(),
+    ):
+        frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="free_speak_sealed_mirror",
+            channel_policy="sealed_test",
+            current_text=text,
+            current_speaker_user_ids=(7,),
+            current_speaker_labels=("Test Member",),
+            addressee_kinds=("discord_mention",),
+            addressee_user_ids=(99,),
+            source_message_ids=(301,),
+            explicit_mention_count=1,
+            subject_user_ids=subject_user_ids,
+            moment_id=moment_id,
+            moment_situation_state=(
+                "recent_active" if moment_id else "none"
+            ),
+            moment_topic_coherent=bool(moment_id),
+            moment_participant_overlap=bool(moment_id),
+            referent_status="not_requested",
+            response_act="answer",
+            packet_revision="turn_authority_boundary_fixture",
+        )
+        frame_subjects = tuple(
+            PacketFrameSubject(
+                user_id=subject.user_id,
+                entity_ref=subject.entity_ref,
+                label_hint=subject.label_hint,
+                binding_method=subject.binding_method,
+                confidence=subject.confidence,
+                role_hints=subject.role_hints,
+                domain_hints=subject.domain_hints,
+            )
+            for subject in frame.subjects
+        )
+        resolutions = tuple(
+            PacketSubjectResolution(
+                status="resolved",
+                subject_user_id=subject.user_id,
+                subject_key=(
+                    "discord_user:%s" % subject.user_id
+                    if subject.user_id
+                    else subject.entity_ref
+                ),
+                entity_ref=subject.entity_ref,
+                binding_method=subject.binding_method,
+                confidence=subject.confidence,
+                candidate_count=1,
+                reason_codes=("situation_frame_subject",),
+            )
+            for subject in frame.subjects
+        )
+        primary_resolution = (
+            resolutions[0]
+            if len(resolutions) == 1
+            else PacketSubjectResolution(
+                status=("multi_resolved" if resolutions else "not_applicable"),
+                candidate_count=len(resolutions),
+                reason_codes=(
+                    "situation_frame_subjects"
+                    if resolutions
+                    else "subject_not_required",
+                ),
+            )
+        )
+        request = replace(
+            self.packet.request,
+            subject_user_id=0,
+            subject_display_name="",
+            user_text=text,
+            frame_schema_version=frame.schema_version,
+            frame_revision=frame.frame_revision,
+            frame_input_evidence_digest=frame.input_evidence_digest,
+            frame_status=frame.status,
+            frame_ambiguity_reasons=frame.ambiguity_reasons,
+            frame_subject_requirement=frame.subject_requirement,
+            frame_subjects=frame_subjects,
+            frame_tasks=tuple(
+                PacketFrameTask(
+                    task_id=task.task_id,
+                    text_digest=task.text_digest,
+                    task_kind=task.task_kind,
+                    object_kind=task.object_kind,
+                    authority_scope=task.authority_scope,
+                    temporal_scope=task.temporal_scope,
+                    currentness=task.currentness,
+                    required_response_act=task.required_response_act,
+                    subject_requirement=task.subject_requirement,
+                    subject_indexes=task.subject_indexes,
+                )
+                for task in frame.tasks
+            ),
+            frame_role_hints=frame.role_hints,
+            frame_domain_hints=frame.domain_hints,
+            frame_event_ref=frame.event_ref,
+            frame_event_relation=frame.event_relation,
+            frame_task_kind=frame.task_kind,
+            frame_object_kind=frame.object_kind,
+            frame_phase=frame.phase,
+            frame_temporal_scope=frame.temporal_scope,
+            frame_currentness=frame.currentness,
+        )
+        packet = replace(
+            self.packet,
+            request=request,
+            subject_resolution=primary_resolution,
+            subject_resolutions=resolutions,
+        )
+        return frame, replace(self.basis, packet=packet)
+
     def _multi_subject_basis(self, text, subjects):
         frame = build_situation_frame_v1(
             route_allowed=True,
@@ -3118,6 +3235,218 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertGreaterEqual(unsupported, 1)
         self.assertIn("unsupported_packet_domain", classifications)
+
+    def test_frame_and_claim_review_share_one_authority_boundary(self):
+        external_cases = (
+            (
+                "@BNL-01. When did Apollo 11 land?",
+                "It landed in 1969.",
+                "external_public",
+            ),
+            (
+                "Hey **@BNL-01**, when did Apollo 11 land?",
+                "It landed in 1969.",
+                "external_public",
+            ),
+            (
+                "Please @BNL-01 can you tell me when Apollo 11 landed?",
+                "It landed in 1969.",
+                "external_public",
+            ),
+            (
+                "@BNL-01 can you explain when Apollo 11 landed?",
+                "Apollo 11 landed in 1969.",
+                "current_request",
+            ),
+            (
+                "@BNL-01, what does the word 'you' mean?",
+                "It is a second-person pronoun.",
+                "external_public",
+            ),
+        )
+        for request_text, response, expected_authority in external_cases:
+            with self.subTest(request_text=request_text):
+                frame, basis = self._basis_with_authority_frame(request_text)
+
+                self.assertEqual(
+                    frame.tasks[0].authority_scope,
+                    expected_authority,
+                )
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(basis, response)
+                )
+                self.assertEqual(unsupported, 0)
+                self.assertNotIn(
+                    "unsupported_packet_domain",
+                    classifications,
+                )
+
+        governed_cases = (
+            (
+                "@BNL-01 When was BARCODE founded?",
+                "It was founded in 1999.",
+                (),
+            ),
+            (
+                "@BNL-01, when were you created?",
+                "It was created in 1999.",
+                (),
+            ),
+            (
+                "@BNL-01, don't you know when you were created?",
+                "It was created in 1999.",
+                (),
+            ),
+            (
+                "@BNL-01's creator is who?",
+                "It was Test Creator.",
+                (),
+            ),
+            (
+                "@BNL-01 was created when?",
+                "It was created in 1999.",
+                (),
+            ),
+            (
+                "@BNL-01 can explain its origin?",
+                "It can explain its origin.",
+                (),
+            ),
+            (
+                "When was **@BNL-01** created?",
+                "It was created in 1999.",
+                (),
+            ),
+            (
+                "When did <@202> join?",
+                "They joined in 1999.",
+                (202,),
+            ),
+            (
+                "<@202>'s birthday is when?",
+                "It is January 1.",
+                (202,),
+            ),
+            (
+                "<@202> was created when?",
+                "They were created in 1999.",
+                (202,),
+            ),
+        )
+        for request_text, response, subject_user_ids in governed_cases:
+            with self.subTest(request_text=request_text):
+                frame, basis = self._basis_with_authority_frame(
+                    request_text,
+                    subject_user_ids=subject_user_ids,
+                )
+
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(basis, response)
+                )
+                self.assertGreaterEqual(unsupported, 1)
+                self.assertIn(
+                    "unsupported_packet_domain",
+                    classifications,
+                )
+
+        ordinary_text = (
+            "@BNL-01 Sealed Row 9 provider fixture: In one paragraph, what "
+            "makes a community feel connected instead of merely active?"
+        )
+        frame, basis = self._basis_with_authority_frame(
+            ordinary_text,
+            moment_id="moment_prior_fixture",
+        )
+        self.assertEqual(frame.tasks[0].authority_scope, "external_public")
+        self.assertEqual(
+            ordinary_chat_task_support_plan(basis)[0].support_kind,
+            "external_public",
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            basis,
+            "Connection grows when members listen and build shared context.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertNotIn("unsupported_packet_domain", classifications)
+
+        event_frame, event_basis = self._basis_with_authority_frame(
+            "How many people attended?",
+            moment_id="moment_prior_fixture",
+        )
+        self.assertEqual(event_frame.tasks[0].authority_scope, "packet")
+        self.assertEqual(event_frame.tasks[0].object_kind, "moment")
+        self.assertEqual(
+            ordinary_chat_task_support_plan(event_basis)[0].support_kind,
+            "hold",
+        )
+        for unsupported_response in (
+            "Attendance reached 50 people.",
+            "Fifty people attended.",
+            "Around 50 people attended.",
+            "The crowd reached 50 people.",
+        ):
+            with self.subTest(unsupported_response=unsupported_response):
+                classifications, unsupported = (
+                    audit_ordinary_chat_candidate_claims(
+                        event_basis,
+                        unsupported_response,
+                    )
+                )
+                self.assertGreaterEqual(unsupported, 1)
+                self.assertIn(
+                    "unsupported_packet_domain",
+                    classifications,
+                )
+
+        moment_digest = "f" * 64
+        moment_item = replace(
+            event_basis.packet.items[0],
+            lane="moment",
+            source_ref="moment:moment_prior_fixture",
+            source_digest=moment_digest,
+            text="Attendance reached 50 people.",
+            subject_key="",
+        )
+        supported_event_basis = replace(
+            event_basis,
+            packet=replace(event_basis.packet, items=(moment_item,)),
+            rendered_evidence_refs=(
+                ("E1", "moment", moment_digest, ()),
+            ),
+            rendered_source_digests=(moment_digest,),
+        )
+        support_plan = ordinary_chat_task_support_plan(
+            supported_event_basis
+        )
+        self.assertEqual(support_plan[0].support_kind, "packet")
+        self.assertEqual(support_plan[0].evidence_ids, ("E1",))
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            supported_event_basis,
+            "Attendance reached 50 people.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertEqual(
+            classifications,
+            ("authorized_evidence_supported",),
+        )
+
+        named_event_frame, named_event_basis = (
+            self._basis_with_authority_frame(
+                "Who attended Woodstock?",
+                moment_id="moment_prior_fixture",
+            )
+        )
+        self.assertEqual(
+            named_event_frame.tasks[0].authority_scope,
+            "external_public",
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            named_event_basis,
+            "Jimi Hendrix performed at Woodstock.",
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertNotIn("unsupported_packet_domain", classifications)
 
     def test_member_context_does_not_block_supported_external_knowledge(self):
         cases = (

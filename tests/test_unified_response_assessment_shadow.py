@@ -30,6 +30,203 @@ FOUNDATION_SHADOWS = {
 
 
 class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
+    def test_situation_frame_separates_addressing_from_governed_subjects(self):
+        external_cases = (
+            (
+                "@BNL-01 Sealed Row 9 provider fixture: In one paragraph, "
+                "what makes a community feel connected instead of merely "
+                "active?",
+                "external_public",
+            ),
+            (
+                "Hey **@BNL-01**. When did Apollo 11 land?",
+                "external_public",
+            ),
+            (
+                "Hey *<@99>*. When did Apollo 11 land?",
+                "external_public",
+            ),
+            (
+                "Please @BNL-01, can you tell me when Apollo 11 landed?",
+                "external_public",
+            ),
+            (
+                "@BNL-01 can you explain when Apollo 11 landed?",
+                "current_request",
+            ),
+            (
+                "@BNL-01, what does the word 'you' mean?",
+                "external_public",
+            ),
+            (
+                "@BNL-01, what does “your birthday” mean?",
+                "external_public",
+            ),
+            (
+                "@BNL-01, what does `your birthday` mean?",
+                "external_public",
+            ),
+            ("@BNL-01, how are you?", "current_request"),
+        )
+        for text, expected_authority in external_cases:
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="free_speak_sealed_mirror",
+                    channel_policy="sealed_test",
+                    current_text=text,
+                    current_speaker_user_ids=(101,),
+                    current_speaker_labels=("Test Member",),
+                    addressee_kinds=("discord_mention",),
+                    addressee_user_ids=(99,),
+                    explicit_mention_count=1,
+                    response_act="answer",
+                )
+
+                self.assertEqual(frame.subjects, ())
+                self.assertEqual(frame.subject_requirement, "not_applicable")
+                self.assertEqual(
+                    tuple(task.authority_scope for task in frame.tasks),
+                    (expected_authority,),
+                )
+
+        governed_cases = (
+            ("@BNL-01 When was BARCODE founded?", "barcode"),
+            ("@BNL-01, when were you created?", "bnl_01"),
+            ("@BNL-01, don't you know when you were created?", "bnl_01"),
+            ("@BNL-01, when'd you launch?", "bnl_01"),
+            ("@BNL-01, what's your origin?", "bnl_01"),
+            ("@BNL-01's creator is who?", "bnl_01"),
+            ("@BNL-01 's creator is who?", "bnl_01"),
+            ("@BNL-01 was created when?", "bnl_01"),
+            ("@BNL-01 can explain its origin?", "bnl_01"),
+            ("When was **@BNL-01** created?", "bnl_01"),
+        )
+        for text, expected_entity_ref in governed_cases:
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="free_speak_sealed_mirror",
+                    channel_policy="sealed_test",
+                    current_text=text,
+                    current_speaker_user_ids=(101,),
+                    current_speaker_labels=("Test Member",),
+                    addressee_kinds=("discord_mention",),
+                    addressee_user_ids=(99,),
+                    explicit_mention_count=1,
+                    response_act="answer",
+                )
+
+                self.assertEqual(frame.status, "resolved")
+                self.assertEqual(frame.subject_requirement, "required")
+                self.assertIn(
+                    expected_entity_ref,
+                    tuple(subject.entity_ref for subject in frame.subjects),
+                )
+                self.assertEqual(
+                    tuple(task.authority_scope for task in frame.tasks),
+                    ("packet",),
+                )
+                self.assertEqual(frame.tasks[0].subject_requirement, "required")
+                self.assertTrue(frame.tasks[0].subject_indexes)
+
+        for text in (
+            "When did <@202> join?",
+            "<@202>'s birthday is when?",
+            "<@202> 's birthday is when?",
+            "<@202> was created when?",
+        ):
+            with self.subTest(member_text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="free_speak_sealed_mirror",
+                    channel_policy="sealed_test",
+                    current_text=text,
+                    current_speaker_user_ids=(101,),
+                    current_speaker_labels=("Test Member",),
+                    subject_user_ids=(202,),
+                    subject_label_hints=("Second Member",),
+                    response_act="answer",
+                )
+
+                self.assertEqual(frame.subjects[0].user_id, 202)
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(frame.tasks[0].subject_indexes, (0,))
+
+    def test_situation_frame_requires_an_actual_event_referent(self):
+        ordinary_text = (
+            "Sealed Row 9 provider fixture: In one paragraph, what makes a "
+            "community feel connected instead of merely active?"
+        )
+        external_cases = (
+            ordinary_text,
+            "When did Apollo 11 land?",
+            "Who attended Woodstock?",
+        )
+        for moment_state in ("recent_active", "recent_finalized"):
+            for text in external_cases:
+                with self.subTest(moment_state=moment_state, text=text):
+                    frame = build_situation_frame_v1(
+                        route_allowed=True,
+                        route_mode="normal_chat",
+                        conversation_surface="free_speak_sealed_mirror",
+                        channel_policy="sealed_test",
+                        current_text=text,
+                        current_speaker_user_ids=(101,),
+                        current_speaker_labels=("Test Member",),
+                        moment_id="moment_prior_fixture",
+                        moment_situation_state=moment_state,
+                        moment_topic_coherent=True,
+                        moment_participant_overlap=True,
+                        response_act="answer",
+                    )
+
+                    self.assertTrue(frame.event_ref)
+                    self.assertEqual(frame.tasks[0].authority_scope, "external_public")
+
+        event_cases = (
+            "How many people attended?",
+            "Who participated?",
+            "What happened?",
+            "How did the test go?",
+            "Did it pass?",
+            "What changed in the recent event?",
+        )
+        for text in event_cases:
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="free_speak_sealed_mirror",
+                    channel_policy="sealed_test",
+                    current_text=text,
+                    current_speaker_user_ids=(101,),
+                    current_speaker_labels=("Test Member",),
+                    moment_id="moment_prior_fixture",
+                    moment_situation_state="recent_active",
+                    moment_topic_coherent=True,
+                    moment_participant_overlap=True,
+                    response_act="answer",
+                )
+
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(frame.tasks[0].object_kind, "moment")
+
+        no_event = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="free_speak_sealed_mirror",
+            channel_policy="sealed_test",
+            current_text="How many people attended?",
+            current_speaker_user_ids=(101,),
+            current_speaker_labels=("Test Member",),
+            response_act="answer",
+        )
+        self.assertEqual(no_event.tasks[0].authority_scope, "external_public")
+
     def shared_choice_assessment(self):
         final_question = (
             "Between Chrome Prophet and Null Basilica, which fits that "
