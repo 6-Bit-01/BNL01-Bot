@@ -415,6 +415,12 @@ _SITUATION_LEADING_ADDRESSEE_RE = re.compile(
     r"(?P<space>\s*)",
     re.I,
 )
+_SITUATION_TRAILING_BNL_ADDRESSEE_RE = re.compile(
+    r"(?P<body>[\s\S]*?)(?P<delimiter>[.,;:!?—–])\s*"
+    r"@?BNL(?:[- ]?0?1)?"
+    r"(?![- ]?0?1[a-z0-9_])(?![a-z0-9_])\s*[.!?]*\s*$",
+    re.I,
+)
 _SITUATION_LEADING_SUBJECT_PREDICATE_RE = re.compile(
     r"^(?:is|was|are|were|has|had|does|did|"
     r"(?:can|could|would|will|should)(?!\s+you\b)|"
@@ -479,7 +485,8 @@ _SITUATION_ENTITY_SUBJECT_QUESTION_RE = re.compile(
     re.I,
 )
 _SITUATION_ENTITY_SUBJECT_REQUEST_RE = re.compile(
-    r"\b(?:tell\s+me\s+about|what\s+do\s+you\s+"
+    r"\b(?:(?:who|what)\s+(?:created|built|made|founded|started)|"
+    r"tell\s+me\s+about|what\s+do\s+you\s+"
     r"(?:know|remember)\s+about|describe|summari[sz]e|explain)"
     r"\s+(?:the\s+)?$",
     re.I,
@@ -493,11 +500,12 @@ _SITUATION_EXPLICIT_EVENT_REFERENT_RE = re.compile(
 )
 _SITUATION_IMPLICIT_EVENT_QUERY_RE = re.compile(
     r"(?:"
-    r"(?:how\s+many\s+(?:people|members|participants)|who)\s+"
-    r"(?:attended|participated|joined|showed\s+up)"
+    r"(?:how\s+many\s+(?:humans?|people|members|participants)|who)\s+"
+    r"(?:attended|participated|joined|showed\s+up|took\s+part)"
     r"(?:\s+(?:it|this|that|there))?|"
-    r"how\s+many\s+(?:people|members|participants)\s+were\s+there|"
-    r"what\s+(?:happened|changed|failed|was\s+decided|got\s+fixed)|"
+    r"how\s+many\s+(?:humans?|people|members|participants)\s+were\s+there|"
+    r"what\s+(?:happened|changed|failed|was\s+decided|got\s+fixed|"
+    r"(?:are|were)\s+the\s+final\s+(?:settings|parameters|results))|"
     r"how\s+did\s+(?:it|this|that|the\s+(?:test|run|show|session))\s+go|"
     r"did\s+(?:it|this|that)\s+(?:work|pass|fail|finish|end|start)|"
     r"when\s+did\s+(?:it|this|that)\s+(?:start|end|happen|finish)"
@@ -838,15 +846,20 @@ def _situation_subject_text(value: str) -> str:
 
     text = _situation_plain_text(value).strip()
     match = _SITUATION_LEADING_ADDRESSEE_RE.match(text)
-    if match is None or match.group("possessive"):
-        return text
-    remainder = text[match.end() :].lstrip()
-    if (
-        not match.group("delimiter")
-        and _SITUATION_LEADING_SUBJECT_PREDICATE_RE.match(remainder)
-    ):
-        return text
-    return remainder
+    if match is not None and not match.group("possessive"):
+        remainder = text[match.end() :].lstrip()
+        if (
+            match.group("delimiter")
+            or not _SITUATION_LEADING_SUBJECT_PREDICATE_RE.match(remainder)
+        ):
+            text = remainder
+    trailing = _SITUATION_TRAILING_BNL_ADDRESSEE_RE.fullmatch(text)
+    if trailing is not None:
+        delimiter = trailing.group("delimiter")
+        text = trailing.group("body").rstrip()
+        if delimiter in ".!?":
+            text += delimiter
+    return text
 
 
 def _situation_bnl_self_subject_cue(value: str) -> bool:
@@ -1043,7 +1056,15 @@ def _situation_task_segments(text: str) -> Tuple[str, ...]:
     parts = tuple(part.strip(" ,;.!?") for part in value.split("\n"))
     parts = tuple(part for part in parts if part)
     explicit_tasks = tuple(
-        part for part in parts if _TASK_SEGMENT_START_RE.search(part)
+        part
+        for part in parts
+        if _TASK_SEGMENT_START_RE.search(part)
+        or re.search(
+            r":\s*(?:(?:briefly|please|quickly|first)\s+)*(?:%s)"
+            % _TASK_LEAD_RE.pattern,
+            part,
+            re.I,
+        )
     )
     if explicit_tasks and len(parts) > 1:
         return explicit_tasks
@@ -1482,6 +1503,17 @@ def build_situation_frame_v1(
         _EXTERNAL_ROLE_QUERY_RE.search(request_subject_text)
     )
 
+    event_label_context = bool(
+        str(moment_id or "").strip()
+        and (
+            _SITUATION_EXPLICIT_EVENT_REFERENT_RE.search(
+                request_subject_text
+            )
+            or _SITUATION_IMPLICIT_EVENT_QUERY_RE.search(
+                request_subject_text
+            )
+        )
+    )
     subjects = []
     if subject_ids:
         for index, user_id in enumerate(subject_ids):
@@ -1520,7 +1552,12 @@ def build_situation_frame_v1(
                     domain_hints=domains,
                 )
             )
-    elif not subject_ids and label_hints:
+    if (
+        not entity_refs
+        and not subject_ids
+        and label_hints
+        and not event_label_context
+    ):
         for label_hint in label_hints:
             subjects.append(
                 SituationSubjectReference(

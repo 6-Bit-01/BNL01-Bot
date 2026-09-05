@@ -24,6 +24,7 @@ from bnl_shared_brain_synthesis import (
     finalize_run,
     ordinary_chat_configuration,
     ordinary_chat_deterministic_response_act,
+    ordinary_chat_response_json_schema,
     ordinary_chat_route_scope_decision,
     ordinary_chat_task_support_plan,
     publication_packet_composes_current_queue,
@@ -735,7 +736,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v6",
+            "ordinary_chat_single_packet_v7",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
         self.assertFalse(
@@ -1034,8 +1035,9 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(owned.ready)
         self.assertIn("PACKET-OWNED RESPONSE CONTRACT", owned.prompt)
         self.assertIn("TURN RESPONSE PLAN", owned.prompt)
-        self.assertIn("VISIBLE RESPONSE CONTRACT", owned.prompt)
-        self.assertIn("Write one natural BNL reply, not JSON", owned.prompt)
+        self.assertIn("ONE-CALL RESPONSE ENVELOPE", owned.prompt)
+        self.assertIn("provider response schema", owned.prompt)
+        self.assertIn("only user-visible part", owned.prompt)
         self.assertNotIn("Return only this exact JSON template", owned.prompt)
         self.assertIn(self.basis.rendered_context, owned.prompt)
         self.assertEqual(owned.prompt.count(self.basis.rendered_context), 1)
@@ -1135,6 +1137,22 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertIn("one shared mind with filtered surfaces", owned.prompt)
 
     def test_typed_response_contract_accepts_only_applicable_packet_refs(self):
+        schema = ordinary_chat_response_json_schema()
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["required"], ["tasks"])
+        task_schema = schema["properties"]["tasks"]["items"]
+        self.assertEqual(
+            task_schema["properties"]["supportKind"]["enum"],
+            [
+                "packet",
+                "external_public",
+                "current_request",
+                "hold",
+                "clarify",
+            ],
+        )
+        self.assertFalse(task_schema["additionalProperties"])
+
         contract = _contract_for_support_plan(
             self.basis,
             ("Your favorite movie is Arrival.",),
@@ -1637,7 +1655,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertTrue(all(plan.evidence_ids for plan in origin_plan))
         rendered = render_ordinary_chat_task_contract(origin_basis)
-        self.assertIn("Write one natural BNL reply, not JSON", rendered)
+        self.assertIn("ONE-CALL RESPONSE ENVELOPE", rendered)
         self.assertIn(
             'request="Who is Cache Back"',
             rendered,
@@ -1651,7 +1669,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "Answer every task in order",
+            "one task object for every task above",
             rendered,
         )
         for plan in origin_plan:
@@ -3403,6 +3421,8 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         for unsupported_response in (
             "Attendance reached 50 people.",
             "Fifty people attended.",
+            "Twenty five people attended.",
+            "One human took part.",
             "Around 50 people attended.",
             "The crowd reached 50 people.",
         ):

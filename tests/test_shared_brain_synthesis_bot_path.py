@@ -1101,7 +1101,11 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text="One generated answer.",
+                text=(
+                    '{"tasks":[{"taskId":"T1","text":"One generated '
+                    'answer.","supportKind":"current_request",'
+                    '"evidenceIds":["REQUEST"]}]}'
+                ),
                 provider_call_count=1,
                 total_tokens=321,
                 prompt_tokens=200,
@@ -1194,7 +1198,12 @@ class SharedBrainSynthesisBotPathTests(
             123_456,
         )
         self.assertTrue(evaluate.call_args.kwargs["cost_priced"])
-        self.assertFalse(evaluate.call_args.kwargs["typed_contract_required"])
+        self.assertTrue(evaluate.call_args.kwargs["typed_contract_required"])
+        self.assertEqual(
+            evaluate.call_args.kwargs["response_contract"].status,
+            "parsed",
+        )
+        self.assertTrue(execution.typed_contract_required)
 
     async def test_single_packet_preprovider_exit_records_zero_calls(self):
         basis = SimpleNamespace(
@@ -1248,6 +1257,11 @@ class SharedBrainSynthesisBotPathTests(
                 "_evaluate_ordinary_chat_single_packet_receipt",
                 new=evaluate,
             ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=mock.AsyncMock(return_value=True),
+            ) as finalize,
         ):
             execution = (
                 await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
@@ -1268,8 +1282,12 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertIsNone(execution)
+        self.assertIsNotNone(execution)
+        self.assertEqual(execution.response, "")
+        self.assertTrue(execution.typed_contract_required)
         provider.assert_awaited_once()
+        finalize.assert_awaited_once()
+        self.assertFalse(finalize.await_args.kwargs["response_sent"])
         self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 0)
         self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
 
@@ -1290,7 +1308,11 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text="Do you mean Mac Modem or Cache Back?",
+                text=(
+                    '{"tasks":[{"taskId":"T1","text":"Do you mean Mac '
+                    'Modem or Cache Back?","supportKind":"clarify",'
+                    '"evidenceIds":[]}]}'
+                ),
                 provider_call_count=1,
             )
         )
@@ -1391,7 +1413,10 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text=response,
+                text=(
+                    '{"tasks":[{"taskId":"T1","text":"%s",'
+                    '"supportKind":"hold","evidenceIds":[]}]}' % response
+                ),
                 provider_call_count=1,
             )
         )
@@ -1493,7 +1518,11 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text=response,
+                text=(
+                    '{"tasks":[{"taskId":"T1","text":"%s",'
+                    '"supportKind":"current_request",'
+                    '"evidenceIds":["REQUEST"]}]}' % response
+                ),
                 provider_call_count=1,
             )
         )
@@ -2070,6 +2099,163 @@ class SharedBrainSynthesisBotPathTests(
         finalize.assert_awaited_once()
         self.assertTrue(finalize.await_args.kwargs["response_sent"])
         self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+
+    async def test_typed_single_packet_rejection_never_calls_rewriter(self):
+        message = FakeMessage()
+        run = SimpleNamespace(run_id="typed-rejected-run")
+        decision = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="typed_contract_packet_support_invalid",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Untrusted visible candidate.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=False,
+            provider_call_count=1,
+            corrective_call_count=0,
+            review_reason="typed_contract_packet_support_invalid",
+            typed_contract_required=True,
+        )
+        resolve = mock.AsyncMock()
+        review = mock.AsyncMock(return_value=decision)
+        finalize = mock.AsyncMock(return_value=True)
+        guard = mock.AsyncMock()
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "resolve_guarded_response_obligation",
+                    new=resolve,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_record_ordinary_chat_single_packet_review",
+                    new=review,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalize,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "ignored baseline",
+                self.plan(),
+                prompt="ignored baseline prompt",
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+                ordinary_chat_single_packet_execution=execution,
+            )
+
+        self.assertEqual(message.replies, [])
+        resolve.assert_not_awaited()
+        guard.assert_not_awaited()
+        review.assert_awaited_once()
+        self.assertEqual(
+            review.await_args.kwargs["corrective_call_count"],
+            0,
+        )
+        finalize.assert_awaited_once()
+        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+
+    async def test_typed_single_packet_guard_is_validation_only(self):
+        message = FakeMessage()
+        run = SimpleNamespace(run_id="typed-guard-run")
+        decision = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Packet-supported answer.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+            typed_contract_required=True,
+        )
+        guard = mock.AsyncMock(
+            return_value=(
+                "",
+                {
+                    "suppressed": True,
+                    "suppression_reason": "generic_non_answer_validation_only",
+                },
+            )
+        )
+        resolve = mock.AsyncMock()
+        review = mock.AsyncMock(return_value=decision)
+        finalize = mock.AsyncMock(return_value=True)
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=guard,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "resolve_guarded_response_obligation",
+                    new=resolve,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_record_ordinary_chat_single_packet_review",
+                    new=review,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bnl01_bot,
+                    "safely_finalize_shared_brain_synthesis",
+                    new=finalize,
+                )
+            )
+
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "ignored baseline",
+                self.plan(),
+                prompt="ignored baseline prompt",
+                source_context_available=True,
+                allow_model_save=False,
+                mark_recent_direct=False,
+                ordinary_chat_single_packet_execution=execution,
+            )
+
+        self.assertEqual(message.replies, [])
+        self.assertFalse(guard.await_args.kwargs["regeneration_allowed"])
+        resolve.assert_not_awaited()
+        review.assert_awaited_once()
+        finalize.assert_awaited_once()
+        self.assertFalse(finalize.await_args.kwargs["response_sent"])
 
     async def test_natural_single_packet_candidate_uses_shared_guard(self):
         message = FakeMessage()

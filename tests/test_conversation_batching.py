@@ -648,6 +648,70 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "prompt": generation.await_args.args[1],
         }
 
+    async def test_recent_followup_directness_survives_batch_buffer(self):
+        channel = self._channel(8146)
+        message = FakeMessage(
+            channel,
+            "How is he connected to Call'em Bini?",
+        )
+
+        with (
+            self._on_message_runtime(
+                channel.id,
+                followup_candidate=True,
+            ),
+            mock.patch.object(bnl01_bot, "_reset_debounce"),
+        ):
+            await bnl01_bot.on_message(message)
+
+        self.assertEqual(len(bnl01_bot._channel_buffers[channel.id]), 1)
+        turn = bnl01_bot._channel_buffers[channel.id][0]
+        self.assertEqual(turn.planned_directness, "recent_followup")
+        self.assertTrue(turn.planned_direct_to_bnl)
+
+        collapsed = bnl01_bot._collapse_consecutive_batch_fragments(
+            [turn, turn]
+        )
+        self.assertEqual(len(collapsed), 1)
+        self.assertTrue(collapsed[0].planned_direct_to_bnl)
+        self.assertEqual(collapsed[0].planned_directness, "recent_followup")
+
+        with mock.patch.object(
+            bnl01_bot,
+            "_should_force_free_speak_continuation_answer",
+            return_value=(True, "same_user_continuation_substantive"),
+        ):
+            packet = bnl01_bot._build_active_response_packet(
+                channel.id,
+                [turn],
+                None,
+                bot_user=SimpleNamespace(id=999, display_name="BNL-01"),
+                guild_id=channel.guild.id,
+                channel_policy="sealed_test",
+            )
+
+        self.assertTrue(packet["planned_direct_to_bnl"])
+        self.assertTrue(packet["addressed_to_bot"])
+        self.assertTrue(packet["response_obligation"])
+        self.assertEqual(packet["address_kind"], "recent_followup")
+
+    def test_passive_batch_turn_does_not_gain_planned_directness(self):
+        plan = bnl01_bot.plan_conversation_response(
+            "The beam looked narrow.",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            followup_candidate=False,
+            channel_allows_conversation=True,
+            batching_enabled=True,
+            conversation_surface=(
+                bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR
+            ),
+        )
+
+        self.assertEqual(plan.directness, "free_speak_passive")
+        self.assertFalse(bnl01_bot.conversation_plan_is_directed_to_bnl(plan))
+
     def _assert_people_memory_contract(self, prompt):
         self.assertIn(
             "summarize another member's meaning in your own words by default",
@@ -3513,6 +3577,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             candidate_active=True,
             provider_call_count=1,
             corrective_call_count=0,
+            typed_contract_required=True,
         )
         ordinary_generation = mock.AsyncMock(return_value=execution)
         shared_generation = mock.AsyncMock()
@@ -3606,6 +3671,233 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             finalize.await_args.kwargs["guard_status"],
             "batch_single_packet_candidate_sent",
+        )
+
+    async def test_typed_batch_contract_rejection_withholds_without_second_call(
+        self,
+    ):
+        channel = self._channel(8137)
+        basis = object()
+        packet = object()
+        assessment = object()
+        decision = SimpleNamespace(
+            candidate_selected=False,
+            typed_contract_status="invalid",
+        )
+        review_reason = "typed_contract_packet_support_invalid"
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Untrusted visible candidate.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(basis,),
+            candidate_active=False,
+            provider_call_count=1,
+            corrective_call_count=0,
+            review_reason=review_reason,
+            typed_contract_required=True,
+        )
+        ordinary_generation = mock.AsyncMock(return_value=execution)
+        shared_generation = mock.AsyncMock()
+        guarded = mock.AsyncMock()
+        resolve = mock.AsyncMock()
+        record_review = mock.AsyncMock(return_value=decision)
+        finalize = mock.AsyncMock(return_value=decision)
+
+        def build_assessment(*_args, **kwargs):
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError(
+                "a typed batch rejection must not call the legacy provider"
+            )
+
+        self._prime_flush(channel, "BNL, who is Cache Back?")
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.object(
+                bnl01_bot,
+                "ordinary_chat_route_scope_decision",
+                return_value=SimpleNamespace(eligible=True, reason="canary"),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=build_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_single_packet",
+                new=ordinary_generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=shared_generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=guarded,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_guarded_response_obligation",
+                new=resolve,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_record_ordinary_chat_single_packet_review",
+                new=record_review,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=finalize,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        ordinary_generation.assert_awaited_once()
+        shared_generation.assert_not_awaited()
+        guarded.assert_not_awaited()
+        resolve.assert_not_awaited()
+        self.assertEqual(channel.sent, [])
+        record_review.assert_awaited_once()
+        self.assertEqual(record_review.await_args.kwargs["reason"], review_reason)
+        self.assertEqual(
+            record_review.await_args.kwargs["corrective_call_count"],
+            0,
+        )
+        finalize.assert_awaited_once()
+        self.assertEqual(finalize.await_args.kwargs["final_response"], "")
+        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+        self.assertEqual(
+            finalize.await_args.kwargs["guard_status"],
+            "typed_batch_single_packet_candidate_rejected",
+        )
+
+    async def test_typed_batch_guard_rejection_withholds_without_regeneration(
+        self,
+    ):
+        channel = self._channel(8138)
+        basis = object()
+        packet = object()
+        assessment = object()
+        decision = SimpleNamespace(
+            candidate_selected=True,
+            typed_contract_status="valid",
+        )
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response="Packet-owned candidate.",
+            prompt="packet-owned prompt",
+            prompt_source_bases=(basis,),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+            typed_contract_required=True,
+        )
+        ordinary_generation = mock.AsyncMock(return_value=execution)
+        guard_reason = "current_payload_grounding_after_retry"
+        guarded = mock.AsyncMock(
+            return_value=(
+                execution.response,
+                {
+                    "suppressed": True,
+                    "suppression_reason": guard_reason,
+                },
+            )
+        )
+        resolve = mock.AsyncMock()
+        record_review = mock.AsyncMock(return_value=decision)
+        finalize = mock.AsyncMock(return_value=decision)
+
+        def build_assessment(*_args, **kwargs):
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError(
+                "a typed batch guard failure must not call the legacy provider"
+            )
+
+        self._prime_flush(channel, "BNL, who is Cache Back?")
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.object(
+                bnl01_bot,
+                "ordinary_chat_route_scope_decision",
+                return_value=SimpleNamespace(eligible=True, reason="canary"),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=build_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_single_packet",
+                new=ordinary_generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=mock.AsyncMock(),
+            ) as shared_generation,
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=guarded,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_guarded_response_obligation",
+                new=resolve,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_record_ordinary_chat_single_packet_review",
+                new=record_review,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=finalize,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        ordinary_generation.assert_awaited_once()
+        shared_generation.assert_not_awaited()
+        guarded.assert_awaited_once()
+        self.assertFalse(guarded.await_args.kwargs["regeneration_allowed"])
+        resolve.assert_not_awaited()
+        self.assertEqual(channel.sent, [])
+        record_review.assert_awaited_once()
+        self.assertEqual(record_review.await_args.kwargs["reason"], guard_reason)
+        self.assertEqual(
+            record_review.await_args.kwargs["corrective_call_count"],
+            0,
+        )
+        finalize.assert_awaited_once()
+        self.assertEqual(finalize.await_args.kwargs["final_response"], "")
+        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+        self.assertEqual(
+            finalize.await_args.kwargs["guard_status"],
+            "typed_batch_single_packet_guard_rejected",
         )
 
     async def test_mixed_journal_and_current_queue_batch_uses_one_natural_packet(

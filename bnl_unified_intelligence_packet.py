@@ -81,6 +81,7 @@ from bnl_journal import (
 )
 from bnl_moment_engine import (
     SITUATION_EPISODE_READ_VERSION,
+    render_active_episode_canary_context,
     select_public_participant_moment_gists,
     select_situation_aware_episode_gists,
 )
@@ -100,6 +101,9 @@ from bnl_website_relay_state import (
 SCHEMA_VERSION = "unified_intelligence_packet_v12"
 SUBJECT_RESOLUTION_VERSION = "governed_packet_subject_resolution_v1"
 SOURCE_SNAPSHOT_VERSION = "unified_packet_source_snapshot_v2"
+SEALED_ACTIVE_EPISODE_PACKET_VERSION = (
+    "sealed_active_episode_packet_v1"
+)
 JOURNAL_PUBLICATION_SOURCE_CLASS = "journal_publication_projection"
 RELAY_PUBLICATION_SOURCE_CLASS = "relay_publication_projection"
 TABLE_NAME = "memory_governance_intelligence_packet_runs"
@@ -294,6 +298,9 @@ _EPISODE_QUERY_RE = re.compile(
     r"what\s+was\s+(?:retested|tested\s+again|completed|resolved)|"
     r"(?:correction|retest|retry|completion)\s+(?:history|result|status)|"
     r"(?:resume|continue|reopen|return\s+to)\s+(?:that|this|the)|"
+    r"(?:how\s+many\s+(?:humans?|people|members|participants)|who)\s+"
+    r"(?:attended|participated|joined|showed\s+up|took\s+part)|"
+    r"how\s+many\s+(?:humans?|people|members|participants)\s+were\s+there|"
     r"(?:moment|episode|open\s+loop|unresolved\s+thread)s?)\b",
     re.I,
 )
@@ -2862,6 +2869,88 @@ def _episode_projection_digest(
     )
 
 
+def _sealed_active_episode_projection(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    *,
+    expected_episode_id: str = "",
+) -> tuple[
+    str,
+    Any,
+    tuple[str, ...],
+    tuple[str, ...],
+    str,
+    str,
+] | None:
+    """Read one existing sealed aggregate and bind all source lineage."""
+
+    reference_out: dict[str, Any] = {}
+    context = render_active_episode_canary_context(
+        conn,
+        guild_id=int(request.guild_id or 0),
+        channel_id=int(request.channel_id or 0),
+        channel_policy=str(request.channel_policy or ""),
+        route_mode=str(request.route_mode or "unknown"),
+        topic_text=str(request.user_text or "")[:8000],
+        now=request.now or None,
+        expected_episode_id=str(expected_episode_id or ""),
+        reference_out=reference_out,
+    )
+    reference = reference_out.get("reference")
+    if not context or reference is None:
+        return None
+    roots: list[str] = []
+    occurrences: list[str] = []
+    for moment_id in tuple(reference.source_moment_ids or ()):
+        moment_roots, moment_occurrences = _moment_all_root_metadata(
+            conn,
+            moment_id=moment_id,
+        )
+        roots.extend(moment_roots)
+        occurrences.extend(moment_occurrences)
+    bound_roots = tuple(dict.fromkeys(roots))
+    bound_occurrences = tuple(dict.fromkeys(occurrences))
+    if not bound_roots or not bound_occurrences:
+        return None
+    episode_row = conn.execute(
+        """
+        SELECT last_activity_at
+        FROM memory_moment_episodes
+        WHERE episode_id=? AND guild_id=? AND channel_id=?
+          AND channel_policy='sealed_test' AND route_mode=?
+        """,
+        (
+            reference.episode_id,
+            int(request.guild_id or 0),
+            int(request.channel_id or 0),
+            str(request.route_mode or "unknown"),
+        ),
+    ).fetchone()
+    if not episode_row or not str(episode_row[0] or ""):
+        return None
+    source_digest = _digest(
+        SEALED_ACTIVE_EPISODE_PACKET_VERSION,
+        context,
+        reference.episode_id,
+        reference.lifecycle_status,
+        tuple(reference.source_moment_ids or ()),
+        int(reference.participant_count or 0),
+        int(reference.open_loop_count or 0),
+        tuple(reference.semantic_types or ()),
+        bound_roots,
+        bound_occurrences,
+        str(episode_row[0] or ""),
+    )
+    return (
+        context,
+        reference,
+        bound_roots,
+        bound_occurrences,
+        source_digest,
+        str(episode_row[0] or ""),
+    )
+
+
 def _episode_items(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
@@ -2878,6 +2967,69 @@ def _episode_items(
         str(request.frame_subject_requirement or "").strip().lower()
         == "required"
     )
+    if (
+        str(request.channel_policy or "").strip().lower()
+        == "sealed_test"
+        and not subject_required
+    ):
+        projection = _sealed_active_episode_projection(conn, request)
+        if projection is not None:
+            (
+                context,
+                reference,
+                roots,
+                occurrences,
+                source_digest,
+                observed_at,
+            ) = projection
+            event_ref = str(request.frame_event_ref or "").strip()
+            if event_ref not in reference.source_moment_ids:
+                event_ref = str(reference.source_moment_ids[-1] or "")
+            item = IntelligencePacketItem(
+                lane="episode",
+                source_class="moment_gist",
+                source_type="sealed_active_episode_aggregate",
+                source_ref="episode:%s:sealed-active"
+                % reference.episode_id,
+                source_digest=source_digest,
+                subject_key="event:%s" % reference.episode_id,
+                predicate_key="active_episode_aggregate",
+                text=context[:1200],
+                visibility="sealed_test",
+                confidence="high",
+                lifecycle=reference.lifecycle_status,
+                authority=_AUTHORITY_RANK["moment_gist"],
+                lineage=roots,
+                observed_at=observed_at,
+                usage="episode_aggregate",
+                score=94.0,
+                revalidation_kind="sealed_active_episode",
+                revalidation_key=reference.episode_id,
+                root_identities=roots,
+                occurrence_identities=occurrences,
+                event_ref=event_ref,
+                episode_ref=reference.episode_id,
+                event_relation=str(
+                    request.frame_event_relation or "same_event"
+                ),
+                phase=str(request.frame_phase or ""),
+                uncertainty_status="sealed_same_channel_aggregate",
+            )
+            diagnostics.episode_candidate_count = 1
+            if _route_allows_item(request, item):
+                diagnostics.episode_query_status = "selected"
+                diagnostics.candidates_by_lane["episode"] = (
+                    diagnostics.candidates_by_lane.get("episode", 0) + 1
+                )
+                return [item]
+            diagnostics.visibility_exclusions += 1
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="episode",
+                reason="episode_visibility",
+                source_class=item.source_class,
+            )
     subject_key = str(subject_resolution.subject_key or "")
     if subject_required and not re.fullmatch(
         r"discord_user:[1-9]\d*",
@@ -5911,6 +6063,54 @@ def _episode_version(
     return ""
 
 
+def _sealed_active_episode_version(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    item: IntelligencePacketItem,
+) -> str:
+    projection = _sealed_active_episode_projection(
+        conn,
+        packet.request,
+        expected_episode_id=str(item.revalidation_key or ""),
+    )
+    if projection is None:
+        return ""
+    (
+        context,
+        reference,
+        roots,
+        occurrences,
+        source_digest,
+        observed_at,
+    ) = projection
+    event_ref = str(packet.request.frame_event_ref or "").strip()
+    if event_ref not in reference.source_moment_ids:
+        event_ref = str(reference.source_moment_ids[-1] or "")
+    if not (
+        item.source_type == "sealed_active_episode_aggregate"
+        and item.source_ref
+        == "episode:%s:sealed-active" % reference.episode_id
+        and item.revalidation_key == reference.episode_id
+        and item.subject_key == "event:%s" % reference.episode_id
+        and item.predicate_key == "active_episode_aggregate"
+        and item.text == context[:1200]
+        and item.visibility == "sealed_test"
+        and item.lifecycle == reference.lifecycle_status
+        and item.lineage == roots
+        and item.observed_at == observed_at
+        and item.usage == "episode_aggregate"
+        and item.root_identities == roots
+        and item.occurrence_identities == occurrences
+        and item.event_ref == event_ref
+        and item.episode_ref == reference.episode_id
+        and item.event_relation
+        == str(packet.request.frame_event_relation or "same_event")
+        and item.uncertainty_status == "sealed_same_channel_aggregate"
+    ):
+        return ""
+    return source_digest
+
+
 def _show_episode_version(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
@@ -6438,6 +6638,12 @@ def _revalidate_packet_in_snapshot(
                 current = _moment_version(conn, packet, item)
             elif item.revalidation_kind == "episode":
                 current = _episode_version(conn, packet, item)
+            elif item.revalidation_kind == "sealed_active_episode":
+                current = _sealed_active_episode_version(
+                    conn,
+                    packet,
+                    item,
+                )
             elif item.revalidation_kind == "show_episode":
                 current = _show_episode_version(
                     conn,

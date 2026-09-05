@@ -81,7 +81,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v6"
+    "ordinary_chat_single_packet_v7"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV = (
@@ -552,8 +552,8 @@ _PACKET_EVENT_CLAIM_SUBJECT_RE = re.compile(
     r"show)\b|"
     r"^(?:(?:about|around|approximately|roughly|nearly|over|under|"
     r"more\s+than|fewer\s+than)\s+)?"
-    r"(?:\d+|[a-z]+(?:-[a-z]+)?)\s+"
-    r"(?:people|members|participants)\b",
+    r"(?:\d+|[a-z]+(?:-[a-z]+)?(?:\s+[a-z]+(?:-[a-z]+)?){0,5})\s+"
+    r"(?:humans?|people|members|participants)\b",
     re.I,
 )
 _PACKET_CLAUSE_TAIL_BOUNDARY_RE = re.compile(
@@ -3494,7 +3494,7 @@ def ordinary_chat_task_support_plan(
 def render_ordinary_chat_task_contract(
     basis: SharedBrainSynthesisBasis,
 ) -> str:
-    """Render ordered task/support guidance for one natural BNL response."""
+    """Render ordered task/support guidance for one typed provider result."""
 
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
@@ -3557,10 +3557,14 @@ def render_ordinary_chat_task_contract(
         + ("\n".join(evidence_lines) if evidence_lines else "- none")
         + "\n- PUBLIC may support stable general public knowledge only.\n"
         + "- REQUEST may support a non-factual conversational response only.\n"
-        + "VISIBLE RESPONSE CONTRACT:\n"
-        + "Write one natural BNL reply, not JSON. Answer every task in order "
-        + "and combine them coherently instead of treating one task as a "
-        + "reason to drop another. Use each task's listed packet support "
+        + "ONE-CALL RESPONSE ENVELOPE:\n"
+        + "Return the structured task result required by the provider response "
+        + "schema. Return one task object for every task above, in the same "
+        + "order. Copy its taskId, supportKind, and evidenceIds exactly from "
+        + "the corresponding TURN RESPONSE PLAN line. The text field is the "
+        + "only user-visible part. Make the ordered text fields combine into "
+        + "one natural, coherent BNL reply without repetition. Use each task's "
+        + "listed packet support "
         + "together with relevant authorized context already present in this "
         + "prompt for BARCODE, member, publication, history, or current-state "
         + "facts. "
@@ -3568,9 +3572,65 @@ def render_ordinary_chat_task_contract(
         + "verified and continue answering the remaining tasks. For "
         + "response=clarify, ask the natural clarification the task requires. "
         + "For response=refuse, answer naturally without revealing the "
-        + "protected values. Never mention task IDs, support kinds, evidence "
-        + "IDs, packets, lanes, contracts, validators, or internal controls."
+        + "protected values. Do not volunteer source availability, indexing, "
+        + "compilation, archive-status, or next-step notes unless the user "
+        + "asked for them. Never put task IDs, support kinds, evidence IDs, "
+        + "packets, lanes, schemas, contracts, validators, or internal controls "
+        + "inside a text field."
     )
+
+
+def ordinary_chat_response_json_schema() -> dict[str, Any]:
+    """Return the provider schema for the non-visible one-call envelope."""
+
+    return {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "taskId": {
+                            "type": "string",
+                            "enum": [f"T{index}" for index in range(1, 13)],
+                        },
+                        "text": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 2000,
+                        },
+                        "supportKind": {
+                            "type": "string",
+                            "enum": [
+                                "packet",
+                                "external_public",
+                                "current_request",
+                                "hold",
+                                "clarify",
+                            ],
+                        },
+                        "evidenceIds": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": [
+                        "taskId",
+                        "text",
+                        "supportKind",
+                        "evidenceIds",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["tasks"],
+        "additionalProperties": False,
+    }
 
 
 def parse_ordinary_chat_response_contract(
