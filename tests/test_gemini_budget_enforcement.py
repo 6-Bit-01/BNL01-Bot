@@ -452,7 +452,12 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
                 )
             )
 
-        self.assertIsNone(execution)
+        self.assertIsNotNone(execution)
+        self.assertFalse(execution.candidate_active)
+        self.assertEqual(execution.response, "")
+        self.assertEqual(execution.provider_call_count, 0)
+        self.assertEqual(execution.corrective_call_count, 0)
+        self.assertTrue(execution.typed_contract_required)
         fake_client.models.generate_content.assert_not_called()
 
     def test_unknown_active_model_is_unpriced_and_never_called(self):

@@ -51,8 +51,16 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 "external_public",
             ),
             (
+                "When did Apollo 11 land? @BNL-01",
+                "external_public",
+            ),
+            (
+                "When did Apollo 11 land, @BNL-01?",
+                "external_public",
+            ),
+            (
                 "@BNL-01 can you explain when Apollo 11 landed?",
-                "current_request",
+                "external_public",
             ),
             (
                 "@BNL-01, how do you boil an egg?",
@@ -122,6 +130,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             ("@BNL-01 was created when?", "bnl_01"),
             ("@BNL-01 can explain its origin?", "bnl_01"),
             ("When was **@BNL-01** created?", "bnl_01"),
+            ("Who created @BNL-01?", "bnl_01"),
         )
         for text, expected_entity_ref in governed_cases:
             with self.subTest(text=text):

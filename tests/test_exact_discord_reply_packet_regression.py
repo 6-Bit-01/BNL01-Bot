@@ -299,6 +299,22 @@ class ExactDiscordReplyPacketRegressionTests(unittest.TestCase):
             response_contract,
         )
         self.assertTrue(validation.valid, validation.status)
+        self.assertEqual(
+            validation.claim_classifications,
+            ("authorized_exact_reply_transfer",),
+        )
+        wrong_value_contract = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"You gave me amber.",'
+            '"supportKind":"packet","evidenceIds":["%s"]}]}'
+            % cobalt_evidence_id
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                ordinary_basis,
+                wrong_value_contract,
+            ).status,
+            "task_text_unsupported",
+        )
 
         with sqlite3.connect(self.db_path) as conn:
             run = begin_single_packet_run(

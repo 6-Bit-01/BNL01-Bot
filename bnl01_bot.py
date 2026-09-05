@@ -189,8 +189,10 @@ from bnl_shared_brain_synthesis import (
     evaluate_single_packet_response,
     finalize_run as finalize_shared_brain_synthesis_run,
     honest_empty_profile_response,
+    ordinary_chat_response_json_schema,
     ordinary_chat_configuration,
     ordinary_chat_route_scope_decision,
+    parse_ordinary_chat_response_contract,
     publication_packet_composes_current_queue,
     publication_packet_owns_turn,
     record_fallback as record_shared_brain_synthesis_fallback,
@@ -11405,6 +11407,20 @@ def decide_reply_eligibility(
             True,
             True,
         )
+    if (
+        active_channel
+        and text_present
+        and surface == CONVERSATION_SURFACE_MENTION_OR_REPLY
+    ):
+        return ReplyEligibility(
+            False,
+            "mention_or_reply_tag_or_reply_required",
+            "passive_observe",
+            "silent_observe",
+            False,
+            False,
+            False,
+        )
     if active_channel and text_present and policy in CONVERSATIONAL_POLICIES:
         batch_allowed = bool(batching)
         return ReplyEligibility(
@@ -15748,6 +15764,8 @@ class BatchConversationTurn:
     user_id: int
     addressing: DiscordTurnAddressing
     attribution_target_user_ids: tuple[int, ...] = ()
+    planned_directness: str = ""
+    planned_direct_to_bnl: bool = False
 
     def __iter__(self):
         yield self.name
@@ -15767,8 +15785,10 @@ def build_batched_conversation_turn(
     *,
     direct_to_bnl: bool = False,
     addressing: DiscordTurnAddressing | None = None,
+    planned_directness: str = "",
+    planned_direct_to_bnl: bool = False,
 ) -> BatchConversationTurn:
-    """Build a batch item without flattening reply/tag routing into user prose."""
+    """Build a batch item without flattening typed routing into user prose."""
     addressing = addressing or resolve_discord_turn_addressing(
         message,
         direct_to_bnl=direct_to_bnl,
@@ -15784,6 +15804,8 @@ def build_batched_conversation_turn(
             if int(target_user_id or 0) > 0
             else ()
         ),
+        planned_directness=str(planned_directness or ""),
+        planned_direct_to_bnl=bool(planned_direct_to_bnl),
     )
 
 
@@ -15938,6 +15960,10 @@ def batch_exclusively_targets_other_people(items) -> bool:
     return bool(
         any(meta and meta.third_party_only for meta in addressing)
         and not any(
+            bool(getattr(item, "planned_direct_to_bnl", False))
+            for item in (items or [])
+        )
+        and not any(
             meta and (meta.directly_targets_bnl or meta.plain_text_names_bnl)
             for meta in addressing
         )
@@ -15948,9 +15974,39 @@ def batch_has_response_obligation(items) -> bool:
     """Return True when trusted routing says at least one turn calls BNL."""
 
     return any(
-        isinstance(getattr(item, "addressing", None), DiscordTurnAddressing)
-        and getattr(item, "addressing").addresses_bnl
+        bool(getattr(item, "planned_direct_to_bnl", False))
+        or (
+            isinstance(
+                getattr(item, "addressing", None),
+                DiscordTurnAddressing,
+            )
+            and getattr(item, "addressing").addresses_bnl
+        )
         for item in (items or ())
+    )
+
+
+def batch_is_outside_channel_admission(
+    items,
+    channel_policy: str,
+    conversation_surface: str = "",
+) -> bool:
+    """Apply channel admission before addressee attribution.
+
+    Human mentions and reply targets remain useful conversation metadata, but
+    they are never a response veto after a turn has entered a free-speak room.
+    Mention-or-reply surfaces still require an unmistakable BNL admission.
+    """
+
+    surface = (
+        str(conversation_surface or "").strip()
+        or conversation_surface_for_channel_policy(channel_policy)
+    )
+    if conversation_surface_allows_free_speak(surface):
+        return False
+    return bool(
+        batch_exclusively_targets_other_people(items)
+        and not batch_has_response_obligation(items)
     )
 
 
@@ -15959,8 +16015,11 @@ def should_suppress_human_to_human_tag_only_turn(
     *,
     followup_candidate: bool = False,
     active_direct_session: bool = False,
+    conversation_surface: str = "",
 ) -> bool:
     """Observe human-only tags unless they are an answer in BNL's active exchange."""
+    if conversation_surface_allows_free_speak(conversation_surface):
+        return False
     return bool(human_to_human_tag_only and not followup_candidate and not active_direct_session)
 
 
@@ -27121,7 +27180,8 @@ def build_live_conversation_orchestration_decision(
         addressed[-1].address_kind if addressed else "none"
     )
     third_party_only = bool(
-        addressings
+        not conversation_surface_allows_free_speak(conversation_surface)
+        and addressings
         and all(meta.third_party_only for meta in addressings)
     )
     referent_status = (
@@ -29579,6 +29639,15 @@ def _generation_config_for_model(
     config_kwargs = {
         "max_output_tokens": policy.max_output_tokens,
     }
+    if str(route or "") == ORDINARY_CHAT_SINGLE_PACKET_ROUTE:
+        config_kwargs.update(
+            {
+                "response_mime_type": "application/json",
+                "response_json_schema": (
+                    ordinary_chat_response_json_schema()
+                ),
+            }
+        )
     normalized_model = str(model_name or "").lower()
     if "gemini-2.5" in normalized_model:
         legacy_budget = min(
@@ -34447,6 +34516,12 @@ def _collapse_consecutive_batch_fragments(items):
     current_attribution_targets = set(
         getattr(items[0], "attribution_target_user_ids", ()) or ()
     )
+    current_planned_directness = str(
+        getattr(items[0], "planned_directness", "") or ""
+    )
+    current_planned_direct_to_bnl = bool(
+        getattr(items[0], "planned_direct_to_bnl", False)
+    )
     fragments = [current_content]
 
     for item in items[1:]:
@@ -34457,6 +34532,15 @@ def _collapse_consecutive_batch_fragments(items):
             fragments.append(content)
             current_attribution_targets.update(
                 getattr(item, "attribution_target_user_ids", ()) or ()
+            )
+            item_planned_directness = str(
+                getattr(item, "planned_directness", "") or ""
+            )
+            if item_planned_directness:
+                current_planned_directness = item_planned_directness
+            current_planned_direct_to_bnl = bool(
+                current_planned_direct_to_bnl
+                or getattr(item, "planned_direct_to_bnl", False)
             )
             continue
 
@@ -34469,6 +34553,8 @@ def _collapse_consecutive_batch_fragments(items):
                     current_uid,
                     current_addressing,
                     tuple(sorted(current_attribution_targets)),
+                    current_planned_directness,
+                    current_planned_direct_to_bnl,
                 )
             )
         else:
@@ -34477,6 +34563,12 @@ def _collapse_consecutive_batch_fragments(items):
         current_addressing = addressing
         current_attribution_targets = set(
             getattr(item, "attribution_target_user_ids", ()) or ()
+        )
+        current_planned_directness = str(
+            getattr(item, "planned_directness", "") or ""
+        )
+        current_planned_direct_to_bnl = bool(
+            getattr(item, "planned_direct_to_bnl", False)
         )
         fragments = [current_content]
 
@@ -34489,6 +34581,8 @@ def _collapse_consecutive_batch_fragments(items):
                 current_uid,
                 current_addressing,
                 tuple(sorted(current_attribution_targets)),
+                current_planned_directness,
+                current_planned_direct_to_bnl,
             )
         )
     else:
@@ -35055,7 +35149,14 @@ def _get_recent_same_user_message_for_previous_request(
     return None
 
 
-def _classify_batch_engagement(items, bot_user=None, pending_request_intent=False):
+def _classify_batch_engagement(
+    items,
+    bot_user=None,
+    pending_request_intent=False,
+    *,
+    channel_policy: str = "unknown",
+    conversation_surface: str = "",
+):
     if not items:
         return "skip", "empty_batch"
 
@@ -35103,10 +35204,22 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
     substantive_cluster = token_count >= 18 or (token_count >= 12 and len(texts) >= 3)
     casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
     code_derived_bnl_target = any(meta and meta.directly_targets_bnl for meta in item_addressing)
+    resolved_surface = (
+        str(conversation_surface or "").strip()
+        or conversation_surface_for_channel_policy(channel_policy)
+    )
+    free_speak_surface = conversation_surface_allows_free_speak(
+        resolved_surface
+    )
 
-    # Free-speak lets BNL join the room; it does not make questions directed at
-    # another person into questions for BNL. A literal BNL name still opts in.
-    if batch_exclusively_targets_other_people(items) and not code_derived_bnl_target and not bot_named:
+    # Addressee attribution cannot veto a turn after channel admission.  On a
+    # tag-required surface it remains part of the admission check.
+    if (
+        not free_speak_surface
+        and batch_exclusively_targets_other_people(items)
+        and not code_derived_bnl_target
+        and not bot_named
+    ):
         return "observe", "third_party_addressed_turn"
 
     if multiline_payload_detected:
@@ -35132,6 +35245,10 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
         if token_count >= 4 or len(texts) >= 2 or (token_count >= 1 and meaningful_media_label):
             return "answer", "media_context_with_text"
         return "acknowledge", "light_media_reaction_cluster"
+    if free_speak_surface and distinct_users >= 2 and substantive_cluster:
+        return "answer", "free_speak_multi_user_conversation"
+    if free_speak_surface and substantive_cluster:
+        return "answer", "free_speak_substantive_room_conversation"
     if numeric_only_cluster:
         return "skip", "noise_fragment_cluster"
     if test_like or short_fragment_cluster:
@@ -35210,6 +35327,11 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         collapsed_items,
         bot_user,
         pending_request_intent=pending_request,
+        channel_policy=channel_policy,
+        conversation_surface=conversation_surface_for_channel_policy(
+            channel_policy,
+            True,
+        ),
     )
     force_answer, force_reason = _should_force_free_speak_continuation_answer(
         guild_id=guild_id,
@@ -35219,9 +35341,13 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         recent_bnl_reply_context=recent_bnl_reply_context,
         consume_retransmission=consume_retransmission,
     )
-    if force_answer and decision != "answer":
+    generic_free_speak_answer = reason in {
+        "free_speak_multi_user_conversation",
+        "free_speak_substantive_room_conversation",
+    }
+    if force_answer and (decision != "answer" or generic_free_speak_answer):
         logging.info(
-            "skip_blocked_by_substantive_continuation guild_id=%s channel_id=%s decision=%s reason=%s force_reason=%s",
+            "substantive_continuation_answer_preserved guild_id=%s channel_id=%s decision=%s reason=%s force_reason=%s",
             guild_id,
             channel_id,
             decision,
@@ -35274,8 +35400,15 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
     should_generate = decision == "answer"
     request_action = _detect_request_action(combined_text)
     request_anchor_detected = bool(re.search(r"\b(these people|these things|this list|tell me|compare|rank|explain|describe|summarize|rewrite|respond to|answer)\b", combined_text.lower()))
-    addressed_to_bot = bool(
+    planned_direct_to_bnl = bool(
         any(
+            getattr(item, "planned_direct_to_bnl", False)
+            for item in original_items
+        )
+    )
+    addressed_to_bot = bool(
+        planned_direct_to_bnl
+        or any(
             getattr(item, "addressing", None)
             and (
                 getattr(item, "addressing").directly_targets_bnl
@@ -35290,7 +35423,8 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         )
     )
     response_obligation = bool(
-        any(
+        planned_direct_to_bnl
+        or any(
             getattr(item, "addressing", None)
             and getattr(item, "addressing").addresses_bnl
             for item in original_items
@@ -35303,7 +35437,14 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
             if getattr(item, "addressing", None)
             and getattr(item, "addressing").addresses_bnl
         ),
-        "none",
+        next(
+            (
+                str(getattr(item, "planned_directness", "") or "")
+                for item in reversed(original_items)
+                if getattr(item, "planned_direct_to_bnl", False)
+            ),
+            "none",
+        ),
     )
     is_direct_question = "?" in combined_text
     has_structured_intent = _has_structured_intent(original_items, payload_items, pending_state=pending_request, pending_anchor=pending_anchor)
@@ -35322,6 +35463,7 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         "request_style": "list" if has_request_payload else "chat",
         "request_anchor_detected": request_anchor_detected,
         "has_structured_intent": has_structured_intent,
+        "planned_direct_to_bnl": planned_direct_to_bnl,
         "addressed_to_bot": addressed_to_bot,
         "response_obligation": response_obligation,
         "address_kind": address_kind,
@@ -35712,6 +35854,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     channel_id = channel.id
     guild_id = channel.guild.id
     channel_policy = resolve_channel_policy(channel)
+    conversation_surface = conversation_surface_for_channel_policy(
+        channel_policy,
+        True,
+    )
     sealed_test_channel = channel_policy == "sealed_test"
     now = datetime.now(PACIFIC_TZ)
     handoff_items = _channel_interrupt_handoff.pop(channel_id, None)
@@ -35830,9 +35976,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     try:
         _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
         if (
-            batch_exclusively_targets_other_people(items)
+            batch_is_outside_channel_admission(
+                items,
+                channel_policy,
+                conversation_surface,
+            )
             and not (pending_state or pending_anchor)
-            and not batch_orchestration_influences
         ):
             _log_batch_event(
                 logging.INFO,
@@ -36004,9 +36153,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
 
         while True:
             if (
-                batch_exclusively_targets_other_people(items)
+                batch_is_outside_channel_admission(
+                    items,
+                    channel_policy,
+                    conversation_surface,
+                )
                 and not (pending_state or pending_anchor)
-                and not batch_orchestration_influences
             ):
                 _log_batch_event(
                     logging.INFO,
@@ -37399,6 +37551,52 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if batch_ordinary_chat_execution is not None
             else 0
         )
+        batch_typed_single_packet = bool(
+            batch_ordinary_chat_execution is not None
+            and batch_ordinary_chat_execution.typed_contract_required
+        )
+
+        async def _withhold_batch_typed_single_packet(
+            *,
+            reason: str,
+            guard_status: str,
+            frame_revalidation_status: str = "",
+            source_revalidation_status: str = "",
+        ) -> None:
+            """Finalize one-call batch output without exposing or rewriting it."""
+
+            nonlocal batch_synthesis_decision
+            batch_synthesis_decision = (
+                await safely_record_ordinary_chat_single_packet_review(
+                    batch_synthesis_decision,
+                    reason=reason,
+                    corrective_call_count=(
+                        batch_single_packet_corrective_call_count
+                    ),
+                    frame_revalidation_status=frame_revalidation_status,
+                    source_revalidation_status=source_revalidation_status,
+                )
+                or batch_synthesis_decision
+            )
+            await safely_finalize_shared_brain_synthesis(
+                batch_synthesis_decision,
+                final_response="",
+                response_sent=False,
+                candidate_live=False,
+                guard_status=guard_status,
+            )
+            logging.warning(
+                "ordinary_chat_typed_single_packet_withheld route=batch "
+                "reason=%s provider_calls=%s corrective_calls=%s",
+                reason,
+                (
+                    batch_ordinary_chat_execution.provider_call_count
+                    if batch_ordinary_chat_execution is not None
+                    else 0
+                ),
+                batch_single_packet_corrective_call_count,
+            )
+
         if batch_single_packet_cutover:
             response = batch_ordinary_chat_execution.response
             prompt = batch_ordinary_chat_execution.prompt
@@ -37423,6 +37621,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_review_reason = (
                 batch_ordinary_chat_execution.review_reason
             )
+            if batch_typed_single_packet:
+                await _withhold_batch_typed_single_packet(
+                    reason=batch_review_reason,
+                    guard_status=(
+                        "typed_batch_single_packet_candidate_rejected"
+                    ),
+                )
+                return
             review_diagnostics = {
                 "suppressed": True,
                 "suppression_reason": batch_review_reason,
@@ -37543,8 +37749,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 ),
                 prompt_source_bases=tuple(batch_prompt_source_bases),
                 regeneration_allowed=bool(
-                    batch_single_packet_cutover
-                    or not batch_synthesis_candidate_active
+                    not batch_typed_single_packet
+                    and (
+                        batch_single_packet_cutover
+                        or not batch_synthesis_candidate_active
+                    )
                 ),
                 situation_frame=(
                     orchestration_state["decision"].situation_frame
@@ -37559,6 +37768,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_diagnostics.get("suppression_reason")
                 or "single_packet_guard_repair_required"
             )
+            if batch_typed_single_packet:
+                await _withhold_batch_typed_single_packet(
+                    reason=batch_single_packet_guard_reason,
+                    guard_status=(
+                        "typed_batch_single_packet_guard_rejected"
+                    ),
+                )
+                return
             (
                 response,
                 prompt,
@@ -37817,6 +38034,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             return
         if guard_diagnostics.get("suppressed"):
+            if batch_typed_single_packet:
+                await _withhold_batch_typed_single_packet(
+                    reason=str(
+                        guard_diagnostics.get("suppression_reason")
+                        or "typed_batch_single_packet_guard_rejected"
+                    ),
+                    guard_status=(
+                        "typed_batch_single_packet_guard_rejected"
+                    ),
+                )
+                return
             (
                 response,
                 prompt,
@@ -37894,6 +38122,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             "exact_quote_guard_reason": presend_quote_failure,
                         }
                     )
+                    if batch_typed_single_packet:
+                        await _withhold_batch_typed_single_packet(
+                            reason=presend_quote_failure,
+                            guard_status=(
+                                "typed_batch_single_packet_quote_rejected"
+                            ),
+                        )
+                        return
                     (
                         response,
                         prompt,
@@ -38031,6 +38267,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "prompt_source_basis_changed": True,
                 }
             )
+            if batch_typed_single_packet:
+                await _withhold_batch_typed_single_packet(
+                    reason=batch_source_failure,
+                    guard_status=(
+                        "typed_batch_single_packet_source_changed"
+                    ),
+                    source_revalidation_status=batch_source_failure,
+                )
+                return
             (
                 response,
                 prompt,
@@ -38376,6 +38621,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         "suppression_reason": frame_rewrite_reason,
                     }
                 )
+                if batch_typed_single_packet:
+                    await _withhold_batch_typed_single_packet(
+                        reason=frame_rewrite_reason,
+                        guard_status=(
+                            "typed_batch_single_packet_frame_changed"
+                        ),
+                        frame_revalidation_status=(
+                            batch_frame_revalidation.status
+                        ),
+                    )
+                    return
                 (
                     response,
                     prompt,
@@ -42778,6 +43034,7 @@ class OrdinaryChatSinglePacketExecution:
     provider_call_count: int
     corrective_call_count: int
     review_reason: str = ""
+    typed_contract_required: bool = False
 
 
 def _begin_ordinary_chat_single_packet_receipt(
@@ -43285,11 +43542,12 @@ async def maybe_generate_ordinary_chat_single_packet(
     source_context_available: bool,
     prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
 ) -> OrdinaryChatSinglePacketExecution | None:
-    """Generate one natural response from the shared packet when available.
+    """Generate one typed, locally validated response from the shared packet.
 
-    Packet and receipt failures are diagnostic conditions, not response
-    authority. Returning ``None`` leaves the caller on the same normal BNL
-    generation path instead of substituting a canned block message.
+    A pre-provider packet failure may leave the caller on normal generation.
+    Once this route calls the provider, however, it owns the turn: malformed
+    or rejected output is recorded and withheld instead of triggering a
+    second physical call or exposing the non-visible response envelope.
     """
 
     if not scope_applied:
@@ -43353,6 +43611,7 @@ async def maybe_generate_ordinary_chat_single_packet(
     generation_started = time.monotonic()
     provider_call_count = 0
     tracked_generation = TrackedGenerationResponse("", 0)
+    response_contract = parse_ordinary_chat_response_contract("")
     try:
         tracked_generation = await get_tracked_gemini_response_with_optional_typing(
             channel,
@@ -43362,7 +43621,10 @@ async def maybe_generate_ordinary_chat_single_packet(
             route=ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
             source_context_available=source_context_available,
         )
-        candidate = str(tracked_generation.text or "").strip()
+        response_contract = parse_ordinary_chat_response_contract(
+            tracked_generation.text
+        )
+        candidate = response_contract.response
         provider_call_count = tracked_generation.provider_call_count
     except Exception as exc:
         logging.warning(
@@ -43401,8 +43663,8 @@ async def maybe_generate_ordinary_chat_single_packet(
             provider_error_code=(
                 tracked_generation.provider_error_code
             ),
-            response_contract=None,
-            typed_contract_required=False,
+            response_contract=response_contract,
+            typed_contract_required=True,
         )
     except Exception as exc:
         logging.warning(
@@ -43431,27 +43693,36 @@ async def maybe_generate_ordinary_chat_single_packet(
             )
             or decision
         )
-    if candidate:
-        return OrdinaryChatSinglePacketExecution(
-            decision=decision,
-            response=candidate,
-            prompt=packet_prompt.prompt,
-            prompt_source_bases=(*tuple(prompt_source_bases or ()), basis),
-            candidate_active=bool(decision.candidate_selected),
-            provider_call_count=provider_call_count,
-            corrective_call_count=0,
-            review_reason=(
-                ""
-                if decision.candidate_selected
-                else str(decision.fallback_reason or "candidate_advisory")
-            ),
-        )
-    logging.warning(
-        "ordinary_chat_shared_brain_generation_empty reason=%s "
-        "response_path=normal_generation",
-        str(decision.fallback_reason or "generation_failed"),
+    review_reason = (
+        ""
+        if decision.candidate_selected
+        else str(decision.fallback_reason or "candidate_advisory")
     )
-    return None
+    execution = OrdinaryChatSinglePacketExecution(
+        decision=decision,
+        response=candidate,
+        prompt=packet_prompt.prompt,
+        prompt_source_bases=(*tuple(prompt_source_bases or ()), basis),
+        candidate_active=bool(decision.candidate_selected),
+        provider_call_count=provider_call_count,
+        corrective_call_count=0,
+        review_reason=review_reason,
+        typed_contract_required=True,
+    )
+    if not candidate:
+        logging.warning(
+            "ordinary_chat_shared_brain_generation_withheld reason=%s "
+            "response_path=no_second_call",
+            str(review_reason or "generation_failed"),
+        )
+        await safely_finalize_shared_brain_synthesis(
+            decision,
+            final_response="",
+            response_sent=False,
+            candidate_live=False,
+            guard_status="typed_single_packet_response_withheld",
+        )
+    return execution
 
 
 def build_ordinary_chat_response_repair_prompt(
@@ -43769,6 +44040,10 @@ async def send_planned_conversation_response(
         ordinary_chat_single_packet_execution is not None
     )
     single_packet_cutover = single_packet_receipt_present
+    typed_single_packet = bool(
+        ordinary_chat_single_packet_execution is not None
+        and ordinary_chat_single_packet_execution.typed_contract_required
+    )
     single_packet_corrective_call_count = int(
         ordinary_chat_single_packet_execution.corrective_call_count
         if ordinary_chat_single_packet_execution is not None
@@ -43821,12 +44096,57 @@ async def send_planned_conversation_response(
         prompt = baseline_prompt
         prompt_source_bases = baseline_prompt_source_bases
 
+    async def _withhold_typed_single_packet(
+        *,
+        reason: str,
+        guard_status: str,
+        frame_revalidation_status: str = "",
+        source_revalidation_status: str = "",
+    ) -> None:
+        """Finalize one-call output without exposing or regenerating it."""
+
+        nonlocal synthesis_decision
+        synthesis_decision = (
+            await safely_record_ordinary_chat_single_packet_review(
+                synthesis_decision,
+                reason=reason,
+                corrective_call_count=single_packet_corrective_call_count,
+                frame_revalidation_status=frame_revalidation_status,
+                source_revalidation_status=source_revalidation_status,
+            )
+            or synthesis_decision
+        )
+        await safely_finalize_shared_brain_synthesis(
+            synthesis_decision,
+            final_response="",
+            response_sent=False,
+            candidate_live=False,
+            guard_status=guard_status,
+        )
+        logging.warning(
+            "ordinary_chat_typed_single_packet_withheld reason=%s "
+            "provider_calls=%s corrective_calls=%s",
+            reason,
+            (
+                ordinary_chat_single_packet_execution.provider_call_count
+                if ordinary_chat_single_packet_execution is not None
+                else 0
+            ),
+            single_packet_corrective_call_count,
+        )
+
     if (
         single_packet_cutover
         and ordinary_chat_single_packet_execution is not None
         and ordinary_chat_single_packet_execution.review_reason
     ):
         review_reason = ordinary_chat_single_packet_execution.review_reason
+        if typed_single_packet:
+            await _withhold_typed_single_packet(
+                reason=review_reason,
+                guard_status="typed_single_packet_candidate_rejected",
+            )
+            return model_decision
         review_diagnostics = {
             "suppressed": True,
             "suppression_reason": review_reason,
@@ -43966,7 +44286,11 @@ async def send_planned_conversation_response(
         # evidence can require a grounded rewrite, but it cannot turn the
         # guard into a response veto.
         regeneration_allowed=bool(
-            single_packet_cutover or not synthesis_candidate_active
+            not typed_single_packet
+            and (
+                single_packet_cutover
+                or not synthesis_candidate_active
+            )
         ),
     )
     if (
@@ -43977,6 +44301,12 @@ async def send_planned_conversation_response(
             guard_diagnostics.get("suppression_reason")
             or "single_packet_guard_repair_required"
         )
+        if typed_single_packet:
+            await _withhold_typed_single_packet(
+                reason=reason,
+                guard_status="typed_single_packet_guard_rejected",
+            )
+            return model_decision
         (
             response,
             prompt,
@@ -44132,6 +44462,15 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("regenerated_for_register_mismatch")
     )
     if guard_diagnostics.get("suppressed"):
+        if typed_single_packet:
+            await _withhold_typed_single_packet(
+                reason=str(
+                    guard_diagnostics.get("suppression_reason")
+                    or "typed_single_packet_guard_rejected"
+                ),
+                guard_status="typed_single_packet_guard_rejected",
+            )
+            return model_decision
         (
             response,
             prompt,
@@ -44288,6 +44627,12 @@ async def send_planned_conversation_response(
                     "exact_quote_guard_reason": quote_presend_failure,
                 }
             )
+            if typed_single_packet:
+                await _withhold_typed_single_packet(
+                    reason=quote_presend_failure,
+                    guard_status="typed_single_packet_quote_rejected",
+                )
+                return model_decision
             (
                 response,
                 prompt,
@@ -44390,6 +44735,13 @@ async def send_planned_conversation_response(
                 "prompt_source_basis_changed": True,
             }
         )
+        if typed_single_packet:
+            await _withhold_typed_single_packet(
+                reason=direct_source_failure,
+                guard_status="typed_single_packet_source_changed",
+                source_revalidation_status=direct_source_failure,
+            )
+            return model_decision
         (
             response,
             prompt,
@@ -44603,6 +44955,15 @@ async def send_planned_conversation_response(
                     "suppression_reason": frame_rewrite_reason,
                 }
             )
+            if typed_single_packet:
+                await _withhold_typed_single_packet(
+                    reason=frame_rewrite_reason,
+                    guard_status="typed_single_packet_frame_changed",
+                    frame_revalidation_status=(
+                        final_frame_revalidation.status
+                    ),
+                )
+                return model_decision
             (
                 response,
                 prompt,
@@ -44874,7 +45235,11 @@ async def on_message(message: discord.Message):
     is_sealed_test_channel = channel_policy == "sealed_test"
     conversation_surface = conversation_surface_for_channel_policy(channel_policy, is_active_channel)
     free_speak_surface = conversation_surface_allows_free_speak(conversation_surface)
-    should_handle_as_active_channel = is_active_channel or free_speak_surface
+    # The configured active-channel ID is a legacy deployment selector, not a
+    # conversation-policy override.  Admission is owned by the resolved
+    # surface: public home/sealed mirror are free-speak; other conversational
+    # channels require an actual BNL mention or Discord reply.
+    should_handle_as_active_channel = free_speak_surface
     passive_memory_allowed = allow_passive_memory_for_policy(channel_policy)
     bot_user_id = int(getattr(client.user, "id", 0) or 0)
     clean_content = resolve_discord_user_mentions_for_conversation(
@@ -45033,7 +45398,7 @@ async def on_message(message: discord.Message):
         channel_policy,
         turn_addressing.addresses_bnl,
     )
-    channel_allows_conversation = bool(free_speak_surface or is_active_channel)
+    channel_allows_conversation = bool(free_speak_surface)
     followup_candidate = (
         bool(conversation_content)
         and (
@@ -45550,7 +45915,7 @@ async def on_message(message: discord.Message):
         )
         return
 
-    if clean_content and (is_active_channel or real_direct_target):
+    if clean_content and (should_handle_as_active_channel or real_direct_target):
         if not is_sealed_test_channel:
             maybe_update_broadcast_status_from_text(clean_content)
             maybe_update_restricted_status_from_text(clean_content)
@@ -45561,6 +45926,7 @@ async def on_message(message: discord.Message):
         human_to_human_tag_only,
         followup_candidate=followup_candidate,
         active_direct_session=active_same_user_session,
+        conversation_surface=conversation_surface,
     )
     if channel_policy != "broadcast_memory" and not suppress_human_to_human_turn and random.random() < REACTION_CHANCE:
         try:
@@ -46161,6 +46527,10 @@ async def on_message(message: discord.Message):
                 conversation_content,
                 direct_to_bnl=real_direct_target,
                 addressing=turn_addressing,
+                planned_directness=conversation_plan.directness,
+                planned_direct_to_bnl=(
+                    conversation_plan_is_directed_to_bnl(conversation_plan)
+                ),
             )
         )
         _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)

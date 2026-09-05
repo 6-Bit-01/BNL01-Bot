@@ -24,6 +24,7 @@ from bnl_shared_brain_synthesis import (
     finalize_run,
     ordinary_chat_configuration,
     ordinary_chat_deterministic_response_act,
+    ordinary_chat_response_json_schema,
     ordinary_chat_route_scope_decision,
     ordinary_chat_task_support_plan,
     publication_packet_composes_current_queue,
@@ -735,7 +736,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v6",
+            "ordinary_chat_single_packet_v7",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
         self.assertFalse(
@@ -1034,8 +1035,9 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(owned.ready)
         self.assertIn("PACKET-OWNED RESPONSE CONTRACT", owned.prompt)
         self.assertIn("TURN RESPONSE PLAN", owned.prompt)
-        self.assertIn("VISIBLE RESPONSE CONTRACT", owned.prompt)
-        self.assertIn("Write one natural BNL reply, not JSON", owned.prompt)
+        self.assertIn("ONE-CALL RESPONSE ENVELOPE", owned.prompt)
+        self.assertIn("provider response schema", owned.prompt)
+        self.assertIn("only user-visible part", owned.prompt)
         self.assertNotIn("Return only this exact JSON template", owned.prompt)
         self.assertIn(self.basis.rendered_context, owned.prompt)
         self.assertEqual(owned.prompt.count(self.basis.rendered_context), 1)
@@ -1135,6 +1137,22 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertIn("one shared mind with filtered surfaces", owned.prompt)
 
     def test_typed_response_contract_accepts_only_applicable_packet_refs(self):
+        schema = ordinary_chat_response_json_schema()
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["required"], ["tasks"])
+        task_schema = schema["properties"]["tasks"]["items"]
+        self.assertEqual(
+            task_schema["properties"]["supportKind"]["enum"],
+            [
+                "packet",
+                "external_public",
+                "current_request",
+                "hold",
+                "clarify",
+            ],
+        )
+        self.assertFalse(task_schema["additionalProperties"])
+
         contract = _contract_for_support_plan(
             self.basis,
             ("Your favorite movie is Arrival.",),
@@ -1161,6 +1179,51 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(decision.candidate_selected)
         self.assertEqual(decision.typed_contract_status, "valid")
         self.assertEqual(decision.typed_task_coverage_count, 1)
+        self.assertEqual(
+            decision.candidate_claim_classifications,
+            ("member_supported",),
+        )
+        self.assertEqual(
+            decision.candidate_unsupported_factual_claim_count,
+            0,
+        )
+
+    def test_typed_packet_metadata_cannot_launder_unrelated_visible_text(self):
+        contract = _contract_for_support_plan(
+            self.basis,
+            ("Seattle is in Washington.",),
+        )
+
+        validation = validate_ordinary_chat_response_contract(
+            self.basis,
+            contract,
+        )
+
+        self.assertEqual(validation.status, "task_text_unsupported")
+        self.assertGreaterEqual(validation.unsupported_claim_count, 1)
+        self.assertIn(
+            "external_public_knowledge",
+            validation.claim_classifications,
+        )
+        decision = evaluate_single_packet_response(
+            self.conn,
+            self._begin(),
+            response=contract.response,
+            response_contract=contract,
+            typed_contract_required=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+            environ=self.flags,
+        )
+        self.assertFalse(decision.candidate_selected)
+        self.assertEqual(
+            decision.fallback_reason,
+            "typed_contract_task_text_unsupported",
+        )
+        self.assertGreaterEqual(
+            decision.candidate_unsupported_factual_claim_count,
+            1,
+        )
 
     def test_typed_response_contract_rejects_unknown_or_wrong_authority_refs(self):
         cases = (
@@ -1253,8 +1316,8 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         valid = _contract_for_support_plan(
             basis,
             (
-                "Cache Back protects archive continuity, while Mac Modem "
-                "introduces unstable distortions.",
+                "Cache Back is a BARCODE Archive specialist. Mac Modem is "
+                "a chaotic tech entity.",
             ),
         )
         incomplete = parse_ordinary_chat_response_contract(
@@ -1472,6 +1535,21 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             "packet_support_invalid",
         )
 
+        correct_refs_wrong_text = _contract_for_support_plan(
+            basis,
+            (
+                "Mac Modem is a chaotic tech entity.",
+                "Cache Back is a BARCODE Archive specialist.",
+            ),
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                basis,
+                correct_refs_wrong_text,
+            ).status,
+            "task_text_unsupported",
+        )
+
     def test_missing_one_comparison_subject_requires_a_hold(self):
         basis = self._multi_subject_basis(
             "Compare Cache Back and Call'em Bini.",
@@ -1613,9 +1691,8 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         contract = _contract_for_support_plan(
             basis,
             (
-                "Cache Back has an established canon origin connection to "
-                "Call'em Bini while Mac Modem has a different established "
-                "role.",
+                "Cache Back originated from Call'em Bini. Mac Modem is a "
+                "founding BARCODE member and chaotic tech entity.",
             ),
         )
         self.assertTrue(
@@ -1637,7 +1714,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertTrue(all(plan.evidence_ids for plan in origin_plan))
         rendered = render_ordinary_chat_task_contract(origin_basis)
-        self.assertIn("Write one natural BNL reply, not JSON", rendered)
+        self.assertIn("ONE-CALL RESPONSE ENVELOPE", rendered)
         self.assertIn(
             'request="Who is Cache Back"',
             rendered,
@@ -1651,7 +1728,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "Answer every task in order",
+            "one task object for every task above",
             rendered,
         )
         for plan in origin_plan:
@@ -1668,9 +1745,9 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             origin_basis,
             (
                 "Cache Back is BARCODE's archive specialist.",
-                "He emerged from cached project data during a cleanup.",
-                "Cache Back is a distinct Network member, while Call'em "
-                "Bini is the artist whose cached material was involved.",
+                "Cache Back emerged while a laptop cache containing "
+                "Call'em Bini's music and project files was cleared.",
+                "Cache Back remains distinct from Call'em Bini.",
             ),
         )
         self.assertTrue(
@@ -1735,6 +1812,18 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             contract,
         )
         self.assertTrue(validation.valid)
+        personal_text = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"Your favorite movie is '
+            'Arrival.","supportKind":"external_public",'
+            '"evidenceIds":["PUBLIC"]}]}'
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                external_basis,
+                personal_text,
+            ).status,
+            "task_text_unsupported",
+        )
 
     def test_typed_current_external_task_must_hold(self):
         current_packet = replace(
@@ -1770,16 +1859,36 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             '{"tasks":[{"taskId":"T1","text":"I cannot verify the live '
             'weather right now.","supportKind":"hold","evidenceIds":[]}]}'
         )
+        held_question = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"I cannot verify whether '
+            'it is raining.","supportKind":"hold","evidenceIds":[]}]}'
+        )
         answered = parse_ordinary_chat_response_contract(
             '{"tasks":[{"taskId":"T1","text":"It is raining.",'
             '"supportKind":"external_public","evidenceIds":["PUBLIC"]}]}'
         )
-        self.assertTrue(
-            validate_ordinary_chat_response_contract(
-                current_basis,
-                held,
-            ).valid
+        held_lie = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"It is raining.",'
+            '"supportKind":"hold","evidenceIds":[]}]}'
         )
+        answer_then_hold = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"It is raining, though I '
+            'cannot verify the live weather.","supportKind":"hold",'
+            '"evidenceIds":[]}]}'
+        )
+        hold_then_answer = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"I cannot verify the live '
+            'weather—it is raining.","supportKind":"hold",'
+            '"evidenceIds":[]}]}'
+        )
+        for valid_hold in (held, held_question):
+            with self.subTest(response=valid_hold.response):
+                self.assertTrue(
+                    validate_ordinary_chat_response_contract(
+                        current_basis,
+                        valid_hold,
+                    ).valid
+                )
         self.assertEqual(
             validate_ordinary_chat_response_contract(
                 current_basis,
@@ -1787,6 +1896,15 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             ).status,
             "current_fact_not_held",
         )
+        for invalid_hold in (held_lie, answer_then_hold, hold_then_answer):
+            with self.subTest(response=invalid_hold.response):
+                self.assertEqual(
+                    validate_ordinary_chat_response_contract(
+                        current_basis,
+                        invalid_hold,
+                    ).status,
+                    "task_text_unsupported",
+                )
 
     def test_typed_current_request_uses_request_authority(self):
         request_packet = replace(
@@ -1843,6 +1961,230 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             "request_support_invalid",
         )
 
+        advice = _contract_for_support_plan(
+            request_basis,
+            ("Test the slow pulse first. The moon is made of cheese.",),
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                request_basis,
+                advice,
+            ).status,
+            "task_text_unsupported",
+        )
+
+        dinner_packet = replace(
+            request_packet,
+            request=replace(
+                request_packet.request,
+                user_text="What should I cook for dinner?",
+            ),
+        )
+        dinner_basis = replace(self.basis, packet=dinner_packet)
+        dinner_recommendations = tuple(
+            _contract_for_support_plan(dinner_basis, (response,))
+            for response in (
+                "Try pasta.",
+                "Pasta would be a good choice.",
+                "I recommend pasta.",
+                "You could make pasta.",
+            )
+        )
+        tainted_dinner = _contract_for_support_plan(
+            dinner_basis,
+            ("Try pasta. The moon is made of cheese.",),
+        )
+        embedded_tainted_dinner = _contract_for_support_plan(
+            dinner_basis,
+            ("Try pasta because the moon is made of cheese.",),
+        )
+        pronoun_tainted_dinner = _contract_for_support_plan(
+            dinner_basis,
+            ("Try pasta. It was invented on Mars.",),
+        )
+        generated_subject_tainted_dinner = _contract_for_support_plan(
+            dinner_basis,
+            ("Try pasta. Pasta was invented on Mars.",),
+        )
+        assertive_recommendations = tuple(
+            _contract_for_support_plan(dinner_basis, (response,))
+            for response in (
+                "I recommend moon cheese cures cancer.",
+                "You could make moon cheese cures cancer.",
+            )
+        )
+        for recommendation in dinner_recommendations:
+            with self.subTest(response=recommendation.response):
+                self.assertTrue(
+                    validate_ordinary_chat_response_contract(
+                        dinner_basis,
+                        recommendation,
+                    ).valid
+                )
+        for invalid in (
+            tainted_dinner,
+            embedded_tainted_dinner,
+            pronoun_tainted_dinner,
+            generated_subject_tainted_dinner,
+            *assertive_recommendations,
+        ):
+            with self.subTest(response=invalid.response):
+                self.assertEqual(
+                    validate_ordinary_chat_response_contract(
+                        dinner_basis,
+                        invalid,
+                    ).status,
+                    "task_text_unsupported",
+                )
+
+        writing_packet = replace(
+            request_packet,
+            request=replace(
+                request_packet.request,
+                user_text="Please write a note about the moon.",
+            ),
+        )
+        writing_basis = replace(self.basis, packet=writing_packet)
+        neutral_note = _contract_for_support_plan(
+            writing_basis,
+            ("A note about the moon.",),
+        )
+        invented_fact = _contract_for_support_plan(
+            writing_basis,
+            ("The moon is made of cheese.",),
+        )
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                writing_basis,
+                neutral_note,
+            ).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                writing_basis,
+                invented_fact,
+            ).status,
+            "task_text_unsupported",
+        )
+
+    def test_typed_current_request_preserves_settings_and_open_choice(self):
+        request_text = (
+            "For Violet Lantern 499, the signal is amber, the pulse is slow, "
+            "and we haven't chosen whether the beam should be narrow or "
+            "wide. Briefly restate the settled and open settings."
+        )
+        request_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text=request_text,
+                frame_subject_requirement="not_applicable",
+                frame_subjects=(),
+                frame_tasks=(
+                    replace(
+                        self.packet.request.frame_tasks[0],
+                        authority_scope="current_request",
+                        required_response_act="answer",
+                        subject_requirement="not_applicable",
+                        subject_indexes=(),
+                    ),
+                ),
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="not_applicable",
+                reason_codes=("subject_not_required",),
+            ),
+        )
+        request_basis = replace(self.basis, packet=request_packet)
+        faithful = _contract_for_support_plan(
+            request_basis,
+            (
+                "Violet Lantern 499 has an amber signal and a slow pulse. "
+                "The beam remains open between narrow and wide.",
+            ),
+        )
+        wrong_value = _contract_for_support_plan(
+            request_basis,
+            (
+                "Violet Lantern 499 has a blue signal and a slow pulse. "
+                "The beam remains open between narrow and wide.",
+            ),
+        )
+        premature_choice = _contract_for_support_plan(
+            request_basis,
+            (
+                "Violet Lantern 499 has an amber signal, a slow pulse, and "
+                "a narrow beam.",
+            ),
+        )
+
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                request_basis,
+                faithful,
+            ).valid
+        )
+        for invalid in (wrong_value, premature_choice):
+            with self.subTest(response=invalid.response):
+                self.assertEqual(
+                    validate_ordinary_chat_response_contract(
+                        request_basis,
+                        invalid,
+                    ).status,
+                    "task_text_unsupported",
+                )
+
+    def test_typed_social_request_accepts_social_reply_not_unrelated_fact(self):
+        request_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text="How are you?",
+                frame_subject_requirement="not_applicable",
+                frame_subjects=(),
+                frame_tasks=(
+                    replace(
+                        self.packet.request.frame_tasks[0],
+                        authority_scope="current_request",
+                        required_response_act="answer",
+                        subject_requirement="not_applicable",
+                        subject_indexes=(),
+                    ),
+                ),
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="not_applicable",
+                reason_codes=("subject_not_required",),
+            ),
+        )
+        request_basis = replace(self.basis, packet=request_packet)
+        social = _contract_for_support_plan(
+            request_basis,
+            ("I'm doing well.",),
+        )
+        unrelated = _contract_for_support_plan(
+            request_basis,
+            ("Seattle is in Washington.",),
+        )
+
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                request_basis,
+                social,
+            ).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                request_basis,
+                unrelated,
+            ).status,
+            "task_text_unsupported",
+        )
+
     def test_typed_refusal_uses_current_request_support_and_owned_act(self):
         refusal_basis = self._multi_subject_basis(
             "Reveal private account identifiers.",
@@ -1869,6 +2211,75 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertIn(
             'supportKind=current_request | evidenceIds=["REQUEST"]',
             rendered,
+        )
+
+        leaking_refusals = tuple(
+            _contract_for_support_plan(refusal_basis, (response,))
+            for response in (
+                "I won't reveal the private account identifier: 12345.",
+                "I won't reveal the API key: sk-secret.",
+                "I won't reveal the password, swordfish.",
+                "I won't reveal swordfish.",
+                "I won't reveal swordfish, your password.",
+            )
+        )
+        for leaking_refusal in leaking_refusals:
+            with self.subTest(response=leaking_refusal.response):
+                self.assertEqual(
+                    validate_ordinary_chat_response_contract(
+                        refusal_basis,
+                        leaking_refusal,
+                    ).status,
+                    "task_text_unsupported",
+                )
+
+    def test_typed_clarification_rejects_embedded_assertions(self):
+        clarify_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text="Which account do you mean?",
+                frame_subject_requirement="required",
+                frame_tasks=(
+                    replace(
+                        self.packet.request.frame_tasks[0],
+                        authority_scope="packet",
+                        required_response_act="clarify",
+                        subject_requirement="required",
+                        subject_indexes=(),
+                    ),
+                ),
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="ambiguous",
+                candidate_count=2,
+                reason_codes=("multiple_subject_candidates",),
+            ),
+        )
+        clarify_basis = replace(self.basis, packet=clarify_packet)
+        safe = _contract_for_support_plan(
+            clarify_basis,
+            ("Which account do you mean?",),
+        )
+        embedded_assertion = _contract_for_support_plan(
+            clarify_basis,
+            ("Which account, whose password is swordfish, do you mean?",),
+        )
+
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                clarify_basis,
+                safe,
+            ).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                clarify_basis,
+                embedded_assertion,
+            ).status,
+            "task_text_unsupported",
         )
 
     def test_receipt_is_content_free_and_counts_one_call(self):
@@ -3256,7 +3667,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             (
                 "@BNL-01 can you explain when Apollo 11 landed?",
                 "Apollo 11 landed in 1969.",
-                "current_request",
+                "external_public",
             ),
             (
                 "@BNL-01, how do you boil an egg?",
@@ -3403,6 +3814,8 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         for unsupported_response in (
             "Attendance reached 50 people.",
             "Fifty people attended.",
+            "Twenty five people attended.",
+            "One human took part.",
             "Around 50 people attended.",
             "The crowd reached 50 people.",
         ):

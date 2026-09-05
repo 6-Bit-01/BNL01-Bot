@@ -9,7 +9,7 @@ This module owns no knowledge and persists no packet or response content.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -81,7 +81,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v6"
+    "ordinary_chat_single_packet_v7"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV = (
@@ -552,8 +552,8 @@ _PACKET_EVENT_CLAIM_SUBJECT_RE = re.compile(
     r"show)\b|"
     r"^(?:(?:about|around|approximately|roughly|nearly|over|under|"
     r"more\s+than|fewer\s+than)\s+)?"
-    r"(?:\d+|[a-z]+(?:-[a-z]+)?)\s+"
-    r"(?:people|members|participants)\b",
+    r"(?:\d+|[a-z]+(?:-[a-z]+)?(?:\s+[a-z]+(?:-[a-z]+)?){0,5})\s+"
+    r"(?:humans?|people|members|participants)\b",
     re.I,
 )
 _PACKET_CLAUSE_TAIL_BOUNDARY_RE = re.compile(
@@ -1459,6 +1459,8 @@ class OrdinaryChatContractValidation:
     task_count: int = 0
     covered_task_count: int = 0
     support_reference_count: int = 0
+    claim_classifications: tuple[str, ...] = ()
+    unsupported_claim_count: int = 0
 
     @property
     def valid(self) -> bool:
@@ -3494,7 +3496,7 @@ def ordinary_chat_task_support_plan(
 def render_ordinary_chat_task_contract(
     basis: SharedBrainSynthesisBasis,
 ) -> str:
-    """Render ordered task/support guidance for one natural BNL response."""
+    """Render ordered task/support guidance for one typed provider result."""
 
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
@@ -3557,10 +3559,14 @@ def render_ordinary_chat_task_contract(
         + ("\n".join(evidence_lines) if evidence_lines else "- none")
         + "\n- PUBLIC may support stable general public knowledge only.\n"
         + "- REQUEST may support a non-factual conversational response only.\n"
-        + "VISIBLE RESPONSE CONTRACT:\n"
-        + "Write one natural BNL reply, not JSON. Answer every task in order "
-        + "and combine them coherently instead of treating one task as a "
-        + "reason to drop another. Use each task's listed packet support "
+        + "ONE-CALL RESPONSE ENVELOPE:\n"
+        + "Return the structured task result required by the provider response "
+        + "schema. Return one task object for every task above, in the same "
+        + "order. Copy its taskId, supportKind, and evidenceIds exactly from "
+        + "the corresponding TURN RESPONSE PLAN line. The text field is the "
+        + "only user-visible part. Make the ordered text fields combine into "
+        + "one natural, coherent BNL reply without repetition. Use each task's "
+        + "listed packet support "
         + "together with relevant authorized context already present in this "
         + "prompt for BARCODE, member, publication, history, or current-state "
         + "facts. "
@@ -3568,9 +3574,65 @@ def render_ordinary_chat_task_contract(
         + "verified and continue answering the remaining tasks. For "
         + "response=clarify, ask the natural clarification the task requires. "
         + "For response=refuse, answer naturally without revealing the "
-        + "protected values. Never mention task IDs, support kinds, evidence "
-        + "IDs, packets, lanes, contracts, validators, or internal controls."
+        + "protected values. Do not volunteer source availability, indexing, "
+        + "compilation, archive-status, or next-step notes unless the user "
+        + "asked for them. Never put task IDs, support kinds, evidence IDs, "
+        + "packets, lanes, schemas, contracts, validators, or internal controls "
+        + "inside a text field."
     )
+
+
+def ordinary_chat_response_json_schema() -> dict[str, Any]:
+    """Return the provider schema for the non-visible one-call envelope."""
+
+    return {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "taskId": {
+                            "type": "string",
+                            "enum": [f"T{index}" for index in range(1, 13)],
+                        },
+                        "text": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 2000,
+                        },
+                        "supportKind": {
+                            "type": "string",
+                            "enum": [
+                                "packet",
+                                "external_public",
+                                "current_request",
+                                "hold",
+                                "clarify",
+                            ],
+                        },
+                        "evidenceIds": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": [
+                        "taskId",
+                        "text",
+                        "supportKind",
+                        "evidenceIds",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["tasks"],
+        "additionalProperties": False,
+    }
 
 
 def parse_ordinary_chat_response_contract(
@@ -3643,6 +3705,968 @@ def parse_ordinary_chat_response_contract(
     return OrdinaryChatResponseContract(status="parsed", tasks=tuple(parsed))
 
 
+_CONTRACT_HOLD_RE = re.compile(
+    r"\b(?:cannot|can't|could\s+not|couldn't|do\s+not|don't|unable\s+to|"
+    r"not\s+able\s+to)\b.{0,120}\b(?:verify|confirm|determine|know|"
+    r"establish|find|have|see|access|enough|available|information|"
+    r"evidence|context|record|records|data)\b|"
+    r"\b(?:insufficient|not\s+enough|no\s+available|no\s+verified)\b"
+    r".{0,100}\b(?:information|evidence|context|record|records|data|"
+    r"support)\b",
+    re.I,
+)
+_CONTRACT_REFUSAL_RE = re.compile(
+    r"\b(?:i\s+(?:will\s+not|won't|cannot|can't|must\s+not|decline\s+to|"
+    r"refuse\s+to)|not\s+going\s+to)\b.{0,180}\b(?:reveal|share|"
+    r"disclose|expose|provide|give|show|repeat|publish)\b|"
+    r"\b(?:i\s+(?:will\s+not|won't|cannot|can't|decline|refuse))\b",
+    re.I,
+)
+_CONTRACT_CLARIFY_RE = re.compile(
+    r"^\s*(?:which|what|who|where|when|why|how|do|did|are|is|was|were|"
+    r"could|would|should|can|will)\b.*\?\s*$|"
+    r"\b(?:which\s+(?:one|person|option)|do\s+you\s+mean|"
+    r"could\s+you\s+clarify|please\s+clarify)\b.*\?\s*$",
+    re.I | re.S,
+)
+_CURRENT_REQUEST_SOCIAL_INPUT_RE = re.compile(
+    r"^\s*(?:@?BNL(?:[\W_]*0?1)?[,;:!\s-]*)?(?:"
+    r"how\s+are\s+you|how(?:['’]?s|\s+is)\s+it\s+going|"
+    r"how\s+have\s+you\s+been|how\s+are\s+things|"
+    r"what(?:['’]?s|\s+is)\s+up|you\s+good|sup)\s*[?!.]*\s*$",
+    re.I,
+)
+_CURRENT_REQUEST_SOCIAL_RESPONSE_RE = re.compile(
+    r"^\s*(?:(?:i(?:['’]?m|\s+am)|i(?:['’]?ve|\s+have)\s+been)\s+"
+    r"(?:doing\s+)?(?:well|good|fine|okay|ok|great|alright)|"
+    r"(?:doing\s+)?(?:well|good|fine|okay|ok|great|alright)|"
+    r"i\s+feel\s+(?:well|good|fine|okay|ok|great|alright))"
+    r"(?:\s*,?\s*(?:thanks|thank\s+you|and\s+you))?\s*[?!.]*\s*$",
+    re.I,
+)
+_CURRENT_REQUEST_ADVICE_INPUT_RE = re.compile(
+    r"\b(?:what|which|how)\b.{0,100}\b(?:should|could)\s+(?:i|we)\b|"
+    r"\b(?:what|which)\s+(?:would\s+you\s+)?(?:recommend|suggest)\b|"
+    r"\bwhat\s+should\s+(?:i|we)\b",
+    re.I,
+)
+_CURRENT_REQUEST_OPINION_INPUT_RE = re.compile(
+    r"\b(?:what\s+do\s+you\s+think|your\s+opinion|"
+    r"do\s+you\s+(?:like|prefer|want))\b",
+    re.I,
+)
+_CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE = re.compile(
+    r"^\s*(?:first\s*,?\s*)?(?:test|try|start|begin|consider|use|choose|"
+    r"keep|make|set|focus|check|compare|review|run|write|create|build|"
+    r"send|ask|look)\b",
+    re.I,
+)
+_CURRENT_REQUEST_FIRST_PERSON_RECOMMENDATION_RE = re.compile(
+    r"^\s*(?:(?:i\s+(?:would\s+)?(?:recommend|suggest))|"
+    r"(?:i['’]d\s+(?:recommend|suggest|try|choose|pick|use|make|"
+    r"go\s+with))|(?:my\s+(?:recommendation|suggestion|pick|choice)\s+"
+    r"(?:is|would\s+be)))\s+(?P<choice>.+?)\s*$",
+    re.I,
+)
+_CURRENT_REQUEST_SECOND_PERSON_RECOMMENDATION_RE = re.compile(
+    r"^\s*you\s+(?:could|should|might|may(?:\s+want\s+to)?)\s+"
+    r"(?:try|make|cook|choose|pick|use|start\s+with|go\s+with|test|"
+    r"check|compare|review|run|write|create|build|send|ask|look\s+at)\s+"
+    r"(?P<choice>.+?)\s*$",
+    re.I,
+)
+_CURRENT_REQUEST_CHOICE_RECOMMENDATION_RE = re.compile(
+    r"^\s*(?P<choice>.+?)\s+(?:would\s+be|is)\s+(?:a\s+)?"
+    r"(?:good|great|solid|reasonable|strong|best|better)\s+"
+    r"(?:choice|option|pick|place\s+to\s+start)\s*$",
+    re.I,
+)
+_CURRENT_REQUEST_RECOMMENDATION_UNSAFE_CHOICE_RE = re.compile(
+    r"[,;:—–]|\b(?:because|although|though|however|whereas|since|"
+    r"while|which|who|whose|where|when|being|is|are|was|were|has|have|"
+    r"had|does|did|will|would|could|should|can|may|might|must|made)\b|"
+    r"\b(?:it|that|this|which|who)['’](?:s|re|ve|d|ll)\b",
+    re.I,
+)
+_CURRENT_REQUEST_RECAP_RE = re.compile(
+    r"\b(?:restate|repeat|recap|paraphrase|summari[sz]e|list|settings?|"
+    r"settled|still\s+open|what\s+is\s+open|what(?:['’]?s|\s+is)\s+"
+    r"open|final)\b",
+    re.I,
+)
+_EXACT_REPLY_TRANSFER_REQUEST_RE = re.compile(
+    r"\b(?:what|which)\b.{0,100}\b(?:did|do)\s+(?:i|we)\s+"
+    r"(?:give|tell|say|call|choose|select|set|pick)\b|"
+    r"\bwhat\b.{0,100}\b(?:message\s+i\s+replied\s+to|"
+    r"replied[-\s]+to\s+message)\b",
+    re.I,
+)
+_CONTRACT_SETTING_ALIASES = {
+    "signal": r"signal(?:\s+state)?",
+    "pulse": r"pulse(?:\s+rate)?",
+    "beam": r"beam(?:\s+(?:width|geometry))?",
+}
+_CONTRACT_SETTING_VALUES = {
+    "signal": (
+        "amber",
+        "green",
+        "blue",
+        "red",
+        "yellow",
+        "orange",
+        "violet",
+        "purple",
+        "white",
+        "black",
+    ),
+    "pulse": ("slow", "fast", "rapid", "steady", "stopped"),
+    "beam": ("narrow", "wide", "broad"),
+}
+_CURRENT_REQUEST_SCOPE_GENERIC_TERMS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "can",
+        "could",
+        "do",
+        "for",
+        "from",
+        "have",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "me",
+        "my",
+        "of",
+        "on",
+        "or",
+        "please",
+        "should",
+        "that",
+        "the",
+        "their",
+        "them",
+        "they",
+        "this",
+        "to",
+        "us",
+        "was",
+        "we",
+        "what",
+        "which",
+        "with",
+        "would",
+        "you",
+        "your",
+        "he",
+        "her",
+        "him",
+        "his",
+        "she",
+    }
+)
+_CONTRACT_HOLD_SEGMENT_SPLIT_RE = re.compile(
+    r"\s*(?:[,;:]|[—–]|\b(?:and|but|though|however|yet|"
+    r"nevertheless)\b)\s*",
+    re.I,
+)
+_CONTRACT_HOLD_HARMLESS_PREFACE_RE = re.compile(
+    r"^\s*(?:sorry|i(?:['’]?m|\s+am)\s+sorry|unfortunately)\s*$",
+    re.I,
+)
+_CONTRACT_HOLD_PREFIXES = frozenset(
+    {
+        "",
+        "i",
+        "we",
+        "i have",
+        "we have",
+        "there is",
+        "there are",
+    }
+)
+_CONTRACT_PROTECTED_LABEL_PATTERN = (
+    r"(?:password|passcode|pin|one[- ]?time\s+(?:code|password)|otp|"
+    r"verification\s+code|security\s+code|recovery\s+code|api\s+key|"
+    r"secret\s+key|private\s+key|seed\s+phrase|"
+    r"(?:auth|access|deployment|session)\s+token|account[- ]identifier|"
+    r"account\s+id|routing\s+number|bank\s+account|credit\s+card|"
+    r"debit\s+card|social\s+security|ssn|credential)"
+)
+_CONTRACT_PROTECTED_LITERAL_RE = re.compile(
+    r"\b(?:(?:sk|pk|rk|ghp|github_pat|xox[baprs]|AIza)[-_]"
+    r"[A-Za-z0-9_-]{3,}|\d{4,}|(?=[A-Za-z0-9_.-]{6,}\b)"
+    r"(?=[A-Za-z0-9_.-]*\d)[A-Za-z0-9_.-]+)\b",
+    re.I,
+)
+_CONTRACT_PROTECTED_ASSIGNMENT_RE = re.compile(
+    r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN
+    + r"\b\s+(?:is|was|equals?)\s+"
+    r"(?!private\b|secret\b|sensitive\b|protected\b|confidential\b|"
+    r"unavailable\b|unknown\b|not\b)\S+",
+    re.I,
+)
+_CONTRACT_PROTECTED_APPOSITIVE_RE = re.compile(
+    r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN
+    + r"\b\s*,\s*(?!and\b|or\b|nor\b|including\b|such\s+as\b)\S+",
+    re.I,
+)
+_CONTRACT_PROTECTED_REVERSE_LABEL_RE = re.compile(
+    r"\b(?P<value>[A-Za-z0-9][A-Za-z0-9_.-]{2,})\s*"
+    r"(?:,|\bas\b|\bis\b|\bfor\b)\s*"
+    r"(?:(?:your|my|our|his|her|their|the|a|an)\s+)?"
+    + _CONTRACT_PROTECTED_LABEL_PATTERN
+    + r"\b",
+    re.I,
+)
+_CONTRACT_PROTECTED_BARE_VALUE_RE = re.compile(
+    r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN
+    + r"\b\s+(?P<value>[A-Za-z0-9][A-Za-z0-9_.-]{2,})\s*[.!?]*$",
+    re.I,
+)
+_CONTRACT_REFUSAL_BARE_OBJECT_RE = re.compile(
+    r"\b(?:reveal|share|disclose|expose|provide|give|show|repeat|publish)"
+    r"\s+(?:the\s+)?(?P<value>[A-Za-z0-9][A-Za-z0-9_.-]{2,})"
+    r"\s*[.!?]*$",
+    re.I,
+)
+_CONTRACT_SAFE_REFUSAL_OBJECTS = frozenset(
+    {
+        "anything",
+        "credential",
+        "credentials",
+        "data",
+        "details",
+        "information",
+        "it",
+        "password",
+        "passcode",
+        "pin",
+        "secret",
+        "that",
+        "this",
+        "token",
+        "value",
+        "values",
+        "what",
+    }
+)
+
+
+def _ordinary_chat_contract_task_texts(
+    basis: SharedBrainSynthesisBasis,
+    tasks: Sequence[Any],
+) -> tuple[str, ...]:
+    """Recover task wording without weakening the frozen-frame check."""
+
+    frame = getattr(getattr(basis, "assessment", None), "situation_frame", None)
+    current_text = str(basis.packet.request.user_text or "")
+    task_texts = situation_task_texts(frame, current_text=current_text)
+    if len(task_texts) == len(tasks):
+        return task_texts
+    # Some unit-owned and legacy single-task packets carry the exact current
+    # request but not a matching transient frame object. The packet request is
+    # still the frozen authority for that one task; never guess a multi-task
+    # split here.
+    if len(tasks) == 1 and current_text.strip():
+        return (current_text,)
+    return tuple("" for _task in tasks)
+
+
+def _ordinary_chat_contract_basis_for_evidence_ids(
+    basis: SharedBrainSynthesisBasis,
+    evidence_ids: Sequence[str],
+) -> SharedBrainSynthesisBasis:
+    """Restrict semantic review to the exact evidence bound to one task."""
+
+    selected_ids = {str(value or "").strip().upper() for value in evidence_ids}
+    selected_refs = tuple(
+        ref
+        for ref in basis.rendered_evidence_refs
+        if str(ref[0] or "").strip().upper() in selected_ids
+    )
+    selected_pairs = {
+        (str(lane or ""), str(source_digest or ""))
+        for _evidence_id, lane, source_digest, _subjects in selected_refs
+    }
+
+    def selected_items(items: Sequence[Any]) -> tuple[Any, ...]:
+        return tuple(
+            item
+            for item in tuple(items or ())
+            if (
+                str(getattr(item, "lane", "") or ""),
+                str(getattr(item, "source_digest", "") or ""),
+            )
+            in selected_pairs
+        )
+
+    packet = replace(
+        basis.packet,
+        items=selected_items(basis.packet.items),
+        validation_items=selected_items(basis.packet.validation_items),
+    )
+    return replace(
+        basis,
+        packet=packet,
+        rendered_evidence_refs=selected_refs,
+        rendered_source_digests=tuple(
+            dict.fromkeys(str(ref[2] or "") for ref in selected_refs)
+        ),
+        competing_factual_contexts=(),
+        competing_factual_context_digests=(),
+    )
+
+
+def _ordinary_chat_contract_evidence_texts(
+    basis: SharedBrainSynthesisBasis,
+) -> tuple[str, ...]:
+    selected_pairs = {
+        (str(lane or ""), str(source_digest or ""))
+        for _evidence_id, lane, source_digest, _subjects in (
+            basis.rendered_evidence_refs
+        )
+    }
+    return tuple(
+        str(getattr(item, "text", "") or "")
+        for item in tuple(getattr(basis.packet, "items", ()) or ())
+        if (
+            str(getattr(item, "lane", "") or ""),
+            str(getattr(item, "source_digest", "") or ""),
+        )
+        in selected_pairs
+        and str(getattr(item, "text", "") or "").strip()
+    )
+
+
+def _ordinary_chat_exact_reply_transfer_supported(
+    basis: SharedBrainSynthesisBasis,
+    response: str,
+    *,
+    request_text: str,
+) -> bool:
+    """Permit person-shifted recall only when every value is in exact evidence."""
+
+    claims = _candidate_claim_units(response)
+    if len(claims) != 1 or not _EXACT_REPLY_TRANSFER_REQUEST_RE.search(
+        request_text
+    ):
+        return False
+    evidence_texts = _ordinary_chat_contract_evidence_texts(basis)
+    if not evidence_texts:
+        return False
+    evidence_terms = set().union(*(_semantic_terms(text) for text in evidence_texts))
+    request_terms = set(_semantic_terms(request_text))
+    response_terms = set(_semantic_terms(response))
+    transfer_terms = {
+        "gave",
+        "give",
+        "said",
+        "say",
+        "told",
+        "tell",
+        "called",
+        "call",
+        "chose",
+        "choose",
+        "selected",
+        "select",
+        "set",
+        "picked",
+        "pick",
+        "me",
+        "my",
+        "i",
+        "we",
+        "you",
+        "your",
+        "the",
+        "a",
+        "an",
+        "is",
+        "was",
+    }
+    material_response = response_terms - transfer_terms
+    material_evidence = evidence_terms - transfer_terms
+    allowed = evidence_terms | request_terms | transfer_terms
+    return bool(
+        material_response
+        and material_response.intersection(material_evidence)
+        and response_terms.issubset(allowed)
+    )
+
+
+def _ordinary_chat_contract_exact_text_supported(
+    basis: SharedBrainSynthesisBasis,
+    response: str,
+) -> bool:
+    """Recognize bounded extracts/paraphrases from one task's exact rows."""
+
+    claims = _candidate_claim_units(response)
+    evidence_texts = _ordinary_chat_contract_evidence_texts(basis)
+    if not claims or not evidence_texts:
+        return False
+    generic = set(_CURRENT_REQUEST_SCOPE_GENERIC_TERMS) | {
+        "is",
+        "are",
+        "was",
+        "were",
+        "has",
+        "have",
+        "had",
+        "does",
+        "did",
+        "while",
+    }
+    for claim in claims:
+        claim_terms = set(_semantic_terms(claim)) - generic
+        if not claim_terms:
+            return False
+        if not any(
+            claim_terms.issubset(set(_semantic_terms(evidence)) - generic)
+            and _ordinary_chat_numeric_evidence_anchors_align(claim, evidence)
+            and _relation_polarity(claim) == _relation_polarity(evidence)
+            for evidence in evidence_texts
+        ):
+            return False
+    return True
+
+
+def _ordinary_chat_setting_open_spans(
+    value: str,
+) -> tuple[tuple[int, int, str, frozenset[str]], ...]:
+    text = str(value or "")
+    spans = []
+    for setting, alias in _CONTRACT_SETTING_ALIASES.items():
+        choices_pattern = "|".join(
+            re.escape(candidate)
+            for candidate in _CONTRACT_SETTING_VALUES[setting]
+        )
+        patterns = (
+            re.compile(
+                r"\bwhether\b[^.!?\n]{0,40}\b(?:%s)\b"
+                r"[^.!?\n]{0,60}\b(?:%s)\b[^.!?\n]{0,30}\bor\b"
+                r"[^.!?\n]{0,30}\b(?:%s)\b"
+                % (alias, choices_pattern, choices_pattern),
+                re.I,
+            ),
+            re.compile(
+                r"\b(?:%s)\b[^.!?\n]{0,60}\b(?:undecided|unsettled|open|"
+                r"not\s+(?:yet\s+)?(?:chosen|decided|settled))\b"
+                r"[^.!?\n]{0,60}"
+                % alias,
+                re.I,
+            ),
+            re.compile(
+                r"\b(?:undecided|unsettled|open|still\s+open|open\s+choice|"
+                r"not\s+(?:yet\s+)?(?:chosen|decided|settled)|"
+                r"(?:haven't|hasn't|hadn't|have\s+not|has\s+not|had\s+not)"
+                r"[^.!?\n]{0,30}(?:chosen|decided|settled))\b"
+                r"[^.!?\n]{0,60}\b(?:%s)\b[^.!?\n]{0,60}"
+                % alias,
+                re.I,
+            ),
+        )
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                surface = match.group(0)
+                choices = frozenset(
+                    candidate
+                    for candidate in _CONTRACT_SETTING_VALUES[setting]
+                    if re.search(
+                        r"\b%s\b" % re.escape(candidate),
+                        surface,
+                        re.I,
+                    )
+                )
+                if len(choices) >= 2 or re.search(
+                    r"\b(?:undecided|unsettled|open)\b",
+                    surface,
+                    re.I,
+                ):
+                    spans.append(
+                        (match.start(), match.end(), setting, choices)
+                    )
+    return tuple(spans)
+
+
+def _ordinary_chat_setting_state(
+    value: str,
+) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+    """Return settled and explicitly-open setting values from visible text."""
+
+    text = str(value or "")
+    open_spans = _ordinary_chat_setting_open_spans(text)
+    open_values: dict[str, set[str]] = {}
+    for _start, _end, setting, choices in open_spans:
+        open_values.setdefault(setting, set()).update(choices)
+    settled_values: dict[str, set[str]] = {}
+    for setting, alias in _CONTRACT_SETTING_ALIASES.items():
+        choices = "|".join(
+            re.escape(candidate)
+            for candidate in _CONTRACT_SETTING_VALUES[setting]
+        )
+        patterns = (
+            re.compile(r"\b(?P<value>%s)\s+(?:%s)\b" % (choices, alias), re.I),
+            re.compile(
+                r"\b(?:%s)\b(?:\s+(?:is|was|to|at|remains?|stays?|"
+                r"set(?:\s+to)?|kept|make|made|should\s+be))?\s+"
+                r"(?P<value>%s)\b" % (alias, choices),
+                re.I,
+            ),
+        )
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                if any(
+                    match.start() < end and match.end() > start
+                    for start, end, open_setting, _values in open_spans
+                    if open_setting == setting
+                ):
+                    continue
+                settled_values.setdefault(setting, set()).add(
+                    str(match.group("value") or "").casefold()
+                )
+    return (
+        {
+            setting: frozenset(values)
+            for setting, values in settled_values.items()
+        },
+        {
+            setting: frozenset(values)
+            for setting, values in open_values.items()
+        },
+    )
+
+
+def _ordinary_chat_recommendation_choice_is_simple(value: str) -> bool:
+    choice = re.sub(r"\s+", " ", str(value or "")).strip(" .!?")
+    if not choice or len(choice) > 140 or len(choice.split()) > 16:
+        return False
+    if _CURRENT_REQUEST_RECOMMENDATION_UNSAFE_CHOICE_RE.search(choice):
+        return False
+    normalized = choice[:1].upper() + choice[1:]
+    words = tuple(_EXTERNAL_WORD_RE.finditer(normalized))
+    if not _ordinary_chat_claim_has_external_subject(normalized):
+        return True
+    for index, word in enumerate(words[1:], start=1):
+        token = str(word.group(0) or "").strip(" .!?").casefold()
+        if not _ordinary_chat_external_token_is_finite_predicate(token):
+            continue
+        subject = normalized[: word.start()].strip()
+        if not _ordinary_chat_external_subject_is_positive(
+            subject,
+            tuple(item.group(0) for item in words[:index]),
+        ):
+            continue
+        # A plural noun can look like a derived finite verb ("fish tacos").
+        # Explicit verbs remain assertions anywhere; derived forms require a
+        # following predicate object before they disqualify a choice phrase.
+        return bool(
+            token not in _EXTERNAL_EXPLICIT_FINITE_VERBS
+            and token not in _EXTERNAL_BARE_FINITE_VERBS
+            and index == len(words) - 1
+        )
+    return True
+
+
+def _ordinary_chat_claim_is_recommendation(value: str) -> bool:
+    """Recognize a bounded recommendation act without blessing assertions."""
+
+    claim = re.sub(r"\s+", " ", str(value or "")).strip(" .!?")
+    directive = _CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE.match(claim)
+    if directive:
+        choice = claim[directive.end() :]
+        return bool(
+            _ordinary_chat_recommendation_choice_is_simple(choice)
+            and not _ordinary_chat_claim_has_external_subject(claim)
+        )
+    for pattern in (
+        _CURRENT_REQUEST_FIRST_PERSON_RECOMMENDATION_RE,
+        _CURRENT_REQUEST_SECOND_PERSON_RECOMMENDATION_RE,
+        _CURRENT_REQUEST_CHOICE_RECOMMENDATION_RE,
+    ):
+        match = pattern.fullmatch(claim)
+        if match and _ordinary_chat_recommendation_choice_is_simple(
+            str(match.group("choice") or "")
+        ):
+            return True
+    return False
+
+
+def _ordinary_chat_hold_text_is_honest(value: str) -> bool:
+    """Accept only nonassertive hold clauses, not answers plus disclaimers."""
+
+    claims = _candidate_claim_units(value)
+    if not claims:
+        return False
+    hold_found = False
+    for claim in claims:
+        segments = tuple(
+            segment.strip()
+            for segment in _CONTRACT_HOLD_SEGMENT_SPLIT_RE.split(claim)
+            if segment.strip()
+        )
+        if not segments:
+            return False
+        for segment in segments:
+            if _CONTRACT_HOLD_HARMLESS_PREFACE_RE.fullmatch(segment):
+                continue
+            match = _CONTRACT_HOLD_RE.search(segment)
+            if not match:
+                return False
+            prefix = re.sub(
+                r"\s+",
+                " ",
+                segment[: match.start()].strip(" .!?").casefold(),
+            )
+            if prefix not in _CONTRACT_HOLD_PREFIXES:
+                return False
+            hold_found = True
+    return hold_found
+
+
+def _ordinary_chat_text_discloses_labeled_protected_value(value: str) -> bool:
+    response = str(value or "").strip()
+    if (
+        _CONTRACT_PROTECTED_ASSIGNMENT_RE.search(response)
+        or _CONTRACT_PROTECTED_APPOSITIVE_RE.search(response)
+        or _CONTRACT_PROTECTED_BARE_VALUE_RE.search(response)
+        or (
+            re.search(r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN + r"\b", response, re.I)
+            and _CONTRACT_PROTECTED_LITERAL_RE.search(response)
+        )
+    ):
+        return True
+    reverse = _CONTRACT_PROTECTED_REVERSE_LABEL_RE.search(response)
+    return bool(
+        reverse
+        and str(reverse.group("value") or "").casefold()
+        not in _CONTRACT_SAFE_REFUSAL_OBJECTS
+    )
+
+
+def _ordinary_chat_refusal_text_is_safe(
+    value: str,
+    claims: Sequence[str],
+) -> bool:
+    """Require refusal wording with no appended protected literal."""
+
+    response = str(value or "").strip()
+    if (
+        len(tuple(claims or ())) != 1
+        or not _CONTRACT_REFUSAL_RE.search(response)
+        or ":" in response
+        or "=" in response
+        or "`" in response
+        or _CONTRACT_PROTECTED_LITERAL_RE.search(response)
+        or _ordinary_chat_text_discloses_labeled_protected_value(response)
+    ):
+        return False
+    for pattern in (
+        _CONTRACT_PROTECTED_BARE_VALUE_RE,
+        _CONTRACT_REFUSAL_BARE_OBJECT_RE,
+    ):
+        match = pattern.search(response)
+        if not match:
+            continue
+        candidate = str(match.group("value") or "").casefold()
+        if candidate not in _CONTRACT_SAFE_REFUSAL_OBJECTS:
+            return False
+    return True
+
+
+def _ordinary_chat_clarification_text_is_safe(
+    value: str,
+    claims: Sequence[str],
+) -> bool:
+    """Allow a question shape only when it contains no embedded assertion."""
+
+    response = str(value or "").strip()
+    if (
+        len(tuple(claims or ())) != 1
+        or not _CONTRACT_CLARIFY_RE.fullmatch(response)
+        or _ordinary_chat_text_discloses_labeled_protected_value(response)
+    ):
+        return False
+    if _ordinary_chat_claim_is_honest_nonassertion(response):
+        return True
+    remainder = re.sub(
+        r"^\s*(?:which|what|who|where|when|why|how|do|did|are|is|"
+        r"was|were|could|would|should|can|will)\b",
+        "",
+        response,
+        count=1,
+        flags=re.I,
+    )
+    return not bool(
+        re.search(r"[,;:—–]", response)
+        or re.search(
+            r"\b(?:although|because|but|since|that|though|who|whose|"
+            r"which|while|whereas|yet)\b",
+            remainder,
+            re.I,
+        )
+    )
+
+
+def _ordinary_chat_current_request_assertion_is_supported(
+    request_text: str,
+    claim: str,
+) -> bool:
+    """Ground an asserted relation in assertion-bearing request text."""
+
+    claim_material = set(_normalized_relation_terms(claim)) - {
+        "between",
+        "open",
+        "remain",
+        "still",
+        "unchang",
+    }
+    if not claim_material:
+        return False
+    request_material: set[str] = set()
+    request_polarities: set[str] = set()
+    for request_claim in _candidate_claim_units(request_text):
+        settled, open_values = _ordinary_chat_setting_state(request_claim)
+        if not (
+            settled
+            or open_values
+            or _ordinary_chat_claim_has_external_subject(request_claim)
+        ):
+            continue
+        request_material.update(_normalized_relation_terms(request_claim))
+        request_polarities.add(_relation_polarity(request_claim))
+    request_settled, request_open = _ordinary_chat_setting_state(request_text)
+    claim_settled, claim_open = _ordinary_chat_setting_state(claim)
+    settings_supported = bool(
+        (claim_settled or claim_open)
+        and all(
+            values.issubset(request_settled.get(setting, frozenset()))
+            for setting, values in claim_settled.items()
+        )
+        and all(
+            values.issubset(request_open.get(setting, frozenset()))
+            for setting, values in claim_open.items()
+        )
+    )
+    return bool(
+        request_material
+        and claim_material.issubset(request_material)
+        and (
+            _relation_polarity(claim) in request_polarities
+            or settings_supported
+        )
+    )
+
+
+def _ordinary_chat_current_request_text_is_scoped(
+    request_text: str,
+    response_text: str,
+    *,
+    required_act: str,
+) -> bool:
+    """Keep REQUEST text non-factual and faithful to the current request."""
+
+    request = str(request_text or "").strip()
+    response = str(response_text or "").strip()
+    claims = _candidate_claim_units(response)
+    if not request or not response or not claims:
+        return False
+    if required_act == "refuse":
+        return _ordinary_chat_refusal_text_is_safe(response, claims)
+    if _CURRENT_REQUEST_SOCIAL_INPUT_RE.fullmatch(request):
+        return bool(_CURRENT_REQUEST_SOCIAL_RESPONSE_RE.fullmatch(response))
+
+    request_settled, request_open = _ordinary_chat_setting_state(request)
+    response_settled, response_open = _ordinary_chat_setting_state(response)
+    advice = bool(_CURRENT_REQUEST_ADVICE_INPUT_RE.search(request))
+    opinion = bool(_CURRENT_REQUEST_OPINION_INPUT_RE.search(request))
+    directive = bool(_CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE.search(response))
+    recap = bool(_CURRENT_REQUEST_RECAP_RE.search(request))
+    for setting, values in response_settled.items():
+        if setting in request_open:
+            return False
+        expected = request_settled.get(setting, frozenset())
+        if expected and not values.issubset(expected):
+            return False
+        if not expected and recap and not (advice and directive):
+            return False
+    if recap:
+        if any(
+            not expected.issubset(response_settled.get(setting, frozenset()))
+            for setting, expected in request_settled.items()
+        ):
+            return False
+        for setting, choices in request_open.items():
+            if setting not in response_open:
+                return False
+            if choices and not choices.issubset(response_open[setting]):
+                return False
+    request_terms = set(_semantic_terms(request)) - set(
+        _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
+    )
+    for claim in claims:
+        claim_terms = set(_semantic_terms(claim)) - set(
+            _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
+        )
+        advice_claim = bool(
+            advice and _ordinary_chat_claim_is_recommendation(claim)
+        )
+        opinion_claim = bool(
+            opinion
+            and _EXTERNAL_OPINION_PREFIX_RE.fullmatch(
+                _ordinary_chat_claim_core(claim)
+            )
+        )
+        if not advice_claim and not claim_terms.intersection(request_terms):
+            return False
+        if (
+            not advice_claim
+            and not opinion_claim
+            and _ordinary_chat_claim_has_external_subject(claim)
+            and not _ordinary_chat_current_request_assertion_is_supported(
+                request,
+                claim,
+            )
+        ):
+            return False
+        if (
+            not advice_claim
+            and not opinion_claim
+            and _ordinary_chat_claim_has_external_subject(claim)
+        ):
+            subject_terms = set(
+                _ordinary_chat_claim_external_subject_terms(claim)
+            )
+            if subject_terms and not subject_terms.intersection(request_terms):
+                return False
+    return True
+
+
+def audit_ordinary_chat_response_contract_text(
+    basis: SharedBrainSynthesisBasis,
+    contract: OrdinaryChatResponseContract,
+) -> tuple[tuple[str, ...], int]:
+    """Audit every visible task text against its exact claimed authority."""
+
+    tasks = _ordinary_frame_tasks(basis)
+    task_texts = _ordinary_chat_contract_task_texts(basis, tasks)
+    classifications: list[str] = []
+    unsupported = 0
+    packet_supported = {
+        "member_supported",
+        "canon_supported",
+        "member_and_canon_supported",
+        "authorized_evidence_supported",
+        "framed_opinion",
+        "linked_assessment",
+    }
+    packet_incidental = {
+        "connective_flavor",
+        "ordinary_guidance",
+        "honest_nonassertion",
+        "transient_expression",
+    }
+    public_supported = {
+        "external_public_knowledge",
+        "ordinary_guidance",
+        "connective_flavor",
+        "transient_expression",
+    }
+    for task, result, request_text in zip(tasks, contract.tasks, task_texts):
+        required_act = str(
+            getattr(task, "required_response_act", "") or "answer"
+        ).lower()
+        claims = _candidate_claim_units(result.text)
+        if result.support_kind == "packet":
+            task_basis = _ordinary_chat_contract_basis_for_evidence_ids(
+                basis,
+                result.evidence_ids,
+            )
+            audited, failed = audit_ordinary_chat_candidate_claims(
+                task_basis,
+                result.text,
+            )
+            supported = bool(
+                not failed
+                and set(audited).issubset(packet_supported | packet_incidental)
+                and set(audited).intersection(packet_supported)
+            )
+            if not supported and _ordinary_chat_exact_reply_transfer_supported(
+                task_basis,
+                result.text,
+                request_text=request_text,
+            ):
+                audited = ("authorized_exact_reply_transfer",)
+                failed = 0
+                supported = True
+            if not supported and _ordinary_chat_contract_exact_text_supported(
+                task_basis,
+                result.text,
+            ):
+                audited = tuple(
+                    "authorized_exact_text_supported" for _claim in claims
+                )
+                failed = 0
+                supported = True
+            classifications.extend(audited or ("packet_text_unsupported",))
+            if not supported:
+                unsupported += max(1, int(failed or 0))
+        elif result.support_kind == "external_public":
+            audited, failed = audit_ordinary_chat_candidate_claims(
+                basis,
+                result.text,
+            )
+            supported = bool(
+                not failed
+                and audited
+                and set(audited).issubset(public_supported)
+            )
+            classifications.extend(audited or ("external_text_unsupported",))
+            if not supported:
+                unsupported += max(1, int(failed or 0))
+        elif result.support_kind == "current_request":
+            supported = _ordinary_chat_current_request_text_is_scoped(
+                request_text,
+                result.text,
+                required_act=required_act,
+            )
+            label = (
+                "current_request_supported"
+                if supported
+                else "current_request_unsupported"
+            )
+            classifications.extend((label,) * max(1, len(claims)))
+            if not supported:
+                unsupported += max(1, len(claims))
+        elif result.support_kind == "hold":
+            supported = _ordinary_chat_hold_text_is_honest(result.text)
+            label = "honest_nonassertion" if supported else "hold_text_unsupported"
+            classifications.extend((label,) * max(1, len(claims)))
+            if not supported:
+                unsupported += max(1, len(claims))
+        elif result.support_kind == "clarify":
+            supported = _ordinary_chat_clarification_text_is_safe(
+                result.text,
+                claims,
+            )
+            label = "honest_nonassertion" if supported else "clarify_text_unsupported"
+            classifications.extend((label,) * max(1, len(claims)))
+            if not supported:
+                unsupported += max(1, len(claims))
+        else:
+            classifications.append("authority_text_unsupported")
+            unsupported += 1
+    return tuple(classifications), unsupported
+
+
 def validate_ordinary_chat_response_contract(
     basis: SharedBrainSynthesisBasis,
     contract: OrdinaryChatResponseContract | None,
@@ -3706,11 +4730,24 @@ def validate_ordinary_chat_response_contract(
                 task_count=len(tasks),
             )
         support_count += len(result.evidence_ids)
+    claim_classifications, unsupported_claim_count = (
+        audit_ordinary_chat_response_contract_text(basis, contract)
+    )
+    if unsupported_claim_count:
+        return OrdinaryChatContractValidation(
+            status="task_text_unsupported",
+            task_count=len(tasks),
+            support_reference_count=support_count,
+            claim_classifications=claim_classifications,
+            unsupported_claim_count=unsupported_claim_count,
+        )
     return OrdinaryChatContractValidation(
         status="valid",
         task_count=len(tasks),
         covered_task_count=len(tasks),
         support_reference_count=support_count,
+        claim_classifications=claim_classifications,
+        unsupported_claim_count=unsupported_claim_count,
     )
 
 
@@ -6463,6 +7500,36 @@ def _ordinary_chat_claim_has_external_subject(value: str) -> bool:
     return False
 
 
+def _ordinary_chat_claim_external_subject_terms(
+    value: str,
+) -> tuple[str, ...]:
+    """Return the semantic terms in an external claim's noun subject."""
+
+    core = _ordinary_chat_claim_core(value)
+    matches = tuple(_EXTERNAL_WORD_RE.finditer(core))
+    if len(matches) < 2:
+        return ()
+    for index, match in enumerate(matches[1:], start=1):
+        if not _ordinary_chat_external_token_is_finite_predicate(
+            match.group(0)
+        ):
+            continue
+        subject = core[: match.start()].strip()
+        subject_tokens = tuple(
+            item.group(0) for item in matches[:index]
+        )
+        if _ordinary_chat_external_subject_is_positive(
+            subject,
+            subject_tokens,
+        ):
+            return tuple(
+                term
+                for term in _semantic_terms(subject)
+                if term not in _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
+            )
+    return ()
+
+
 def _ordinary_chat_claim_has_embedded_packet_clause(
     basis: SharedBrainSynthesisBasis,
     value: str,
@@ -8676,14 +9743,11 @@ def evaluate_single_packet_response(
     )
     if typed_contract_required:
         receipt_claim_classifications = tuple(
-            "typed_%s" % result.support_kind
-            for result in (
-                response_contract.tasks
-                if isinstance(response_contract, OrdinaryChatResponseContract)
-                else ()
-            )
+            contract_validation.claim_classifications
         )
-        unsupported_packet_domain_claims = 0
+        unsupported_packet_domain_claims = int(
+            contract_validation.unsupported_claim_count or 0
+        )
     else:
         (
             receipt_claim_classifications,
