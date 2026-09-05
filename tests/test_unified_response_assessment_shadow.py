@@ -60,7 +60,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             ),
             (
                 "@BNL-01 can you explain when Apollo 11 landed?",
-                "current_request",
+                "external_public",
             ),
             (
                 "@BNL-01, how do you boil an egg?",

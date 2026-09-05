@@ -11407,6 +11407,20 @@ def decide_reply_eligibility(
             True,
             True,
         )
+    if (
+        active_channel
+        and text_present
+        and surface == CONVERSATION_SURFACE_MENTION_OR_REPLY
+    ):
+        return ReplyEligibility(
+            False,
+            "mention_or_reply_tag_or_reply_required",
+            "passive_observe",
+            "silent_observe",
+            False,
+            False,
+            False,
+        )
     if active_channel and text_present and policy in CONVERSATIONAL_POLICIES:
         batch_allowed = bool(batching)
         return ReplyEligibility(
@@ -15946,6 +15960,10 @@ def batch_exclusively_targets_other_people(items) -> bool:
     return bool(
         any(meta and meta.third_party_only for meta in addressing)
         and not any(
+            bool(getattr(item, "planned_direct_to_bnl", False))
+            for item in (items or [])
+        )
+        and not any(
             meta and (meta.directly_targets_bnl or meta.plain_text_names_bnl)
             for meta in addressing
         )
@@ -15956,9 +15974,39 @@ def batch_has_response_obligation(items) -> bool:
     """Return True when trusted routing says at least one turn calls BNL."""
 
     return any(
-        isinstance(getattr(item, "addressing", None), DiscordTurnAddressing)
-        and getattr(item, "addressing").addresses_bnl
+        bool(getattr(item, "planned_direct_to_bnl", False))
+        or (
+            isinstance(
+                getattr(item, "addressing", None),
+                DiscordTurnAddressing,
+            )
+            and getattr(item, "addressing").addresses_bnl
+        )
         for item in (items or ())
+    )
+
+
+def batch_is_outside_channel_admission(
+    items,
+    channel_policy: str,
+    conversation_surface: str = "",
+) -> bool:
+    """Apply channel admission before addressee attribution.
+
+    Human mentions and reply targets remain useful conversation metadata, but
+    they are never a response veto after a turn has entered a free-speak room.
+    Mention-or-reply surfaces still require an unmistakable BNL admission.
+    """
+
+    surface = (
+        str(conversation_surface or "").strip()
+        or conversation_surface_for_channel_policy(channel_policy)
+    )
+    if conversation_surface_allows_free_speak(surface):
+        return False
+    return bool(
+        batch_exclusively_targets_other_people(items)
+        and not batch_has_response_obligation(items)
     )
 
 
@@ -15967,8 +16015,11 @@ def should_suppress_human_to_human_tag_only_turn(
     *,
     followup_candidate: bool = False,
     active_direct_session: bool = False,
+    conversation_surface: str = "",
 ) -> bool:
     """Observe human-only tags unless they are an answer in BNL's active exchange."""
+    if conversation_surface_allows_free_speak(conversation_surface):
+        return False
     return bool(human_to_human_tag_only and not followup_candidate and not active_direct_session)
 
 
@@ -27129,7 +27180,8 @@ def build_live_conversation_orchestration_decision(
         addressed[-1].address_kind if addressed else "none"
     )
     third_party_only = bool(
-        addressings
+        not conversation_surface_allows_free_speak(conversation_surface)
+        and addressings
         and all(meta.third_party_only for meta in addressings)
     )
     referent_status = (
@@ -35097,7 +35149,14 @@ def _get_recent_same_user_message_for_previous_request(
     return None
 
 
-def _classify_batch_engagement(items, bot_user=None, pending_request_intent=False):
+def _classify_batch_engagement(
+    items,
+    bot_user=None,
+    pending_request_intent=False,
+    *,
+    channel_policy: str = "unknown",
+    conversation_surface: str = "",
+):
     if not items:
         return "skip", "empty_batch"
 
@@ -35145,10 +35204,22 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
     substantive_cluster = token_count >= 18 or (token_count >= 12 and len(texts) >= 3)
     casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
     code_derived_bnl_target = any(meta and meta.directly_targets_bnl for meta in item_addressing)
+    resolved_surface = (
+        str(conversation_surface or "").strip()
+        or conversation_surface_for_channel_policy(channel_policy)
+    )
+    free_speak_surface = conversation_surface_allows_free_speak(
+        resolved_surface
+    )
 
-    # Free-speak lets BNL join the room; it does not make questions directed at
-    # another person into questions for BNL. A literal BNL name still opts in.
-    if batch_exclusively_targets_other_people(items) and not code_derived_bnl_target and not bot_named:
+    # Addressee attribution cannot veto a turn after channel admission.  On a
+    # tag-required surface it remains part of the admission check.
+    if (
+        not free_speak_surface
+        and batch_exclusively_targets_other_people(items)
+        and not code_derived_bnl_target
+        and not bot_named
+    ):
         return "observe", "third_party_addressed_turn"
 
     if multiline_payload_detected:
@@ -35174,6 +35245,10 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
         if token_count >= 4 or len(texts) >= 2 or (token_count >= 1 and meaningful_media_label):
             return "answer", "media_context_with_text"
         return "acknowledge", "light_media_reaction_cluster"
+    if free_speak_surface and distinct_users >= 2 and substantive_cluster:
+        return "answer", "free_speak_multi_user_conversation"
+    if free_speak_surface and substantive_cluster:
+        return "answer", "free_speak_substantive_room_conversation"
     if numeric_only_cluster:
         return "skip", "noise_fragment_cluster"
     if test_like or short_fragment_cluster:
@@ -35252,6 +35327,11 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         collapsed_items,
         bot_user,
         pending_request_intent=pending_request,
+        channel_policy=channel_policy,
+        conversation_surface=conversation_surface_for_channel_policy(
+            channel_policy,
+            True,
+        ),
     )
     force_answer, force_reason = _should_force_free_speak_continuation_answer(
         guild_id=guild_id,
@@ -35261,9 +35341,13 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         recent_bnl_reply_context=recent_bnl_reply_context,
         consume_retransmission=consume_retransmission,
     )
-    if force_answer and decision != "answer":
+    generic_free_speak_answer = reason in {
+        "free_speak_multi_user_conversation",
+        "free_speak_substantive_room_conversation",
+    }
+    if force_answer and (decision != "answer" or generic_free_speak_answer):
         logging.info(
-            "skip_blocked_by_substantive_continuation guild_id=%s channel_id=%s decision=%s reason=%s force_reason=%s",
+            "substantive_continuation_answer_preserved guild_id=%s channel_id=%s decision=%s reason=%s force_reason=%s",
             guild_id,
             channel_id,
             decision,
@@ -35770,6 +35854,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     channel_id = channel.id
     guild_id = channel.guild.id
     channel_policy = resolve_channel_policy(channel)
+    conversation_surface = conversation_surface_for_channel_policy(
+        channel_policy,
+        True,
+    )
     sealed_test_channel = channel_policy == "sealed_test"
     now = datetime.now(PACIFIC_TZ)
     handoff_items = _channel_interrupt_handoff.pop(channel_id, None)
@@ -35888,9 +35976,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     try:
         _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
         if (
-            batch_exclusively_targets_other_people(items)
+            batch_is_outside_channel_admission(
+                items,
+                channel_policy,
+                conversation_surface,
+            )
             and not (pending_state or pending_anchor)
-            and not batch_orchestration_influences
         ):
             _log_batch_event(
                 logging.INFO,
@@ -36062,9 +36153,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
 
         while True:
             if (
-                batch_exclusively_targets_other_people(items)
+                batch_is_outside_channel_admission(
+                    items,
+                    channel_policy,
+                    conversation_surface,
+                )
                 and not (pending_state or pending_anchor)
-                and not batch_orchestration_influences
             ):
                 _log_batch_event(
                     logging.INFO,
@@ -45141,7 +45235,11 @@ async def on_message(message: discord.Message):
     is_sealed_test_channel = channel_policy == "sealed_test"
     conversation_surface = conversation_surface_for_channel_policy(channel_policy, is_active_channel)
     free_speak_surface = conversation_surface_allows_free_speak(conversation_surface)
-    should_handle_as_active_channel = is_active_channel or free_speak_surface
+    # The configured active-channel ID is a legacy deployment selector, not a
+    # conversation-policy override.  Admission is owned by the resolved
+    # surface: public home/sealed mirror are free-speak; other conversational
+    # channels require an actual BNL mention or Discord reply.
+    should_handle_as_active_channel = free_speak_surface
     passive_memory_allowed = allow_passive_memory_for_policy(channel_policy)
     bot_user_id = int(getattr(client.user, "id", 0) or 0)
     clean_content = resolve_discord_user_mentions_for_conversation(
@@ -45300,7 +45398,7 @@ async def on_message(message: discord.Message):
         channel_policy,
         turn_addressing.addresses_bnl,
     )
-    channel_allows_conversation = bool(free_speak_surface or is_active_channel)
+    channel_allows_conversation = bool(free_speak_surface)
     followup_candidate = (
         bool(conversation_content)
         and (
@@ -45817,7 +45915,7 @@ async def on_message(message: discord.Message):
         )
         return
 
-    if clean_content and (is_active_channel or real_direct_target):
+    if clean_content and (should_handle_as_active_channel or real_direct_target):
         if not is_sealed_test_channel:
             maybe_update_broadcast_status_from_text(clean_content)
             maybe_update_restricted_status_from_text(clean_content)
@@ -45828,6 +45926,7 @@ async def on_message(message: discord.Message):
         human_to_human_tag_only,
         followup_candidate=followup_candidate,
         active_direct_session=active_same_user_session,
+        conversation_surface=conversation_surface,
     )
     if channel_policy != "broadcast_memory" and not suppress_human_to_human_turn and random.random() < REACTION_CHANCE:
         try:

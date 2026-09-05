@@ -695,6 +695,53 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(packet["response_obligation"])
         self.assertEqual(packet["address_kind"], "recent_followup")
 
+    async def test_legacy_active_public_context_does_not_override_tag_admission(self):
+        channel = self._channel(8147)
+        message = FakeMessage(channel, "Ambient room conversation.")
+
+        with (
+            self._on_message_runtime(
+                channel.id,
+                followup_candidate=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_context",
+            ),
+            mock.patch.object(bnl01_bot, "_reset_debounce") as reset,
+        ):
+            await bnl01_bot.on_message(message)
+
+        self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), [])
+        self.assertEqual(message.replies, [])
+        reset.assert_not_called()
+
+    async def test_free_speak_human_tag_enters_room_batch(self):
+        channel = self._channel(8148)
+        other_human = SimpleNamespace(id=456, display_name="Another Member")
+        message = FakeMessage(
+            channel,
+            "<@456> what do you think about the next broadcast?",
+            mentions=[other_human],
+        )
+
+        with (
+            self._on_message_runtime(
+                channel.id,
+                followup_candidate=False,
+            ),
+            mock.patch.object(bnl01_bot, "_reset_debounce") as reset,
+        ):
+            await bnl01_bot.on_message(message)
+
+        self.assertEqual(len(bnl01_bot._channel_buffers[channel.id]), 1)
+        self.assertTrue(
+            bnl01_bot._channel_buffers[channel.id][0]
+            .addressing.targets_other_human
+        )
+        reset.assert_called_once()
+
     def test_passive_batch_turn_does_not_gain_planned_directness(self):
         plan = bnl01_bot.plan_conversation_response(
             "The beam looked narrow.",
@@ -2778,7 +2825,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(channel.id, bnl01_bot._channel_tasks)
         self.assertEqual(channel.sent, [])
 
-    async def test_on_message_human_recipient_outranks_stale_followup(self):
+    async def test_tag_required_human_recipient_does_not_admit_stale_followup(self):
         channel = self._channel(8109)
         author = FakeAuthor()
         miss_bit = SimpleNamespace(id=456, display_name="Miss Bit", bot=False)
@@ -2789,16 +2836,15 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             mentions=[miss_bit],
         )
 
-        with self._on_message_runtime(channel.id, followup_candidate=True):
+        with (
+            self._on_message_runtime(channel.id, followup_candidate=True),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_context",
+            ),
+        ):
             await bnl01_bot.on_message(message)
-            scheduled = bnl01_bot._channel_tasks[channel.id]
-            scheduled.cancel()
-            try:
-                await scheduled
-            except asyncio.CancelledError:
-                pass
-            bnl01_bot._channel_tasks.pop(channel.id, None)
-            await bnl01_bot._flush_channel_buffer(channel)
 
         self.assertEqual(channel.sent, [])
         self.assertEqual(message.replies, [])

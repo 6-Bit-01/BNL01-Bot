@@ -556,7 +556,7 @@ _EXTERNAL_ROLE_QUERY_RE = re.compile(
 _CURRENT_REQUEST_TASK_RE = re.compile(
     r"\b(?:how\s+are\s+you|what\s+do\s+you\s+think|your\s+opinion|"
     r"do\s+you\s+(?:like|prefer|want)|can\s+you\s+(?:help|write|make|"
-    r"create|explain)|please\s+(?:help|write|make|create)|"
+    r"create)|please\s+(?:help|write|make|create)|"
     r"thank\s+you|thanks|hello|hey)\b",
     re.I,
 )
