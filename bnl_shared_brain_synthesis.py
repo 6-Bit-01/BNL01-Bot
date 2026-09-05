@@ -3756,6 +3756,33 @@ _CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE = re.compile(
     r"send|ask|look)\b",
     re.I,
 )
+_CURRENT_REQUEST_FIRST_PERSON_RECOMMENDATION_RE = re.compile(
+    r"^\s*(?:(?:i\s+(?:would\s+)?(?:recommend|suggest))|"
+    r"(?:i['’]d\s+(?:recommend|suggest|try|choose|pick|use|make|"
+    r"go\s+with))|(?:my\s+(?:recommendation|suggestion|pick|choice)\s+"
+    r"(?:is|would\s+be)))\s+(?P<choice>.+?)\s*$",
+    re.I,
+)
+_CURRENT_REQUEST_SECOND_PERSON_RECOMMENDATION_RE = re.compile(
+    r"^\s*you\s+(?:could|should|might|may(?:\s+want\s+to)?)\s+"
+    r"(?:try|make|cook|choose|pick|use|start\s+with|go\s+with|test|"
+    r"check|compare|review|run|write|create|build|send|ask|look\s+at)\s+"
+    r"(?P<choice>.+?)\s*$",
+    re.I,
+)
+_CURRENT_REQUEST_CHOICE_RECOMMENDATION_RE = re.compile(
+    r"^\s*(?P<choice>.+?)\s+(?:would\s+be|is)\s+(?:a\s+)?"
+    r"(?:good|great|solid|reasonable|strong|best|better)\s+"
+    r"(?:choice|option|pick|place\s+to\s+start)\s*$",
+    re.I,
+)
+_CURRENT_REQUEST_RECOMMENDATION_UNSAFE_CHOICE_RE = re.compile(
+    r"[,;:—–]|\b(?:because|although|though|however|whereas|since|"
+    r"while|which|who|whose|where|when|being|is|are|was|were|has|have|"
+    r"had|does|did|will|would|could|should|can|may|might|must|made)\b|"
+    r"\b(?:it|that|this|which|who)['’](?:s|re|ve|d|ll)\b",
+    re.I,
+)
 _CURRENT_REQUEST_RECAP_RE = re.compile(
     r"\b(?:restate|repeat|recap|paraphrase|summari[sz]e|list|settings?|"
     r"settled|still\s+open|what\s+is\s+open|what(?:['’]?s|\s+is)\s+"
@@ -3838,6 +3865,83 @@ _CURRENT_REQUEST_SCOPE_GENERIC_TERMS = frozenset(
         "him",
         "his",
         "she",
+    }
+)
+_CONTRACT_HOLD_SEGMENT_SPLIT_RE = re.compile(
+    r"\s*(?:[,;:]|[—–]|\b(?:and|but|though|however|yet|"
+    r"nevertheless)\b)\s*",
+    re.I,
+)
+_CONTRACT_HOLD_HARMLESS_PREFACE_RE = re.compile(
+    r"^\s*(?:sorry|i(?:['’]?m|\s+am)\s+sorry|unfortunately)\s*$",
+    re.I,
+)
+_CONTRACT_HOLD_PREFIXES = frozenset(
+    {
+        "",
+        "i",
+        "we",
+        "i have",
+        "we have",
+        "there is",
+        "there are",
+    }
+)
+_CONTRACT_PROTECTED_LABEL_PATTERN = (
+    r"(?:password|passcode|pin|one[- ]?time\s+(?:code|password)|otp|"
+    r"verification\s+code|security\s+code|recovery\s+code|api\s+key|"
+    r"secret\s+key|private\s+key|seed\s+phrase|"
+    r"(?:auth|access|deployment|session)\s+token|account[- ]identifier|"
+    r"account\s+id|routing\s+number|bank\s+account|credit\s+card|"
+    r"debit\s+card|social\s+security|ssn|credential)"
+)
+_CONTRACT_PROTECTED_LITERAL_RE = re.compile(
+    r"\b(?:(?:sk|pk|rk|ghp|github_pat|xox[baprs]|AIza)[-_]"
+    r"[A-Za-z0-9_-]{3,}|\d{4,}|(?=[A-Za-z0-9_.-]{6,}\b)"
+    r"(?=[A-Za-z0-9_.-]*\d)[A-Za-z0-9_.-]+)\b",
+    re.I,
+)
+_CONTRACT_PROTECTED_ASSIGNMENT_RE = re.compile(
+    r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN
+    + r"\b\s+(?:is|was|equals?)\s+"
+    r"(?!private\b|secret\b|sensitive\b|protected\b|confidential\b|"
+    r"unavailable\b|unknown\b|not\b)\S+",
+    re.I,
+)
+_CONTRACT_PROTECTED_APPOSITIVE_RE = re.compile(
+    r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN
+    + r"\b\s*,\s*(?!and\b|or\b|nor\b|including\b|such\s+as\b)\S+",
+    re.I,
+)
+_CONTRACT_PROTECTED_BARE_VALUE_RE = re.compile(
+    r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN
+    + r"\b\s+(?P<value>[A-Za-z0-9][A-Za-z0-9_.-]{2,})\s*[.!?]*$",
+    re.I,
+)
+_CONTRACT_REFUSAL_BARE_OBJECT_RE = re.compile(
+    r"\b(?:reveal|share|disclose|expose|provide|give|show|repeat|publish)"
+    r"\s+(?:the\s+)?(?P<value>[A-Za-z0-9][A-Za-z0-9_.-]{2,})"
+    r"\s*[.!?]*$",
+    re.I,
+)
+_CONTRACT_SAFE_REFUSAL_OBJECTS = frozenset(
+    {
+        "anything",
+        "credential",
+        "credentials",
+        "data",
+        "details",
+        "information",
+        "it",
+        "password",
+        "passcode",
+        "pin",
+        "secret",
+        "that",
+        "this",
+        "token",
+        "value",
+        "values",
     }
 )
 
@@ -4127,6 +4231,102 @@ def _ordinary_chat_setting_state(
     )
 
 
+def _ordinary_chat_recommendation_choice_is_simple(value: str) -> bool:
+    choice = re.sub(r"\s+", " ", str(value or "")).strip(" .!?")
+    if not choice or len(choice) > 140 or len(choice.split()) > 16:
+        return False
+    return not bool(
+        _CURRENT_REQUEST_RECOMMENDATION_UNSAFE_CHOICE_RE.search(choice)
+    )
+
+
+def _ordinary_chat_claim_is_recommendation(value: str) -> bool:
+    """Recognize a bounded recommendation act without blessing assertions."""
+
+    claim = re.sub(r"\s+", " ", str(value or "")).strip(" .!?")
+    directive = _CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE.match(claim)
+    if directive:
+        choice = claim[directive.end() :]
+        return bool(
+            _ordinary_chat_recommendation_choice_is_simple(choice)
+            and not _ordinary_chat_claim_has_external_subject(claim)
+        )
+    for pattern in (
+        _CURRENT_REQUEST_FIRST_PERSON_RECOMMENDATION_RE,
+        _CURRENT_REQUEST_SECOND_PERSON_RECOMMENDATION_RE,
+        _CURRENT_REQUEST_CHOICE_RECOMMENDATION_RE,
+    ):
+        match = pattern.fullmatch(claim)
+        if match and _ordinary_chat_recommendation_choice_is_simple(
+            str(match.group("choice") or "")
+        ):
+            return True
+    return False
+
+
+def _ordinary_chat_hold_text_is_honest(value: str) -> bool:
+    """Accept only nonassertive hold clauses, not answers plus disclaimers."""
+
+    claims = _candidate_claim_units(value)
+    if not claims:
+        return False
+    hold_found = False
+    for claim in claims:
+        segments = tuple(
+            segment.strip()
+            for segment in _CONTRACT_HOLD_SEGMENT_SPLIT_RE.split(claim)
+            if segment.strip()
+        )
+        if not segments:
+            return False
+        for segment in segments:
+            if _CONTRACT_HOLD_HARMLESS_PREFACE_RE.fullmatch(segment):
+                continue
+            match = _CONTRACT_HOLD_RE.search(segment)
+            if not match:
+                return False
+            prefix = re.sub(
+                r"\s+",
+                " ",
+                segment[: match.start()].strip(" .!?").casefold(),
+            )
+            if prefix not in _CONTRACT_HOLD_PREFIXES:
+                return False
+            hold_found = True
+    return hold_found
+
+
+def _ordinary_chat_refusal_text_is_safe(
+    value: str,
+    claims: Sequence[str],
+) -> bool:
+    """Require refusal wording with no appended protected literal."""
+
+    response = str(value or "").strip()
+    if (
+        len(tuple(claims or ())) != 1
+        or not _CONTRACT_REFUSAL_RE.search(response)
+        or ":" in response
+        or "=" in response
+        or "`" in response
+        or _CONTRACT_PROTECTED_LITERAL_RE.search(response)
+        or _CONTRACT_PROTECTED_ASSIGNMENT_RE.search(response)
+        or _CONTRACT_PROTECTED_APPOSITIVE_RE.search(response)
+    ):
+        return False
+    for pattern in (
+        _CONTRACT_PROTECTED_BARE_VALUE_RE,
+        _CONTRACT_REFUSAL_BARE_OBJECT_RE,
+    ):
+        match = pattern.search(response)
+        if not match:
+            continue
+        candidate = str(match.group("value") or "").casefold()
+        if candidate not in _CONTRACT_SAFE_REFUSAL_OBJECTS:
+            return False
+    return True
+
+
 def _ordinary_chat_current_request_text_is_scoped(
     request_text: str,
     response_text: str,
@@ -4141,11 +4341,7 @@ def _ordinary_chat_current_request_text_is_scoped(
     if not request or not response or not claims:
         return False
     if required_act == "refuse":
-        return bool(
-            len(claims) == 1
-            and _CONTRACT_REFUSAL_RE.search(response)
-            and not re.search(r"\b(?:password|token|api\s*key)\s+(?:is|=)\b", response, re.I)
-        )
+        return _ordinary_chat_refusal_text_is_safe(response, claims)
     if _CURRENT_REQUEST_SOCIAL_INPUT_RE.fullmatch(request):
         return bool(_CURRENT_REQUEST_SOCIAL_RESPONSE_RE.fullmatch(response))
 
@@ -4180,13 +4376,12 @@ def _ordinary_chat_current_request_text_is_scoped(
         claim_terms = set(_semantic_terms(claim)) - set(
             _CURRENT_REQUEST_SCOPE_GENERIC_TERMS
         )
-        directive_claim = bool(
-            advice
-            and _CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE.search(claim)
+        advice_claim = bool(
+            advice and _ordinary_chat_claim_is_recommendation(claim)
         )
-        if not directive_claim and not claim_terms.intersection(request_terms):
+        if not advice_claim and not claim_terms.intersection(request_terms):
             return False
-        if _ordinary_chat_claim_has_external_subject(claim):
+        if not advice_claim and _ordinary_chat_claim_has_external_subject(claim):
             subject_terms = set(
                 _ordinary_chat_claim_external_subject_terms(claim)
             )
@@ -4292,10 +4487,7 @@ def audit_ordinary_chat_response_contract_text(
             if not supported:
                 unsupported += max(1, len(claims))
         elif result.support_kind == "hold":
-            supported = bool(
-                claims
-                and all(_CONTRACT_HOLD_RE.search(claim) for claim in claims)
-            )
+            supported = _ordinary_chat_hold_text_is_honest(result.text)
             label = "honest_nonassertion" if supported else "hold_text_unsupported"
             classifications.extend((label,) * max(1, len(claims)))
             if not supported:

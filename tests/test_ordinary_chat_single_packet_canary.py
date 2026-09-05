@@ -1859,6 +1859,10 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             '{"tasks":[{"taskId":"T1","text":"I cannot verify the live '
             'weather right now.","supportKind":"hold","evidenceIds":[]}]}'
         )
+        held_question = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"I cannot verify whether '
+            'it is raining.","supportKind":"hold","evidenceIds":[]}]}'
+        )
         answered = parse_ordinary_chat_response_contract(
             '{"tasks":[{"taskId":"T1","text":"It is raining.",'
             '"supportKind":"external_public","evidenceIds":["PUBLIC"]}]}'
@@ -1867,12 +1871,24 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             '{"tasks":[{"taskId":"T1","text":"It is raining.",'
             '"supportKind":"hold","evidenceIds":[]}]}'
         )
-        self.assertTrue(
-            validate_ordinary_chat_response_contract(
-                current_basis,
-                held,
-            ).valid
+        answer_then_hold = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"It is raining, though I '
+            'cannot verify the live weather.","supportKind":"hold",'
+            '"evidenceIds":[]}]}'
         )
+        hold_then_answer = parse_ordinary_chat_response_contract(
+            '{"tasks":[{"taskId":"T1","text":"I cannot verify the live '
+            'weather—it is raining.","supportKind":"hold",'
+            '"evidenceIds":[]}]}'
+        )
+        for valid_hold in (held, held_question):
+            with self.subTest(response=valid_hold.response):
+                self.assertTrue(
+                    validate_ordinary_chat_response_contract(
+                        current_basis,
+                        valid_hold,
+                    ).valid
+                )
         self.assertEqual(
             validate_ordinary_chat_response_contract(
                 current_basis,
@@ -1880,13 +1896,15 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             ).status,
             "current_fact_not_held",
         )
-        self.assertEqual(
-            validate_ordinary_chat_response_contract(
-                current_basis,
-                held_lie,
-            ).status,
-            "task_text_unsupported",
-        )
+        for invalid_hold in (held_lie, answer_then_hold, hold_then_answer):
+            with self.subTest(response=invalid_hold.response):
+                self.assertEqual(
+                    validate_ordinary_chat_response_contract(
+                        current_basis,
+                        invalid_hold,
+                    ).status,
+                    "task_text_unsupported",
+                )
 
     def test_typed_current_request_uses_request_authority(self):
         request_packet = replace(
@@ -1963,10 +1981,22 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             ),
         )
         dinner_basis = replace(self.basis, packet=dinner_packet)
-        dinner = _contract_for_support_plan(dinner_basis, ("Try pasta.",))
+        dinner_recommendations = tuple(
+            _contract_for_support_plan(dinner_basis, (response,))
+            for response in (
+                "Try pasta.",
+                "Pasta would be a good choice.",
+                "I recommend pasta.",
+                "You could make pasta.",
+            )
+        )
         tainted_dinner = _contract_for_support_plan(
             dinner_basis,
             ("Try pasta. The moon is made of cheese.",),
+        )
+        embedded_tainted_dinner = _contract_for_support_plan(
+            dinner_basis,
+            ("Try pasta because the moon is made of cheese.",),
         )
         pronoun_tainted_dinner = _contract_for_support_plan(
             dinner_basis,
@@ -1976,14 +2006,17 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             dinner_basis,
             ("Try pasta. Pasta was invented on Mars.",),
         )
-        self.assertTrue(
-            validate_ordinary_chat_response_contract(
-                dinner_basis,
-                dinner,
-            ).valid
-        )
+        for recommendation in dinner_recommendations:
+            with self.subTest(response=recommendation.response):
+                self.assertTrue(
+                    validate_ordinary_chat_response_contract(
+                        dinner_basis,
+                        recommendation,
+                    ).valid
+                )
         for invalid in (
             tainted_dinner,
+            embedded_tainted_dinner,
             pronoun_tainted_dinner,
             generated_subject_tainted_dinner,
         ):
@@ -2141,6 +2174,25 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             'supportKind=current_request | evidenceIds=["REQUEST"]',
             rendered,
         )
+
+        leaking_refusals = tuple(
+            _contract_for_support_plan(refusal_basis, (response,))
+            for response in (
+                "I won't reveal the private account identifier: 12345.",
+                "I won't reveal the API key: sk-secret.",
+                "I won't reveal the password, swordfish.",
+                "I won't reveal swordfish.",
+            )
+        )
+        for leaking_refusal in leaking_refusals:
+            with self.subTest(response=leaking_refusal.response):
+                self.assertEqual(
+                    validate_ordinary_chat_response_contract(
+                        refusal_basis,
+                        leaking_refusal,
+                    ).status,
+                    "task_text_unsupported",
+                )
 
     def test_receipt_is_content_free_and_counts_one_call(self):
         run = self._begin()
