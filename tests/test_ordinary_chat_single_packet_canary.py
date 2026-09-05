@@ -2006,6 +2006,13 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             dinner_basis,
             ("Try pasta. Pasta was invented on Mars.",),
         )
+        assertive_recommendations = tuple(
+            _contract_for_support_plan(dinner_basis, (response,))
+            for response in (
+                "I recommend moon cheese cures cancer.",
+                "You could make moon cheese cures cancer.",
+            )
+        )
         for recommendation in dinner_recommendations:
             with self.subTest(response=recommendation.response):
                 self.assertTrue(
@@ -2019,6 +2026,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             embedded_tainted_dinner,
             pronoun_tainted_dinner,
             generated_subject_tainted_dinner,
+            *assertive_recommendations,
         ):
             with self.subTest(response=invalid.response):
                 self.assertEqual(
@@ -2028,6 +2036,36 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     ).status,
                     "task_text_unsupported",
                 )
+
+        writing_packet = replace(
+            request_packet,
+            request=replace(
+                request_packet.request,
+                user_text="Please write a note about the moon.",
+            ),
+        )
+        writing_basis = replace(self.basis, packet=writing_packet)
+        neutral_note = _contract_for_support_plan(
+            writing_basis,
+            ("A note about the moon.",),
+        )
+        invented_fact = _contract_for_support_plan(
+            writing_basis,
+            ("The moon is made of cheese.",),
+        )
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                writing_basis,
+                neutral_note,
+            ).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                writing_basis,
+                invented_fact,
+            ).status,
+            "task_text_unsupported",
+        )
 
     def test_typed_current_request_preserves_settings_and_open_choice(self):
         request_text = (
@@ -2182,6 +2220,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 "I won't reveal the API key: sk-secret.",
                 "I won't reveal the password, swordfish.",
                 "I won't reveal swordfish.",
+                "I won't reveal swordfish, your password.",
             )
         )
         for leaking_refusal in leaking_refusals:
@@ -2193,6 +2232,55 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     ).status,
                     "task_text_unsupported",
                 )
+
+    def test_typed_clarification_rejects_embedded_assertions(self):
+        clarify_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                subject_user_id=0,
+                subject_display_name="",
+                user_text="Which account do you mean?",
+                frame_subject_requirement="required",
+                frame_tasks=(
+                    replace(
+                        self.packet.request.frame_tasks[0],
+                        authority_scope="packet",
+                        required_response_act="clarify",
+                        subject_requirement="required",
+                        subject_indexes=(),
+                    ),
+                ),
+            ),
+            subject_resolution=PacketSubjectResolution(
+                status="ambiguous",
+                candidate_count=2,
+                reason_codes=("multiple_subject_candidates",),
+            ),
+        )
+        clarify_basis = replace(self.basis, packet=clarify_packet)
+        safe = _contract_for_support_plan(
+            clarify_basis,
+            ("Which account do you mean?",),
+        )
+        embedded_assertion = _contract_for_support_plan(
+            clarify_basis,
+            ("Which account, whose password is swordfish, do you mean?",),
+        )
+
+        self.assertTrue(
+            validate_ordinary_chat_response_contract(
+                clarify_basis,
+                safe,
+            ).valid
+        )
+        self.assertEqual(
+            validate_ordinary_chat_response_contract(
+                clarify_basis,
+                embedded_assertion,
+            ).status,
+            "task_text_unsupported",
+        )
 
     def test_receipt_is_content_free_and_counts_one_call(self):
         run = self._begin()

@@ -3750,6 +3750,11 @@ _CURRENT_REQUEST_ADVICE_INPUT_RE = re.compile(
     r"\bwhat\s+should\s+(?:i|we)\b",
     re.I,
 )
+_CURRENT_REQUEST_OPINION_INPUT_RE = re.compile(
+    r"\b(?:what\s+do\s+you\s+think|your\s+opinion|"
+    r"do\s+you\s+(?:like|prefer|want))\b",
+    re.I,
+)
 _CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE = re.compile(
     r"^\s*(?:first\s*,?\s*)?(?:test|try|start|begin|consider|use|choose|"
     r"keep|make|set|focus|check|compare|review|run|write|create|build|"
@@ -3913,6 +3918,14 @@ _CONTRACT_PROTECTED_APPOSITIVE_RE = re.compile(
     + r"\b\s*,\s*(?!and\b|or\b|nor\b|including\b|such\s+as\b)\S+",
     re.I,
 )
+_CONTRACT_PROTECTED_REVERSE_LABEL_RE = re.compile(
+    r"\b(?P<value>[A-Za-z0-9][A-Za-z0-9_.-]{2,})\s*"
+    r"(?:,|\bas\b|\bis\b|\bfor\b)\s*"
+    r"(?:(?:your|my|our|his|her|their|the|a|an)\s+)?"
+    + _CONTRACT_PROTECTED_LABEL_PATTERN
+    + r"\b",
+    re.I,
+)
 _CONTRACT_PROTECTED_BARE_VALUE_RE = re.compile(
     r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN
     + r"\b\s+(?P<value>[A-Za-z0-9][A-Za-z0-9_.-]{2,})\s*[.!?]*$",
@@ -3942,6 +3955,7 @@ _CONTRACT_SAFE_REFUSAL_OBJECTS = frozenset(
         "token",
         "value",
         "values",
+        "what",
     }
 )
 
@@ -4235,9 +4249,31 @@ def _ordinary_chat_recommendation_choice_is_simple(value: str) -> bool:
     choice = re.sub(r"\s+", " ", str(value or "")).strip(" .!?")
     if not choice or len(choice) > 140 or len(choice.split()) > 16:
         return False
-    return not bool(
-        _CURRENT_REQUEST_RECOMMENDATION_UNSAFE_CHOICE_RE.search(choice)
-    )
+    if _CURRENT_REQUEST_RECOMMENDATION_UNSAFE_CHOICE_RE.search(choice):
+        return False
+    normalized = choice[:1].upper() + choice[1:]
+    words = tuple(_EXTERNAL_WORD_RE.finditer(normalized))
+    if not _ordinary_chat_claim_has_external_subject(normalized):
+        return True
+    for index, word in enumerate(words[1:], start=1):
+        token = str(word.group(0) or "").strip(" .!?").casefold()
+        if not _ordinary_chat_external_token_is_finite_predicate(token):
+            continue
+        subject = normalized[: word.start()].strip()
+        if not _ordinary_chat_external_subject_is_positive(
+            subject,
+            tuple(item.group(0) for item in words[:index]),
+        ):
+            continue
+        # A plural noun can look like a derived finite verb ("fish tacos").
+        # Explicit verbs remain assertions anywhere; derived forms require a
+        # following predicate object before they disqualify a choice phrase.
+        return bool(
+            token not in _EXTERNAL_EXPLICIT_FINITE_VERBS
+            and token not in _EXTERNAL_BARE_FINITE_VERBS
+            and index == len(words) - 1
+        )
+    return True
 
 
 def _ordinary_chat_claim_is_recommendation(value: str) -> bool:
@@ -4296,6 +4332,26 @@ def _ordinary_chat_hold_text_is_honest(value: str) -> bool:
     return hold_found
 
 
+def _ordinary_chat_text_discloses_labeled_protected_value(value: str) -> bool:
+    response = str(value or "").strip()
+    if (
+        _CONTRACT_PROTECTED_ASSIGNMENT_RE.search(response)
+        or _CONTRACT_PROTECTED_APPOSITIVE_RE.search(response)
+        or _CONTRACT_PROTECTED_BARE_VALUE_RE.search(response)
+        or (
+            re.search(r"\b" + _CONTRACT_PROTECTED_LABEL_PATTERN + r"\b", response, re.I)
+            and _CONTRACT_PROTECTED_LITERAL_RE.search(response)
+        )
+    ):
+        return True
+    reverse = _CONTRACT_PROTECTED_REVERSE_LABEL_RE.search(response)
+    return bool(
+        reverse
+        and str(reverse.group("value") or "").casefold()
+        not in _CONTRACT_SAFE_REFUSAL_OBJECTS
+    )
+
+
 def _ordinary_chat_refusal_text_is_safe(
     value: str,
     claims: Sequence[str],
@@ -4310,8 +4366,7 @@ def _ordinary_chat_refusal_text_is_safe(
         or "=" in response
         or "`" in response
         or _CONTRACT_PROTECTED_LITERAL_RE.search(response)
-        or _CONTRACT_PROTECTED_ASSIGNMENT_RE.search(response)
-        or _CONTRACT_PROTECTED_APPOSITIVE_RE.search(response)
+        or _ordinary_chat_text_discloses_labeled_protected_value(response)
     ):
         return False
     for pattern in (
@@ -4325,6 +4380,90 @@ def _ordinary_chat_refusal_text_is_safe(
         if candidate not in _CONTRACT_SAFE_REFUSAL_OBJECTS:
             return False
     return True
+
+
+def _ordinary_chat_clarification_text_is_safe(
+    value: str,
+    claims: Sequence[str],
+) -> bool:
+    """Allow a question shape only when it contains no embedded assertion."""
+
+    response = str(value or "").strip()
+    if (
+        len(tuple(claims or ())) != 1
+        or not _CONTRACT_CLARIFY_RE.fullmatch(response)
+        or _ordinary_chat_text_discloses_labeled_protected_value(response)
+    ):
+        return False
+    if _ordinary_chat_claim_is_honest_nonassertion(response):
+        return True
+    remainder = re.sub(
+        r"^\s*(?:which|what|who|where|when|why|how|do|did|are|is|"
+        r"was|were|could|would|should|can|will)\b",
+        "",
+        response,
+        count=1,
+        flags=re.I,
+    )
+    return not bool(
+        re.search(r"[,;:—–]", response)
+        or re.search(
+            r"\b(?:although|because|but|since|that|though|who|whose|"
+            r"which|while|whereas|yet)\b",
+            remainder,
+            re.I,
+        )
+    )
+
+
+def _ordinary_chat_current_request_assertion_is_supported(
+    request_text: str,
+    claim: str,
+) -> bool:
+    """Ground an asserted relation in assertion-bearing request text."""
+
+    claim_material = set(_normalized_relation_terms(claim)) - {
+        "between",
+        "open",
+        "remain",
+        "still",
+        "unchang",
+    }
+    if not claim_material:
+        return False
+    request_material: set[str] = set()
+    request_polarities: set[str] = set()
+    for request_claim in _candidate_claim_units(request_text):
+        settled, open_values = _ordinary_chat_setting_state(request_claim)
+        if not (
+            settled
+            or open_values
+            or _ordinary_chat_claim_has_external_subject(request_claim)
+        ):
+            continue
+        request_material.update(_normalized_relation_terms(request_claim))
+        request_polarities.add(_relation_polarity(request_claim))
+    request_settled, request_open = _ordinary_chat_setting_state(request_text)
+    claim_settled, claim_open = _ordinary_chat_setting_state(claim)
+    settings_supported = bool(
+        (claim_settled or claim_open)
+        and all(
+            values.issubset(request_settled.get(setting, frozenset()))
+            for setting, values in claim_settled.items()
+        )
+        and all(
+            values.issubset(request_open.get(setting, frozenset()))
+            for setting, values in claim_open.items()
+        )
+    )
+    return bool(
+        request_material
+        and claim_material.issubset(request_material)
+        and (
+            _relation_polarity(claim) in request_polarities
+            or settings_supported
+        )
+    )
 
 
 def _ordinary_chat_current_request_text_is_scoped(
@@ -4348,6 +4487,7 @@ def _ordinary_chat_current_request_text_is_scoped(
     request_settled, request_open = _ordinary_chat_setting_state(request)
     response_settled, response_open = _ordinary_chat_setting_state(response)
     advice = bool(_CURRENT_REQUEST_ADVICE_INPUT_RE.search(request))
+    opinion = bool(_CURRENT_REQUEST_OPINION_INPUT_RE.search(request))
     directive = bool(_CURRENT_REQUEST_DIRECTIVE_RESPONSE_RE.search(response))
     recap = bool(_CURRENT_REQUEST_RECAP_RE.search(request))
     for setting, values in response_settled.items():
@@ -4379,9 +4519,29 @@ def _ordinary_chat_current_request_text_is_scoped(
         advice_claim = bool(
             advice and _ordinary_chat_claim_is_recommendation(claim)
         )
+        opinion_claim = bool(
+            opinion
+            and _EXTERNAL_OPINION_PREFIX_RE.fullmatch(
+                _ordinary_chat_claim_core(claim)
+            )
+        )
         if not advice_claim and not claim_terms.intersection(request_terms):
             return False
-        if not advice_claim and _ordinary_chat_claim_has_external_subject(claim):
+        if (
+            not advice_claim
+            and not opinion_claim
+            and _ordinary_chat_claim_has_external_subject(claim)
+            and not _ordinary_chat_current_request_assertion_is_supported(
+                request,
+                claim,
+            )
+        ):
+            return False
+        if (
+            not advice_claim
+            and not opinion_claim
+            and _ordinary_chat_claim_has_external_subject(claim)
+        ):
             subject_terms = set(
                 _ordinary_chat_claim_external_subject_terms(claim)
             )
@@ -4493,9 +4653,9 @@ def audit_ordinary_chat_response_contract_text(
             if not supported:
                 unsupported += max(1, len(claims))
         elif result.support_kind == "clarify":
-            supported = bool(
-                len(claims) == 1
-                and _CONTRACT_CLARIFY_RE.fullmatch(result.text)
+            supported = _ordinary_chat_clarification_text_is_safe(
+                result.text,
+                claims,
             )
             label = "honest_nonassertion" if supported else "clarify_text_unsupported"
             classifications.extend((label,) * max(1, len(claims)))
