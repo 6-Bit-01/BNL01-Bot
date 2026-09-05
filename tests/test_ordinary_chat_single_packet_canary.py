@@ -2999,6 +2999,85 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(unsupported, 0)
         self.assertNotIn("unsupported_packet_domain", classifications)
 
+        live_text = (
+            "Sealed Row 9 provider fixture: In one paragraph, what makes a "
+            "community feel connected instead of merely active?"
+        )
+        recent_moment_frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="free_speak_sealed_mirror",
+            channel_policy="sealed_test",
+            current_text=live_text,
+            current_speaker_user_ids=(7,),
+            current_speaker_labels=("Test Member",),
+            addressee_kinds=("discord_mention",),
+            addressee_user_ids=(99,),
+            source_message_ids=(301,),
+            explicit_mention_count=1,
+            moment_id="moment_prior_fixture",
+            moment_situation_state="recent_finalized",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            referent_status="not_requested",
+            response_act="answer",
+            packet_revision="turn_row9_live_fixture",
+        )
+        self.assertEqual(
+            tuple(
+                task.authority_scope
+                for task in recent_moment_frame.tasks
+            ),
+            ("external_public",),
+        )
+        self.assertEqual(
+            recent_moment_frame.event_relation,
+            "same_event_new_phase",
+        )
+        recent_moment_packet = replace(
+            external_packet,
+            request=replace(
+                external_packet.request,
+                user_text=live_text,
+                frame_revision=recent_moment_frame.frame_revision,
+                frame_input_evidence_digest=(
+                    recent_moment_frame.input_evidence_digest
+                ),
+                frame_subject_requirement=(
+                    recent_moment_frame.subject_requirement
+                ),
+                frame_tasks=tuple(
+                    PacketFrameTask(
+                        task_id=task.task_id,
+                        text_digest=task.text_digest,
+                        task_kind=task.task_kind,
+                        object_kind=task.object_kind,
+                        authority_scope=task.authority_scope,
+                        temporal_scope=task.temporal_scope,
+                        currentness=task.currentness,
+                        required_response_act=task.required_response_act,
+                        subject_requirement=task.subject_requirement,
+                        subject_indexes=task.subject_indexes,
+                    )
+                    for task in recent_moment_frame.tasks
+                ),
+                frame_event_ref=recent_moment_frame.event_ref,
+                frame_event_relation=recent_moment_frame.event_relation,
+            ),
+        )
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            replace(self.basis, packet=recent_moment_packet),
+            response,
+        )
+        self.assertEqual(unsupported, 0)
+        self.assertNotIn("unsupported_packet_domain", classifications)
+        classifications, unsupported = audit_ordinary_chat_candidate_claims(
+            replace(self.basis, packet=recent_moment_packet),
+            "The moment says the project was founded in 1999.",
+        )
+        self.assertGreaterEqual(unsupported, 1)
+        self.assertIn("unsupported_packet_domain", classifications)
+
         for unsupported_response in (
             "Your birthday is 1999-01-01.",
             "BARCODE started in 1999.",
