@@ -393,6 +393,117 @@ _BNL_SELF_SUBJECT_CUE_RE = re.compile(
     r"\bdescribe\s+yourself\b",
     re.I,
 )
+_SITUATION_PRESENTATION_RE = re.compile(
+    r"(?:\*\*|__|~~|(?<!\w)[*_]|[*_](?!\w)|"
+    r"[\u200b-\u200d\ufeff])"
+)
+_SITUATION_CODE_QUOTED_RE = re.compile(r"`+[^`\n]{1,240}`+")
+_SITUATION_DOUBLE_QUOTED_RE = re.compile(
+    r'(?:"[^"\n]{1,240}"|“[^”\n]{1,240}”)'
+)
+_SITUATION_SINGLE_QUOTED_RE = re.compile(
+    r"(?<!\w)(?:'[^'\n]{1,120}'|‘[^’\n]{1,120}’)(?!\w)"
+)
+_SITUATION_LEADING_ADDRESSEE_RE = re.compile(
+    r"^\s*(?:(?:hey|hi|hello|yo|please|okay|ok|so)\b"
+    r"[\s.,;:!?—–-]*)*"
+    r"(?P<addressee><@!?\d+>|@?BNL(?:[- ]?0?1)?)"
+    r"(?![- ]?0?1[a-z0-9_])"
+    r"(?![a-z0-9_])"
+    r"(?P<possessive>\s*['’]\s*s\b)?"
+    r"(?P<delimiter>\s*[.,;:!?—–-]+)?"
+    r"(?P<space>\s*)",
+    re.I,
+)
+_SITUATION_LEADING_SUBJECT_PREDICATE_RE = re.compile(
+    r"^(?:is|was|are|were|has|had|does|did|"
+    r"(?:can|could|would|will|should)(?!\s+you\b)|"
+    r"knows?|remembers?|works?|worked|owns?|owned|runs?|ran|"
+    r"hosts?|hosted|founds?|founded|starts?|started|"
+    r"joins?|joined|attends?|attended|creates?|created|"
+    r"builds?|built|launches?|launched)\b",
+    re.I,
+)
+_SITUATION_BNL_FACTUAL_SELF_RE = re.compile(
+    r"\b(?:when(?:['’]d|\s+did)\s+you\s+"
+    r"(?:start|begin|launch|join)\b|"
+    r"when\s+(?:were|was)\s+you\s+"
+    r"(?:created|built|founded|launched|started|born)|"
+    r"where\s+(?:are|were)\s+you\s+from|"
+    r"how\s+old\s+are\s+you|"
+    r"(?:who|what)\s+(?:created|built|made|founded|started)\s+you\b|"
+    r"you\s+(?:were|are)\s+(?:created|built|founded|launched|"
+    r"started|born)\b|"
+    r"(?:what(?:['’]s|\s+is)|when(?:['’]s|\s+is)|who(?:['’]s|\s+is))"
+    r"\s+your\s+(?:birthday|creator|creation|founder|founding|"
+    r"origin|history|identity|name|role|purpose|design|code|"
+    r"version|age|lore|canon|memory|project|network|radio)\b|"
+    r"your\s+(?:birthday|creator|creation|founder|founding|origin|"
+    r"history|identity|name|role|purpose|design|code|version|age|"
+    r"lore|canon|memory|project|network|radio)\b)",
+    re.I,
+)
+_SITUATION_BNL_ENTITY_RE = re.compile(
+    r"(?<![a-z0-9])@?B[\W_]*N[\W_]*L(?:[\W_]*0?1)?"
+    r"(?![\W_]*0?1[a-z0-9])(?![a-z0-9])",
+    re.I,
+)
+_SITUATION_BARCODE_EXACT_RE = re.compile(
+    r"(?<![A-Za-z0-9])BARCODE(?![A-Za-z0-9])"
+)
+_SITUATION_BARCODE_NETWORK_RE = re.compile(
+    r"\bbar[\W_]*code[\W_]*network\b",
+    re.I,
+)
+_SITUATION_BARCODE_RADIO_RE = re.compile(
+    r"\bbar[\W_]*code[\W_]*radio\b",
+    re.I,
+)
+_SITUATION_BARCODE_PROJECT_RE = re.compile(
+    r"\bbarcode\s+(?:collective|project)\b",
+    re.I,
+)
+_SITUATION_ENTITY_SUBJECT_PREDICATE_RE = re.compile(
+    r"^\s*(?:['’]\s*s\b|(?:is|was|are|were|has|had|does|did|"
+    r"can|could|would|will|should|knows?|remembers?|works?|worked|"
+    r"owns?|owned|runs?|ran|hosts?|hosted|founds?|founded|starts?|"
+    r"started|joins?|joined|attends?|attended|creates?|created|"
+    r"builds?|built|launches?|launched)\b)",
+    re.I,
+)
+_SITUATION_ENTITY_SUBJECT_QUESTION_RE = re.compile(
+    r"\b(?:who|what|which|when|where|why|how)\b"
+    r"(?:\s+[a-z0-9'’-]+){0,4}\s+"
+    r"(?:is|was|are|were|do|does|did|has|have|had|"
+    r"can|could|would|will|should)\s+(?:the\s+)?$",
+    re.I,
+)
+_SITUATION_ENTITY_SUBJECT_REQUEST_RE = re.compile(
+    r"\b(?:tell\s+me\s+about|what\s+do\s+you\s+"
+    r"(?:know|remember)\s+about|describe|summari[sz]e|explain)"
+    r"\s+(?:the\s+)?$",
+    re.I,
+)
+_SITUATION_EXPLICIT_EVENT_REFERENT_RE = re.compile(
+    r"\b(?:this|that|our|the)\s+"
+    r"(?:(?:current|recent|last|previous|earlier|same|active|finalized)\s+)?"
+    r"(?:moment|episode|event|incident|attempt|run|session|test|"
+    r"rehearsal|show|discussion|thread)\b",
+    re.I,
+)
+_SITUATION_IMPLICIT_EVENT_QUERY_RE = re.compile(
+    r"(?:"
+    r"(?:how\s+many\s+(?:people|members|participants)|who)\s+"
+    r"(?:attended|participated|joined|showed\s+up)"
+    r"(?:\s+(?:it|this|that|there))?|"
+    r"how\s+many\s+(?:people|members|participants)\s+were\s+there|"
+    r"what\s+(?:happened|changed|failed|was\s+decided|got\s+fixed)|"
+    r"how\s+did\s+(?:it|this|that|the\s+(?:test|run|show|session))\s+go|"
+    r"did\s+(?:it|this|that)\s+(?:work|pass|fail|finish|end|start)|"
+    r"when\s+did\s+(?:it|this|that)\s+(?:start|end|happen|finish)"
+    r")\s*[?!.]*\s*$",
+    re.I,
+)
 _TASK_LEAD_RE = re.compile(
     r"(?:what|which|who|where|when|why|how|tell|explain|summari[sz]e|"
     r"restate|repeat|recap|paraphrase|recommend|suggest|list|"
@@ -697,6 +808,178 @@ def _situation_visibility(channel_policy: Any, route_allowed: bool) -> str:
     return "unknown"
 
 
+def _situation_plain_text(value: str) -> str:
+    """Remove presentation-only wrappers before request authority parsing."""
+
+    return _SITUATION_PRESENTATION_RE.sub(
+        "",
+        str(value or ""),
+    ).replace("\u00a0", " ")
+
+
+def _situation_unquoted_text(value: str) -> str:
+    """Hide quoted words so their pronouns cannot become live subjects."""
+
+    without_code = _SITUATION_CODE_QUOTED_RE.sub(" ", str(value or ""))
+    without_double_quotes = _SITUATION_DOUBLE_QUOTED_RE.sub(
+        " ",
+        without_code,
+    )
+    return _SITUATION_SINGLE_QUOTED_RE.sub(" ", without_double_quotes)
+
+
+def _situation_subject_text(value: str) -> str:
+    """Remove one true leading addressee while retaining factual subjects.
+
+    Discord addressing answers who should receive a response; it does not by
+    itself make the addressee the factual subject.  A possessive or an
+    immediate subject predicate keeps the leading name in the semantic text.
+    """
+
+    text = _situation_plain_text(value).strip()
+    match = _SITUATION_LEADING_ADDRESSEE_RE.match(text)
+    if match is None or match.group("possessive"):
+        return text
+    remainder = text[match.end() :].lstrip()
+    if (
+        not match.group("delimiter")
+        and _SITUATION_LEADING_SUBJECT_PREDICATE_RE.match(remainder)
+    ):
+        return text
+    return remainder
+
+
+def _situation_bnl_self_subject_cue(value: str) -> bool:
+    subject_text = _situation_unquoted_text(
+        _situation_subject_text(value)
+    )
+    return bool(
+        _BNL_SELF_SUBJECT_CUE_RE.search(subject_text)
+        or _SITUATION_BNL_FACTUAL_SELF_RE.search(subject_text)
+    )
+
+
+def _situation_entity_acts_as_subject(
+    subject_text: str,
+    entity_pattern: re.Pattern,
+) -> bool:
+    """Return whether one governed entity occupies a factual subject slot."""
+
+    for match in entity_pattern.finditer(str(subject_text or "")):
+        before = subject_text[: match.start()]
+        after = subject_text[match.end() :]
+        if _SITUATION_ENTITY_SUBJECT_PREDICATE_RE.match(after):
+            return True
+        if _SITUATION_ENTITY_SUBJECT_QUESTION_RE.search(before):
+            return True
+        if _SITUATION_ENTITY_SUBJECT_REQUEST_RE.search(before):
+            return True
+        if (
+            not before.strip()
+            and re.match(
+                r"^\s*[,;:—–-]+\s*(?:who|what|which|when|where|why|how)\b",
+                after,
+                re.I,
+            )
+        ):
+            return True
+    return False
+
+
+def _situation_governed_entity_refs(value: str) -> Tuple[str, ...]:
+    """Return exact existing canon entities used as request subjects."""
+
+    subject_text = _situation_unquoted_text(
+        _situation_subject_text(value)
+    )
+    refs = []
+    if (
+        _situation_entity_acts_as_subject(
+            subject_text,
+            _SITUATION_BNL_ENTITY_RE,
+        )
+        or _situation_bnl_self_subject_cue(value)
+    ):
+        refs.append(BNL01.key)
+    if _situation_entity_acts_as_subject(
+        subject_text,
+        _SITUATION_BARCODE_RADIO_RE,
+    ):
+        refs.append("barcode_radio")
+    elif _situation_entity_acts_as_subject(
+        subject_text,
+        _SITUATION_BARCODE_NETWORK_RE,
+    ):
+        refs.append("barcode_network")
+    elif (
+        _situation_entity_acts_as_subject(
+            subject_text,
+            _SITUATION_BARCODE_EXACT_RE,
+        )
+        or _situation_entity_acts_as_subject(
+            subject_text,
+            _SITUATION_BARCODE_PROJECT_RE,
+        )
+    ):
+        refs.append("barcode")
+    return tuple(dict.fromkeys(refs))
+
+
+def _situation_governed_user_ids(value: str) -> Tuple[int, ...]:
+    """Return Discord mentions that remain after true vocative removal."""
+
+    subject_text = _situation_unquoted_text(
+        _situation_subject_text(value)
+    )
+    return tuple(
+        dict.fromkeys(
+            int(match.group("user_id"))
+            for match in re.finditer(
+                r"<@!?(?P<user_id>\d+)>",
+                subject_text,
+            )
+            if int(match.group("user_id") or 0) > 0
+        )
+    )
+
+
+def situation_governed_dependency_kinds(
+    value: str,
+    *,
+    event_ref: str = "",
+) -> Tuple[str, ...]:
+    """Classify request dependencies that require governed packet support.
+
+    This is an applicability boundary only.  It grants no facts and stores no
+    content; the packet's existing owners still select every usable source.
+    """
+
+    subject_text = _situation_unquoted_text(
+        _situation_subject_text(value)
+    )
+    dependencies = []
+    if (
+        _SITUATION_BNL_ENTITY_RE.search(subject_text)
+        or _situation_bnl_self_subject_cue(value)
+    ):
+        dependencies.append("bnl_subject")
+    if (
+        _SITUATION_BARCODE_RADIO_RE.search(subject_text)
+        or _SITUATION_BARCODE_NETWORK_RE.search(subject_text)
+        or _SITUATION_BARCODE_EXACT_RE.search(subject_text)
+        or _SITUATION_BARCODE_PROJECT_RE.search(subject_text)
+    ):
+        dependencies.append("project_subject")
+    if _situation_governed_user_ids(value):
+        dependencies.append("discord_subject")
+    if str(event_ref or "").strip() and (
+        _SITUATION_EXPLICIT_EVENT_REFERENT_RE.search(subject_text)
+        or _SITUATION_IMPLICIT_EVENT_QUERY_RE.search(subject_text)
+    ):
+        dependencies.append("event_referent")
+    return tuple(dict.fromkeys(dependencies))
+
+
 def _situation_phase(text: str) -> str:
     for phase, pattern in _SITUATION_PHASE_PATTERNS:
         if pattern.search(text or ""):
@@ -801,14 +1084,17 @@ def _task_subject_indexes(
     segment: str,
     subjects: Sequence[SituationSubjectReference],
 ) -> Tuple[int, ...]:
-    bnl_self = bool(_BNL_SELF_SUBJECT_CUE_RE.search(segment or ""))
-    self_subject = bool(_SELF_SUBJECT_CUE_RE.search(segment or ""))
-    third_party = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(segment or ""))
+    subject_text = _situation_unquoted_text(
+        _situation_subject_text(segment)
+    )
+    bnl_self = _situation_bnl_self_subject_cue(segment)
+    self_subject = bool(_SELF_SUBJECT_CUE_RE.search(subject_text))
+    third_party = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(subject_text))
     matches = []
     for index, subject in enumerate(subjects):
         if int(subject.user_id or 0) > 0 and re.search(
             r"<@!?%s>" % int(subject.user_id),
-            segment or "",
+            subject_text,
         ):
             matches.append(index)
             continue
@@ -844,7 +1130,7 @@ def _task_subject_indexes(
         if any(
             re.search(
                 r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(label),
-                segment or "",
+                subject_text,
                 re.I,
             )
             for label in labels
@@ -861,12 +1147,31 @@ def _situation_tasks(
     subjects: Sequence[SituationSubjectReference],
     response_act: str,
     exact_reply_resolved: bool = False,
+    event_ref: str = "",
 ) -> Tuple[SituationTaskReference, ...]:
     tasks = []
     prior_unique_subject_index = None
     for index, segment in enumerate(_situation_task_segments(text), start=1):
+        subject_text = _situation_unquoted_text(
+            _situation_subject_text(segment)
+        )
+        dependency_kinds = situation_governed_dependency_kinds(
+            segment,
+            event_ref=event_ref,
+        )
+        event_dependent = "event_referent" in dependency_kinds
+        governed_dependency = any(
+            dependency in {
+                "bnl_subject",
+                "project_subject",
+                "discord_subject",
+            }
+            for dependency in dependency_kinds
+        )
         phase = _situation_phase(segment)
         object_kind = _situation_object(segment)
+        if event_dependent and object_kind == "unknown":
+            object_kind = "moment"
         temporal_scope, currentness = _situation_temporal_scope(segment)
         evidence = build_conversation_evidence_item(
             text=segment,
@@ -911,10 +1216,10 @@ def _situation_tasks(
                 )
         external_role_query = bool(_EXTERNAL_ROLE_QUERY_RE.search(segment))
         subject_cue = bool(
-            _BNL_SELF_SUBJECT_CUE_RE.search(segment)
-            or _SELF_SUBJECT_CUE_RE.search(segment)
+            _situation_bnl_self_subject_cue(segment)
+            or _SELF_SUBJECT_CUE_RE.search(subject_text)
             or (
-                _THIRD_PARTY_SUBJECT_CUE_RE.search(segment)
+                _THIRD_PARTY_SUBJECT_CUE_RE.search(subject_text)
                 and not external_role_query
             )
             or (object_kind == "person" and not external_role_query)
@@ -943,9 +1248,14 @@ def _situation_tasks(
             authority_scope = "current_request"
             subject_requirement = "not_applicable"
             subject_indexes = ()
-        elif subject_requirement == "required" or (
-            object_kind in _PACKET_AUTHORITY_OBJECTS
-            and not external_role_query
+        elif (
+            subject_requirement == "required"
+            or governed_dependency
+            or (
+                object_kind in _PACKET_AUTHORITY_OBJECTS
+                and not external_role_query
+            )
+            or event_dependent
         ):
             authority_scope = "packet"
         elif conversation_context_task:
@@ -1138,7 +1448,12 @@ def build_situation_frame_v1(
     target_ids = _unique_positive_ints(addressee_user_ids)
     subject_ids = _unique_positive_ints(subject_user_ids)
     label_hints = _unique_strings(subject_label_hints)[:8]
-    entity_refs = _unique_strings(subject_entity_refs)[:8]
+    entity_refs = _unique_strings(
+        (
+            *subject_entity_refs,
+            *_situation_governed_entity_refs(text),
+        )
+    )[:8]
     roles, domains = _situation_roles_domains(text)
     phase = _situation_phase(text)
     object_kind = _situation_object(text)
@@ -1153,10 +1468,19 @@ def build_situation_frame_v1(
         exact_quote_requested=False,
         evidence_items=(evidence,),
     )
-    third_party_cue = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(text))
-    self_subject_cue = bool(_SELF_SUBJECT_CUE_RE.search(text))
-    bnl_self_subject_cue = bool(_BNL_SELF_SUBJECT_CUE_RE.search(text))
-    external_role_query = bool(_EXTERNAL_ROLE_QUERY_RE.search(text))
+    request_subject_text = _situation_unquoted_text(
+        _situation_subject_text(text)
+    )
+    third_party_cue = bool(
+        _THIRD_PARTY_SUBJECT_CUE_RE.search(request_subject_text)
+    )
+    self_subject_cue = bool(
+        _SELF_SUBJECT_CUE_RE.search(request_subject_text)
+    )
+    bnl_self_subject_cue = _situation_bnl_self_subject_cue(text)
+    external_role_query = bool(
+        _EXTERNAL_ROLE_QUERY_RE.search(request_subject_text)
+    )
 
     subjects = []
     if subject_ids:
@@ -1262,6 +1586,7 @@ def build_situation_frame_v1(
         subjects=subjects,
         response_act=str(response_act or "observe"),
         exact_reply_resolved=exact_reply_resolved,
+        event_ref=str(moment_id or ""),
     )
 
     ambiguity = []
@@ -1335,6 +1660,8 @@ def build_situation_frame_v1(
             objective_kind=objective_kind,
         )
     )
+    if len(tasks) == 1:
+        object_kind = tasks[0].object_kind
     if len(tasks) > 1:
         object_kind = (
             tasks[0].object_kind
