@@ -101,6 +101,14 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
 
         governed_cases = (
             ("@BNL-01 When was BARCODE founded?", "barcode"),
+            (
+                "What do you know about BARCODE Radio?",
+                "barcode_radio",
+            ),
+            (
+                "What do you know about BARCODE Network?",
+                "barcode_network",
+            ),
             ("@BNL-01, when were you created?", "bnl_01"),
             ("@BNL-01, don't you know when you were created?", "bnl_01"),
             (
@@ -168,6 +176,47 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 self.assertEqual(frame.subjects[0].user_id, 202)
                 self.assertEqual(frame.tasks[0].authority_scope, "packet")
                 self.assertEqual(frame.tasks[0].subject_indexes, (0,))
+
+    def test_project_context_does_not_expand_typed_subjects(self):
+        cases = (
+            (
+                "Who is DJ Floppydisc in BARCODE?",
+                ("dj_floppydisc",),
+            ),
+            (
+                "Tell me about Cache Back's work with BARCODE Radio.",
+                ("cache_back",),
+            ),
+            (
+                "Mac Modem and Cache Back are both part of BARCODE. "
+                "What is his role in the Network?",
+                ("mac_modem", "cache_back"),
+            ),
+        )
+        for text, typed_subjects in cases:
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True,
+                    route_mode="normal_chat",
+                    conversation_surface="free_speak_sealed_mirror",
+                    channel_policy="sealed_test",
+                    current_text=text,
+                    current_speaker_user_ids=(101,),
+                    current_speaker_labels=("Test Member",),
+                    subject_entity_refs=typed_subjects,
+                    response_act="answer",
+                )
+
+                self.assertEqual(
+                    tuple(subject.entity_ref for subject in frame.subjects),
+                    typed_subjects,
+                )
+                self.assertTrue(
+                    all(
+                        task.authority_scope == "packet"
+                        for task in frame.tasks
+                    )
+                )
 
     def test_situation_frame_requires_an_actual_event_referent(self):
         ordinary_text = (

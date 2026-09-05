@@ -463,6 +463,27 @@ _SITUATION_BARCODE_PROJECT_RE = re.compile(
     r"\bbarcode\s+(?:collective|project)\b",
     re.I,
 )
+_SITUATION_ENTITY_SUBJECT_PREDICATE_RE = re.compile(
+    r"^\s*(?:['’]\s*s\b|(?:is|was|are|were|has|had|does|did|"
+    r"can|could|would|will|should|knows?|remembers?|works?|worked|"
+    r"owns?|owned|runs?|ran|hosts?|hosted|founds?|founded|starts?|"
+    r"started|joins?|joined|attends?|attended|creates?|created|"
+    r"builds?|built|launches?|launched)\b)",
+    re.I,
+)
+_SITUATION_ENTITY_SUBJECT_QUESTION_RE = re.compile(
+    r"\b(?:who|what|which|when|where|why|how)\b"
+    r"(?:\s+[a-z0-9'’-]+){0,4}\s+"
+    r"(?:is|was|are|were|do|does|did|has|have|had|"
+    r"can|could|would|will|should)\s+(?:the\s+)?$",
+    re.I,
+)
+_SITUATION_ENTITY_SUBJECT_REQUEST_RE = re.compile(
+    r"\b(?:tell\s+me\s+about|what\s+do\s+you\s+"
+    r"(?:know|remember)\s+about|describe|summari[sz]e|explain)"
+    r"\s+(?:the\s+)?$",
+    re.I,
+)
 _SITUATION_EXPLICIT_EVENT_REFERENT_RE = re.compile(
     r"\b(?:this|that|our|the)\s+"
     r"(?:(?:current|recent|last|previous|earlier|same|active|finalized)\s+)?"
@@ -838,6 +859,33 @@ def _situation_bnl_self_subject_cue(value: str) -> bool:
     )
 
 
+def _situation_entity_acts_as_subject(
+    subject_text: str,
+    entity_pattern: re.Pattern,
+) -> bool:
+    """Return whether one governed entity occupies a factual subject slot."""
+
+    for match in entity_pattern.finditer(str(subject_text or "")):
+        before = subject_text[: match.start()]
+        after = subject_text[match.end() :]
+        if _SITUATION_ENTITY_SUBJECT_PREDICATE_RE.match(after):
+            return True
+        if _SITUATION_ENTITY_SUBJECT_QUESTION_RE.search(before):
+            return True
+        if _SITUATION_ENTITY_SUBJECT_REQUEST_RE.search(before):
+            return True
+        if (
+            not before.strip()
+            and re.match(
+                r"^\s*[,;:—–-]+\s*(?:who|what|which|when|where|why|how)\b",
+                after,
+                re.I,
+            )
+        ):
+            return True
+    return False
+
+
 def _situation_governed_entity_refs(value: str) -> Tuple[str, ...]:
     """Return exact existing canon entities used as request subjects."""
 
@@ -846,17 +894,32 @@ def _situation_governed_entity_refs(value: str) -> Tuple[str, ...]:
     )
     refs = []
     if (
-        _SITUATION_BNL_ENTITY_RE.search(subject_text)
+        _situation_entity_acts_as_subject(
+            subject_text,
+            _SITUATION_BNL_ENTITY_RE,
+        )
         or _situation_bnl_self_subject_cue(value)
     ):
         refs.append(BNL01.key)
-    if _SITUATION_BARCODE_RADIO_RE.search(subject_text):
+    if _situation_entity_acts_as_subject(
+        subject_text,
+        _SITUATION_BARCODE_RADIO_RE,
+    ):
         refs.append("barcode_radio")
-    elif _SITUATION_BARCODE_NETWORK_RE.search(subject_text):
+    elif _situation_entity_acts_as_subject(
+        subject_text,
+        _SITUATION_BARCODE_NETWORK_RE,
+    ):
         refs.append("barcode_network")
     elif (
-        _SITUATION_BARCODE_EXACT_RE.search(subject_text)
-        or _SITUATION_BARCODE_PROJECT_RE.search(subject_text)
+        _situation_entity_acts_as_subject(
+            subject_text,
+            _SITUATION_BARCODE_EXACT_RE,
+        )
+        or _situation_entity_acts_as_subject(
+            subject_text,
+            _SITUATION_BARCODE_PROJECT_RE,
+        )
     ):
         refs.append("barcode")
     return tuple(dict.fromkeys(refs))
@@ -895,12 +958,16 @@ def situation_governed_dependency_kinds(
         _situation_subject_text(value)
     )
     dependencies = []
-    entity_refs = _situation_governed_entity_refs(value)
-    if BNL01.key in entity_refs:
+    if (
+        _SITUATION_BNL_ENTITY_RE.search(subject_text)
+        or _situation_bnl_self_subject_cue(value)
+    ):
         dependencies.append("bnl_subject")
-    if any(
-        entity_ref in {"barcode", "barcode_network", "barcode_radio"}
-        for entity_ref in entity_refs
+    if (
+        _SITUATION_BARCODE_RADIO_RE.search(subject_text)
+        or _SITUATION_BARCODE_NETWORK_RE.search(subject_text)
+        or _SITUATION_BARCODE_EXACT_RE.search(subject_text)
+        or _SITUATION_BARCODE_PROJECT_RE.search(subject_text)
     ):
         dependencies.append("project_subject")
     if _situation_governed_user_ids(value):
@@ -1093,6 +1160,14 @@ def _situation_tasks(
             event_ref=event_ref,
         )
         event_dependent = "event_referent" in dependency_kinds
+        governed_dependency = any(
+            dependency in {
+                "bnl_subject",
+                "project_subject",
+                "discord_subject",
+            }
+            for dependency in dependency_kinds
+        )
         phase = _situation_phase(segment)
         object_kind = _situation_object(segment)
         if event_dependent and object_kind == "unknown":
@@ -1143,14 +1218,6 @@ def _situation_tasks(
         subject_cue = bool(
             _situation_bnl_self_subject_cue(segment)
             or _SELF_SUBJECT_CUE_RE.search(subject_text)
-            or any(
-                dependency in {
-                    "bnl_subject",
-                    "project_subject",
-                    "discord_subject",
-                }
-                for dependency in dependency_kinds
-            )
             or (
                 _THIRD_PARTY_SUBJECT_CUE_RE.search(subject_text)
                 and not external_role_query
@@ -1183,6 +1250,7 @@ def _situation_tasks(
             subject_indexes = ()
         elif (
             subject_requirement == "required"
+            or governed_dependency
             or (
                 object_kind in _PACKET_AUTHORITY_OBJECTS
                 and not external_role_query
