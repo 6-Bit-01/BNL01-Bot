@@ -3582,8 +3582,10 @@ def ordinary_chat_task_support_plan(
 
 def render_ordinary_chat_task_contract(
     basis: SharedBrainSynthesisBasis,
+    *,
+    typed_output: bool = True,
 ) -> str:
-    """Render ordered task/support guidance for one typed provider result."""
+    """Render the same task/support guidance for typed or natural output."""
 
     tasks = _ordinary_frame_tasks(basis)
     if not tasks:
@@ -3639,6 +3641,20 @@ def render_ordinary_chat_task_contract(
             subject_indexes,
         ) in basis.rendered_evidence_refs
     ]
+    output_instructions = (
+        "ONE-CALL RESPONSE ENVELOPE:\n"
+        "Return the structured task result required by the provider response "
+        "schema. Return one task object for every task above, in the same "
+        "order. Copy its taskId, supportKind, and evidenceIds exactly from "
+        "the corresponding TURN RESPONSE PLAN line. The text field is the "
+        "only user-visible part. Make the ordered text fields combine into "
+        "one natural, coherent BNL reply without repetition. "
+        if typed_output
+        else "NATURAL RESPONSE:\n"
+        "Answer the tasks above in one natural, coherent BNL reply without "
+        "repetition. Return only the visible reply, without a JSON envelope "
+        "or schema fields. "
+    )
     return (
         "TURN RESPONSE PLAN:\n"
         + "\n".join(task_lines)
@@ -3646,13 +3662,8 @@ def render_ordinary_chat_task_contract(
         + ("\n".join(evidence_lines) if evidence_lines else "- none")
         + "\n- PUBLIC may support stable general public knowledge only.\n"
         + "- REQUEST may support a non-factual conversational response only.\n"
-        + "ONE-CALL RESPONSE ENVELOPE:\n"
-        + "Return the structured task result required by the provider response "
-        + "schema. Return one task object for every task above, in the same "
-        + "order. Copy its taskId, supportKind, and evidenceIds exactly from "
-        + "the corresponding TURN RESPONSE PLAN line. The text field is the "
-        + "only user-visible part. Make the ordered text fields combine into "
-        + "one natural, coherent BNL reply without repetition. Use each task's "
+        + output_instructions
+        + "Use each task's "
         + "listed packet support "
         + "together with relevant authorized context already present in this "
         + "prompt for BARCODE, member, publication, history, or current-state "
@@ -3665,7 +3676,7 @@ def render_ordinary_chat_task_contract(
         + "compilation, archive-status, or next-step notes unless the user "
         + "asked for them. Never put task IDs, support kinds, evidence IDs, "
         + "packets, lanes, schemas, contracts, validators, or internal controls "
-        + "inside a text field."
+        + ("inside a text field." if typed_output else "inside the visible reply.")
     )
 
 
@@ -4065,6 +4076,41 @@ def _ordinary_chat_contract_task_texts(
     if len(tasks) == 1 and current_text.strip():
         return (current_text,)
     return tuple("" for _task in tasks)
+
+
+def _ordinary_chat_contract_basis_for_public_task(
+    basis: SharedBrainSynthesisBasis,
+    task: Any,
+    request_text: str,
+) -> SharedBrainSynthesisBasis:
+    """Scope implicit claim referents to one resolved public task for review.
+
+    Evidence, participant bindings, and explicit governed-claim checks keep
+    their original basis. Only the request scope used to interpret otherwise
+    ambiguous prose changes; this view is never used for generation or packet
+    revalidation. A neighboring member or event task cannot supply implicit
+    subjects to a separately resolved public explanation.
+    """
+
+    subject_requirement = str(
+        getattr(task, "subject_requirement", "") or ""
+    ).strip().lower()
+    if (
+        str(getattr(task, "authority_scope", "") or "").strip().lower()
+        != "external_public"
+        or subject_requirement not in {"", "not_applicable", "not_required"}
+        or tuple(getattr(task, "subject_indexes", ()) or ())
+        or not str(request_text or "").strip()
+    ):
+        return basis
+    request = replace(
+        basis.packet.request,
+        user_text=request_text,
+        frame_tasks=(task,),
+        frame_subject_requirement=(subject_requirement or "not_applicable"),
+        frame_object_kind=str(getattr(task, "object_kind", "") or "unknown"),
+    )
+    return replace(basis, packet=replace(basis.packet, request=request))
 
 
 def _ordinary_chat_contract_basis_for_evidence_ids(
@@ -4707,8 +4753,13 @@ def audit_ordinary_chat_response_contract_text(
             if not supported:
                 unsupported += max(1, int(failed or 0))
         elif result.support_kind == "external_public":
-            audited, failed = audit_ordinary_chat_candidate_claims(
+            task_basis = _ordinary_chat_contract_basis_for_public_task(
                 basis,
+                task,
+                request_text,
+            )
+            audited, failed = audit_ordinary_chat_candidate_claims(
+                task_basis,
                 result.text,
                 allow_generic_second_person=True,
             )

@@ -356,6 +356,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         *,
         moment_id="",
         subject_user_ids=(),
+        subject_label_hints=(),
     ):
         frame = build_situation_frame_v1(
             route_allowed=True,
@@ -370,6 +371,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             source_message_ids=(301,),
             explicit_mention_count=1,
             subject_user_ids=subject_user_ids,
+            subject_label_hints=subject_label_hints,
             moment_id=moment_id,
             moment_situation_state=(
                 "recent_active" if moment_id else "none"
@@ -1256,6 +1258,39 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             )
         )
 
+    def test_natural_task_contract_retains_task_support_and_authority_guidance(self):
+        typed = render_ordinary_chat_task_contract(self.basis)
+        natural = render_ordinary_chat_task_contract(
+            self.basis,
+            typed_output=False,
+        )
+
+        self.assertIn("ONE-CALL RESPONSE ENVELOPE:", typed)
+        self.assertIn("Return the structured task result", typed)
+        self.assertNotIn("ONE-CALL RESPONSE ENVELOPE:", natural)
+        self.assertNotIn("Return the structured task result", natural)
+        self.assertIn("NATURAL RESPONSE:", natural)
+        self.assertIn("Return only the visible reply", natural)
+        self.assertIn("without a JSON envelope or schema fields", natural)
+        self.assertEqual(
+            typed.split("ONE-CALL RESPONSE ENVELOPE:", 1)[0],
+            natural.split("NATURAL RESPONSE:", 1)[0],
+        )
+        self.assertIn("TURN RESPONSE PLAN:", natural)
+        self.assertIn("SUPPORT REFERENCES:", natural)
+        for guidance in (
+            "PUBLIC may support stable general public knowledge only.",
+            "REQUEST may support a non-factual conversational response only.",
+            "relevant authorized context already present in this prompt",
+            "For supportKind=hold, state only the specific fact that cannot "
+            "be verified and continue answering the remaining tasks.",
+            "For response=refuse, answer naturally without revealing the "
+            "protected values.",
+        ):
+            with self.subTest(guidance=guidance):
+                self.assertIn(guidance, typed)
+                self.assertIn(guidance, natural)
+
     def test_packet_prompt_keeps_authorized_context_without_owner_veto(self):
         base_prompt = (
             "Current user request: What do you remember about me?\n"
@@ -2109,6 +2144,166 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                         protected_contract,
                     ).status,
                     "task_text_unsupported",
+                )
+
+    def test_typed_public_task_keeps_own_authority_in_mixed_member_turn(self):
+        request_text = (
+            "What do you know about me? Separately, briefly explain why "
+            "a checksum can detect a corrupted file but cannot repair it."
+        )
+        for moment_id in ("", "prior_event"):
+            frame, basis = self._basis_with_authority_frame(
+                request_text,
+                subject_user_ids=(7,),
+                subject_label_hints=("Test Member",),
+                moment_id=moment_id,
+            )
+            basis = replace(
+                basis,
+                assessment=replace(
+                    basis.assessment,
+                    situation_frame=frame,
+                ),
+            )
+            self.assertEqual(
+                tuple(task.authority_scope for task in frame.tasks),
+                ("packet", "external_public"),
+            )
+            self.assertEqual(
+                tuple(plan.support_kind for plan in
+                      ordinary_chat_task_support_plan(basis)),
+                ("packet", "external_public"),
+            )
+            for public_text in (
+                "It cannot reconstruct the original data from the short "
+                "digest alone.",
+                "A checksum summarizes the bytes without retaining a "
+                "copy of them.",
+            ):
+                with self.subTest(
+                    moment_id=moment_id,
+                    public_text=public_text,
+                ):
+                    contract = _contract_for_support_plan(
+                        basis,
+                        ("Your favorite movie is Arrival.", public_text),
+                    )
+                    validation = validate_ordinary_chat_response_contract(
+                        basis,
+                        contract,
+                    )
+                    self.assertTrue(validation.valid, validation)
+                    self.assertEqual(validation.covered_task_count, 2)
+                    self.assertEqual(validation.unsupported_claim_count, 0)
+                    self.assertEqual(
+                        validation.claim_classifications,
+                        ("member_supported", "external_public_knowledge"),
+                    )
+
+    def test_typed_public_task_does_not_inherit_neighboring_show_dependency(self):
+        frame, basis = self._basis_with_authority_frame(
+            "What happened in that show? Separately, briefly explain why "
+            "a checksum can detect a corrupted file but cannot repair it.",
+            moment_id="prior_event",
+        )
+        # This turn has an event referent but no retrieved show evidence.
+        basis = replace(
+            basis,
+            packet=replace(basis.packet, items=()),
+            assessment=replace(basis.assessment, situation_frame=frame),
+            rendered_evidence_refs=(),
+            rendered_source_digests=(),
+        )
+        self.assertEqual(frame.event_ref, "prior_event")
+        self.assertEqual(
+            tuple(task.authority_scope for task in frame.tasks),
+            ("packet", "external_public"),
+        )
+        self.assertEqual(
+            tuple(plan.support_kind for plan in
+                  ordinary_chat_task_support_plan(basis)),
+            ("hold", "external_public"),
+        )
+        public_text = (
+            "It cannot reconstruct the original data from the short "
+            "digest alone."
+        )
+        contract = _contract_for_support_plan(
+            basis,
+            ("I cannot verify what happened in that show.", public_text),
+        )
+        validation = validate_ordinary_chat_response_contract(basis, contract)
+        self.assertTrue(validation.valid, validation)
+        self.assertEqual(validation.covered_task_count, 2)
+        self.assertEqual(
+            validation.claim_classifications,
+            ("honest_nonassertion", "external_public_knowledge"),
+        )
+
+        unsupported_show = _contract_for_support_plan(
+            basis,
+            ("Fifty people attended that show.", public_text),
+        )
+        self.assertFalse(
+            validate_ordinary_chat_response_contract(
+                basis,
+                unsupported_show,
+            ).valid,
+        )
+
+    def test_typed_public_task_preserves_participant_and_project_authority(self):
+        frame, basis = self._basis_with_authority_frame(
+            "What do you know about me? Separately, briefly explain why "
+            "a checksum can detect a corrupted file but cannot repair it.",
+            subject_user_ids=(7,),
+            subject_label_hints=("Test Member",),
+            moment_id="prior_event",
+        )
+        basis = replace(
+            basis,
+            assessment=replace(basis.assessment, situation_frame=frame),
+        )
+        for packet_text, public_text in (
+            ("Your favorite movie is Arrival.", "You work at NASA."),
+            (
+                "Your favorite movie is Arrival.",
+                "Your favorite movie is Solaris.",
+            ),
+            (
+                "Your favorite movie is Arrival.",
+                "<@7> uses checksums to encrypt private files.",
+            ),
+            (
+                "Your favorite movie is Arrival.",
+                "Test Member uses checksums to encrypt private files.",
+            ),
+            (
+                "Your favorite movie is Arrival.",
+                "BARCODE uses checksums to encrypt private files.",
+            ),
+            (
+                "Your favorite movie is Solaris.",
+                "It cannot reconstruct the original data from the short "
+                "digest alone.",
+            ),
+        ):
+            with self.subTest(
+                packet_text=packet_text,
+                public_text=public_text,
+            ):
+                contract = _contract_for_support_plan(
+                    basis,
+                    (packet_text, public_text),
+                )
+                validation = validate_ordinary_chat_response_contract(
+                    basis,
+                    contract,
+                )
+                self.assertEqual(validation.status, "task_text_unsupported")
+                self.assertGreaterEqual(validation.unsupported_claim_count, 1)
+                self.assertIn(
+                    "unsupported_packet_domain",
+                    validation.claim_classifications,
                 )
 
     def test_typed_current_external_task_must_hold(self):
