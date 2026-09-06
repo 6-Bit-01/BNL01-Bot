@@ -197,6 +197,7 @@ from bnl_shared_brain_synthesis import (
     publication_packet_owns_turn,
     record_fallback as record_shared_brain_synthesis_fallback,
     record_single_packet_review,
+    render_ordinary_chat_task_contract,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
     route_scope_enabled as shared_brain_synthesis_route_scope_enabled,
     validate_ordinary_chat_response_contract,
@@ -11835,6 +11836,8 @@ def format_last_route_debug() -> str:
         ("ordinary_chat_run_id", "ordinary-chat response run"),
         ("ordinary_chat_response_sent", "ordinary-chat delivery confirmed"),
         ("ordinary_chat_turn_total_tokens", "ordinary-chat total generation tokens"),
+        ("ordinary_chat_final_repair_status", "ordinary-chat final repair status"),
+        ("ordinary_chat_final_guard_status", "ordinary-chat final delivery status"),
         ("save_policy_reason", "save policy reason"),
     ]
     lines = ["**BNL route debug (last conversational reply)**"]
@@ -41809,6 +41812,7 @@ async def apply_guarded_response_regeneration(
             )
             return _decode_ordinary_chat_repair_response(
                 tracked.text, prompt_source_bases, generation_accounting,
+                typed_output_expected=(generation_route == ORDINARY_CHAT_SINGLE_PACKET_ROUTE),
             )
         if batch_generation_id is not None:
             return await get_gemini_response(
@@ -43288,6 +43292,8 @@ async def safely_finalize_shared_brain_synthesis(
                     "ordinary_chat_single_packet_corrective_call_count": accounting.get("corrective_call_count", 0),
                     "ordinary_chat_turn_total_tokens": accounting.get("total_tokens", 0),
                     "ordinary_chat_response_sent": bool(response_sent),
+                    "ordinary_chat_final_repair_status": accounting.get("final_repair_contract_status", "not_needed"),
+                    "ordinary_chat_final_guard_status": guard_status,
                 })
         return finalized
     except Exception as exc:
@@ -43763,10 +43769,43 @@ def _ordinary_chat_run_accounting(decision) -> dict | None:
     return accounting if isinstance(accounting, dict) else None
 
 
+def _ordinary_chat_public_text_recovery_allowed(
+    reason: str,
+    prompt_source_bases: tuple[PromptSourceBasis, ...],
+) -> bool:
+    """Let a resolved public question recover from an inconclusive text audit.
+
+    The frozen task/reference contract already passed before this verdict.
+    Member, packet, current-state and mixed-authority tasks retain typed repair.
+    No language pattern or generated claim can expand the Frame's authority.
+    """
+    if reason != "typed_contract_task_text_unsupported":
+        return False
+    basis = _ordinary_chat_basis_from_sources(prompt_source_bases)
+    if basis is None:
+        return False
+    request = basis.packet.request
+    tasks = tuple(request.frame_tasks or ())
+    return bool(
+        request.frame_revision
+        and request.frame_subject_requirement in {"not_applicable", "not_required"}
+        and tasks
+        and all(
+            task.authority_scope == "external_public"
+            and task.required_response_act == "answer"
+            and task.subject_requirement in {"", "not_applicable", "not_required"}
+            and not task.subject_indexes
+            for task in tasks
+        )
+    )
+
+
 def _decode_ordinary_chat_repair_response(
     raw_response: str,
     prompt_source_bases: tuple[PromptSourceBasis, ...],
     generation_accounting: dict | None = None,
+    *,
+    typed_output_expected: bool = True,
 ) -> str:
     """Use the original typed contract before exposing any repaired text.
 
@@ -43776,6 +43815,32 @@ def _decode_ordinary_chat_repair_response(
     """
     raw = str(raw_response or "").strip()
     contract = parse_ordinary_chat_response_contract(raw)
+    envelope_surface = raw
+    if raw.startswith("```") and raw.endswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 3:
+            envelope_surface = "\n".join(lines[1:-1]).strip()
+    try:
+        payload = json.loads(envelope_surface)
+    except (TypeError, ValueError):
+        payload = None
+    internal_task_payload = bool(
+        (
+            isinstance(payload, dict)
+            and isinstance(payload.get("tasks"), list)
+            and any(
+                isinstance(task, dict)
+                and {"taskId", "supportKind", "evidenceIds"}.intersection(task)
+                for task in payload["tasks"]
+            )
+        )
+        or (
+            payload is None
+            and envelope_surface.startswith("{")
+            and re.search(r'"tasks"\s*:\s*\[', envelope_surface)
+            and re.search(r'"(?:taskId|supportKind|evidenceIds)"\s*:', envelope_surface)
+        )
+    )
     basis = _ordinary_chat_basis_from_sources(prompt_source_bases)
     status = contract.status
     if contract.status == "parsed":
@@ -43787,13 +43852,17 @@ def _decode_ordinary_chat_repair_response(
             status = "natural_recovery_envelope"
             response = contract.response
     elif (
-        basis is not None and raw.startswith(("{", "[", "```"))
+        typed_output_expected
+        and basis is not None and raw.startswith(("{", "[", "```"))
     ) or (
         # A schema-free repair can legitimately answer with JSON or code.
         # Keep only the internal task envelope out of the visible response,
         # including an incomplete envelope that the parser could not accept.
-        contract.status not in {"invalid_json", "invalid_shape"}
-        or bool(re.match(r'^\s*(?:```(?:json)?\s*)?\{\s*"tasks"\s*:', raw))
+        internal_task_payload
+        or (
+            payload is None
+            and bool(re.match(r'^\s*(?:```(?:json)?\s*)?\{\s*"tasks"\s*:', raw))
+        )
     ):
         response = ""
     else:
@@ -43903,6 +43972,28 @@ async def regenerate_ordinary_chat_response_obligation(
             route_mode=route_mode,
         )
     )
+    repair_basis = _ordinary_chat_basis_from_sources(repair_bases)
+    public_text_recovery = _ordinary_chat_public_text_recovery_allowed(
+        reason, repair_bases,
+    )
+    if public_text_recovery:
+        # Change only the response format. Keep the task plan, all authorized
+        # context, and the frozen source bases for the existing final guards.
+        typed_contract = render_ordinary_chat_task_contract(repair_basis)
+        natural_contract = render_ordinary_chat_task_contract(
+            repair_basis, typed_output=False,
+        )
+        if typed_contract and typed_contract in repair_prompt:
+            repair_prompt = repair_prompt.replace(typed_contract, natural_contract)
+        else:
+            repair_prompt += "\n\n" + natural_contract
+    repair_route = (
+        ORDINARY_CHAT_SINGLE_PACKET_ROUTE
+        if repair_basis is not None and not public_text_recovery
+        else ORDINARY_CHAT_RESPONSE_REPAIR_ROUTE
+    )
+    if generation_accounting is not None:
+        generation_accounting["final_repair_route"] = repair_route
     generation_started = time.monotonic()
     try:
         tracked = await get_tracked_gemini_response_with_optional_typing(
@@ -43910,11 +44001,7 @@ async def regenerate_ordinary_chat_response_obligation(
             repair_prompt,
             user_id,
             guild_id,
-            route=(
-                ORDINARY_CHAT_SINGLE_PACKET_ROUTE
-                if _ordinary_chat_basis_from_sources(repair_bases) is not None
-                else ORDINARY_CHAT_RESPONSE_REPAIR_ROUTE
-            ),
+            route=repair_route,
             source_context_available=bool(
                 source_context_available and not source_neutral
             ),
@@ -43933,6 +44020,7 @@ async def regenerate_ordinary_chat_response_obligation(
     )
     rewritten = _decode_ordinary_chat_repair_response(
         tracked.text, repair_bases, generation_accounting,
+        typed_output_expected=(repair_route == ORDINARY_CHAT_SINGLE_PACKET_ROUTE),
     )
     return (
         rewritten,
@@ -44023,7 +44111,11 @@ async def resolve_guarded_response_obligation(
         ) = await regenerate_ordinary_chat_response_obligation(
             channel=channel,
             prompt=rewritten_prompt,
-            reason="generic_non_answer_after_response_rewrite",
+            reason=(
+                reason
+                if _ordinary_chat_public_text_recovery_allowed(reason, rewritten_bases)
+                else "generic_non_answer_after_response_rewrite"
+            ),
             prompt_source_bases=rewritten_bases,
             user_id=user_id,
             guild_id=guild_id,
