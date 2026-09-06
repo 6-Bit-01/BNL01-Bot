@@ -737,7 +737,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v9",
+            "ordinary_chat_single_packet_v10",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
         self.assertFalse(
@@ -832,19 +832,36 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["sealed_test_mirror_scope_digest"])
 
         for user_id in (7, 8, 999):
-            with self.subTest(user_id=user_id):
-                decision = ordinary_chat_route_scope_decision(
-                    guild_id=123,
+            for current_direct in (True, False):
+                with self.subTest(
                     user_id=user_id,
-                    channel_id=456,
-                    route_mode="normal_chat",
-                    channel_policy="sealed_test",
-                    current_direct=True,
-                    user_text=self.text,
-                    environ=sealed_flags,
-                )
-                self.assertTrue(decision.eligible)
-                self.assertTrue(decision.effective)
+                    current_direct=current_direct,
+                ):
+                    decision = ordinary_chat_route_scope_decision(
+                        guild_id=123,
+                        user_id=user_id,
+                        channel_id=456,
+                        route_mode="normal_chat",
+                        channel_policy="sealed_test",
+                        current_direct=current_direct,
+                        user_text=self.text,
+                        environ=sealed_flags,
+                    )
+                    self.assertTrue(decision.eligible)
+                    self.assertTrue(decision.effective)
+
+        public_passive = ordinary_chat_route_scope_decision(
+            guild_id=1,
+            user_id=7,
+            channel_id=10,
+            route_mode="normal_chat",
+            channel_policy="public_context",
+            current_direct=False,
+            user_text=self.text,
+            environ=self.flags,
+        )
+        self.assertFalse(public_passive.eligible)
+        self.assertEqual(public_passive.reason, "not_direct")
 
         wrong_channel = ordinary_chat_route_scope_decision(
             guild_id=123,
@@ -950,6 +967,62 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             valid, status = revalidate_basis(
                 self.conn,
                 sealed_basis,
+                environ=sealed_flags,
+            )
+
+        self.assertTrue(valid)
+        self.assertEqual(status, "passed")
+
+    def test_sealed_test_passive_answer_builds_and_revalidates_basis(self):
+        sealed_flags = {
+            key: value
+            for key, value in self.flags.items()
+            if key
+            not in {
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS",
+            }
+        }
+        passive_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                guild_id=123,
+                channel_id=456,
+                channel_policy="sealed_test",
+                visibility_allowance="sealed_test",
+                direct_state="indirect",
+            ),
+        )
+        passive_assessment = replace(
+            self.assessment,
+            guild_id=123,
+            channel_policy="sealed_test",
+        )
+
+        passive_basis = build_ordinary_chat_basis(
+            guild_id=123,
+            user_id=999,
+            channel_id=456,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            current_direct=False,
+            user_text=self.text,
+            packet=passive_packet,
+            assessment=passive_assessment,
+            environ=sealed_flags,
+        )
+
+        self.assertIsNotNone(passive_basis)
+        self.assertEqual(passive_basis.packet.request.direct_state, "indirect")
+        with mock.patch(
+            "bnl_shared_brain_synthesis.revalidate_packet",
+            return_value=mock.Mock(valid=True, status="passed"),
+        ):
+            valid, status = revalidate_basis(
+                self.conn,
+                passive_basis,
                 environ=sealed_flags,
             )
 

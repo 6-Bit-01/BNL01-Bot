@@ -81,7 +81,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v9"
+    "ordinary_chat_single_packet_v10"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_TESTING_CHANNEL_ID_ENV = "BNL_TESTING_CHANNEL_ID"
@@ -1945,7 +1945,7 @@ def _ordinary_chat_configuration_details(
         ),
         "sealed_test_mirror_scope_digest": (
             _digest(
-                "ordinary_chat_single_packet_sealed_mirror_v2",
+                "ordinary_chat_single_packet_sealed_mirror_v3",
                 testing_channel_id,
                 ("sealed_test",),
                 _ROUTE_MODE,
@@ -2086,7 +2086,7 @@ def ordinary_chat_route_scope_decision(
         policy not in details["channel_policies"]
     ):
         reason = "channel_policy_not_supported"
-    elif not current_direct:
+    elif not current_direct and not sealed_test_mirror:
         reason = "not_direct"
     elif not str(user_text or "").strip():
         reason = "empty_turn"
@@ -4895,6 +4895,10 @@ def build_ordinary_chat_basis(
         UnifiedResponseAssessment,
     ):
         return None
+    if packet.request.direct_state != (
+        "direct" if current_direct else "indirect"
+    ):
+        return None
     rendered, lane_counts, item_count, source_digests = (
         _ordinary_packet_context(packet)
     )
@@ -5139,7 +5143,7 @@ def revalidate_basis(
             or basis.packet.request.channel_id != basis.channel_id
             or basis.packet.request.route_mode != basis.route_mode
             or basis.packet.request.channel_policy != basis.channel_policy
-            or basis.packet.request.direct_state != "direct"
+            or basis.packet.request.direct_state not in {"direct", "indirect"}
             or basis.assessment.guild_id != basis.guild_id
             or basis.assessment.route_mode != basis.route_mode
             or basis.assessment.channel_policy != basis.channel_policy

@@ -3719,6 +3719,133 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "batch_single_packet_candidate_sent",
         )
 
+    async def test_untagged_sealed_mirror_question_uses_single_packet(self):
+        channel = self._channel(8148)
+        request = (
+            "Briefly explain the practical difference between a narrow beam "
+            "and a wide beam."
+        )
+        answer = (
+            "A narrow beam concentrates energy and range; a wide beam trades "
+            "intensity for broader coverage."
+        )
+        packet = object()
+        assessment = object()
+        basis = object()
+        decision = SimpleNamespace(candidate_selected=True)
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision,
+            response=answer,
+            prompt="packet-owned prompt",
+            prompt_source_bases=(basis,),
+            candidate_active=True,
+            provider_call_count=1,
+            corrective_call_count=0,
+        )
+        assessment_calls = []
+
+        def build_assessment(*_args, **kwargs):
+            assessment_calls.append(kwargs)
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError(
+                "an answer-worthy sealed-mirror turn must not use the legacy "
+                "provider"
+            )
+
+        sealed_flags = {
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+            "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_TESTING_CHANNEL_ID": str(channel.id),
+            "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+            "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+            "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+        }
+
+        self._prime_flush(channel, request)
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.dict(os.environ, sealed_flags, clear=False),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_tiktok_show_evidence_context_for_turn",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "render_community_visual_basis_for_prompt",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                side_effect=build_assessment,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_ordinary_chat_basis",
+                return_value=basis,
+            ) as build_ordinary,
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_ordinary_chat_single_packet",
+                new=mock.AsyncMock(return_value=execution),
+            ) as generate_ordinary,
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+            ) as build_shared,
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=mock.AsyncMock(),
+            ) as generate_shared,
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=mock.AsyncMock(return_value=decision),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(channel.sent, [answer])
+        self.assertTrue(assessment_calls)
+        self.assertFalse(assessment_calls[-1]["current_direct"])
+        self.assertTrue(
+            assessment_calls[-1]["ordinary_chat_route_authorized"]
+        )
+        build_ordinary.assert_called_once()
+        self.assertFalse(
+            build_ordinary.call_args.kwargs["current_direct"]
+        )
+        generate_ordinary.assert_awaited_once()
+        build_shared.assert_not_called()
+        generate_shared.assert_not_awaited()
+
     async def test_typed_batch_contract_rejection_is_rewritten_and_sent(
         self,
     ):

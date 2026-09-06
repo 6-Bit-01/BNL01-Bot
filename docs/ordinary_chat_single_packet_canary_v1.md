@@ -47,8 +47,12 @@ three allowlists must each contain exactly one positive ID. Additional user or
 channel IDs fail closed with `scoped_expansion_not_enabled`. These allowlists
 do not govern `sealed_test` participants.
 
-The route is limited to direct, text-only `normal_chat` turns in `sealed_test`,
-`public_home`, or `public_context`. Direct-payload tasks, simple
+The route is limited to text-only `normal_chat` turns. The configured
+`sealed_test` mirror admits every single-speaker turn that the existing batch
+engagement controller has already decided to answer, including an untagged
+question; skip, observe, and acknowledgement-only turns exit before packet
+scope is evaluated. `public_home` and `public_context` remain limited to direct
+turns in their explicit rollout scope. Direct-payload tasks, simple
 greetings, show/status answers, media turns, commands, Journal/Relay controls,
 standalone website read-model answers, Broadcast-memory answers, and
 community-visual owners stay on their established routes. A mixed request for
