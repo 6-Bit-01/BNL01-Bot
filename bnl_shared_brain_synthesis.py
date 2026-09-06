@@ -9,7 +9,7 @@ This module owns no knowledge and persists no packet or response content.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -1357,6 +1357,11 @@ class SynthesisCanaryRun:
     prompt_applied: bool
     fallback_reason: str
     revalidation_status: str
+    # One transient accumulator follows the existing run through generation,
+    # guard repair and delivery. It is persisted only in the run's own receipt.
+    generation_accounting: dict[str, Any] | None = field(
+        default=None, compare=False, repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -9520,6 +9525,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ),
         ("provider_call_count", "INTEGER NOT NULL DEFAULT 0"),
         ("corrective_call_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("turn_generation_usage_json", "TEXT NOT NULL DEFAULT '{}'"),
         (
             "frame_revalidation_status",
             "TEXT NOT NULL DEFAULT 'not_evaluated'",
@@ -10468,6 +10474,22 @@ def finalize_run(
         processing_error = 1
     else:
         processing_error = 0
+    accounting = decision.run.generation_accounting
+    if accounting is not None:
+        conn.execute(
+            """
+            UPDATE memory_governance_shared_brain_synthesis_runs
+            SET provider_call_count=?,corrective_call_count=?,
+                turn_generation_usage_json=?
+            WHERE run_id=?
+            """,
+            (
+                max(0, int(accounting.get("provider_call_count", 0))),
+                max(0, int(accounting.get("corrective_call_count", 0))),
+                json.dumps(accounting, sort_keys=True),
+                decision.run.run_id,
+            ),
+        )
     cursor = conn.execute(
         """
         UPDATE memory_governance_shared_brain_synthesis_runs
@@ -10529,6 +10551,8 @@ def _empty_report() -> dict[str, Any]:
         "correctiveCallTotal": 0,
         "ordinaryCallCountViolationRuns": 0,
         "ordinaryCorrectiveCallViolationRuns": 0,
+        "ordinaryRepairedRuns": 0,
+        "turnGenerationUsage": {},
         "ordinaryTypedContractViolationRuns": 0,
         "typedContractStatusCounts": {},
         "typedTaskTotal": 0,
@@ -10708,6 +10732,10 @@ def build_evaluation_report(
         "corrective_call_count"
         if "corrective_call_count" in columns
         else "0"
+    )
+    turn_usage_expr = (
+        "turn_generation_usage_json"
+        if "turn_generation_usage_json" in columns else "'{}'"
     )
     frame_revalidation_expr = (
         "frame_revalidation_status"
@@ -10979,7 +11007,7 @@ def build_evaluation_report(
                {frame_revalidation_expr},{source_revalidation_expr},
                {typed_contract_status_expr},{typed_task_count_expr},
                {typed_task_coverage_expr},{typed_support_reference_expr},
-               created_at
+               {turn_usage_expr},created_at
         FROM memory_governance_shared_brain_synthesis_runs
         WHERE guild_id=?
         ORDER BY created_at DESC,run_id DESC
@@ -11008,6 +11036,7 @@ def build_evaluation_report(
             ),
             provider_call_expr=provider_call_expr,
             corrective_call_expr=corrective_call_expr,
+            turn_usage_expr=turn_usage_expr,
             frame_revalidation_expr=frame_revalidation_expr,
             source_revalidation_expr=source_revalidation_expr,
             typed_contract_status_expr=typed_contract_status_expr,
@@ -11039,6 +11068,8 @@ def build_evaluation_report(
     supported_coverage_regressions = 0
     ordinary_chat_runs = provider_call_total = corrective_call_total = 0
     ordinary_call_violations = ordinary_corrective_violations = 0
+    ordinary_repaired_runs = 0
+    turn_usage_totals: Counter[str] = Counter()
     ordinary_typed_contract_violations = 0
     typed_task_total = typed_task_coverage_total = 0
     typed_support_reference_total = 0
@@ -11084,6 +11115,7 @@ def build_evaluation_report(
             typed_task_count,
             typed_task_coverage_count,
             typed_support_reference_count,
+            turn_usage_json,
             _created_at,
         ) = row
         prompt += int(bool(prompt_applied))
@@ -11127,6 +11159,20 @@ def build_evaluation_report(
         ] += 1
         calls = max(0, int(provider_call_count or 0))
         corrective_calls = max(0, int(corrective_call_count or 0))
+        try:
+            turn_usage = json.loads(str(turn_usage_json or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            turn_usage = {}
+        if not isinstance(turn_usage, dict):
+            turn_usage = {}
+        if turn_usage:
+            turn_usage_totals["recordedRuns"] += 1
+            for key in (
+                "provider_call_count", "corrective_call_count", "total_tokens",
+                "prompt_tokens", "output_tokens", "thought_tokens", "cached_tokens",
+                "estimated_cost_nanos", "generation_latency_ms",
+            ):
+                turn_usage_totals[key] += max(0, int(turn_usage.get(key, 0) or 0))
         provider_call_total += calls
         corrective_call_total += corrective_calls
         frame_revalidation[
@@ -11149,10 +11195,21 @@ def build_evaluation_report(
         )
         if str(authority_mode or "") == ORDINARY_CHAT_AUTHORITY:
             ordinary_chat_runs += 1
-            ordinary_call_violations += int(
-                calls > 1 or (bool(prompt_applied) and calls != 1)
-            )
-            ordinary_corrective_violations += int(corrective_calls > 0)
+            if turn_usage:
+                # New final receipts include repairs in total calls. A bounded
+                # repair is visible work, not a violation of the response act.
+                primary_calls = calls - corrective_calls
+                ordinary_call_violations += int(
+                    primary_calls < 0 or primary_calls > 1
+                    or (bool(prompt_applied) and primary_calls != 1)
+                )
+                ordinary_repaired_runs += int(corrective_calls > 0)
+            else:
+                # Preserve the historical interpretation of older receipts.
+                ordinary_call_violations += int(
+                    calls > 1 or (bool(prompt_applied) and calls != 1)
+                )
+                ordinary_corrective_violations += int(corrective_calls > 0)
             ordinary_typed_contract_violations += int(
                 bool(candidate_selected)
                 and str(typed_contract_status or "") != "valid"
@@ -11208,6 +11265,8 @@ def build_evaluation_report(
         "ordinaryCorrectiveCallViolationRuns": (
             ordinary_corrective_violations
         ),
+        "ordinaryRepairedRuns": ordinary_repaired_runs,
+        "turnGenerationUsage": dict(turn_usage_totals),
         "ordinaryTypedContractViolationRuns": (
             ordinary_typed_contract_violations
         ),

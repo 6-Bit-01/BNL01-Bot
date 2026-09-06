@@ -14,6 +14,15 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
+from bnl_shared_brain_synthesis import SynthesisCanaryRun
+
+
+def ordinary_packet_run(basis):
+    return SynthesisCanaryRun(
+        run_id="batch-single-packet-test-run", basis=basis,
+        prompt_applied=True, fallback_reason="", revalidation_status="valid",
+        generation_accounting={"provider_call_count": 1, "corrective_call_count": 0},
+    )
 
 
 class ConversationBatchConfigTests(unittest.TestCase):
@@ -1120,7 +1129,12 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         save_model.assert_not_called()
         persist_name_decision.assert_not_awaited()
         record_assessment.assert_not_awaited()
-        finalize_synthesis.assert_not_awaited()
+        # The finalization owner is reached even for a no-store answer; with
+        # no synthesis decision it returns without creating a receipt.
+        finalize_synthesis.assert_awaited_once()
+        self.assertIsNone(finalize_synthesis.await_args.args[0])
+        self.assertTrue(finalize_synthesis.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize_synthesis.await_args.kwargs["candidate_live"])
         generate_synthesis.assert_not_awaited()
         mark_continuation.assert_not_called()
         consume_retransmission.assert_not_called()
@@ -2209,7 +2223,9 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         assessment = object()
         basis = object()
         memory_basis = object()
-        decision = SimpleNamespace(candidate_selected=True)
+        decision = SimpleNamespace(
+            candidate_selected=True, run=ordinary_packet_run(basis),
+        )
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
             decision=decision,
             response=answer,
@@ -3612,6 +3628,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         packet = object()
         assessment = object()
         decision = SimpleNamespace(
+            run=ordinary_packet_run(basis),
             candidate_selected=True,
             typed_contract_status="valid",
         )
@@ -3732,7 +3749,9 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         packet = object()
         assessment = object()
         basis = object()
-        decision = SimpleNamespace(candidate_selected=True)
+        decision = SimpleNamespace(
+            candidate_selected=True, run=ordinary_packet_run(basis),
+        )
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
             decision=decision,
             response=answer,
@@ -3863,6 +3882,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         packet = object()
         assessment = object()
         decision = SimpleNamespace(
+            run=ordinary_packet_run(basis),
             candidate_selected=False,
             typed_contract_status="invalid",
         )
@@ -4004,6 +4024,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         packet = object()
         assessment = object()
         decision = SimpleNamespace(
+            run=ordinary_packet_run(basis),
             candidate_selected=True,
             typed_contract_status="valid",
         )
@@ -4149,7 +4170,9 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         packet = object()
         assessment = object()
         memory_basis = object()
-        decision = SimpleNamespace(candidate_selected=True)
+        decision = SimpleNamespace(
+            candidate_selected=True, run=ordinary_packet_run(basis),
+        )
         answer = (
             "The Journal described the queue as BARCODE's public handoff "
             "for submissions. Right now, the live queue is open."
@@ -4415,6 +4438,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         packet = object()
         assessment = object()
         decision = SimpleNamespace(
+            run=ordinary_packet_run(basis),
             candidate_selected=True,
             typed_contract_status="valid",
         )

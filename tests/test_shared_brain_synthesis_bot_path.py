@@ -9,6 +9,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
+from bnl_shared_brain_synthesis import SynthesisCanaryRun
 
 
 class FakeChannel:
@@ -1088,7 +1089,8 @@ class SharedBrainSynthesisBotPathTests(
         )
         conversation_basis = object()
         memory_basis = object()
-        run = SimpleNamespace(
+        run = SynthesisCanaryRun(
+            run_id="single-packet-test-run",
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1209,7 +1211,8 @@ class SharedBrainSynthesisBotPathTests(
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
-        run = SimpleNamespace(
+        run = SynthesisCanaryRun(
+            run_id="single-packet-test-run",
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1294,7 +1297,8 @@ class SharedBrainSynthesisBotPathTests(
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
-        run = SimpleNamespace(
+        run = SynthesisCanaryRun(
+            run_id="single-packet-test-run",
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1395,7 +1399,8 @@ class SharedBrainSynthesisBotPathTests(
             # Unrelated canon evidence must not support live queue state.
             rendered_evidence_refs=(("E1", "canon", "digest", ()),),
         )
-        run = SimpleNamespace(
+        run = SynthesisCanaryRun(
+            run_id="single-packet-test-run",
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1500,7 +1505,8 @@ class SharedBrainSynthesisBotPathTests(
             ),
             rendered_evidence_refs=(),
         )
-        run = SimpleNamespace(
+        run = SynthesisCanaryRun(
+            run_id="single-packet-test-run",
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1757,7 +1763,7 @@ class SharedBrainSynthesisBotPathTests(
         self.assertEqual(calls, 1)
         self.assertEqual(
             provider.await_args.kwargs["route"],
-            bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+            bnl01_bot.ORDINARY_CHAT_RESPONSE_REPAIR_ROUTE,
         )
 
     async def test_empty_first_rewrite_gets_second_shared_brain_attempt(self):
@@ -2041,7 +2047,8 @@ class SharedBrainSynthesisBotPathTests(
         record_review.assert_not_awaited()
         finalize.assert_awaited_once()
         self.assertTrue(finalize.await_args.kwargs["response_sent"])
-        self.assertTrue(finalize.await_args.kwargs["candidate_live"])
+        # The repair was sent; the original candidate was not delivered.
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
 
     async def test_single_packet_generic_blocker_is_rewritten_not_sent(self):
         message = FakeMessage()

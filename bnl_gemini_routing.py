@@ -127,8 +127,11 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
         minimum=0,
         maximum=2,
     )
-    if normalized_route == "ordinary_chat_single_packet_canary":
-        # The accepted cutover path is one logical and physical provider
+    if normalized_route in {
+        "ordinary_chat_single_packet_canary",
+        "ordinary_chat_single_packet_canary_response_repair",
+    }:
+        # Each initial or repair generation makes one physical provider
         # attempt: no retry multiplication and no model fallback.
         return GeminiRoutePolicy(
             lane="protected",
