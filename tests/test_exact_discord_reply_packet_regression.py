@@ -39,6 +39,7 @@ class ExactDiscordReplyPacketRegressionTests(unittest.TestCase):
             "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
             "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_TESTING_CHANNEL_ID": "10",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10",

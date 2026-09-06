@@ -27494,6 +27494,7 @@ def _build_unified_intelligence_packet_shadow(
     operational_context_snapshot: str,
     operational_context_authorized: bool,
     current_direct: bool,
+    ordinary_chat_route_authorized: bool = False,
     situation_frame: SituationFrameV1 | None = None,
 ) -> UnifiedIntelligencePacket | None:
     """Build and persist one packet receipt without exposing it to the prompt."""
@@ -27610,9 +27611,6 @@ def _build_unified_intelligence_packet_shadow(
     shared_brain_configuration = (
         shared_brain_synthesis_canary_configuration()
     )
-    ordinary_chat_single_packet_configuration = (
-        ordinary_chat_configuration()
-    )
     journal_control_snapshot: JournalControlSnapshot | None = None
     journal_control_status = "not_requested"
     if journal_publication_query_mode(current_text) != "not_requested":
@@ -27657,14 +27655,7 @@ def _build_unified_intelligence_packet_shadow(
         immediate_recap=immediate_room_recap_requested(current_text),
         declared_canon_authorized=bool(
             shared_brain_configuration.get("effective")
-            or ordinary_chat_single_packet_configuration.get("effective")
-            or (
-                str(channel_policy or "").strip().lower()
-                == "sealed_test"
-                and ordinary_chat_single_packet_configuration.get(
-                    "sealed_test_mirror_effective"
-                )
-            )
+            or ordinary_chat_route_authorized
         ),
         frame_schema_version=(
             situation_frame.schema_version
@@ -27793,6 +27784,7 @@ def build_unified_response_assessment_shadow(
     operational_context_snapshot: str = "",
     packet_operational_context_authorized: bool = False,
     current_direct: bool = True,
+    ordinary_chat_route_authorized: bool = False,
     broadcast_memory_present: bool = False,
     intelligence_packet_out: dict | None = None,
     situation_frame: SituationFrameV1 | None = None,
@@ -27958,6 +27950,7 @@ def build_unified_response_assessment_shadow(
             packet_operational_context_authorized
         ),
         current_direct=current_direct,
+        ordinary_chat_route_authorized=ordinary_chat_route_authorized,
         situation_frame=situation_frame,
     )
     packet_usable = bool(
@@ -36809,6 +36802,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         active_packet.get("addressed_to_bot")
                         or is_broad_personal_recall_request(combined_text)
                     ),
+                    ordinary_chat_route_authorized=(
+                        batch_ordinary_chat_single_packet
+                    ),
                     intelligence_packet_out=(
                         batch_intelligence_packet_out
                     ),
@@ -39552,6 +39548,7 @@ def build_user_aware_prompt(
         packet_operational_context_authorized=bool(
             publication_queue_packet_ready
         ),
+        ordinary_chat_route_authorized=ordinary_chat_single_packet,
         broadcast_memory_present=assessment_broadcast_context_present,
         intelligence_packet_out=intelligence_packet_out,
         situation_frame=(

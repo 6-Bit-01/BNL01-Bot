@@ -32,7 +32,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v7"
+SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v8"
 SHADOW_EVALUATION_ORDER = (
     "memory_ledger",
     "moment_engine",
@@ -159,6 +159,9 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
         ),
         "ordinary_chat_single_packet_sealed_test_mirror_effective": bool(
             ordinary_chat_single_packet["sealed_test_mirror_effective"]
+        ),
+        "ordinary_chat_single_packet_sealed_test_channel_configured": bool(
+            ordinary_chat_single_packet["sealed_test_channel_configured"]
         ),
         "ordinary_chat_single_packet_kill_switch_env": str(
             ordinary_chat_single_packet["kill_switch_env"]
