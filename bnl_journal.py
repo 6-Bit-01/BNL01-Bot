@@ -639,7 +639,13 @@ def _journal_publication_digest(
         "sourceWindowStart": str(row.get("source_window_start") or ""),
         "sourceWindowEnd": str(row.get("source_window_end") or ""),
         "queryMode": str(query_mode or ""),
-        "controlAuthority": snapshot.authority_identity,
+        # Publication reads use public visibility. A control that excludes an
+        # article from memory formation does not revoke its published text.
+        # Snapshot freshness is checked separately on selection/revalidation.
+        "publicControlAuthority": (
+            snapshot.snapshot_version,
+            snapshot.public_excluded_entry_ids,
+        ),
     }
     return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
 
@@ -776,23 +782,28 @@ def select_published_journal_entries_on_connection(
     control_snapshot: JournalControlSnapshot | None,
     now: Any = None,
     limit: int = JOURNAL_PUBLICATION_RESULT_LIMIT,
+    include_context: bool = False,
 ) -> JournalPublicationSelection:
+    """Read published text; optionally retrieve topical ordinary context.
+
+    Without controls, local candidates are reported without exposing their
+    text. Callers can avoid a website control fetch when no local entry fits.
+    Memory-formation controls do not change public publication visibility.
+    """
     requested_mode = journal_publication_query_mode(user_text)
     if requested_mode == "not_requested":
-        return JournalPublicationSelection("not_requested", "not_requested")
-    control_status = journal_control_snapshot_status(
-        control_snapshot,
-        now=now,
-    )
-    if control_status != "valid" or control_snapshot is None:
-        return JournalPublicationSelection(control_status, requested_mode)
+        if not include_context:
+            return JournalPublicationSelection("not_requested", "not_requested")
+        requested_mode = "context"
     if not table_exists(conn, "bnl_journal_entries"):
         return JournalPublicationSelection("source_unavailable", requested_mode)
 
     identity = _journal_query_identity(user_text)
     publication_date_match = _JOURNAL_DATE_RE.search(str(user_text or ""))
     publication_date = (
-        publication_date_match.group(1) if publication_date_match else ""
+        publication_date_match.group(1)
+        if publication_date_match and requested_mode != "context"
+        else ""
     )
     if identity:
         query_mode = "exact_identity"
@@ -805,7 +816,7 @@ def select_published_journal_entries_on_connection(
     else:
         title_rows = (
             []
-            if requested_mode == "latest"
+            if requested_mode in {"latest", "context"}
             else _latest_published_journal_rows(
                 conn,
                 guild_id=guild_id,
@@ -826,7 +837,9 @@ def select_published_journal_entries_on_connection(
             )
         else:
             query_mode = (
-                "latest" if requested_mode == "latest" else "topic"
+                requested_mode
+                if requested_mode in {"latest", "context"}
+                else "topic"
             )
             rows = _latest_published_journal_rows(
                 conn,
@@ -837,12 +850,18 @@ def select_published_journal_entries_on_connection(
             if terms:
                 scored: list[tuple[int, str, dict[str, Any]]] = []
                 for row in rows:
-                    candidate_terms = _topic_terms(
-                        " ".join(
-                            str(row.get(key) or "")
-                            for key in ("title", "excerpt", "sections_json")
-                        )
-                    )
+                    publication_text = [
+                        str(row.get(key) or "")
+                        for key in ("title", "excerpt")
+                    ]
+                    for section in _json_list(row.get("sections_json")):
+                        if isinstance(section, dict):
+                            publication_text.extend(
+                                str(section.get(key) or "")
+                                for key in ("heading", "body")
+                            )
+                    # Rank the published words, never JSON field names.
+                    candidate_terms = _topic_terms(" ".join(publication_text))
                     score = len(terms & candidate_terms)
                     scored.append(
                         (
@@ -863,24 +882,36 @@ def select_published_journal_entries_on_connection(
                     ),
                     reverse=True,
                 )
-                # Lexical overlap ranks the bounded public evidence window;
-                # it does not decide whether BNL is allowed to reason over
-                # otherwise eligible recent Journal publications.
-                rows = [row for _score, _timestamp, row in scored]
+                # Explicit Journal requests retain the bounded recent window.
+                # Incidental context retrieves matching records without
+                # filling an unrelated conversation with recent publications.
+                rows = [
+                    row for score, _timestamp, row in scored
+                    if query_mode != "context" or score > 0
+                ]
+            elif query_mode == "context":
+                rows = []
 
     candidate_count = len(rows)
+    if not candidate_count:
+        return JournalPublicationSelection("not_found", query_mode)
+    # Rank the local bounded window first so ordinary unrelated conversation
+    # does not fetch website controls just to discover there is no evidence.
+    control_status = journal_control_snapshot_status(
+        control_snapshot,
+        now=now,
+    )
+    if control_status != "valid" or control_snapshot is None:
+        return JournalPublicationSelection(
+            control_status, query_mode, candidate_count=candidate_count,
+        )
     public_excluded = set(control_snapshot.public_excluded_entry_ids)
-    memory_excluded = set(control_snapshot.memory_excluded_entry_ids)
     selected: list[JournalPublication] = []
     hidden_count = 0
-    memory_ineligible_count = 0
     for row in rows:
         entry_id = str(row.get("entry_id") or "")
         if entry_id in public_excluded:
             hidden_count += 1
-            continue
-        if query_mode in {"topic", "latest"} and entry_id in memory_excluded:
-            memory_ineligible_count += 1
             continue
         publication = _journal_publication_from_row(
             row,
@@ -899,8 +930,6 @@ def select_published_journal_entries_on_connection(
         status = "eligible"
     elif hidden_count:
         status = "public_hidden"
-    elif memory_ineligible_count:
-        status = "memory_ineligible"
     elif candidate_count:
         status = "source_invalid"
     else:
@@ -911,7 +940,6 @@ def select_published_journal_entries_on_connection(
         publications=tuple(selected),
         candidate_count=candidate_count,
         public_hidden_count=hidden_count,
-        memory_ineligible_count=memory_ineligible_count,
     )
 
 
@@ -932,11 +960,6 @@ def revalidate_published_journal_entry_on_connection(
     ):
         return ""
     if entry_id in set(control_snapshot.public_excluded_entry_ids):
-        return ""
-    if (
-        query_mode in {"topic", "latest"}
-        and entry_id in set(control_snapshot.memory_excluded_entry_ids)
-    ):
         return ""
     if query_mode == "latest":
         if not str(user_text or "").strip():

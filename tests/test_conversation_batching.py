@@ -168,6 +168,17 @@ class BlockingSendChannel(FakeChannel):
 
 class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # Sealed conversation now reads public memory through the real reader.
+        # Each coordinator fixture needs the same schema as a running bot.
+        self.db_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.db_directory.cleanup)
+        db_patch = mock.patch.object(
+            bnl01_bot, "DB_FILE",
+            os.path.join(self.db_directory.name, "batch-memory.sqlite3"),
+        )
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        bnl01_bot.init_db()
         self.channel_ids = set()
         self.original_batching_enabled = bnl01_bot.BNL_ACTIVE_BATCHING_ENABLED
         self.original_typing_enabled = bnl01_bot.BNL_TYPING_INDICATOR_ENABLED
@@ -1687,7 +1698,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         with (
             self._flush_runtime(channel.id, generate),
             mock.patch.dict(os.environ, canary_env, clear=False),
-            mock.patch.object(bnl01_bot, "DB_FILE", ":memory:"),
             mock.patch.object(
                 bnl01_bot,
                 "apply_guarded_response_regeneration",
