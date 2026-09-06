@@ -37551,52 +37551,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if batch_ordinary_chat_execution is not None
             else 0
         )
-        batch_typed_single_packet = bool(
-            batch_ordinary_chat_execution is not None
-            and batch_ordinary_chat_execution.typed_contract_required
-        )
-
-        async def _withhold_batch_typed_single_packet(
-            *,
-            reason: str,
-            guard_status: str,
-            frame_revalidation_status: str = "",
-            source_revalidation_status: str = "",
-        ) -> None:
-            """Finalize one-call batch output without exposing or rewriting it."""
-
-            nonlocal batch_synthesis_decision
-            batch_synthesis_decision = (
-                await safely_record_ordinary_chat_single_packet_review(
-                    batch_synthesis_decision,
-                    reason=reason,
-                    corrective_call_count=(
-                        batch_single_packet_corrective_call_count
-                    ),
-                    frame_revalidation_status=frame_revalidation_status,
-                    source_revalidation_status=source_revalidation_status,
-                )
-                or batch_synthesis_decision
-            )
-            await safely_finalize_shared_brain_synthesis(
-                batch_synthesis_decision,
-                final_response="",
-                response_sent=False,
-                candidate_live=False,
-                guard_status=guard_status,
-            )
-            logging.warning(
-                "ordinary_chat_typed_single_packet_withheld route=batch "
-                "reason=%s provider_calls=%s corrective_calls=%s",
-                reason,
-                (
-                    batch_ordinary_chat_execution.provider_call_count
-                    if batch_ordinary_chat_execution is not None
-                    else 0
-                ),
-                batch_single_packet_corrective_call_count,
-            )
-
         if batch_single_packet_cutover:
             response = batch_ordinary_chat_execution.response
             prompt = batch_ordinary_chat_execution.prompt
@@ -37621,14 +37575,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_review_reason = (
                 batch_ordinary_chat_execution.review_reason
             )
-            if batch_typed_single_packet:
-                await _withhold_batch_typed_single_packet(
-                    reason=batch_review_reason,
-                    guard_status=(
-                        "typed_batch_single_packet_candidate_rejected"
-                    ),
-                )
-                return
             review_diagnostics = {
                 "suppressed": True,
                 "suppression_reason": batch_review_reason,
@@ -37749,11 +37695,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 ),
                 prompt_source_bases=tuple(batch_prompt_source_bases),
                 regeneration_allowed=bool(
-                    not batch_typed_single_packet
-                    and (
-                        batch_single_packet_cutover
-                        or not batch_synthesis_candidate_active
-                    )
+                    batch_single_packet_cutover
+                    or not batch_synthesis_candidate_active
                 ),
                 situation_frame=(
                     orchestration_state["decision"].situation_frame
@@ -37768,14 +37711,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_diagnostics.get("suppression_reason")
                 or "single_packet_guard_repair_required"
             )
-            if batch_typed_single_packet:
-                await _withhold_batch_typed_single_packet(
-                    reason=batch_single_packet_guard_reason,
-                    guard_status=(
-                        "typed_batch_single_packet_guard_rejected"
-                    ),
-                )
-                return
             (
                 response,
                 prompt,
@@ -38034,17 +37969,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             return
         if guard_diagnostics.get("suppressed"):
-            if batch_typed_single_packet:
-                await _withhold_batch_typed_single_packet(
-                    reason=str(
-                        guard_diagnostics.get("suppression_reason")
-                        or "typed_batch_single_packet_guard_rejected"
-                    ),
-                    guard_status=(
-                        "typed_batch_single_packet_guard_rejected"
-                    ),
-                )
-                return
             (
                 response,
                 prompt,
@@ -38122,14 +38046,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             "exact_quote_guard_reason": presend_quote_failure,
                         }
                     )
-                    if batch_typed_single_packet:
-                        await _withhold_batch_typed_single_packet(
-                            reason=presend_quote_failure,
-                            guard_status=(
-                                "typed_batch_single_packet_quote_rejected"
-                            ),
-                        )
-                        return
                     (
                         response,
                         prompt,
@@ -38267,15 +38183,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "prompt_source_basis_changed": True,
                 }
             )
-            if batch_typed_single_packet:
-                await _withhold_batch_typed_single_packet(
-                    reason=batch_source_failure,
-                    guard_status=(
-                        "typed_batch_single_packet_source_changed"
-                    ),
-                    source_revalidation_status=batch_source_failure,
-                )
-                return
             (
                 response,
                 prompt,
@@ -38621,17 +38528,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         "suppression_reason": frame_rewrite_reason,
                     }
                 )
-                if batch_typed_single_packet:
-                    await _withhold_batch_typed_single_packet(
-                        reason=frame_rewrite_reason,
-                        guard_status=(
-                            "typed_batch_single_packet_frame_changed"
-                        ),
-                        frame_revalidation_status=(
-                            batch_frame_revalidation.status
-                        ),
-                    )
-                    return
                 (
                     response,
                     prompt,
@@ -43545,9 +43441,9 @@ async def maybe_generate_ordinary_chat_single_packet(
     """Generate one typed, locally validated response from the shared packet.
 
     A pre-provider packet failure may leave the caller on normal generation.
-    Once this route calls the provider, however, it owns the turn: malformed
-    or rejected output is recorded and withheld instead of triggering a
-    second physical call or exposing the non-visible response envelope.
+    Once this route calls the provider, it returns the reviewed execution to
+    the delivery owner. A rejected draft remains rejected, but the delivery
+    owner retains the already-authorized response obligation and may repair it.
     """
 
     if not scope_applied:
@@ -43711,16 +43607,9 @@ async def maybe_generate_ordinary_chat_single_packet(
     )
     if not candidate:
         logging.warning(
-            "ordinary_chat_shared_brain_generation_withheld reason=%s "
-            "response_path=no_second_call",
+            "ordinary_chat_shared_brain_generation_repair_required reason=%s "
+            "response_path=response_obligation_repair",
             str(review_reason or "generation_failed"),
-        )
-        await safely_finalize_shared_brain_synthesis(
-            decision,
-            final_response="",
-            response_sent=False,
-            candidate_live=False,
-            guard_status="typed_single_packet_response_withheld",
         )
     return execution
 
@@ -43836,8 +43725,25 @@ async def regenerate_ordinary_chat_response_obligation(
             type(exc).__name__,
         )
         return "", repair_prompt, repair_bases, 0, source_neutral
+
+    raw_rewrite = str(tracked.text or "").strip()
+    repair_contract = parse_ordinary_chat_response_contract(raw_rewrite)
+    if repair_contract.status == "parsed":
+        rewritten = repair_contract.response
+    elif raw_rewrite.startswith(("{", "[", "```")):
+        # The packet-owned route requests a non-visible JSON envelope. Never
+        # expose a malformed envelope merely because this is a repair call.
+        logging.warning(
+            "ordinary_chat_response_rewrite_envelope_invalid status=%s",
+            repair_contract.status,
+        )
+        rewritten = ""
+    else:
+        # Preserve compatibility with an established natural-prose provider
+        # response while the route is rolled through scoped deployments.
+        rewritten = raw_rewrite
     return (
-        str(tracked.text or "").strip(),
+        rewritten,
         repair_prompt,
         repair_bases,
         max(0, int(tracked.provider_call_count or 0)),
@@ -44040,10 +43946,6 @@ async def send_planned_conversation_response(
         ordinary_chat_single_packet_execution is not None
     )
     single_packet_cutover = single_packet_receipt_present
-    typed_single_packet = bool(
-        ordinary_chat_single_packet_execution is not None
-        and ordinary_chat_single_packet_execution.typed_contract_required
-    )
     single_packet_corrective_call_count = int(
         ordinary_chat_single_packet_execution.corrective_call_count
         if ordinary_chat_single_packet_execution is not None
@@ -44096,57 +43998,12 @@ async def send_planned_conversation_response(
         prompt = baseline_prompt
         prompt_source_bases = baseline_prompt_source_bases
 
-    async def _withhold_typed_single_packet(
-        *,
-        reason: str,
-        guard_status: str,
-        frame_revalidation_status: str = "",
-        source_revalidation_status: str = "",
-    ) -> None:
-        """Finalize one-call output without exposing or regenerating it."""
-
-        nonlocal synthesis_decision
-        synthesis_decision = (
-            await safely_record_ordinary_chat_single_packet_review(
-                synthesis_decision,
-                reason=reason,
-                corrective_call_count=single_packet_corrective_call_count,
-                frame_revalidation_status=frame_revalidation_status,
-                source_revalidation_status=source_revalidation_status,
-            )
-            or synthesis_decision
-        )
-        await safely_finalize_shared_brain_synthesis(
-            synthesis_decision,
-            final_response="",
-            response_sent=False,
-            candidate_live=False,
-            guard_status=guard_status,
-        )
-        logging.warning(
-            "ordinary_chat_typed_single_packet_withheld reason=%s "
-            "provider_calls=%s corrective_calls=%s",
-            reason,
-            (
-                ordinary_chat_single_packet_execution.provider_call_count
-                if ordinary_chat_single_packet_execution is not None
-                else 0
-            ),
-            single_packet_corrective_call_count,
-        )
-
     if (
         single_packet_cutover
         and ordinary_chat_single_packet_execution is not None
         and ordinary_chat_single_packet_execution.review_reason
     ):
         review_reason = ordinary_chat_single_packet_execution.review_reason
-        if typed_single_packet:
-            await _withhold_typed_single_packet(
-                reason=review_reason,
-                guard_status="typed_single_packet_candidate_rejected",
-            )
-            return model_decision
         review_diagnostics = {
             "suppressed": True,
             "suppression_reason": review_reason,
@@ -44286,11 +44143,8 @@ async def send_planned_conversation_response(
         # evidence can require a grounded rewrite, but it cannot turn the
         # guard into a response veto.
         regeneration_allowed=bool(
-            not typed_single_packet
-            and (
-                single_packet_cutover
-                or not synthesis_candidate_active
-            )
+            single_packet_cutover
+            or not synthesis_candidate_active
         ),
     )
     if (
@@ -44301,12 +44155,6 @@ async def send_planned_conversation_response(
             guard_diagnostics.get("suppression_reason")
             or "single_packet_guard_repair_required"
         )
-        if typed_single_packet:
-            await _withhold_typed_single_packet(
-                reason=reason,
-                guard_status="typed_single_packet_guard_rejected",
-            )
-            return model_decision
         (
             response,
             prompt,
@@ -44462,15 +44310,6 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("regenerated_for_register_mismatch")
     )
     if guard_diagnostics.get("suppressed"):
-        if typed_single_packet:
-            await _withhold_typed_single_packet(
-                reason=str(
-                    guard_diagnostics.get("suppression_reason")
-                    or "typed_single_packet_guard_rejected"
-                ),
-                guard_status="typed_single_packet_guard_rejected",
-            )
-            return model_decision
         (
             response,
             prompt,
@@ -44627,12 +44466,6 @@ async def send_planned_conversation_response(
                     "exact_quote_guard_reason": quote_presend_failure,
                 }
             )
-            if typed_single_packet:
-                await _withhold_typed_single_packet(
-                    reason=quote_presend_failure,
-                    guard_status="typed_single_packet_quote_rejected",
-                )
-                return model_decision
             (
                 response,
                 prompt,
@@ -44735,13 +44568,6 @@ async def send_planned_conversation_response(
                 "prompt_source_basis_changed": True,
             }
         )
-        if typed_single_packet:
-            await _withhold_typed_single_packet(
-                reason=direct_source_failure,
-                guard_status="typed_single_packet_source_changed",
-                source_revalidation_status=direct_source_failure,
-            )
-            return model_decision
         (
             response,
             prompt,
@@ -44955,15 +44781,6 @@ async def send_planned_conversation_response(
                     "suppression_reason": frame_rewrite_reason,
                 }
             )
-            if typed_single_packet:
-                await _withhold_typed_single_packet(
-                    reason=frame_rewrite_reason,
-                    guard_status="typed_single_packet_frame_changed",
-                    frame_revalidation_status=(
-                        final_frame_revalidation.status
-                    ),
-                )
-                return model_decision
             (
                 response,
                 prompt,
