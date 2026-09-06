@@ -9,7 +9,6 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
-from bnl_shared_brain_synthesis import SynthesisCanaryRun
 
 
 class FakeChannel:
@@ -1089,8 +1088,7 @@ class SharedBrainSynthesisBotPathTests(
         )
         conversation_basis = object()
         memory_basis = object()
-        run = SynthesisCanaryRun(
-            run_id="single-packet-test-run",
+        run = SimpleNamespace(
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1103,11 +1101,7 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text=(
-                    '{"tasks":[{"taskId":"T1","text":"One generated '
-                    'answer.","supportKind":"current_request",'
-                    '"evidenceIds":["REQUEST"]}]}'
-                ),
+                text="One generated answer.",
                 provider_call_count=1,
                 total_tokens=321,
                 prompt_tokens=200,
@@ -1200,19 +1194,13 @@ class SharedBrainSynthesisBotPathTests(
             123_456,
         )
         self.assertTrue(evaluate.call_args.kwargs["cost_priced"])
-        self.assertTrue(evaluate.call_args.kwargs["typed_contract_required"])
-        self.assertEqual(
-            evaluate.call_args.kwargs["response_contract"].status,
-            "parsed",
-        )
-        self.assertTrue(execution.typed_contract_required)
+        self.assertFalse(evaluate.call_args.kwargs["typed_contract_required"])
 
     async def test_single_packet_preprovider_exit_records_zero_calls(self):
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
-        run = SynthesisCanaryRun(
-            run_id="single-packet-test-run",
+        run = SimpleNamespace(
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1260,11 +1248,6 @@ class SharedBrainSynthesisBotPathTests(
                 "_evaluate_ordinary_chat_single_packet_receipt",
                 new=evaluate,
             ),
-            mock.patch.object(
-                bnl01_bot,
-                "safely_finalize_shared_brain_synthesis",
-                new=mock.AsyncMock(return_value=True),
-            ) as finalize,
         ):
             execution = (
                 await bnl01_bot.maybe_generate_ordinary_chat_single_packet(
@@ -1285,11 +1268,8 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertIsNotNone(execution)
-        self.assertEqual(execution.response, "")
-        self.assertTrue(execution.typed_contract_required)
+        self.assertIsNone(execution)
         provider.assert_awaited_once()
-        finalize.assert_not_awaited()
         self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 0)
         self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
 
@@ -1297,8 +1277,7 @@ class SharedBrainSynthesisBotPathTests(
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
-        run = SynthesisCanaryRun(
-            run_id="single-packet-test-run",
+        run = SimpleNamespace(
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1311,11 +1290,7 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text=(
-                    '{"tasks":[{"taskId":"T1","text":"Do you mean Mac '
-                    'Modem or Cache Back?","supportKind":"clarify",'
-                    '"evidenceIds":[]}]}'
-                ),
+                text="Do you mean Mac Modem or Cache Back?",
                 provider_call_count=1,
             )
         )
@@ -1399,8 +1374,7 @@ class SharedBrainSynthesisBotPathTests(
             # Unrelated canon evidence must not support live queue state.
             rendered_evidence_refs=(("E1", "canon", "digest", ()),),
         )
-        run = SynthesisCanaryRun(
-            run_id="single-packet-test-run",
+        run = SimpleNamespace(
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1417,10 +1391,7 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text=(
-                    '{"tasks":[{"taskId":"T1","text":"%s",'
-                    '"supportKind":"hold","evidenceIds":[]}]}' % response
-                ),
+                text=response,
                 provider_call_count=1,
             )
         )
@@ -1505,8 +1476,7 @@ class SharedBrainSynthesisBotPathTests(
             ),
             rendered_evidence_refs=(),
         )
-        run = SynthesisCanaryRun(
-            run_id="single-packet-test-run",
+        run = SimpleNamespace(
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -1523,11 +1493,7 @@ class SharedBrainSynthesisBotPathTests(
         )
         provider = mock.AsyncMock(
             return_value=bnl01_bot.TrackedGenerationResponse(
-                text=(
-                    '{"tasks":[{"taskId":"T1","text":"%s",'
-                    '"supportKind":"current_request",'
-                    '"evidenceIds":["REQUEST"]}]}' % response
-                ),
+                text=response,
                 provider_call_count=1,
             )
         )
@@ -1717,54 +1683,6 @@ class SharedBrainSynthesisBotPathTests(
         self.assertEqual(1, len(source_bases))
         self.assertFalse(source_neutral)
         self.assertFalse(diagnostics["suppressed"])
-
-    async def test_response_repair_extracts_typed_envelope_text(self):
-        natural_answer = (
-            "Violet Lantern 500 is set to green with a narrow beam and a "
-            "slow pulse."
-        )
-        envelope = (
-            '{"tasks":[{"taskId":"T1","text":"'
-            + natural_answer
-            + '","supportKind":"current_request",'
-            '"evidenceIds":["REQUEST"]}]}'
-        )
-        provider = mock.AsyncMock(
-            return_value=bnl01_bot.TrackedGenerationResponse(
-                text=envelope,
-                provider_call_count=1,
-            )
-        )
-
-        with mock.patch.object(
-            bnl01_bot,
-            "get_tracked_gemini_response_with_optional_typing",
-            new=provider,
-        ):
-            response, _prompt, _bases, calls, _source_neutral = (
-                await bnl01_bot.regenerate_ordinary_chat_response_obligation(
-                    channel=FakeChannel(),
-                    prompt="packet-owned Violet Lantern prompt",
-                    reason="typed_contract_task_text_unsupported",
-                    prompt_source_bases=(),
-                    user_id=7,
-                    guild_id=1,
-                    source_context_available=True,
-                    current_user_text=(
-                        "Actually, change the signal to green and make the "
-                        "beam narrow. Keep the slow pulse. What are the final "
-                        "Violet Lantern 500 settings?"
-                    ),
-                )
-            )
-
-        self.assertEqual(response, natural_answer)
-        self.assertNotIn('"tasks"', response)
-        self.assertEqual(calls, 1)
-        self.assertEqual(
-            provider.await_args.kwargs["route"],
-            bnl01_bot.ORDINARY_CHAT_RESPONSE_REPAIR_ROUTE,
-        )
 
     async def test_empty_first_rewrite_gets_second_shared_brain_attempt(self):
         natural_answer = (
@@ -2047,8 +1965,7 @@ class SharedBrainSynthesisBotPathTests(
         record_review.assert_not_awaited()
         finalize.assert_awaited_once()
         self.assertTrue(finalize.await_args.kwargs["response_sent"])
-        # The repair was sent; the original candidate was not delivered.
-        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
+        self.assertTrue(finalize.await_args.kwargs["candidate_live"])
 
     async def test_single_packet_generic_blocker_is_rewritten_not_sent(self):
         message = FakeMessage()
@@ -2148,197 +2065,6 @@ class SharedBrainSynthesisBotPathTests(
         self.assertIn("Journal", message.replies[0])
         self.assertIn("open right now", message.replies[0])
         guard.assert_awaited_once()
-        resolve.assert_awaited_once()
-        review.assert_awaited_once()
-        finalize.assert_awaited_once()
-        self.assertTrue(finalize.await_args.kwargs["response_sent"])
-        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
-
-    async def test_typed_current_request_rejection_is_rewritten_and_sent(self):
-        message = FakeMessage()
-        message.content = (
-            "Actually, change the signal to green and make the beam narrow. "
-            "Keep the slow pulse. What are the final Violet Lantern 500 "
-            "settings?"
-        )
-        natural_response = (
-            "Violet Lantern 500 is set to green with a narrow beam and a "
-            "slow pulse."
-        )
-        run = SimpleNamespace(run_id="typed-rejected-run")
-        decision = SimpleNamespace(
-            run=run,
-            candidate_selected=False,
-            fallback_reason="typed_contract_task_text_unsupported",
-        )
-        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=decision,
-            response=(
-                "Violet Lantern 500 is set to blue with a wide beam and a "
-                "fast pulse."
-            ),
-            prompt="packet-owned prompt",
-            prompt_source_bases=(),
-            candidate_active=False,
-            provider_call_count=1,
-            corrective_call_count=0,
-            review_reason="typed_contract_task_text_unsupported",
-            typed_contract_required=True,
-        )
-        resolve = mock.AsyncMock(
-            return_value=(
-                natural_response,
-                "packet-owned repair prompt",
-                (),
-                1,
-                False,
-            )
-        )
-        review = mock.AsyncMock(return_value=decision)
-        finalize = mock.AsyncMock(return_value=True)
-        guard = mock.AsyncMock(
-            return_value=(natural_response, {"suppressed": False})
-        )
-        with ExitStack() as stack:
-            for patcher in self.common_patches():
-                stack.enter_context(patcher)
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "resolve_guarded_response_obligation",
-                    new=resolve,
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "safely_record_ordinary_chat_single_packet_review",
-                    new=review,
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "safely_finalize_shared_brain_synthesis",
-                    new=finalize,
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "apply_guarded_response_regeneration",
-                    new=guard,
-                )
-            )
-
-            await bnl01_bot.send_planned_conversation_response(
-                message,
-                "ignored baseline",
-                self.plan(),
-                prompt="ignored baseline prompt",
-                source_context_available=True,
-                allow_model_save=False,
-                mark_recent_direct=False,
-                ordinary_chat_single_packet_execution=execution,
-            )
-
-        self.assertEqual(message.replies, [natural_response])
-        resolve.assert_awaited_once()
-        guard.assert_awaited_once()
-        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
-        review.assert_awaited_once()
-        self.assertEqual(
-            review.await_args.kwargs["corrective_call_count"],
-            1,
-        )
-        finalize.assert_awaited_once()
-        self.assertTrue(finalize.await_args.kwargs["response_sent"])
-        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
-
-    async def test_typed_single_packet_guard_rejection_is_rewritten_and_sent(self):
-        message = FakeMessage()
-        natural_response = "Packet-supported natural answer."
-        run = SimpleNamespace(run_id="typed-guard-run")
-        decision = SimpleNamespace(
-            run=run,
-            candidate_selected=True,
-            fallback_reason="",
-        )
-        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=decision,
-            response="Packet-supported answer.",
-            prompt="packet-owned prompt",
-            prompt_source_bases=(),
-            candidate_active=True,
-            provider_call_count=1,
-            corrective_call_count=0,
-            typed_contract_required=True,
-        )
-        guard = mock.AsyncMock(
-            return_value=(
-                "",
-                {
-                    "suppressed": True,
-                    "suppression_reason": "generic_non_answer_validation_only",
-                },
-            )
-        )
-        resolve = mock.AsyncMock(
-            return_value=(
-                natural_response,
-                "packet-owned repair prompt",
-                (),
-                1,
-                False,
-            )
-        )
-        review = mock.AsyncMock(return_value=decision)
-        finalize = mock.AsyncMock(return_value=True)
-        with ExitStack() as stack:
-            for patcher in self.common_patches():
-                stack.enter_context(patcher)
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "apply_guarded_response_regeneration",
-                    new=guard,
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "resolve_guarded_response_obligation",
-                    new=resolve,
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "safely_record_ordinary_chat_single_packet_review",
-                    new=review,
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    bnl01_bot,
-                    "safely_finalize_shared_brain_synthesis",
-                    new=finalize,
-                )
-            )
-
-            await bnl01_bot.send_planned_conversation_response(
-                message,
-                "ignored baseline",
-                self.plan(),
-                prompt="ignored baseline prompt",
-                source_context_available=True,
-                allow_model_save=False,
-                mark_recent_direct=False,
-                ordinary_chat_single_packet_execution=execution,
-            )
-
-        self.assertEqual(message.replies, [natural_response])
-        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
         resolve.assert_awaited_once()
         review.assert_awaited_once()
         finalize.assert_awaited_once()

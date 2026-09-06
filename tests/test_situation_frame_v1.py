@@ -211,44 +211,6 @@ class SituationFrameV1Tests(unittest.TestCase):
         self.assertEqual(live_weather.tasks[0].authority_scope, "external_current")
         self.assertEqual(live_weather.tasks[0].required_response_act, "hold")
 
-    def test_event_continuity_label_is_not_recast_as_a_person_subject(self):
-        frame = build_situation_frame_v1(
-            route_allowed=True,
-            route_mode="normal_chat",
-            conversation_surface="free_speak_sealed_mirror",
-            channel_policy="sealed_test",
-            current_text=(
-                "Back to Violet Lantern 499: what changed during this test, "
-                "what were the final settings, and how many humans took part?"
-            ),
-            current_speaker_user_ids=(101,),
-            current_speaker_labels=("Test Member",),
-            subject_label_hints=("Violet Lantern 499",),
-            moment_id="moment_violet_lantern",
-            moment_situation_state="recent_active",
-            moment_topic_coherent=True,
-            moment_participant_overlap=True,
-            referent_status="resolved",
-            response_act="answer",
-        )
-
-        self.assertEqual(frame.status, "resolved")
-        self.assertEqual(frame.subjects, ())
-        self.assertEqual(frame.subject_requirement, "not_applicable")
-        self.assertEqual(len(frame.tasks), 3)
-        self.assertTrue(
-            all(task.authority_scope == "packet" for task in frame.tasks)
-        )
-        self.assertTrue(
-            all(task.object_kind == "moment" for task in frame.tasks)
-        )
-        self.assertTrue(
-            all(
-                task.subject_requirement == "not_applicable"
-                for task in frame.tasks
-            )
-        )
-
     def test_barcode_radio_queue_is_one_packet_owned_queue_task(self):
         questions = (
             "is the Barcode Radio queue open right now?",

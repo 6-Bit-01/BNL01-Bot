@@ -85,85 +85,6 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             assessment.excluded_lanes,
         )
 
-    def test_declared_canon_uses_current_ordinary_route_authority(self):
-        flags = {
-            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
-            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
-            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
-            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
-            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
-            "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
-            "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
-            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
-            "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
-            "BNL_TESTING_CHANNEL_ID": "303",
-            "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
-            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "101",
-            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "303",
-            "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
-            "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
-            "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
-        }
-        captured_requests = []
-
-        def packet_builder(_conn, request, *, persist):
-            self.assertTrue(persist)
-            captured_requests.append(request)
-            return SimpleNamespace()
-
-        common = {
-            "guild_id": 1,
-            "route_mode": bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
-            "channel_policy": "sealed_test",
-            "conversation_surface": "free_speak_sealed_mirror",
-            "current_text": "What is the current status?",
-            "current_speaker_user_ids": (101,),
-            "current_speaker_labels": ("Member 1",),
-            "target_user_ids": (),
-            "participant_user_ids": (101,),
-            "conversation_evidence_items": (),
-            "source_context_snapshot": "",
-            "source_context_authorized": False,
-            "operational_context_snapshot": "",
-            "operational_context_authorized": False,
-            "current_direct": True,
-        }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = os.path.join(tmpdir, "packet.db")
-            sqlite3.connect(db_path).close()
-            with (
-                mock.patch.dict(os.environ, flags, clear=False),
-                mock.patch.object(bnl01_bot, "DB_FILE", db_path),
-                mock.patch.object(
-                    bnl01_bot,
-                    "unified_intelligence_packet_shadow_enabled",
-                    return_value=True,
-                ),
-                mock.patch.object(
-                    bnl01_bot,
-                    "shared_brain_synthesis_canary_configuration",
-                    return_value={"effective": False},
-                ),
-                mock.patch.object(
-                    bnl01_bot,
-                    "build_unified_intelligence_packet",
-                    side_effect=packet_builder,
-                ),
-            ):
-                bnl01_bot._build_unified_intelligence_packet_shadow(
-                    **common,
-                    channel_id=304,
-                    ordinary_chat_route_authorized=False,
-                )
-                bnl01_bot._build_unified_intelligence_packet_shadow(
-                    **common,
-                    channel_id=303,
-                    ordinary_chat_route_authorized=True,
-                )
-
-        self.assertFalse(captured_requests[0].declared_canon_authorized)
-        self.assertTrue(captured_requests[1].declared_canon_authorized)
-
     def test_bot_adapter_carries_active_episode_source_moments(self):
         historical_marker = bnl01_bot.build_conversation_evidence_item(
             text="This is a separate task: Project Copper Kite.",
@@ -652,7 +573,6 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
             "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
-            "BNL_TESTING_CHANNEL_ID": "303",
             (
                 "BNL_ORDINARY_CHAT_SINGLE_PACKET_"
                 "SCOPED_EXPANSION_ENABLED"
@@ -855,7 +775,6 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
             "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
-            "BNL_TESTING_CHANNEL_ID": "303",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "101",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "303",
@@ -875,10 +794,6 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             return assessment
 
         with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            mock.patch.object(
-                bnl01_bot, "DB_FILE", os.path.join(tmpdir, "packet.db")
-            ),
             mock.patch.dict(os.environ, flags, clear=False),
             mock.patch.object(
                 bnl01_bot,
@@ -951,7 +866,6 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 return_value=None,
             ),
         ):
-            bnl01_bot.init_db()
             metadata = {}
             prompt, *_ = bnl01_bot.build_user_aware_prompt(
                 101,

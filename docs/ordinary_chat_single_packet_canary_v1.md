@@ -3,37 +3,14 @@
 This capability cuts an explicitly bounded ordinary-chat scope over to one
 composed shared-brain prompt and one natural response obligation. It is disabled by
 default and is separate from the broad-profile comparison canary and
-public-home recall owner. The configured sealed test room is a channel-wide
-behavioral mirror; public rollout remains explicitly allowlisted and bounded.
-An eligible turn uses its packet-owned prompt when it is available. If packet
-preparation is unavailable, the established context-rich generation path still
-answers the user. Neither path emits a deterministic blocker or canned fallback
-message.
+public-home recall owner. The default remains the original private acceptance
+scope; contract v4 adds a second gate for controlled multi-user or
+multi-channel expansion. An eligible turn uses its packet-owned prompt when it
+is available. If packet preparation is unavailable, the established
+context-rich generation path still answers the user. Neither path emits a
+deterministic blocker or canned fallback message.
 
-## Default-off sealed test mirror
-
-The channel identified by `BNL_TESTING_CHANNEL_ID` is the isolated behavioral
-mirror for `#barcode-bot`. Once the
-ordinary-chat capability and its packet/assessment prerequisites are enabled,
-every participant already admitted to that Discord channel uses the same
-single-packet shared-brain path. The bot does not apply a second per-user,
-per-guild, or rollout allowlist inside the sealed room. The stable Discord
-channel ID selects the room; it does not select people. A different channel
-is rejected even if it has the same name or is otherwise labeled
-`sealed_test`. The `sealed_test`
-policy continues to own its private visibility and persistence boundaries; the
-mirror changes conversational and shared-brain routing, not disclosure scope.
-
-Required values:
-
-- `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED=true`
-- `BNL_TESTING_CHANNEL_ID=<the one sealed test channel id>`
-- `BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED=true`
-- `BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED=true`
-
-The existing ordinary-chat kill switch remains the rollback control.
-
-## Explicitly allowlisted public acceptance scope
+## Default-off private acceptance scope
 
 All four values are required:
 
@@ -42,17 +19,14 @@ All four values are required:
 - `BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS=<one user id>`
 - `BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS=<one channel id>`
 
-For `public_home` and `public_context`, without the scoped-expansion gate the
-three allowlists must each contain exactly one positive ID. Additional user or
-channel IDs fail closed with `scoped_expansion_not_enabled`. These allowlists
-do not govern `sealed_test` participants.
+Without the scoped-expansion gate, the three allowlists must each contain
+exactly one positive ID. Additional user or channel IDs fail closed with
+`scoped_expansion_not_enabled`; deploying contract v4 without changing the
+environment therefore preserves the accepted private routing and prompt-owner
+behavior.
 
-The route is limited to text-only `normal_chat` turns. The configured
-`sealed_test` mirror admits every single-speaker turn that the existing batch
-engagement controller has already decided to answer, including an untagged
-question; skip, observe, and acknowledgement-only turns exit before packet
-scope is evaluated. `public_home` and `public_context` remain limited to direct
-turns in their explicit rollout scope. Direct-payload tasks, simple
+The route is limited to direct, text-only `normal_chat` turns in
+`sealed_test`, `public_home`, or `public_context`. Direct-payload tasks, simple
 greetings, show/status answers, media turns, commands, Journal/Relay controls,
 standalone website read-model answers, Broadcast-memory answers, and
 community-visual owners stay on their established routes. A mixed request for
@@ -69,8 +43,7 @@ context-rich generation path in place. The independent rollback switch is
 
 ## Separately gated bounded expansion
 
-Expanding the explicitly allowlisted public acceptance scope additionally
-requires:
+Expanding beyond the private acceptance scope additionally requires:
 
 - `BNL_ORDINARY_CHAT_SINGLE_PACKET_SCOPED_EXPANSION_ENABLED=true`
 
@@ -87,10 +60,10 @@ authority. The primary ordinary-chat kill switch, global live-gate conflicts,
 and specialized-owner exclusions are unchanged. Ordinary generation remains
 responsible for the reply when packet authority is not active.
 
-Content-free configuration diagnostics expose sealed-mirror readiness, the
-private or `bounded_expansion` public scope mode, allowlist counts, hard caps,
-expansion-gate state, expansion-effective state, and scope digests. IDs are not
-exposed.
+Content-free configuration diagnostics expose the private or
+`bounded_expansion` scope mode, allowlist counts, hard caps, expansion-gate
+state, expansion-effective state, and a scope digest that changes when either
+the allowlists or expansion authorization changes. IDs are not exposed.
 
 ## One shared understanding and one response
 

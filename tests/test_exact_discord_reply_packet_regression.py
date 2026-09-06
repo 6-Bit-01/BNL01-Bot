@@ -39,7 +39,6 @@ class ExactDiscordReplyPacketRegressionTests(unittest.TestCase):
             "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
             "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
-            "BNL_TESTING_CHANNEL_ID": "10",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10",
@@ -300,22 +299,6 @@ class ExactDiscordReplyPacketRegressionTests(unittest.TestCase):
             response_contract,
         )
         self.assertTrue(validation.valid, validation.status)
-        self.assertEqual(
-            validation.claim_classifications,
-            ("authorized_exact_reply_transfer",),
-        )
-        wrong_value_contract = parse_ordinary_chat_response_contract(
-            '{"tasks":[{"taskId":"T1","text":"You gave me amber.",'
-            '"supportKind":"packet","evidenceIds":["%s"]}]}'
-            % cobalt_evidence_id
-        )
-        self.assertEqual(
-            validate_ordinary_chat_response_contract(
-                ordinary_basis,
-                wrong_value_contract,
-            ).status,
-            "task_text_unsupported",
-        )
 
         with sqlite3.connect(self.db_path) as conn:
             run = begin_single_packet_run(
