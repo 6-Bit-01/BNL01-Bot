@@ -27658,6 +27658,13 @@ def _build_unified_intelligence_packet_shadow(
         declared_canon_authorized=bool(
             shared_brain_configuration.get("effective")
             or ordinary_chat_single_packet_configuration.get("effective")
+            or (
+                str(channel_policy or "").strip().lower()
+                == "sealed_test"
+                and ordinary_chat_single_packet_configuration.get(
+                    "sealed_test_mirror_effective"
+                )
+            )
         ),
         frame_schema_version=(
             situation_frame.schema_version
