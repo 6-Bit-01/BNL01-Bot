@@ -421,6 +421,8 @@ class SharedBrainResponseHandoffTests(unittest.IsolatedAsyncioTestCase):
             path = os.path.join(directory, "batch-public-repair.db")
             with sqlite3.connect(path) as conn:
                 self.fixture.conn.backup(conn)
+            with mock.patch.object(bot, "DB_FILE", path):
+                bot.init_db()
             with (
                 batch._flush_runtime(channel.id, AssertionError("Legacy generation must not replace the packet route")),
                 mock.patch.object(bot, "DB_FILE", path),

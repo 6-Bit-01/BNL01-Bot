@@ -348,7 +348,9 @@ def _policy(row: dict) -> str:
     return str(row.get("channel_policy") or "unknown").strip().lower()
 
 def _public_cross_compatible(source: str, target: str) -> bool:
-    return source in PUBLIC_SAFE_POLICIES and target in PUBLIC_SAFE_POLICIES
+    # A sealed conversation can use the same public continuity sources as
+    # public home. Sealed source rows remain local to their original room.
+    return source in PUBLIC_SAFE_POLICIES and target in (PUBLIC_SAFE_POLICIES | SEALED_POLICIES)
 
 def route_permits_continuity(route_mode: str, allowed_sources: Iterable[str] = ()) -> bool:
     route = (route_mode or "").strip().lower()
@@ -1614,7 +1616,8 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         if _unsafe_row(row):
             return False, same_room
         if same_room:
-            if p != target_policy or (target_policy not in SAME_CHANNEL_CONTEXT_POLICIES):
+            readable_public_history = target_policy in SEALED_POLICIES and p in PUBLIC_SAFE_POLICIES
+            if (p != target_policy and not readable_public_history) or (target_policy not in SAME_CHANNEL_CONTEXT_POLICIES):
                 return False, same_room
             if not _row_age_ok(row, now, SAME_ROOM_RECENCY_MINUTES):
                 return False, same_room
