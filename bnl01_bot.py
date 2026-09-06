@@ -27661,6 +27661,8 @@ def _build_unified_intelligence_packet_shadow(
             or (
                 str(channel_policy or "").strip().lower()
                 == "sealed_test"
+                and BNL_TESTING_CHANNEL_ID > 0
+                and int(channel_id or 0) == BNL_TESTING_CHANNEL_ID
                 and ordinary_chat_single_packet_configuration.get(
                     "sealed_test_mirror_effective"
                 )

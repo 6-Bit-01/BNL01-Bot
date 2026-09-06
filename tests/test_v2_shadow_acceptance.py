@@ -595,6 +595,7 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
         gates = build_gate_snapshot(
             {
                 "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+                "BNL_TESTING_CHANNEL_ID": "456",
                 "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
                 "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
                 "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
@@ -608,6 +609,11 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
         self.assertTrue(
             gates[
                 "ordinary_chat_single_packet_sealed_test_mirror_effective"
+            ]
+        )
+        self.assertTrue(
+            gates[
+                "ordinary_chat_single_packet_sealed_test_channel_configured"
             ]
         )
         self.assertFalse(

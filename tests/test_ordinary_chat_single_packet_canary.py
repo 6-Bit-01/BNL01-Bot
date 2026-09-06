@@ -82,6 +82,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
             "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_TESTING_CHANNEL_ID": "456",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10",
@@ -736,7 +737,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v8",
+            "ordinary_chat_single_packet_v9",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
         self.assertFalse(
@@ -757,6 +758,11 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertTrue(configured["sealed_test_mirror_effective"])
         self.assertFalse(configured["sealed_test_user_scope_required"])
+        self.assertTrue(configured["sealed_test_channel_configured"])
+        self.assertEqual(
+            configured["sealed_test_channel_env"],
+            "BNL_TESTING_CHANNEL_ID",
+        )
 
         expanded_without_gate = ordinary_chat_configuration(
             {
@@ -840,6 +846,23 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 self.assertTrue(decision.eligible)
                 self.assertTrue(decision.effective)
 
+        wrong_channel = ordinary_chat_route_scope_decision(
+            guild_id=123,
+            user_id=999,
+            channel_id=457,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            current_direct=True,
+            user_text=self.text,
+            environ=sealed_flags,
+        )
+        self.assertFalse(wrong_channel.eligible)
+        self.assertFalse(wrong_channel.effective)
+        self.assertEqual(
+            wrong_channel.reason,
+            "sealed_test_channel_mismatch",
+        )
+
         public_decision = ordinary_chat_route_scope_decision(
             guild_id=123,
             user_id=7,
@@ -854,6 +877,34 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertEqual(
             public_decision.reason,
             "configuration_scope_incomplete",
+        )
+
+        unconfigured_flags = {
+            key: value
+            for key, value in sealed_flags.items()
+            if key != "BNL_TESTING_CHANNEL_ID"
+        }
+        unconfigured = ordinary_chat_configuration(unconfigured_flags)
+        self.assertFalse(unconfigured["any_route_effective"])
+        self.assertFalse(unconfigured["sealed_test_channel_configured"])
+        self.assertEqual(
+            unconfigured["sealed_test_mirror_reason"],
+            "testing_channel_unconfigured",
+        )
+        unconfigured_decision = ordinary_chat_route_scope_decision(
+            guild_id=123,
+            user_id=999,
+            channel_id=456,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            current_direct=True,
+            user_text=self.text,
+            environ=unconfigured_flags,
+        )
+        self.assertFalse(unconfigured_decision.eligible)
+        self.assertEqual(
+            unconfigured_decision.reason,
+            "configuration_testing_channel_unconfigured",
         )
 
     def test_sealed_test_revalidation_does_not_reintroduce_user_scope(self):

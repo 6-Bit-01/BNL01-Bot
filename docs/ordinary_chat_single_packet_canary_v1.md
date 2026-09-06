@@ -3,25 +3,31 @@
 This capability cuts an explicitly bounded ordinary-chat scope over to one
 composed shared-brain prompt and one natural response obligation. It is disabled by
 default and is separate from the broad-profile comparison canary and
-public-home recall owner. The sealed test room is a channel-wide behavioral
-mirror; public rollout remains explicitly allowlisted and bounded. An eligible
-turn uses its packet-owned prompt when it is available. If packet preparation
-is unavailable, the established context-rich generation path still answers the
-user. Neither path emits a deterministic blocker or canned fallback message.
+public-home recall owner. The configured sealed test room is a channel-wide
+behavioral mirror; public rollout remains explicitly allowlisted and bounded.
+An eligible turn uses its packet-owned prompt when it is available. If packet
+preparation is unavailable, the established context-rich generation path still
+answers the user. Neither path emits a deterministic blocker or canned fallback
+message.
 
 ## Default-off sealed test mirror
 
-`sealed_test` is the isolated behavioral mirror for `#barcode-bot`. Once the
+The channel identified by `BNL_TESTING_CHANNEL_ID` is the isolated behavioral
+mirror for `#barcode-bot`. Once the
 ordinary-chat capability and its packet/assessment prerequisites are enabled,
 every participant already admitted to that Discord channel uses the same
 single-packet shared-brain path. The bot does not apply a second per-user,
-per-guild, or per-channel allowlist inside the sealed room. The `sealed_test`
+per-guild, or rollout allowlist inside the sealed room. The stable Discord
+channel ID selects the room; it does not select people. A different channel
+is rejected even if it has the same name or is otherwise labeled
+`sealed_test`. The `sealed_test`
 policy continues to own its private visibility and persistence boundaries; the
 mirror changes conversational and shared-brain routing, not disclosure scope.
 
 Required values:
 
 - `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED=true`
+- `BNL_TESTING_CHANNEL_ID=<the one sealed test channel id>`
 - `BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED=true`
 - `BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED=true`
 

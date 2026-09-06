@@ -81,9 +81,10 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v8"
+    "ordinary_chat_single_packet_v9"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
+ORDINARY_CHAT_TESTING_CHANNEL_ID_ENV = "BNL_TESTING_CHANNEL_ID"
 ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV = (
     "BNL_ORDINARY_CHAT_SINGLE_PACKET_SCOPED_EXPANSION_ENABLED"
 )
@@ -1780,6 +1781,15 @@ def _ordinary_chat_configuration_details(
     channels = _positive_ids(
         environ.get(ORDINARY_CHAT_CHANNEL_IDS_ENV, "")
     )
+    testing_channel_ids = _positive_ids(
+        environ.get(ORDINARY_CHAT_TESTING_CHANNEL_ID_ENV, "")
+    )
+    testing_channel_configured = len(testing_channel_ids) == 1
+    testing_channel_id = (
+        next(iter(testing_channel_ids))
+        if testing_channel_configured
+        else 0
+    )
     comparison_authority_requested = bool(
         _flag(environ.get(ENABLED_ENV, ""))
         or _flag(environ.get(PUBLIC_HOME_OWNER_ENABLED_ENV, ""))
@@ -1847,12 +1857,15 @@ def _ordinary_chat_configuration_details(
     )
     sealed_test_mirror_effective = bool(
         requested
+        and testing_channel_configured
         and prerequisites_ready
         and not comparison_authority_requested
         and not active_live_gates
     )
     if not requested:
         sealed_test_mirror_reason = "disabled"
+    elif not testing_channel_configured:
+        sealed_test_mirror_reason = "testing_channel_unconfigured"
     elif comparison_authority_requested:
         sealed_test_mirror_reason = "comparison_authority_conflict"
     elif active_live_gates:
@@ -1899,6 +1912,8 @@ def _ordinary_chat_configuration_details(
         "reason": reason,
         "sealed_test_mirror_effective": sealed_test_mirror_effective,
         "sealed_test_mirror_reason": sealed_test_mirror_reason,
+        "testing_channel_configured": testing_channel_configured,
+        "testing_channel_id": testing_channel_id,
         "authority_mode": ORDINARY_CHAT_AUTHORITY,
         "guilds": guilds,
         "users": users,
@@ -1930,7 +1945,8 @@ def _ordinary_chat_configuration_details(
         ),
         "sealed_test_mirror_scope_digest": (
             _digest(
-                "ordinary_chat_single_packet_sealed_mirror_v1",
+                "ordinary_chat_single_packet_sealed_mirror_v2",
+                testing_channel_id,
                 ("sealed_test",),
                 _ROUTE_MODE,
             )
@@ -1985,6 +2001,10 @@ def ordinary_chat_configuration(
             "sealed_test_mirror_reason"
         ],
         "sealed_test_user_scope_required": False,
+        "sealed_test_channel_configured": details[
+            "testing_channel_configured"
+        ],
+        "sealed_test_channel_env": ORDINARY_CHAT_TESTING_CHANNEL_ID_ENV,
         "authority_mode": ORDINARY_CHAT_AUTHORITY,
         "fully_scoped": details["fully_scoped"],
         "guild_allowlist_count": len(details["guilds"]),
@@ -2033,18 +2053,26 @@ def ordinary_chat_route_scope_decision(
     env = os.environ if environ is None else environ
     details = _ordinary_chat_configuration_details(env)
     policy = str(channel_policy or "").strip().lower()
-    sealed_test_mirror = policy == "sealed_test"
+    sealed_test_policy = policy == "sealed_test"
+    sealed_test_mirror = bool(
+        sealed_test_policy
+        and int(channel_id or 0) == details["testing_channel_id"]
+    )
     route_effective = bool(
-        details["sealed_test_mirror_effective"]
-        if sealed_test_mirror
+        details["sealed_test_mirror_effective"] and sealed_test_mirror
+        if sealed_test_policy
         else details["effective"]
     )
     configuration_reason = (
         details["sealed_test_mirror_reason"]
-        if sealed_test_mirror
+        if sealed_test_policy
         else details["reason"]
     )
-    if not route_effective:
+    if sealed_test_policy and not details["sealed_test_mirror_effective"]:
+        reason = "configuration_%s" % configuration_reason
+    elif sealed_test_policy and not sealed_test_mirror:
+        reason = "sealed_test_channel_mismatch"
+    elif not route_effective:
         reason = "configuration_%s" % configuration_reason
     elif not sealed_test_mirror and int(guild_id or 0) not in details["guilds"]:
         reason = "guild_not_allowlisted"
