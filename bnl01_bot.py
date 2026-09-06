@@ -21390,7 +21390,7 @@ def get_conversation_context_v2_rows(
         )
         _remember(cursor.fetchall())
     # Bounded same-user public-safe cross-channel candidates; assembler applies final recency/route/topic/policy gates.
-    if current_user_id and policy in {"public_home", "public_context"}:
+    if current_user_id and policy in {"public_home", "public_context", "sealed_test"}:
         cursor.execute(
             base_select + """
               AND user_id = ?
@@ -25974,15 +25974,21 @@ def build_user_memory_context(
         record_prompt_diagnostics({"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}})
         return "Memory intentionally skipped for simple greeting."
     policy = (channel_policy or "unknown").strip().lower() or "unknown"
-    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "sealed_test", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
+    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
         record_prompt_diagnostics({"skipped_reason": f"route_or_policy_{policy}", "included": {"short": 0, "medium": 0, "long": 0}})
         return "No route-safe durable memory for this mode/channel."
+
+    # The private mirror reads the existing public memory projection. Its
+    # actual policy remains sealed for provenance, diagnostics and every write.
+    # Being an operator does not widen a mirror conversation's source access.
+    memory_read_policy = "public_home" if policy == "sealed_test" else policy
+    memory_read_operator = bool(is_owner_or_mod and policy != "sealed_test")
 
     source_safe_recall_synthesis = source_safe_recall_synthesis_enabled(
         guild_id=guild_id,
         user_id=user_id,
         route_mode=route_mode,
-        channel_policy=policy,
+        channel_policy=memory_read_policy,
         user_text=user_text,
         current_direct=current_direct,
         environ=env,
@@ -25996,9 +26002,9 @@ def build_user_memory_context(
         user_id,
         guild_id,
         route_mode=route_mode,
-        channel_policy=policy,
+        channel_policy=memory_read_policy,
         user_text=user_text,
-        is_owner_or_mod=is_owner_or_mod,
+        is_owner_or_mod=memory_read_operator,
         connection=connection,
     )
     approved_facts = get_approved_member_fact_evidence(
@@ -26042,7 +26048,7 @@ def build_user_memory_context(
         guild_id=guild_id,
         user_id=user_id,
         route_mode=route_mode,
-        channel_policy=policy,
+        channel_policy=memory_read_policy,
         current_direct=current_direct,
         environ=env,
     ):
@@ -26098,7 +26104,7 @@ def build_user_memory_context(
             if rel_conn is None:
                 rel_conn = sqlite3.connect(DB_FILE)
             rel_v2 = governed_relationship_v2_summary(
-                rel_conn, guild_id=guild_id, user_id=user_id, target_user_id=user_id, route_mode=route_mode, channel_policy=policy,
+                rel_conn, guild_id=guild_id, user_id=user_id, target_user_id=user_id, route_mode=route_mode, channel_policy=memory_read_policy,
                 simple_greeting=bool(route_mode == ROUTE_MODE_SIMPLE_GREETING), direct=bool(current_direct), governance_allowed=bool(governance_allowed),
             )
             if rel_v2:

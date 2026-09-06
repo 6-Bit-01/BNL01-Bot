@@ -875,6 +875,10 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             return assessment
 
         with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(
+                bnl01_bot, "DB_FILE", os.path.join(tmpdir, "packet.db")
+            ),
             mock.patch.dict(os.environ, flags, clear=False),
             mock.patch.object(
                 bnl01_bot,
@@ -947,6 +951,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 return_value=None,
             ),
         ):
+            bnl01_bot.init_db()
             metadata = {}
             prompt, *_ = bnl01_bot.build_user_aware_prompt(
                 101,
