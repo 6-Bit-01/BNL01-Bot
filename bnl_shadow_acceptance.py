@@ -140,13 +140,25 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
             ordinary_chat_single_packet["configured_enabled"]
         ),
         "ordinary_chat_single_packet_effective": bool(
-            ordinary_chat_single_packet["effective"]
+            ordinary_chat_single_packet["any_route_effective"]
         ),
         "ordinary_chat_single_packet_reason": str(
-            ordinary_chat_single_packet["reason"]
+            ordinary_chat_single_packet[
+                "sealed_test_mirror_reason"
+                if ordinary_chat_single_packet[
+                    "sealed_test_mirror_effective"
+                ]
+                else "reason"
+            ]
         ),
         "ordinary_chat_single_packet_fully_scoped": bool(
             ordinary_chat_single_packet["fully_scoped"]
+        ),
+        "ordinary_chat_single_packet_allowlisted_scope_effective": bool(
+            ordinary_chat_single_packet["effective"]
+        ),
+        "ordinary_chat_single_packet_sealed_test_mirror_effective": bool(
+            ordinary_chat_single_packet["sealed_test_mirror_effective"]
         ),
         "ordinary_chat_single_packet_kill_switch_env": str(
             ordinary_chat_single_packet["kill_switch_env"]
@@ -155,7 +167,7 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
             governance_live_requested
             or relationship_live
             or engagement_live
-            or ordinary_chat_single_packet["effective"]
+            or ordinary_chat_single_packet["any_route_effective"]
         ),
     }
 

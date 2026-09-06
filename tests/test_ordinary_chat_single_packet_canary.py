@@ -736,7 +736,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v7",
+            "ordinary_chat_single_packet_v8",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
         self.assertFalse(
@@ -755,6 +755,8 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             configured["kill_switch_env"],
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED",
         )
+        self.assertTrue(configured["sealed_test_mirror_effective"])
+        self.assertFalse(configured["sealed_test_user_scope_required"])
 
         expanded_without_gate = ordinary_chat_configuration(
             {
@@ -798,6 +800,110 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             conflicting["reason"],
             "comparison_authority_conflict",
         )
+        self.assertFalse(conflicting["sealed_test_mirror_effective"])
+
+    def test_sealed_test_mirror_is_channel_scoped_not_user_scoped(self):
+        sealed_flags = {
+            key: value
+            for key, value in self.flags.items()
+            if key
+            not in {
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS",
+            }
+        }
+        configured = ordinary_chat_configuration(sealed_flags)
+
+        self.assertFalse(configured["effective"])
+        self.assertTrue(configured["any_route_effective"])
+        self.assertEqual(configured["reason"], "scope_incomplete")
+        self.assertTrue(configured["sealed_test_mirror_effective"])
+        self.assertEqual(
+            configured["sealed_test_mirror_reason"],
+            ORDINARY_CHAT_AUTHORITY,
+        )
+        self.assertTrue(configured["sealed_test_mirror_scope_digest"])
+
+        for user_id in (7, 8, 999):
+            with self.subTest(user_id=user_id):
+                decision = ordinary_chat_route_scope_decision(
+                    guild_id=123,
+                    user_id=user_id,
+                    channel_id=456,
+                    route_mode="normal_chat",
+                    channel_policy="sealed_test",
+                    current_direct=True,
+                    user_text=self.text,
+                    environ=sealed_flags,
+                )
+                self.assertTrue(decision.eligible)
+                self.assertTrue(decision.effective)
+
+        public_decision = ordinary_chat_route_scope_decision(
+            guild_id=123,
+            user_id=7,
+            channel_id=456,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            current_direct=True,
+            user_text=self.text,
+            environ=sealed_flags,
+        )
+        self.assertFalse(public_decision.eligible)
+        self.assertEqual(
+            public_decision.reason,
+            "configuration_scope_incomplete",
+        )
+
+    def test_sealed_test_revalidation_does_not_reintroduce_user_scope(self):
+        sealed_flags = {
+            key: value
+            for key, value in self.flags.items()
+            if key
+            not in {
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS",
+            }
+        }
+        sealed_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                guild_id=123,
+                channel_id=456,
+                channel_policy="sealed_test",
+                visibility_allowance="sealed_test",
+            ),
+        )
+        sealed_assessment = replace(
+            self.assessment,
+            guild_id=123,
+            channel_policy="sealed_test",
+        )
+        sealed_basis = replace(
+            self.basis,
+            packet=sealed_packet,
+            assessment=sealed_assessment,
+            guild_id=123,
+            user_id=999,
+            channel_id=456,
+            channel_policy="sealed_test",
+        )
+
+        with mock.patch(
+            "bnl_shared_brain_synthesis.revalidate_packet",
+            return_value=mock.Mock(valid=True, status="passed"),
+        ):
+            valid, status = revalidate_basis(
+                self.conn,
+                sealed_basis,
+                environ=sealed_flags,
+            )
+
+        self.assertTrue(valid)
+        self.assertEqual(status, "passed")
 
     def test_bounded_expansion_requires_its_gate_and_stays_capped(self):
         expanded_flags = {

@@ -81,7 +81,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v7"
+    "ordinary_chat_single_packet_v8"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV = (
@@ -1769,7 +1769,7 @@ def configuration(
 def _ordinary_chat_configuration_details(
     environ: Mapping[str, str],
 ) -> dict[str, Any]:
-    """Resolve private or explicitly expanded ordinary-chat authority."""
+    """Resolve sealed-mirror and explicitly allowlisted public authority."""
 
     requested = _flag(environ.get(ORDINARY_CHAT_ENABLED_ENV, ""))
     scoped_expansion_requested = _flag(
@@ -1845,6 +1845,24 @@ def _ordinary_chat_configuration_details(
         and not comparison_authority_requested
         and not active_live_gates
     )
+    sealed_test_mirror_effective = bool(
+        requested
+        and prerequisites_ready
+        and not comparison_authority_requested
+        and not active_live_gates
+    )
+    if not requested:
+        sealed_test_mirror_reason = "disabled"
+    elif comparison_authority_requested:
+        sealed_test_mirror_reason = "comparison_authority_conflict"
+    elif active_live_gates:
+        sealed_test_mirror_reason = "global_live_authority_detected"
+    elif version_conflicts:
+        sealed_test_mirror_reason = "prerequisite_version_conflict"
+    elif not prerequisites_ready:
+        sealed_test_mirror_reason = "missing_shadow_prerequisites"
+    else:
+        sealed_test_mirror_reason = ORDINARY_CHAT_AUTHORITY
     if not requested:
         reason = "disabled"
     elif scope_present and not scope_within_limits:
@@ -1879,6 +1897,8 @@ def _ordinary_chat_configuration_details(
         "scope_mode": scope_mode,
         "effective": effective,
         "reason": reason,
+        "sealed_test_mirror_effective": sealed_test_mirror_effective,
+        "sealed_test_mirror_reason": sealed_test_mirror_reason,
         "authority_mode": ORDINARY_CHAT_AUTHORITY,
         "guilds": guilds,
         "users": users,
@@ -1903,6 +1923,15 @@ def _ordinary_chat_configuration_details(
                 tuple(sorted(users)),
                 tuple(sorted(channels)),
                 tuple(sorted(_ORDINARY_CHAT_CHANNEL_POLICIES)),
+                _ROUTE_MODE,
+            )
+            if requested
+            else ""
+        ),
+        "sealed_test_mirror_scope_digest": (
+            _digest(
+                "ordinary_chat_single_packet_sealed_mirror_v1",
+                ("sealed_test",),
                 _ROUTE_MODE,
             )
             if requested
@@ -1944,7 +1973,18 @@ def ordinary_chat_configuration(
         "expanded_scope_present": details["expanded_scope_present"],
         "scope_mode": details["scope_mode"],
         "effective": details["effective"],
+        "any_route_effective": bool(
+            details["effective"]
+            or details["sealed_test_mirror_effective"]
+        ),
         "reason": details["reason"],
+        "sealed_test_mirror_effective": details[
+            "sealed_test_mirror_effective"
+        ],
+        "sealed_test_mirror_reason": details[
+            "sealed_test_mirror_reason"
+        ],
+        "sealed_test_user_scope_required": False,
         "authority_mode": ORDINARY_CHAT_AUTHORITY,
         "fully_scoped": details["fully_scoped"],
         "guild_allowlist_count": len(details["guilds"]),
@@ -1958,6 +1998,9 @@ def ordinary_chat_configuration(
         "prerequisites_ready": details["prerequisites_ready"],
         "conflicts": conflicts,
         "scope_digest": details["scope_digest"],
+        "sealed_test_mirror_scope_digest": details[
+            "sealed_test_mirror_scope_digest"
+        ],
         "kill_switch_env": ORDINARY_CHAT_ENABLED_ENV,
         "expansion_gate_env": (
             ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV
@@ -1989,19 +2032,30 @@ def ordinary_chat_route_scope_decision(
 
     env = os.environ if environ is None else environ
     details = _ordinary_chat_configuration_details(env)
-    if not details["effective"]:
-        reason = "configuration_%s" % details["reason"]
-    elif int(guild_id or 0) not in details["guilds"]:
+    policy = str(channel_policy or "").strip().lower()
+    sealed_test_mirror = policy == "sealed_test"
+    route_effective = bool(
+        details["sealed_test_mirror_effective"]
+        if sealed_test_mirror
+        else details["effective"]
+    )
+    configuration_reason = (
+        details["sealed_test_mirror_reason"]
+        if sealed_test_mirror
+        else details["reason"]
+    )
+    if not route_effective:
+        reason = "configuration_%s" % configuration_reason
+    elif not sealed_test_mirror and int(guild_id or 0) not in details["guilds"]:
         reason = "guild_not_allowlisted"
-    elif int(user_id or 0) not in details["users"]:
+    elif not sealed_test_mirror and int(user_id or 0) not in details["users"]:
         reason = "user_not_allowlisted"
-    elif int(channel_id or 0) not in details["channels"]:
+    elif not sealed_test_mirror and int(channel_id or 0) not in details["channels"]:
         reason = "channel_not_allowlisted"
     elif str(route_mode or "") != _ROUTE_MODE:
         reason = "route_mode_not_supported"
     elif (
-        str(channel_policy or "").strip().lower()
-        not in details["channel_policies"]
+        policy not in details["channel_policies"]
     ):
         reason = "channel_policy_not_supported"
     elif not current_direct:
@@ -2021,7 +2075,7 @@ def ordinary_chat_route_scope_decision(
         route_family=ORDINARY_CHAT_ROUTE_FAMILY,
         authority_mode=ORDINARY_CHAT_AUTHORITY,
         requested=bool(details["requested"]),
-        effective=bool(details["effective"]),
+        effective=route_effective,
     )
 
 
@@ -5028,8 +5082,18 @@ def revalidate_basis(
 ) -> tuple[bool, str]:
     env = os.environ if environ is None else environ
     if basis.ordinary_chat_single_packet:
-        details = _ordinary_chat_configuration_details(env)
-        config = ordinary_chat_configuration(env)
+        fresh_scope = ordinary_chat_route_scope_decision(
+            guild_id=basis.guild_id,
+            user_id=basis.user_id,
+            channel_id=basis.channel_id,
+            route_mode=basis.route_mode,
+            channel_policy=basis.channel_policy,
+            current_direct=(
+                basis.packet.request.direct_state == "direct"
+            ),
+            user_text=basis.packet.request.user_text,
+            environ=env,
+        )
         fresh_rendered, fresh_lane_counts, fresh_item_count, fresh_digests = (
             _ordinary_packet_context(basis.packet)
         )
@@ -5038,14 +5102,10 @@ def revalidate_basis(
             fresh_digests,
         )
         if (
-            not config["effective"]
+            not fresh_scope.eligible
             or basis.authority_mode != ORDINARY_CHAT_AUTHORITY
             or basis.route_family != ORDINARY_CHAT_ROUTE_FAMILY
-            or basis.guild_id not in details["guilds"]
-            or basis.user_id not in details["users"]
-            or basis.channel_id not in details["channels"]
             or basis.route_mode != _ROUTE_MODE
-            or basis.channel_policy not in details["channel_policies"]
             or basis.packet.schema_version != PACKET_SCHEMA_VERSION
             or basis.packet.request.guild_id != basis.guild_id
             or basis.packet.request.channel_id != basis.channel_id
