@@ -737,7 +737,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v10",
+            "ordinary_chat_single_packet_v11",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
         self.assertFalse(
@@ -2054,6 +2054,62 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             ).status,
             "task_text_unsupported",
         )
+
+    def test_typed_external_explanation_allows_generic_second_person_only(self):
+        request_text = (
+            "Briefly explain the practical difference between a narrow "
+            "beam and a wide beam."
+        )
+        frame, external_basis = self._basis_with_authority_frame(
+            request_text
+        )
+        self.assertEqual(frame.tasks[0].authority_scope, "external_public")
+        response = (
+            "A narrow beam concentrates its total energy into a tight, "
+            "highly directional line. That yields maximum range, "
+            "penetration, and power density at a specific target, but it "
+            "demands precise alignment—step an inch off-axis, and the "
+            "signal vanishes. A wide beam spreads that same energy across "
+            "a much broader field. You trade away reach and peak intensity "
+            "in exchange for immediate situational coverage, flooding an "
+            "area rather than piercing it. Practically speaking: narrow "
+            "beams are for long-distance, high-fidelity point-to-point "
+            "links where you know exactly where to aim; wide beams are for "
+            "ambient illumination and general broadcasting where staying "
+            "connected matters more than reaching the horizon."
+        )
+        contract = _contract_for_support_plan(external_basis, (response,))
+        validation = validate_ordinary_chat_response_contract(
+            external_basis,
+            contract,
+        )
+
+        self.assertTrue(validation.valid, validation)
+        self.assertEqual(validation.unsupported_claim_count, 0)
+        self.assertEqual(
+            set(validation.claim_classifications),
+            {"external_public_knowledge"},
+        )
+
+        for protected_claim in (
+            "Your favorite movie is Arrival.",
+            "You work at NASA.",
+            "You prefer narrow beams.",
+            "BARCODE uses a narrow beam.",
+            "<@7> uses a narrow beam.",
+        ):
+            with self.subTest(protected_claim=protected_claim):
+                protected_contract = _contract_for_support_plan(
+                    external_basis,
+                    (protected_claim,),
+                )
+                self.assertEqual(
+                    validate_ordinary_chat_response_contract(
+                        external_basis,
+                        protected_contract,
+                    ).status,
+                    "task_text_unsupported",
+                )
 
     def test_typed_current_external_task_must_hold(self):
         current_packet = replace(

@@ -81,7 +81,7 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v10"
+    "ordinary_chat_single_packet_v11"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
 ORDINARY_CHAT_TESTING_CHANNEL_ID_ENV = "BNL_TESTING_CHANNEL_ID"
@@ -4705,6 +4705,7 @@ def audit_ordinary_chat_response_contract_text(
             audited, failed = audit_ordinary_chat_candidate_claims(
                 basis,
                 result.text,
+                allow_generic_second_person=True,
             )
             supported = bool(
                 not failed
@@ -7856,6 +7857,7 @@ def _ordinary_chat_claim_has_packet_subject(
     packet_context: bool,
     selected_labels: Sequence[str],
     global_labels: Sequence[str],
+    allow_generic_second_person: bool = False,
 ) -> bool:
     governed_surface = _ordinary_chat_claim_governed_surface(claim)
     core = _ordinary_chat_claim_core(claim)
@@ -7872,6 +7874,35 @@ def _ordinary_chat_claim_has_packet_subject(
     )
     attributive_member_at_start = bool(
         _PACKET_DOMAIN_ATTRIBUTIVE_MEMBER_RE.match(core)
+    )
+    # A validated PUBLIC task may use plain second person generically (for
+    # example, "you trade range for coverage"). Possessive, identity, and
+    # profile assertions remain requester-scoped and therefore packet-owned.
+    generic_second_person = bool(
+        allow_generic_second_person
+        and re.search(r"\byou\b", governed_without_links, re.I)
+        and not re.search(
+            r"\b(?:your|yours|you['’](?:d|ll|re|ve))\b",
+            governed_without_links,
+            re.I,
+        )
+        and not _DIRECT_MEMBER_ASSERTION_RE.search(governed_without_links)
+        and not _UNSUPPORTED_SCALAR_ASSERTION_RE.search(
+            governed_without_links
+        )
+    )
+    leading_direct_packet_subject = bool(
+        _CLAIM_LEADING_DIRECT_PACKET_SUBJECT_RE.search(core)
+    )
+    if generic_second_person and re.match(r"^you\b", core, re.I):
+        leading_direct_packet_subject = False
+    requester_reference = bool(
+        re.search(r"<@!?\d+>", core)
+        or re.search(r"\b(?:your|yours)\b", governed_without_links, re.I)
+        or (
+            not generic_second_person
+            and re.search(r"\byou\b", governed_without_links, re.I)
+        )
     )
     event_context = bool(
         "event_referent"
@@ -7908,13 +7939,8 @@ def _ordinary_chat_claim_has_packet_subject(
             event_context
             and _PACKET_EVENT_CLAIM_SUBJECT_RE.search(core)
         )
-        or _CLAIM_LEADING_DIRECT_PACKET_SUBJECT_RE.search(core)
-        or re.search(r"<@!?\d+>", core)
-        or re.search(
-            r"(?:<@!?\d+>|\b(?:you|your|yours)\b)",
-            governed_without_links,
-            re.I,
-        )
+        or leading_direct_packet_subject
+        or requester_reference
         or re.match(
             r"^about\s+(?:you|your|the\s+(?:member|requester|user)|"
             r"this\s+member|that\s+member|<@!?\d+>)(?!\w)",
@@ -8963,6 +8989,7 @@ def audit_ordinary_chat_candidate_claims(
     response: str,
     *,
     coverage: CandidateProfileCoverage | None = None,
+    allow_generic_second_person: bool = False,
 ) -> tuple[tuple[str, ...], int]:
     """Separate unsupported packet claims from allowed external knowledge.
 
@@ -9181,6 +9208,9 @@ def audit_ordinary_chat_candidate_claims(
                 packet_context=packet_context,
                 selected_labels=selected_labels,
                 global_labels=global_labels,
+                allow_generic_second_person=(
+                    allow_generic_second_person
+                ),
             )
             or (
                 _ordinary_chat_queue_open_state(claim) is not None
