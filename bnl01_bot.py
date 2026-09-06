@@ -199,6 +199,7 @@ from bnl_shared_brain_synthesis import (
     record_single_packet_review,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
     route_scope_enabled as shared_brain_synthesis_route_scope_enabled,
+    validate_ordinary_chat_response_contract,
 )
 from bnl_memory_preview import (
     MemoryPreviewEvaluation,
@@ -1866,6 +1867,12 @@ You are BNL-01. The BARCODE Network is watching. You are functioning as intended
 # evidence. Packet bookkeeping does not replace that context or veto a reply.
 ORDINARY_CHAT_SINGLE_PACKET_ROUTE = (
     "ordinary_chat_single_packet_canary"
+)
+# The same response owner may need natural prose after its factual basis was
+# invalidated. This route keeps its voice/single generation path without asking
+# the provider to invent a typed task envelope after that basis was removed.
+ORDINARY_CHAT_RESPONSE_REPAIR_ROUTE = (
+    ORDINARY_CHAT_SINGLE_PACKET_ROUTE + "_response_repair"
 )
 BNL01_PACKET_OWNED_SYSTEM_PROMPT = """You are BNL-01, the BARCODE Network Liaison Entity.
 
@@ -11825,6 +11832,9 @@ def format_last_route_debug() -> str:
             "ordinary_chat_single_packet_review_reason",
             "ordinary-chat packet review reason",
         ),
+        ("ordinary_chat_run_id", "ordinary-chat response run"),
+        ("ordinary_chat_response_sent", "ordinary-chat delivery confirmed"),
+        ("ordinary_chat_turn_total_tokens", "ordinary-chat total generation tokens"),
         ("save_policy_reason", "save policy reason"),
     ]
     lines = ["**BNL route debug (last conversational reply)**"]
@@ -30926,9 +30936,10 @@ async def get_gemini_response(
     generation_result_out: dict | None = None,
 ):
     try:
-        one_call_packet_route = (
-            str(route or "") == ORDINARY_CHAT_SINGLE_PACKET_ROUTE
-        )
+        one_call_packet_route = str(route or "") in {
+            ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+            ORDINARY_CHAT_RESPONSE_REPAIR_ROUTE,
+        }
         if not check_quota_availability(route):
             result = GenerationResult(
                 False,
@@ -37491,6 +37502,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             ordinary_chat_single_packet_applied=(
                 batch_single_packet_cutover
             ),
+            ordinary_chat_run_id=(
+                batch_ordinary_chat_execution.decision.run.run_id
+                if batch_ordinary_chat_execution is not None
+                and batch_ordinary_chat_execution.decision is not None else ""
+            ),
             ordinary_chat_single_packet_provider_call_count=(
                 batch_ordinary_chat_execution.provider_call_count
                 if batch_ordinary_chat_execution is not None
@@ -37604,6 +37620,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 source_context_available=(
                     batch_response_source_context_available
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
             )
             batch_single_packet_corrective_call_count += (
                 response_rewrite_calls
@@ -37704,6 +37721,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 situation_frame=(
                     orchestration_state["decision"].situation_frame
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
             )
         )
         if (
@@ -37744,6 +37762,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 third_party_attribution_requested=(
                     batch_attribution_contract.third_party_attribution_requested
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
             )
             batch_single_packet_corrective_call_count += (
                 response_rewrite_calls
@@ -37791,6 +37810,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             != batch_single_packet_selected_response
         ):
             guard_diagnostics["single_packet_guard_repaired"] = True
+            batch_synthesis_candidate_active = False
         if (
             not batch_single_packet_cutover
             and batch_synthesis_candidate_active
@@ -37875,6 +37895,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         situation_frame=(
                             orchestration_state["decision"].situation_frame
                         ),
+                        generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
                     )
                 )
         guard_triggered = bool(
@@ -38001,6 +38022,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_attribution_contract
                     .third_party_attribution_requested
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
             )
             batch_prompt_source_bases = list(rewritten_source_bases)
             if batch_single_packet_cutover:
@@ -38080,6 +38102,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             batch_attribution_contract
                             .third_party_attribution_requested
                         ),
+                        generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
                     )
                     batch_single_packet_corrective_call_count += (
                         response_rewrite_calls
@@ -38171,6 +38194,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             batch_attribution_contract
                             .third_party_attribution_requested
                         ),
+                        generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
                     )
                     if not response:
                         return
@@ -38214,6 +38238,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 third_party_attribution_requested=(
                     batch_attribution_contract.third_party_attribution_requested
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
             )
             batch_single_packet_corrective_call_count += (
                 response_rewrite_calls
@@ -38319,6 +38344,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     situation_frame=(
                         orchestration_state["decision"].situation_frame
                     ),
+                    generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
                 )
             )
             if guard_diagnostics.get("suppressed"):
@@ -38353,6 +38379,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_attribution_contract
                         .third_party_attribution_requested
                     ),
+                    generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
                 )
                 batch_prompt_source_bases = list(
                     rewritten_source_bases
@@ -38457,6 +38484,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_attribution_contract
                     .third_party_attribution_requested
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
             )
             if not response:
                 return
@@ -38562,6 +38590,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_attribution_contract
                         .third_party_attribution_requested
                     ),
+                    generation_accounting=_ordinary_chat_run_accounting(batch_synthesis_decision),
                 )
                 batch_single_packet_corrective_call_count += (
                     response_rewrite_calls
@@ -38695,17 +38724,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="batch_discord_send_failed",
             )
             return
-        if not batch_model_persistence_allowed:
-            logging.info(
-                "batch_response_persistence_skipped "
-                "reason=%s channel_policy=%s",
-                batch_source_no_store_reason,
-                channel_policy,
-            )
-            _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
-            _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-            return
         await safely_finalize_shared_brain_synthesis(
             batch_synthesis_decision,
             final_response=response,
@@ -38726,6 +38744,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 else "batch_established_path_sent"
             ),
         )
+        if not batch_model_persistence_allowed:
+            logging.info(
+                "batch_response_persistence_skipped "
+                "reason=%s channel_policy=%s",
+                batch_source_no_store_reason,
+                channel_policy,
+            )
+            _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
+            _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+            return
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
         for uid in unique_user_ids:
             _consume_awaiting_retransmission(guild_id, channel_id, uid)
@@ -39518,6 +39547,7 @@ def build_user_aware_prompt(
         current_speaker_user_ids=(int(user_id or 0),),
         current_speaker_labels=(safe_display_name,),
         channel_id=channel_id,
+        current_direct=bool(is_direct_interaction),
         target_user_ids=(
             (int(moment_attribution_target_user_id),)
             if int(moment_attribution_target_user_id or 0) > 0
@@ -41443,6 +41473,7 @@ async def apply_guarded_response_regeneration(
     situation_frame: SituationFrameV1 | None = None,
     situation_frame_current_text: str = "",
     situation_frame_route_mode: str = "",
+    generation_accounting: dict | None = None,
 ) -> tuple[str, dict]:
     diagnostics = {
         "scripted_mode_leak_guard_triggered": False,
@@ -41749,6 +41780,36 @@ async def apply_guarded_response_regeneration(
         regeneration_kwargs["source_context_available"] = True
 
     async def regenerate(candidate_prompt: str):
+        if generation_route in {
+            ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+            ORDINARY_CHAT_RESPONSE_REPAIR_ROUTE,
+        }:
+            started = time.monotonic()
+            tracked = await get_tracked_gemini_response_with_optional_typing(
+                None if batch_generation_id is not None else channel,
+                candidate_prompt,
+                user_id,
+                guild_id,
+                route=generation_route,
+                source_context_available=source_context_available,
+            )
+            elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+            _record_ordinary_chat_generation_usage(
+                generation_accounting, tracked, elapsed_ms, corrective=True,
+            )
+            _record_ordinary_chat_generation_usage(
+                diagnostics.setdefault("ordinary_chat_repair_usage", {}),
+                tracked, elapsed_ms, corrective=True,
+            )
+            diagnostics["ordinary_chat_repair_provider_call_count"] = (
+                diagnostics["ordinary_chat_repair_usage"]["provider_call_count"]
+            )
+            diagnostics["ordinary_chat_repair_total_tokens"] = (
+                diagnostics["ordinary_chat_repair_usage"]["total_tokens"]
+            )
+            return _decode_ordinary_chat_repair_response(
+                tracked.text, prompt_source_bases, generation_accounting,
+            )
         if batch_generation_id is not None:
             return await get_gemini_response(
                 candidate_prompt,
@@ -43199,7 +43260,7 @@ async def safely_finalize_shared_brain_synthesis(
     if decision is None:
         return False
     try:
-        return await asyncio.to_thread(
+        finalized = await asyncio.to_thread(
             _finalize_shared_brain_synthesis_receipt,
             decision,
             final_response=final_response,
@@ -43207,6 +43268,28 @@ async def safely_finalize_shared_brain_synthesis(
             candidate_live=candidate_live,
             guard_status=guard_status,
         )
+        accounting = _ordinary_chat_run_accounting(decision)
+        if accounting is not None:
+            logging.info(
+                "ordinary_chat_turn_completed run_id=%s response_sent=%s "
+                "provider_calls=%s corrective_calls=%s total_tokens=%s "
+                "generation_latency_ms=%s guard_status=%s",
+                decision.run.run_id, int(response_sent),
+                accounting.get("provider_call_count", 0),
+                accounting.get("corrective_call_count", 0),
+                accounting.get("total_tokens", 0),
+                accounting.get("generation_latency_ms", 0), guard_status,
+            )
+            # Another channel may have completed during the final receipt write.
+            # Update only the debug record belonging to this exact response run.
+            if LAST_ROUTE_DEBUG.get("ordinary_chat_run_id") == decision.run.run_id:
+                LAST_ROUTE_DEBUG.update({
+                    "ordinary_chat_single_packet_provider_call_count": accounting.get("provider_call_count", 0),
+                    "ordinary_chat_single_packet_corrective_call_count": accounting.get("corrective_call_count", 0),
+                    "ordinary_chat_turn_total_tokens": accounting.get("total_tokens", 0),
+                    "ordinary_chat_response_sent": bool(response_sent),
+                })
+        return finalized
     except Exception as exc:
         logging.warning(
             "shared_brain_synthesis_canary_finalize_failed error=%s",
@@ -43508,6 +43591,7 @@ async def maybe_generate_ordinary_chat_single_packet(
         )
         return None
 
+    run = replace(run, generation_accounting={})
     generation_started = time.monotonic()
     provider_call_count = 0
     tracked_generation = TrackedGenerationResponse("", 0)
@@ -43541,6 +43625,10 @@ async def maybe_generate_ordinary_chat_single_packet(
     generation_latency_ms = max(
         0,
         int(round((time.monotonic() - generation_started) * 1000)),
+    )
+    _record_ordinary_chat_generation_usage(
+        run.generation_accounting, tracked_generation,
+        generation_latency_ms, corrective=False,
     )
     try:
         decision = await asyncio.to_thread(
@@ -43616,6 +43704,108 @@ async def maybe_generate_ordinary_chat_single_packet(
             str(review_reason or "generation_failed"),
         )
     return execution
+
+
+def _record_ordinary_chat_generation_usage(
+    accounting: dict | None,
+    tracked: TrackedGenerationResponse,
+    elapsed_ms: int,
+    *,
+    corrective: bool,
+) -> None:
+    """Accumulate physical work on the existing ordinary response run."""
+    if accounting is None:
+        return
+    accounting["generation_count"] = int(accounting.get("generation_count", 0)) + 1
+    accounting["repair_generation_count"] = int(
+        accounting.get("repair_generation_count", 0)
+    ) + int(corrective)
+    for key, attribute in (
+        ("provider_call_count", "provider_call_count"),
+        ("total_tokens", "total_tokens"),
+        ("prompt_tokens", "prompt_tokens"),
+        ("output_tokens", "candidate_tokens"),
+        ("thought_tokens", "thought_tokens"),
+        ("cached_tokens", "cached_tokens"),
+        ("estimated_cost_nanos", "estimated_cost_nanos"),
+    ):
+        accounting[key] = int(accounting.get(key, 0)) + max(
+            0, int(getattr(tracked, attribute, 0) or 0),
+        )
+    calls = max(0, int(tracked.provider_call_count or 0))
+    accounting["corrective_call_count"] = int(
+        accounting.get("corrective_call_count", 0)
+    ) + (calls if corrective else 0)
+    accounting["generation_latency_ms"] = int(
+        accounting.get("generation_latency_ms", 0)
+    ) + max(0, int(elapsed_ms))
+    if calls:
+        accounting["cost_priced"] = bool(
+            accounting.get("cost_priced", True) and tracked.cost_priced
+        )
+
+
+def _ordinary_chat_basis_from_sources(
+    prompt_source_bases: tuple[PromptSourceBasis, ...],
+) -> SharedBrainSynthesisBasis | None:
+    return next(
+        (
+            basis for basis in reversed(tuple(prompt_source_bases or ()))
+            if isinstance(basis, SharedBrainSynthesisBasis)
+            and basis.ordinary_chat_single_packet
+        ),
+        None,
+    )
+
+
+def _ordinary_chat_run_accounting(decision) -> dict | None:
+    accounting = getattr(getattr(decision, "run", None), "generation_accounting", None)
+    return accounting if isinstance(accounting, dict) else None
+
+
+def _decode_ordinary_chat_repair_response(
+    raw_response: str,
+    prompt_source_bases: tuple[PromptSourceBasis, ...],
+    generation_accounting: dict | None = None,
+) -> str:
+    """Use the original typed contract before exposing any repaired text.
+
+    Natural prose remains a supported recovery result. Once a provider returns
+    the non-visible envelope, however, its task/support references must pass
+    the same validator used for the initial candidate when that basis applies.
+    """
+    raw = str(raw_response or "").strip()
+    contract = parse_ordinary_chat_response_contract(raw)
+    basis = _ordinary_chat_basis_from_sources(prompt_source_bases)
+    status = contract.status
+    if contract.status == "parsed":
+        if basis is not None:
+            validation = validate_ordinary_chat_response_contract(basis, contract)
+            status = validation.status
+            response = contract.response if validation.valid else ""
+        else:
+            status = "natural_recovery_envelope"
+            response = contract.response
+    elif (
+        basis is not None and raw.startswith(("{", "[", "```"))
+    ) or (
+        # A schema-free repair can legitimately answer with JSON or code.
+        # Keep only the internal task envelope out of the visible response,
+        # including an incomplete envelope that the parser could not accept.
+        contract.status not in {"invalid_json", "invalid_shape"}
+        or bool(re.match(r'^\s*(?:```(?:json)?\s*)?\{\s*"tasks"\s*:', raw))
+    ):
+        response = ""
+    else:
+        status = "natural_prose" if raw else "empty"
+        response = raw
+    if generation_accounting is not None:
+        generation_accounting["final_repair_contract_status"] = status
+    if raw and not response:
+        logging.warning(
+            "ordinary_chat_response_rewrite_contract_invalid status=%s", status,
+        )
+    return response
 
 
 def build_ordinary_chat_response_repair_prompt(
@@ -43700,6 +43890,7 @@ async def regenerate_ordinary_chat_response_obligation(
     source_context_available: bool,
     current_user_text: str = "",
     route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+    generation_accounting: dict | None = None,
 ) -> tuple[str, str, tuple[PromptSourceBasis, ...], int, bool]:
     """Regenerate a natural ordinary-chat response after draft rejection."""
 
@@ -43712,13 +43903,18 @@ async def regenerate_ordinary_chat_response_obligation(
             route_mode=route_mode,
         )
     )
+    generation_started = time.monotonic()
     try:
         tracked = await get_tracked_gemini_response_with_optional_typing(
             channel,
             repair_prompt,
             user_id,
             guild_id,
-            route=ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+            route=(
+                ORDINARY_CHAT_SINGLE_PACKET_ROUTE
+                if _ordinary_chat_basis_from_sources(repair_bases) is not None
+                else ORDINARY_CHAT_RESPONSE_REPAIR_ROUTE
+            ),
             source_context_available=bool(
                 source_context_available and not source_neutral
             ),
@@ -43730,22 +43926,14 @@ async def regenerate_ordinary_chat_response_obligation(
         )
         return "", repair_prompt, repair_bases, 0, source_neutral
 
-    raw_rewrite = str(tracked.text or "").strip()
-    repair_contract = parse_ordinary_chat_response_contract(raw_rewrite)
-    if repair_contract.status == "parsed":
-        rewritten = repair_contract.response
-    elif raw_rewrite.startswith(("{", "[", "```")):
-        # The packet-owned route requests a non-visible JSON envelope. Never
-        # expose a malformed envelope merely because this is a repair call.
-        logging.warning(
-            "ordinary_chat_response_rewrite_envelope_invalid status=%s",
-            repair_contract.status,
-        )
-        rewritten = ""
-    else:
-        # Preserve compatibility with an established natural-prose provider
-        # response while the route is rolled through scoped deployments.
-        rewritten = raw_rewrite
+    _record_ordinary_chat_generation_usage(
+        generation_accounting, tracked,
+        max(0, int((time.monotonic() - generation_started) * 1000)),
+        corrective=True,
+    )
+    rewritten = _decode_ordinary_chat_repair_response(
+        tracked.text, repair_bases, generation_accounting,
+    )
     return (
         rewritten,
         repair_prompt,
@@ -43772,6 +43960,7 @@ async def resolve_guarded_response_obligation(
     exact_quote_requested: bool = False,
     exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
     third_party_attribution_requested: bool = False,
+    generation_accounting: dict | None = None,
 ) -> tuple[str, str, tuple[PromptSourceBasis, ...], int, bool]:
     """Keep response authorship with BNL after a guard rejects a draft."""
 
@@ -43822,6 +44011,7 @@ async def resolve_guarded_response_obligation(
         source_context_available=source_context_available,
         current_user_text=current_user_text,
         route_mode=route_mode,
+        generation_accounting=generation_accounting,
     )
     if not rewritten or is_generic_non_answer_response(rewritten):
         (
@@ -43842,6 +44032,7 @@ async def resolve_guarded_response_obligation(
             ),
             current_user_text=current_user_text,
             route_mode=route_mode,
+            generation_accounting=generation_accounting,
         )
         provider_calls += retry_calls
     if rewritten and is_generic_non_answer_response(rewritten):
@@ -44037,6 +44228,7 @@ async def send_planned_conversation_response(
             third_party_attribution_requested=(
                 third_party_attribution_requested
             ),
+            generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
         )
         single_packet_corrective_call_count += response_rewrite_calls
         synthesis_decision = (
@@ -44130,6 +44322,7 @@ async def send_planned_conversation_response(
             regeneration_allowed=regeneration_allowed,
             situation_frame=situation_frame,
             situation_frame_current_text=situation_frame_current_text,
+            generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
         )
 
     archive_guard_triggered = bool(
@@ -44183,6 +44376,7 @@ async def send_planned_conversation_response(
             third_party_attribution_requested=(
                 third_party_attribution_requested
             ),
+            generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
         )
         single_packet_corrective_call_count += response_rewrite_calls
         synthesis_decision = (
@@ -44221,6 +44415,7 @@ async def send_planned_conversation_response(
         and str(response or "") != single_packet_selected_response
     ):
         guard_diagnostics["single_packet_guard_repaired"] = True
+        synthesis_candidate_active = False
     canary_guard_fallback_triggered = False
     if (
         not single_packet_cutover
@@ -44338,6 +44533,7 @@ async def send_planned_conversation_response(
             third_party_attribution_requested=(
                 third_party_attribution_requested
             ),
+            generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
         )
         if single_packet_cutover:
             single_packet_corrective_call_count += response_rewrite_calls
@@ -44415,6 +44611,10 @@ async def send_planned_conversation_response(
         ack_converted_to_observe=False,
         ack_escalated_to_generation=False,
         ordinary_chat_single_packet_applied=single_packet_receipt_present,
+        ordinary_chat_run_id=(
+            synthesis_decision.run.run_id if single_packet_receipt_present
+            and synthesis_decision is not None else ""
+        ),
         ordinary_chat_single_packet_provider_call_count=(
             ordinary_chat_single_packet_execution.provider_call_count
             if ordinary_chat_single_packet_execution is not None
@@ -44494,6 +44694,7 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested=(
                     third_party_attribution_requested
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
             )
             single_packet_corrective_call_count += response_rewrite_calls
             synthesis_decision = (
@@ -44557,6 +44758,7 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested=(
                     third_party_attribution_requested
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
             )
             if not response:
                 return model_decision
@@ -44596,6 +44798,7 @@ async def send_planned_conversation_response(
             third_party_attribution_requested=(
                 third_party_attribution_requested
             ),
+            generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
         )
         single_packet_corrective_call_count += response_rewrite_calls
         synthesis_decision = (
@@ -44668,6 +44871,7 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested=(
                     third_party_attribution_requested
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
             )
         if not response:
             return model_decision
@@ -44724,6 +44928,7 @@ async def send_planned_conversation_response(
             third_party_attribution_requested=(
                 third_party_attribution_requested
             ),
+            generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
         )
         if not response:
             return model_decision
@@ -44809,6 +45014,7 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested=(
                     third_party_attribution_requested
                 ),
+                generation_accounting=_ordinary_chat_run_accounting(synthesis_decision),
             )
             single_packet_corrective_call_count += response_rewrite_calls
             synthesis_decision = (

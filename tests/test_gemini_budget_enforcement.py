@@ -16,6 +16,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
+from bnl_shared_brain_synthesis import SynthesisCanaryRun
 
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -378,7 +379,8 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
-        run = SimpleNamespace(
+        run = SynthesisCanaryRun(
+            run_id="budget-single-packet-test-run",
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
