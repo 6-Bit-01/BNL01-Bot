@@ -9,18 +9,42 @@ Journal or Relay store, change publication, or activate a response gate.
 The bot's `bnl_journal_entries` owner supplies immutable public content,
 revision, content hash, lifecycle, and publication time. The website's
 existing authenticated `GET /api/bnl/journal/control` owner supplies the
-independent visibility and reuse decision introduced by site PR #304:
+public visibility state introduced by site PR #304:
 
-- `publicExcludedEntryIds` controls exact Discord retrieval;
-- `memoryExcludedEntryIds` separately controls topic/continuity reuse; and
-- control version, revision, digest, observed time, expiry, and `persisted`
-  status bind selection and pre-send revalidation.
+- `publicExcludedEntryIds` excludes hidden entries from conversational reads;
+- the September 6 owner direction makes public text available for ordinary
+  reuse regardless of `memoryExcludedEntryIds`; and
+- the existing validated snapshot supplies public visibility and an expiry.
 
-Missing, malformed, unpersisted, stale, or changed control state fails closed.
-Exact identity, exact title, and exact publication-date lookup may use a public
-entry even when reuse is disabled. Topic lookup requires both public visibility
-and memory eligibility. The latest published revision wins; a later draft does
+Missing or invalid visibility state omits Journal input while normal conversation
+keeps its other context. Exact identity/title/date, latest and topical reads all
+use public entries. Public-read digests cover content and public exclusions,
+without treating memory-formation controls as public-read permissions.
+The latest published revision wins; a later draft does
 not replace it, while a later published revision invalidates an earlier packet.
+
+## Normal Gemini connection — September 6
+
+Normal direct and batched conversations now call these existing readers in all
+three public channel policies and their sealed testing mirror. `include_context`
+adds a bounded relevance search without requiring the user to say Journal or
+Relay. It selects at most two publications per kind; unrelated queries add none.
+Journal ranking uses decoded published text, not JSON field names.
+
+The normal prompt receives attributed publication history alongside existing
+conversation, memory, show and current queue inputs. Gemini interprets the
+question and writes the response. This does not enable experimental generation
+or add an output format or language validator.
+
+Journal relevance is checked locally before fetching website visibility. Direct
+and batch publication reads run off the Discord event loop. The normal path
+reuses its fetched snapshot within the site's declared freshness window (at
+most 300 seconds); final source checks perform no HTTP requests. Existing source
+bases compare selected local revisions and accepted Relay records. If an input
+changes or the snapshot expires, ordinary source recovery removes that
+publication block and retains unrelated context. A hide made after the initial
+fetch is subject to that existing freshness window; this is not an immediate
+remote invalidation subscription.
 
 ## Relay authority
 
@@ -45,10 +69,11 @@ occurrence identities, profile point, canon status/domain/kind, or subject-fact
 authority. Rendering labels them as exact published prose with zero independent
 fact or recurrence weight.
 
-Every selected Journal item is re-read against the exact canonical revision and
-a newly fetched control authority identity. Every selected Relay is re-read
+The separate experimental packet path re-reads a selected Journal against the
+exact canonical revision and newly fetched full control identity. It remains
+disabled in the recovered runtime. Every selected Relay is re-read
 against its exact durable row and acceptance provenance. Content or lifecycle,
-visibility/reuse, control revision/digest, Relay row, or receipt mutation makes
+public visibility, control identity, Relay row, or receipt mutation makes
 the packet invalid. Receipts retain only aggregate status/count fields and
 digests; they do not retain publication text or entry IDs.
 

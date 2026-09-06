@@ -235,6 +235,7 @@ from bnl_unified_response_assessment import (
 from bnl_journal import (
     JOURNAL_ROUTE,
     JournalControlSnapshot,
+    JournalPublication,
     ensure_schema as ensure_journal_schema,
     approve_draft as approve_journal_draft,
     deliver_approved as deliver_approved_journal,
@@ -247,6 +248,10 @@ from bnl_journal import (
     reject_draft as reject_journal_draft,
     journal_publication_query_mode,
     parse_journal_control_snapshot,
+    journal_control_snapshot_status,
+    render_journal_publication,
+    select_published_journal_entries_on_connection,
+    revalidate_published_journal_entry_on_connection,
 )
 from bnl_journal_source_store import (
     ensure_schema as ensure_journal_source_schema,
@@ -462,6 +467,7 @@ from bnl_gemini_cost import (
 )
 
 from bnl_website_relay_state import (
+    AcceptedRelayPublication,
     RelaySourceDecision,
     WebsiteRelayDecision,
     accepted_publication_count as relay_accepted_publication_count,
@@ -480,6 +486,9 @@ from bnl_website_relay_state import (
     clear_pending_v2_publication as relay_clear_pending_v2_publication,
     normalize_text as relay_normalize_text,
     relay_publication_query_mode,
+    render_accepted_relay_publication,
+    select_accepted_relay_publications_on_connection,
+    revalidate_accepted_relay_publication_on_connection,
     recent_history as relay_recent_history,
     reject_reason_for_candidate as relay_reject_reason_for_candidate,
     stock_directive_reason as relay_stock_directive_reason,
@@ -7655,6 +7664,12 @@ def calculate_adaptive_memory_limits(
     *,
     connection: sqlite3.Connection | None = None,
 ) -> dict:
+    policy = (channel_policy or "unknown").strip().lower() or "unknown"
+    # A member's Discord permissions do not expand the memory visible in a
+    # public conversation or its private testing mirror. Internal callers
+    # retain their already-resolved operator authority.
+    if policy in PUBLIC_CHAT_POLICIES or policy == "sealed_test":
+        is_owner_or_mod = False
     relation = get_relationship_state(
         user_id,
         guild_id,
@@ -7685,11 +7700,11 @@ def calculate_adaptive_memory_limits(
         multiplier += 0.20; reasons.append("recent_activity")
     if user_text and _memory_salience_score(user_text) >= 0.75:
         multiplier += 0.20; reasons.append("high_salience_or_explicit_memory_language")
-    if route_mode in SOURCE_INTERNAL_MODES or (channel_policy or "") in {"internal_controlled", "broadcast_memory"}:
+    if route_mode in SOURCE_INTERNAL_MODES or policy in {"internal_controlled", "broadcast_memory"}:
         multiplier += 0.15; reasons.append("internal_route")
     if is_owner_or_mod:
         multiplier += 0.25; reasons.append("operator")
-    if (channel_policy or "") in {"public_selective", "sealed_test", "unknown", "protected_system"}:
+    if policy in {"public_selective", "unknown", "protected_system"}:
         multiplier = min(multiplier, 1.15); reasons.append("restricted_surface_cap")
     def scale(base, maxv):
         return min(maxv, max(base, int(round(base * multiplier))))
@@ -7697,7 +7712,7 @@ def calculate_adaptive_memory_limits(
     visibility = "public_safe"
     if is_owner_or_mod:
         prompt_budget = MEMORY_PROMPT_BUDGET_OPERATOR; visibility = "operator_only"
-    elif route_mode in SOURCE_INTERNAL_MODES or (channel_policy or "") in {"internal_controlled", "broadcast_memory"}:
+    elif route_mode in SOURCE_INTERNAL_MODES or policy in {"internal_controlled", "broadcast_memory"}:
         prompt_budget = MEMORY_PROMPT_BUDGET_INTERNAL; visibility = "internal"
     return {
         "conversation_rows": scale(CONVERSATION_ROWS_PER_USER_BASE, CONVERSATION_ROWS_PER_USER_MAX),
@@ -21317,12 +21332,13 @@ def get_conversation_context_v2_rows(
             (guild_id, normalized_channel_name, policy, int(channel_id or 0), safe_limit),
         )
         _remember(cursor.fetchall())
-    # Bounded same-user public-safe cross-channel candidates; assembler applies final recency/route/topic/policy gates.
-    if current_user_id and policy in {"public_home", "public_context"}:
+    # Public history is readable in public and sealed conversations. The
+    # assembler retains relevance, attribution and the one-way sealed boundary.
+    if current_user_id and policy in PUBLIC_CHAT_POLICIES | {"sealed_test"}:
         cursor.execute(
             base_select + """
               AND user_id = ?
-              AND channel_policy IN ('public_home', 'public_context')
+              AND channel_policy IN ('public_home', 'public_context', 'public_selective')
             ORDER BY id DESC LIMIT ?
             """,
             (guild_id, int(current_user_id), safe_limit),
@@ -21505,7 +21521,7 @@ def get_conversation_history(user_id: int, guild_id: int, limit: int = 50):
     return history
 
 
-ROOM_CONTEXT_ALLOWED_POLICIES = {"public_home", "public_context", "sealed_test"}
+ROOM_CONTEXT_ALLOWED_POLICIES = PUBLIC_CHAT_POLICIES | {"sealed_test"}
 ROOM_CONTEXT_BLOCKED_POLICIES = {
     "internal_controlled",
     "broadcast_memory",
@@ -21556,12 +21572,15 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
                 FROM conversations
                 WHERE guild_id = ?
                   AND channel_id = ?
-                  AND channel_policy IN ('public_home', 'public_context', 'sealed_test')
+                  AND (
+                    channel_policy IN ('public_home', 'public_context', 'public_selective')
+                    OR (? = 'sealed_test' AND channel_policy = 'sealed_test')
+                  )
                   AND timestamp >= datetime('now', ?)
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (guild_id, int(channel_id), cutoff_sql, safe_limit),
+                (guild_id, int(channel_id), policy, cutoff_sql, safe_limit),
             )
             _remember_rows(cursor.fetchall())
         if normalized_channel_name:
@@ -21571,12 +21590,16 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
                 FROM conversations
                 WHERE guild_id = ?
                   AND LOWER(COALESCE(channel_name, '')) = ?
-                  AND channel_policy IN ('public_home', 'public_context', 'sealed_test')
+                  AND (COALESCE(channel_id, 0) = 0 OR ? = 0)
+                  AND (
+                    channel_policy IN ('public_home', 'public_context', 'public_selective')
+                    OR (? = 'sealed_test' AND channel_policy = 'sealed_test')
+                  )
                   AND timestamp >= datetime('now', ?)
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (guild_id, normalized_channel_name, cutoff_sql, safe_limit),
+                (guild_id, normalized_channel_name, int(channel_id or 0), policy, cutoff_sql, safe_limit),
             )
             _remember_rows(cursor.fetchall())
     finally:
@@ -21586,7 +21609,9 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
     context_rows = []
     for row in rows:
         row_policy = (row[5] or "unknown").strip().lower()
-        if row_policy not in ROOM_CONTEXT_ALLOWED_POLICIES:
+        if row_policy not in ROOM_CONTEXT_ALLOWED_POLICIES or (
+            row_policy == "sealed_test" and policy != "sealed_test"
+        ):
             continue
         content = (row[3] or "").strip()
         if not content:
@@ -25902,9 +25927,11 @@ def build_user_memory_context(
         record_prompt_diagnostics({"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}})
         return "Memory intentionally skipped for simple greeting."
     policy = (channel_policy or "unknown").strip().lower() or "unknown"
-    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "sealed_test", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
+    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
         record_prompt_diagnostics({"skipped_reason": f"route_or_policy_{policy}", "included": {"short": 0, "medium": 0, "long": 0}})
         return "No route-safe durable memory for this mode/channel."
+    if policy in PUBLIC_CHAT_POLICIES or policy == "sealed_test":
+        is_owner_or_mod = False
 
     source_safe_recall_synthesis = source_safe_recall_synthesis_enabled(
         guild_id=guild_id,
@@ -26389,6 +26416,123 @@ def build_batch_moment_attribution_context(
 
 
 @dataclass(frozen=True)
+class PublicationPromptSourceBasis:
+    """Existing public publications selected for a normal Gemini prompt."""
+
+    expected_digest: str
+    rendered_context: str
+    guild_id: int
+    user_text: str
+    source_kind: str
+    publications: tuple[Union[JournalPublication, AcceptedRelayPublication], ...]
+    journal_control_snapshot: JournalControlSnapshot | None = None
+
+
+def _build_publication_prompt_source_basis(
+    *, guild_id: int, user_text: str, source_kind: str,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+) -> PublicationPromptSourceBasis | None:
+    """Read the existing publication stores without altering them."""
+    if DB_FILE == ":memory:" or not os.path.isfile(DB_FILE):
+        return None
+    try:
+        with sqlite3.connect(
+            "file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1,
+        ) as conn:
+            if source_kind == "journal":
+                # Check relevance locally before fetching website visibility.
+                selection = select_published_journal_entries_on_connection(
+                    conn, guild_id=guild_id, user_text=user_text,
+                    control_snapshot=None, include_context=True, limit=2,
+                )
+                if not selection.candidate_count:
+                    return None
+                if journal_control_snapshot_status(journal_control_snapshot) != "valid":
+                    journal_control_snapshot, _reason = (
+                        _journal_publication_control_snapshot_sync()
+                    )
+                selection = select_published_journal_entries_on_connection(
+                    conn, guild_id=guild_id, user_text=user_text,
+                    control_snapshot=journal_control_snapshot,
+                    include_context=True, limit=2,
+                )
+                render = render_journal_publication
+            else:
+                selection = select_accepted_relay_publications_on_connection(
+                    conn, guild_id=guild_id, user_text=user_text,
+                    include_context=True, limit=2,
+                )
+                render = render_accepted_relay_publication
+            if not selection.publications:
+                return None
+            context = (
+                "Published %s context (publication history):\n" % source_kind.title()
+                + "\n".join(render(publication) for publication in selection.publications)
+            )
+            return PublicationPromptSourceBasis(
+                expected_digest=_prompt_source_digest(
+                    "\n".join(p.source_digest for p in selection.publications)
+                ),
+                rendered_context=context, guild_id=guild_id,
+                user_text=user_text, source_kind=source_kind,
+                publications=selection.publications,
+                journal_control_snapshot=journal_control_snapshot,
+            )
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        logging.warning("normal_publication_context_unavailable kind=%s", source_kind)
+        return None
+
+
+def build_publication_prompt_source_bases(
+    *, guild_id: int, channel_policy: str, user_text: str,
+) -> tuple[PublicationPromptSourceBasis, ...]:
+    """Public knowledge is available equally to public and sealed chat."""
+    if channel_policy not in PUBLIC_CHAT_POLICIES | {"sealed_test"}:
+        return ()
+    return tuple(
+        basis for kind in ("journal", "relay")
+        if (basis := _build_publication_prompt_source_basis(
+            guild_id=guild_id, user_text=user_text, source_kind=kind,
+        )) is not None
+    )
+
+
+def _refresh_publication_prompt_source_basis(
+    basis: PublicationPromptSourceBasis,
+) -> tuple[PublicationPromptSourceBasis, bool]:
+    # Reuse the site's still-fresh visibility snapshot for this turn. The
+    # existing source checks compare exact published revisions/accepted rows;
+    # this adds no provider call or synchronous network fetch before Discord send.
+    if not basis.publications:
+        return basis, False
+    try:
+        with sqlite3.connect(
+            "file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1,
+        ) as conn:
+            digests = []
+            for publication in basis.publications:
+                if isinstance(publication, JournalPublication):
+                    digest = revalidate_published_journal_entry_on_connection(
+                        conn, guild_id=basis.guild_id,
+                        entry_id=publication.entry_id, revision=publication.revision,
+                        query_mode=publication.query_mode, user_text=basis.user_text,
+                        control_snapshot=basis.journal_control_snapshot,
+                    )
+                else:
+                    digest = revalidate_accepted_relay_publication_on_connection(
+                        conn, guild_id=basis.guild_id, relay_id=publication.relay_id,
+                        query_mode=publication.query_mode, user_text=basis.user_text,
+                    )
+                digests.append(digest)
+            if digests and all(digests) and _prompt_source_digest("\n".join(digests)) == basis.expected_digest:
+                return basis, False
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        pass
+    # Remove only the changed publication block; keep the other normal context.
+    return replace(basis, expected_digest="", rendered_context="", publications=()), bool(basis.rendered_context)
+
+
+@dataclass(frozen=True)
 class MemoryPromptSourceBasis:
     """Typed reconstruction inputs for source-bearing member memory context."""
 
@@ -26466,6 +26610,7 @@ class UnifiedMomentCanaryPromptSourceBasis:
 
 
 PromptSourceBasis = Union[
+    PublicationPromptSourceBasis,
     MemoryPromptSourceBasis,
     ConversationPromptSourceBasis,
     BatchMomentPromptSourceBasis,
@@ -28947,6 +29092,8 @@ def refresh_prompt_source_basis(
     basis: PromptSourceBasis,
 ) -> tuple[PromptSourceBasis, bool]:
     """Synchronously rebuild one source basis after any provider await."""
+    if isinstance(basis, PublicationPromptSourceBasis):
+        return _refresh_publication_prompt_source_basis(basis)
     if isinstance(basis, SharedBrainSynthesisBasis):
         try:
             snapshot, provided = (
@@ -29106,6 +29253,8 @@ def refresh_prompt_source_bases(
             if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis)
             else "batch_moment"
             if isinstance(basis, BatchMomentPromptSourceBasis)
+            else "publication"
+            if isinstance(basis, PublicationPromptSourceBasis)
             else "memory"
         )
         changed_kinds.append(kind)
@@ -29125,7 +29274,7 @@ def refresh_prompt_source_bases(
         if basis.rendered_context not in updated_prompt:
             replacement_failed = True
             continue
-        if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
+        if isinstance(basis, (UnifiedMomentCanaryPromptSourceBasis, PublicationPromptSourceBasis)):
             replacement = fresh.rendered_context
         else:
             replacement = (
@@ -29174,6 +29323,8 @@ def prompt_source_basis_failure(
                         basis,
                         UnifiedMomentCanaryPromptSourceBasis,
                     )
+                    else "publication_source_changed"
+                    if isinstance(basis, PublicationPromptSourceBasis)
                     else "memory_source_changed"
                 )
     except Exception:
@@ -36290,10 +36441,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             batch_source_no_store_reason = "website_read_model_no_store"
             batch_website_read_model_prompt_block = ""
-            if (
-                batch_website_read_model_context
-                and not batch_publication_queue_packet_ready
-            ):
+            if batch_website_read_model_context:
                 batch_website_read_model_prompt_block = (
                     "\n\nAuthoritative current live-show context for this "
                     "request:\n"
@@ -36358,9 +36506,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_memory_prompt_block = ""
             if len(unique_user_ids) == 1:
                 member = channel.guild.get_member(first_uid)
-                batch_member_is_privileged = is_privileged_member(
-                    member,
-                    channel.guild,
+                batch_member_is_privileged = bool(
+                    is_privileged_member(member, channel.guild)
+                    and is_operator_authority_context(
+                        channel_policy, getattr(channel, "name", ""),
+                    )
                 )
                 batch_memory_target_user_id = (
                     batch_attribution_contract.target_user_id
@@ -36699,7 +36849,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         for block in (
                             recent_room_prompt,
                             batch_memory_prompt_block,
-                            batch_website_read_model_prompt_block,
+                            (
+                                "" if batch_publication_queue_packet_ready
+                                else batch_website_read_model_prompt_block
+                            ),
                             batch_tiktok_show_evidence_prompt_block,
                         )
                         if block
@@ -36714,6 +36867,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 and batch_ordinary_chat_basis is None
                 else ""
             )
+            if batch_publication_queue_packet_ready and batch_ordinary_chat_basis is not None:
+                prompt = "".join(prompt.rsplit(batch_website_read_model_prompt_block, 1))
+            if batch_ordinary_chat_basis is None:
+                batch_publication_bases = await asyncio.to_thread(
+                    build_publication_prompt_source_bases,
+                    guild_id=guild_id, channel_policy=channel_policy,
+                    user_text=combined_text,
+                )
+                batch_prompt_source_bases.extend(batch_publication_bases)
+                for publication_basis in batch_publication_bases:
+                    prompt += "\n\n" + publication_basis.rendered_context + "\n"
+                batch_source_context_available = bool(
+                    batch_source_context_available or batch_publication_bases
+                )
             batch_shared_brain_synthesis_basis = (
                 build_shared_brain_synthesis_basis(
                     guild_id=guild_id,
@@ -38870,6 +39037,25 @@ async def on_ready():
             ensure_next_ambient_scheduled(g.id)
 
     await client.change_presence(activity=discord.Game(name="Cataloging BARCODE data..."))
+
+
+async def build_user_aware_prompt_async(
+    user_id: int, guild_id: int, fallback_display_name: str,
+    clean_content: str, **kwargs,
+) -> tuple:
+    """Fetch publication inputs off the Discord loop, then use its normal builder."""
+    publication_bases = await asyncio.to_thread(
+        build_publication_prompt_source_bases,
+        guild_id=guild_id,
+        channel_policy=kwargs.get("channel_policy", "unknown"),
+        user_text=clean_content,
+    )
+    return build_user_aware_prompt(
+        user_id, guild_id, fallback_display_name, clean_content,
+        publication_source_bases=publication_bases, **kwargs,
+    )
+
+
 def build_user_aware_prompt(
     user_id: int,
     guild_id: int,
@@ -38893,6 +39079,7 @@ def build_user_aware_prompt(
     conversation_context_result: ConversationContextResult | None = None,
     conversation_orchestration: ConversationOrchestrationDecision | None = None,
     _ordinary_chat_single_packet_enabled_override: bool | None = None,
+    publication_source_bases: tuple[PublicationPromptSourceBasis, ...] | None = None,
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -39163,9 +39350,6 @@ def build_user_aware_prompt(
         publication_queue_composition
         and operational_queue_packet_snapshot
     )
-    if publication_queue_packet_ready:
-        show_state_prompt_block = ""
-        website_read_model_prompt_block = ""
     broadcast_context_eligible = bool(
         broadcast_context
         and not finalized_show_packet_owner
@@ -39472,8 +39656,8 @@ def build_user_aware_prompt(
                         else ""
                     ),
                     broadcast_prompt_block,
-                    show_state_prompt_block,
-                    website_read_model_prompt_block,
+                    "" if publication_queue_packet_ready else show_state_prompt_block,
+                    "" if publication_queue_packet_ready else website_read_model_prompt_block,
                     queue_artist_memory_prompt_block,
                     tiktok_show_evidence_prompt_block,
                     source_context_prompt_block,
@@ -39485,9 +39669,29 @@ def build_user_aware_prompt(
         else None
     )
 
+    if publication_queue_packet_ready and ordinary_chat_single_packet_basis is not None:
+        show_state_prompt_block = ""
+        website_read_model_prompt_block = ""
+    publication_bases = (
+        publication_source_bases
+        if publication_source_bases is not None
+        else build_publication_prompt_source_bases(
+            guild_id=guild_id, channel_policy=channel_policy,
+            user_text=clean_content,
+        )
+    )
+    if ordinary_chat_single_packet_basis is not None:
+        publication_bases = ()
+    prompt_source_bases.extend(publication_bases)
+    publication_prompt_block = "".join(
+        basis.rendered_context + "\n" for basis in publication_bases
+    )
+
     if prompt_metadata is not None:
+        prompt_metadata["publication_context_present"] = bool(publication_bases)
         prompt_metadata["source_context_available"] = bool(
             ordinary_chat_single_packet_basis
+            or publication_bases
             or broadcast_context
             or show_state_context
             or website_read_model_context
@@ -39696,6 +39900,7 @@ def build_user_aware_prompt(
         f"{website_read_model_prompt_block}"
         f"{queue_artist_memory_prompt_block}"
         f"{tiktok_show_evidence_prompt_block}"
+        f"{publication_prompt_block}"
         f"{source_context_prompt_block}"
         f"{exact_quote_prompt_block}"
         f"{tiktok_show_analysis_turn_contract}"
@@ -40634,7 +40839,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
             current_direct=True,
         )
     )
-    prompt, allow_greeting, style_key = build_user_aware_prompt(
+    prompt, allow_greeting, style_key = await build_user_aware_prompt_async(
         session["requester_user_id"],
         session["guild_id"],
         session["requester_display_name"],
@@ -45931,7 +46136,7 @@ async def on_message(message: discord.Message):
                     current_direct=direct_interaction,
                 )
             )
-            prompt, allow_greeting, style_key = build_user_aware_prompt(
+            prompt, allow_greeting, style_key = await build_user_aware_prompt_async(
                 message.author.id,
                 message.guild.id,
                 message.author.display_name,
@@ -46447,7 +46652,7 @@ async def on_message(message: discord.Message):
                 current_direct=direct_interaction,
             )
         )
-        prompt, allow_greeting, style_key = build_user_aware_prompt(
+        prompt, allow_greeting, style_key = await build_user_aware_prompt_async(
             message.author.id,
             message.guild.id,
             message.author.display_name,
@@ -46918,7 +47123,7 @@ async def on_message(message: discord.Message):
                 current_direct=direct_interaction,
             )
         )
-        prompt, allow_greeting, style_key = build_user_aware_prompt(
+        prompt, allow_greeting, style_key = await build_user_aware_prompt_async(
             message.author.id,
             message.guild.id,
             message.author.display_name,

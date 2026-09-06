@@ -348,7 +348,35 @@ class PublicationReadAdapterTests(unittest.TestCase):
             control_snapshot=exact_snapshot,
             now=NOW,
         )
-        self.assertEqual("memory_ineligible", topic.status)
+        self.assertEqual("eligible", topic.status)
+        self.assertEqual(entry_id, topic.publications[0].entry_id)
+        self.assertEqual(0, topic.memory_ineligible_count)
+        latest = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text="what did the latest Journal say?",
+            control_snapshot=exact_snapshot,
+            now=NOW,
+        )
+        self.assertEqual("eligible", latest.status)
+        self.assertEqual(entry_id, latest.publications[0].entry_id)
+        for selection, question in (
+            (topic, "what has the Journal said about receivers?"),
+            (latest, "what did the latest Journal say?"),
+        ):
+            self.assertEqual(
+                selection.publications[0].source_digest,
+                journal.revalidate_published_journal_entry_on_connection(
+                    self.conn,
+                    guild_id=1,
+                    entry_id=entry_id,
+                    revision=1,
+                    query_mode=selection.query_mode,
+                    control_snapshot=exact_snapshot,
+                    user_text=question,
+                    now=NOW,
+                ),
+            )
         hidden = journal.select_published_journal_entries_on_connection(
             self.conn,
             guild_id=1,
@@ -381,6 +409,165 @@ class PublicationReadAdapterTests(unittest.TestCase):
             now=NOW,
         )
         self.assertEqual("source_invalid", contradictory.status)
+
+    def test_journal_normal_context_retrieves_relevant_publications_without_cue(self):
+        self.add_journal(
+            "journal_ceramic_detailed",
+            title="Ceramic Receivers",
+            excerpt="Ceramic receivers recovered a clean carrier.",
+            body="The ceramic receivers picked up the distant signal.",
+        )
+        self.add_journal(
+            "journal_unrelated_newer",
+            title="Copper Antennas",
+            excerpt="Copper antennas stood beside the studio.",
+            body="Copper antenna maintenance continued.",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        question = "Tell me about those ceramic receivers."
+        kwargs = dict(
+            guild_id=1,
+            user_text=question,
+            control_snapshot=control_snapshot(
+                memory_excluded=("journal_ceramic_detailed",),
+            ),
+            now=NOW,
+        )
+        self.assertEqual(
+            "not_requested",
+            journal.select_published_journal_entries_on_connection(
+                self.conn, **kwargs,
+            ).status,
+        )
+        selected = journal.select_published_journal_entries_on_connection(
+            self.conn, include_context=True, **kwargs,
+        )
+        self.assertEqual("eligible", selected.status)
+        self.assertEqual("context", selected.query_mode)
+        self.assertEqual(
+            ("journal_ceramic_detailed",),
+            tuple(item.entry_id for item in selected.publications),
+        )
+        self.assertEqual(
+            selected.publications[0].source_digest,
+            journal.revalidate_published_journal_entry_on_connection(
+                self.conn,
+                guild_id=1,
+                entry_id="journal_ceramic_detailed",
+                revision=1,
+                query_mode="context",
+                control_snapshot=kwargs["control_snapshot"],
+                now=NOW,
+            ),
+        )
+        hidden = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            **{
+                **kwargs,
+                "control_snapshot": control_snapshot(
+                    public_excluded=("journal_ceramic_detailed",),
+                ),
+            },
+            include_context=True,
+        )
+        self.assertEqual("public_hidden", hidden.status)
+        self.assertFalse(hidden.publications)
+
+    def test_journal_context_omits_unrelated_or_empty_topics(self):
+        self.add_journal("journal_unrelated")
+        for question in (
+            "Briefly explain why a checksum detects file corruption.",
+            "",
+            "What about 2026-08-02?",
+        ):
+            with self.subTest(question=question):
+                selected = journal.select_published_journal_entries_on_connection(
+                    self.conn,
+                    guild_id=1,
+                    user_text=question,
+                    control_snapshot=control_snapshot(),
+                    now=NOW,
+                    include_context=True,
+                )
+                self.assertEqual("not_found", selected.status)
+                self.assertFalse(selected.publications)
+
+    def test_journal_local_probe_needs_controls_only_for_matching_candidates(self):
+        self.add_journal("journal_local_probe")
+        for question, expected_status, expected_count in (
+            ("Tell me about ceramic receivers.", "control_snapshot_unavailable", 1),
+            ("Explain file checksums.", "not_found", 0),
+        ):
+            with self.subTest(question=question):
+                selected = journal.select_published_journal_entries_on_connection(
+                    self.conn,
+                    guild_id=1,
+                    user_text=question,
+                    control_snapshot=None,
+                    now=NOW,
+                    include_context=True,
+                )
+                self.assertEqual(expected_status, selected.status)
+                self.assertEqual(expected_count, selected.candidate_count)
+                self.assertEqual("context", selected.query_mode)
+                self.assertFalse(selected.publications)
+
+    def test_journal_context_does_not_treat_section_field_names_as_publication_words(self):
+        self.add_journal("journal_unrelated_schema")
+        for question in (
+            "What is a rigid body in physics?",
+            "How do I choose a heading for an essay?",
+        ):
+            with self.subTest(question=question):
+                selected = journal.select_published_journal_entries_on_connection(
+                    self.conn,
+                    guild_id=1,
+                    user_text=question,
+                    control_snapshot=None,
+                    now=NOW,
+                    include_context=True,
+                )
+                self.assertEqual("not_found", selected.status)
+                self.assertEqual(0, selected.candidate_count)
+                self.assertFalse(selected.publications)
+
+    def test_journal_public_read_digest_ignores_memory_control_changes(self):
+        entry_id = "journal_public_control"
+        self.add_journal(entry_id)
+        selected = journal.select_published_journal_entries_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text="what has the Journal said about receivers?",
+            control_snapshot=control_snapshot(),
+            now=NOW,
+        )
+        digest = selected.publications[0].source_digest
+        self.assertEqual(
+            digest,
+            journal.revalidate_published_journal_entry_on_connection(
+                self.conn,
+                guild_id=1,
+                entry_id=entry_id,
+                revision=1,
+                query_mode="topic",
+                control_snapshot=control_snapshot(
+                    memory_excluded=(entry_id,), digest="b" * 64,
+                ),
+                now=NOW,
+            ),
+        )
+        self.assertEqual(
+            "",
+            journal.revalidate_published_journal_entry_on_connection(
+                self.conn,
+                guild_id=1,
+                entry_id=entry_id,
+                revision=1,
+                query_mode="topic",
+                control_snapshot=control_snapshot(public_excluded=(entry_id,)),
+                now=NOW,
+            ),
+        )
 
     def test_relay_permanent_history_and_site_manual_provenance(self):
         for index in range(30):
@@ -537,6 +724,86 @@ class PublicationReadAdapterTests(unittest.TestCase):
             ("bnl-broadcast-newer", "bnl-broadcast-older"),
             tuple(item.relay_id for item in selected.publications),
         )
+
+    def test_relay_normal_context_ranks_matching_accepted_publications(self):
+        self.add_relay(
+            "bnl-ceramic-detailed",
+            message="Ceramic receivers recovered a clean carrier.",
+            directive="",
+        )
+        self.add_relay(
+            "bnl-receivers-newer",
+            message="The receivers were delivered to the studio.",
+            directive="",
+            published_at="2026-08-04T01:00:00Z",
+        )
+        self.add_relay(
+            "bnl-unrelated-newest",
+            message="Copper antennas stood beside the studio.",
+            directive="",
+            published_at="2026-08-05T01:00:00Z",
+        )
+        question = "Tell me about those ceramic receivers."
+        self.assertEqual(
+            "not_requested",
+            relay.select_accepted_relay_publications_on_connection(
+                self.conn, guild_id=1, user_text=question,
+            ).status,
+        )
+        selected = relay.select_accepted_relay_publications_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text=question,
+            limit=1,
+            include_context=True,
+        )
+        self.assertEqual("eligible", selected.status)
+        self.assertEqual("context", selected.query_mode)
+        self.assertEqual(
+            ("bnl-ceramic-detailed",),
+            tuple(item.relay_id for item in selected.publications),
+        )
+        self.assertEqual(
+            selected.publications[0].source_digest,
+            relay.revalidate_accepted_relay_publication_on_connection(
+                self.conn,
+                guild_id=1,
+                relay_id="bnl-ceramic-detailed",
+                query_mode="context",
+            ),
+        )
+
+    def test_relay_context_omits_unrelated_rows_and_requires_accepted_history(self):
+        self.add_relay("bnl-unrelated")
+        for question in (
+            "Briefly explain why a checksum detects file corruption.",
+            "",
+            "What about 2026-08-03?",
+        ):
+            with self.subTest(question=question):
+                selected = relay.select_accepted_relay_publications_on_connection(
+                    self.conn,
+                    guild_id=1,
+                    user_text=question,
+                    include_context=True,
+                )
+                self.assertEqual("not_found", selected.status)
+                self.assertFalse(selected.publications)
+        self.add_relay(
+            "bnl-hydrated-unaccepted",
+            message="Platinum oscillators caught a signal.",
+            directive="",
+            lane="hydrated",
+            event_type="approved_canon",
+        )
+        selected = relay.select_accepted_relay_publications_on_connection(
+            self.conn,
+            guild_id=1,
+            user_text="Tell me about platinum oscillators.",
+            include_context=True,
+        )
+        self.assertEqual("provenance_unapproved", selected.status)
+        self.assertFalse(selected.publications)
 
     def test_relay_attempts_and_presence_are_not_accepted_speech(self):
         self.conn.execute(

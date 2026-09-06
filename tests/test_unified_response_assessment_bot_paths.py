@@ -727,6 +727,17 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         broadcast_builder.assert_called_once()
 
     def test_journal_and_current_queue_compose_in_one_packet(self):
+        # Exercise the real sealed public-memory read against an initialized
+        # temporary database, including during prompt-source revalidation.
+        db_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(db_directory.cleanup)
+        db_patch = mock.patch.object(
+            bnl01_bot, "DB_FILE",
+            os.path.join(db_directory.name, "publication-memory.sqlite3"),
+        )
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        bnl01_bot.init_db()
         text = (
             "What did the Journal say about the queue, and is the queue "
             "open right now?"
