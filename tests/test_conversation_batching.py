@@ -3719,10 +3719,19 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "batch_single_packet_candidate_sent",
         )
 
-    async def test_typed_batch_contract_rejection_withholds_without_second_call(
+    async def test_typed_batch_contract_rejection_is_rewritten_and_sent(
         self,
     ):
         channel = self._channel(8137)
+        request = (
+            "Actually, change the signal to green and make the beam narrow. "
+            "Keep the slow pulse. What are the final Violet Lantern 500 "
+            "settings?"
+        )
+        natural_response = (
+            "Violet Lantern 500 is set to green with a narrow beam and a "
+            "slow pulse."
+        )
         basis = object()
         packet = object()
         assessment = object()
@@ -3730,10 +3739,13 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             candidate_selected=False,
             typed_contract_status="invalid",
         )
-        review_reason = "typed_contract_packet_support_invalid"
+        review_reason = "typed_contract_task_text_unsupported"
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
             decision=decision,
-            response="Untrusted visible candidate.",
+            response=(
+                "Violet Lantern 500 is set to blue with a wide beam and a "
+                "fast pulse."
+            ),
             prompt="packet-owned prompt",
             prompt_source_bases=(basis,),
             candidate_active=False,
@@ -3744,8 +3756,18 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         ordinary_generation = mock.AsyncMock(return_value=execution)
         shared_generation = mock.AsyncMock()
-        guarded = mock.AsyncMock()
-        resolve = mock.AsyncMock()
+        guarded = mock.AsyncMock(
+            return_value=(natural_response, {"suppressed": False})
+        )
+        resolve = mock.AsyncMock(
+            return_value=(
+                natural_response,
+                "packet-owned repair prompt",
+                (basis,),
+                1,
+                False,
+            )
+        )
         record_review = mock.AsyncMock(return_value=decision)
         finalize = mock.AsyncMock(return_value=decision)
 
@@ -3758,7 +3780,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 "a typed batch rejection must not call the legacy provider"
             )
 
-        self._prime_flush(channel, "BNL, who is Cache Back?")
+        self._prime_flush(channel, request)
         with (
             self._flush_runtime(channel.id, legacy_generation),
             mock.patch.object(
@@ -3798,6 +3820,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
                 "safely_record_ordinary_chat_single_packet_review",
                 new=record_review,
             ),
@@ -3806,33 +3833,46 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 "safely_finalize_shared_brain_synthesis",
                 new=finalize,
             ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
         ):
             await bnl01_bot._flush_channel_buffer(channel)
 
         ordinary_generation.assert_awaited_once()
         shared_generation.assert_not_awaited()
-        guarded.assert_not_awaited()
-        resolve.assert_not_awaited()
-        self.assertEqual(channel.sent, [])
+        guarded.assert_awaited_once()
+        self.assertTrue(guarded.await_args.kwargs["regeneration_allowed"])
+        resolve.assert_awaited_once()
+        self.assertEqual(channel.sent, [natural_response])
         record_review.assert_awaited_once()
-        self.assertEqual(record_review.await_args.kwargs["reason"], review_reason)
+        self.assertEqual(
+            record_review.await_args.kwargs["reason"],
+            "single_packet_candidate_rewritten_after_review",
+        )
         self.assertEqual(
             record_review.await_args.kwargs["corrective_call_count"],
-            0,
+            1,
         )
         finalize.assert_awaited_once()
-        self.assertEqual(finalize.await_args.kwargs["final_response"], "")
-        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertEqual(
+            finalize.await_args.kwargs["final_response"],
+            natural_response,
+        )
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
         self.assertFalse(finalize.await_args.kwargs["candidate_live"])
         self.assertEqual(
             finalize.await_args.kwargs["guard_status"],
-            "typed_batch_single_packet_candidate_rejected",
+            "batch_single_packet_repaired_response_sent",
         )
 
-    async def test_typed_batch_guard_rejection_withholds_without_regeneration(
+    async def test_typed_batch_guard_rejection_is_rewritten_and_sent(
         self,
     ):
         channel = self._channel(8138)
+        natural_response = "Packet-supported natural answer."
         basis = object()
         packet = object()
         assessment = object()
@@ -3861,7 +3901,15 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         )
-        resolve = mock.AsyncMock()
+        resolve = mock.AsyncMock(
+            return_value=(
+                natural_response,
+                "packet-owned repair prompt",
+                (basis,),
+                1,
+                False,
+            )
+        )
         record_review = mock.AsyncMock(return_value=decision)
         finalize = mock.AsyncMock(return_value=decision)
 
@@ -3914,6 +3962,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
                 "safely_record_ordinary_chat_single_packet_review",
                 new=record_review,
             ),
@@ -3922,28 +3975,39 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 "safely_finalize_shared_brain_synthesis",
                 new=finalize,
             ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
         ):
             await bnl01_bot._flush_channel_buffer(channel)
 
         ordinary_generation.assert_awaited_once()
         shared_generation.assert_not_awaited()
         guarded.assert_awaited_once()
-        self.assertFalse(guarded.await_args.kwargs["regeneration_allowed"])
-        resolve.assert_not_awaited()
-        self.assertEqual(channel.sent, [])
+        self.assertTrue(guarded.await_args.kwargs["regeneration_allowed"])
+        resolve.assert_awaited_once()
+        self.assertEqual(channel.sent, [natural_response])
         record_review.assert_awaited_once()
-        self.assertEqual(record_review.await_args.kwargs["reason"], guard_reason)
+        self.assertEqual(
+            record_review.await_args.kwargs["reason"],
+            "single_packet_response_rewritten_after_guard",
+        )
         self.assertEqual(
             record_review.await_args.kwargs["corrective_call_count"],
-            0,
+            1,
         )
         finalize.assert_awaited_once()
-        self.assertEqual(finalize.await_args.kwargs["final_response"], "")
-        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertEqual(
+            finalize.await_args.kwargs["final_response"],
+            natural_response,
+        )
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
         self.assertFalse(finalize.await_args.kwargs["candidate_live"])
         self.assertEqual(
             finalize.await_args.kwargs["guard_status"],
-            "typed_batch_single_packet_guard_rejected",
+            "batch_single_packet_repaired_response_sent",
         )
 
     async def test_mixed_journal_and_current_queue_batch_uses_one_natural_packet(

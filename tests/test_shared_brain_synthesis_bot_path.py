@@ -1286,8 +1286,7 @@ class SharedBrainSynthesisBotPathTests(
         self.assertEqual(execution.response, "")
         self.assertTrue(execution.typed_contract_required)
         provider.assert_awaited_once()
-        finalize.assert_awaited_once()
-        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        finalize.assert_not_awaited()
         self.assertEqual(evaluate.call_args.kwargs["provider_call_count"], 0)
         self.assertEqual(evaluate.call_args.kwargs["corrective_call_count"], 0)
 
@@ -1713,6 +1712,54 @@ class SharedBrainSynthesisBotPathTests(
         self.assertFalse(source_neutral)
         self.assertFalse(diagnostics["suppressed"])
 
+    async def test_response_repair_extracts_typed_envelope_text(self):
+        natural_answer = (
+            "Violet Lantern 500 is set to green with a narrow beam and a "
+            "slow pulse."
+        )
+        envelope = (
+            '{"tasks":[{"taskId":"T1","text":"'
+            + natural_answer
+            + '","supportKind":"current_request",'
+            '"evidenceIds":["REQUEST"]}]}'
+        )
+        provider = mock.AsyncMock(
+            return_value=bnl01_bot.TrackedGenerationResponse(
+                text=envelope,
+                provider_call_count=1,
+            )
+        )
+
+        with mock.patch.object(
+            bnl01_bot,
+            "get_tracked_gemini_response_with_optional_typing",
+            new=provider,
+        ):
+            response, _prompt, _bases, calls, _source_neutral = (
+                await bnl01_bot.regenerate_ordinary_chat_response_obligation(
+                    channel=FakeChannel(),
+                    prompt="packet-owned Violet Lantern prompt",
+                    reason="typed_contract_task_text_unsupported",
+                    prompt_source_bases=(),
+                    user_id=7,
+                    guild_id=1,
+                    source_context_available=True,
+                    current_user_text=(
+                        "Actually, change the signal to green and make the "
+                        "beam narrow. Keep the slow pulse. What are the final "
+                        "Violet Lantern 500 settings?"
+                    ),
+                )
+            )
+
+        self.assertEqual(response, natural_answer)
+        self.assertNotIn('"tasks"', response)
+        self.assertEqual(calls, 1)
+        self.assertEqual(
+            provider.await_args.kwargs["route"],
+            bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+        )
+
     async def test_empty_first_rewrite_gets_second_shared_brain_attempt(self):
         natural_answer = (
             "The Journal covered the queue’s published role, and the current "
@@ -2100,29 +2147,51 @@ class SharedBrainSynthesisBotPathTests(
         self.assertTrue(finalize.await_args.kwargs["response_sent"])
         self.assertFalse(finalize.await_args.kwargs["candidate_live"])
 
-    async def test_typed_single_packet_rejection_never_calls_rewriter(self):
+    async def test_typed_current_request_rejection_is_rewritten_and_sent(self):
         message = FakeMessage()
+        message.content = (
+            "Actually, change the signal to green and make the beam narrow. "
+            "Keep the slow pulse. What are the final Violet Lantern 500 "
+            "settings?"
+        )
+        natural_response = (
+            "Violet Lantern 500 is set to green with a narrow beam and a "
+            "slow pulse."
+        )
         run = SimpleNamespace(run_id="typed-rejected-run")
         decision = SimpleNamespace(
             run=run,
             candidate_selected=False,
-            fallback_reason="typed_contract_packet_support_invalid",
+            fallback_reason="typed_contract_task_text_unsupported",
         )
         execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
             decision=decision,
-            response="Untrusted visible candidate.",
+            response=(
+                "Violet Lantern 500 is set to blue with a wide beam and a "
+                "fast pulse."
+            ),
             prompt="packet-owned prompt",
             prompt_source_bases=(),
             candidate_active=False,
             provider_call_count=1,
             corrective_call_count=0,
-            review_reason="typed_contract_packet_support_invalid",
+            review_reason="typed_contract_task_text_unsupported",
             typed_contract_required=True,
         )
-        resolve = mock.AsyncMock()
+        resolve = mock.AsyncMock(
+            return_value=(
+                natural_response,
+                "packet-owned repair prompt",
+                (),
+                1,
+                False,
+            )
+        )
         review = mock.AsyncMock(return_value=decision)
         finalize = mock.AsyncMock(return_value=True)
-        guard = mock.AsyncMock()
+        guard = mock.AsyncMock(
+            return_value=(natural_response, {"suppressed": False})
+        )
         with ExitStack() as stack:
             for patcher in self.common_patches():
                 stack.enter_context(patcher)
@@ -2166,19 +2235,22 @@ class SharedBrainSynthesisBotPathTests(
                 ordinary_chat_single_packet_execution=execution,
             )
 
-        self.assertEqual(message.replies, [])
-        resolve.assert_not_awaited()
-        guard.assert_not_awaited()
+        self.assertEqual(message.replies, [natural_response])
+        resolve.assert_awaited_once()
+        guard.assert_awaited_once()
+        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
         review.assert_awaited_once()
         self.assertEqual(
             review.await_args.kwargs["corrective_call_count"],
-            0,
+            1,
         )
         finalize.assert_awaited_once()
-        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
 
-    async def test_typed_single_packet_guard_is_validation_only(self):
+    async def test_typed_single_packet_guard_rejection_is_rewritten_and_sent(self):
         message = FakeMessage()
+        natural_response = "Packet-supported natural answer."
         run = SimpleNamespace(run_id="typed-guard-run")
         decision = SimpleNamespace(
             run=run,
@@ -2204,7 +2276,15 @@ class SharedBrainSynthesisBotPathTests(
                 },
             )
         )
-        resolve = mock.AsyncMock()
+        resolve = mock.AsyncMock(
+            return_value=(
+                natural_response,
+                "packet-owned repair prompt",
+                (),
+                1,
+                False,
+            )
+        )
         review = mock.AsyncMock(return_value=decision)
         finalize = mock.AsyncMock(return_value=True)
         with ExitStack() as stack:
@@ -2250,12 +2330,13 @@ class SharedBrainSynthesisBotPathTests(
                 ordinary_chat_single_packet_execution=execution,
             )
 
-        self.assertEqual(message.replies, [])
-        self.assertFalse(guard.await_args.kwargs["regeneration_allowed"])
-        resolve.assert_not_awaited()
+        self.assertEqual(message.replies, [natural_response])
+        self.assertTrue(guard.await_args.kwargs["regeneration_allowed"])
+        resolve.assert_awaited_once()
         review.assert_awaited_once()
         finalize.assert_awaited_once()
-        self.assertFalse(finalize.await_args.kwargs["response_sent"])
+        self.assertTrue(finalize.await_args.kwargs["response_sent"])
+        self.assertFalse(finalize.await_args.kwargs["candidate_live"])
 
     async def test_natural_single_packet_candidate_uses_shared_guard(self):
         message = FakeMessage()
