@@ -1,9 +1,6 @@
 import os
-import sqlite3
-import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
-from unittest import mock
 
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
@@ -650,92 +647,8 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertEqual(res.rendered_context, "")
         sealed_public = assemble_conversation_context_v2([row(1,"user","sealed", policy="sealed_test"), row(2,"model","sealed answer", policy="sealed_test")], req(channel_policy="sealed_test", route_mode="normal_chat"))
         self.assertIn("sealed answer", sealed_public.rendered_context)
-        public_read = assemble_conversation_context_v2([row(1,"user","public", policy="public_home"), row(2,"model","public answer", policy="public_home")], req(channel_policy="sealed_test"))
-        self.assertIn("public answer", public_read.rendered_context)
-
-    def test_sealed_public_continuity_reads_keep_existing_source_filters(self):
-        rows = [
-            row(1, "user", "We are discussing the red synth.", policy="sealed_test", minutes=1),
-            row(2, "model", "Keep the local synth discussion here.", policy="sealed_test", minutes=0.5),
-            row(3, "user", "The red synth attack is too sharp.", channel=20, policy="public_home", minutes=5),
-            row(4, "model", "Use 180 milliseconds for the red synth attack.", channel=20, policy="public_home", minutes=4.5),
-            row(5, "user", "Another member's red synth arrangement.", user=2, channel=20, policy="public_home", minutes=4),
-            row(6, "model", "Another member's public answer.", user=2, channel=20, policy="public_home", minutes=3.5),
-        ]
-        for offset, policy in enumerate(("internal_controlled", "sealed_test", "protected_system", "public_selective"), start=4):
-            rows.extend((
-                row(offset * 2 - 1, "user", "Restricted red synth source.", channel=30 + offset, policy=policy, minutes=3),
-                row(offset * 2, "model", "Restricted red synth answer.", channel=30 + offset, policy=policy, minutes=2.5),
-            ))
-        rows.extend((
-            row(15, "user", "An old red synth discussion.", channel=20, policy="public_context", minutes=200),
-            row(16, "model", "An old red synth answer.", channel=20, policy="public_context", minutes=199),
-        ))
-        sealed_request = req(
-            channel_policy="sealed_test", channel_name="bnl-testing",
-            current_texts=("Continue from the other channel about the red synth.",),
-        )
-        for source_policy in ("public_home", "public_context"):
-            with self.subTest(source_policy=source_policy):
-                rows[2]["channel_policy"] = source_policy
-                rows[3]["channel_policy"] = source_policy
-                result = assemble_conversation_context_v2(rows, sealed_request)
-                self.assertEqual(result.same_room_paired_turn_count, 1)
-                self.assertEqual(result.cross_channel_paired_turn_count, 1)
-                self.assertEqual(set(result.selected_row_ids), {1, 2, 3, 4})
-                self.assertIn("180 milliseconds", result.rendered_context)
-                self.assertIn("Keep the local synth discussion here.", result.rendered_context)
-                self.assertNotIn("Restricted", result.rendered_context)
-                self.assertNotIn("Another member", result.rendered_context)
-                self.assertNotIn("An old", result.rendered_context)
-        public_result = assemble_conversation_context_v2(
-            rows, req(current_texts=sealed_request.current_texts),
-        )
-        self.assertNotIn("Keep the local synth discussion here.", public_result.rendered_context)
-        self.assertNotIn("Restricted", public_result.rendered_context)
-
-    def test_sealed_public_continuity_candidates_reach_existing_assembler(self):
-        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-gemini-key", "DISCORD_BOT_TOKEN": "test-discord-token"}):
-            import bnl01_bot as bot
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "sealed-public-continuity.db")
-            with sqlite3.connect(path) as conn:
-                conn.execute(
-                    "CREATE TABLE conversations(id INTEGER PRIMARY KEY, guild_id INTEGER, "
-                    "role TEXT, content TEXT, user_id INTEGER, user_name TEXT, channel_id INTEGER, "
-                    "channel_name TEXT, channel_policy TEXT, timestamp TEXT, message_id INTEGER)"
-                )
-                for row_id, channel_id, policy, user_id in (
-                    (1, 10, "sealed_test", 1),
-                    (3, 20, "public_home", 1),
-                    (5, 20, "public_home", 2),
-                    (7, 30, "internal_controlled", 1),
-                    (9, 40, "sealed_test", 1),
-                ):
-                    for offset, role in enumerate(("user", "model")):
-                        conn.execute(
-                            "INSERT INTO conversations VALUES(?,99,?,?,?,'Test Member',?,?,?, ?,NULL)",
-                            (row_id + offset, role, "Red synth continuity " + str(row_id + offset),
-                             user_id, channel_id, "bnl-testing" if policy == "sealed_test" else "public-room",
-                             policy, (NOW - timedelta(minutes=1)).isoformat()),
-                        )
-            with mock.patch.object(bot, "DB_FILE", path):
-                candidates = bot.get_conversation_context_v2_rows(
-                    99, current_user_id=1, channel_id=10,
-                    channel_name="bnl-testing", channel_policy="sealed_test",
-                )
-                self.assertEqual({item["id"] for item in candidates}, {1, 2, 3, 4})
-                result = assemble_conversation_context_v2(
-                    candidates, req(channel_policy="sealed_test", channel_name="bnl-testing",
-                                    current_texts=("Continue from the other channel about the red synth.",)),
-                )
-                self.assertEqual(set(result.selected_row_ids), {1, 2, 3, 4})
-                public_candidates = bot.get_conversation_context_v2_rows(
-                    99, current_user_id=1, channel_id=20,
-                    channel_name="public-room", channel_policy="public_home",
-                )
-                self.assertTrue(public_candidates)
-                self.assertTrue(all(item["channel_policy"] == "public_home" for item in public_candidates))
+        leak = assemble_conversation_context_v2([row(1,"user","public", policy="public_home"), row(2,"model","public answer", policy="public_home")], req(channel_policy="sealed_test"))
+        self.assertEqual(leak.rendered_context, "")
 
     def test_greeting_and_user_zero_get_no_context_and_truth_label_present(self):
         rows=[row(1,"user","ordinary follow up", minutes=2), row(2,"model","ordinary answer", minutes=1)]

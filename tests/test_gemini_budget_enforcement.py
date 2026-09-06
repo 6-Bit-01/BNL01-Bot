@@ -16,7 +16,6 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
-from bnl_shared_brain_synthesis import SynthesisCanaryRun
 
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -379,8 +378,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
         basis = SimpleNamespace(
             packet=SimpleNamespace(source_snapshot_digest="source-digest")
         )
-        run = SynthesisCanaryRun(
-            run_id="budget-single-packet-test-run",
+        run = SimpleNamespace(
             prompt_applied=True,
             fallback_reason="",
             revalidation_status="passed",
@@ -454,12 +452,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
                 )
             )
 
-        self.assertIsNotNone(execution)
-        self.assertFalse(execution.candidate_active)
-        self.assertEqual(execution.response, "")
-        self.assertEqual(execution.provider_call_count, 0)
-        self.assertEqual(execution.corrective_call_count, 0)
-        self.assertTrue(execution.typed_contract_required)
+        self.assertIsNone(execution)
         fake_client.models.generate_content.assert_not_called()
 
     def test_unknown_active_model_is_unpriced_and_never_called(self):

@@ -478,18 +478,6 @@ class TokenBudgetAccountingTests(unittest.TestCase):
         )
         self.assertIsNone(config.thinking_config)
 
-    def test_single_packet_config_requires_structured_one_call_envelope(self):
-        config = bnl01_bot._generation_config_for_model(
-            "gemini-3.6-flash",
-            bnl01_bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
-        )
-
-        self.assertEqual(config.response_mime_type, "application/json")
-        schema = config.response_json_schema
-        self.assertEqual(schema["type"], "object")
-        self.assertEqual(schema["required"], ["tasks"])
-        self.assertFalse(schema["additionalProperties"])
-
 
 if __name__ == "__main__":
     unittest.main()

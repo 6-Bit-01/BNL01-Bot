@@ -233,14 +233,7 @@ class DiscordTurnAddressingTests(unittest.TestCase):
                 message, message.content, bot_user_id=bot.id, remove_bot_mention=True
             )
             turn = bnl01_bot.build_batched_conversation_turn(message, resolved, direct_to_bnl=False)
-        decision, reason = bnl01_bot._classify_batch_engagement(
-            [turn],
-            bot_user=bot,
-            channel_policy="public_context",
-            conversation_surface=(
-                bnl01_bot.CONVERSATION_SURFACE_MENTION_OR_REPLY
-            ),
-        )
+        decision, reason = bnl01_bot._classify_batch_engagement([turn], bot_user=bot)
         prompt = bnl01_bot._format_batched_prompt([turn], "balanced", "")
         self.assertEqual((decision, reason), ("observe", "third_party_addressed_turn"))
         self.assertIn("explicit tag recipients=@6 Bit", prompt)
@@ -258,14 +251,7 @@ class DiscordTurnAddressingTests(unittest.TestCase):
             turn = bnl01_bot.build_batched_conversation_turn(message, resolved, direct_to_bnl=False)
         self.assertFalse(turn.addressing.plain_text_names_bnl)
         self.assertTrue(bnl01_bot.batch_exclusively_targets_other_people([turn]))
-        self.assertEqual(
-            bnl01_bot._classify_batch_engagement(
-                [turn],
-                bot_user=bot,
-                channel_policy="public_context",
-            )[0],
-            "observe",
-        )
+        self.assertEqual(bnl01_bot._classify_batch_engagement([turn], bot_user=bot)[0], "observe")
 
     def test_reply_to_human_and_reply_to_bnl_stay_distinct_in_batch_metadata(self):
         bot = SimpleNamespace(id=999, display_name="BNL-01")
@@ -276,11 +262,7 @@ class DiscordTurnAddressingTests(unittest.TestCase):
             human_turn = bnl01_bot.build_batched_conversation_turn(human_reply, human_reply.content, direct_to_bnl=False)
             bnl_turn = bnl01_bot.build_batched_conversation_turn(bnl_reply, bnl_reply.content, direct_to_bnl=True)
         self.assertEqual(
-            bnl01_bot._classify_batch_engagement(
-                [human_turn],
-                bot_user=bot,
-                channel_policy="public_context",
-            ),
+            bnl01_bot._classify_batch_engagement([human_turn], bot_user=bot),
             ("observe", "third_party_addressed_turn"),
         )
         self.assertEqual(bnl01_bot._classify_batch_engagement([bnl_turn], bot_user=bot)[0], "answer")
@@ -299,87 +281,6 @@ class DiscordTurnAddressingTests(unittest.TestCase):
             bnl01_bot.should_suppress_human_to_human_tag_only_turn(
                 True,
                 active_direct_session=True,
-            )
-        )
-        for surface in (
-            bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_PUBLIC_HOME,
-            bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
-        ):
-            self.assertFalse(
-                bnl01_bot.should_suppress_human_to_human_tag_only_turn(
-                    True,
-                    conversation_surface=surface,
-                ),
-                surface,
-            )
-
-    def test_free_speak_human_addressee_is_context_not_admission_veto(self):
-        bot = SimpleNamespace(id=999, display_name="BNL-01")
-        six_bit = SimpleNamespace(id=456, display_name="6 Bit")
-        message = self._message(
-            "hey <@456>, what do you think about the next broadcast?",
-            [six_bit],
-        )
-        with mock.patch.object(
-            type(bnl01_bot.client),
-            "user",
-            new_callable=mock.PropertyMock,
-            return_value=bot,
-        ):
-            turn = bnl01_bot.build_batched_conversation_turn(
-                message,
-                message.content,
-                direct_to_bnl=False,
-            )
-
-        for policy in ("public_home", "sealed_test"):
-            with self.subTest(policy=policy):
-                decision, _reason = bnl01_bot._classify_batch_engagement(
-                    [turn],
-                    bot_user=bot,
-                    channel_policy=policy,
-                )
-                self.assertEqual(decision, "answer")
-                self.assertFalse(
-                    bnl01_bot.batch_is_outside_channel_admission(
-                        [turn],
-                        policy,
-                    )
-                )
-
-        self.assertTrue(
-            bnl01_bot.batch_is_outside_channel_admission(
-                [turn],
-                "public_context",
-            )
-        )
-
-    def test_planned_directness_outranks_stale_third_party_metadata(self):
-        addressing = bnl01_bot.DiscordTurnAddressing(
-            speaker="Test Member",
-            explicit_tag_recipients=("@Another Member",),
-            reply_target="none",
-            explicitly_mentions_bnl=False,
-            reply_targets_bnl=False,
-            directly_targets_bnl=False,
-            targets_other_human=True,
-            plain_text_names_bnl=False,
-        )
-        turn = bnl01_bot.BatchConversationTurn(
-            "Test Member",
-            "Continue that thought.",
-            123,
-            addressing,
-            planned_directness="recent_followup",
-            planned_direct_to_bnl=True,
-        )
-
-        self.assertFalse(bnl01_bot.batch_exclusively_targets_other_people([turn]))
-        self.assertTrue(bnl01_bot.batch_has_response_obligation([turn]))
-        self.assertFalse(
-            bnl01_bot.batch_is_outside_channel_admission(
-                [turn],
-                "public_context",
             )
         )
 
@@ -800,7 +701,7 @@ class ConversationPlannerTests(unittest.TestCase):
         self.assertEqual(reply.response_timing, bnl01_bot.RESPONSE_TIMING_PACED_DIRECT)
         self.assertEqual(reply.response_generation, bnl01_bot.RESPONSE_GENERATION_GEMINI_NORMAL_CHAT)
 
-    def test_non_direct_legacy_active_public_context_requires_tag(self):
+    def test_non_direct_active_message_batches_when_batching_enabled(self):
         plan = bnl01_bot.plan_conversation_response(
             "room chatter continuing",
             "public_context",
@@ -810,16 +711,9 @@ class ConversationPlannerTests(unittest.TestCase):
             followup_candidate=False,
             batching_enabled=True,
         )
-        self.assertEqual(
-            plan.response_timing,
-            bnl01_bot.RESPONSE_TIMING_SILENT_OBSERVE,
-        )
-        self.assertEqual(plan.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_DO_NOT_BATCH)
+        self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_BATCHED_CHANNEL)
+        self.assertEqual(plan.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_ENTER_BATCH)
         self.assertFalse(plan.should_reply)
-        self.assertEqual(
-            plan.reason,
-            "mention_or_reply_tag_or_reply_required",
-        )
 
     def test_non_direct_active_message_silent_when_batching_disabled(self):
         plan = bnl01_bot.plan_conversation_response(
@@ -1118,28 +1012,6 @@ class ConversationPlannerTests(unittest.TestCase):
         self.assertFalse(passive.should_reply)
         self.assertEqual(passive.response_timing, bnl01_bot.RESPONSE_TIMING_BLOCKED)
 
-        legacy_configured_active = bnl01_bot.plan_conversation_response(
-            "random public chatter",
-            "public_context",
-            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
-            active_channel=True,
-            channel_allows_conversation=False,
-            batching_enabled=True,
-            conversation_surface=(
-                bnl01_bot.CONVERSATION_SURFACE_MENTION_OR_REPLY
-            ),
-        )
-        self.assertFalse(legacy_configured_active.should_reply)
-        self.assertFalse(legacy_configured_active.batch_allowed)
-        self.assertEqual(
-            legacy_configured_active.reason,
-            "mention_or_reply_tag_or_reply_required",
-        )
-        self.assertEqual(
-            legacy_configured_active.policy_reply_class,
-            "silent_observe",
-        )
-
         plain_name = bnl01_bot.plan_conversation_response(
             "Hi BNL",
             "public_context",
@@ -1149,34 +1021,6 @@ class ConversationPlannerTests(unittest.TestCase):
         )
         self.assertFalse(plain_name.should_reply)
         self.assertEqual(plain_name.reason, "public_context_plain_name_call_not_direct")
-
-    def test_discord_reply_to_bnl_outranks_simultaneous_mention(self):
-        eligibility = bnl01_bot.decide_reply_eligibility(
-            "<@999> continue this",
-            "public_context",
-            real_direct_target=True,
-            reply_to_bot=True,
-            batching_enabled=True,
-            conversation_surface=(
-                bnl01_bot.CONVERSATION_SURFACE_MENTION_OR_REPLY
-            ),
-        )
-        addressing = bnl01_bot.DiscordTurnAddressing(
-            speaker="Test Member",
-            explicit_tag_recipients=("BNL-01",),
-            reply_target="BNL-01",
-            explicitly_mentions_bnl=True,
-            reply_targets_bnl=True,
-            directly_targets_bnl=True,
-            targets_other_human=False,
-            plain_text_names_bnl=False,
-        )
-
-        self.assertTrue(eligibility.should_reply)
-        self.assertEqual(eligibility.directness, "reply_to_bot")
-        self.assertEqual(eligibility.policy_reply_class, "planned_direct")
-        self.assertFalse(eligibility.batch_allowed)
-        self.assertEqual(addressing.address_kind, "discord_reply")
 
     def test_public_selective_internal_and_protected_passive_stay_quiet(self):
         for policy in ("public_selective", "internal_controlled", "reference_canon", "unknown"):

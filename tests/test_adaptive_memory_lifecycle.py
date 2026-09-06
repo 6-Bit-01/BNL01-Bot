@@ -118,56 +118,6 @@ class AdaptiveMemoryLifecycleTests(unittest.TestCase):
         self.assertIn("memory_governance_live", text)
         self.assertNotIn("PRIVATE_ADMIN_ALPHA", text)
 
-    def test_sealed_mirror_reads_public_memory_without_widening_operator_access(self):
-        public_text = "Public source file memory remains available to the private mirror."
-        bnl01_bot.add_short_memory_trace(
-            42, 1, public_text, source_channel_policy="public_home",
-            source_trust="source_safe_public",
-        )
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
-            for policy, text in (
-                ("internal_controlled", "PRIVATE_ADMIN_ALPHA must stay internal."),
-                ("sealed_test", "SEALED_FIXTURE_BETA must not become public memory."),
-            ):
-                bnl01_bot._insert_memory_tier(
-                    conn.cursor(), 42, 1, "long", text, 0.95,
-                    source_channel_policy=policy, source_trust="legacy_unknown",
-                    topic_key="memory",
-                )
-        before = self._rows()
-        public = bnl01_bot.build_user_memory_context(
-            42, 1, channel_policy="public_home", user_text="source file memory", environ={},
-        )
-        for operator in (False, True):
-            with self.subTest(operator=operator):
-                sealed = bnl01_bot.build_user_memory_context(
-                    42, 1, channel_policy="sealed_test", user_text="source file memory",
-                    is_owner_or_mod=operator, environ={},
-                )
-                self.assertEqual(public, sealed)
-                self.assertIn(public_text, sealed)
-                self.assertNotIn("PRIVATE_ADMIN_ALPHA", sealed)
-                self.assertNotIn("SEALED_FIXTURE_BETA", sealed)
-                diagnostics = bnl01_bot.LAST_MEMORY_PROMPT_DIAGNOSTICS[(42, 1)]
-                self.assertEqual("sealed_test", diagnostics["route_surface"]["channel_policy"])
-                self.assertEqual("public_safe", diagnostics["visibility"])
-        self.assertEqual(before, self._rows())
-
-    def test_sealed_public_memory_read_keeps_governance_receipt_private(self):
-        bnl01_bot.add_short_memory_trace(
-            42, 1, "Public memory about a shared music project.",
-            source_channel_policy="public_home", source_trust="source_safe_public",
-        )
-        bnl01_bot.build_user_memory_context(
-            42, 1, channel_policy="sealed_test", channel_id=10,
-            user_text="remember the music project",
-            environ={"BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true"},
-        )
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
-            rows = conn.execute("SELECT channel_policy FROM memory_governance_shadow_runs").fetchall()
-        self.assertTrue(rows)
-        self.assertEqual({"sealed_test"}, {row[0] for row in rows})
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -1966,7 +1966,7 @@ class OneMindCoordinatorTests(unittest.TestCase):
         self.assertTrue(decision.response_required)
         self.assertEqual(decision.reason, "addressed_response_obligation")
 
-    def test_route_policy_and_channel_admission_remain_higher_authority(self):
+    def test_route_policy_and_third_party_routing_remain_higher_authority(self):
         blocked = coordinate_conversation_turn(
             ConversationOrchestrationInput(
                 route_allowed=False,
@@ -1976,39 +1976,19 @@ class OneMindCoordinatorTests(unittest.TestCase):
                 address_kind="discord_mention",
             )
         )
-        free_speak_human_addressee = (
-            bnl01_bot.build_live_conversation_orchestration_decision(
-                engagement_decision="answer",
-                engagement_reason="room_conversation",
-                channel_policy="public_home",
-                conversation_surface=(
-                    bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_PUBLIC_HOME
-                ),
-                addressings=(_addressing(other_human=True),),
-                context_result=None,
-                moment_situation=None,
-                influence_mode="live",
-            )
-        )
-        tag_required_human_only = (
-            bnl01_bot.build_live_conversation_orchestration_decision(
-                engagement_decision="answer",
-                engagement_reason="stale_followup",
-                channel_policy="public_context",
-                conversation_surface=(
-                    bnl01_bot.CONVERSATION_SURFACE_MENTION_OR_REPLY
-                ),
-                addressings=(_addressing(other_human=True),),
-                context_result=None,
-                moment_situation=None,
-                influence_mode="live",
-            )
+        human_only = bnl01_bot.build_live_conversation_orchestration_decision(
+            engagement_decision="answer",
+            engagement_reason="stale_followup",
+            channel_policy="public_home",
+            addressings=(_addressing(other_human=True),),
+            context_result=None,
+            moment_situation=None,
+            influence_mode="live",
         )
 
         self.assertEqual(blocked.response_act, "blocked")
-        self.assertEqual(free_speak_human_addressee.response_act, "answer")
-        self.assertEqual(tag_required_human_only.response_act, "observe")
-        self.assertEqual(tag_required_human_only.reason, "third_party_only")
+        self.assertEqual(human_only.response_act, "observe")
+        self.assertEqual(human_only.reason, "third_party_only")
 
     def test_optional_context_and_moment_absence_do_not_veto_an_address(self):
         decision = bnl01_bot.build_live_conversation_orchestration_decision(
@@ -3654,13 +3634,17 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
             source = source_file.read()
 
         self.assertEqual(
-            source.count("batch_is_outside_channel_admission("),
-            3,
+            source.count(
+                "batch_exclusively_targets_other_people(items)\n"
+                "                and not (pending_state or pending_anchor)\n"
+                "                and not batch_orchestration_influences"
+            ),
+            1,
         )
-        self.assertNotIn(
+        self.assertIn(
             "batch_exclusively_targets_other_people(items)\n"
-            "                and not (pending_state or pending_anchor)\n"
-            "                and not batch_orchestration_influences",
+            "            and not (pending_state or pending_anchor)\n"
+            "            and not batch_orchestration_influences",
             source,
         )
 

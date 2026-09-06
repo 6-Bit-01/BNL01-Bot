@@ -591,38 +591,6 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
                 )
                 self.assertFalse(snapshot["automaticCutoverAllowed"])
 
-    def test_sealed_test_mirror_is_reported_live_without_user_scope(self):
-        gates = build_gate_snapshot(
-            {
-                "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
-                "BNL_TESTING_CHANNEL_ID": "456",
-                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
-                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
-                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
-                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
-                "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
-                "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
-            }
-        )
-
-        self.assertTrue(gates["ordinary_chat_single_packet_effective"])
-        self.assertTrue(
-            gates[
-                "ordinary_chat_single_packet_sealed_test_mirror_effective"
-            ]
-        )
-        self.assertTrue(
-            gates[
-                "ordinary_chat_single_packet_sealed_test_channel_configured"
-            ]
-        )
-        self.assertFalse(
-            gates[
-                "ordinary_chat_single_packet_allowlisted_scope_effective"
-            ]
-        )
-        self.assertFalse(gates["all_live_gates_clear"])
-
     def test_episode_scope_invariant_is_a_hard_moment_blocker(self):
         for index in (1, 2):
             self.conn.execute(
