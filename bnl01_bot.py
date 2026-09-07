@@ -1977,6 +1977,8 @@ _bnl_control_flags_last_source_url = None
 BNL_READ_MODEL_TTL_SECONDS = 20
 _bnl_read_model_cache = None
 _bnl_read_model_cached_at = None
+_bnl_read_model_cache_scope = None
+_bnl_read_model_cache_lock = threading.Lock()
 
 
 def _build_bnl_control_flag_urls() -> list[str]:
@@ -2113,62 +2115,131 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
     return dict(defaults)
 
 
+def _bnl_read_model_source_scope(url: str, api_key: str) -> tuple:
+    # Bind the existing cache to its source and credentials without storing a
+    # second plaintext service key. This value is never logged or projected.
+    return (url, hashlib.sha256(api_key.encode("utf-8")).hexdigest())
+
+
+def _valid_bnl_read_model_snapshot(data: dict, *, authenticated: bool) -> bool:
+    if not isinstance(data, dict):
+        return False
+    public_only = data.get("publicOnly")
+    access_scope = str(data.get("accessScope") or "").strip().lower()
+    public_response = public_only is True and access_scope in {"", "none", "public"}
+    private_response = authenticated and public_only is False and access_scope == "private"
+    return bool(
+        data.get("ok") is True
+        and data.get("version") == 1
+        and isinstance(data.get("sections"), dict)
+        and (public_response or private_response)
+    )
+
+
 def fetch_bnl_read_model(force: bool = False) -> dict:
     """
     Fetch the website read model as temporary prompt context only.
 
-    The existing BNL service key authenticates the private queue projection.
-    A private response is accepted only when that key is configured; public
-    responses remain compatible with the original public-only contract.
+    Forced reads still refresh the queue. A transient refresh failure can use
+    the existing cache only within its original TTL and source/auth scope.
+    Channel-specific queue access remains enforced by the existing consumers.
     This helper never writes to SQLite, broadcast memory, website relay, or site state.
     """
-    global _bnl_read_model_cache, _bnl_read_model_cached_at
-    if not BNL_READ_MODEL_ENABLED or not BNL_READ_MODEL_URL:
+    global _bnl_read_model_cache, _bnl_read_model_cached_at, _bnl_read_model_cache_scope
+    source_url, api_key = BNL_READ_MODEL_URL, BNL_API_KEY
+    if not BNL_READ_MODEL_ENABLED or not source_url:
         logging.info("bnl_read_model_fetch_skipped reason=disabled")
         return {}
 
     now = datetime.now(PACIFIC_TZ)
-    if not force and _bnl_read_model_cache and _bnl_read_model_cached_at:
-        age = (now - _bnl_read_model_cached_at).total_seconds()
-        if age < BNL_READ_MODEL_TTL_SECONDS:
-            return _bnl_read_model_cache
+    source_scope = _bnl_read_model_source_scope(source_url, api_key)
+
+    def scope_still_current() -> bool:
+        return bool(
+            BNL_READ_MODEL_ENABLED
+            and source_scope == _bnl_read_model_source_scope(BNL_READ_MODEL_URL, BNL_API_KEY)
+        )
+
+    def fresh_cached_snapshot(*, refresh_failed: bool = False) -> dict:
+        with _bnl_read_model_cache_lock:
+            if (
+                not scope_still_current()
+                or _bnl_read_model_cache_scope != source_scope
+                or _bnl_read_model_cached_at is None
+                or not _valid_bnl_read_model_snapshot(
+                    _bnl_read_model_cache, authenticated=bool(api_key)
+                )
+            ):
+                return {}
+            age = (datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds()
+            if 0 <= age < BNL_READ_MODEL_TTL_SECONDS:
+                if refresh_failed:
+                    logging.info("bnl_read_model_cache_reused reason=refresh_failed age_seconds=%.3f", age)
+                return _bnl_read_model_cache
+        return {}
+
+    def discard_rejected_snapshot() -> dict:
+        global _bnl_read_model_cache, _bnl_read_model_cached_at, _bnl_read_model_cache_scope
+        with _bnl_read_model_cache_lock:
+            # An older request must not erase a newer completed refresh.
+            if (
+                _bnl_read_model_cache_scope == source_scope
+                and _bnl_read_model_cached_at is not None
+                and _bnl_read_model_cached_at <= now
+            ):
+                _bnl_read_model_cache = None
+                _bnl_read_model_cached_at = None
+                _bnl_read_model_cache_scope = None
+        return {}
+
+    if not force:
+        cached = fresh_cached_snapshot()
+        if cached:
+            return cached
 
     headers = {"Accept": "application/json"}
     if force:
         headers["Cache-Control"] = "no-cache"
-    if BNL_API_KEY:
-        headers["x-api-key"] = BNL_API_KEY
-    req = urllib.request.Request(BNL_READ_MODEL_URL, method="GET", headers=headers)
+    if api_key:
+        headers["x-api-key"] = api_key
+    req = urllib.request.Request(source_url, method="GET", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=3) as response:
             code = getattr(response, "status", None) or response.getcode()
             if not (200 <= code < 300):
                 logging.warning("bnl_read_model_fetch_failed reason=http_status")
-                return {}
+                return fresh_cached_snapshot(refresh_failed=True) if code in {408, 429} or code >= 500 else discard_rejected_snapshot()
             body = response.read().decode("utf-8", errors="replace")
             data = json.loads(body) if body else {}
     except Exception as e:
         logging.warning(f"bnl_read_model_fetch_failed reason={type(e).__name__}")
-        return {}
+        transient = (
+            (e.code in {408, 429} or e.code >= 500) if isinstance(e, urllib.error.HTTPError)
+            else isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError, OSError))
+        )
+        return fresh_cached_snapshot(refresh_failed=True) if transient else discard_rejected_snapshot()
 
-    if not isinstance(data, dict):
+    if not _valid_bnl_read_model_snapshot(data, authenticated=bool(api_key)):
         logging.warning("bnl_read_model_invalid_shape")
-        return {}
-    public_only = data.get("publicOnly")
-    access_scope = str(data.get("accessScope") or "").strip().lower()
-    public_response = public_only is True and access_scope in {"", "none", "public"}
-    private_response = bool(BNL_API_KEY) and public_only is False and access_scope == "private"
-    if (
-        data.get("ok") is not True
-        or data.get("version") != 1
-        or not isinstance(data.get("sections"), dict)
-        or not (public_response or private_response)
-    ):
-        logging.warning("bnl_read_model_invalid_shape")
-        return {}
+        return discard_rejected_snapshot()
 
-    _bnl_read_model_cache = data
-    _bnl_read_model_cached_at = now
+    with _bnl_read_model_cache_lock:
+        if not scope_still_current():
+            return {}
+        # Keep the last-started successful refresh when requests overlap.
+        if (
+            _bnl_read_model_cache_scope == source_scope
+            and _bnl_read_model_cached_at is not None
+            and _bnl_read_model_cached_at > now
+        ):
+            age = (datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds()
+            if not 0 <= age < BNL_READ_MODEL_TTL_SECONDS:
+                return {}
+            data = _bnl_read_model_cache
+        else:
+            _bnl_read_model_cache = data
+            _bnl_read_model_cached_at = now
+            _bnl_read_model_cache_scope = source_scope
     logging.info(
         "bnl_read_model_fetch_success sections=%s access_scope=%s",
         len(data.get("sections") or {}),
@@ -10836,7 +10907,11 @@ def tiktok_show_episode_response_failure(
     *,
     current_user_text: str = "",
 ) -> str:
-    """Reject show answers that ignore evidence or backfill gaps with lore."""
+    """Historical show-only diagnostic retained for regression fixtures.
+
+    Ordinary response delivery must not call this whole-answer checker: a
+    mixed answer can use timestamps and facts supplied by other valid sources.
+    """
 
     evidence = _show_episode_evidence_from_prompt(prompt)
     if not evidence:
@@ -11009,48 +11084,9 @@ def recover_guarded_response_obligation(
     source_neutral = _guard_recovery_requires_source_neutral_response(
         original_reason
     )
-    show_evidence = _show_episode_evidence_from_prompt(prompt)
-    if show_evidence and not source_neutral and not force_model_rewrite:
-        for candidate in candidates:
-            repaired = remove_unsupported_show_lore_sentences(
-                candidate,
-                prompt,
-            )
-            if not repaired:
-                continue
-            if tiktok_show_analysis_response_failure(repaired, prompt):
-                continue
-            if tiktok_show_episode_response_failure(
-                repaired,
-                prompt,
-                current_user_text=current_user_text,
-            ):
-                continue
-            if contains_fake_lookup_claim(repaired):
-                continue
-            if (
-                not source_context_available
-                and _contains_unsupported_source_authority_claim(repaired)
-            ):
-                continue
-            if detect_normal_chat_presentation_mode_leak(
-                repaired,
-                route_mode,
-            ):
-                continue
-            diagnostics["response_obligation_recovery_kind"] = (
-                "grounded_show_candidate"
-            )
-            diagnostics["source_neutral_recovery"] = False
-            logging.warning(
-                "response_obligation_recovered_after_guard reason=%s "
-                "kind=grounded_show_candidate route_mode=%s channel_policy=%s",
-                original_reason,
-                route_mode,
-                channel_policy,
-            )
-            return repaired
-        force_model_rewrite = True
+    # Show memory is one source among the authorized conversation inputs.
+    # Its historical lexical/clock checker cannot judge a whole mixed answer.
+    # Recovery uses the same general source and privacy checks as normal chat.
 
     quote_guard_requested = bool(
         exact_quote_requested or third_party_attribution_requested
@@ -11063,6 +11099,11 @@ def recover_guarded_response_obligation(
                 original_reason.startswith("contextual_followthrough_")
                 and is_contextual_followthrough_deflection(candidate)
             ):
+                continue
+            # Keep the existing durable-analysis check on recovered drafts;
+            # removing show-only clock authority must not reuse a candidate
+            # already rejected by the separately retained analysis owner.
+            if tiktok_show_analysis_response_failure(candidate, prompt):
                 continue
             if contains_fake_lookup_claim(candidate):
                 continue
@@ -38653,6 +38694,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="stale_after_presend_response_rewrite",
             )
             return
+        _record_guard_regeneration_debug(
+            guard_diagnostics,
+            channel_id=channel_id,
+        )
         _log_batch_event(
             logging.INFO,
             "response_send_commit_start",
@@ -41465,6 +41510,23 @@ def build_exact_quote_correction_prompt(
     )
 
 
+def _record_guard_regeneration_debug(diagnostics: dict, *, channel_id: int) -> None:
+    """Refresh the existing last-route flag after the final guard/recovery await."""
+
+    if LAST_ROUTE_DEBUG.get("channel_id") != channel_id:
+        return
+    regenerated = any(
+        bool(value)
+        for name, value in diagnostics.items()
+        if name.endswith("_regenerated") or name.startswith("regenerated_for_")
+    )
+    if regenerated:
+        # The historical field is displayed as "regeneration happened".
+        LAST_ROUTE_DEBUG["regenerated_for_mode_leak"] = True
+    if diagnostics.get("response_obligation_regenerated"):
+        LAST_ROUTE_DEBUG["fallback_used"] = True
+
+
 async def apply_guarded_response_regeneration(
     response: str,
     *,
@@ -41835,13 +41897,6 @@ async def apply_guarded_response_regeneration(
                     prompt,
                 )
             )
-            or bool(
-                tiktok_show_episode_response_failure(
-                    candidate,
-                    prompt,
-                    current_user_text=current_user_text,
-                )
-            )
             or (
                 contextual_followthrough_required
                 and is_contextual_followthrough_deflection(candidate)
@@ -42064,92 +42119,9 @@ async def apply_guarded_response_regeneration(
             return "", diagnostics
         response = regenerated
 
-    tiktok_episode_failure = tiktok_show_episode_response_failure(
-        response,
-        prompt,
-        current_user_text=current_user_text,
-    )
-    if tiktok_episode_failure:
-        diagnostics["tiktok_show_episode_guard_triggered"] = True
-        diagnostics["tiktok_show_episode_guard_reason"] = (
-            tiktok_episode_failure
-        )
-        logging.warning(
-            "tiktok_show_episode_guard_triggered reason=%s "
-            "route_mode=%s channel_policy=%s",
-            tiktok_episode_failure,
-            route_mode,
-            channel_policy,
-        )
-        if not regeneration_allowed:
-            diagnostics.update(
-                {
-                    "suppressed": True,
-                    "suppression_reason": (
-                        "tiktok_show_episode_validation_only"
-                    ),
-                    "guard_fallback_or_generic_non_answer": True,
-                }
-            )
-            return "", diagnostics
-        regenerated = await regenerate(
-            build_tiktok_show_episode_correction_prompt(
-                prompt,
-                tiktok_episode_failure,
-            )
-        )
-        diagnostics["tiktok_show_episode_regenerated"] = True
-        regenerated = (regenerated or "").strip()
-        regenerated_failure = tiktok_show_episode_response_failure(
-            regenerated,
-            prompt,
-            current_user_text=current_user_text,
-        )
-        diagnostics["tiktok_show_episode_guard_reason"] = (
-            regenerated_failure
-        )
-        if retry_has_guard_failure(regenerated):
-            lore_sanitized = ""
-            if regenerated_failure.startswith("unsupported_show_lore_"):
-                lore_sanitized = remove_unsupported_show_lore_sentences(
-                    regenerated,
-                    prompt,
-                )
-            if (
-                lore_sanitized
-                and lore_sanitized != regenerated
-                and not retry_has_guard_failure(lore_sanitized)
-            ):
-                logging.warning(
-                    "tiktok_show_episode_lore_sanitized_after_retry "
-                    "reason=%s route_mode=%s channel_policy=%s",
-                    regenerated_failure,
-                    route_mode,
-                    channel_policy,
-                )
-                diagnostics["tiktok_show_episode_lore_sanitized"] = True
-                diagnostics["tiktok_show_episode_guard_reason"] = ""
-                response = lore_sanitized
-            else:
-                logging.warning(
-                    "tiktok_show_episode_candidate_rejected_after_retry "
-                    "reason=%s route_mode=%s channel_policy=%s",
-                    regenerated_failure or "other_guard",
-                    route_mode,
-                    channel_policy,
-                )
-                diagnostics.update(
-                    {
-                        "suppressed": True,
-                        "suppression_reason": (
-                            "tiktok_show_episode_after_retry"
-                        ),
-                        "guard_fallback_or_generic_non_answer": True,
-                    }
-                )
-                return "", diagnostics
-        else:
-            response = regenerated
+    # The full answer may combine Journal, queue, canon and show evidence.
+    # Gemini consumes those source-labelled inputs; the show-only checker has
+    # no authority to reject or rewrite statements supplied by another source.
 
     exact_reply_grounding = reply_referent_grounding(response)
     diagnostics["exact_reply_grounding_status"] = (
@@ -42752,26 +42724,6 @@ async def apply_guarded_response_regeneration(
                 "suppressed": True,
                 "suppression_reason": (
                     "tiktok_show_analysis_failed_before_send"
-                ),
-                "guard_fallback_or_generic_non_answer": True,
-            }
-        )
-        return "", diagnostics
-    final_tiktok_episode_failure = tiktok_show_episode_response_failure(
-        response,
-        prompt,
-        current_user_text=current_user_text,
-    )
-    if final_tiktok_episode_failure:
-        diagnostics.update(
-            {
-                "tiktok_show_episode_guard_triggered": True,
-                "tiktok_show_episode_guard_reason": (
-                    final_tiktok_episode_failure
-                ),
-                "suppressed": True,
-                "suppression_reason": (
-                    "tiktok_show_episode_failed_before_send"
                 ),
                 "guard_fallback_or_generic_non_answer": True,
             }
@@ -43742,7 +43694,11 @@ async def regenerate_ordinary_chat_response_obligation(
     current_user_text: str = "",
     route_mode: str = ROUTE_MODE_NORMAL_CHAT,
 ) -> tuple[str, str, tuple[PromptSourceBasis, ...], int, bool]:
-    """Regenerate a natural ordinary-chat response after draft rejection."""
+    """Recover through normal Gemini, including its voice and source guards.
+
+    Recovery is also used when the experimental packet generator is off. It
+    must not select that generator's system prompt or bypass normal safeguards.
+    """
 
     repair_prompt, repair_bases, source_neutral = (
         build_ordinary_chat_response_repair_prompt(
@@ -43759,7 +43715,7 @@ async def regenerate_ordinary_chat_response_obligation(
             repair_prompt,
             user_id,
             guild_id,
-            route=ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
+            route="get_gemini_response",
             source_context_available=bool(
                 source_context_available and not source_neutral
             ),
@@ -44893,6 +44849,10 @@ async def send_planned_conversation_response(
             guard_status="stale_after_presend_response_rewrite",
         )
         return model_decision
+    _record_guard_regeneration_debug(
+        guard_diagnostics,
+        channel_id=int(getattr(message.channel, "id", 0) or 0),
+    )
     sent_message_ids = []
     try:
         if len(response) <= 2000:
