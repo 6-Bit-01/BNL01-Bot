@@ -168,17 +168,6 @@ class BlockingSendChannel(FakeChannel):
 
 class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        # Sealed conversation now reads public memory through the real reader.
-        # Each coordinator fixture needs the same schema as a running bot.
-        self.db_directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.db_directory.cleanup)
-        db_patch = mock.patch.object(
-            bnl01_bot, "DB_FILE",
-            os.path.join(self.db_directory.name, "batch-memory.sqlite3"),
-        )
-        db_patch.start()
-        self.addCleanup(db_patch.stop)
-        bnl01_bot.init_db()
         self.channel_ids = set()
         self.original_batching_enabled = bnl01_bot.BNL_ACTIVE_BATCHING_ENABLED
         self.original_typing_enabled = bnl01_bot.BNL_TYPING_INDICATOR_ENABLED
@@ -885,98 +874,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "One combined response.",
         )
 
-    async def _run_normal_response_restoration_case(self, policy, drafts):
-        """Exercise normal assembly, provider dispatch, guards and batch send.
-
-        Queue acquisition has separate reader-boundary tests. These fixtures
-        hold its successful public evidence constant while testing whether a
-        show-only reviewer can discard another source's statements.
-        """
-        channel = self._channel(8181 if policy == "sealed_test" else 8182)
-        request = "What was your latest Journal about, and is the queue open right now?"
-        source_context = (
-            "Website public queue read model context:\n"
-            "Queue: queueOpen=False; today's intake opened at 18:40.\n"
-            "Published Journal: Screen Tap Milestones; published at 19:00. "
-            "The room celebrated a radio placement and traded storm Foley."
-        )
-        show_context = (
-            "Durable BARCODE Radio show episode memory:\n"
-            "Show episode: Friday Radio; Alex discussed green visuals."
-        )
-        responses = iter(drafts)
-        provider = mock.Mock(side_effect=lambda **_kwargs: SimpleNamespace(
-            candidates=[SimpleNamespace(content=SimpleNamespace(
-                parts=[SimpleNamespace(text=next(responses))],
-            ))],
-            usage_metadata=SimpleNamespace(
-                total_token_count=20, prompt_token_count=10,
-                candidates_token_count=10, thoughts_token_count=0,
-                cached_content_token_count=0,
-            ),
-        ))
-        real_generate = bnl01_bot.get_gemini_response
-        real_guard = bnl01_bot.apply_guarded_response_regeneration
-        real_source_check = bnl01_bot._contains_unsupported_source_authority_claim
-        real_debug = bnl01_bot.update_last_route_debug
-        self._prime_flush(channel, request)
-        with self._flush_runtime(channel.id, None), ExitStack() as stack:
-            for name, value in (
-                ("get_gemini_response", real_generate),
-                ("apply_guarded_response_regeneration", real_guard),
-                ("_contains_unsupported_source_authority_claim", real_source_check),
-                ("update_last_route_debug", real_debug),
-            ):
-                stack.enter_context(mock.patch.object(bnl01_bot, name, new=value))
-            for name, value in (
-                ("resolve_channel_policy", policy),
-                ("maybe_build_bnl_read_model_context", source_context),
-                ("build_tiktok_show_evidence_context_for_turn", show_context),
-                ("build_user_memory_context", ""),
-                ("get_gemini_client", SimpleNamespace(models=SimpleNamespace(generate_content=provider))),
-            ):
-                stack.enter_context(mock.patch.object(bnl01_bot, name, return_value=value))
-            stack.enter_context(mock.patch.object(bnl01_bot.random, "random", return_value=1.0))
-            stack.enter_context(mock.patch.dict(os.environ, {
-                "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "false",
-                "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
-                "BNL_UNIFIED_MOMENT_CANARY_ENABLED": "false",
-                "BNL_GEMINI_BUDGET_ENFORCEMENT_ENABLED": "false",
-            }))
-            await bnl01_bot._flush_channel_buffer(channel)
-        self.assertEqual(channel.sent, [drafts[-1]])
-        self.assertEqual(provider.call_count, len(drafts))
-        for call in provider.call_args_list:
-            contents = call.kwargs["contents"]
-            self.assertIn(bnl01_bot.BNL01_SYSTEM_PROMPT, contents)
-            self.assertNotIn(bnl01_bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT, contents)
-            self.assertIn(source_context, contents)
-            self.assertIn(show_context, contents)
-        self.assertFalse(bnl01_bot.LAST_ROUTE_DEBUG["ordinary_chat_single_packet_applied"])
-        return dict(bnl01_bot.LAST_ROUTE_DEBUG)
-
-    async def test_normal_mixed_source_batch_delivers_clocks_without_show_veto(self):
-        answer = (
-            "The latest Journal, Screen Tap Milestones, was published at 19:00 "
-            "and covered the radio placement and storm Foley. Submissions are "
-            "closed now; today's intake opened at 18:40."
-        )
-        for policy in ("public_home", "sealed_test"):
-            with self.subTest(policy=policy):
-                debug = await self._run_normal_response_restoration_case(policy, [answer])
-                self.assertFalse(debug["regenerated_for_mode_leak"])
-
-    async def test_normal_batch_recovery_keeps_normal_provider_and_reports_regeneration(self):
-        answer = (
-            "Screen Tap Milestones covered the radio placement and storm Foley. "
-            "Submissions are closed now."
-        )
-        debug = await self._run_normal_response_restoration_case(
-            "sealed_test", ["What can I help with?", "What can I help with?", answer],
-        )
-        self.assertTrue(debug["regenerated_for_mode_leak"])
-        self.assertTrue(debug["fallback_used"])
-
     async def test_public_batch_guard_exhaustion_recovers_required_reply(self):
         channel = self._channel(8104)
         answer = "A concrete public answer survived the guard repair limit."
@@ -1172,90 +1069,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         save_model.assert_called_once()
         self.assertEqual(save_model.call_args.args[2], channel.sent[0])
         self.assertEqual(save_model.call_args.kwargs["channel_policy"], "public_home")
-
-    async def test_sealed_generic_recurrence_with_public_show_context_commits_after_send(
-        self,
-    ):
-        channel = self._channel(8153)
-        request = (
-            "Sealed acceptance fixture: based only on memory, what recurring "
-            "themes keep coming up for me?"
-        )
-        answer = "There is not enough independent recurrence evidence yet."
-        generation_calls = []
-        show_evidence = (
-            "Durable BARCODE Radio show episode memory:\n"
-            "- Public finalized show evidence relevant to this request."
-        )
-        show_context = mock.Mock(return_value=show_evidence)
-        save_model = mock.Mock()
-        record_assessment = mock.AsyncMock()
-
-        async def generate(prompt, **kwargs):
-            generation_calls.append((prompt, kwargs))
-            return answer
-
-        self._prime_flush(channel, request)
-        with (
-            self._flush_runtime(channel.id, generate),
-            mock.patch.object(
-                bnl01_bot,
-                "maybe_build_bnl_read_model_context",
-                return_value="",
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "build_tiktok_show_evidence_context_for_turn",
-                new=show_context,
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "build_user_memory_context",
-                return_value="",
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "unified_response_assessment_shadow_enabled",
-                return_value=True,
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "save_model_message",
-                new=save_model,
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "record_unified_response_assessment_shadow_after_send",
-                new=record_assessment,
-            ),
-        ):
-            await bnl01_bot._flush_channel_buffer(channel)
-
-        show_context.assert_called_once_with(
-            guild_id=channel.guild.id,
-            user_text=request,
-            subject_user_id=100,
-            website_read_model_context="",
-        )
-        self.assertEqual(channel.sent, [answer])
-        self.assertEqual(len(generation_calls), 1)
-        self.assertTrue(generation_calls[0][1]["source_context_available"])
-        self.assertIn(show_evidence, generation_calls[0][0])
-        save_model.assert_called_once()
-        self.assertEqual(save_model.call_args.args[2], answer)
-        self.assertEqual(
-            save_model.call_args.kwargs["channel_policy"],
-            "sealed_test",
-        )
-        record_assessment.assert_awaited_once()
-        self.assertIsNotNone(record_assessment.await_args.args[0])
-        self.assertEqual(
-            record_assessment.await_args.kwargs["response"],
-            answer,
-        )
-        self.assertTrue(
-            record_assessment.await_args.kwargs["response_sent"]
-        )
 
     async def test_non_privileged_tester_queue_fragment_bypasses_reply_cooldown(self):
         channel = self._channel(8151)
@@ -1569,7 +1382,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("vending machine", prompts[1])
         self.assertEqual(channel.sent, [repaired_response])
 
-    async def test_public_plain_name_show_timeline_supplies_episode_to_normal_owner(self):
+    async def test_public_plain_name_show_timeline_uses_finalized_episode_owner(self):
         channel = self._channel(8150)
         request = (
             "BNL, what happened during yesterday's BARCODE Radio show? Give me "
@@ -1587,11 +1400,20 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "- TikTok t+2.0m Alex: \"the green visuals during this song are wild\"\n"
             "- Discord t+5.2m Alex: \"Did the Wheel put Queue Light up next, BNL?\""
         )
+        observed_refusal = (
+            "I don't have yesterday's broadcast logs or chat feed loaded in my "
+            "active buffer, 6 Bit. You'll need to check the raw recordings "
+            "directly or ask Sheila for the show breakdown."
+        )
         repaired = (
             "The retained episode clock begins at t+1.2m with Neon Fox's First "
             "Signal, followed by Alex calling out its green visuals in TikTok "
             "chat. At t+4.5m the Wheel confirmed Second Artist's Queue Light; "
             "Alex then asked BNL about that move in Discord."
+        )
+        retry_with_unsupported_lore = (
+            repaired
+            + " Cliff handled a studio-floor interruption between those events."
         )
         prompts = []
         source_context_flags = []
@@ -1603,7 +1425,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             source_context_flags.append(
                 bool(kwargs.get("source_context_available"))
             )
-            return repaired
+            return (
+                observed_refusal
+                if len(prompts) == 1
+                else retry_with_unsupported_lore
+            )
 
         def assess(**kwargs):
             assessment_calls.append(kwargs)
@@ -1655,14 +1481,17 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bnl01_bot._flush_channel_buffer(channel)
 
-        self.assertEqual(len(prompts), 1)
+        self.assertEqual(len(prompts), 2)
         self.assertIn(episode_context, prompts[0])
         self.assertIn(
             "Finalized BARCODE Radio episode priority:",
             prompts[0],
         )
-        self.assertNotIn("FINALIZED SHOW EVIDENCE CORRECTION REQUIRED", prompts[0])
-        self.assertEqual(source_context_flags, [True])
+        self.assertIn(
+            "FINALIZED SHOW EVIDENCE CORRECTION REQUIRED",
+            prompts[1],
+        )
+        self.assertEqual(source_context_flags, [True, True])
         build_episode.assert_called_once_with(
             "missing-public-show-batch-test.db",
             guild_id=channel.guild.id,
@@ -1678,6 +1507,8 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             assessment_calls[0]["website_read_model_present"]
         )
         self.assertEqual(channel.sent, [repaired])
+        self.assertNotIn(observed_refusal, channel.sent)
+        self.assertNotIn("Cliff", channel.sent[0])
 
     async def test_batch_records_one_participant_neutral_unified_assessment_after_send(self):
         channel = self._channel(8137)
@@ -1772,6 +1603,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         with (
             self._flush_runtime(channel.id, generate),
             mock.patch.dict(os.environ, canary_env, clear=False),
+            mock.patch.object(bnl01_bot, "DB_FILE", ":memory:"),
             mock.patch.object(
                 bnl01_bot,
                 "apply_guarded_response_regeneration",
@@ -2093,19 +1925,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
-                "build_tiktok_show_evidence_context_for_turn",
-                return_value=(
-                    "Durable BARCODE Radio show episode memory:\n"
-                    "- REQUESTER SHOW EVIDENCE"
-                ),
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "finalized_show_packet_owner_requested",
-                return_value=False,
-            ),
-            mock.patch.object(
-                bnl01_bot,
                 "build_unified_response_assessment_shadow",
                 return_value=object(),
             ),
@@ -2113,7 +1932,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 bnl01_bot,
                 "build_shared_brain_synthesis_basis",
                 return_value=object(),
-            ) as build_basis,
+            ),
             mock.patch.object(
                 bnl01_bot,
                 "maybe_generate_shared_brain_synthesis_canary",
@@ -2143,19 +1962,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await bnl01_bot._flush_channel_buffer(channel)
 
         deterministic_governance.assert_not_called()
-        competing_contexts = build_basis.call_args.kwargs[
-            "competing_factual_contexts"
-        ]
-        self.assertTrue(
-            any("Derived memory summaries" in item for item in competing_contexts)
-        )
-        self.assertTrue(
-            any("REQUESTER SHOW EVIDENCE" in item for item in competing_contexts)
-        )
         synthesize.assert_awaited_once()
-        self.assertTrue(
-            synthesize.await_args.kwargs["source_context_available"]
-        )
         guard.assert_awaited_once()
         self.assertFalse(
             guard.await_args.kwargs["regeneration_allowed"]
@@ -2165,149 +1972,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         finalized.assert_awaited_once()
         self.assertTrue(finalized.await_args.kwargs["response_sent"])
         self.assertTrue(finalized.await_args.kwargs["candidate_live"])
-
-    async def test_batched_personal_recurrence_composes_requester_show_evidence(self):
-        channel = self._channel(8146)
-        request = (
-            "Sealed acceptance fixture: based only on memory, what recurring "
-            "themes keep coming up for me?"
-        )
-        answer = (
-            "You repeatedly combine hands-on broadcast oversight with precise "
-            "identity and system corrections. Your retained show questions "
-            "add a concrete habit of checking the room signal and queue while "
-            "the broader memory shows the same calibration instinct elsewhere."
-        )
-        packet = object()
-        assessment = object()
-        basis = object()
-        memory_basis = object()
-        decision = SimpleNamespace(candidate_selected=True)
-        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
-            decision=decision,
-            response=answer,
-            prompt="one composed requester-memory prompt",
-            prompt_source_bases=(memory_basis,),
-            candidate_active=True,
-            provider_call_count=1,
-            corrective_call_count=0,
-        )
-        scope_calls = []
-
-        def build_assessment(*_args, **kwargs):
-            kwargs["intelligence_packet_out"]["packet"] = packet
-            return assessment
-
-        def scope_decision(**kwargs):
-            scope_calls.append(kwargs)
-            return SimpleNamespace(
-                eligible=not kwargs.get("specialized_owner_present", False),
-                reason="eligible",
-            )
-
-        async def legacy_generation(*_args, **_kwargs):
-            raise AssertionError(
-                "requester show evidence must join the existing packet"
-            )
-
-        self._prime_flush(channel, request)
-        with (
-            self._flush_runtime(channel.id, legacy_generation),
-            mock.patch.object(
-                bnl01_bot,
-                "maybe_build_bnl_read_model_context",
-                return_value="",
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "build_tiktok_show_evidence_context_for_turn",
-                return_value=(
-                    "Durable BARCODE Radio show episode memory:\n"
-                    "- REQUESTER SHOW EVIDENCE"
-                ),
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "finalized_show_packet_owner_requested",
-                return_value=False,
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "build_tiktok_show_episode_turn_contract",
-            ) as show_owner_contract,
-            mock.patch.object(
-                bnl01_bot,
-                "build_user_memory_context",
-                return_value="DURABLE MEMBER MEMORY",
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "build_memory_prompt_source_basis",
-                return_value=memory_basis,
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "ordinary_chat_route_scope_decision",
-                side_effect=scope_decision,
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "build_unified_response_assessment_shadow",
-                side_effect=build_assessment,
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "build_ordinary_chat_basis",
-                return_value=basis,
-            ) as build_ordinary,
-            mock.patch.object(
-                bnl01_bot,
-                "maybe_generate_ordinary_chat_single_packet",
-                new=mock.AsyncMock(return_value=execution),
-            ) as generate_ordinary,
-            mock.patch.object(
-                bnl01_bot,
-                "build_shared_brain_synthesis_basis",
-            ) as build_shared,
-            mock.patch.object(
-                bnl01_bot,
-                "maybe_generate_shared_brain_synthesis_canary",
-                new=mock.AsyncMock(),
-            ) as generate_shared,
-            mock.patch.object(
-                bnl01_bot,
-                "prompt_source_basis_failure",
-                return_value="",
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "safely_finalize_shared_brain_synthesis",
-                new=mock.AsyncMock(return_value=True),
-            ),
-            mock.patch.object(
-                bnl01_bot,
-                "record_unified_response_assessment_shadow_after_send",
-                new=mock.AsyncMock(),
-            ),
-        ):
-            await bnl01_bot._flush_channel_buffer(channel)
-
-        self.assertEqual(channel.sent, [answer])
-        self.assertTrue(scope_calls)
-        self.assertFalse(scope_calls[-1]["specialized_owner_present"])
-        show_owner_contract.assert_not_called()
-        competing_contexts = build_ordinary.call_args.kwargs[
-            "competing_factual_contexts"
-        ]
-        self.assertTrue(
-            any("DURABLE MEMBER MEMORY" in item for item in competing_contexts)
-        )
-        self.assertTrue(
-            any("REQUESTER SHOW EVIDENCE" in item for item in competing_contexts)
-        )
-        generate_ordinary.assert_awaited_once()
-        build_shared.assert_not_called()
-        generate_shared.assert_not_awaited()
 
     async def test_batched_packet_source_change_falls_back_to_normal_baseline(self):
         channel = self._channel(8127)

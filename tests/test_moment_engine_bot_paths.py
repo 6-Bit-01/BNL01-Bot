@@ -93,7 +93,6 @@ class MomentEngineBotPathTests(unittest.TestCase):
 
         self.assertIsNotNone(assessment)
         self.assertTrue(assessment.active_episode_id.startswith("mep_"))
-        self.assertEqual(len(assessment.active_episode_source_moment_ids), 1)
         self.assertIn("active_episode", assessment.selected_lanes)
         self.assertIn("active_episode", assessment.prompt_missing_lanes)
         self.assertNotIn(

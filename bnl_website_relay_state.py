@@ -585,17 +585,13 @@ def select_accepted_relay_publications_on_connection(
     guild_id: int,
     user_text: str,
     limit: int = RELAY_PUBLICATION_RESULT_LIMIT,
-    include_context: bool = False,
 ) -> AcceptedRelayPublicationSelection:
-    """Read accepted history, optionally adding topical ordinary context."""
     requested_mode = relay_publication_query_mode(user_text)
     if requested_mode == "not_requested":
-        if not include_context:
-            return AcceptedRelayPublicationSelection(
-                "not_requested",
-                "not_requested",
-            )
-        requested_mode = "context"
+        return AcceptedRelayPublicationSelection(
+            "not_requested",
+            "not_requested",
+        )
     if not _relay_table_exists(conn, "website_relay_history"):
         return AcceptedRelayPublicationSelection(
             "source_unavailable",
@@ -603,11 +599,7 @@ def select_accepted_relay_publications_on_connection(
         )
     identity = _relay_query_identity(user_text)
     date_match = _RELAY_DATE_RE.search(str(user_text or ""))
-    publication_date = (
-        date_match.group(1)
-        if date_match and requested_mode != "context"
-        else ""
-    )
+    publication_date = date_match.group(1) if date_match else ""
     if identity:
         query_mode = "exact_identity"
         rows = _relay_publication_rows(
@@ -626,9 +618,7 @@ def select_accepted_relay_publications_on_connection(
         )
     else:
         query_mode = (
-            requested_mode
-            if requested_mode in {"latest", "context"}
-            else "topic"
+            "latest" if requested_mode == "latest" else "topic"
         )
         rows = _relay_publication_rows(
             conn,
@@ -670,15 +660,10 @@ def select_accepted_relay_publications_on_connection(
                 ),
                 reverse=True,
             )
-            # Explicit Relay requests retain their recent evidence window.
-            # Ordinary context only supplies matching publications; this is
-            # retrieval ranking and does not govern the model's response.
-            rows = [
-                row for score, _timestamp, row in scored
-                if query_mode != "context" or score > 0
-            ]
-        elif query_mode == "context":
-            rows = []
+            # Lexical overlap is a ranking hint, not an authority gate. The
+            # one governed response model determines relevance from this
+            # bounded window of accepted public Relay evidence.
+            rows = [row for _score, _timestamp, row in scored]
     candidate_count = len(rows)
     selected: list[AcceptedRelayPublication] = []
     provenance_excluded = 0

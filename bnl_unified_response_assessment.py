@@ -364,7 +364,7 @@ _SELF_SUBJECT_CUE_RE = re.compile(
     r"\b(?:what\s+(?:am\s+i|do\s+you\s+(?:know|remember)\s+about\s+me)|"
     r"tell\s+me\s+(?:what|who)\s+i\s+am|about\s+me|my\s+(?:profile|"
     r"history|role|work|music|preferences?|goals?|memory|story)|"
-    r"remember\s+me|what\s+(?:recurring\s+)?(?:patterns?|themes?)\s+(?:keep\s+)?"
+    r"remember\s+me|what\s+(?:patterns?|themes?)\s+(?:keep\s+)?"
     r"(?:recurring|coming\s+up)\s+for\s+me|"
     r"what\s+keeps\s+(?:recurring|coming\s+up)\s+for\s+me)\b",
     re.I,
@@ -2301,7 +2301,6 @@ class UnifiedResponseAssessment:
     profile_sufficiency_reasons: Tuple[str, ...] = ()
     situation_frame: SituationFrameV1 | None = None
     frame_revalidation: FrameSourceRevalidationResult | None = None
-    active_episode_source_moment_ids: Tuple[str, ...] = ()
 
 
 def build_unified_response_assessment(
@@ -2316,7 +2315,6 @@ def build_unified_response_assessment(
     speaker_labels: Sequence[str] = (),
     current_exchange_source_ids: Sequence[int] = (),
     active_episode_id: str = "",
-    active_episode_source_moment_ids: Sequence[str] = (),
     prior_moment_ids: Sequence[str] = (),
     governed_entry_ids: Sequence[str] = (),
     relationship_candidate_keys: Sequence[str] = (),
@@ -2371,9 +2369,6 @@ def build_unified_response_assessment(
     )
     labels = _unique_strings(speaker_labels)
     exchange_ids = _unique_positive_ints(current_exchange_source_ids)
-    episode_source_moment_ids = _unique_strings(
-        active_episode_source_moment_ids
-    )
     moment_ids = _unique_strings(prior_moment_ids)
     governed_ids = _unique_strings(governed_entry_ids)
     relationship_keys = _unique_strings(relationship_candidate_keys)
@@ -2744,7 +2739,6 @@ def build_unified_response_assessment(
             )
             else None
         ),
-        active_episode_source_moment_ids=episode_source_moment_ids,
     )
 
 
@@ -3817,14 +3811,7 @@ def persist_shadow_run(
         len(assessment.participant_user_ids),
         len(assessment.current_exchange_source_ids),
         int(bool(assessment.active_episode_id)),
-        len(
-            _unique_strings(
-                (
-                    *assessment.prior_moment_ids,
-                    *assessment.active_episode_source_moment_ids,
-                )
-            )
-        ),
+        len(assessment.prior_moment_ids),
         assessment.moment_candidate_count,
         len(assessment.governed_entry_ids),
         assessment.governed_candidate_count,
