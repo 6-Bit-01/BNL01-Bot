@@ -21,6 +21,8 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
 import bnl_journal
+import bnl_memory_ledger as ledger
+import bnl_moment_engine as moments
 import bnl_website_relay_state
 import test_publication_read_adapters as publication_fixtures
 from test_conversation_batching import FakeChannel, FakeGuild, FakeMessage
@@ -565,6 +567,248 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
             rows = conn.execute("SELECT content FROM conversations WHERE role='model'").fetchall()
         self.assertEqual(rows, [(final_answer,)])
+
+
+    def _seed_group_member_sources(self, *, facts=False, count=2):
+        names = ("Amber Instrumentalist", "Violet Sound Designer", "Copper Percussionist", "Indigo Studio Artist", "Cyan Music Producer", "Green Sound Engineer", "Blue Session Artist", "Golden Instrumentalist")
+        colors = ("amber", "violet", "copper", "indigo", "cyan", "green", "blue", "gold")
+        members = []
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute("DELETE FROM memory_tiers")
+            for index in range(count):
+                uid, name, color = 100 + index, names[index], colors[index]
+                members.append((name, f"BNL, remember the {color} music project?", uid))
+                if not facts:
+                    for tier, part in (("short", "intro"), ("medium", "mix"), ("long", "release")):
+                        bnl01_bot._insert_memory_tier(
+                            conn.cursor(), uid, self.guild_id, tier,
+                            f"The {color} project {part} has soft chords.", 0.99,
+                            source_role="user", source_channel_policy="public_home",
+                            source_trust="source_safe_public", topic_key="music",
+                        )
+                for policy, trust, summary in (
+                    ("internal_controlled", "legacy_unknown", f"Private {color} infrastructure access."),
+                    ("sealed_test", "legacy_unknown", f"Sealed {color} hidden rehearsal."),
+                ):
+                    bnl01_bot._insert_memory_tier(
+                        conn.cursor(), uid, self.guild_id, "long", summary, 1.0,
+                        source_role="user", source_channel_policy=policy, source_trust=trust,
+                    )
+            for uid, guild in ((9999, self.guild_id), (100, self.guild_id + 1)):
+                bnl01_bot._insert_memory_tier(
+                    conn.cursor(), uid, guild, "long", "Unrelated secret project marker.", 1.0,
+                    source_role="user", source_channel_policy="public_home", source_trust="source_safe_public",
+                )
+        if facts:
+            for index, (name, _request, uid) in enumerate(members):
+                with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                    cursor = conn.execute(
+                        "INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,role,content) VALUES (?,?,?,?,?,?,?,?)",
+                        (uid, name, self.guild_id, "barcode-bot", "public_home", 8800, "user", f"My favorite color is {colors[index]}."),
+                    )
+                    source_row_id = cursor.lastrowid
+                bnl01_bot.upsert_user_fact(
+                    uid, self.guild_id, "favorite_color", colors[index],
+                    source_conversation_row_id=source_row_id,
+                    source_channel_policy="public_home", source_directed=True,
+                )
+        return tuple(members)
+
+    async def test_group_memory_reaches_real_prompt_guard_and_neutral_storage(self):
+        members = self._seed_group_member_sources()
+        answer = "The amber project uses soft chords, and the violet project does too."
+        for policy, enabled in (("public_home", "false"), ("sealed_test", "true")):
+            channel_id = 8811 + len(self.channel_ids)
+            with mock.patch.dict(os.environ, {
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+                "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": enabled,
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": str(self.guild_id),
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "100",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": str(channel_id),
+            }), mock.patch.object(
+                bnl01_bot, "maybe_generate_ordinary_chat_single_packet",
+                wraps=bnl01_bot.maybe_generate_ordinary_chat_single_packet,
+            ) as ordinary:
+                if enabled == "true":
+                    self.assertTrue(bnl01_bot.ordinary_chat_configuration()["effective"], bnl01_bot.ordinary_chat_configuration())
+                channel, generation, guard = await self._batch(
+                    policy, answer=answer, participants=members, privileged=True,
+                )
+            generation.assert_awaited_once()
+            prompt = generation.await_args.args[0]
+            bases = tuple(b for b in guard.await_args.kwargs["prompt_source_bases"] if isinstance(b, bnl01_bot.MemoryPromptSourceBasis))
+            self.assertEqual([basis.user_id for basis in bases], [100, 101])
+            self.assertTrue(all(not basis.is_owner_or_mod for basis in bases))
+            for basis, color in zip(bases, ("amber", "violet")):
+                for part in ("intro", "mix", "release"):
+                    self.assertIn(f"The {color} project {part} has soft chords.", basis.rendered_context)
+                self.assertIn(basis.rendered_context, prompt)
+            self.assertNotIn("Private", "\n".join(b.rendered_context for b in bases))
+            self.assertNotIn("Sealed", "\n".join(b.rendered_context for b in bases))
+            self.assertNotIn("Unrelated secret project marker", prompt)
+            self.assertEqual(channel.sent, [answer])
+            # The existing group boundary must not become a new canary gate.
+            self.assertTrue(all(not call.kwargs["scope_applied"] for call in ordinary.await_args_list))
+            with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                row = conn.execute("SELECT id,user_id,content FROM conversations WHERE role='model' AND channel_id=?", (channel.id,)).fetchone()
+                self.assertEqual(row[1:], (0, answer))
+                links = conn.execute("SELECT user_id FROM conversation_response_participants WHERE conversation_row_id=? ORDER BY user_id", (row[0],)).fetchall()
+                self.assertEqual(links, [(100,), (101,)])
+
+    async def test_eight_group_members_share_one_budget_including_wrappers(self):
+        members = self._seed_group_member_sources(facts=True, count=8)
+        channel, generation, guard = await self._batch(
+            "public_home", participants=members,
+            answer="Those individual colors give this room a varied palette.",
+        )
+        bases = tuple(b for b in guard.await_args.kwargs["prompt_source_bases"] if isinstance(b, bnl01_bot.MemoryPromptSourceBasis))
+        self.assertEqual(len(bases), 8)
+        injected = "\n\n" + "\n\n".join(b.rendered_context for b in bases)
+        self.assertLessEqual(len(injected), bnl01_bot.MEMORY_PROMPT_BUDGET_PUBLIC)
+        self.assertIn(injected, generation.await_args.args[0])
+        for basis, color in zip(bases, ("amber", "violet", "copper", "indigo", "cyan", "green", "blue", "gold")):
+            self.assertIn(f"Favorite color: {color}", basis.rendered_context)
+            fresh, changed = bnl01_bot.refresh_prompt_source_basis(basis)
+            self.assertFalse(changed)
+            self.assertLessEqual(len(fresh.rendered_context), basis.member_budget_chars)
+        self.assertEqual(len(channel.sent), 1)
+
+    def test_group_own_message_directness_and_duplicate_names_remain_distinct(self):
+        members = self._seed_group_member_sources(facts=True)
+        turns = []
+        for index, (_name, text, uid) in enumerate(members):
+            addressing = bnl01_bot.DiscordTurnAddressing(
+                speaker="Test Member", explicit_tag_recipients=(), reply_target="none",
+                explicitly_mentions_bnl=index == 1, reply_targets_bnl=False,
+                directly_targets_bnl=index == 1, targets_other_human=False,
+                plain_text_names_bnl=False, speaker_user_id=uid,
+            )
+            turns.append(bnl01_bot.BatchConversationTurn("Test Member", text, uid, addressing))
+        context, bases, metadata = bnl01_bot.build_batch_member_memory_context(
+            turns, guild_id=self.guild_id, channel_id=8810,
+            channel_policy="public_home", route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+        )
+        self.assertEqual([basis.current_direct for basis in bases], [False, True])
+        self.assertEqual([basis.user_text for basis in bases], [item[1] for item in turns])
+        transcript = bnl01_bot._format_batched_prompt(turns, "balanced", "")
+        self.assertIn("speaker 1 - Test Member", transcript)
+        self.assertIn("speaker 2 - Test Member", transcript)
+        self.assertIn("Favorite color: amber", bases[0].rendered_context)
+        self.assertNotIn("Favorite color: violet", bases[0].rendered_context)
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute("UPDATE user_memory_facts SET fact_value='green' WHERE user_id=101")
+        prompt, fresh, changed, failed = bnl01_bot.refresh_prompt_source_bases(context, bases)
+        self.assertFalse(failed)
+        self.assertEqual(changed, ("memory",))
+        self.assertEqual(fresh[0], bases[0])
+        self.assertIn("Favorite color: green", fresh[1].rendered_context)
+        self.assertNotIn("Favorite color: violet", prompt)
+        self.assertEqual(metadata["member_source_count"], 2)
+
+    async def test_second_member_forget_during_generation_never_sends_stale_fact(self):
+        members = self._seed_group_member_sources(facts=True)
+        drafts = []
+
+        async def generate(prompt, *_args, **_kwargs):
+            drafts.append(prompt)
+            if len(drafts) == 1:
+                with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                    conn.execute("UPDATE user_memory_facts SET lifecycle_status='forgotten',fact_value='' WHERE user_id=101")
+                return "Amber Instrumentalist named amber, while Violet Sound Designer named violet."
+            self.assertNotIn("Favorite color: violet", prompt)
+            return "Amber Instrumentalist named amber; the other preference is not available now."
+
+        channel, generation, _guard = await self._batch(
+            "public_home", participants=members, answer=generate,
+        )
+        self.assertGreaterEqual(generation.await_count, 2)
+        self.assertNotIn("while Violet Sound Designer named violet", "\n".join(channel.sent))
+        self.assertEqual(channel.sent, ["Amber Instrumentalist named amber; the other preference is not available now."])
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            saved = conn.execute("SELECT content FROM conversations WHERE role='model'").fetchall()
+        self.assertEqual(saved, [(channel.sent[0],)])
+
+    def test_group_reader_preserves_read_snapshot_with_governance_shadows_on(self):
+        self._seed_group_member_sources(facts=True)
+        with mock.patch.dict(os.environ, {"BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true"}):
+            with bnl01_bot.closing(bnl01_bot._open_member_memory_read_connection()) as conn:
+                conn.execute("BEGIN")
+                statements = []
+                conn.set_trace_callback(statements.append)
+                context, _metadata = bnl01_bot._read_bounded_member_memory(
+                    100, self.guild_id, speaker_label="speaker 1 - Test Member",
+                    budget_chars=400, route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="public_home", user_text="remember the amber project",
+                    current_direct=True, governance_allowed=False, channel_id=8810,
+                    connection=conn,
+                )
+                self.assertIn("Favorite color: amber", context)
+                self.assertTrue(conn.in_transaction)
+                self.assertFalse(any(sql.strip().upper().startswith(("COMMIT", "INSERT", "UPDATE", "DELETE")) for sql in statements))
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute("UPDATE user_memory_facts SET fact_value='forbidden write'")
+        missing = os.path.join(self.tmp, "absent.db")
+        with mock.patch.object(bnl01_bot, "DB_FILE", missing):
+            with self.assertRaises(sqlite3.OperationalError):
+                bnl01_bot._open_member_memory_read_connection()
+        self.assertFalse(os.path.exists(missing))
+
+
+    def test_group_member_governed_canary_retains_authority_and_revalidates(self):
+        self._seed_group_member_sources(facts=True)
+        expected = "The Copper Kite arrangement is the current music goal."
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            # Production enabled the Moment shadow before startup. Preserve
+            # that initialized-schema prerequisite for the read-only canary.
+            moments.ensure_moment_schema(conn)
+            for uid, visibility, predicate, value in (
+                (100, ledger.Visibility.PUBLIC_SAFE, "goal", expected),
+                (100, ledger.Visibility.PRIVATE, "commitment", "Private infrastructure password marker."),
+                (9999, ledger.Visibility.PUBLIC_SAFE, "goal", "Other member Copper Kite secret marker."),
+            ):
+                entry = ledger.LedgerEntry(
+                    guild_id=self.guild_id, source_table="test_member_goal",
+                    source_row_id=f"{uid}:{predicate}", source_role="member",
+                    entry_type="goal", predicate_key=predicate,
+                    subject_key=ledger.subject_key_for_user(uid), value=value,
+                    source_class=ledger.SourceClass.FIRST_PARTY_RECORD,
+                    visibility=visibility, confidence=ledger.Confidence.HIGH,
+                    public_usable=visibility == ledger.Visibility.PUBLIC_SAFE,
+                    channel_policy="public_home", route_mode="normal_chat", salience=0.9,
+                )
+                ledger.insert_ledger_entry(conn, entry)
+                if value == expected:
+                    entry_id = entry.entry_id
+        items = (("Test Member", "What do you remember about me?", 100), ("Violet Sound Designer", "That violet music project is underway.", 101))
+        with mock.patch.dict(os.environ, {
+            "BNL_MEMORY_GOVERNANCE_CANARY_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_CANARY_GUILD_IDS": str(self.guild_id),
+            "BNL_MEMORY_GOVERNANCE_CANARY_USER_IDS": "100",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+        }):
+            context, bases, metadata = bnl01_bot.build_batch_member_memory_context(
+                items, guild_id=self.guild_id, channel_id=8810,
+                channel_policy="public_home", route_mode="normal_chat",
+            )
+            self.assertIn(expected, context)
+            self.assertIn("governed first_party_record", context)
+            self.assertNotIn("Private infrastructure", context)
+            self.assertNotIn("Other member", context)
+            basis = next(b for b in bases if b.user_id == 100)
+            self.assertTrue(basis.source_safe_recall_synthesis)
+            self.assertTrue(basis.governed_basis_digest)
+            self.assertIn(entry_id, metadata["governed_entry_ids"])
+            self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "")
+            with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                conn.execute("UPDATE memory_ledger_entries SET normalized_value=? WHERE entry_id=?", ("The Silver Moth arrangement is the corrected music goal.", entry_id))
+            self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "memory_source_changed")
 
 
 if __name__ == "__main__":

@@ -535,10 +535,12 @@ def build_governed_context(
     legacy_context: str = "",
     include_review_moments: bool = False,
     include_public_moment_gists: bool = False,
+    initialize_schema: bool = True,
 ) -> GovernanceResult:
     diag = GovernanceDiagnostics(route_policy={"route_mode": req.route_mode, "channel_policy": req.channel_policy, "visibility": req.visibility_allowance})
     try:
-        ensure_governance_schema(conn)
+        if initialize_schema:
+            ensure_governance_schema(conn)
     except Exception as e:
         diag.processing_errors.append(type(e).__name__)
         return GovernanceResult("", (), (), diag)
