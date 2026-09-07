@@ -13,7 +13,8 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Union
 
 from bnl_canon_source_contract import (
@@ -24228,6 +24229,17 @@ class ApprovedMemberFactEvidence:
 
 
 @dataclass(frozen=True)
+class MemberMemoryPromptUnit:
+    """One display unit already admitted by the existing member-memory reader."""
+
+    kind: str
+    text: str
+    governed_entry_id: str = ""
+    source_class: str = ""
+    governed_source_digest: str = ""
+
+
+@dataclass(frozen=True)
 class PersonalRecallBasis:
     direct_facts: tuple[ApprovedMemberFactEvidence, ...]
     recent_public_topics: tuple[str, ...]
@@ -25980,6 +25992,7 @@ def build_user_memory_context(
     connection: sqlite3.Connection | None = None,
     environ: dict[str, str] | None = None,
     record_operational_diagnostics: bool = True,
+    read_only: bool = False,
 ) -> str:
     env = os.environ if environ is None else environ
 
@@ -26007,6 +26020,7 @@ def build_user_memory_context(
                 "governed_source_classes": (),
                 "governed_basis_digest": "",
                 "atomic_candidates_live_used": 0,
+                "memory_context_units": (),
             }
         )
     if route_mode == ROUTE_MODE_SIMPLE_GREETING:
@@ -26078,6 +26092,7 @@ def build_user_memory_context(
         )
 
     sections = []
+    memory_context_units: list[MemberMemoryPromptUnit] = []
     moment_gist_context = ""
     if moment_gist_canary_enabled(
         guild_id=guild_id,
@@ -26123,6 +26138,9 @@ def build_user_memory_context(
             if connection is None and moment_conn is not None:
                 moment_conn.close()
         if moment_gist_context:
+            memory_context_units.append(
+                MemberMemoryPromptUnit("moment", moment_gist_context)
+            )
             if source_metadata is not None:
                 source_metadata["moment_gist_rendered"] = True
             sections.append(
@@ -26144,6 +26162,9 @@ def build_user_memory_context(
             )
             if rel_v2:
                 sections.append(rel_v2)
+                memory_context_units.append(
+                    MemberMemoryPromptUnit("relationship_v2", rel_v2)
+                )
         except Exception as exc:
             logging.debug("relationship_v2_prompt_summary_failed error=%s", exc)
         finally:
@@ -26154,7 +26175,14 @@ def build_user_memory_context(
         sections.append(
             f"Relationship state: stage={stage}, stance={stance}, interactions={interactions}, affinity={affinity:.2f}, last_topic={last_topic or 'general'}."
         )
+        memory_context_units.append(
+            MemberMemoryPromptUnit("relationship", sections[-1])
+        )
     if approved_facts:
+        memory_context_units.extend(
+            MemberMemoryPromptUnit("approved_fact", _approved_fact_prompt_line(fact))
+            for fact in approved_facts
+        )
         sections.append(
             "Approved direct self-reports:\n"
             + "\n".join(_approved_fact_prompt_line(fact) for fact in approved_facts)
@@ -26169,6 +26197,9 @@ def build_user_memory_context(
             "Observed habits: "
             f"messages={total}, question_ratio={q_ratio:.2f}, humor_ratio={humor_ratio:.2f}, "
             f"late_night_ratio={late_ratio:.2f}, avg_len={avg_len:.1f}, last_topic={last_topic or 'general'}."
+        )
+        memory_context_units.append(
+            MemberMemoryPromptUnit("habits", sections[-1])
         )
     if journal and limits["visibility"] != "public_safe":
         journal_lines = [f"- [{etype}] {summary}" for (etype, summary, _ts) in journal]
@@ -26225,6 +26256,10 @@ def build_user_memory_context(
         labels = {"short": "Relevant short-term traces", "medium": "Relevant medium topic summaries", "long": "Relevant long-term memory"}
         for tier in ("short", "medium", "long"):
             if selected[tier]:
+                memory_context_units.extend(
+                    MemberMemoryPromptUnit(tier, _conversation_trace_prompt_line(row))
+                    for row in selected[tier]
+                )
                 diagnostics["included"][tier] = len(selected[tier])
                 tier_lines.append(
                     labels[tier]
@@ -26244,6 +26279,7 @@ def build_user_memory_context(
     legacy_context = "\n".join(sections) if sections else "No durable memory yet."
     if source_metadata is not None:
         source_metadata["legacy_memory_present"] = bool(sections)
+        source_metadata["memory_context_units"] = tuple(memory_context_units)
     diagnostics["skipped"] = dict(diagnostics["skipped"])
     if memory_governance_shadow_enabled(env):
         try:
@@ -26279,6 +26315,7 @@ def build_user_memory_context(
                     gov_req,
                     legacy_context=legacy_context,
                     include_review_moments=True,
+                    initialize_schema=not read_only,
                     include_public_moment_gists=bool(
                         moment_engine_shadow_enabled(env)
                         and (
@@ -26337,8 +26374,25 @@ def build_user_memory_context(
                             "atomic_candidates_live_used": 0,
                         }
                     )
-                persist_shadow_diagnostics(gov_conn, gov_req, gov_result, legacy_context)
+                if record_operational_diagnostics and not read_only:
+                    persist_shadow_diagnostics(gov_conn, gov_req, gov_result, legacy_context)
                 unsafe_governed = safety.unsafe
+                if source_metadata is not None and (
+                    source_safe_recall_synthesis
+                    or (memory_governance_live_enabled(env) and not unsafe_governed)
+                ):
+                    source_metadata["memory_context_units"] = (
+                        () if unsafe_governed else tuple(
+                            MemberMemoryPromptUnit(
+                                "moment" if candidate.source_class == "moment_gist" else "governed",
+                                candidate.text[:240],
+                                str(candidate.entry_id or ""),
+                                str(candidate.source_class or ""),
+                                _governed_memory_basis_digest((candidate,)),
+                            )
+                            for candidate in gov_result.selected
+                        )
+                    )
                 if source_safe_recall_synthesis:
                     response_mode = (
                         "source_safe_synthesis_blocked"
@@ -26391,6 +26445,10 @@ def build_user_memory_context(
                         moment_gist_context
                         and moment_gist_context not in governed_context
                     ):
+                        if source_metadata is not None:
+                            source_metadata["memory_context_units"] += (
+                                MemberMemoryPromptUnit("moment", moment_gist_context),
+                            )
                         governed_context = (
                             governed_context.rstrip()
                             + "\n"
@@ -26421,6 +26479,7 @@ def build_user_memory_context(
                             "legacy_memory_present": False,
                             "moment_gist_rendered": False,
                             "atomic_candidates_live_used": 0,
+                            "memory_context_units": (),
                         }
                     )
                 record_prompt_diagnostics(diagnostics)
@@ -26656,6 +26715,8 @@ class MemoryPromptSourceBasis:
     has_moment_gist: bool = False
     governed_basis_digest: str = ""
     source_safe_recall_synthesis: bool = False
+    member_budget_chars: int = 0
+    member_speaker_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -28475,6 +28536,7 @@ async def record_unified_response_assessment_shadow_after_send(
 
 
 _SOURCE_BEARING_MEMORY_MARKERS = (
+    "Member memory for speaker ",
     "Moment-based continuity gist",
     "Approved direct self-reports:",
     "Relationship state:",
@@ -28766,6 +28828,8 @@ def build_memory_prompt_source_basis(
     has_moment_gist: bool = False,
     governed_basis_digest: str = "",
     source_safe_recall_synthesis: bool = False,
+    member_budget_chars: int = 0,
+    member_speaker_label: str = "",
 ) -> MemoryPromptSourceBasis | None:
     value = str(rendered_context or "")
     if not any(marker in value for marker in _SOURCE_BEARING_MEMORY_MARKERS):
@@ -28790,7 +28854,184 @@ def build_memory_prompt_source_basis(
         source_safe_recall_synthesis=bool(
             source_safe_recall_synthesis
         ),
+        member_budget_chars=max(0, int(member_budget_chars)),
+        member_speaker_label=str(member_speaker_label or ""),
     )
+
+
+def _batch_member_speaker_labels(items) -> dict[int, str]:
+    """Bind duplicate display names to distinct current speakers, without IDs."""
+    names: dict[int, str] = {}
+    for item in items or ():
+        if len(item) < 3:
+            continue
+        uid = int(item[2] or 0)
+        if uid > 0 and uid not in names:
+            names[uid] = _safe_prompt_display_label(item[0])
+    if len(names) <= 1:
+        return {}
+    return {
+        uid: f"speaker {index} - {name}"
+        for index, (uid, name) in enumerate(names.items(), start=1)
+    }
+
+
+def _bounded_member_memory_context(
+    metadata: dict, *, speaker_label: str, budget_chars: int,
+) -> str:
+    """Budget complete reader-selected units together with their attribution."""
+    ordinal, _, name = speaker_label.partition(" - ")
+    # The full label is bound in the current transcript and frozen basis.
+    # A display-label prefix plus its stable ordinal keeps room for evidence
+    # even at the existing eight-message batch limit.
+    display_label = f"{ordinal} - {name[:20]}" if name else ordinal
+    header = f"Member memory for {display_label}:\n"
+    units = tuple(metadata.get("memory_context_units") or ())
+    kinds = ("approved_fact", "short", "medium", "long", "governed", "moment", "relationship", "relationship_v2", "habits")
+    buckets = {
+        kind: [unit for unit in units if unit.kind == kind and unit.text.strip()]
+        for kind in kinds
+    }
+    selected = []
+    lines = []
+    used = len(header)
+    # Round-robin preserves a chance for each existing memory class without
+    # treating one member's entire memory allowance as a group allowance.
+    for index in range(max((len(bucket) for bucket in buckets.values()), default=0)):
+        for kind in kinds:
+            if index >= len(buckets[kind]):
+                continue
+            unit = buckets[kind][index]
+            text = unit.text.strip()
+            text = text.removeprefix("- ").strip()
+            if kind == "approved_fact":
+                text = text.removesuffix(" (direct member self-report; changeable, not Core)")
+                line = "- [changeable self-report] " + text
+            elif kind == "governed":
+                line = f"- [governed {unit.source_class}; not quote authority] {text}"
+            else:
+                line = f"- [{kind} hint; not quote authority] {text}"
+            cost = len(line) + (1 if lines else 0)
+            if used + cost > max(0, int(budget_chars)):
+                continue
+            selected.append(unit)
+            lines.append(line)
+            used += cost
+    metadata.update({
+        "memory_context_units": tuple(selected),
+        "approved_fact_count": sum(unit.kind == "approved_fact" for unit in selected),
+        "legacy_relationship_present": any(unit.kind in {"relationship", "habits"} for unit in selected),
+        "relationship_v2_candidate_present": any(unit.kind == "relationship_v2" for unit in selected),
+        "legacy_memory_present": any(unit.kind not in {"governed", "moment"} for unit in selected),
+        "moment_gist_rendered": any(unit.kind == "moment" for unit in selected),
+        "moment_candidate_count": sum(unit.kind == "moment" for unit in selected),
+        "governed_entry_ids": tuple(unit.governed_entry_id for unit in selected if unit.governed_entry_id),
+        "governed_candidate_count": sum(bool(unit.governed_entry_id) for unit in selected),
+        "governed_source_classes": tuple(dict.fromkeys(unit.source_class for unit in selected if unit.source_class)),
+        "governed_basis_digest": (
+            _prompt_source_digest("\n".join(unit.governed_source_digest for unit in selected if unit.governed_source_digest))
+            if any(unit.governed_source_digest for unit in selected) else ""
+        ),
+        "prompt_budget": max(0, int(budget_chars)),
+    })
+    return header + "\n".join(lines) if lines else ""
+
+
+def _read_bounded_member_memory(
+    user_id: int, guild_id: int, *, speaker_label: str,
+    budget_chars: int, route_mode: str, channel_policy: str,
+    user_text: str, current_direct: bool, governance_allowed: bool,
+    channel_id: int, connection: sqlite3.Connection | None = None,
+) -> tuple[str, dict]:
+    metadata: dict = {}
+    with (nullcontext(connection) if connection is not None else
+          closing(_open_member_memory_read_connection())) as conn:
+        if connection is None:
+            conn.execute("BEGIN")
+        # Each member uses the same proven public reader. Suppressing receipt
+        # writes keeps selection and revalidation in one SQLite read snapshot.
+        build_user_memory_context(
+            user_id, guild_id, route_mode=route_mode,
+            channel_policy=channel_policy, user_text=user_text,
+            is_owner_or_mod=False, current_direct=current_direct,
+            governance_allowed=governance_allowed, channel_id=channel_id,
+            moment_attribution_target_user_id=0, source_metadata=metadata,
+            connection=conn, record_operational_diagnostics=False,
+            read_only=True,
+        )
+        rendered = _bounded_member_memory_context(
+            metadata, speaker_label=speaker_label, budget_chars=budget_chars,
+        )
+    return rendered, metadata
+
+
+def _open_member_memory_read_connection() -> sqlite3.Connection:
+    """Read the initialized runtime DB; a missing path must never create one."""
+    return sqlite3.connect(
+        Path(DB_FILE).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25,
+    )
+
+
+def build_batch_member_memory_context(
+    items, *, guild_id: int, channel_id: int,
+    channel_policy: str, route_mode: str,
+) -> tuple[str, tuple[MemoryPromptSourceBasis, ...], dict]:
+    """Join independently scoped current-speaker memory under one public cap."""
+    labels = _batch_member_speaker_labels(items)
+    if not labels or channel_policy not in {*PUBLIC_CHAT_POLICIES, "sealed_test"}:
+        return "", (), {}
+    budget = max(0, MEMORY_PROMPT_BUDGET_PUBLIC)
+    # Include separators and the two leading newlines used by prompt assembly.
+    allowance = max(0, budget - 2 * len(labels)) // len(labels)
+    contexts = []
+    bases = []
+    members = []
+    governance_allowed = bool(memory_governance_live_enabled())
+    with closing(_open_member_memory_read_connection()) as conn:
+        conn.execute("BEGIN")
+        for uid, label in labels.items():
+            member_items = tuple(item for item in items if int(item[2] or 0) == uid)
+            member_text = " ".join(str(item[1] or "") for item in member_items)
+            direct = bool(
+                any(
+                    isinstance(getattr(item, "addressing", None), DiscordTurnAddressing)
+                    and (item.addressing.directly_targets_bnl or item.addressing.plain_text_names_bnl)
+                    for item in member_items
+                )
+                or is_broad_personal_recall_request(member_text)
+            )
+            context, metadata = _read_bounded_member_memory(
+                uid, guild_id, speaker_label=label, budget_chars=allowance,
+                route_mode=route_mode, channel_policy=channel_policy,
+                user_text=member_text, current_direct=direct,
+                governance_allowed=governance_allowed, channel_id=channel_id,
+                connection=conn,
+            )
+            if not context:
+                continue
+            basis = build_memory_prompt_source_basis(
+                context, user_id=uid, guild_id=guild_id, route_mode=route_mode,
+                channel_policy=channel_policy, user_text=member_text,
+                is_owner_or_mod=False, current_direct=direct,
+                governance_allowed=governance_allowed, channel_id=channel_id,
+                moment_attribution_target_user_id=0,
+                has_moment_gist=metadata["moment_gist_rendered"],
+                governed_basis_digest=str(metadata.get("governed_basis_digest") or ""),
+                source_safe_recall_synthesis=bool(metadata.get("source_safe_recall_synthesis")),
+                member_budget_chars=allowance, member_speaker_label=label,
+            )
+            if basis is not None:
+                contexts.append(context)
+                bases.append(basis)
+                members.append(metadata)
+    aggregate = {"prompt_budget": budget, "member_source_count": len(bases)}
+    for field in ("approved_fact_count", "governed_candidate_count", "governance_exclusion_count", "governance_contradiction_count", "moment_candidate_count"):
+        aggregate[field] = sum(int(member.get(field) or 0) for member in members)
+    for field in ("legacy_memory_present", "legacy_relationship_present", "moment_gist_rendered", "source_safe_recall_synthesis", "relationship_v2_candidate_present"):
+        aggregate[field] = any(member.get(field) for member in members)
+    for field in ("governed_entry_ids", "governed_source_classes"):
+        aggregate[field] = tuple(dict.fromkeys(value for member in members for value in member.get(field, ())))
+    return "\n\n".join(contexts), tuple(bases), aggregate
 
 
 def _conversation_prompt_basis_digest(
@@ -29206,21 +29447,32 @@ def refresh_prompt_source_basis(
         )
     if isinstance(basis, MemoryPromptSourceBasis):
         source_metadata: dict = {}
-        fresh_context = build_user_memory_context(
-            basis.user_id,
-            basis.guild_id,
-            route_mode=basis.route_mode,
-            channel_policy=basis.channel_policy,
-            user_text=basis.user_text,
-            is_owner_or_mod=basis.is_owner_or_mod,
-            current_direct=basis.current_direct,
-            governance_allowed=basis.governance_allowed,
-            channel_id=basis.channel_id,
-            moment_attribution_target_user_id=(
-                basis.moment_attribution_target_user_id
-            ),
-            source_metadata=source_metadata,
-        )
+        if basis.member_budget_chars:
+            fresh_context, source_metadata = _read_bounded_member_memory(
+                basis.user_id, basis.guild_id,
+                speaker_label=basis.member_speaker_label,
+                budget_chars=basis.member_budget_chars,
+                route_mode=basis.route_mode, channel_policy=basis.channel_policy,
+                user_text=basis.user_text, current_direct=basis.current_direct,
+                governance_allowed=basis.governance_allowed,
+                channel_id=basis.channel_id,
+            )
+        else:
+            fresh_context = build_user_memory_context(
+                basis.user_id,
+                basis.guild_id,
+                route_mode=basis.route_mode,
+                channel_policy=basis.channel_policy,
+                user_text=basis.user_text,
+                is_owner_or_mod=basis.is_owner_or_mod,
+                current_direct=basis.current_direct,
+                governance_allowed=basis.governance_allowed,
+                channel_id=basis.channel_id,
+                moment_attribution_target_user_id=(
+                    basis.moment_attribution_target_user_id
+                ),
+                source_metadata=source_metadata,
+            )
         fresh = replace(
             basis,
             expected_digest=_prompt_source_digest(fresh_context),
@@ -35599,6 +35851,7 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
 
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     rendered_messages = []
+    member_labels = _batch_member_speaker_labels(messages)
     multiline_payload_found = False
     combined_user_text = " ".join(
         (item.content if isinstance(item, BatchConversationTurn) else item[1]) or ""
@@ -35615,6 +35868,8 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
             name, content = item[0], item[1]
             addressing = getattr(item, "addressing", None)
         name = _safe_prompt_display_label(name)
+        if len(item) >= 3 and int(item[2] or 0) in member_labels:
+            name = member_labels[int(item[2])]
         routing_bits = []
         if addressing:
             if addressing.explicit_tag_recipients:
@@ -36606,6 +36861,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 prompt += "\n\n" + orchestration_prompt_block + "\n"
             batch_memory_context = ""
             batch_memory_source_metadata: dict = {}
+            batch_member_memory_bases: tuple[MemoryPromptSourceBasis, ...] = ()
             batch_member_is_privileged = False
             batch_memory_target_user_id = 0
             batch_source_safe_recall = False
@@ -36664,6 +36920,26 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         + "\n"
                     )
                     prompt += batch_memory_prompt_block
+            elif len(unique_user_ids) > 1:
+                try:
+                    (
+                        batch_memory_context,
+                        batch_member_memory_bases,
+                        batch_memory_source_metadata,
+                    ) = await asyncio.to_thread(
+                        build_batch_member_memory_context,
+                        tuple(collapsed_items), guild_id=guild_id,
+                        channel_id=channel_id, channel_policy=channel_policy,
+                        route_mode=batch_route_mode,
+                    )
+                except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                    logging.warning(
+                        "batch_member_memory_read_failed error=%s",
+                        type(exc).__name__,
+                    )
+                if batch_memory_context:
+                    batch_memory_prompt_block = batch_memory_context
+                    prompt += "\n\n" + batch_memory_prompt_block
             batch_moment_attribution_context = ""
             if len(unique_user_ids) > 1:
                 batch_moment_attribution_context = (
@@ -36680,7 +36956,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         + batch_moment_attribution_context
                         + "\n"
                     )
-            batch_prompt_source_bases: list[PromptSourceBasis] = []
+            batch_prompt_source_bases: list[PromptSourceBasis] = list(batch_member_memory_bases)
             batch_conversation_basis = build_conversation_prompt_source_basis(
                 recent_room_prompt,
                 guild_id=guild_id,
@@ -36694,7 +36970,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_prompt_source_bases.append(
                     batch_conversation_basis
                 )
-            if batch_memory_context:
+            if batch_memory_context and len(unique_user_ids) == 1:
                 batch_memory_basis = build_memory_prompt_source_basis(
                     batch_memory_context,
                     user_id=first_uid,
@@ -36781,8 +37057,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         (
                             (
                                 "governed_memory"
-                                if len(unique_user_ids) == 1
-                                and batch_source_safe_recall
+                                if (batch_source_safe_recall or any(
+                                    basis.source_safe_recall_synthesis
+                                    for basis in batch_member_memory_bases
+                                ))
                                 else "legacy_memory"
                             ),
                             any(
@@ -37567,7 +37845,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             simple_greeting_detected=is_simple_greeting_to_bnl(combined_text),
             memory_context_injected=bool(batch_memory_context),
             memory_context_source_count=(
-                1 if batch_memory_context else 0
+                len(batch_member_memory_bases)
+                if batch_member_memory_bases
+                else 1 if batch_memory_context else 0
             ),
             memory_injection_decision=(
                 "single_packet_owner"
