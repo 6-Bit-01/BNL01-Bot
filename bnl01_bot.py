@@ -2208,13 +2208,13 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
             code = getattr(response, "status", None) or response.getcode()
             if not (200 <= code < 300):
                 logging.warning("bnl_read_model_fetch_failed reason=http_status")
-                return fresh_cached_snapshot(refresh_failed=True) if code >= 500 else discard_rejected_snapshot()
+                return fresh_cached_snapshot(refresh_failed=True) if code in {408, 429} or code >= 500 else discard_rejected_snapshot()
             body = response.read().decode("utf-8", errors="replace")
             data = json.loads(body) if body else {}
     except Exception as e:
         logging.warning(f"bnl_read_model_fetch_failed reason={type(e).__name__}")
         transient = (
-            e.code >= 500 if isinstance(e, urllib.error.HTTPError)
+            (e.code in {408, 429} or e.code >= 500) if isinstance(e, urllib.error.HTTPError)
             else isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError, OSError))
         )
         return fresh_cached_snapshot(refresh_failed=True) if transient else discard_rejected_snapshot()

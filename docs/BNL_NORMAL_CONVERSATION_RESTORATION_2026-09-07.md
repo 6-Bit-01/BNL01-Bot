@@ -49,7 +49,7 @@ Those functions predate #488; copying its tree would leave the failure class.
 
 ## Verification
 
-Full `make check` passed: **2,624 tests in 83.259 seconds**, plus compilation,
+Full `make check` passed: **2,625 tests in 81.960 seconds**, plus compilation,
 using Python 3.12 with the repository's pinned requirements. Independent review
 found no remaining blocking issues after preserving the separate durable
 TikTok-analysis candidate check during normal recovery.
@@ -77,6 +77,29 @@ health, real Gemini answer quality or VPS deployment.
 Admission, scheduling, model selection, ingestion, publication and memory
 writers are unchanged by source comparison. The foreground HTTP timeout remains
 three seconds; this change does not claim measured live latency improvement.
+
+## PR #511 review disposition
+
+The additional queue review is accepted: HTTP 408 and 429 use the same existing
+fresh-cache recovery as transient server/transport failures, for both raised
+HTTP errors and returned status codes. Authorization failures and invalid
+payloads retain their existing rejection behavior; recovery does not extend
+the snapshot's lifetime.
+
+The suggestion to restore private-incident/lore word lists is not adopted.
+Probes of the old checker reject valid public Journal references to Cliff or
+Sheila and a publicly documented booth incident because only the separate show
+block is searched. The private-incident regex also matches the denial "I do
+not have Sheila's management logs." A differently worded invented backstage
+claim passes it. Those patterns are fallible prose heuristics, not private-data
+access boundaries, and restoring them would recreate the approved removal's
+source-composition conflict.
+
+Existing source visibility, private-memory selection, source revalidation and
+control-marker protections remain. The system prompt still forbids fabricated
+private/off-camera show events. Removing the word-list veto intentionally
+removes that particular hallucination filter; it does not prove Gemini can
+never invent a show detail. Live answer quality remains part of acceptance.
 
 Use the actual queue reader, publication readers, Context/Frame, prompt
 assembly and normal dispatch/send path for mixed-source checks. Preserve

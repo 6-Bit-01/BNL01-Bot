@@ -187,12 +187,32 @@ class ReadModelRefreshRecoveryTests(unittest.TestCase):
         self.assertEqual(self.context(), "")
         self.assertIsNone(bnl01_bot._bnl_read_model_cache)
 
-    def test_transient_server_failure_reuses_only_fresh_cache(self):
-        self.seed(read_model(opened=False))
-        self.http.side_effect = urllib.error.HTTPError("fixture", 503, "unavailable", {}, None)
-        self.assertIn("queueOpen=False", self.context())
-        self.now += timedelta(seconds=20)
-        self.assertEqual(self.context(), "")
+    def test_transient_http_error_reuses_only_fresh_cache(self):
+        for code in (408, 429, 503):
+            with self.subTest(code=code):
+                self.http.side_effect = None
+                self.seed(read_model(opened=False))
+                cached_at = bnl01_bot._bnl_read_model_cached_at
+                self.http.side_effect = urllib.error.HTTPError(
+                    "fixture", code, "temporarily unavailable", {}, None
+                )
+                self.assertIn("queueOpen=False", self.context())
+                self.assertEqual(bnl01_bot._bnl_read_model_cached_at, cached_at)
+                self.now += timedelta(seconds=20)
+                self.assertEqual(self.context(), "")
+
+    def test_transient_http_status_reuses_only_fresh_cache(self):
+        for code in (408, 429, 503):
+            with self.subTest(code=code):
+                self.seed(read_model(opened=False))
+                cached_at = bnl01_bot._bnl_read_model_cached_at
+                response = Response({})
+                response.status = code
+                self.http.return_value = response
+                self.assertIn("queueOpen=False", self.context())
+                self.assertEqual(bnl01_bot._bnl_read_model_cached_at, cached_at)
+                self.now += timedelta(seconds=20)
+                self.assertEqual(self.context(), "")
 
     def test_normal_cached_read_avoids_duplicate_http_until_refresh_requested(self):
         self.seed()
