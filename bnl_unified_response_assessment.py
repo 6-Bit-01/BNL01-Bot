@@ -285,23 +285,6 @@ _SITUATION_PHASE_PATTERNS = (
         ),
     ),
     (
-        "diagnosis",
-        re.compile(
-            r"(?:\b(?:isolat(?:e|ed|ing|ion)|"
-            r"locali[sz](?:e|ed|ing|ation)|"
-            r"trac(?:e|ed|ing)|narrow(?:ed|ing)?)\b"
-            r"[^.!?\n]{0,48}"
-            r"\b(?:failure|issue|problem|defect|bug|fault|error|"
-            r"crash|regression)\b[^.!?\n]{0,24}\b(?:to|at)\b|"
-            r"\b(?:failure|issue|problem|defect|bug|fault|error|"
-            r"crash|regression)\b[^.!?\n]{0,24}"
-            r"\b(?:is|are|was|were|has\s+been|had\s+been)\b"
-            r"[^.!?\n]{0,16}\b(?:isolated|localized|localised|"
-            r"traced|narrowed)\b[^.!?\n]{0,24}\b(?:to|at)\b)",
-            re.I,
-        ),
-    ),
-    (
         "failure",
         re.compile(
             r"\b(?:failed?|failure|broken|crash(?:ed)?|error|"
@@ -536,40 +519,6 @@ _SITUATION_EXPLICIT_NEW_EVENT_RE = re.compile(
     r"\b(?:new|different|separate|another)\s+"
     r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b|"
     r"\bnot\s+(?:the\s+)?same\s+(?:event|incident|thread|case)\b",
-    re.I,
-)
-_SITUATION_NEGATED_NEW_EVENT_RE = re.compile(
-    r"\b(?:(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|"
-    r"aren(?:'|’)t|weren(?:'|’)t)\s+"
-    r"(?:(?:a|an|the)\s+)?|"
-    r"(?:(?:do|should)(?:n['’]t|\s+not)|"
-    r"let(?:['’]s|\s+us)\s+not|never)\s+"
-    r"(?:(?:start|begin|open|create)\s+|"
-    r"(?:treat|regard|count|consider|call)\s+"
-    r"(?:this|that|it)\s+as\s+)(?:(?:a|an|the)\s+)?)"
-    r"(?:new|different|separate|another)\s+"
-    r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
-    re.I,
-)
-_SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE = re.compile(
-    r"^\s*(?:(?:can|could|would|will|should)\s+(?:you|we)\s+"
-    r"(?:please\s+)?|please\s+)?"
-    r"(?:(?:start|begin|open|create)\b|"
-    r"(?:(?:treat|regard|count|call)\s+"
-    r"(?:this|that|it)\s+as\b|"
-    r"consider\s+(?:this|that|it)\s+(?:as\s+)?"
-    r"(?=(?:(?:a|an|the)\s+)?"
-    r"(?:new|different|separate|another)\b)))",
-    re.I,
-)
-_SITUATION_NEW_EVENT_UNCERTAINTY_RE = re.compile(
-    r"(?:^\s*(?:maybe|perhaps|possibly|whether|if|"
-    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+"
-    r"(?:not\s+)?sure|"
-    r"(?:(?:i|we)\s+wonder|"
-    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+wondering)"
-    r"\s+(?:if|whether))\b|"
-    r"\b(?:this|that|it)\s+(?:may|might|could|would)\s+be\b)",
     re.I,
 )
 _SITUATION_CONCURRENT_RE = re.compile(
@@ -1017,44 +966,6 @@ def _situation_temporal_scope(text: str) -> Tuple[str, str]:
     return "unspecified", "unknown"
 
 
-def _situation_explicit_new_event(text: str) -> bool:
-    unnegated = _SITUATION_NEGATED_NEW_EVENT_RE.sub("", text or "")
-    for match in _SITUATION_EXPLICIT_NEW_EVENT_RE.finditer(unnegated):
-        clause_start = max(
-            unnegated.rfind(boundary, 0, match.start())
-            for boundary in ".!?;\n"
-        ) + 1
-        clause_tail = unnegated[match.end() :]
-        clause_boundary = re.search(r"[:.!?;\n]", clause_tail)
-        clause_end = (
-            match.end() + clause_boundary.end()
-            if clause_boundary is not None
-            else len(unnegated)
-        )
-        clause = unnegated[clause_start:clause_end]
-        assertion_start = max(
-            clause_start,
-            max(
-                unnegated.rfind(boundary, clause_start, match.start())
-                for boundary in ",:—"
-            )
-            + 1,
-        )
-        cue_prefix = unnegated[assertion_start : match.end()]
-        assertion = unnegated[assertion_start:clause_end]
-        if (
-            clause.rstrip().endswith("?")
-            and not _SITUATION_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(
-                assertion
-            )
-        ):
-            continue
-        if _SITUATION_NEW_EVENT_UNCERTAINTY_RE.search(cue_prefix):
-            continue
-        return True
-    return False
-
-
 def _situation_event_relation(
     *,
     current_text: str,
@@ -1065,7 +976,7 @@ def _situation_event_relation(
 ) -> str:
     state = str(moment_situation_state or "none").strip().lower()
     text = str(current_text or "")
-    if _situation_explicit_new_event(text):
+    if _SITUATION_EXPLICIT_NEW_EVENT_RE.search(text):
         return (
             "new_event_same_participant"
             if moment_participant_overlap
@@ -2477,19 +2388,7 @@ def build_unified_response_assessment(
     objective = _current_objective(current_text)
     current_options = _unique_strings(current_payload_anchors)[:8]
     resolved_thread_focus = _thread_focus_mode(thread_focus_mode)
-    criterion_evidence_items = evidence_items
-    if (
-        situation_frame is not None
-        and situation_frame.status == "resolved"
-        and situation_frame.event_relation == "new_event_same_participant"
-    ):
-        # A resolved explicit event boundary keeps nearby history available
-        # for attribution and audit, but criteria from the interrupted event
-        # must not be imposed on the new task.
-        criterion_evidence_items = tuple(
-            item for item in evidence_items if item.current_turn
-        )
-    criteria = _criterion_items(criterion_evidence_items)
+    criteria = _criterion_items(evidence_items)
     objective_kind = _objective_kind(
         objective=objective,
         current_options=current_options,

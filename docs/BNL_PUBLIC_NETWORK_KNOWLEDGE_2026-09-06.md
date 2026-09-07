@@ -75,5 +75,7 @@ answer and existing route debug. Expected: normal Gemini, available context
 used, experimental ordinary-packet receipt absent, and no test history written
 into public memory. A passing receipt alone does not prove answer quality.
 
-Recovery reference remains PR #509 and the existing operating configuration.
+The September 7 [normal conversation restoration](BNL_NORMAL_CONVERSATION_RESTORATION_2026-09-07.md)
+supersedes the earlier PR #509 recovery reference and deployment instructions.
+It retains the public-source connections described here.
 Do not reset the database or erase public TikTok history to undo a code change.

@@ -104,7 +104,9 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 source_moment_ids=("moment-one",),
             )
         )
-        current_text = "Is this a separate task, or should we continue?"
+        # Exercise source provenance independently of the reverted
+        # question/negation classifier added during the Row 6 tests.
+        current_text = "Back to Project Copper Kite: what changed and what remains open?"
         situation_frame = bnl01_bot.build_situation_frame_v1(
             route_allowed=True,
             route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,

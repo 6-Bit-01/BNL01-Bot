@@ -74,46 +74,6 @@ _EPISODE_RESUME_RE = re.compile(
     r"get\s+back\s+to|reopen)\b",
     re.I,
 )
-_EPISODE_EXPLICIT_NEW_EVENT_RE = re.compile(
-    r"\b(?:new|different|separate|another)\s+"
-    r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b|"
-    r"\bnot\s+(?:the\s+)?same\s+(?:event|incident|thread|case)\b",
-    re.I,
-)
-_EPISODE_NEGATED_NEW_EVENT_RE = re.compile(
-    r"\b(?:(?:no|not|never|isn(?:'|’)t|wasn(?:'|’)t|"
-    r"aren(?:'|’)t|weren(?:'|’)t)\s+"
-    r"(?:(?:a|an|the)\s+)?|"
-    r"(?:(?:do|should)(?:n['’]t|\s+not)|"
-    r"let(?:['’]s|\s+us)\s+not|never)\s+"
-    r"(?:(?:start|begin|open|create)\s+|"
-    r"(?:treat|regard|count|consider|call)\s+"
-    r"(?:this|that|it)\s+as\s+)(?:(?:a|an|the)\s+)?)"
-    r"(?:new|different|separate|another)\s+"
-    r"(?:event|incident|failure|attempt|run|task|discussion|thread|case)\b",
-    re.I,
-)
-_EPISODE_NEW_EVENT_DIRECTIVE_QUESTION_RE = re.compile(
-    r"^\s*(?:(?:can|could|would|will|should)\s+(?:you|we)\s+"
-    r"(?:please\s+)?|please\s+)?"
-    r"(?:(?:start|begin|open|create)\b|"
-    r"(?:(?:treat|regard|count|call)\s+"
-    r"(?:this|that|it)\s+as\b|"
-    r"consider\s+(?:this|that|it)\s+(?:as\s+)?"
-    r"(?=(?:(?:a|an|the)\s+)?"
-    r"(?:new|different|separate|another)\b)))",
-    re.I,
-)
-_EPISODE_NEW_EVENT_UNCERTAINTY_RE = re.compile(
-    r"(?:^\s*(?:maybe|perhaps|possibly|whether|if|"
-    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+"
-    r"(?:not\s+)?sure|"
-    r"(?:(?:i|we)\s+wonder|"
-    r"(?:i(?:\s+am|['’]m)|we(?:\s+are|['’]re))\s+wondering)"
-    r"\s+(?:if|whether))\b|"
-    r"\b(?:this|that|it)\s+(?:may|might|could|would)\s+be\b)",
-    re.I,
-)
 _EPISODE_RELATED_RE = re.compile(
     r"\b(?:combine|connect|link|tie)\b.{0,36}"
     r"\b(?:thread|topic|discussion|conversation|idea|plan|moment)s?\b"
@@ -135,7 +95,7 @@ _EPISODE_NEGATED_CLOSE_RE = re.compile(
 _EPISODE_ACTION_RE = re.compile(
     r"\b(?:i|we|you|they|he|she)\s+(?:will|plan(?:ned)?\s+to|"
     r"intend(?:ed)?\s+to|need(?:ed)?\s+to|should|could)\b"
-    r"|\b(?:let(?:'|’)s|implement|perform|build|fix|test|send|write|create|"
+    r"|\b(?:let(?:'|’)s|implement|build|fix|test|send|write|create|"
     r"change|update|deploy|review|check|run)\b",
     re.I,
 )
@@ -2606,12 +2566,7 @@ def observe_ledger_entry(conn: sqlite3.Connection, ledger_entry_id: str) -> Mome
         if source.source_table != "conversations" or source.lifecycle_status not in {"active", "review_only"} or source.entry_type not in {"observation", "derived_summary"}:
             conn.execute("RELEASE moment_observe")
             return MomentObservationResult(reason_code="ineligible_source", ledger_entry_id=source.entry_id)
-        # Human-authored content remains the authority-bearing privacy
-        # boundary. Model turns are retained only as structural conversation
-        # evidence and never become public content authority; applying the
-        # opaque-code detector to them can drop BNL's intentional alphanumeric
-        # glitch markers and prevent an otherwise valid Moment from forming.
-        if source.is_human and _contains_sensitive_moment_source(
+        if _contains_sensitive_moment_source(
             source.normalized_value,
             source.predicate_key,
         ):
@@ -3003,52 +2958,6 @@ def _episode_event_types(source: SourceEntry) -> tuple[str, ...]:
 def _episode_resume_requested(rows: list[SourceEntry]) -> bool:
     return any(
         row.is_human and _EPISODE_RESUME_RE.search(row.normalized_value or "")
-        for row in rows
-    )
-
-
-def _episode_text_explicit_new_event(value: str) -> bool:
-    unnegated = _EPISODE_NEGATED_NEW_EVENT_RE.sub("", value or "")
-    for match in _EPISODE_EXPLICIT_NEW_EVENT_RE.finditer(unnegated):
-        clause_start = max(
-            unnegated.rfind(boundary, 0, match.start())
-            for boundary in ".!?;\n"
-        ) + 1
-        clause_tail = unnegated[match.end() :]
-        clause_boundary = re.search(r"[:.!?;\n]", clause_tail)
-        clause_end = (
-            match.end() + clause_boundary.end()
-            if clause_boundary is not None
-            else len(unnegated)
-        )
-        clause = unnegated[clause_start:clause_end]
-        assertion_start = max(
-            clause_start,
-            max(
-                unnegated.rfind(boundary, clause_start, match.start())
-                for boundary in ",:—"
-            )
-            + 1,
-        )
-        cue_prefix = unnegated[assertion_start : match.end()]
-        assertion = unnegated[assertion_start:clause_end]
-        if (
-            clause.rstrip().endswith("?")
-            and not _EPISODE_NEW_EVENT_DIRECTIVE_QUESTION_RE.search(
-                assertion
-            )
-        ):
-            continue
-        if _EPISODE_NEW_EVENT_UNCERTAINTY_RE.search(cue_prefix):
-            continue
-        return True
-    return False
-
-
-def _episode_explicit_new_event(rows: list[SourceEntry]) -> bool:
-    return any(
-        row.is_human
-        and _episode_text_explicit_new_event(row.normalized_value or "")
         for row in rows
     )
 
@@ -4007,11 +3916,7 @@ def observe_finalized_moment_episode(
             )
             prior_episode = None
 
-        if (
-            prior_episode
-            and not _episode_explicit_new_event(rows)
-            and _episode_topic_matches(prior_episode, basis)
-        ):
+        if prior_episode and _episode_topic_matches(prior_episode, basis):
             episode_id = str(prior_episode[0])
             _insert_episode_moment(
                 conn,
@@ -4280,26 +4185,20 @@ def active_episode_for_assessment(
     now: str | None = None,
     expected_episode_id: str = "",
 ) -> ActiveEpisodeReference | None:
-    """Select one active episode without creating schema or changing state."""
+    """Select one active episode without creating schema or changing state.
 
-    boundary_text = (
-        topic_text if current_turn_text is None else current_turn_text
-    )
-    explicit_new_event = _episode_text_explicit_new_event(boundary_text)
+    Keep the resolved episode identity for render/revalidation consistency.
+    ``current_turn_text`` remains a compatible input; episode selection uses
+    the established topic and participant evidence rather than a second
+    natural-language boundary classifier.
+    """
+
     if (
         not shadow_enabled()
         or not ledger_shadow_enabled()
         or not _table_exists(conn, "memory_moment_episodes")
-        or explicit_new_event
     ):
         return None
-    continuity_probe = bool(
-        current_turn_text is not None
-        and (
-            _EPISODE_RESUME_RE.search(boundary_text or "")
-            or _EPISODE_NEGATED_NEW_EVENT_RE.search(boundary_text or "")
-        )
-    )
     expected_id = str(expected_episode_id or "").strip()
     candidate_query = """
         SELECT episode_id,guild_id,channel_id,channel_policy,route_mode,
@@ -4332,7 +4231,6 @@ def active_episode_for_assessment(
     family = _topic_family(topic_text, "conversation")
     if (
         not expected_id
-        and not continuity_probe
         and signature
         and not _coherent(
             family,
