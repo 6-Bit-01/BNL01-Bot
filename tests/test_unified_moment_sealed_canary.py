@@ -261,11 +261,8 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
-                "_active_episode_reference_for_unified_assessment",
-                return_value=SimpleNamespace(
-                    episode_id="opaque_active_episode",
-                    source_moment_ids=(),
-                ),
+                "_active_episode_id_for_unified_assessment",
+                return_value="opaque_active_episode",
             ),
             mock.patch.object(bnl01_bot, "DB_FILE", ":memory:"),
         )

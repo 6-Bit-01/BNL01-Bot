@@ -121,7 +121,6 @@ from bnl_memory_governance import (
     view_member_memory,
 )
 from bnl_moment_engine import (
-    ActiveEpisodeReference,
     MomentSituationReference,
     active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
@@ -235,7 +234,6 @@ from bnl_unified_response_assessment import (
 from bnl_journal import (
     JOURNAL_ROUTE,
     JournalControlSnapshot,
-    JournalPublication,
     ensure_schema as ensure_journal_schema,
     approve_draft as approve_journal_draft,
     deliver_approved as deliver_approved_journal,
@@ -248,10 +246,6 @@ from bnl_journal import (
     reject_draft as reject_journal_draft,
     journal_publication_query_mode,
     parse_journal_control_snapshot,
-    journal_control_snapshot_status,
-    render_journal_publication,
-    select_published_journal_entries_on_connection,
-    revalidate_published_journal_entry_on_connection,
 )
 from bnl_journal_source_store import (
     ensure_schema as ensure_journal_source_schema,
@@ -467,7 +461,6 @@ from bnl_gemini_cost import (
 )
 
 from bnl_website_relay_state import (
-    AcceptedRelayPublication,
     RelaySourceDecision,
     WebsiteRelayDecision,
     accepted_publication_count as relay_accepted_publication_count,
@@ -486,9 +479,6 @@ from bnl_website_relay_state import (
     clear_pending_v2_publication as relay_clear_pending_v2_publication,
     normalize_text as relay_normalize_text,
     relay_publication_query_mode,
-    render_accepted_relay_publication,
-    select_accepted_relay_publications_on_connection,
-    revalidate_accepted_relay_publication_on_connection,
     recent_history as relay_recent_history,
     reject_reason_for_candidate as relay_reject_reason_for_candidate,
     stock_directive_reason as relay_stock_directive_reason,
@@ -1977,8 +1967,6 @@ _bnl_control_flags_last_source_url = None
 BNL_READ_MODEL_TTL_SECONDS = 20
 _bnl_read_model_cache = None
 _bnl_read_model_cached_at = None
-_bnl_read_model_cache_scope = None
-_bnl_read_model_cache_lock = threading.Lock()
 
 
 def _build_bnl_control_flag_urls() -> list[str]:
@@ -2115,131 +2103,62 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
     return dict(defaults)
 
 
-def _bnl_read_model_source_scope(url: str, api_key: str) -> tuple:
-    # Bind the existing cache to its source and credentials without storing a
-    # second plaintext service key. This value is never logged or projected.
-    return (url, hashlib.sha256(api_key.encode("utf-8")).hexdigest())
-
-
-def _valid_bnl_read_model_snapshot(data: dict, *, authenticated: bool) -> bool:
-    if not isinstance(data, dict):
-        return False
-    public_only = data.get("publicOnly")
-    access_scope = str(data.get("accessScope") or "").strip().lower()
-    public_response = public_only is True and access_scope in {"", "none", "public"}
-    private_response = authenticated and public_only is False and access_scope == "private"
-    return bool(
-        data.get("ok") is True
-        and data.get("version") == 1
-        and isinstance(data.get("sections"), dict)
-        and (public_response or private_response)
-    )
-
-
 def fetch_bnl_read_model(force: bool = False) -> dict:
     """
     Fetch the website read model as temporary prompt context only.
 
-    Forced reads still refresh the queue. A transient refresh failure can use
-    the existing cache only within its original TTL and source/auth scope.
-    Channel-specific queue access remains enforced by the existing consumers.
+    The existing BNL service key authenticates the private queue projection.
+    A private response is accepted only when that key is configured; public
+    responses remain compatible with the original public-only contract.
     This helper never writes to SQLite, broadcast memory, website relay, or site state.
     """
-    global _bnl_read_model_cache, _bnl_read_model_cached_at, _bnl_read_model_cache_scope
-    source_url, api_key = BNL_READ_MODEL_URL, BNL_API_KEY
-    if not BNL_READ_MODEL_ENABLED or not source_url:
+    global _bnl_read_model_cache, _bnl_read_model_cached_at
+    if not BNL_READ_MODEL_ENABLED or not BNL_READ_MODEL_URL:
         logging.info("bnl_read_model_fetch_skipped reason=disabled")
         return {}
 
     now = datetime.now(PACIFIC_TZ)
-    source_scope = _bnl_read_model_source_scope(source_url, api_key)
-
-    def scope_still_current() -> bool:
-        return bool(
-            BNL_READ_MODEL_ENABLED
-            and source_scope == _bnl_read_model_source_scope(BNL_READ_MODEL_URL, BNL_API_KEY)
-        )
-
-    def fresh_cached_snapshot(*, refresh_failed: bool = False) -> dict:
-        with _bnl_read_model_cache_lock:
-            if (
-                not scope_still_current()
-                or _bnl_read_model_cache_scope != source_scope
-                or _bnl_read_model_cached_at is None
-                or not _valid_bnl_read_model_snapshot(
-                    _bnl_read_model_cache, authenticated=bool(api_key)
-                )
-            ):
-                return {}
-            age = (datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds()
-            if 0 <= age < BNL_READ_MODEL_TTL_SECONDS:
-                if refresh_failed:
-                    logging.info("bnl_read_model_cache_reused reason=refresh_failed age_seconds=%.3f", age)
-                return _bnl_read_model_cache
-        return {}
-
-    def discard_rejected_snapshot() -> dict:
-        global _bnl_read_model_cache, _bnl_read_model_cached_at, _bnl_read_model_cache_scope
-        with _bnl_read_model_cache_lock:
-            # An older request must not erase a newer completed refresh.
-            if (
-                _bnl_read_model_cache_scope == source_scope
-                and _bnl_read_model_cached_at is not None
-                and _bnl_read_model_cached_at <= now
-            ):
-                _bnl_read_model_cache = None
-                _bnl_read_model_cached_at = None
-                _bnl_read_model_cache_scope = None
-        return {}
-
-    if not force:
-        cached = fresh_cached_snapshot()
-        if cached:
-            return cached
+    if not force and _bnl_read_model_cache and _bnl_read_model_cached_at:
+        age = (now - _bnl_read_model_cached_at).total_seconds()
+        if age < BNL_READ_MODEL_TTL_SECONDS:
+            return _bnl_read_model_cache
 
     headers = {"Accept": "application/json"}
     if force:
         headers["Cache-Control"] = "no-cache"
-    if api_key:
-        headers["x-api-key"] = api_key
-    req = urllib.request.Request(source_url, method="GET", headers=headers)
+    if BNL_API_KEY:
+        headers["x-api-key"] = BNL_API_KEY
+    req = urllib.request.Request(BNL_READ_MODEL_URL, method="GET", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=3) as response:
             code = getattr(response, "status", None) or response.getcode()
             if not (200 <= code < 300):
                 logging.warning("bnl_read_model_fetch_failed reason=http_status")
-                return fresh_cached_snapshot(refresh_failed=True) if code in {408, 429} or code >= 500 else discard_rejected_snapshot()
+                return {}
             body = response.read().decode("utf-8", errors="replace")
             data = json.loads(body) if body else {}
     except Exception as e:
         logging.warning(f"bnl_read_model_fetch_failed reason={type(e).__name__}")
-        transient = (
-            (e.code in {408, 429} or e.code >= 500) if isinstance(e, urllib.error.HTTPError)
-            else isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError, OSError))
-        )
-        return fresh_cached_snapshot(refresh_failed=True) if transient else discard_rejected_snapshot()
+        return {}
 
-    if not _valid_bnl_read_model_snapshot(data, authenticated=bool(api_key)):
+    if not isinstance(data, dict):
         logging.warning("bnl_read_model_invalid_shape")
-        return discard_rejected_snapshot()
+        return {}
+    public_only = data.get("publicOnly")
+    access_scope = str(data.get("accessScope") or "").strip().lower()
+    public_response = public_only is True and access_scope in {"", "none", "public"}
+    private_response = bool(BNL_API_KEY) and public_only is False and access_scope == "private"
+    if (
+        data.get("ok") is not True
+        or data.get("version") != 1
+        or not isinstance(data.get("sections"), dict)
+        or not (public_response or private_response)
+    ):
+        logging.warning("bnl_read_model_invalid_shape")
+        return {}
 
-    with _bnl_read_model_cache_lock:
-        if not scope_still_current():
-            return {}
-        # Keep the last-started successful refresh when requests overlap.
-        if (
-            _bnl_read_model_cache_scope == source_scope
-            and _bnl_read_model_cached_at is not None
-            and _bnl_read_model_cached_at > now
-        ):
-            age = (datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds()
-            if not 0 <= age < BNL_READ_MODEL_TTL_SECONDS:
-                return {}
-            data = _bnl_read_model_cache
-        else:
-            _bnl_read_model_cache = data
-            _bnl_read_model_cached_at = now
-            _bnl_read_model_cache_scope = source_scope
+    _bnl_read_model_cache = data
+    _bnl_read_model_cached_at = now
     logging.info(
         "bnl_read_model_fetch_success sections=%s access_scope=%s",
         len(data.get("sections") or {}),
@@ -7735,12 +7654,6 @@ def calculate_adaptive_memory_limits(
     *,
     connection: sqlite3.Connection | None = None,
 ) -> dict:
-    policy = (channel_policy or "unknown").strip().lower() or "unknown"
-    # A member's Discord permissions do not expand the memory visible in a
-    # public conversation or its private testing mirror. Internal callers
-    # retain their already-resolved operator authority.
-    if policy in PUBLIC_CHAT_POLICIES or policy == "sealed_test":
-        is_owner_or_mod = False
     relation = get_relationship_state(
         user_id,
         guild_id,
@@ -7771,11 +7684,11 @@ def calculate_adaptive_memory_limits(
         multiplier += 0.20; reasons.append("recent_activity")
     if user_text and _memory_salience_score(user_text) >= 0.75:
         multiplier += 0.20; reasons.append("high_salience_or_explicit_memory_language")
-    if route_mode in SOURCE_INTERNAL_MODES or policy in {"internal_controlled", "broadcast_memory"}:
+    if route_mode in SOURCE_INTERNAL_MODES or (channel_policy or "") in {"internal_controlled", "broadcast_memory"}:
         multiplier += 0.15; reasons.append("internal_route")
     if is_owner_or_mod:
         multiplier += 0.25; reasons.append("operator")
-    if policy in {"public_selective", "unknown", "protected_system"}:
+    if (channel_policy or "") in {"public_selective", "sealed_test", "unknown", "protected_system"}:
         multiplier = min(multiplier, 1.15); reasons.append("restricted_surface_cap")
     def scale(base, maxv):
         return min(maxv, max(base, int(round(base * multiplier))))
@@ -7783,7 +7696,7 @@ def calculate_adaptive_memory_limits(
     visibility = "public_safe"
     if is_owner_or_mod:
         prompt_budget = MEMORY_PROMPT_BUDGET_OPERATOR; visibility = "operator_only"
-    elif route_mode in SOURCE_INTERNAL_MODES or policy in {"internal_controlled", "broadcast_memory"}:
+    elif route_mode in SOURCE_INTERNAL_MODES or (channel_policy or "") in {"internal_controlled", "broadcast_memory"}:
         prompt_budget = MEMORY_PROMPT_BUDGET_INTERNAL; visibility = "internal"
     return {
         "conversation_rows": scale(CONVERSATION_ROWS_PER_USER_BASE, CONVERSATION_ROWS_PER_USER_MAX),
@@ -10907,11 +10820,7 @@ def tiktok_show_episode_response_failure(
     *,
     current_user_text: str = "",
 ) -> str:
-    """Historical show-only diagnostic retained for regression fixtures.
-
-    Ordinary response delivery must not call this whole-answer checker: a
-    mixed answer can use timestamps and facts supplied by other valid sources.
-    """
+    """Reject show answers that ignore evidence or backfill gaps with lore."""
 
     evidence = _show_episode_evidence_from_prompt(prompt)
     if not evidence:
@@ -11084,9 +10993,48 @@ def recover_guarded_response_obligation(
     source_neutral = _guard_recovery_requires_source_neutral_response(
         original_reason
     )
-    # Show memory is one source among the authorized conversation inputs.
-    # Its historical lexical/clock checker cannot judge a whole mixed answer.
-    # Recovery uses the same general source and privacy checks as normal chat.
+    show_evidence = _show_episode_evidence_from_prompt(prompt)
+    if show_evidence and not source_neutral and not force_model_rewrite:
+        for candidate in candidates:
+            repaired = remove_unsupported_show_lore_sentences(
+                candidate,
+                prompt,
+            )
+            if not repaired:
+                continue
+            if tiktok_show_analysis_response_failure(repaired, prompt):
+                continue
+            if tiktok_show_episode_response_failure(
+                repaired,
+                prompt,
+                current_user_text=current_user_text,
+            ):
+                continue
+            if contains_fake_lookup_claim(repaired):
+                continue
+            if (
+                not source_context_available
+                and _contains_unsupported_source_authority_claim(repaired)
+            ):
+                continue
+            if detect_normal_chat_presentation_mode_leak(
+                repaired,
+                route_mode,
+            ):
+                continue
+            diagnostics["response_obligation_recovery_kind"] = (
+                "grounded_show_candidate"
+            )
+            diagnostics["source_neutral_recovery"] = False
+            logging.warning(
+                "response_obligation_recovered_after_guard reason=%s "
+                "kind=grounded_show_candidate route_mode=%s channel_policy=%s",
+                original_reason,
+                route_mode,
+                channel_policy,
+            )
+            return repaired
+        force_model_rewrite = True
 
     quote_guard_requested = bool(
         exact_quote_requested or third_party_attribution_requested
@@ -11099,11 +11047,6 @@ def recover_guarded_response_obligation(
                 original_reason.startswith("contextual_followthrough_")
                 and is_contextual_followthrough_deflection(candidate)
             ):
-                continue
-            # Keep the existing durable-analysis check on recovered drafts;
-            # removing show-only clock authority must not reuse a candidate
-            # already rejected by the separately retained analysis owner.
-            if tiktok_show_analysis_response_failure(candidate, prompt):
                 continue
             if contains_fake_lookup_claim(candidate):
                 continue
@@ -21373,13 +21316,12 @@ def get_conversation_context_v2_rows(
             (guild_id, normalized_channel_name, policy, int(channel_id or 0), safe_limit),
         )
         _remember(cursor.fetchall())
-    # Public history is readable in public and sealed conversations. The
-    # assembler retains relevance, attribution and the one-way sealed boundary.
-    if current_user_id and policy in PUBLIC_CHAT_POLICIES | {"sealed_test"}:
+    # Bounded same-user public-safe cross-channel candidates; assembler applies final recency/route/topic/policy gates.
+    if current_user_id and policy in {"public_home", "public_context"}:
         cursor.execute(
             base_select + """
               AND user_id = ?
-              AND channel_policy IN ('public_home', 'public_context', 'public_selective')
+              AND channel_policy IN ('public_home', 'public_context')
             ORDER BY id DESC LIMIT ?
             """,
             (guild_id, int(current_user_id), safe_limit),
@@ -21562,7 +21504,7 @@ def get_conversation_history(user_id: int, guild_id: int, limit: int = 50):
     return history
 
 
-ROOM_CONTEXT_ALLOWED_POLICIES = PUBLIC_CHAT_POLICIES | {"sealed_test"}
+ROOM_CONTEXT_ALLOWED_POLICIES = {"public_home", "public_context", "sealed_test"}
 ROOM_CONTEXT_BLOCKED_POLICIES = {
     "internal_controlled",
     "broadcast_memory",
@@ -21613,15 +21555,12 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
                 FROM conversations
                 WHERE guild_id = ?
                   AND channel_id = ?
-                  AND (
-                    channel_policy IN ('public_home', 'public_context', 'public_selective')
-                    OR (? = 'sealed_test' AND channel_policy = 'sealed_test')
-                  )
+                  AND channel_policy IN ('public_home', 'public_context', 'sealed_test')
                   AND timestamp >= datetime('now', ?)
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (guild_id, int(channel_id), policy, cutoff_sql, safe_limit),
+                (guild_id, int(channel_id), cutoff_sql, safe_limit),
             )
             _remember_rows(cursor.fetchall())
         if normalized_channel_name:
@@ -21631,16 +21570,12 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
                 FROM conversations
                 WHERE guild_id = ?
                   AND LOWER(COALESCE(channel_name, '')) = ?
-                  AND (COALESCE(channel_id, 0) = 0 OR ? = 0)
-                  AND (
-                    channel_policy IN ('public_home', 'public_context', 'public_selective')
-                    OR (? = 'sealed_test' AND channel_policy = 'sealed_test')
-                  )
+                  AND channel_policy IN ('public_home', 'public_context', 'sealed_test')
                   AND timestamp >= datetime('now', ?)
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (guild_id, normalized_channel_name, int(channel_id or 0), policy, cutoff_sql, safe_limit),
+                (guild_id, normalized_channel_name, cutoff_sql, safe_limit),
             )
             _remember_rows(cursor.fetchall())
     finally:
@@ -21650,9 +21585,7 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
     context_rows = []
     for row in rows:
         row_policy = (row[5] or "unknown").strip().lower()
-        if row_policy not in ROOM_CONTEXT_ALLOWED_POLICIES or (
-            row_policy == "sealed_test" and policy != "sealed_test"
-        ):
+        if row_policy not in ROOM_CONTEXT_ALLOWED_POLICIES:
             continue
         content = (row[3] or "").strip()
         if not content:
@@ -25968,11 +25901,9 @@ def build_user_memory_context(
         record_prompt_diagnostics({"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}})
         return "Memory intentionally skipped for simple greeting."
     policy = (channel_policy or "unknown").strip().lower() or "unknown"
-    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
+    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "sealed_test", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
         record_prompt_diagnostics({"skipped_reason": f"route_or_policy_{policy}", "included": {"short": 0, "medium": 0, "long": 0}})
         return "No route-safe durable memory for this mode/channel."
-    if policy in PUBLIC_CHAT_POLICIES or policy == "sealed_test":
-        is_owner_or_mod = False
 
     source_safe_recall_synthesis = source_safe_recall_synthesis_enabled(
         guild_id=guild_id,
@@ -26457,123 +26388,6 @@ def build_batch_moment_attribution_context(
 
 
 @dataclass(frozen=True)
-class PublicationPromptSourceBasis:
-    """Existing public publications selected for a normal Gemini prompt."""
-
-    expected_digest: str
-    rendered_context: str
-    guild_id: int
-    user_text: str
-    source_kind: str
-    publications: tuple[Union[JournalPublication, AcceptedRelayPublication], ...]
-    journal_control_snapshot: JournalControlSnapshot | None = None
-
-
-def _build_publication_prompt_source_basis(
-    *, guild_id: int, user_text: str, source_kind: str,
-    journal_control_snapshot: JournalControlSnapshot | None = None,
-) -> PublicationPromptSourceBasis | None:
-    """Read the existing publication stores without altering them."""
-    if DB_FILE == ":memory:" or not os.path.isfile(DB_FILE):
-        return None
-    try:
-        with sqlite3.connect(
-            "file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1,
-        ) as conn:
-            if source_kind == "journal":
-                # Check relevance locally before fetching website visibility.
-                selection = select_published_journal_entries_on_connection(
-                    conn, guild_id=guild_id, user_text=user_text,
-                    control_snapshot=None, include_context=True, limit=2,
-                )
-                if not selection.candidate_count:
-                    return None
-                if journal_control_snapshot_status(journal_control_snapshot) != "valid":
-                    journal_control_snapshot, _reason = (
-                        _journal_publication_control_snapshot_sync()
-                    )
-                selection = select_published_journal_entries_on_connection(
-                    conn, guild_id=guild_id, user_text=user_text,
-                    control_snapshot=journal_control_snapshot,
-                    include_context=True, limit=2,
-                )
-                render = render_journal_publication
-            else:
-                selection = select_accepted_relay_publications_on_connection(
-                    conn, guild_id=guild_id, user_text=user_text,
-                    include_context=True, limit=2,
-                )
-                render = render_accepted_relay_publication
-            if not selection.publications:
-                return None
-            context = (
-                "Published %s context (publication history):\n" % source_kind.title()
-                + "\n".join(render(publication) for publication in selection.publications)
-            )
-            return PublicationPromptSourceBasis(
-                expected_digest=_prompt_source_digest(
-                    "\n".join(p.source_digest for p in selection.publications)
-                ),
-                rendered_context=context, guild_id=guild_id,
-                user_text=user_text, source_kind=source_kind,
-                publications=selection.publications,
-                journal_control_snapshot=journal_control_snapshot,
-            )
-    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
-        logging.warning("normal_publication_context_unavailable kind=%s", source_kind)
-        return None
-
-
-def build_publication_prompt_source_bases(
-    *, guild_id: int, channel_policy: str, user_text: str,
-) -> tuple[PublicationPromptSourceBasis, ...]:
-    """Public knowledge is available equally to public and sealed chat."""
-    if channel_policy not in PUBLIC_CHAT_POLICIES | {"sealed_test"}:
-        return ()
-    return tuple(
-        basis for kind in ("journal", "relay")
-        if (basis := _build_publication_prompt_source_basis(
-            guild_id=guild_id, user_text=user_text, source_kind=kind,
-        )) is not None
-    )
-
-
-def _refresh_publication_prompt_source_basis(
-    basis: PublicationPromptSourceBasis,
-) -> tuple[PublicationPromptSourceBasis, bool]:
-    # Reuse the site's still-fresh visibility snapshot for this turn. The
-    # existing source checks compare exact published revisions/accepted rows;
-    # this adds no provider call or synchronous network fetch before Discord send.
-    if not basis.publications:
-        return basis, False
-    try:
-        with sqlite3.connect(
-            "file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1,
-        ) as conn:
-            digests = []
-            for publication in basis.publications:
-                if isinstance(publication, JournalPublication):
-                    digest = revalidate_published_journal_entry_on_connection(
-                        conn, guild_id=basis.guild_id,
-                        entry_id=publication.entry_id, revision=publication.revision,
-                        query_mode=publication.query_mode, user_text=basis.user_text,
-                        control_snapshot=basis.journal_control_snapshot,
-                    )
-                else:
-                    digest = revalidate_accepted_relay_publication_on_connection(
-                        conn, guild_id=basis.guild_id, relay_id=publication.relay_id,
-                        query_mode=publication.query_mode, user_text=basis.user_text,
-                    )
-                digests.append(digest)
-            if digests and all(digests) and _prompt_source_digest("\n".join(digests)) == basis.expected_digest:
-                return basis, False
-    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
-        pass
-    # Remove only the changed publication block; keep the other normal context.
-    return replace(basis, expected_digest="", rendered_context="", publications=()), bool(basis.rendered_context)
-
-
-@dataclass(frozen=True)
 class MemoryPromptSourceBasis:
     """Typed reconstruction inputs for source-bearing member memory context."""
 
@@ -26651,7 +26465,6 @@ class UnifiedMomentCanaryPromptSourceBasis:
 
 
 PromptSourceBasis = Union[
-    PublicationPromptSourceBasis,
     MemoryPromptSourceBasis,
     ConversationPromptSourceBasis,
     BatchMomentPromptSourceBasis,
@@ -26671,17 +26484,16 @@ def _canon_relevant_to_response(text: str) -> bool:
     return bool(_UNIFIED_ASSESSMENT_CANON_RELEVANCE_RE.search(text or ""))
 
 
-def _active_episode_reference_for_unified_assessment(
+def _active_episode_id_for_unified_assessment(
     *,
     guild_id: int,
     channel_id: int,
     channel_policy: str,
     route_mode: str,
     topic_text: str,
-    current_turn_text: str,
     participant_user_ids: tuple[int, ...],
-) -> ActiveEpisodeReference | None:
-    """Read one source-validated active episode for shadow comparison."""
+) -> str:
+    """Read one opaque episode id for shadow comparison only."""
 
     if (
         not moment_engine_shadow_enabled()
@@ -26690,7 +26502,7 @@ def _active_episode_reference_for_unified_assessment(
         or DB_FILE == ":memory:"
         or not os.path.exists(DB_FILE)
     ):
-        return None
+        return ""
     participant_keys = tuple(
         "discord_user:%s" % int(user_id)
         for user_id in participant_user_ids
@@ -26709,12 +26521,11 @@ def _active_episode_reference_for_unified_assessment(
                 channel_policy=str(channel_policy or "unknown"),
                 route_mode=str(route_mode or "unknown"),
                 topic_text=str(topic_text or "")[:8000],
-                current_turn_text=str(current_turn_text or "")[:8000],
                 participant_keys=participant_keys,
             )
-        return reference
+        return reference.episode_id if reference is not None else ""
     except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
-        return None
+        return ""
 
 
 def _recent_moment_situation_for_turn(
@@ -28013,11 +27824,8 @@ def build_unified_response_assessment_shadow(
     active_episode_id = str(
         memory_meta.get("active_episode_id") or ""
     ).strip()
-    active_episode_source_moment_ids = tuple(
-        memory_meta.get("active_episode_source_moment_ids") or ()
-    )
     if not active_episode_id:
-        active_episode_reference = _active_episode_reference_for_unified_assessment(
+        active_episode_id = _active_episode_id_for_unified_assessment(
             guild_id=guild_id,
             channel_id=channel_id,
             channel_policy=channel_policy,
@@ -28027,21 +27835,8 @@ def build_unified_response_assessment_shadow(
                 for item in semantic_evidence_items
                 if str(item.text or "").strip()
             ),
-            current_turn_text=current_text,
             participant_user_ids=participant_user_ids,
         )
-        if active_episode_reference is not None:
-            active_episode_id = active_episode_reference.episode_id
-            active_episode_source_moment_ids = (
-                active_episode_reference.source_moment_ids
-            )
-    if (
-        isinstance(situation_frame, SituationFrameV1)
-        and situation_frame.event_relation
-        in {"new_event_same_participant", "new_event_or_uncertain"}
-    ):
-        active_episode_id = ""
-        active_episode_source_moment_ids = ()
     current_payload_anchors = extract_current_payload_anchors(
         current_text,
         conversation_contexts,
@@ -28199,9 +27994,6 @@ def build_unified_response_assessment_shadow(
         speaker_labels=speaker_labels,
         current_exchange_source_ids=current_exchange_source_ids,
         active_episode_id=active_episode_id,
-        active_episode_source_moment_ids=(
-            active_episode_source_moment_ids
-        ),
         prior_moment_ids=assessment_moment_refs,
         governed_entry_ids=assessment_governed_refs,
         relationship_candidate_keys=assessment_relationship_refs,
@@ -28348,28 +28140,16 @@ def record_unified_response_assessment_shadow(
     response_sent: bool = True,
 ) -> str:
     """Persist one content-free receipt; never affect response delivery."""
-    diagnostics = guard_diagnostics or {}
     for basis in tuple(
-        diagnostics.get("_revalidated_prompt_source_bases")
+        (guard_diagnostics or {}).get(
+            "_revalidated_prompt_source_bases"
+        )
         or ()
     ):
         if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
             assessment = basis.assessment
             break
-    if (
-        assessment is not None
-        and diagnostics.get("source_neutral_recovery")
-    ):
-        assessment = with_prompt_lane_presence(
-            replace(
-                assessment,
-                active_episode_id="",
-                active_episode_source_moment_ids=(),
-            ),
-            "active_episode",
-            present=False,
-        )
-    frame_revalidation = diagnostics.get(
+    frame_revalidation = (guard_diagnostics or {}).get(
         "_situation_frame_revalidation"
     )
     if (
@@ -28499,7 +28279,6 @@ def _render_unified_moment_canary_context(
     ):
         return "", False, assessment
     episode_context = ""
-    episode_reference: ActiveEpisodeReference | None = None
     if (
         DB_FILE != ":memory:"
         and os.path.exists(DB_FILE)
@@ -28511,7 +28290,6 @@ def _render_unified_moment_canary_context(
             if int(user_id or 0) > 0
         )
         try:
-            reference_out: dict[str, ActiveEpisodeReference] = {}
             with sqlite3.connect(
                 "file:%s?mode=ro" % DB_FILE,
                 uri=True,
@@ -28525,28 +28303,11 @@ def _render_unified_moment_canary_context(
                     route_mode=str(route_mode or "unknown"),
                     topic_text=str(topic_text or "")[:8000],
                     participant_keys=participant_keys,
-                    expected_episode_id=assessment.active_episode_id,
-                    reference_out=reference_out,
                 )
-            episode_reference = reference_out.get("reference")
         except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
             episode_context = ""
-            episode_reference = None
-    reconciled_assessment = replace(
-        assessment,
-        active_episode_id=(
-            episode_reference.episode_id
-            if episode_context and episode_reference is not None
-            else ""
-        ),
-        active_episode_source_moment_ids=(
-            episode_reference.source_moment_ids
-            if episode_context and episode_reference is not None
-            else ()
-        ),
-    )
     reconciled_assessment = with_prompt_lane_presence(
-        reconciled_assessment,
+        assessment,
         "active_episode",
         present=bool(episode_context),
     )
@@ -29133,8 +28894,6 @@ def refresh_prompt_source_basis(
     basis: PromptSourceBasis,
 ) -> tuple[PromptSourceBasis, bool]:
     """Synchronously rebuild one source basis after any provider await."""
-    if isinstance(basis, PublicationPromptSourceBasis):
-        return _refresh_publication_prompt_source_basis(basis)
     if isinstance(basis, SharedBrainSynthesisBasis):
         try:
             snapshot, provided = (
@@ -29184,10 +28943,6 @@ def refresh_prompt_source_basis(
             fresh.expected_digest != basis.expected_digest
             or fresh.episode_context_present
             != basis.episode_context_present
-            or fresh.assessment.active_episode_id
-            != basis.assessment.active_episode_id
-            or fresh.assessment.active_episode_source_moment_ids
-            != basis.assessment.active_episode_source_moment_ids
         )
     if isinstance(basis, MemoryPromptSourceBasis):
         source_metadata: dict = {}
@@ -29294,8 +29049,6 @@ def refresh_prompt_source_bases(
             if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis)
             else "batch_moment"
             if isinstance(basis, BatchMomentPromptSourceBasis)
-            else "publication"
-            if isinstance(basis, PublicationPromptSourceBasis)
             else "memory"
         )
         changed_kinds.append(kind)
@@ -29315,7 +29068,7 @@ def refresh_prompt_source_bases(
         if basis.rendered_context not in updated_prompt:
             replacement_failed = True
             continue
-        if isinstance(basis, (UnifiedMomentCanaryPromptSourceBasis, PublicationPromptSourceBasis)):
+        if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
             replacement = fresh.rendered_context
         else:
             replacement = (
@@ -29364,8 +29117,6 @@ def prompt_source_basis_failure(
                         basis,
                         UnifiedMomentCanaryPromptSourceBasis,
                     )
-                    else "publication_source_changed"
-                    if isinstance(basis, PublicationPromptSourceBasis)
                     else "memory_source_changed"
                 )
     except Exception:
@@ -36379,18 +36130,16 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     ),
                 )
             )
+            batch_tiktok_show_episode_turn_contract = (
+                build_tiktok_show_episode_turn_contract(
+                    batch_tiktok_show_evidence_context
+                )
+            )
             batch_finalized_show_packet_owner = (
                 finalized_show_packet_owner_requested(
                     combined_text,
                     batch_tiktok_show_evidence_context,
                 )
-            )
-            batch_tiktok_show_episode_turn_contract = (
-                build_tiktok_show_episode_turn_contract(
-                    batch_tiktok_show_evidence_context
-                )
-                if batch_finalized_show_packet_owner
-                else ""
             )
             batch_source_context_available = bool(
                 batch_website_read_model_context
@@ -36455,7 +36204,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 has_media=bool(active_packet.get("media_present")),
                 specialized_owner_present=bool(
                     (
-                        batch_website_read_model_context
+                        batch_source_context_available
                         and not batch_publication_packet_owns_turn
                         and not batch_publication_queue_packet_ready
                     )
@@ -36466,6 +36215,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 len(unique_user_ids) == 1
                 and batch_ordinary_chat_scope.eligible
             )
+            batch_source_no_store_reason = (
+                "finalized_show_evidence_no_store"
+                if batch_tiktok_show_evidence_context
+                else "website_read_model_no_store"
+            )
             batch_public_tiktok_memory_allowed = (
                 public_tiktok_interaction_memory_allowed(
                     combined_text,
@@ -36473,16 +36227,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_website_read_model_context,
                 )
             )
-            batch_model_persistence_allowed = (
-                model_response_persistence_allowed_with_website_context(
-                    combined_text,
-                    channel_policy,
-                    batch_website_read_model_context,
-                )
-            )
-            batch_source_no_store_reason = "website_read_model_no_store"
             batch_website_read_model_prompt_block = ""
-            if batch_website_read_model_context:
+            if (
+                batch_website_read_model_context
+                and not batch_publication_queue_packet_ready
+            ):
                 batch_website_read_model_prompt_block = (
                     "\n\nAuthoritative current live-show context for this "
                     "request:\n"
@@ -36547,11 +36296,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_memory_prompt_block = ""
             if len(unique_user_ids) == 1:
                 member = channel.guild.get_member(first_uid)
-                batch_member_is_privileged = bool(
-                    is_privileged_member(member, channel.guild)
-                    and is_operator_authority_context(
-                        channel_policy, getattr(channel, "name", ""),
-                    )
+                batch_member_is_privileged = is_privileged_member(
+                    member,
+                    channel.guild,
                 )
                 batch_memory_target_user_id = (
                     batch_attribution_contract.target_user_id
@@ -36890,10 +36637,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         for block in (
                             recent_room_prompt,
                             batch_memory_prompt_block,
-                            (
-                                "" if batch_publication_queue_packet_ready
-                                else batch_website_read_model_prompt_block
-                            ),
+                            batch_website_read_model_prompt_block,
                             batch_tiktok_show_evidence_prompt_block,
                         )
                         if block
@@ -36908,20 +36652,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 and batch_ordinary_chat_basis is None
                 else ""
             )
-            if batch_publication_queue_packet_ready and batch_ordinary_chat_basis is not None:
-                prompt = "".join(prompt.rsplit(batch_website_read_model_prompt_block, 1))
-            if batch_ordinary_chat_basis is None:
-                batch_publication_bases = await asyncio.to_thread(
-                    build_publication_prompt_source_bases,
-                    guild_id=guild_id, channel_policy=channel_policy,
-                    user_text=combined_text,
-                )
-                batch_prompt_source_bases.extend(batch_publication_bases)
-                for publication_basis in batch_publication_bases:
-                    prompt += "\n\n" + publication_basis.rendered_context + "\n"
-                batch_source_context_available = bool(
-                    batch_source_context_available or batch_publication_bases
-                )
             batch_shared_brain_synthesis_basis = (
                 build_shared_brain_synthesis_basis(
                     guild_id=guild_id,
@@ -36944,17 +36674,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_attribution_contract
                         .third_party_attribution_requested
                     ),
-                    competing_factual_contexts=tuple(
-                        context
-                        for context in (
-                            batch_memory_context,
-                            batch_tiktok_show_evidence_prompt_block,
-                        )
-                        if context
+                    competing_factual_contexts=(
+                        (batch_memory_context,)
+                        if batch_memory_context
+                        else ()
                     ),
                 )
                 if len(unique_user_ids) == 1
-                and not batch_website_read_model_context
+                and not batch_source_context_available
                 and not batch_ordinary_chat_single_packet
                 else None
             )
@@ -37503,8 +37230,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 get_route_mode_contract(
                     ROUTE_MODE_NORMAL_CHAT
                 ).save_behavior
-                if batch_model_persistence_allowed
+                if batch_public_tiktok_memory_allowed
                 else "none"
+                if batch_source_context_available
+                else get_route_mode_contract(
+                    ROUTE_MODE_NORMAL_CHAT
+                ).save_behavior
             ),
             source_analysis_context_injected=(
                 batch_source_context_available
@@ -37520,9 +37251,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             save_policy_reason=(
                 "public_tiktok_interaction_normal_memory"
                 if batch_public_tiktok_memory_allowed
-                else "public_memory_sources_normal_memory"
-                if batch_model_persistence_allowed
-                and batch_source_context_available
                 else batch_source_no_store_reason
                 if batch_source_context_available
                 else "batch_model_save_pending"
@@ -37586,7 +37314,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_source_context_available
                     ),
                 )
-                if not batch_website_read_model_context
+                if not batch_source_context_available
                 else None
             )
         batch_synthesis_decision = (
@@ -38694,10 +38422,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="stale_after_presend_response_rewrite",
             )
             return
-        _record_guard_regeneration_debug(
-            guard_diagnostics,
-            channel_id=channel_id,
-        )
         _log_batch_event(
             logging.INFO,
             "response_send_commit_start",
@@ -38752,7 +38476,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="batch_discord_send_failed",
             )
             return
-        if not batch_model_persistence_allowed:
+        if (
+            batch_source_context_available
+            and not batch_public_tiktok_memory_allowed
+        ):
             logging.info(
                 "batch_response_persistence_skipped "
                 "reason=%s channel_policy=%s",
@@ -39082,25 +38809,6 @@ async def on_ready():
             ensure_next_ambient_scheduled(g.id)
 
     await client.change_presence(activity=discord.Game(name="Cataloging BARCODE data..."))
-
-
-async def build_user_aware_prompt_async(
-    user_id: int, guild_id: int, fallback_display_name: str,
-    clean_content: str, **kwargs,
-) -> tuple:
-    """Fetch publication inputs off the Discord loop, then use its normal builder."""
-    publication_bases = await asyncio.to_thread(
-        build_publication_prompt_source_bases,
-        guild_id=guild_id,
-        channel_policy=kwargs.get("channel_policy", "unknown"),
-        user_text=clean_content,
-    )
-    return build_user_aware_prompt(
-        user_id, guild_id, fallback_display_name, clean_content,
-        publication_source_bases=publication_bases, **kwargs,
-    )
-
-
 def build_user_aware_prompt(
     user_id: int,
     guild_id: int,
@@ -39124,7 +38832,6 @@ def build_user_aware_prompt(
     conversation_context_result: ConversationContextResult | None = None,
     conversation_orchestration: ConversationOrchestrationDecision | None = None,
     _ordinary_chat_single_packet_enabled_override: bool | None = None,
-    publication_source_bases: tuple[PublicationPromptSourceBasis, ...] | None = None,
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -39357,16 +39064,14 @@ def build_user_aware_prompt(
         if tiktok_show_evidence_context
         else ""
     )
-    finalized_show_packet_owner = finalized_show_packet_owner_requested(
-        clean_content,
-        tiktok_show_evidence_context,
-    )
     tiktok_show_episode_turn_contract = (
         build_tiktok_show_episode_turn_contract(
             tiktok_show_evidence_context
         )
-        if finalized_show_packet_owner
-        else ""
+    )
+    finalized_show_packet_owner = finalized_show_packet_owner_requested(
+        clean_content,
+        tiktok_show_evidence_context,
     )
     frozen_situation_frame = (
         conversation_orchestration.situation_frame
@@ -39395,6 +39100,9 @@ def build_user_aware_prompt(
         publication_queue_composition
         and operational_queue_packet_snapshot
     )
+    if publication_queue_packet_ready:
+        show_state_prompt_block = ""
+        website_read_model_prompt_block = ""
     broadcast_context_eligible = bool(
         broadcast_context
         and not finalized_show_packet_owner
@@ -39667,13 +39375,8 @@ def build_user_aware_prompt(
         third_party_attribution_requested=(
             third_party_attribution_requested
         ),
-        competing_factual_contexts=tuple(
-            context
-            for context in (
-                memory_context,
-                tiktok_show_evidence_prompt_block,
-            )
-            if context
+        competing_factual_contexts=(
+            (memory_context,) if memory_context else ()
         ),
         )
     )
@@ -39701,8 +39404,8 @@ def build_user_aware_prompt(
                         else ""
                     ),
                     broadcast_prompt_block,
-                    "" if publication_queue_packet_ready else show_state_prompt_block,
-                    "" if publication_queue_packet_ready else website_read_model_prompt_block,
+                    show_state_prompt_block,
+                    website_read_model_prompt_block,
                     queue_artist_memory_prompt_block,
                     tiktok_show_evidence_prompt_block,
                     source_context_prompt_block,
@@ -39714,29 +39417,9 @@ def build_user_aware_prompt(
         else None
     )
 
-    if publication_queue_packet_ready and ordinary_chat_single_packet_basis is not None:
-        show_state_prompt_block = ""
-        website_read_model_prompt_block = ""
-    publication_bases = (
-        publication_source_bases
-        if publication_source_bases is not None
-        else build_publication_prompt_source_bases(
-            guild_id=guild_id, channel_policy=channel_policy,
-            user_text=clean_content,
-        )
-    )
-    if ordinary_chat_single_packet_basis is not None:
-        publication_bases = ()
-    prompt_source_bases.extend(publication_bases)
-    publication_prompt_block = "".join(
-        basis.rendered_context + "\n" for basis in publication_bases
-    )
-
     if prompt_metadata is not None:
-        prompt_metadata["publication_context_present"] = bool(publication_bases)
         prompt_metadata["source_context_available"] = bool(
             ordinary_chat_single_packet_basis
-            or publication_bases
             or broadcast_context
             or show_state_context
             or website_read_model_context
@@ -39945,7 +39628,6 @@ def build_user_aware_prompt(
         f"{website_read_model_prompt_block}"
         f"{queue_artist_memory_prompt_block}"
         f"{tiktok_show_evidence_prompt_block}"
-        f"{publication_prompt_block}"
         f"{source_context_prompt_block}"
         f"{exact_quote_prompt_block}"
         f"{tiktok_show_analysis_turn_contract}"
@@ -40884,7 +40566,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
             current_direct=True,
         )
     )
-    prompt, allow_greeting, style_key = await build_user_aware_prompt_async(
+    prompt, allow_greeting, style_key = build_user_aware_prompt(
         session["requester_user_id"],
         session["guild_id"],
         session["requester_display_name"],
@@ -41510,23 +41192,6 @@ def build_exact_quote_correction_prompt(
     )
 
 
-def _record_guard_regeneration_debug(diagnostics: dict, *, channel_id: int) -> None:
-    """Refresh the existing last-route flag after the final guard/recovery await."""
-
-    if LAST_ROUTE_DEBUG.get("channel_id") != channel_id:
-        return
-    regenerated = any(
-        bool(value)
-        for name, value in diagnostics.items()
-        if name.endswith("_regenerated") or name.startswith("regenerated_for_")
-    )
-    if regenerated:
-        # The historical field is displayed as "regeneration happened".
-        LAST_ROUTE_DEBUG["regenerated_for_mode_leak"] = True
-    if diagnostics.get("response_obligation_regenerated"):
-        LAST_ROUTE_DEBUG["fallback_used"] = True
-
-
 async def apply_guarded_response_regeneration(
     response: str,
     *,
@@ -41897,6 +41562,13 @@ async def apply_guarded_response_regeneration(
                     prompt,
                 )
             )
+            or bool(
+                tiktok_show_episode_response_failure(
+                    candidate,
+                    prompt,
+                    current_user_text=current_user_text,
+                )
+            )
             or (
                 contextual_followthrough_required
                 and is_contextual_followthrough_deflection(candidate)
@@ -42119,9 +41791,92 @@ async def apply_guarded_response_regeneration(
             return "", diagnostics
         response = regenerated
 
-    # The full answer may combine Journal, queue, canon and show evidence.
-    # Gemini consumes those source-labelled inputs; the show-only checker has
-    # no authority to reject or rewrite statements supplied by another source.
+    tiktok_episode_failure = tiktok_show_episode_response_failure(
+        response,
+        prompt,
+        current_user_text=current_user_text,
+    )
+    if tiktok_episode_failure:
+        diagnostics["tiktok_show_episode_guard_triggered"] = True
+        diagnostics["tiktok_show_episode_guard_reason"] = (
+            tiktok_episode_failure
+        )
+        logging.warning(
+            "tiktok_show_episode_guard_triggered reason=%s "
+            "route_mode=%s channel_policy=%s",
+            tiktok_episode_failure,
+            route_mode,
+            channel_policy,
+        )
+        if not regeneration_allowed:
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "tiktok_show_episode_validation_only"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        regenerated = await regenerate(
+            build_tiktok_show_episode_correction_prompt(
+                prompt,
+                tiktok_episode_failure,
+            )
+        )
+        diagnostics["tiktok_show_episode_regenerated"] = True
+        regenerated = (regenerated or "").strip()
+        regenerated_failure = tiktok_show_episode_response_failure(
+            regenerated,
+            prompt,
+            current_user_text=current_user_text,
+        )
+        diagnostics["tiktok_show_episode_guard_reason"] = (
+            regenerated_failure
+        )
+        if retry_has_guard_failure(regenerated):
+            lore_sanitized = ""
+            if regenerated_failure.startswith("unsupported_show_lore_"):
+                lore_sanitized = remove_unsupported_show_lore_sentences(
+                    regenerated,
+                    prompt,
+                )
+            if (
+                lore_sanitized
+                and lore_sanitized != regenerated
+                and not retry_has_guard_failure(lore_sanitized)
+            ):
+                logging.warning(
+                    "tiktok_show_episode_lore_sanitized_after_retry "
+                    "reason=%s route_mode=%s channel_policy=%s",
+                    regenerated_failure,
+                    route_mode,
+                    channel_policy,
+                )
+                diagnostics["tiktok_show_episode_lore_sanitized"] = True
+                diagnostics["tiktok_show_episode_guard_reason"] = ""
+                response = lore_sanitized
+            else:
+                logging.warning(
+                    "tiktok_show_episode_candidate_rejected_after_retry "
+                    "reason=%s route_mode=%s channel_policy=%s",
+                    regenerated_failure or "other_guard",
+                    route_mode,
+                    channel_policy,
+                )
+                diagnostics.update(
+                    {
+                        "suppressed": True,
+                        "suppression_reason": (
+                            "tiktok_show_episode_after_retry"
+                        ),
+                        "guard_fallback_or_generic_non_answer": True,
+                    }
+                )
+                return "", diagnostics
+        else:
+            response = regenerated
 
     exact_reply_grounding = reply_referent_grounding(response)
     diagnostics["exact_reply_grounding_status"] = (
@@ -42724,6 +42479,26 @@ async def apply_guarded_response_regeneration(
                 "suppressed": True,
                 "suppression_reason": (
                     "tiktok_show_analysis_failed_before_send"
+                ),
+                "guard_fallback_or_generic_non_answer": True,
+            }
+        )
+        return "", diagnostics
+    final_tiktok_episode_failure = tiktok_show_episode_response_failure(
+        response,
+        prompt,
+        current_user_text=current_user_text,
+    )
+    if final_tiktok_episode_failure:
+        diagnostics.update(
+            {
+                "tiktok_show_episode_guard_triggered": True,
+                "tiktok_show_episode_guard_reason": (
+                    final_tiktok_episode_failure
+                ),
+                "suppressed": True,
+                "suppression_reason": (
+                    "tiktok_show_episode_failed_before_send"
                 ),
                 "guard_fallback_or_generic_non_answer": True,
             }
@@ -43694,11 +43469,7 @@ async def regenerate_ordinary_chat_response_obligation(
     current_user_text: str = "",
     route_mode: str = ROUTE_MODE_NORMAL_CHAT,
 ) -> tuple[str, str, tuple[PromptSourceBasis, ...], int, bool]:
-    """Recover through normal Gemini, including its voice and source guards.
-
-    Recovery is also used when the experimental packet generator is off. It
-    must not select that generator's system prompt or bypass normal safeguards.
-    """
+    """Regenerate a natural ordinary-chat response after draft rejection."""
 
     repair_prompt, repair_bases, source_neutral = (
         build_ordinary_chat_response_repair_prompt(
@@ -43715,7 +43486,7 @@ async def regenerate_ordinary_chat_response_obligation(
             repair_prompt,
             user_id,
             guild_id,
-            route="get_gemini_response",
+            route=ORDINARY_CHAT_SINGLE_PACKET_ROUTE,
             source_context_available=bool(
                 source_context_available and not source_neutral
             ),
@@ -44849,10 +44620,6 @@ async def send_planned_conversation_response(
             guard_status="stale_after_presend_response_rewrite",
         )
         return model_decision
-    _record_guard_regeneration_debug(
-        guard_diagnostics,
-        channel_id=int(getattr(message.channel, "id", 0) or 0),
-    )
     sent_message_ids = []
     try:
         if len(response) <= 2000:
@@ -46096,7 +45863,7 @@ async def on_message(message: discord.Message):
                     current_direct=direct_interaction,
                 )
             )
-            prompt, allow_greeting, style_key = await build_user_aware_prompt_async(
+            prompt, allow_greeting, style_key = build_user_aware_prompt(
                 message.author.id,
                 message.guild.id,
                 message.author.display_name,
@@ -46612,7 +46379,7 @@ async def on_message(message: discord.Message):
                 current_direct=direct_interaction,
             )
         )
-        prompt, allow_greeting, style_key = await build_user_aware_prompt_async(
+        prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
             message.author.display_name,
@@ -47083,7 +46850,7 @@ async def on_message(message: discord.Message):
                 current_direct=direct_interaction,
             )
         )
-        prompt, allow_greeting, style_key = await build_user_aware_prompt_async(
+        prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
             message.author.display_name,

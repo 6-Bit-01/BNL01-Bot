@@ -167,76 +167,62 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
             "",
         )
 
-    def test_normal_recovery_preserves_other_source_statements_with_show_context(self):
-        # The show-only helper documents the historical false rejection. It
-        # must no longer own normal delivery or recovery of a mixed answer.
-        prompt = RAW_PROMPT + "\nPublished Journal: workshop at 19:00."
-        answer = "The Journal described the workshop at 19:00."
-        self.assertEqual(
-            bnl01_bot.tiktok_show_episode_response_failure(answer, prompt),
-            "unsupported_show_clock_time",
-        )
+    def test_response_obligation_recovery_sends_cleaned_show_answer(self):
         diagnostics = {
             "suppressed": True,
-            "suppression_reason": "contextual_followthrough_after_retry",
+            "suppression_reason": "tiktok_show_episode_after_retry",
         }
         recovered = bnl01_bot.recover_guarded_response_obligation(
             "",
-            baseline_response=answer,
-            prompt=prompt,
-            current_user_text="What was the Journal about?",
+            baseline_response=(
+                "The timeline starts with Neon Fox's First Signal. "
+                "Sheila handled an interruption off camera. The Wheel then "
+                "confirmed Second Artist's Queue Light, and Alex asked BNL "
+                "about that move in Discord."
+            ),
+            prompt=RAW_PROMPT,
+            current_user_text=(
+                "What else happened during yesterday's show? Give me a timeline."
+            ),
             diagnostics=diagnostics,
             route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
             channel_policy="public_home",
             source_context_available=True,
         )
-        self.assertEqual(recovered, answer)
+        self.assertNotIn("Sheila", recovered)
+        self.assertIn("First Signal", recovered)
+        self.assertIn("Queue Light", recovered)
         self.assertFalse(diagnostics["suppressed"])
+        self.assertTrue(diagnostics["response_obligation_recovered"])
         self.assertEqual(
             diagnostics["response_obligation_recovery_kind"],
-            "last_safe_candidate",
+            "grounded_show_candidate",
         )
 
-    def test_normal_recovery_does_not_reuse_a_rejected_durable_analysis_draft(self):
-        prompt = (
-            RAW_PROMPT
-            + "\nDurable TikTok show analysis context:\n"
-            + "- Analysis intent=chat_topics.\n"
-            + '- Signal "green visuals": 3 messages / 3 unique chatters.\n'
-        )
-        rejected = "People mostly discussed generic things throughout the live."
-        answer = "Green visuals came up in three messages from three chatters."
-        self.assertEqual(
-            bnl01_bot.tiktok_show_analysis_response_failure(rejected, prompt),
-            "archive_evidence_not_used",
-        )
+    def test_unusable_show_draft_returns_to_shared_brain_with_evidence(self):
         diagnostics = {
             "suppressed": True,
-            "suppression_reason": "tiktok_show_analysis_after_retry",
+            "suppression_reason": "tiktok_show_episode_after_retry",
         }
-        generate = mock.AsyncMock(return_value=bnl01_bot.TrackedGenerationResponse(
-            text=answer, provider_call_count=1,
-        ))
-        with mock.patch.object(
-            bnl01_bot, "get_tracked_gemini_response_with_optional_typing", new=generate,
-        ):
-            recovered, repaired_prompt, _bases, calls, source_neutral = asyncio.run(
-                bnl01_bot.resolve_guarded_response_obligation(
-                    "", baseline_response=rejected, prompt=prompt,
-                    current_user_text="What did the TikTok chat talk about?",
-                    diagnostics=diagnostics,
-                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
-                    channel_policy="public_home", user_id=101, guild_id=1,
-                    channel=None, source_context_available=True,
-                )
-            )
-        self.assertEqual(recovered, answer)
-        generate.assert_awaited_once()
-        self.assertEqual(generate.await_args.kwargs["route"], "get_gemini_response")
-        self.assertIn(prompt, repaired_prompt)
-        self.assertEqual(calls, 1)
-        self.assertFalse(source_neutral)
-        self.assertFalse(diagnostics["suppressed"])
+        recovered = bnl01_bot.recover_guarded_response_obligation(
+            "",
+            baseline_response=(
+                "Cliff and the Studio Rats handled everything backstage."
+            ),
+            prompt=RAW_PROMPT,
+            current_user_text="Give me the show timeline.",
+            diagnostics=diagnostics,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="public_home",
+            source_context_available=True,
+        )
+        self.assertEqual("", recovered)
+        self.assertTrue(diagnostics["suppressed"])
+        self.assertFalse(diagnostics["response_obligation_recovered"])
+        self.assertEqual(
+            diagnostics["response_obligation_recovery_kind"],
+            "model_rewrite_required",
+        )
 
     def test_source_guard_recovery_regenerates_a_natural_reply(self):
         diagnostics = {
@@ -345,16 +331,15 @@ class TikTokShowEpisodeResponseGuardTests(unittest.TestCase):
                         context,
                     )
                 )
-        for non_historical_owner_request in (
+        for live_request in (
             "What are people saying in TikTok chat right now?",
             "Is the queue open right now?",
             "What is currently in the BARCODE Radio queue?",
-            "Based only on memory, what recurring themes keep coming up for me?",
         ):
-            with self.subTest(request=non_historical_owner_request):
+            with self.subTest(live_request=live_request):
                 self.assertFalse(
                     bnl01_bot.finalized_show_packet_owner_requested(
-                        non_historical_owner_request,
+                        live_request,
                         context,
                     )
                 )

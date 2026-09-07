@@ -106,7 +106,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
         return moment_id, tuple(sources)
 
     def test_sealed_canary_renders_only_revalidated_aggregate_episode(self):
-        moment_id, sources = self.finalize_shared_moment(
+        _moment_id, sources = self.finalize_shared_moment(
             95,
             (
                 "Let's build the synth routing for the chorus",
@@ -116,7 +116,6 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             users=(1, 2, 3),
             policy="sealed_test",
         )
-        reference_out = {}
         rendered = moments.render_active_episode_canary_context(
             self.conn,
             guild_id=1,
@@ -126,38 +125,10 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             topic_text="How should we continue the synth routing?",
             participant_keys=("discord_user:1",),
             now=self.timestamp(minutes=4),
-            reference_out=reference_out,
         )
         self.assertIn("Active same-channel episode signal", rendered)
         self.assertIn("Shared human participants: 3", rendered)
         self.assertIn("Unresolved open loops:", rendered)
-        self.assertEqual(
-            reference_out["reference"].source_moment_ids,
-            (moment_id,),
-        )
-        question_reference_out = {}
-        question_rendered = moments.render_active_episode_canary_context(
-            self.conn,
-            guild_id=1,
-            channel_id=10,
-            channel_policy="sealed_test",
-            route_mode="normal_chat",
-            topic_text="Is this a separate task, or should we continue?",
-            participant_keys=("discord_user:1",),
-            now=self.timestamp(minutes=4),
-            expected_episode_id=(
-                reference_out["reference"].episode_id
-            ),
-            reference_out=question_reference_out,
-        )
-        self.assertIn(
-            "Active same-channel episode signal",
-            question_rendered,
-        )
-        self.assertEqual(
-            question_reference_out["reference"].source_moment_ids,
-            (moment_id,),
-        )
         for forbidden in (
             "Member 1",
             "Member 2",
@@ -203,69 +174,6 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             ),
             "",
         )
-
-    def test_sealed_canary_expected_episode_rejects_scope_ambiguity(self):
-        self.finalize_shared_moment(
-            105,
-            (
-                "Let's build the synth routing for the chorus",
-                "The synth drum patch needs a bass answer",
-                "Which synth layer should we test next?",
-            ),
-            users=(1, 2, 3),
-            policy="sealed_test",
-        )
-        old_episode_id = self.conn.execute(
-            "SELECT episode_id FROM memory_moment_episodes"
-        ).fetchone()[0]
-        self.finalize_shared_moment(
-            115,
-            (
-                "Pizza dough needs a hotter oven stone",
-                "Pizza sauce works with the dough structure",
-                "The pizza oven should keep the crust crisp",
-            ),
-            minutes=10,
-            policy="sealed_test",
-        )
-        self.conn.execute(
-            """
-            UPDATE memory_moment_episodes
-            SET lifecycle_status='active',finalized_at=NULL,
-                finalization_reason=''
-            WHERE episode_id=?
-            """,
-            (old_episode_id,),
-        )
-        self.assertEqual(
-            self.conn.execute(
-                """
-                SELECT COUNT(*) FROM memory_moment_episodes
-                WHERE guild_id=1 AND channel_id=10
-                  AND channel_policy='sealed_test'
-                  AND route_mode='normal_chat'
-                  AND lifecycle_status='active'
-                """
-            ).fetchone()[0],
-            2,
-        )
-        reference_out = {"reference": object()}
-        self.assertEqual(
-            moments.render_active_episode_canary_context(
-                self.conn,
-                guild_id=1,
-                channel_id=10,
-                channel_policy="sealed_test",
-                route_mode="normal_chat",
-                topic_text="Is this a separate task, or should we continue?",
-                participant_keys=("discord_user:1",),
-                now=self.timestamp(minutes=14),
-                expected_episode_id=old_episode_id,
-                reference_out=reference_out,
-            ),
-            "",
-        )
-        self.assertEqual(reference_out, {})
 
     def test_coherent_moments_extend_one_shared_episode_with_any_participant_count(self):
         first_moment, _ = self.finalize_shared_moment(

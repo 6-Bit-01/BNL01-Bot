@@ -4180,18 +4180,10 @@ def active_episode_for_assessment(
     channel_policy: str,
     route_mode: str,
     topic_text: str,
-    current_turn_text: str | None = None,
     participant_keys: tuple[str, ...] = (),
     now: str | None = None,
-    expected_episode_id: str = "",
 ) -> ActiveEpisodeReference | None:
-    """Select one active episode without creating schema or changing state.
-
-    Keep the resolved episode identity for render/revalidation consistency.
-    ``current_turn_text`` remains a compatible input; episode selection uses
-    the established topic and participant evidence rather than a second
-    natural-language boundary classifier.
-    """
+    """Select one active episode without creating schema or changing state."""
 
     if (
         not shadow_enabled()
@@ -4199,8 +4191,8 @@ def active_episode_for_assessment(
         or not _table_exists(conn, "memory_moment_episodes")
     ):
         return None
-    expected_id = str(expected_episode_id or "").strip()
-    candidate_query = """
+    candidates = conn.execute(
+        """
         SELECT episode_id,guild_id,channel_id,channel_policy,route_mode,
                visibility,topic_family,topic_signature,lifecycle_status,
                opened_at,last_activity_at,open_loop_count,public_usable,
@@ -4208,20 +4200,18 @@ def active_episode_for_assessment(
         FROM memory_moment_episodes
         WHERE guild_id=? AND channel_id=? AND channel_policy=?
           AND route_mode=? AND lifecycle_status='active'
-    """
-    candidate_params: tuple[Any, ...] = (
-        int(guild_id or 0),
-        int(channel_id or 0),
-        str(channel_policy or "unknown"),
-        str(route_mode or "unknown"),
-    )
-    candidate_query += " ORDER BY last_activity_at DESC,episode_id"
-    candidates = conn.execute(candidate_query, candidate_params).fetchall()
+        ORDER BY last_activity_at DESC,episode_id
+        """,
+        (
+            int(guild_id or 0),
+            int(channel_id or 0),
+            str(channel_policy or "unknown"),
+            str(route_mode or "unknown"),
+        ),
+    ).fetchall()
     if len(candidates) != 1:
         return None
     candidate = candidates[0]
-    if expected_id and str(candidate[0]) != expected_id:
-        return None
     if (
         _parse_ts(now or _now())
         - _parse_ts(str(candidate[10] or ""))
@@ -4229,15 +4219,11 @@ def active_episode_for_assessment(
         return None
     signature = _topic_signature(topic_text, "conversation")
     family = _topic_family(topic_text, "conversation")
-    if (
-        not expected_id
-        and signature
-        and not _coherent(
-            family,
-            signature,
-            str(candidate[6] or ""),
-            _load_sig(str(candidate[7] or "[]")),
-        )
+    if signature and not _coherent(
+        family,
+        signature,
+        str(candidate[6] or ""),
+        _load_sig(str(candidate[7] or "[]")),
     ):
         return None
     scoped_participant_keys = tuple(
@@ -4524,8 +4510,6 @@ def render_active_episode_canary_context(
     topic_text: str,
     participant_keys: tuple[str, ...] = (),
     now: str | None = None,
-    expected_episode_id: str = "",
-    reference_out: dict[str, ActiveEpisodeReference] | None = None,
 ) -> str:
     """Render source-revalidated aggregate episode context for sealed testing.
 
@@ -4535,8 +4519,6 @@ def render_active_episode_canary_context(
     participant names, ids, Moment ids, or episode ids.
     """
 
-    if reference_out is not None:
-        reference_out.clear()
     if (
         str(channel_policy or "").strip().lower() != "sealed_test"
         or int(guild_id or 0) <= 0
@@ -4550,10 +4532,8 @@ def render_active_episode_canary_context(
         channel_policy="sealed_test",
         route_mode=str(route_mode or "unknown"),
         topic_text=str(topic_text or "")[:8000],
-        current_turn_text=str(topic_text or "")[:8000],
         participant_keys=participant_keys,
         now=now,
-        expected_episode_id=expected_episode_id,
     )
     if reference is None:
         return ""
@@ -4693,8 +4673,6 @@ def render_active_episode_canary_context(
         if reference.semantic_types
         else "ongoing discussion"
     )
-    if reference_out is not None:
-        reference_out["reference"] = reference
     return (
         "[Active same-channel episode signal; aggregate continuity only, "
         "never quotation or durable-fact authority]\n"

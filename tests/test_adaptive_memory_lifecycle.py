@@ -40,7 +40,7 @@ class AdaptiveMemoryLifecycleTests(unittest.TestCase):
         self.assertLess(cfg["prompt_public"], cfg["prompt_internal"])
         self.assertLess(cfg["prompt_internal"], cfg["prompt_operator"])
 
-    def test_adaptive_limits_expand_without_public_operator_authority(self):
+    def test_adaptive_limits_expand_for_familiar_operator_high_salience(self):
         bnl01_bot.update_relationship_state(42, 1, "remember this project plan matters for next PR", delta_affinity=0.2)
         for _ in range(40):
             bnl01_bot.update_user_habits(42, 1, "Source file project plan follow-up needs memory continuity.")
@@ -49,23 +49,8 @@ class AdaptiveMemoryLifecycleTests(unittest.TestCase):
         )
         self.assertGreater(limits["short"], bnl01_bot.SHORT_MEMORY_LIMIT_BASE)
         self.assertGreater(limits["medium"], bnl01_bot.MEDIUM_MEMORY_LIMIT_BASE)
-        self.assertEqual(limits["prompt_budget"], bnl01_bot.MEMORY_PROMPT_BUDGET_PUBLIC)
-        self.assertEqual(limits["visibility"], "public_safe")
-        self.assertNotIn("operator", limits["reasons"])
-        sealed_limits = bnl01_bot.calculate_adaptive_memory_limits(
-            42, 1, channel_policy="sealed_test",
-            user_text="remember this project plan for next PR", is_owner_or_mod=True,
-        )
-        self.assertEqual(limits["prompt_budget"], sealed_limits["prompt_budget"])
-        self.assertEqual(limits["multiplier"], sealed_limits["multiplier"])
-        self.assertEqual(sealed_limits["visibility"], "public_safe")
-        operator_limits = bnl01_bot.calculate_adaptive_memory_limits(
-            42, 1, channel_policy="internal_controlled",
-            user_text="remember this project plan for next PR", is_owner_or_mod=True,
-        )
-        self.assertEqual(operator_limits["prompt_budget"], bnl01_bot.MEMORY_PROMPT_BUDGET_OPERATOR)
-        self.assertEqual(operator_limits["visibility"], "operator_only")
-        self.assertIn("operator", operator_limits["reasons"])
+        self.assertEqual(limits["prompt_budget"], bnl01_bot.MEMORY_PROMPT_BUDGET_OPERATOR)
+        self.assertIn("operator", limits["reasons"])
 
     def test_low_value_chatter_is_skipped(self):
         bnl01_bot.maybe_add_memory_trace(42, 1, "ok", "public_home", "user", channel_name="general")

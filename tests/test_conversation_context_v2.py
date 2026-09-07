@@ -647,47 +647,8 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertEqual(res.rendered_context, "")
         sealed_public = assemble_conversation_context_v2([row(1,"user","sealed", policy="sealed_test"), row(2,"model","sealed answer", policy="sealed_test")], req(channel_policy="sealed_test", route_mode="normal_chat"))
         self.assertIn("sealed answer", sealed_public.rendered_context)
-        mismatched_room = assemble_conversation_context_v2([row(1,"user","public", policy="public_home"), row(2,"model","public answer", policy="public_home")], req(channel_policy="sealed_test"))
-        self.assertEqual(mismatched_room.rendered_context, "")
-
-    def test_sealed_context_reads_public_history_with_speaker_attribution(self):
-        for policy in ("public_home", "public_context", "public_selective"):
-            for is_batch in (False, True):
-                with self.subTest(policy=policy, is_batch=is_batch):
-                    result = assemble_conversation_context_v2(
-                        [
-                            row(1, "user", "The synth attack needs more time.", channel=20, policy=policy, name="Test Member"),
-                            row(2, "model", "Set the synth attack to 180 milliseconds.", channel=20, policy=policy, name="BNL-01"),
-                        ],
-                        req(
-                            channel_policy="sealed_test",
-                            channel_name="bnl-testing",
-                            current_texts=("Continue from the other channel about the synth attack.",),
-                            is_direct_target=not is_batch,
-                            is_batch=is_batch,
-                        ),
-                    )
-                    self.assertEqual(result.cross_channel_paired_turn_count, 1)
-                    self.assertEqual(result.selected_row_ids, (1, 2))
-                    self.assertIn("180 milliseconds", result.rendered_context)
-                    self.assertIn("BNL-01 (reply to Test Member)", result.rendered_context)
-
-    def test_sealed_and_private_history_cannot_cross_to_public_or_another_sealed_room(self):
-        for source_policy in ("sealed_test", "internal_controlled"):
-            for target_policy in ("public_home", "public_context", "public_selective", "sealed_test"):
-                with self.subTest(source=source_policy, target=target_policy):
-                    result = assemble_conversation_context_v2(
-                        [
-                            row(1, "user", "Keep the private synth setting here.", channel=20, policy=source_policy),
-                            row(2, "model", "The private synth setting is 230 milliseconds.", channel=20, policy=source_policy),
-                        ],
-                        req(
-                            channel_policy=target_policy,
-                            current_texts=("Continue from the other channel about the private synth setting.",),
-                        ),
-                    )
-                    self.assertEqual(result.rendered_context, "")
-                    self.assertEqual(result.selected_row_ids, ())
+        leak = assemble_conversation_context_v2([row(1,"user","public", policy="public_home"), row(2,"model","public answer", policy="public_home")], req(channel_policy="sealed_test"))
+        self.assertEqual(leak.rendered_context, "")
 
     def test_greeting_and_user_zero_get_no_context_and_truth_label_present(self):
         rows=[row(1,"user","ordinary follow up", minutes=2), row(2,"model","ordinary answer", minutes=1)]
@@ -698,7 +659,7 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertIn("do not prove canon", res.rendered_context.lower())
         self.assertIn("queue state", res.rendered_context)
 
-    def test_public_selective_same_room_context_and_route_parity_metadata(self):
+    def test_public_selective_same_channel_only_and_route_parity_metadata(self):
         rows=[row(1,"user","same selective", policy="public_selective"), row(2,"model","same answer", policy="public_selective"), row(3,"user","other selective", channel=20, policy="public_selective"), row(4,"model","other answer", channel=20, policy="public_selective")]
         for flags in [dict(is_direct_target=True), dict(is_reply_to_bnl=True), dict(is_batch=True), dict(is_deferred_payload_session=True)]:
             r=req(channel_policy="public_selective", current_texts=("why same selective?",), **flags)
@@ -993,11 +954,11 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
             res = assemble_conversation_context_v2(rows, req(current_texts=(text,)))
             self.assertEqual(res.cross_channel_paired_turn_count, 0)
 
-    def test_public_selective_continuity_both_directions(self):
+    def test_public_selective_same_channel_only_both_directions(self):
         selective_rows = [row(1,"user","selective source", channel=20, policy="public_selective"), row(2,"model","selective answer", channel=20, policy="public_selective")]
-        self.assertIn("selective answer", assemble_conversation_context_v2(selective_rows, req(channel_policy="public_home", current_texts=("continue from before selective source",))).rendered_context)
+        self.assertEqual(assemble_conversation_context_v2(selective_rows, req(channel_policy="public_home", current_texts=("continue from before selective source",))).rendered_context, "")
         public_rows = [row(1,"user","public source", channel=20, policy="public_home"), row(2,"model","public answer", channel=20, policy="public_home")]
-        self.assertIn("public answer", assemble_conversation_context_v2(public_rows, req(channel_policy="public_selective", current_texts=("continue from before public source",))).rendered_context)
+        self.assertEqual(assemble_conversation_context_v2(public_rows, req(channel_policy="public_selective", current_texts=("continue from before public source",))).rendered_context, "")
 
     def test_unsafe_history_queue_media_and_role_forgery_are_filtered_or_sanitized(self):
         rows = [
@@ -1148,46 +1109,12 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         except OSError:
             pass
 
-    def _insert(self, role, content, uid=1, mid=None, channel=10, policy="public_home", minutes=1, name=None, guild=99):
+    def _insert(self, role, content, uid=1, mid=None, channel=10, policy="public_home", minutes=1, name=None):
         import sqlite3
         ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).replace(microsecond=0).isoformat(sep=" ")
         conn=sqlite3.connect(self.tmp.name)
-        conn.execute("INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,message_id,role,content,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?)", (uid, name or ("member" if role=="user" else "BNL-01"), guild, "home", policy, channel, mid, role, content, ts))
+        conn.execute("INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,message_id,role,content,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?)", (uid, name or ("member" if role=="user" else "BNL-01"), 99, "home", policy, channel, mid, role, content, ts))
         conn.commit(); conn.close()
-
-    def test_public_cross_channel_reads_reach_public_and_sealed_prompts_with_same_guild_boundary(self):
-        public_policies = ("public_home", "public_context", "public_selective")
-        for uid, source_policy in enumerate(public_policies, 1):
-            for role, content in (
-                ("user", "The synth attack needs more time."),
-                ("model", "Set the synth attack to 180 milliseconds."),
-            ):
-                self._insert(role, content, uid=uid, channel=20, policy=source_policy, name="Test Member")
-            for policy in ("sealed_test", "internal_controlled"):
-                self._insert("user", "Keep the private synth setting here.", uid=uid, channel=30, policy=policy)
-                self._insert("model", "Private synth setting 230 milliseconds.", uid=uid, channel=30, policy=policy)
-            self._insert("user", "Synth setting in a different guild.", uid=uid, channel=20, policy=source_policy, guild=100)
-            self._insert("model", "Different guild synth setting 340 milliseconds.", uid=uid, channel=20, policy=source_policy, guild=100)
-
-            for target_policy in public_policies + ("sealed_test",):
-                for is_batch in (False, True):
-                    with self.subTest(source=source_policy, target=target_policy, is_batch=is_batch):
-                        rendered = self.bot.build_conversation_context_v2_for_prompt(
-                            guild_id=99,
-                            current_user_id=uid,
-                            channel_id=10,
-                            channel_name="target-room",
-                            channel_policy=target_policy,
-                            route_mode=self.bot.ROUTE_MODE_NORMAL_CHAT,
-                            current_texts=["Continue from the other channel about the synth attack."],
-                            current_participants={uid},
-                            is_direct_target=not is_batch,
-                            is_batch=is_batch,
-                        )
-                        self.assertIn("180 milliseconds", rendered)
-                        self.assertIn("BNL-01 (reply to Test Member)", rendered)
-                        self.assertNotIn("230 milliseconds", rendered)
-                        self.assertNotIn("340 milliseconds", rendered)
 
     def test_direct_prompt_after_save_has_one_live_request_and_no_legacy_room_stack(self):
         b=self.bot
@@ -1208,23 +1135,6 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         room=self.bot.build_room_first_direct_context(99,10,"home","public_home","member",current_text="current",current_user_id=1,route_mode=self.bot.ROUTE_MODE_NORMAL_CHAT)
         self.assertIn("Recent room context from this channel", room)
         self.assertEqual(self.bot.LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get("selection_fallback_reason"), "rollback_disabled")
-
-    def test_legacy_room_reader_supports_public_selective_and_keeps_sealed_history_local(self):
-        self._insert("user", "Public selective room discussion.", policy="public_selective")
-        self._insert("user", "Sealed room discussion.", policy="sealed_test")
-        self._insert("user", "Private room discussion.", policy="internal_controlled")
-        self._insert("user", "Different sealed room discussion.", policy="sealed_test", channel=30)
-        self._insert("user", "Different guild discussion.", policy="public_selective", guild=100)
-
-        for target in ("public_home", "public_context", "public_selective", "sealed_test"):
-            with self.subTest(target=target):
-                rows = self.bot.get_recent_channel_context(99, 10, channel_name="home", channel_policy=target)
-                contents = [item["content"] for item in rows]
-                self.assertIn("Public selective room discussion.", contents)
-                self.assertEqual("Sealed room discussion." in contents, target == "sealed_test")
-                self.assertNotIn("Private room discussion.", contents)
-                self.assertNotIn("Different sealed room discussion.", contents)
-                self.assertNotIn("Different guild discussion.", contents)
 
     def test_bot_row_fetch_filters_excluded_history(self):
         self._insert("user","media q", mid=1); self._insert("model","provider=tenor host=cdn preview=yes stored visual description missing", mid=2)
@@ -1495,7 +1405,7 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         self.assertEqual(rendered, "")
 
 class ConversationContextV2SealedRegressionTests(unittest.TestCase):
-    def test_sealed_remember_number_prefers_same_room_without_cross_channel_request(self):
+    def test_sealed_remember_number_pair_selected_and_public_does_not_cross(self):
         rows = [
             row(1, "user", "remember this number: 8", policy="sealed_test", channel=10, cname="bnl-testing"),
             row(2, "model", "I tucked 8 into this sealed little corner.", policy="sealed_test", channel=10, cname="bnl-testing"),
