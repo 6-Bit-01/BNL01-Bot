@@ -21,9 +21,8 @@ RESPONSE_CLUSTER_MAX_USER_SPAN_SECONDS = 30
 MAX_RENDERED_CHARS = 2600
 MAX_RENDERED_LINE_CHARS = 360
 FUTURE_SKEW_SECONDS = 0
-PUBLIC_SAFE_POLICIES = {"public_home", "public_context"}
-SAME_CHANNEL_ONLY_PUBLIC_POLICIES = {"public_selective"}
-SAME_CHANNEL_CONTEXT_POLICIES = PUBLIC_SAFE_POLICIES | SAME_CHANNEL_ONLY_PUBLIC_POLICIES | {"sealed_test"}
+PUBLIC_SAFE_POLICIES = {"public_home", "public_context", "public_selective"}
+SAME_CHANNEL_CONTEXT_POLICIES = PUBLIC_SAFE_POLICIES | {"sealed_test"}
 SEALED_POLICIES = {"sealed_test"}
 BLOCKED_PUBLIC_POLICIES = {
     "internal_controlled", "broadcast_memory", "protected_system", "reference_canon",
@@ -348,7 +347,12 @@ def _policy(row: dict) -> str:
     return str(row.get("channel_policy") or "unknown").strip().lower()
 
 def _public_cross_compatible(source: str, target: str) -> bool:
-    return source in PUBLIC_SAFE_POLICIES and target in PUBLIC_SAFE_POLICIES
+    # A sealed conversation can use public history while its own history stays
+    # local. Keep the source policy public; widening the reader is one-way.
+    return (
+        source in PUBLIC_SAFE_POLICIES
+        and target in PUBLIC_SAFE_POLICIES | SEALED_POLICIES
+    )
 
 def route_permits_continuity(route_mode: str, allowed_sources: Iterable[str] = ()) -> bool:
     route = (route_mode or "").strip().lower()
@@ -1469,10 +1473,6 @@ def _unsafe_operational_state_assertion(content: str) -> bool:
     )
 
 def _cross_channel_allowed(pair: dict, req: ConversationContextRequest, current_text: str) -> bool:
-    if req.channel_policy in SAME_CHANNEL_ONLY_PUBLIC_POLICIES:
-        return False
-    if _policy(pair["user"]) in SAME_CHANNEL_ONLY_PUBLIC_POLICIES:
-        return False
     pair_text = (pair["user"].get("content") or "") + " " + (pair["model"].get("content") or "")
     return bool(STRONG_CONTINUATION_RE.search(current_text or "") or _overlap(pair_text, current_text) >= 2)
 

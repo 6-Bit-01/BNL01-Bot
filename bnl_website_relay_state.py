@@ -585,13 +585,17 @@ def select_accepted_relay_publications_on_connection(
     guild_id: int,
     user_text: str,
     limit: int = RELAY_PUBLICATION_RESULT_LIMIT,
+    include_context: bool = False,
 ) -> AcceptedRelayPublicationSelection:
+    """Select accepted public prose, optionally as relevant ordinary context."""
     requested_mode = relay_publication_query_mode(user_text)
     if requested_mode == "not_requested":
-        return AcceptedRelayPublicationSelection(
-            "not_requested",
-            "not_requested",
-        )
+        if not include_context:
+            return AcceptedRelayPublicationSelection(
+                "not_requested",
+                "not_requested",
+            )
+        requested_mode = "context"
     if not _relay_table_exists(conn, "website_relay_history"):
         return AcceptedRelayPublicationSelection(
             "source_unavailable",
@@ -599,7 +603,11 @@ def select_accepted_relay_publications_on_connection(
         )
     identity = _relay_query_identity(user_text)
     date_match = _RELAY_DATE_RE.search(str(user_text or ""))
-    publication_date = date_match.group(1) if date_match else ""
+    publication_date = (
+        date_match.group(1)
+        if date_match and requested_mode != "context"
+        else ""
+    )
     if identity:
         query_mode = "exact_identity"
         rows = _relay_publication_rows(
@@ -618,7 +626,9 @@ def select_accepted_relay_publications_on_connection(
         )
     else:
         query_mode = (
-            "latest" if requested_mode == "latest" else "topic"
+            requested_mode
+            if requested_mode in {"latest", "context"}
+            else "topic"
         )
         rows = _relay_publication_rows(
             conn,
@@ -636,9 +646,12 @@ def select_accepted_relay_publications_on_connection(
                         " ".join(
                             str(row.get(key) or "").lower()
                             for key in (
-                                "public_message",
-                                "public_directive",
-                                "event_type",
+                                ("public_message", "public_directive")
+                                if query_mode == "context"
+                                else (
+                                    "public_message", "public_directive",
+                                    "event_type",
+                                )
                             )
                         ),
                     )
@@ -660,10 +673,15 @@ def select_accepted_relay_publications_on_connection(
                 ),
                 reverse=True,
             )
-            # Lexical overlap is a ranking hint, not an authority gate. The
-            # one governed response model determines relevance from this
-            # bounded window of accepted public Relay evidence.
-            rows = [row for _score, _timestamp, row in scored]
+            # Explicit requests retain their bounded recent evidence window.
+            # Incidental context selects matching prose; acceptance provenance
+            # is still verified before any text is returned.
+            rows = [
+                row for score, _timestamp, row in scored
+                if query_mode != "context" or score > 0
+            ]
+        elif query_mode == "context":
+            rows = []
     candidate_count = len(rows)
     selected: list[AcceptedRelayPublication] = []
     provenance_excluded = 0

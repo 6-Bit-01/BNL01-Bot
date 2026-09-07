@@ -168,11 +168,107 @@ class BlockingSendChannel(FakeChannel):
 
 class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # Sealed conversation now reads public memory through the real reader.
+        # Each coordinator fixture needs the same schema as a running bot.
+        self.db_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.db_directory.cleanup)
+        db_patch = mock.patch.object(
+            bnl01_bot, "DB_FILE",
+            os.path.join(self.db_directory.name, "batch-memory.sqlite3"),
+        )
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        bnl01_bot.init_db()
         self.channel_ids = set()
         self.original_batching_enabled = bnl01_bot.BNL_ACTIVE_BATCHING_ENABLED
         self.original_typing_enabled = bnl01_bot.BNL_TYPING_INDICATOR_ENABLED
         bnl01_bot.BNL_ACTIVE_BATCHING_ENABLED = True
         bnl01_bot.BNL_TYPING_INDICATOR_ENABLED = True
+
+    async def test_sealed_generic_recurrence_with_public_show_context_commits_after_send(
+        self,
+    ):
+        channel = self._channel(8153)
+        request = (
+            "Sealed acceptance fixture: based only on memory, what recurring "
+            "themes keep coming up for me?"
+        )
+        answer = "There is not enough independent recurrence evidence yet."
+        generation_calls = []
+        show_evidence = (
+            "Durable BARCODE Radio show episode memory:\n"
+            "- Public finalized show evidence relevant to this request."
+        )
+        show_context = mock.Mock(return_value=show_evidence)
+        save_model = mock.Mock()
+        record_assessment = mock.AsyncMock()
+
+        async def generate(prompt, **kwargs):
+            generation_calls.append((prompt, kwargs))
+            return answer
+
+        self._prime_flush(channel, request)
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_build_bnl_read_model_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_tiktok_show_evidence_context_for_turn",
+                new=show_context,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "unified_response_assessment_shadow_enabled",
+                return_value=True,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "save_model_message",
+                new=save_model,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=record_assessment,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        show_context.assert_called_once_with(
+            guild_id=channel.guild.id,
+            user_text=request,
+            subject_user_id=100,
+            website_read_model_context="",
+        )
+        self.assertEqual(channel.sent, [answer])
+        self.assertEqual(len(generation_calls), 1)
+        self.assertTrue(generation_calls[0][1]["source_context_available"])
+        self.assertIn(show_evidence, generation_calls[0][0])
+        save_model.assert_called_once()
+        self.assertEqual(save_model.call_args.args[2], answer)
+        self.assertEqual(
+            save_model.call_args.kwargs["channel_policy"],
+            "sealed_test",
+        )
+        record_assessment.assert_awaited_once()
+        self.assertIsNotNone(record_assessment.await_args.args[0])
+        self.assertEqual(
+            record_assessment.await_args.kwargs["response"],
+            answer,
+        )
+        self.assertTrue(
+            record_assessment.await_args.kwargs["response_sent"]
+        )
+
 
     async def asyncTearDown(self):
         for channel_id in self.channel_ids:
@@ -1603,7 +1699,6 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         with (
             self._flush_runtime(channel.id, generate),
             mock.patch.dict(os.environ, canary_env, clear=False),
-            mock.patch.object(bnl01_bot, "DB_FILE", ":memory:"),
             mock.patch.object(
                 bnl01_bot,
                 "apply_guarded_response_regeneration",
@@ -2073,7 +2168,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(
                 bnl01_bot,
                 "prompt_source_basis_failure",
-                side_effect=lambda _bases: next(source_results),
+                side_effect=lambda _bases, **_controls: next(source_results),
             ),
             mock.patch.object(
                 bnl01_bot,
@@ -3203,7 +3298,8 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 "_revalidated_prompt_source_bases": (refreshed_basis,),
             }
 
-        def source_check(bases):
+        def source_check(bases, *, journal_control_snapshot=None, journal_control_snapshot_provided=False):
+            self.assertFalse(journal_control_snapshot_provided)
             checked_bases.append(tuple(bases))
             return "" if tuple(bases) == (refreshed_basis,) else (
                 "memory_source_changed"
