@@ -996,7 +996,8 @@ class PromptSourceRevalidationTests(unittest.IsolatedAsyncioTestCase):
             events.append("quote_await")
             return ""
 
-        def source_check(bases):
+        def source_check(bases, *, journal_control_snapshot=None, journal_control_snapshot_provided=False):
+            self.assertFalse(journal_control_snapshot_provided)
             events.append("source_check")
             self.assertEqual(tuple(bases), (refreshed_basis,))
             return ""

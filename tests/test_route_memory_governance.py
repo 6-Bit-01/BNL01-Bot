@@ -2571,7 +2571,8 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
             "Current user request: he tagged me, not you\n"
         )
 
-        async def fake_regen(channel, correction_prompt, user_id, guild_id, route="get_gemini_response"):
+        async def fake_regen(channel, correction_prompt, user_id, guild_id, route="get_gemini_response", *, allow_style_rewrite=True):
+            self.assertFalse(allow_style_rewrite)
             self.assertIn("literal tag/reply targets", correction_prompt)
             self.assertIn("Mind Fanatic", correction_prompt)
             return "Right—Mind Fanatic tagged you, 6 Bit. I intercepted a conversation that was not addressed to me."
@@ -2614,7 +2615,8 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("source_grounding_after_retry", diagnostics["suppression_reason"])
 
     async def test_mode_leak_substantive_request_regenerates_without_generic_fallback(self):
-        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):
+        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response", *, allow_style_rewrite=True):
+            self.assertFalse(allow_style_rewrite)
             self.assertIn("previous draft exposed internal Source File", prompt)
             self.assertIn("No phrase is disallowed merely because it sounds mechanical", prompt)
             return "Crow, the show note points to a normal BARCODE answer instead of an internal classification."
@@ -2655,7 +2657,8 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
         provider.assert_not_awaited()
 
     async def test_generic_non_answer_to_substantive_request_regenerates(self):
-        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):
+        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response", *, allow_style_rewrite=True):
+            self.assertFalse(allow_style_rewrite)
             self.assertIn("failed to answer the current user message", prompt)
             return "The schedule is uncertain; I can only confirm the public room has no locked broadcast status yet."
 
