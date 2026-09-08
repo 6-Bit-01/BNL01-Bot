@@ -390,8 +390,12 @@ def shadow_enabled(environ: Optional[Dict[str, str]] = None) -> bool:
 def live_enabled(environ: Optional[Dict[str, str]] = None) -> bool:
     return shadow_enabled(environ) and gate_enabled(LIVE_ENV, environ)
 
-def _terms(s: str) -> Set[str]:
+def memory_relevance_terms(s: str) -> Set[str]:
+    """Shared lexical terms for existing member-memory retrieval owners."""
     return {t for t in re.findall(r"[a-z0-9]{3,}", (s or "").lower()) if t not in {"what", "whats", "remember", "memory", "about", "know", "does", "this", "that", "queue"}}
+
+# Preserve the existing governance selector's normalization unchanged.
+_terms = memory_relevance_terms
 
 def _hash(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8")).hexdigest()[:16]
