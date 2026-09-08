@@ -6,7 +6,7 @@ testable, and independent from Discord, SQLite, and Journal implementation code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import os
 import re
@@ -14,6 +14,70 @@ import re
 
 DEFAULT_PRIMARY_MODEL = "gemini-3.6-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash"
+
+
+@dataclass(frozen=True)
+class GeminiImagePart:
+    """One admitted current-message image, kept transient through generation."""
+
+    data: bytes = field(repr=False)
+    mime_type: str
+    source_label: str
+    estimated_tokens: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, bytes) or not self.data:
+            raise ValueError("gemini_image_requires_nonempty_bytes")
+        if not isinstance(self.mime_type, str) or not self.mime_type:
+            raise ValueError("gemini_image_requires_mime_type")
+        if not isinstance(self.source_label, str) or not self.source_label:
+            raise ValueError("gemini_image_requires_source_label")
+        if type(self.estimated_tokens) is not int or self.estimated_tokens < 1:
+            raise ValueError("gemini_image_requires_positive_token_estimate")
+
+
+@dataclass(frozen=True)
+class GeminiImageRequest:
+    """Text and its scoped images; diagnostic text never includes image bytes."""
+
+    text: str
+    images: tuple[GeminiImagePart, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ValueError("gemini_image_request_requires_text")
+        if not isinstance(self.images, tuple) or any(
+            not isinstance(image, GeminiImagePart) for image in self.images
+        ):
+            raise ValueError("gemini_image_request_requires_immutable_image_parts")
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def estimate_gemini_prompt_tokens(
+    contents: str | GeminiImageRequest,
+    *,
+    conservative_utf8: bool = False,
+) -> int:
+    """Apply the existing text estimate and include admitted image token bounds.
+
+    UTF-8 counting is the existing conservative dollar-reservation rule. Daily
+    token reservations use the existing character estimate. Neither path may
+    count a byte representation in place of the actual image token allowance.
+    """
+
+    def text_tokens(value: str) -> int:
+        if conservative_utf8:
+            return max(1, len(value.encode("utf-8")))
+        return max(1, (len(value) + 2) // 3)
+
+    if not isinstance(contents, GeminiImageRequest):
+        return text_tokens(str(contents or ""))
+    return text_tokens(contents.text) + sum(
+        text_tokens(image.source_label) + image.estimated_tokens
+        for image in contents.images
+    )
 
 
 class ProviderFailureKind(str, Enum):
@@ -235,13 +299,16 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
     )
 
 
-def single_attempt_reservation(contents: str, policy: GeminiRoutePolicy) -> int:
-    prompt_tokens = max(1, (len(str(contents or "")) + 2) // 3)
+def single_attempt_reservation(
+    contents: str | GeminiImageRequest,
+    policy: GeminiRoutePolicy,
+) -> int:
+    prompt_tokens = estimate_gemini_prompt_tokens(contents)
     return prompt_tokens + int(policy.max_output_tokens)
 
 
 def estimated_generation_reservation(
-    contents: str,
+    contents: str | GeminiImageRequest,
     policy: GeminiRoutePolicy,
 ) -> int:
     model_count = 2 if policy.allow_fallback else 1
