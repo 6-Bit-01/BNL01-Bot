@@ -1045,5 +1045,96 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "memory_source_changed")
 
 
+    async def test_personal_show_memory_composes_with_member_memory_in_direct_prompt(self):
+        show_context = (
+            "Durable BARCODE Radio show episode memory:\n"
+            "Attributed public TikTok/Discord evidence:\n"
+            "- Test Member asked BNL about the Copper Kite instrumental.\n"
+        )
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy), mock.patch.object(
+                bnl01_bot, "build_tiktok_show_evidence_context_for_turn",
+                return_value=show_context,
+            ), mock.patch.object(
+                bnl01_bot, "build_shared_brain_synthesis_basis",
+                wraps=bnl01_bot.build_shared_brain_synthesis_basis,
+            ) as synthesis:
+                prompt, metadata = self._direct_prompt(
+                    policy, request="What do you remember about me?",
+                )
+                self.assertIn(PUBLIC_MEMORY, prompt)
+                self.assertIn(show_context, prompt)
+                self.assertNotIn("Finalized BARCODE Radio episode priority:", prompt)
+                self.assertTrue(metadata["source_context_available"])
+                contexts = synthesis.call_args.kwargs["competing_factual_contexts"]
+                self.assertTrue(any(PUBLIC_MEMORY in value for value in contexts))
+                self.assertTrue(any(show_context in value for value in contexts))
+
+    async def _assert_personal_show_memory_batch_composition(self, policy):
+        show_context = (
+            "Durable BARCODE Radio show episode memory:\n"
+            "Attributed public TikTok/Discord evidence:\n"
+            "- Test Member asked BNL about the Copper Kite instrumental.\n"
+        )
+        answer = "Test Member shared the Copper Kite instrumental and asked about it during the show."
+        with mock.patch.object(
+            bnl01_bot, "build_tiktok_show_evidence_context_for_turn",
+            return_value=show_context,
+        ), mock.patch.object(
+            bnl01_bot, "build_shared_brain_synthesis_basis",
+            wraps=bnl01_bot.build_shared_brain_synthesis_basis,
+        ) as synthesis:
+            # The sealed legacy broad-recall shortcut is a distinct owner;
+            # this targeted wording enters its existing normal batch route.
+            request = (
+                "BNL, what do you remember me telling you about the Copper Kite instrumental?"
+                if policy == "sealed_test"
+                else "BNL, what do you remember about me?"
+            )
+            channel, generation, _guard = await self._batch(
+                policy, request=request, answer=answer,
+            )
+            prompt = generation.call_args.args[0]
+            self.assertIn(PUBLIC_MEMORY, prompt)
+            self.assertIn(show_context, prompt)
+            self.assertNotIn("Finalized BARCODE Radio episode priority:", prompt)
+            synthesis.assert_called_once()
+            contexts = synthesis.call_args.kwargs["competing_factual_contexts"]
+            self.assertTrue(any(PUBLIC_MEMORY in value for value in contexts))
+            self.assertTrue(any(show_context in value for value in contexts))
+            self.assertEqual(generation.await_count, 1)
+            self.assertEqual(channel.sent, [answer])
+            with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM conversations WHERE role='model' AND content=?",
+                    (answer,),
+                ).fetchone()[0], 1)
+
+    async def test_personal_show_memory_composes_in_public_batch(self):
+        await self._assert_personal_show_memory_batch_composition("public_home")
+
+    async def test_personal_show_memory_composes_in_sealed_batch(self):
+        await self._assert_personal_show_memory_batch_composition("sealed_test")
+
+    async def test_explicit_show_request_retains_show_priority_in_direct_and_batch(self):
+        show_context = (
+            "Durable BARCODE Radio show episode memory:\n"
+            "Attributed public TikTok/Discord evidence:\n"
+            "- Test Member asked BNL about the Copper Kite instrumental.\n"
+        )
+        request = "What happened during the last show?"
+        with mock.patch.object(
+            bnl01_bot, "build_tiktok_show_evidence_context_for_turn", return_value=show_context,
+        ):
+            prompt, _metadata = self._direct_prompt("sealed_test", request=request)
+            self.assertIn("Finalized BARCODE Radio episode priority:", prompt)
+            channel, generation, _guard = await self._batch(
+                "sealed_test", request=request,
+                answer="Test Member asked BNL about the Copper Kite instrumental.",
+            )
+            self.assertIn("Finalized BARCODE Radio episode priority:", generation.call_args.args[0])
+            self.assertEqual(generation.await_count, 1)
+            self.assertEqual(len(channel.sent), 1)
+
 if __name__ == "__main__":
     unittest.main()

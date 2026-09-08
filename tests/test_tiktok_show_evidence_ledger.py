@@ -1354,6 +1354,110 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             )
             self.assertEqual(wrong_episode, "")
 
+    def test_requester_show_recall_keeps_own_evidence_in_both_views(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=authorized_read_model({
+                    "currentShow": None,
+                    "latestShow": archived_show(),
+                    "shows": [],
+                }),
+                artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
+            )
+            query = "What did I ask BNL during the live?"
+            rendered = build_tiktok_show_evidence_context(
+                db_file, guild_id=77, user_text=query, subject_user_id=42,
+            )
+            with sqlite3.connect(db_file) as conn:
+                items = select_tiktok_show_episode_context_items(
+                    conn, guild_id=77, user_text=query, subject_user_id=42,
+                    now="2026-08-29T12:00:00-07:00",
+                )
+            dialogue = next(item for item in items if item.kind == "dialogue")
+            for evidence in (rendered, dialogue.text):
+                self.assertIn("Did the Wheel put Queue Light up next, BNL?", evidence)
+                self.assertNotIn("BNL, did the sponsor break finish?", evidence)
+                self.assertNotIn("This private row", evidence)
+            self.assertEqual(dialogue.subject_key, "discord_user:42")
+            self.assertFalse(any(item.kind == "community" for item in items))
+            self.assertIn("BNL replied", rendered)
+
+    def test_absent_requester_does_not_inherit_other_show_participants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=authorized_read_model({
+                    "currentShow": None,
+                    "latestShow": archived_show(),
+                    "shows": [],
+                }),
+                artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
+            )
+            for query in (
+                "What did I ask BNL during the live?",
+                "What topics came up in my messages during the show?",
+            ):
+                with self.subTest(query=query):
+                    self.assertEqual(build_tiktok_show_evidence_context(
+                        db_file, guild_id=77, user_text=query,
+                        subject_user_id=999,
+                    ), "")
+                    with sqlite3.connect(db_file) as conn:
+                        self.assertEqual(select_tiktok_show_episode_context_items(
+                            conn, guild_id=77, user_text=query,
+                            subject_user_id=999,
+                            now="2026-08-29T12:00:00-07:00",
+                        ), ())
+
+    def test_personal_show_topics_and_room_recap_keep_distinct_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=authorized_read_model({
+                    "currentShow": None,
+                    "latestShow": archived_show(),
+                    "shows": [],
+                }),
+                artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
+            )
+            personal_query = "What topics came up in my messages during the show?"
+            room_query = "What recurring topics came up throughout the show?"
+            personal = build_tiktok_show_evidence_context(
+                db_file, guild_id=77, user_text=personal_query,
+                subject_user_id=42,
+            )
+            room = build_tiktok_show_evidence_context(
+                db_file, guild_id=77, user_text=room_query,
+                subject_user_id=42,
+            )
+            self.assertIn("Did the Wheel put Queue Light up next, BNL?", personal)
+            self.assertNotIn('"green visuals": 3 messages / 3 participants', personal)
+            self.assertIn('"green visuals": 3 messages / 3 participants', room)
+            with sqlite3.connect(db_file) as conn:
+                personal_items = select_tiktok_show_episode_context_items(
+                    conn, guild_id=77, user_text=personal_query,
+                    subject_user_id=42, now="2026-08-29T12:00:00-07:00",
+                )
+                room_items = select_tiktok_show_episode_context_items(
+                    conn, guild_id=77, user_text=room_query,
+                    subject_user_id=42, now="2026-08-29T12:00:00-07:00",
+                )
+            self.assertFalse(any(item.kind == "community" for item in personal_items))
+            self.assertTrue(any(item.kind == "community" for item in room_items))
+
     def test_selector_preserves_show_authority_and_explicit_continuity(self):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "bnl.db")
