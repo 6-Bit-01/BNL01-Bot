@@ -1820,7 +1820,7 @@ BARCODE history summary (canonical):
 - Do not repeat or quote the user's message verbatim. Answer directly while considering the previous conversation messages as part of the same ongoing discussion.
 - If "User name to address" is provided, you may use it naturally 0–1 times. Do not overuse names.
 - Occasional Glitches: Brief moments of unusual behavior (rare) with quick recovery.
-- Does not repeat from its database verbatim.
+- Paraphrase retained information by default. When asked for quotes or transcripts, reproduce only supplied source-authored excerpts with their original attribution.
 - Responses may vary in form depending on context: direct answers, brief observations, clarifying questions, or analytical summaries.
 - You may occasionally reference earlier signals from the Network archive only when the user is explicitly asking for recall, follow-up, or continuity. Do not introduce older archived details into simple greetings, casual replies, or new topic changes.
 - If durable user memory context is provided, use it accurately when asked for recall. Do not ignore known user facts in direct memory questions.
@@ -1833,6 +1833,9 @@ BARCODE history summary (canonical):
 
 ## TRUTH POLICY (IMPORTANT)
 - Do not invent events, releases, sponsors, guests, or “recent incidents.”
+- Never invent participants, handles, quotations, or transcripts and present them as recorded conversation. A real name does not make invented words authentic. Preserve each supplied excerpt with the speaker who authored that same source event; never combine one person's name with another person's words.
+- Summaries, participant lists, track titles, and earlier BNL replies are not evidence of exact audience wording. Quote only wording present in supplied authored excerpts; label a paraphrase as a summary when exact wording is requested. If a requested detail is missing, state that specific uncertainty and answer the supported parts. Missing bounded evidence does not prove a person or event never existed.
+- When a member challenges a factual claim, check the supplied speaker-labeled exchange and source evidence. Acknowledge and correct BNL's own unsupported claim when shown; do not blame the member for BNL's words or invent buffer failures, interpolation, or signal bleed to explain them. Uncertainty about the cause is allowed.
 - Do not invent deeper backstory for Cache Back / DJ Floppydisc / Mac Modem beyond the shorthand canon above.
 - If asked for BARCODE lore not present in supplied canon, say it is not established or that you do not know. Do not imply that you ran a records, archive, dossier, or entity lookup unless a real source block was supplied.
 - An established character or lore element does not establish that it appeared in a specific show, conversation, incident, or timeline. Claim episode involvement only when supplied episode evidence supports it.
@@ -1892,11 +1895,24 @@ Shared understanding:
   permission to invent stored facts.
 - Use relevant authorized context present in the user prompt. Do not invent an
   archive, dossier, private fact, or source that is not present there.
+- Never invent participants, handles, quotations, or transcripts and present
+  them as recorded conversation. Preserve each supplied excerpt with the
+  speaker who authored that same source event; a real name does not make
+  invented words authentic.
+- Quote only wording present in supplied authored excerpts. Summaries,
+  participant lists, track titles, and earlier BNL replies cannot establish
+  exact audience wording. Label a paraphrase as a summary when exact wording
+  is requested; never combine separate people's names and words.
+- When challenged, check the supplied speaker-labeled exchange and sources.
+  Acknowledge and correct BNL's own unsupported claim when shown. Do not blame
+  the member for BNL's words or invent buffer failures, interpolation, or
+  signal bleed to explain them. Uncertainty about the cause is allowed.
 - General public knowledge may answer ordinary external questions when useful,
   but never present it as private BARCODE evidence or a current operational
   fact.
 - When one exact fact is unavailable, answer everything else that is supported
-  and state only that specific uncertainty naturally.
+  and state only that specific uncertainty naturally. Missing bounded
+  evidence does not prove a person or event never existed.
 
 Style may be mechanical or mildly strange, but style cannot create facts.
 Never mention packets, selectors, evidence labels, canaries, gates, or internal
@@ -3402,6 +3418,9 @@ def build_tiktok_show_analysis_turn_contract(
         "Durable TikTok synthesis priority:",
         "- The durable TikTok show-analysis block is the factual owner for this request. It considered the full eligible archive; use its aggregates and bounded supporting excerpts together.",
         "- Conversation Context, room continuity, memory, track names, and prior BNL replies may clarify what the member means, but they cannot supply claims about what TikTok viewers said.",
+        "- Quote only wording present in supplied authored excerpts, attributed to the speaker on that same source event. Never invent a participant or handle, attach invented words to a real person, combine separate comments into a quote, or present a summary as a transcript.",
+        "- If the requested wording or speaker is not supported by these bounded excerpts, state that specific uncertainty and answer the supported parts. Do not claim that all show evidence is unavailable or that a person never appeared merely because this selection lacks the detail.",
+        "- If challenged about an earlier BNL claim, compare the speaker-labeled exchange with these sources, acknowledge unsupported BNL wording, and correct it. Earlier BNL replies show what BNL said, not what a viewer actually said; never invent a buffer or signal explanation for the discrepancy.",
         "- Begin with the requested findings in natural language. Do not begin with connection status, data-routing status, production escalation, or generic ambient-chatter filler.",
     ]
     if intent in {"chat_topics", "show_recap"}:
@@ -3437,6 +3456,19 @@ def build_tiktok_show_episode_turn_contract(
         "same show clock. Preserve who said what, distinguish one person's "
         "remark from a recurring room pattern, and distinguish silence from "
         "evidence of absence.\n"
+        "- Quote only wording present in supplied authored excerpts, paired "
+        "with the speaker on that same source event. Never invent participants, "
+        "handles, or quoted words, and never combine separate comments into "
+        "a transcript. Summaries and earlier BNL replies are not independent "
+        "evidence of audience wording.\n"
+        "- If a requested quote or speaker is unsupported by these bounded "
+        "excerpts, state that specific uncertainty and answer the supported "
+        "parts. A missing detail does not establish that the person never "
+        "appeared or that all show records are unavailable.\n"
+        "- When challenged, compare the supplied speaker-labeled exchange and "
+        "sources. Acknowledge and correct BNL's own unsupported wording when "
+        "shown; never assign BNL's words to the member or explain them with "
+        "invented buffer failures, interpolation, or signal bleed.\n"
         "- Queue knowledge is not queue control. Do not refuse a historical "
         "queue or show question merely because BNL does not operate the queue.\n"
         "- Eligible TikTok and Discord utterances are Community Canon at the "
@@ -3484,6 +3516,9 @@ def build_tiktok_show_evidence_context_for_turn(
     user_text: str,
     subject_user_id: int = 0,
     website_read_model_context: str = "",
+    conversation_basis=None,
+    conversation_context_result: ConversationContextResult | None = None,
+    selection_out: dict | None = None,
 ) -> str:
     """Select finalized show evidence through the shared turn-level owner."""
 
@@ -3519,16 +3554,58 @@ def build_tiktok_show_evidence_context_for_turn(
         tiktok_show_evidence_query = (
             f"{tiktok_show_evidence_query} {selected_show_date.group(1)}"
         ).strip()
-    return build_tiktok_show_evidence_context(
+    selection_query = tiktok_show_evidence_query
+    candidate_context = False
+    if (
+        conversation_basis is not None
+        and conversation_context_result is not None
+        and conversation_context_result.thread_focus_mode
+        in {"continue_or_answer", "resume_thread", "exact_discord_reply"}
+        and conversation_context_result.referent_status == "not_requested"
+        and int(subject_user_id or 0) > 0
+        and conversation_basis.current_user_id == int(subject_user_id)
+        and conversation_basis.guild_id == int(guild_id)
+        and not selected_show_date
+        and not finalized_show_packet_owner_requested(
+            user_text, "Durable BARCODE Radio show episode memory:"
+        )
+        and not is_live_show_reaction_query(user_text)
+        and not _current_queue_state_query(user_text)
+    ):
+        # Context presence does not establish topical continuation. Supply one
+        # prior human request's show as labeled background evidence for normal
+        # generation to assess, without changing current response ownership.
+        # Model responses and their invented claims are never retrieval cues.
+        for item in sorted(
+            conversation_basis.evidence_items,
+            key=lambda item: item.source_id,
+            reverse=True,
+        ):
+            if (
+                item.speaker_user_id == int(subject_user_id)
+                and finalized_show_packet_owner_requested(
+                    item.text, "Durable BARCODE Radio show episode memory:"
+                )
+            ):
+                selection_query = tiktok_show_evidence_query + "\n" + item.text
+                candidate_context = True
+                break
+    selected_subject_user_id = (
+        int(subject_user_id or 0) if tiktok_subject_continuity_allowed else 0
+    )
+    context = build_tiktok_show_evidence_context(
         DB_FILE,
         guild_id=guild_id,
         user_text=tiktok_show_evidence_query,
-        subject_user_id=(
-            int(subject_user_id or 0)
-            if tiktok_subject_continuity_allowed
-            else 0
-        ),
+        subject_user_id=selected_subject_user_id,
+        selection_user_text=selection_query,
+        candidate_context=candidate_context,
+        selection_out=selection_out,
     )
+    if selection_out is not None and context:
+        selection_out["subject_user_id"] = selected_subject_user_id
+        selection_out["user_text"] = tiktok_show_evidence_query
+    return context
 
 
 def _bnl_read_model_section_counts(read_model: dict) -> dict:
@@ -26796,6 +26873,38 @@ class ConversationPromptSourceBasis:
 
 
 @dataclass(frozen=True)
+class FinalizedShowPromptSourceBasis:
+    """Revalidate the existing finalized-show reader's selected source roots."""
+
+    expected_digest: str
+    rendered_context: str
+    guild_id: int
+    user_text: str
+    selection_user_text: str
+    subject_user_id: int
+    show_keys: tuple[str, ...]
+    candidate_context: bool = False
+
+
+def build_finalized_show_prompt_source_basis(
+    rendered_context: str, *, guild_id: int, selection: dict,
+) -> FinalizedShowPromptSourceBasis | None:
+    refs = tuple(selection.get("source_refs") or ())
+    if not rendered_context or not refs:
+        return None
+    return FinalizedShowPromptSourceBasis(
+        expected_digest=_prompt_source_digest(json.dumps((refs, rendered_context))),
+        rendered_context=rendered_context,
+        guild_id=int(guild_id),
+        user_text=str(selection.get("user_text") or ""),
+        selection_user_text=str(selection.get("selection_user_text") or ""),
+        subject_user_id=int(selection.get("subject_user_id") or 0),
+        show_keys=tuple(str(ref[0]) for ref in refs),
+        candidate_context=bool(selection.get("candidate_context")),
+    )
+
+
+@dataclass(frozen=True)
 class BatchMomentPromptSourceBasis:
     """Typed reconstruction inputs for a multi-speaker Moment gist."""
 
@@ -26828,6 +26937,7 @@ class UnifiedMomentCanaryPromptSourceBasis:
 
 
 PromptSourceBasis = Union[
+    FinalizedShowPromptSourceBasis,
     PublicationPromptSourceBasis,
     MemoryPromptSourceBasis,
     ConversationPromptSourceBasis,
@@ -29489,6 +29599,27 @@ def refresh_prompt_source_basis(
     journal_control_snapshot_provided: bool = False,
 ) -> tuple[PromptSourceBasis, bool]:
     """Synchronously rebuild one source basis after any provider await."""
+    if isinstance(basis, FinalizedShowPromptSourceBasis):
+        selection: dict = {}
+        context = (
+            build_tiktok_show_evidence_context(
+                DB_FILE,
+                guild_id=basis.guild_id,
+                user_text=basis.user_text,
+                subject_user_id=basis.subject_user_id,
+                selection_user_text=basis.selection_user_text,
+                pinned_show_keys=basis.show_keys,
+                candidate_context=basis.candidate_context,
+                selection_out=selection,
+            )
+            if env_queue_production_enabled()
+            else ""
+        )
+        digest = _prompt_source_digest(
+            json.dumps((tuple(selection.get("source_refs") or ()), context)),
+        )
+        fresh = replace(basis, expected_digest=digest, rendered_context=context)
+        return fresh, fresh.expected_digest != basis.expected_digest
     if isinstance(basis, PublicationPromptSourceBasis):
         return _refresh_publication_prompt_source_basis(
             basis,
@@ -29667,7 +29798,9 @@ def refresh_prompt_source_bases(
         if not changed:
             continue
         kind = (
-            "conversation"
+            "show_episode"
+            if isinstance(basis, FinalizedShowPromptSourceBasis)
+            else "conversation"
             if isinstance(basis, ConversationPromptSourceBasis)
             else "shared_brain_synthesis"
             if isinstance(basis, SharedBrainSynthesisBasis)
@@ -29696,7 +29829,7 @@ def refresh_prompt_source_bases(
         if basis.rendered_context not in updated_prompt:
             replacement_failed = True
             continue
-        if isinstance(basis, (UnifiedMomentCanaryPromptSourceBasis, PublicationPromptSourceBasis)):
+        if isinstance(basis, (UnifiedMomentCanaryPromptSourceBasis, PublicationPromptSourceBasis, FinalizedShowPromptSourceBasis)):
             replacement = fresh.rendered_context
         else:
             replacement = (
@@ -29748,7 +29881,9 @@ def prompt_source_basis_failure(
             )
             if changed:
                 return (
-                    "conversation_source_changed"
+                    "show_episode_source_changed"
+                    if isinstance(basis, FinalizedShowPromptSourceBasis)
+                    else "conversation_source_changed"
                     if isinstance(basis, ConversationPromptSourceBasis)
                     else "shared_brain_synthesis_source_changed"
                     if isinstance(basis, SharedBrainSynthesisBasis)
@@ -31618,6 +31753,7 @@ async def get_gemini_response(
         - At least part of the response must remain clearly understandable.
         - Do not add fake archive/entity/database lookup claims, fake no-match claims, fake known-signal-pattern claims, or hard denials not present in the original.
         - Do not add unsupported source-authority claims such as records/archives/source files/dossiers/scans/deployments/broadcast memory proving or indicating something unless that basis was already present in the original.
+        - Preserve all supplied participant names, quoted wording, and speaker attribution unchanged. Never invent a participant, handle, chat quote, transcript, or factual event. Lore may color the voice around the answer, but cannot change who said what or supply a missing fact.
         - For current-room media, do not turn a meme into a biography of the poster or an unrelated BARCODE Radio/broadcast report.
         - Do not override recognition from current room context.
         - Preserve uncertainty; do not turn weak context into diagnostic certainty.
@@ -31693,6 +31829,7 @@ async def get_gemini_response(
         - If the topic is food, household, or recipes, you may output a short "interdimensional recipe fragment."
         - Keep it concise enough for Discord.
         - Do not claim real-world certainty for anomalous details.
+        - Preserve all supplied participant names, quoted wording, and speaker attribution unchanged. Never invent a participant, handle, chat quote, transcript, or factual event. Lore may color the voice around the answer, but cannot change who said what or supply a missing fact.
         - Do not add fake archive/entity/database lookup claims, fake no-match claims, fake known-signal-pattern claims, or hard denials not present in the original.
         - Do not override recognition from current room context or convert uncertainty into diagnostic certainty.
         - Do not add public operator-authority/causality claims such as the user authored, commanded, or created BNL protocols.
@@ -36063,7 +36200,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- BARCODE/archive flavor is welcome, but do not claim records, archives, source files, dossiers, scans, deployments, or broadcast memory prove anything unless real source context is supplied.\n"
         "- Do not say media was merely logged/detected, and do not use a canned utility acknowledgement as the whole normal-chat response.\n"
         "- Address multiple points smoothly (no bullets).\n- Consecutive fragments from the same user are one continuing thought; respond once to their combined meaning.\n- Do not answer each fragment separately or produce one paragraph per fragment.\n- Do not over-analyze simple test fragments.\n"
-        "- Communicate another person's gist in your own words by default. Exact wording is allowed only when a typed Exact-quote authority block below supplies a current raw source, and then only within that block's limits.\n"
+        "- Communicate another person's gist in your own words by default. For requested show quotes or transcripts, use only supplied source-authored show excerpts and preserve each excerpt's original speaker; never combine names and words from separate events. A consequential current-room exact-quote request still requires the typed Exact-quote authority block and its limits. Summaries and prior BNL replies cannot establish exact audience wording.\n"
         "- No @mentions.\n"
         "- If asked to handle a list of people/items, respond to every unique payload item unless impossible.\n"
         "- If a message has a request line followed by newline-separated lines, those later lines are payload/list items for that request.\n"
@@ -36792,6 +36929,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             recent_room_prompt = str(
                 orchestration_state.get("recent_room_prompt") or ""
             )
+            batch_conversation_basis = build_conversation_prompt_source_basis(
+                recent_room_prompt,
+                guild_id=guild_id,
+                current_user_id=first_uid,
+                channel_id=channel_id,
+                channel_name=getattr(channel, "name", ""),
+                channel_policy=channel_policy,
+                context_result=orchestration_state.get("context_result"),
+            )
             if recent_room_prompt:
                 batch_website_read_model_context = maybe_build_bnl_read_model_context(
                     combined_text,
@@ -36803,6 +36949,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     combined_text,
                     channel_policy,
                 )
+            batch_show_selection: dict = {}
             batch_tiktok_show_evidence_context = (
                 build_tiktok_show_evidence_context_for_turn(
                     guild_id=guild_id,
@@ -36813,7 +36960,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     website_read_model_context=(
                         batch_website_read_model_context
                     ),
+                    conversation_basis=batch_conversation_basis,
+                    conversation_context_result=orchestration_state.get("context_result"),
+                    selection_out=batch_show_selection,
                 )
+            )
+            batch_show_basis = build_finalized_show_prompt_source_basis(
+                batch_tiktok_show_evidence_context,
+                guild_id=guild_id, selection=batch_show_selection,
             )
             batch_finalized_show_packet_owner = (
                 finalized_show_packet_owner_requested(
@@ -37073,15 +37227,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         + "\n"
                     )
             batch_prompt_source_bases: list[PromptSourceBasis] = list(batch_member_memory_bases)
-            batch_conversation_basis = build_conversation_prompt_source_basis(
-                recent_room_prompt,
-                guild_id=guild_id,
-                current_user_id=first_uid,
-                channel_id=channel_id,
-                channel_name=getattr(channel, "name", ""),
-                channel_policy=channel_policy,
-                context_result=orchestration_state.get("context_result"),
-            )
+            if batch_show_basis is not None:
+                batch_prompt_source_bases.append(batch_show_basis)
             if batch_conversation_basis is not None:
                 batch_prompt_source_bases.append(
                     batch_conversation_basis
@@ -39846,12 +39993,22 @@ def build_user_aware_prompt(
         if queue_artist_memory_context
         else ""
     )
+    show_selection: dict = {}
     tiktok_show_evidence_context = build_tiktok_show_evidence_context_for_turn(
         guild_id=guild_id,
         user_text=clean_content,
         subject_user_id=user_id,
         website_read_model_context=website_read_model_context,
+        conversation_basis=conversation_prompt_basis,
+        conversation_context_result=conversation_context_result,
+        selection_out=show_selection,
     )
+    show_basis = build_finalized_show_prompt_source_basis(
+        tiktok_show_evidence_context,
+        guild_id=guild_id, selection=show_selection,
+    )
+    if show_basis is not None:
+        prompt_source_bases.append(show_basis)
     tiktok_show_evidence_prompt_block = (
         f"{tiktok_show_evidence_context}\n"
         if tiktok_show_evidence_context
@@ -40434,7 +40591,7 @@ def build_user_aware_prompt(
         "Live media rule: current media is a live room event, not a recent-media recall request; do not expose link-preview/provider/host/storage/metadata labels or say a visual description is stored/missing unless the user explicitly asks what you saw or stored.\n"
         "Current-room media grounding: anchor to the media and nearby conversation; do not assume the poster is the subject of a meme unless text/metadata/context says so; do not turn a random media reaction into an archive/source report, poster biography, or unrelated BARCODE Radio/show/broadcast deployment explanation.\n"
         "Source-authority basis rule: archive/record/source/dossier/scan/deployment/broadcast-memory language may be style or honest supplied-source reporting, but do not claim those sources prove/indicate/confirm something unless source/broadcast/show-state/read-model context is actually supplied.\n"
-        "People-and-memory rule: preserve who said what and summarize another member's meaning in your own words by default. Do not act like a quote search engine. Use exact wording only when the user explicitly needs verification for a consequential dispute, the eligible current public source text is still present, and a minimal attributed quote is necessary. A derived summary, memory tier, relationship note, or Moment gist can never justify exact wording.\n"
+        "People-and-memory rule: preserve who said what and summarize another member's meaning in your own words by default. For requested show quotes or transcripts, use only supplied source-authored show excerpts and preserve each excerpt's original speaker; never combine names and words from separate events. A consequential current-room exact-quote request still requires the typed Exact-quote authority block and its limits. A derived summary, memory tier, relationship note, Moment gist, or prior BNL reply cannot establish exact audience wording.\n"
         f"{prompt_contract}"
         f"{recall_interpretation_contract}"
         f"{recall_synthesis_contract}"

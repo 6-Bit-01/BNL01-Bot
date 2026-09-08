@@ -248,6 +248,9 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             user_text=request,
             subject_user_id=100,
             website_read_model_context="",
+            conversation_basis=None,
+            conversation_context_result=None,
+            selection_out={},
         )
         self.assertEqual(channel.sent, [answer])
         self.assertEqual(len(generation_calls), 1)
@@ -750,13 +753,18 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             prompt,
         )
         self.assertIn(
-            "Use exact wording only when the user explicitly needs verification "
-            "for a consequential dispute",
+            "use only supplied source-authored show excerpts and preserve each "
+            "excerpt's original speaker; never combine names and words from separate events",
             prompt,
         )
         self.assertIn(
-            "A derived summary, memory tier, relationship note, or Moment gist "
-            "can never justify exact wording",
+            "A consequential current-room exact-quote request still requires "
+            "the typed Exact-quote authority block and its limits",
+            prompt,
+        )
+        self.assertIn(
+            "A derived summary, memory tier, relationship note, Moment gist, "
+            "or prior BNL reply cannot establish exact audience wording",
             prompt,
         )
 
@@ -1593,6 +1601,9 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             guild_id=channel.guild.id,
             user_text=request,
             subject_user_id=0,
+            selection_user_text=request,
+            candidate_context=False,
+            selection_out={"subject_user_id": 0, "user_text": request},
         )
         self.assertEqual(len(assessment_calls), 1)
         self.assertIn(

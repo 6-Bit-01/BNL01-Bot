@@ -25,6 +25,7 @@ import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_website_relay_state
 import test_publication_read_adapters as publication_fixtures
+import test_tiktok_show_evidence_ledger as show_fixtures
 from test_conversation_batching import FakeChannel, FakeGuild, FakeMessage
 
 
@@ -38,6 +39,7 @@ QUEUE_REQUEST = (
 QUEUE_CONTEXT = "Current public queue information: submissions are open."
 JOURNAL_BODY = "The Copper Kite instrumental brought the room together."
 RELAY_BODY = "The Copper Kite instrumental sparked a public listening exchange."
+REAL_SHOW_CONTEXT_FOR_TURN = bnl01_bot.build_tiktok_show_evidence_context_for_turn
 
 
 class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
@@ -223,6 +225,83 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(PUBLIC_MEMORY, prompt)
         self.assertNotIn(INTERNAL_MEMORY, prompt)
         self.assertNotIn(SEALED_MEMORY, prompt)
+
+    def _seed_finalized_show(self):
+        fixture = show_fixtures.TikTokShowEvidenceLedgerTests()
+        fixture.seed_source_and_memory(bnl01_bot.DB_FILE)
+        result = show_fixtures.sync_tiktok_show_evidence_ledgers(
+            bnl01_bot.DB_FILE, guild_id=77,
+            read_model=show_fixtures.authorized_read_model({
+                "currentShow": None, "latestShow": show_fixtures.archived_show(),
+                "shows": [],
+            }),
+            artist_identity_index=show_fixtures.artist_index(),
+            environ=show_fixtures.ENABLED_QUEUE_ENV,
+        )
+        self.assertEqual(result["showsFinalized"], 1)
+        self.guild_id = 77
+        self.user_id = 42
+        self.stack.enter_context(mock.patch.dict(os.environ, show_fixtures.ENABLED_QUEUE_ENV))
+        self.stack.enter_context(mock.patch.object(
+            bnl01_bot, "build_tiktok_show_evidence_context_for_turn",
+            side_effect=REAL_SHOW_CONTEXT_FOR_TURN,
+        ))
+
+    def _assert_show_source(self, prompt, bases):
+        selected = tuple(b for b in bases if isinstance(b, bnl01_bot.FinalizedShowPromptSourceBasis))
+        self.assertEqual(len(selected), 1)
+        self.assertIn("Source-linked authored examples:", prompt)
+        self.assertIn("the green visuals during this song are wild.", prompt)
+        self.assertNotIn("This private row must never enter", prompt)
+        self.assertEqual(bnl01_bot.prompt_source_basis_failure(selected), "")
+        return selected
+
+    async def test_finalized_show_authored_sources_reach_real_direct_and_batch_assembly(self):
+        self._seed_finalized_show()
+        request = "What did the chat say during the show on 2026-08-28?"
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy, route="direct"):
+                prompt, metadata = await self._direct_prompt_async(policy, request=request)
+                self._assert_show_source(prompt, metadata["prompt_source_bases"])
+            with self.subTest(policy=policy, route="batch"):
+                _channel, generation, guard = await self._batch(policy, request=request)
+                self.assertTrue(generation.await_count)
+                self._assert_show_source(
+                    generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"],
+                )
+
+    async def test_finalized_source_disappearance_uses_existing_refresh_without_substitution(self):
+        self._seed_finalized_show()
+        prompt, metadata = await self._direct_prompt_async(
+            "sealed_test", request="What did the chat say during the show on 2026-08-28?",
+        )
+        bases = self._assert_show_source(prompt, metadata["prompt_source_bases"])
+        replacement_show = show_fixtures.archived_show()
+        replacement_show["sessionId"] = "test-replacement-show"
+        show_fixtures.sync_tiktok_show_evidence_ledgers(
+            bnl01_bot.DB_FILE, guild_id=77,
+            read_model=show_fixtures.authorized_read_model({
+                "currentShow": None, "latestShow": replacement_show,
+                "shows": [show_fixtures.archived_show()],
+            }),
+            artist_identity_index=show_fixtures.artist_index(),
+            environ=show_fixtures.ENABLED_QUEUE_ENV,
+        )
+        self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "")
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute(
+                "DELETE FROM tiktok_show_evidence_ledgers WHERE guild_id=77 AND show_key=?",
+                (bases[0].show_keys[0],),
+            )
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM tiktok_show_evidence_ledgers WHERE guild_id=77",
+            ).fetchone()[0], 1)
+        self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "show_episode_source_changed")
+        refreshed_prompt, fresh, changed, failed = bnl01_bot.refresh_prompt_source_bases(prompt, bases)
+        self.assertTrue(changed)
+        self.assertFalse(failed)
+        self.assertNotIn("the green visuals during this song are wild.", refreshed_prompt)
+        self.assertFalse(fresh[0].rendered_context)
 
     def _seed_publications(self, *, public_excluded=(), memory_excluded=()):
         bnl_journal.ensure_schema(bnl01_bot.DB_FILE)
