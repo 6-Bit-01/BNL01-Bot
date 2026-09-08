@@ -114,6 +114,7 @@ from bnl_memory_governance import (
     correct_member_memory,
     forget_member_memory,
     normalize_personal_recall_intent,
+    memory_relevance_terms,
     persist_shadow_diagnostics,
     purge_conversation_ledger_sources,
     reconcile_orphaned_conversation_ledger_sources,
@@ -147,6 +148,7 @@ from bnl_relationship_engine import (
 )
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
+    STOPWORDS as CONVERSATION_CONTEXT_STOPWORDS,
     ConversationContextRequest,
     ConversationContextResult,
     TransientDiscordReplySource,
@@ -24237,6 +24239,7 @@ class MemberMemoryPromptUnit:
     governed_entry_id: str = ""
     source_class: str = ""
     governed_source_digest: str = ""
+    relevance_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -25796,6 +25799,35 @@ def _memory_row_relevance(row, topic_key: str, user_text: str) -> float:
     return score
 
 
+def _memory_query_relevance(texts, user_text: str) -> dict[str, float]:
+    """Rank content matches within eligible memory, without changing authority."""
+    intent = classify_personal_recall_intent(user_text)
+    if intent.broad_self_profile or intent.status == "needs_context":
+        return {}
+    query_terms = (
+        memory_relevance_terms(intent.normalized_text)
+        - CONVERSATION_CONTEXT_STOPWORDS
+    )
+    if not query_terms:
+        return {}
+    # Use source text, never prompt labels; duplicate tier summaries are one
+    # document for term frequency. Private/excluded rows must not enter here.
+    documents = {
+        str(text or ""): (
+            memory_relevance_terms(str(text or ""))
+            - CONVERSATION_CONTEXT_STOPWORDS
+        )
+        for text in texts
+    }
+    frequency = Counter(term for terms in documents.values() for term in terms)
+    # Wording repeated throughout the candidate corpus contributes less than
+    # distinctive requested content. No topic-specific vocabulary is added.
+    return {
+        text: sum(1.0 / frequency[term] for term in sorted(query_terms & terms))
+        for text, terms in documents.items()
+    }
+
+
 def _memory_row_public_safe(row) -> bool:
     trust = row[9] if len(row) > 9 else "legacy_unknown"
     policy = row[6] if len(row) > 6 else "legacy_unknown"
@@ -26139,7 +26171,7 @@ def build_user_memory_context(
                 moment_conn.close()
         if moment_gist_context:
             memory_context_units.append(
-                MemberMemoryPromptUnit("moment", moment_gist_context)
+                MemberMemoryPromptUnit("moment", moment_gist_context, relevance_text=moment_gist_context)
             )
             if source_metadata is not None:
                 source_metadata["moment_gist_rendered"] = True
@@ -26180,7 +26212,10 @@ def build_user_memory_context(
         )
     if approved_facts:
         memory_context_units.extend(
-            MemberMemoryPromptUnit("approved_fact", _approved_fact_prompt_line(fact))
+            MemberMemoryPromptUnit(
+                "approved_fact", _approved_fact_prompt_line(fact),
+                relevance_text=f"{fact.key.replace('_', ' ')}: {fact.value}",
+            )
             for fact in approved_facts
         )
         sections.append(
@@ -26238,7 +26273,16 @@ def build_user_memory_context(
         if user_text and topic == "general" and not any(k in (user_text or "").lower() for k in ("remember", "source file", "dossier", "project", "queue", "memory")):
             visible_rows = [r for r in visible_rows if r[0] == "long" and float(r[2] or 0) >= 0.8]
             diagnostics["skipped"]["simple_or_new_topic_relevance"] += max(0, len(tier_rows) - len(visible_rows))
-        ranked = sorted(visible_rows, key=lambda r: (_memory_row_relevance(r, topic, user_text), r[0] == "short"), reverse=True)
+        query_relevance = _memory_query_relevance((r[1] for r in visible_rows), user_text)
+        ranked = sorted(
+            visible_rows,
+            key=lambda r: (
+                query_relevance.get(str(r[1] or ""), 0.0),
+                _memory_row_relevance(r, topic, user_text),
+                r[0] == "short",
+            ),
+            reverse=True,
+        )
         tier_limits = {"short": 6 if limits["visibility"] == "public_safe" else 10, "medium": 4 if limits["visibility"] == "public_safe" else 8, "long": 3 if limits["visibility"] == "public_safe" else 6}
         selected = {"short": [], "medium": [], "long": []}
         used = 0
@@ -26257,7 +26301,10 @@ def build_user_memory_context(
         for tier in ("short", "medium", "long"):
             if selected[tier]:
                 memory_context_units.extend(
-                    MemberMemoryPromptUnit(tier, _conversation_trace_prompt_line(row))
+                    MemberMemoryPromptUnit(
+                        tier, _conversation_trace_prompt_line(row),
+                        relevance_text=str(row[1] or ""),
+                    )
                     for row in selected[tier]
                 )
                 diagnostics["included"][tier] = len(selected[tier])
@@ -26389,6 +26436,7 @@ def build_user_memory_context(
                                 str(candidate.entry_id or ""),
                                 str(candidate.source_class or ""),
                                 _governed_memory_basis_digest((candidate,)),
+                                relevance_text=candidate.text[:240],
                             )
                             for candidate in gov_result.selected
                         )
@@ -26447,7 +26495,7 @@ def build_user_memory_context(
                     ):
                         if source_metadata is not None:
                             source_metadata["memory_context_units"] += (
-                                MemberMemoryPromptUnit("moment", moment_gist_context),
+                                MemberMemoryPromptUnit("moment", moment_gist_context, relevance_text=moment_gist_context),
                             )
                         governed_context = (
                             governed_context.rstrip()
@@ -28877,7 +28925,7 @@ def _batch_member_speaker_labels(items) -> dict[int, str]:
 
 
 def _bounded_member_memory_context(
-    metadata: dict, *, speaker_label: str, budget_chars: int,
+    metadata: dict, *, speaker_label: str, budget_chars: int, user_text: str = "",
 ) -> str:
     """Budget complete reader-selected units together with their attribution."""
     ordinal, _, name = speaker_label.partition(" - ")
@@ -28892,31 +28940,40 @@ def _bounded_member_memory_context(
         kind: [unit for unit in units if unit.kind == kind and unit.text.strip()]
         for kind in kinds
     }
+    # Keep the existing class rotation for equal/no query relevance, while
+    # carrying a selected topic through the smaller per-member allowance.
+    ordered = [
+        buckets[kind][index]
+        for index in range(max((len(bucket) for bucket in buckets.values()), default=0))
+        for kind in kinds
+        if index < len(buckets[kind])
+    ]
+    query_relevance = _memory_query_relevance(
+        (unit.relevance_text for unit in units if unit.relevance_text), user_text,
+    )
+    ordered.sort(
+        key=lambda unit: query_relevance.get(unit.relevance_text, 0.0),
+        reverse=True,
+    )
     selected = []
     lines = []
     used = len(header)
-    # Round-robin preserves a chance for each existing memory class without
-    # treating one member's entire memory allowance as a group allowance.
-    for index in range(max((len(bucket) for bucket in buckets.values()), default=0)):
-        for kind in kinds:
-            if index >= len(buckets[kind]):
-                continue
-            unit = buckets[kind][index]
-            text = unit.text.strip()
-            text = text.removeprefix("- ").strip()
-            if kind == "approved_fact":
-                text = text.removesuffix(" (direct member self-report; changeable, not Core)")
-                line = "- [changeable self-report] " + text
-            elif kind == "governed":
-                line = f"- [governed {unit.source_class}; not quote authority] {text}"
-            else:
-                line = f"- [{kind} hint; not quote authority] {text}"
-            cost = len(line) + (1 if lines else 0)
-            if used + cost > max(0, int(budget_chars)):
-                continue
-            selected.append(unit)
-            lines.append(line)
-            used += cost
+    for unit in ordered:
+        kind = unit.kind
+        text = unit.text.strip().removeprefix("- ").strip()
+        if kind == "approved_fact":
+            text = text.removesuffix(" (direct member self-report; changeable, not Core)")
+            line = "- [changeable self-report] " + text
+        elif kind == "governed":
+            line = f"- [governed {unit.source_class}; not quote authority] {text}"
+        else:
+            line = f"- [{kind} hint; not quote authority] {text}"
+        cost = len(line) + (1 if lines else 0)
+        if used + cost > max(0, int(budget_chars)):
+            continue
+        selected.append(unit)
+        lines.append(line)
+        used += cost
     metadata.update({
         "memory_context_units": tuple(selected),
         "approved_fact_count": sum(unit.kind == "approved_fact" for unit in selected),
@@ -28961,6 +29018,7 @@ def _read_bounded_member_memory(
         )
         rendered = _bounded_member_memory_context(
             metadata, speaker_label=speaker_label, budget_chars=budget_chars,
+            user_text=user_text,
         )
     return rendered, metadata
 

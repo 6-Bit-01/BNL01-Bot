@@ -569,6 +569,240 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows, [(final_answer,)])
 
 
+    def _seed_topic_recall_sources(self, *, cross_tier=False):
+        """Known low-salience answers compete with generic recall wording."""
+        targets = {
+            100: "The paper comet melody has muted bells.",
+            101: "The glass orchard arrangement has brushed cymbals.",
+        }
+        members = (
+            ("Test Member", "BNL, what do you remember me telling you about the paper comet?", 100),
+            ("Second Member", "BNL, what do you remember me telling you about the glass orchard?", 101),
+        )
+        target_ids = {}
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute("DELETE FROM memory_tiers")
+            for uid, text in targets.items():
+                tier = "medium" if cross_tier and uid == 100 else "long"
+                target_ids[uid] = bnl01_bot._insert_memory_tier(
+                    conn.cursor(), uid, self.guild_id, tier, text, 0.1,
+                    source_role="user", source_channel_policy="public_home",
+                    source_trust="source_safe_public", topic_key="music",
+                )
+                for index in range(6):
+                    for competitor_tier in (("short", tier) if cross_tier else (tier,)):
+                        bnl01_bot._insert_memory_tier(
+                            conn.cursor(), uid, self.guild_id, competitor_tier,
+                            f"Remember the cedar studio session {index}: warm bass with steady drums.",
+                            0.99 - index * 0.01,
+                            source_role="user", source_channel_policy="public_home",
+                            source_trust="source_safe_public", topic_key="music",
+                        )
+        return members, targets, target_ids
+
+    async def test_targeted_recall_survives_salience_competitors_in_single_prompt(self):
+        members, targets, _target_ids = self._seed_topic_recall_sources()
+        channel, generation, guard = await self._batch(
+            "sealed_test", request=members[0][1], answer=targets[100], privileged=False,
+        )
+        generation.assert_awaited_once()
+        basis = next(b for b in guard.await_args.kwargs["prompt_source_bases"]
+                     if isinstance(b, bnl01_bot.MemoryPromptSourceBasis))
+        self.assertIn(targets[100], basis.rendered_context)
+        self.assertIn(basis.rendered_context, generation.await_args.args[0])
+        self.assertNotIn(targets[101], basis.rendered_context)
+        self.assertEqual(channel.sent, [targets[100]])
+
+    async def test_targeted_group_recall_preserves_each_topic_in_both_orders(self):
+        members, targets, _target_ids = self._seed_topic_recall_sources()
+        answer = "Test Member described muted bells; Second Member described brushed cymbals."
+        for turns in (members, tuple(reversed(members))):
+            with self.subTest(order=tuple(item[2] for item in turns)):
+                channel, generation, guard = await self._batch(
+                    "sealed_test", participants=turns, answer=answer, privileged=False,
+                )
+                generation.assert_awaited_once()
+                bases = tuple(b for b in guard.await_args.kwargs["prompt_source_bases"]
+                              if isinstance(b, bnl01_bot.MemoryPromptSourceBasis))
+                self.assertEqual([basis.user_id for basis in bases], [item[2] for item in turns])
+                for basis in bases:
+                    self.assertIn(targets[basis.user_id], basis.rendered_context)
+                    for other_uid, other_target in targets.items():
+                        if other_uid != basis.user_id:
+                            self.assertNotIn(other_target, basis.rendered_context)
+                    self.assertIn(basis.rendered_context, generation.await_args.args[0])
+                self.assertEqual(channel.sent, [answer])
+
+    async def test_targeted_medium_and_long_recall_survive_group_compaction(self):
+        members, targets, _target_ids = self._seed_topic_recall_sources(cross_tier=True)
+        channel, generation, guard = await self._batch(
+            "sealed_test", participants=members, privileged=False,
+            answer="Test Member described muted bells; Second Member described brushed cymbals.",
+        )
+        generation.assert_awaited_once()
+        bases = tuple(b for b in guard.await_args.kwargs["prompt_source_bases"]
+                      if isinstance(b, bnl01_bot.MemoryPromptSourceBasis))
+        self.assertEqual([basis.user_id for basis in bases], [100, 101])
+        for basis, tier in zip(bases, ("medium", "long")):
+            self.assertEqual(basis.member_budget_chars, 448)
+            self.assertLessEqual(len(basis.rendered_context), basis.member_budget_chars)
+            self.assertIn(targets[basis.user_id], basis.rendered_context)
+            self.assertIn(f"[{tier} hint; not quote authority]", basis.rendered_context)
+            self.assertIn(basis.rendered_context, generation.await_args.args[0])
+        injected = "\n\n" + "\n\n".join(basis.rendered_context for basis in bases)
+        self.assertLessEqual(len(injected), bnl01_bot.MEMORY_PROMPT_BUDGET_PUBLIC)
+        self.assertEqual(len(channel.sent), 1)
+
+    def test_repeated_request_wording_does_not_displace_distinctive_topic(self):
+        target = "The saffron melody has muted bells."
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute("DELETE FROM memory_tiers")
+            bnl01_bot._insert_memory_tier(
+                conn.cursor(), 100, self.guild_id, "short", target, 0.1,
+                source_role="user", source_channel_policy="public_home",
+                source_trust="source_safe_public", topic_key="music",
+            )
+            for index in range(6):
+                bnl01_bot._insert_memory_tier(
+                    conn.cursor(), 100, self.guild_id, "short",
+                    f"I was telling you about cedar studio session {index} and warm bass.",
+                    0.99, source_role="user", source_channel_policy="public_home",
+                    source_trust="source_safe_public", topic_key="music",
+                )
+        metadata = {}
+        context = bnl01_bot.build_user_memory_context(
+            100, self.guild_id, route_mode="normal_chat", channel_policy="sealed_test",
+            user_text="BNL, what was I telling you about saffron?",
+            current_direct=True, source_metadata=metadata,
+        )
+        self.assertIn(target, context)
+        self.assertIn(target, metadata["memory_context_units"][0].text)
+
+    def test_broad_and_unmatched_recall_preserve_salience_order(self):
+        _members, targets, _target_ids = self._seed_topic_recall_sources()
+        for query in (
+            "What do you remember about me?",
+            "BNL, what do you remember about the saffron telescope?",
+            "BNL, what do you remember about a historical member trace?",
+        ):
+            with self.subTest(query=query):
+                metadata = {}
+                context = bnl01_bot.build_user_memory_context(
+                    100, self.guild_id, route_mode="normal_chat",
+                    channel_policy="sealed_test", user_text=query,
+                    current_direct=True, source_metadata=metadata,
+                )
+                units = metadata["memory_context_units"]
+                self.assertEqual(len(units), 3)
+                for unit, index in zip(units, range(3)):
+                    self.assertIn(f"Remember the cedar studio session {index}:", unit.text)
+                self.assertNotIn(targets[100], context)
+
+    def test_excluded_matching_sources_cannot_change_eligible_recall_ranking(self):
+        members, targets, _target_ids = self._seed_topic_recall_sources()
+        before = {}
+        read_args = dict(
+            route_mode="normal_chat", channel_policy="sealed_test",
+            user_text=members[0][1], current_direct=True,
+        )
+        bnl01_bot.build_user_memory_context(100, self.guild_id, source_metadata=before, **read_args)
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            for uid, guild, policy, trust in (
+                (100, self.guild_id, "internal_controlled", "legacy_unknown"),
+                (100, self.guild_id, "sealed_test", "legacy_unknown"),
+                (100, self.guild_id, "public_home", "legacy_unknown"),
+                (9999, self.guild_id, "public_home", "source_safe_public"),
+                (100, self.guild_id + 1, "public_home", "source_safe_public"),
+            ):
+                for index in range(8):
+                    bnl01_bot._insert_memory_tier(
+                        conn.cursor(), uid, guild, "long",
+                        f"The paper comet confidential variant {index} has a hidden melodic pattern.",
+                        1.0, source_role="user", source_channel_policy=policy,
+                        source_trust=trust, topic_key="music",
+                    )
+        after = {}
+        context = bnl01_bot.build_user_memory_context(100, self.guild_id, source_metadata=after, **read_args)
+        self.assertEqual(before["memory_context_units"], after["memory_context_units"])
+        self.assertIn(targets[100], context)
+        self.assertNotIn("confidential variant", context)
+
+    async def test_matching_approved_color_survives_incidental_topic_under_group_budget(self):
+        self._seed_group_member_sources(facts=True)
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            cursor = conn.execute(
+                "INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,role,content) VALUES (?,?,?,?,?,?,?,?)",
+                (100, "Test Member", self.guild_id, "barcode-bot", "public_home", 8800, "user", "My favorite color is blue."),
+            )
+            source_row_id = cursor.lastrowid
+            bnl01_bot._insert_memory_tier(
+                conn.cursor(), 100, self.guild_id, "long",
+                "The blue lantern workshop featured warm bass and crisp drums in a relaxed afternoon session.",
+                0.99, source_role="user", source_channel_policy="public_home",
+                source_trust="source_safe_public", topic_key="music",
+            )
+        bnl01_bot.upsert_user_fact(
+            100, self.guild_id, "favorite_color", "blue",
+            source_conversation_row_id=source_row_id,
+            source_channel_policy="public_home", source_directed=True,
+        )
+        members = (
+            ("Test Member", "BNL, what favorite color did I tell you, was it blue?", 100),
+            ("Second Member", "BNL, what is my favorite color?", 101),
+        )
+        with mock.patch.object(bnl01_bot, "MEMORY_PROMPT_BUDGET_PUBLIC", 448):
+            channel, generation, guard = await self._batch(
+                "sealed_test", participants=members, privileged=False,
+                answer="Test Member chose blue; Second Member chose violet.",
+            )
+        bases = tuple(b for b in guard.await_args.kwargs["prompt_source_bases"]
+                      if isinstance(b, bnl01_bot.MemoryPromptSourceBasis))
+        self.assertEqual([basis.user_id for basis in bases], [100, 101])
+        for basis, color in zip(bases, ("blue", "violet")):
+            self.assertIn(f"[changeable self-report] Favorite color: {color}", basis.rendered_context)
+            self.assertIn(basis.rendered_context, generation.await_args.args[0])
+            self.assertLessEqual(len(basis.rendered_context), 222)
+        self.assertEqual(channel.sent, ["Test Member chose blue; Second Member chose violet."])
+
+    async def test_selected_recall_changed_or_removed_before_send_is_revalidated(self):
+        for mutation in ("change", "remove"):
+            with self.subTest(mutation=mutation):
+                members, targets, target_ids = self._seed_topic_recall_sources()
+                replacement = "The glass orchard arrangement has bright triangles."
+                final_answer = (
+                    "Test Member described muted bells; Second Member now uses bright triangles."
+                    if mutation == "change" else
+                    "Test Member described muted bells; the other arrangement is not available now."
+                )
+                prompts = []
+
+                async def generate(prompt, *_args, **_kwargs):
+                    prompts.append(prompt)
+                    if len(prompts) == 1:
+                        self.assertIn(targets[101], prompt)
+                        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                            if mutation == "change":
+                                conn.execute("UPDATE memory_tiers SET summary=? WHERE id=?", (replacement, target_ids[101]))
+                            else:
+                                conn.execute("DELETE FROM memory_tiers WHERE id=?", (target_ids[101],))
+                        return "Test Member described muted bells; Second Member described brushed cymbals."
+                    self.assertNotIn(targets[101], prompt)
+                    if mutation == "change":
+                        self.assertIn(replacement, prompt)
+                    return final_answer
+
+                channel, generation, _guard = await self._batch(
+                    "sealed_test", participants=members, answer=generate, privileged=False,
+                )
+                self.assertEqual(generation.await_count, 2)
+                self.assertEqual(channel.sent, [final_answer])
+                with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                    saved = conn.execute(
+                        "SELECT content FROM conversations WHERE role='model' AND channel_id=?",
+                        (channel.id,),
+                    ).fetchall()
+                self.assertEqual(saved, [(final_answer,)])
+
     def _seed_group_member_sources(self, *, facts=False, count=2):
         names = ("Amber Instrumentalist", "Violet Sound Designer", "Copper Percussionist", "Indigo Studio Artist", "Cyan Music Producer", "Green Sound Engineer", "Blue Session Artist", "Golden Instrumentalist")
         colors = ("amber", "violet", "copper", "indigo", "cyan", "green", "blue", "gold")
