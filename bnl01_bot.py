@@ -123,6 +123,7 @@ from bnl_memory_governance import (
     view_member_memory,
 )
 from bnl_moment_engine import (
+    ActiveEpisodeReference,
     MomentSituationReference,
     active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
@@ -26821,6 +26822,9 @@ class UnifiedMomentCanaryPromptSourceBasis:
     topic_text: str
     participant_user_ids: tuple[int, ...] = ()
     episode_context_present: bool = False
+    episode_reference: ActiveEpisodeReference | None = None
+    expected_episode_id: str = ""
+    aggregate_only: bool = False
 
 
 PromptSourceBasis = Union[
@@ -28623,9 +28627,14 @@ def _render_unified_moment_canary_context(
     route_mode: str,
     topic_text: str,
     participant_user_ids: tuple[int, ...],
+    expected_episode_id: str = "",
+    reference_out: dict[str, ActiveEpisodeReference] | None = None,
+    aggregate_only: bool = False,
 ) -> tuple[str, bool, UnifiedResponseAssessment]:
     """Rebuild the sealed canary block from current source state."""
 
+    if reference_out is not None:
+        reference_out.clear()
     if (
         not isinstance(assessment, UnifiedResponseAssessment)
         or assessment.guild_id != int(guild_id or 0)
@@ -28640,6 +28649,7 @@ def _render_unified_moment_canary_context(
     ):
         return "", False, assessment
     episode_context = ""
+    episode_reference_out: dict[str, ActiveEpisodeReference] = {}
     if (
         DB_FILE != ":memory:"
         and os.path.exists(DB_FILE)
@@ -28664,17 +28674,39 @@ def _render_unified_moment_canary_context(
                     route_mode=str(route_mode or "unknown"),
                     topic_text=str(topic_text or "")[:8000],
                     participant_keys=participant_keys,
+                    expected_episode_id=(
+                        expected_episode_id or assessment.active_episode_id
+                    ),
+                    reference_out=episode_reference_out,
                 )
         except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
             episode_context = ""
+    episode_reference = episode_reference_out.get("reference")
+    if (
+        episode_context
+        and episode_reference is not None
+        and reference_out is not None
+    ):
+        reference_out["reference"] = episode_reference
     reconciled_assessment = with_prompt_lane_presence(
-        assessment,
+        replace(
+            assessment,
+            active_episode_id=(
+                episode_reference.episode_id
+                if episode_context and episode_reference is not None
+                else ""
+            ),
+        ),
         "active_episode",
         present=bool(episode_context),
     )
-    rendered = render_sealed_canary_brief(
-        reconciled_assessment,
-        active_episode_context=episode_context,
+    rendered = (
+        episode_context
+        if aggregate_only
+        else render_sealed_canary_brief(
+            reconciled_assessment,
+            active_episode_context=episode_context,
+        )
     )
     return rendered, bool(episode_context), reconciled_assessment
 
@@ -28688,9 +28720,11 @@ def build_unified_moment_canary_prompt_source_basis(
     route_mode: str,
     topic_text: str,
     participant_user_ids: tuple[int, ...],
+    aggregate_only: bool = False,
 ) -> UnifiedMomentCanaryPromptSourceBasis | None:
     if assessment is None:
         return None
+    reference_out: dict[str, ActiveEpisodeReference] = {}
     rendered, episode_context_present, reconciled_assessment = (
         _render_unified_moment_canary_context(
             assessment,
@@ -28700,6 +28734,8 @@ def build_unified_moment_canary_prompt_source_basis(
             route_mode=route_mode,
             topic_text=topic_text,
             participant_user_ids=participant_user_ids,
+            reference_out=reference_out,
+            aggregate_only=aggregate_only,
         )
     )
     if not rendered:
@@ -28721,6 +28757,12 @@ def build_unified_moment_canary_prompt_source_basis(
             )
         ),
         episode_context_present=bool(episode_context_present),
+        episode_reference=reference_out.get("reference"),
+        expected_episode_id=(
+            assessment.active_episode_id
+            or reconciled_assessment.active_episode_id
+        ),
+        aggregate_only=bool(aggregate_only),
     )
 
 
@@ -29476,6 +29518,7 @@ def refresh_prompt_source_basis(
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
             return basis, True
     if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
+        reference_out: dict[str, ActiveEpisodeReference] = {}
         (
             fresh_context,
             episode_context_present,
@@ -29489,6 +29532,12 @@ def refresh_prompt_source_basis(
                 route_mode=basis.route_mode,
                 topic_text=basis.topic_text,
                 participant_user_ids=basis.participant_user_ids,
+                expected_episode_id=(
+                    basis.expected_episode_id
+                    or basis.assessment.active_episode_id
+                ),
+                reference_out=reference_out,
+                aggregate_only=basis.aggregate_only,
             )
         )
         fresh = replace(
@@ -29497,11 +29546,18 @@ def refresh_prompt_source_basis(
             rendered_context=fresh_context,
             assessment=reconciled_assessment,
             episode_context_present=bool(episode_context_present),
+            episode_reference=reference_out.get("reference"),
+            expected_episode_id=(
+                basis.expected_episode_id
+                or basis.assessment.active_episode_id
+                or reconciled_assessment.active_episode_id
+            ),
         )
         return fresh, bool(
             fresh.expected_digest != basis.expected_digest
             or fresh.episode_context_present
             != basis.episode_context_present
+            or fresh.episode_reference != basis.episode_reference
         )
     if isinstance(basis, MemoryPromptSourceBasis):
         source_metadata: dict = {}
@@ -37164,8 +37220,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             )
             batch_unified_moment_canary_scope = bool(
-                not batch_ordinary_chat_single_packet
-                and unified_moment_canary_enabled(
+                unified_moment_canary_enabled(
                     guild_id=guild_id,
                     channel_id=channel_id,
                     route_mode=batch_route_mode,
@@ -37265,6 +37320,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         if batch_unified_assessment is not None
                         else tuple(unique_user_ids)
                     ),
+                    aggregate_only=batch_ordinary_chat_single_packet,
                 )
                 if batch_unified_moment_canary_scope
                 else None
@@ -37293,6 +37349,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         for block in (
                             recent_room_prompt,
                             batch_memory_prompt_block,
+                            (
+                                batch_unified_moment_canary_basis.rendered_context
+                                if batch_unified_moment_canary_basis is not None
+                                and batch_unified_moment_canary_basis.aggregate_only
+                                else ""
+                            ),
                             (
                                 "" if batch_publication_queue_packet_ready
                                 else batch_website_read_model_prompt_block
@@ -40010,8 +40072,7 @@ def build_user_aware_prompt(
             )
         )
     unified_moment_canary_scope = bool(
-        not ordinary_chat_single_packet
-        and unified_moment_canary_enabled(
+        unified_moment_canary_enabled(
         guild_id=guild_id,
         channel_id=channel_id,
         route_mode=route_mode,
@@ -40079,6 +40140,7 @@ def build_user_aware_prompt(
                 if unified_assessment is not None
                 else (int(user_id or 0),)
             ),
+            aggregate_only=ordinary_chat_single_packet,
         )
         if unified_moment_canary_scope
         else None
@@ -40133,6 +40195,12 @@ def build_user_aware_prompt(
                 block
                 for block in (
                     room_context,
+                    (
+                        unified_moment_canary_basis.rendered_context
+                        if unified_moment_canary_basis is not None
+                        and unified_moment_canary_basis.aggregate_only
+                        else ""
+                    ),
                     (
                         f"Durable memory context:\n{memory_context}\n"
                         if memory_context
@@ -42398,10 +42466,12 @@ async def apply_guarded_response_regeneration(
             )
             or (
                 unified_moment_canary_basis is not None
+                and not unified_moment_canary_basis.aggregate_only
                 and response_exposes_canary_control_markers(candidate)
             )
             or (
                 unified_moment_canary_basis is not None
+                and not unified_moment_canary_basis.aggregate_only
                 and assess_response_coherence(
                     unified_moment_canary_basis.assessment,
                     candidate,
@@ -43061,7 +43131,10 @@ async def apply_guarded_response_regeneration(
             channel_policy,
         )
         response = regenerated
-    if unified_moment_canary_basis is not None:
+    if (
+        unified_moment_canary_basis is not None
+        and not unified_moment_canary_basis.aggregate_only
+    ):
         canary_coherence = assess_response_coherence(
             unified_moment_canary_basis.assessment,
             response,
