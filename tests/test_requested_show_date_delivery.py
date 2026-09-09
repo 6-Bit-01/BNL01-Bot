@@ -202,6 +202,8 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         for request in (
             "BNL, compare the August 28, 2026 and September 4, 2026 shows",
             "BNL, compare the shows from August 28, 2026 and September 4, 2026",
+            "BNL, compare the shows on August 28, 2026 and on September 4, 2026",
+            "BNL, compare the shows from 2026-08-28 and from 2026-09-04",
         ):
             with self.subTest(request=request):
                 website, episode, basis = self._read(request)

@@ -278,6 +278,8 @@ class RequestedShowEvidenceTests(unittest.TestCase):
         for query, expected in (
             ("BNL, compare the August 28, 2026 and September 4, 2026 shows",
              {"2026-08-28", "2026-09-04"}),
+            ("Compare the shows on August 28, 2026 and on September 4, 2026",
+             {"2026-08-28", "2026-09-04"}),
             ("Tell me about the August 28, 2026 show; my appointment is September 4, 2026.",
              {"2026-08-28"}),
         ):

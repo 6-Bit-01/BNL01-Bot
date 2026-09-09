@@ -448,7 +448,7 @@ def _show_scoped_date_matches(user_text: str) -> tuple[re.Match, ...]:
     groups = []
     for match in dates:
         if groups and re.fullmatch(
-            r"\s*(?:,|,?\s*(?:and|or)|&|/)\s*",
+            r"\s*(?:,|,?\s*(?:and|or)|&|/)(?:\s+(?:on|of|from|for))?\s*",
             query[groups[-1][-1].end():match.start()],
         ):
             groups[-1].append(match)

@@ -121,7 +121,8 @@ proof of what an audience member said. A date outside show context alone is
 not a show-retrieval cue. Dated-source admission uses an existing show/live
 analysis intent or a date-associated show noun phrase; ordinary verbs such as
 "show me" or "I live in" do not make an unrelated date a show reference.
-Coordinated dates may share a leading or trailing show noun. Admission,
+Coordinated dates may share a leading or trailing show noun, including a
+repeated date preposition such as "on August 28 and on September 4". Admission,
 requested-date extraction, packet selection, and pinned source refresh reuse
 that association; an appointment date in another clause does not select a
 second show. The lexical date helper still recognizes all calendar dates, and
