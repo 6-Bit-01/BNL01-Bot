@@ -42623,10 +42623,25 @@ _FINALIZED_SHOW_ATTRIBUTION_VERBS = (
     r"observed|called|described|claimed|thought|believed|felt|reported|"
     r"shared|answered"
 )
+_FINALIZED_SHOW_PARTICIPANT_ACTION_VERBS = (
+    r"acknowledged|admired|agreed|appeared|approved|attended|believed|"
+    r"celebrated|cheered|complained|criticized|disagreed|discussed|"
+    r"disliked|enjoyed|focused|hated|joined|laughed|left|liked|loved|"
+    r"noticed|praised|preferred|reacted|recalled|recognized|"
+    r"recommended|remembered|saw|smiled|suggested|talked|thought|"
+    r"wanted|watched|wondered"
+)
 _FINALIZED_SHOW_ATTRIBUTION_RE = re.compile(
-    r"(?:^|[.!?]\s+|,\s+|\n\s*|[-*+]\s+)"
+    r"(?:^|[.!?]\s+|(?:,|:)\s+|\n\s*|[-*+]\s+)"
     r"(?P<label>[A-Za-z0-9@][^!?\n,:]{0,95}?)\s+"
     rf"(?P<verb>{_FINALIZED_SHOW_ATTRIBUTION_VERBS})\b",
+    re.I,
+)
+_FINALIZED_SHOW_LABELED_ATTRIBUTION_RE = re.compile(
+    r"(?:^|[.!?]\s+|,\s+|\n\s*|[-*+]\s+)"
+    r"(?P<label>[A-Za-z0-9@][^!?\n,:]{0,95}?)"
+    r"(?:[ \t]*:[ \t]+|[ \t]+[–—-][ \t]+)"
+    r"(?P<claim>\S[^!?\n]{0,500})",
     re.I,
 )
 _FINALIZED_SHOW_PARTICIPANT_CLAIM_RE = re.compile(
@@ -42636,27 +42651,138 @@ _FINALIZED_SHOW_PARTICIPANT_CLAIM_RE = re.compile(
     r"(?:participant|viewer|member|speaker|guest|in the chat|there)\b",
     re.I,
 )
+_FINALIZED_SHOW_PARTICIPANT_ACTION_RE = re.compile(
+    r"(?:^|[.!?]\s+|,\s+|\n\s*|[-*+]\s+)"
+    r"(?P<label>[A-Za-z0-9@][^!?\n,:]{0,95}?)\s+"
+    rf"(?P<verb>{_FINALIZED_SHOW_PARTICIPANT_ACTION_VERBS})\b",
+    re.I,
+)
+_FINALIZED_SHOW_PARTICIPANT_STATE_RE = re.compile(
+    r"(?:^|[.!?]\s+|,\s+|\n\s*|[-*+]\s+)"
+    r"(?P<label>[A-Za-z0-9@][^!?\n,:]{0,95}?)\s+"
+    r"(?:was|is|seemed|looked)\s+"
+    r"(?:amused|angry|confused|curious|disappointed|excited|happy|"
+    r"impressed|interested|pleased|sad|surprised|upset)\b",
+    re.I,
+)
+_FINALIZED_SHOW_CONTRIBUTION_SOURCE_RE = re.compile(
+    r"\b(?:an?\s+|the\s+)?"
+    r"(?:comment|contribution|message|observation|question|reaction|"
+    r"reply|request|response|suggestion)\b"
+    r"[^!?\n]{0,48}?\b(?:came\s+)?(?:by|from)\s+"
+    r"(?P<label>@[A-Za-z0-9_.-]{1,80}|[^,;:!?\n]{1,96}?)"
+    r"\s*(?=[,;:!?\n]|$)",
+    re.I,
+)
+_FINALIZED_SHOW_GIST_SUBJECT_RE = re.compile(
+    r"\b(?:as a (?:gist|summary|paraphrase)|gist(?:[- ]only)?|"
+    r"paraphras(?:e|ed|ing)|roughly|in (?:essence|summary)|"
+    r"in other words|my understanding is|"
+    r"the (?:meaning|point|position|idea) was)\b"
+    r"\s*[,;:–—-]?\s*"
+    r"(?P<label>@[A-Za-z0-9_.-]{1,80}|"
+    r"[A-Za-z0-9][^!?\n,:]{0,95}?)\s+"
+    rf"(?:{_FINALIZED_SHOW_PARTICIPANT_ACTION_VERBS})\b",
+    re.I,
+)
+_FINALIZED_SHOW_MEANT_LABEL_RE = re.compile(
+    r"\bwhat\s+(?P<label>[A-Za-z0-9@][A-Za-z0-9_.@ -]{0,71}?)"
+    r"\s+meant\s+was\b",
+    re.I,
+)
+_FINALIZED_SHOW_POSSESSIVE_GIST_LABEL_RE = re.compile(
+    r"(?:^|[.!?]\s+|,\s+|\n\s*|[-*+]\s+)"
+    r"(?P<label>[A-Za-z0-9@][^!?\n,:]{0,95}?)['’]s\s+"
+    r"(?:meaning|point|position|idea|reaction|comment|message|view|take)"
+    r"\s+(?:was|is)\b",
+    re.I,
+)
+_FINALIZED_SHOW_ACCORDING_TO_RE = re.compile(
+    r"\baccording\s+to\s+"
+    r"(?P<label>@[A-Za-z0-9_.-]{1,80}|[^,;:!?\n]{1,96}?)"
+    r"\s*(?=[,;:!?])",
+    re.I,
+)
+_FINALIZED_SHOW_ROSTER_RE = re.compile(
+    r"(?:^|[.!?]\s+|\n\s*|[-*+]\s+|\b(?:the|these|show)\s+)"
+    r"(?:participants?|viewers?|members?|speakers?|guests?|"
+    r"people\s+quoted)"
+    r"(?:\s+(?:included?|were|are|named|listed|quoted)\b\s*:?[ \t]*|"
+    r"\s*:\s*)"
+    r"(?P<labels>[^.!?\n]{1,240})",
+    re.I,
+)
 _FINALIZED_SHOW_NONPERSON_LABELS = frozenset(
     {
         "a summary",
+        "a guest",
+        "a member",
+        "a participant",
+        "a speaker",
+        "a viewer",
         "according to the evidence",
+        "available excerpts",
+        "barcode network",
+        "barcode radio",
         "bnl",
         "bnl 01",
+        "bnl-01",
+        "context",
+        "discord",
         "evidence",
+        "everyone",
+        "exact excerpts",
+        "guests",
+        "gist",
         "i",
         "it",
+        "note",
         "one excerpt",
+        "one guest",
+        "one member",
         "one message",
+        "one participant",
+        "one speaker",
+        "one viewer",
+        "paraphrase",
+        "participants",
+        "people",
+        "requested comments",
+        "source",
+        "source excerpts",
+        "summary",
+        "supported excerpts",
+        "supported quotes",
         "the archive",
+        "the audience",
+        "the bass",
+        "the beat",
         "the chat",
+        "the comments",
+        "the conversation",
+        "the crowd",
+        "the discussion",
         "the evidence",
+        "the energy",
         "the episode",
         "the ledger",
+        "the lighting",
+        "the lights",
+        "the members",
+        "the music",
+        "the participants",
         "the record",
         "the room",
         "the show",
+        "the song",
         "the source",
+        "the speakers",
+        "the track",
+        "the viewers",
+        "the visuals",
         "this",
+        "tiktok",
+        "viewers",
         "we",
     }
 )
@@ -42672,17 +42798,26 @@ _FINALIZED_SHOW_ATTRIBUTION_STOP_WORDS = frozenset(
         "called",
         "claimed",
         "commented",
+        "according",
         "described",
+        "essence",
         "felt",
         "for",
         "from",
         "gist",
+        "gist-only",
+        "idea",
         "into",
+        "meaning",
+        "meant",
         "mentioned",
         "noted",
         "observed",
+        "other",
         "paraphrase",
+        "point",
         "posted",
+        "position",
         "reported",
         "replied",
         "roughly",
@@ -42695,24 +42830,31 @@ _FINALIZED_SHOW_ATTRIBUTION_STOP_WORDS = frozenset(
         "they",
         "this",
         "thought",
+        "understanding",
         "was",
         "were",
+        "what",
         "with",
+        "words",
         "wrote",
     }
 )
 
 
 def _finalized_show_attribution_terms(value: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(
-            r"[a-z0-9][a-z0-9'’-]{2,}",
-            str(value or "").casefold(),
-        )
-        if token not in _FINALIZED_SHOW_ATTRIBUTION_STOP_WORDS
-        and not token.isdigit()
-    }
+    terms = set()
+    for token in re.findall(
+        r"[a-z0-9][a-z0-9'’-]{2,}",
+        str(value or "").casefold(),
+    ):
+        normalized = re.sub(r"['’]s$", "", token)
+        if (
+            len(normalized) >= 3
+            and normalized not in _FINALIZED_SHOW_ATTRIBUTION_STOP_WORDS
+            and not normalized.isdigit()
+        ):
+            terms.add(normalized)
+    return terms
 
 
 def _normalize_finalized_show_speaker_reference(value: str) -> str:
@@ -42744,6 +42886,104 @@ def _finalized_show_speaker_variants(
         variants.add("@" + handle.casefold())
         variants.add(handle.casefold())
     return frozenset(variants)
+
+
+def _finalized_show_presence_variants(
+    excerpts: tuple[FinalizedShowAuthoredExcerpt, ...],
+) -> frozenset[str]:
+    """Allow a display-only roster name only when it identifies one source."""
+
+    variants = (
+        set().union(
+            *(
+                _finalized_show_speaker_variants(excerpt)
+                for excerpt in excerpts
+            )
+        )
+        if excerpts
+        else set()
+    )
+    display_subjects: dict[str, set[str]] = defaultdict(set)
+    for excerpt in excerpts:
+        display = re.sub(
+            r"\s*\(@[A-Za-z0-9_.-]{1,80}\)\s*$",
+            "",
+            excerpt.speaker_label,
+        )
+        normalized = _normalize_finalized_show_speaker_reference(display)
+        if normalized:
+            display_subjects[normalized].add(
+                excerpt.subject_ref or excerpt.event_id
+            )
+    variants.update(
+        display
+        for display, subjects in display_subjects.items()
+        if len(subjects) == 1
+    )
+    return frozenset(variants)
+
+
+def _finalized_show_roster_labels(response: str) -> tuple[str, ...]:
+    labels = []
+    for match in _FINALIZED_SHOW_ROSTER_RE.finditer(str(response or "")):
+        raw_labels = match.group("labels")
+        for raw in re.split(r"\s*(?:,|&|/|\band\b)\s*", raw_labels):
+            candidate = re.sub(
+                r"\s+(?:from|on|in|during)\s+"
+                r"(?:TikTok|Discord|the chat|the show|this episode).*$",
+                "",
+                raw.strip(),
+                flags=re.I,
+            )
+            candidate = re.sub(
+                r"^(?:both|including|namely)\s+",
+                "",
+                candidate,
+                flags=re.I,
+            )
+            normalized = _normalize_finalized_show_speaker_reference(
+                candidate
+            )
+            if (
+                normalized
+                and normalized not in _FINALIZED_SHOW_NONPERSON_LABELS
+                and normalized not in {
+                    "active",
+                    "others",
+                    "present",
+                    "several others",
+                    "several people",
+                    "the audience",
+                    "there",
+                    "two others",
+                    "two people",
+                }
+                and not re.fullmatch(
+                    r"\d+\s+(?:guests?|members?|participants?|people|"
+                    r"speakers?|viewers?)",
+                    normalized,
+                )
+            ):
+                labels.append(normalized)
+    return tuple(dict.fromkeys(labels))
+
+
+def _unquoted_finalized_show_handles(response: str) -> tuple[str, ...]:
+    value = str(response or "")
+    masked = list(value)
+    for _fragment, start, end in _response_show_quote_occurrences(value):
+        masked[start:end] = " " * (end - start)
+    return tuple(
+        dict.fromkeys(
+            "@" + match.group("handle").rstrip(".-").casefold()
+            for match in re.finditer(
+                r"(?<![A-Za-z0-9_.-])"
+                r"@(?P<handle>[A-Za-z0-9_.-]{1,80})",
+                "".join(masked),
+            )
+            if match.group("handle").rstrip(".-")
+        )
+    )
 
 
 def _finalized_show_authority_applies(
@@ -42876,6 +43116,8 @@ def _show_quote_attribution_label(
 
 def _unquoted_finalized_show_attributions(
     response: str,
+    *,
+    include_labeled_wording: bool = False,
 ) -> tuple[tuple[str, str, bool], ...]:
     value = str(response or "")
     masked = list(value)
@@ -42883,15 +43125,32 @@ def _unquoted_finalized_show_attributions(
         masked[start:end] = " " * (end - start)
     unquoted = "".join(masked)
     attributions = []
-    for pattern, wording_claim in (
+    patterns = [
         (_FINALIZED_SHOW_ATTRIBUTION_RE, True),
         (_FINALIZED_SHOW_PARTICIPANT_CLAIM_RE, False),
-    ):
+        (_FINALIZED_SHOW_PARTICIPANT_ACTION_RE, True),
+        (_FINALIZED_SHOW_PARTICIPANT_STATE_RE, True),
+        (_FINALIZED_SHOW_CONTRIBUTION_SOURCE_RE, False),
+    ]
+    if include_labeled_wording:
+        patterns.extend(
+            (
+                (_FINALIZED_SHOW_LABELED_ATTRIBUTION_RE, True),
+                (_FINALIZED_SHOW_GIST_SUBJECT_RE, True),
+                (_FINALIZED_SHOW_MEANT_LABEL_RE, True),
+                (_FINALIZED_SHOW_POSSESSIVE_GIST_LABEL_RE, True),
+                (_FINALIZED_SHOW_ACCORDING_TO_RE, True),
+            )
+        )
+    for pattern, wording_claim in patterns:
         for match in pattern.finditer(unquoted):
             label = _normalize_finalized_show_speaker_reference(
                 match.group("label")
             )
-            if label and label not in _FINALIZED_SHOW_NONPERSON_LABELS:
+            if (
+                label
+                and label not in _FINALIZED_SHOW_NONPERSON_LABELS
+            ):
                 clause_start = max(
                     unquoted.rfind(".", 0, match.start()),
                     unquoted.rfind("!", 0, match.start()),
@@ -42935,7 +43194,12 @@ def finalized_show_authored_response_failure(
         prompt_source_bases,
         current_user_text,
     )
-    for fragment, start, end in _response_show_quote_occurrences(response):
+    request = str(current_user_text or "")
+    quote_intent = bool(
+        _FINALIZED_SHOW_QUOTATION_REQUEST_RE.search(request)
+    )
+    quote_occurrences = _response_show_quote_occurrences(response)
+    for fragment, start, end in quote_occurrences:
         matching_excerpts = tuple(
             excerpt
             for excerpt in excerpts
@@ -42957,12 +43221,20 @@ def finalized_show_authored_response_failure(
             for excerpt in matching_excerpts
         ):
             return "show_authored_quote_speaker_mismatch"
+    presence_variants = _finalized_show_presence_variants(excerpts)
+    for handle in _unquoted_finalized_show_handles(response):
+        if handle not in presence_variants:
+            return "show_authored_participant_not_in_supplied_events"
+    for roster_label in _finalized_show_roster_labels(response):
+        if roster_label not in presence_variants:
+            return "show_authored_participant_not_in_supplied_events"
     for (
         attributed_speaker,
         attribution_clause,
         wording_claim,
     ) in _unquoted_finalized_show_attributions(
-        response
+        response,
+        include_labeled_wording=quote_intent,
     ):
         speaker_excerpts = tuple(
             excerpt
@@ -42976,6 +43248,9 @@ def finalized_show_authored_response_failure(
             clause_terms = _finalized_show_attribution_terms(
                 attribution_clause
             )
+            clause_terms.difference_update(
+                _finalized_show_attribution_terms(attributed_speaker)
+            )
             speaker_terms = set().union(
                 *(
                     _finalized_show_attribution_terms(
@@ -42984,16 +43259,33 @@ def finalized_show_authored_response_failure(
                     for excerpt in speaker_excerpts
                 )
             )
-            if clause_terms and not clause_terms.intersection(speaker_terms):
+            supported_terms = clause_terms.intersection(speaker_terms)
+            if clause_terms and (
+                not supported_terms
+                or (
+                    quote_intent
+                    and supported_terms != clause_terms
+                )
+                or (
+                    not quote_intent
+                    and len(supported_terms) * 2 < len(clause_terms)
+                )
+            ):
                 return "show_authored_attribution_not_supported"
-            request = str(current_user_text or "")
             if (
-                _FINALIZED_SHOW_QUOTATION_REQUEST_RE.search(request)
+                quote_intent
                 and not _CLEAR_PARAPHRASE_LABEL_RE.search(
                     attribution_clause
                 )
             ):
                 return "show_authored_wording_requires_quote_or_labeled_gist"
+    if (
+        quote_intent
+        and not quote_occurrences
+        and not _CLEAR_PARAPHRASE_LABEL_RE.search(str(response or ""))
+        and not _EXACT_QUOTE_REFUSAL_RE.search(str(response or ""))
+    ):
+        return "show_authored_quote_request_requires_exact_excerpt_or_labeled_gist"
     return ""
 
 
@@ -43013,7 +43305,9 @@ def build_finalized_show_authored_correction_prompt(
         + "or quote from a prior BNL reply, summary, participant count, track "
         + "title, or inferred reconstruction. If the requested wording is not "
         + "among the bounded authored events, state that specific uncertainty "
-        + "and answer the supported parts naturally."
+        + "and answer the supported parts naturally. Any non-exact wording must "
+        + "be explicitly labeled as a gist, summary, or paraphrase, and every "
+        + "named participant must appear in the supplied authored events."
     )
 
 

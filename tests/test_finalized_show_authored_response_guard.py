@@ -85,6 +85,24 @@ class FinalizedShowAuthoredResponseValidatorTests(unittest.TestCase):
             self.failure("TestBeacon said the lights were blue."),
             "show_authored_participant_not_in_supplied_events",
         )
+        for response in (
+            "TestBeacon: The paper lantern blinked twice.",
+            "testbeacon: the paper lantern blinked twice.",
+            "TestBeacon — The paper lantern blinked twice.",
+            "As a paraphrase, TestBeacon: the paper lantern blinked twice.",
+            "As a paraphrase, TestBeacon loved the lights.",
+            "As a paraphrase, TestBeacon reacted to the lights.",
+            "What TestBeacon meant was that the lights changed.",
+            "As a paraphrase, TestBeacon's point was the lights changed.",
+            "The meaning was TestBeacon loved the lights.",
+            "According to TestBeacon, as a paraphrase, the lights changed.",
+            "Participants included TestBeacon and Test Member.",
+        ):
+            with self.subTest(response=response):
+                self.assertEqual(
+                    self.failure(response),
+                    "show_authored_participant_not_in_supplied_events",
+                )
 
     def test_rejects_real_words_with_wrong_or_missing_speaker(self):
         self.assertEqual(
@@ -118,6 +136,108 @@ class FinalizedShowAuthoredResponseValidatorTests(unittest.TestCase):
                 "lights changed."
             ),
             "",
+        )
+        self.assertEqual(
+            self.failure(
+                "As a paraphrase, @test.member: the green lights changed."
+            ),
+            "",
+        )
+
+    def test_quote_request_requires_an_excerpt_uncertainty_or_labeled_gist(self):
+        self.assertEqual(
+            self.failure("Here are the requested comments from the show."),
+            "show_authored_quote_request_requires_exact_excerpt_or_labeled_gist",
+        )
+        self.assertEqual(
+            self.failure(
+                '@test.member: "The green lights changed."\n'
+                "TestBeacon: The paper lantern blinked twice."
+            ),
+            "show_authored_participant_not_in_supplied_events",
+        )
+        self.assertEqual(
+            self.failure(
+                "As a paraphrase, @test.member: the green lights changed "
+                "and the paper lantern blinked."
+            ),
+            "show_authored_attribution_not_supported",
+        )
+        self.assertEqual(
+            self.failure(
+                "As a paraphrase, @test.member noticed the paper lantern."
+            ),
+            "show_authored_attribution_not_supported",
+        )
+        self.assertEqual(
+            self.failure(
+                '@test.member: "The green lights changed." A reaction '
+                "came from @testbeacon."
+            ),
+            "show_authored_participant_not_in_supplied_events",
+        )
+        for response in (
+            '"The green lights changed." — @test.member.\n'
+            "TestBeacon smiled.",
+            '"The green lights changed." — @test.member.\n'
+            "TestBeacon was excited.",
+            '"The green lights changed." — @test.member.\n'
+            "A reaction came from TestBeacon.",
+        ):
+            with self.subTest(response=response):
+                self.assertEqual(
+                    self.failure(response),
+                    "show_authored_participant_not_in_supplied_events",
+                )
+        self.assertEqual(
+            self.failure(
+                "As a paraphrase, the chat focused on green lights."
+            ),
+            "",
+        )
+        self.assertEqual(
+            self.failure(
+                '"The green lights changed." — @test.member.\n'
+                "The crowd cheered."
+            ),
+            "",
+        )
+        for response in (
+            "In other words, @test.member said the green lights changed.",
+            "What @test.member meant was the green lights changed.",
+            "According to @test.member, as a paraphrase, the green "
+            "lights changed.",
+            "As a paraphrase, @test.member's point was that the green "
+            "lights changed.",
+        ):
+            with self.subTest(response=response):
+                self.assertEqual(self.failure(response), "")
+
+    def test_roster_names_must_resolve_to_unique_authored_participants(self):
+        self.assertEqual(
+            self.failure(
+                "Participants included Test Member and Test Guest. "
+                "As a paraphrase, the chat discussed green lights."
+            ),
+            "",
+        )
+        one = excerpt(
+            speaker_label="Test Member (@signal.one)",
+            source_text="Signal one stayed green.",
+        )
+        two = excerpt(
+            event_id="test-event-two",
+            subject_ref="tiktok_handle:signal.two",
+            speaker_label="Test Member (@signal.two)",
+            source_text="Signal two changed blue.",
+        )
+        self.assertEqual(
+            self.failure(
+                "Participants included Test Member. As a paraphrase, the "
+                "chat discussed signals.",
+                bases=(basis(one, two),),
+            ),
+            "show_authored_participant_not_in_supplied_events",
         )
 
     def test_known_speaker_cannot_receive_an_ungrounded_unquoted_claim(self):
