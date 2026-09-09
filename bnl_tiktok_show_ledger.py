@@ -9,7 +9,7 @@ not infer Discord identity, artist identity, canon, or relationship state.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -17,7 +17,6 @@ import os
 import re
 import sqlite3
 from typing import Any, Mapping, Optional, Sequence
-from zoneinfo import ZoneInfo
 
 from bnl_canon_source_contract import (
     SIX_BIT,
@@ -39,6 +38,9 @@ from bnl_memory_ledger import (
 from bnl_tiktok_live_context import (
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     build_tiktok_show_evidence_ledger,
+    explicit_show_date,
+    has_explicit_show_date,
+    requested_show_date,
     show_timeline_bounds_ms,
     tiktok_show_evidence_key,
     tiktok_show_records,
@@ -92,10 +94,6 @@ _SUBJECT_CONTINUITY_QUERY_RE = re.compile(
     r"what do you think of me|your (?:read|opinion|impression) of me)\b",
     re.IGNORECASE,
 )
-_RELATIVE_SHOW_DATE_SCOPE_RE = re.compile(
-    r"\b(?:tiktok|tik tok|barcode radio|broadcast|show|episode|live|stream)\b",
-    re.IGNORECASE,
-)
 _MULTI_SHOW_QUERY_RE = re.compile(
     r"\b(?:shows|episodes|over time|across (?:the )?(?:last|past|recent)|"
     r"lately|recently|usually|regulars?|keeps coming|returning)\b",
@@ -105,7 +103,6 @@ _TIMELINE_QUERY_RE = re.compile(
     r"\b(?:timeline|sequence|chronolog(?:y|ical)|what happened|rundown|recap)\b",
     re.IGNORECASE,
 )
-_PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 _QUERY_STOP_WORDS = frozenset(
     {
         "about",
@@ -286,37 +283,8 @@ def _context_digest(*values: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _coerce_pacific_now(value: Any = None) -> datetime:
-    if isinstance(value, datetime):
-        current = value
-    elif value:
-        try:
-            current = datetime.fromisoformat(
-                str(value).replace("Z", "+00:00")
-            )
-        except (TypeError, ValueError):
-            current = datetime.now(timezone.utc)
-    else:
-        current = datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    return current.astimezone(_PACIFIC_TZ)
-
-
 def _requested_show_date(user_text: str, *, now: Any = None) -> str:
-    query = str(user_text or "")
-    explicit = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", query)
-    if explicit:
-        return explicit.group(1)
-    lowered = query.casefold()
-    if not _RELATIVE_SHOW_DATE_SCOPE_RE.search(lowered):
-        return ""
-    current_date = _coerce_pacific_now(now).date()
-    if re.search(r"\b(?:yesterday|last night)\b", lowered):
-        return (current_date - timedelta(days=1)).isoformat()
-    if re.search(r"\b(?:today|tonight|this evening)\b", lowered):
-        return current_date.isoformat()
-    return ""
+    return requested_show_date(user_text, now=now)
 
 
 def _subject_continuity_requested(user_text: str) -> bool:
@@ -2304,6 +2272,8 @@ def _ranked_show_ledgers(
     now: Any = None,
 ) -> list[tuple[int, int, Mapping[str, Any], list[Mapping[str, Any]]]]:
     requested_date = _requested_show_date(user_text, now=now)
+    if has_explicit_show_date(user_text) and not requested_date:
+        return []
     allow_direct_subject = bool(
         allow_subject_continuity
         or _subject_continuity_requested(user_text)
@@ -3009,6 +2979,13 @@ def build_tiktok_show_evidence_context(
     # Prior eligible human context may resolve the show referent. It is a
     # retrieval query, never evidence that an audience member said anything.
     selection_query = str(selection_user_text or user_text or "")
+    date_query = (
+        user_text
+        if has_explicit_show_date(user_text) or _requested_show_date(user_text)
+        else selection_query
+    )
+    if has_explicit_show_date(date_query) and not _requested_show_date(date_query):
+        return ""
     subject_ref = (
         f"discord_user:{int(subject_user_id)}"
         if int(subject_user_id or 0) > 0
@@ -3016,7 +2993,7 @@ def build_tiktok_show_evidence_context(
     )
     # A current correction wins over a prior date. Once a generation owns
     # selected roots, relative-date rollover must not select a different show.
-    requested_show_date = (
+    requested_show_date = explicit_show_date(user_text) or (
         "" if pinned_show_keys else
         (_requested_show_date(user_text) or _requested_show_date(selection_query))
     )

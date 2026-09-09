@@ -19,6 +19,12 @@ whether the model used an allowed phrase.
   activity for a personal-history answer. Ordinary public show questions stay
   available under their existing authorization.
 - A public-only basis cannot gain requester-specific scope during refresh.
+- Website archive selection and finalized episode selection share the same
+  show-date resolver. ISO dates and named calendar dates identify the same
+  record. An explicit historical date takes precedence over current-show
+  wording and a website snapshot's date. An unavailable requested show or an
+  invalid calendar date cannot silently select the latest show. Source refresh
+  preserves that scope.
 - Independent valid sources stay available when one source changes. The
   existing response-repair owner reconstructs the prompt and makes a bounded
   corrective generation when necessary.

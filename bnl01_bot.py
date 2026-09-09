@@ -37,10 +37,12 @@ from bnl_tiktok_live_context import (
     build_durable_show_prompt_context,
     build_live_prompt_context,
     classify_tiktok_show_analysis_intent,
+    has_explicit_show_date,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
     live_context_diagnostics,
+    requested_show_date,
     select_show_for_tiktok_analysis,
 )
 from bnl_tiktok_live_memory import (
@@ -3527,12 +3529,19 @@ def build_tiktok_show_evidence_context_for_turn(
         guild_id=guild_id, subject_user_id=subject_user_id,
     )
     tiktok_show_evidence_query = str(user_text or "")
+    request_owns_show_date = bool(
+        has_explicit_show_date(tiktok_show_evidence_query)
+        or requested_show_date(
+            tiktok_show_evidence_query, include_current_relative=False,
+        )
+    )
     selected_show_date = re.search(
         r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b",
         website_read_model_context or "",
     )
     if (
         selected_show_date
+        and not request_owns_show_date
         and selected_show_date.group(1) not in tiktok_show_evidence_query
     ):
         tiktok_show_evidence_query = (
