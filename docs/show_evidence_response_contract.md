@@ -118,7 +118,10 @@ requiring recap wording. The existing current-speaker, guild, conversation,
 and reply-target boundaries still apply. The prior request selects labeled
 background evidence; it does not take over the current response or become
 proof of what an audience member said. A date outside show context alone is
-not a show-retrieval cue. These bounded cases do not establish arbitrary
+not a show-retrieval cue. Dated-source admission uses an existing show/live
+analysis intent or a date-associated show noun phrase; ordinary verbs such as
+"show me" or "I live in" do not make an unrelated date a show reference.
+These bounded cases do not establish arbitrary
 follow-up understanding or live model factuality.
 
 Regressions use real SQLite archive/ledger readers, source refresh, a real

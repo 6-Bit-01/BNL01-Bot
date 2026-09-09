@@ -333,6 +333,18 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(AUGUST_COMMENT, website)
                 self.assertNotIn(SEPTEMBER_COMMENT, website)
 
+    async def test_unrelated_dated_text_does_not_read_the_same_date_show_archive(self):
+        for request in (
+            "Show me the schedule for September 4, 2026.",
+            "I live in Test City and my appointment is September 4, 2026.",
+        ):
+            for policy in ("public_home", "sealed_test"):
+                with self.subTest(request=request, policy=policy):
+                    self.fetch.reset_mock()
+                    self.assertEqual(REAL_READ_MODEL_CONTEXT(request, policy), "")
+                    self.fetch.assert_not_called()
+                    self.assertEqual(bot.resolve_tiktok_show_analysis_request(request), "")
+
     async def test_explicit_live_show_date_keeps_current_comments_after_midnight(self):
         clock = live_fixture.Clock(time())
         adapter = live_fixture.TikTokLiveContextBridgeTests().make_adapter(clock)

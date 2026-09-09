@@ -11,6 +11,7 @@ from bnl_tiktok_live_context import (
     explicit_show_date,
     explicit_show_dates,
     has_explicit_show_date,
+    is_dated_show_query,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_query,
     requested_show_date,
@@ -48,6 +49,26 @@ def two_show_archive():
 
 
 class RequestedShowDateTests(unittest.TestCase):
+    def test_dated_source_admission_requires_a_show_reference_or_existing_intent(self):
+        for query in (
+            "Show me the schedule for September 4, 2026.",
+            "I live in Test City and my appointment is September 4, 2026.",
+            "On September 4, 2026 show me the schedule.",
+            "Stream the file saved on September 4, 2026.",
+        ):
+            with self.subTest(query=query):
+                self.assertFalse(is_dated_show_query(query))
+        for query in (
+            "Give me actual quotes from the August 28, 2026 show.",
+            "The 2026-08-28 show.",
+            "The show on August 28, 2026.",
+            "That episode from August 28, 2026.",
+            "What's TikTok chat saying on September 4, 2026?",
+            "What stood out in TikTok chat on August 28, 2026?",
+        ):
+            with self.subTest(query=query):
+                self.assertTrue(is_dated_show_query(query))
+
     def test_month_names_ordinals_and_iso_resolve_to_same_calendar_date(self):
         for date_text in (
             "2026-08-28", "2026-8-28", "August 28, 2026", "August 28 2026",

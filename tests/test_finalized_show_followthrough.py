@@ -158,6 +158,8 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
             {"prior_user_id": 43},
             {"exact_other_reply": True},
             {"prior_request": "My birthday is August 28, 2026."},
+            {"prior_request": "Show me the schedule for August 28, 2026."},
+            {"prior_request": "I live in Test City and my appointment is August 28, 2026."},
         ):
             with self.subTest(changes=changes):
                 result, basis = self._context(

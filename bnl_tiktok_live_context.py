@@ -441,10 +441,30 @@ def explicit_show_dates(user_text: str) -> tuple[str, ...]:
 def is_dated_show_query(user_text: str) -> bool:
     """A dated show reference can select evidence without a recap phrase."""
 
-    return bool(
-        has_explicit_show_date(user_text)
-        and _SHOW_DATE_SCOPE_RE.search(str(user_text or ""))
-    )
+    query = _SPACE_RE.sub(" ", str(user_text or "")).strip().lower()
+    dates = _explicit_show_date_matches(query)
+    if not dates:
+        return False
+    if is_tiktok_show_analysis_query(query) or any(
+        re.search(pattern, query) for pattern in _LIVE_REACTION_PATTERNS
+    ):
+        # Admit the existing intent before the website resolves the show's
+        # actual date; this does not authorize a particular archive or buffer.
+        return True
+    for match in dates:
+        before, after = query[:match.start()], query[match.end():]
+        # A dated noun phrase can be a source reference without a recap verb.
+        # A bare "show me" or "I live in" elsewhere in the turn cannot.
+        if (
+            (not before or re.search(r"\b(?:the|this|that|a|an|our)\s+$", before))
+            and re.match(r"\s*(?:['’]s\s+)?(?:show|episode|stream|broadcast)s?\b", after)
+        ) or re.search(
+            r"\b(?:the|this|that|a|an|our)\s+(?:show|episode|stream|broadcast)s?"
+            r"(?:\s+(?:on|of|from|for))?\s+$",
+            before,
+        ):
+            return True
+    return False
 
 
 def _pacific_show_date(now: Any = None) -> date:
