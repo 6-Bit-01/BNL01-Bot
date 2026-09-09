@@ -20,7 +20,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -60,6 +60,41 @@ _HANDLE_RE = re.compile(r"^[A-Za-z0-9._]+$")
 _PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 _SHOW_DATE_SCOPE_RE = re.compile(
     r"\b(?:tiktok|tik tok|barcode radio|broadcast|show|episode|live|stream)\b",
+    re.IGNORECASE,
+)
+_SHOW_MONTHS = {
+    name: number
+    for number, names in enumerate(
+        (
+            ("january", "jan"), ("february", "feb"), ("march", "mar"),
+            ("april", "apr"), ("may",), ("june", "jun"),
+            ("july", "jul"), ("august", "aug"),
+            ("september", "sept", "sep"), ("october", "oct"),
+            ("november", "nov"), ("december", "dec"),
+        ),
+        start=1,
+    )
+    for name in names
+}
+_SHOW_MONTH_PATTERN = "(?:" + "|".join(
+    sorted(_SHOW_MONTHS, key=len, reverse=True)
+) + r")\.?"
+_EXPLICIT_SHOW_DATE_PATTERNS = (
+    re.compile(r"\b(?P<year>\d{4})-(?P<month_number>\d{1,2})-(?P<day>\d{1,2})\b"),
+    re.compile(
+        rf"\b(?P<month_name>{_SHOW_MONTH_PATTERN})\s*(?P<day>\d{{1,2}})"
+        r"(?:st|nd|rd|th)?(?:\s*,\s*|\s+)(?P<year>\d{4})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s*(?P<month_name>{_SHOW_MONTH_PATTERN})"
+        r"\s*,?\s*(?P<year>\d{4})\b",
+        re.IGNORECASE,
+    ),
+)
+_PAST_SHOW_DATE_RE = re.compile(r"\b(?:yesterday|last night)\b", re.IGNORECASE)
+_PAST_SHOW_REFERENCE_RE = re.compile(
+    r"\b(?:last|previous|prior|past) (?:show|episode|stream|broadcast|live)\b",
     re.IGNORECASE,
 )
 
@@ -355,11 +390,81 @@ _HEALTH_FIELDS = (
 )
 
 
-def is_live_show_reaction_query(text: str) -> bool:
+def _explicit_show_date_match(user_text: str) -> Optional[re.Match]:
+    matches = [
+        match for pattern in _EXPLICIT_SHOW_DATE_PATTERNS
+        if (match := pattern.search(str(user_text or ""))) is not None
+    ]
+    return min(matches, key=lambda match: match.start()) if matches else None
+
+
+def has_explicit_show_date(user_text: str) -> bool:
+    """Recognize a dated request even when its calendar date is invalid."""
+
+    return _explicit_show_date_match(user_text) is not None
+
+
+def explicit_show_date(user_text: str) -> str:
+    """Normalize an explicit ISO or English month date without guessing a year."""
+
+    match = _explicit_show_date_match(user_text)
+    if match is None:
+        return ""
+    parts = match.groupdict()
+    month = (
+        _SHOW_MONTHS[parts["month_name"].casefold().rstrip(".")]
+        if parts.get("month_name") else int(parts["month_number"])
+    )
+    try:
+        return date(int(parts["year"]), month, int(parts["day"])).isoformat()
+    except ValueError:
+        return ""
+
+
+def _pacific_show_date(now: Any = None) -> date:
+    if isinstance(now, datetime):
+        current = now
+    elif now is not None:
+        try:
+            current = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            current = datetime.now(timezone.utc)
+    else:
+        current = datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(_PACIFIC_TZ).date()
+
+
+def requested_show_date(
+    user_text: str, *, now: Any = None, include_current_relative: bool = True,
+) -> str:
+    """Resolve the requested public show date for all existing show readers."""
+
+    if has_explicit_show_date(user_text):
+        return explicit_show_date(user_text)
+    query = str(user_text or "")
+    if not _SHOW_DATE_SCOPE_RE.search(query):
+        return ""
+    if _PAST_SHOW_DATE_RE.search(query):
+        return (_pacific_show_date(now) - timedelta(days=1)).isoformat()
+    if include_current_relative and re.search(
+        r"\b(?:today|tonight|this evening)\b", query, re.IGNORECASE,
+    ):
+        return _pacific_show_date(now).isoformat()
+    return ""
+
+
+def is_live_show_reaction_query(text: str, *, now: Any = None) -> bool:
     """Return whether a request needs current TikTok/show reaction context."""
 
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
+        return False
+    if has_explicit_show_date(normalized):
+        if explicit_show_date(normalized) != _pacific_show_date(now).isoformat():
+            return False
+    elif _PAST_SHOW_DATE_RE.search(normalized) or _PAST_SHOW_REFERENCE_RE.search(normalized):
         return False
     return any(re.search(pattern, normalized) for pattern in _LIVE_REACTION_PATTERNS)
 
@@ -526,37 +631,18 @@ def select_show_for_tiktok_analysis(
     if not candidates:
         return {}, "none"
     normalized = _SPACE_RE.sub(" ", str(user_text or "")).strip().lower()
-    explicit_date = re.search(r"\b20\d{2}-\d{2}-\d{2}\b", normalized)
-    if explicit_date:
+    # The website owns an ongoing show's date across midnight. A request for
+    # "tonight" still refers to that current record, while explicit dates and
+    # past calendar days constrain historical selection.
+    requested_date = requested_show_date(
+        user_text, now=now, include_current_relative=False,
+    )
+    if requested_date:
         for source_key, show in candidates:
-            if _bounded_text(show.get("showDate"), 40) == explicit_date.group(0):
+            if _bounded_text(show.get("showDate"), 40) == requested_date:
                 return dict(show), source_key
         return {}, "none"
-    relative_date = ""
-    if _SHOW_DATE_SCOPE_RE.search(normalized) and re.search(
-        r"\b(?:yesterday|last night)\b",
-        normalized,
-    ):
-        if isinstance(now, datetime):
-            current = now
-        elif now is not None:
-            try:
-                current = datetime.fromisoformat(
-                    str(now).replace("Z", "+00:00")
-                )
-            except (TypeError, ValueError):
-                current = datetime.now(timezone.utc)
-        else:
-            current = datetime.now(timezone.utc)
-        if current.tzinfo is None:
-            current = current.replace(tzinfo=timezone.utc)
-        relative_date = (
-            current.astimezone(_PACIFIC_TZ).date() - timedelta(days=1)
-        ).isoformat()
-    if relative_date:
-        for source_key, show in candidates:
-            if _bounded_text(show.get("showDate"), 40) == relative_date:
-                return dict(show), source_key
+    if has_explicit_show_date(user_text):
         return {}, "none"
     if re.search(r"\b(?:last|previous|prior|past) show\b", normalized):
         for source_key, show in candidates:
