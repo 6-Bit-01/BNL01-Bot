@@ -212,6 +212,63 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
             max_results=max_results,
         )
 
+    def test_occurrence_read_cost_does_not_scale_with_unrelated_history(self):
+        base = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        for row_id in range(1, 81):
+            self._add_source(
+                row_id,
+                observed_at=(base + timedelta(hours=row_id)).isoformat(),
+            )
+        self.conn.commit()
+
+        def read_with_cost():
+            ticks = [0]
+
+            def progress():
+                ticks[0] += 1
+                return 0
+
+            self.conn.set_progress_handler(progress, 1000)
+            try:
+                rows = ledger._main_public_assessment_occurrence_candidates(
+                    self.conn,
+                    guild_id=self.GUILD_ID,
+                    subject_key=self.SUBJECT_KEY,
+                    channel_id=10,
+                    channel_policy="public_home",
+                    max_observed_at=(base + timedelta(hours=80)).isoformat(),
+                )
+            finally:
+                self.conn.set_progress_handler(None, 0)
+            return rows, ticks[0] * 1000
+
+        original, original_steps = read_with_cost()
+        self.assertEqual(len(original), ledger._CONVERSATION_OCCURRENCE_MAX_SCAN + 1)
+        # Same guild, other people: these retained conversations and lineage
+        # links must not turn each exact source lookup into a full-table scan.
+        self.conn.executemany(
+            """INSERT INTO conversations
+            SELECT ?,guild_id,99,'Other Member',role,content,channel_id,
+                   channel_name,channel_policy,?,route_mode,public_usable,
+                   visibility,timestamp
+            FROM conversations WHERE id=1""",
+            ((row_id, 1_000_000 + row_id) for row_id in range(1001, 9001)),
+        )
+        self.conn.executemany(
+            "INSERT INTO memory_ledger_lineage VALUES (?,?,?,?,?)",
+            (
+                ("noise-%s" % i, self.GUILD_ID, "derived_from",
+                 "other-%s" % i, base.isoformat())
+                for i in range(8000)
+            ),
+        )
+        self.conn.commit()
+
+        expanded, expanded_steps = read_with_cost()
+
+        self.assertEqual(expanded, original)
+        self.assertLess(expanded_steps, original_steps * 2 + 10_000)
+
     def test_selector_cost_is_bounded_for_221_retained_rows(self):
         base = datetime(2026, 7, 1, tzinfo=timezone.utc)
         for row_id in range(1, 222):

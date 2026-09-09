@@ -2066,6 +2066,9 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_mle_predicate ON memory_ledger_entries(guild_id, predicate_key)",
         "CREATE INDEX IF NOT EXISTS idx_mle_observed ON memory_ledger_entries(guild_id, observed_at)",
         "CREATE INDEX IF NOT EXISTS idx_mll_guild ON memory_ledger_lineage(guild_id, lineage_type, target_entry_id)",
+        # Incoming controls also detect malformed cross-guild edges. Keep that
+        # scope intact while avoiding a full lineage scan for every source.
+        "CREATE INDEX IF NOT EXISTS idx_mll_target ON memory_ledger_lineage(target_entry_id, lineage_type)",
         "CREATE INDEX IF NOT EXISTS idx_mlp_participant ON memory_ledger_participants(guild_id, participant_key, order_index)",
         "CREATE INDEX IF NOT EXISTS idx_mlr_guild ON memory_ledger_shadow_receipts(guild_id, writer, outcome, reason_code)",
         "CREATE INDEX IF NOT EXISTS idx_mlkc_guild_type ON memory_ledger_knowledge_candidates(guild_id, candidate_type, candidate_state)",
@@ -8387,6 +8390,7 @@ def _main_public_assessment_occurrence_candidates(
         FROM main.memory_ledger_entries e
         JOIN main.conversations c
           ON c.guild_id=e.guild_id
+         AND c.id=CAST(e.source_row_id AS INTEGER)
          AND CAST(c.id AS TEXT)=e.source_row_id
         WHERE e.guild_id=? AND e.subject_key=?
           AND e.entry_type='observation' AND e.predicate_key='conversation'
