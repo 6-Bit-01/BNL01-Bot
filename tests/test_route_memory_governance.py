@@ -592,13 +592,18 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
             prompt,
         )
         self.assertIn(
-            "Use exact wording only when the user explicitly needs verification "
-            "for a consequential dispute",
+            "use only supplied source-authored show excerpts and preserve each "
+            "excerpt's original speaker; never combine names and words from separate events",
             prompt,
         )
         self.assertIn(
-            "A derived summary, memory tier, relationship note, or Moment gist "
-            "can never justify exact wording",
+            "A consequential current-room exact-quote request still requires "
+            "the typed Exact-quote authority block and its limits",
+            prompt,
+        )
+        self.assertIn(
+            "A derived summary, memory tier, relationship note, Moment gist, "
+            "or prior BNL reply cannot establish exact audience wording",
             prompt,
         )
 

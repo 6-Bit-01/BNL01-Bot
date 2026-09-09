@@ -25,6 +25,7 @@ import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_website_relay_state
 import test_publication_read_adapters as publication_fixtures
+import test_tiktok_show_evidence_ledger as show_fixtures
 from test_conversation_batching import FakeChannel, FakeGuild, FakeMessage
 
 
@@ -38,6 +39,7 @@ QUEUE_REQUEST = (
 QUEUE_CONTEXT = "Current public queue information: submissions are open."
 JOURNAL_BODY = "The Copper Kite instrumental brought the room together."
 RELAY_BODY = "The Copper Kite instrumental sparked a public listening exchange."
+REAL_SHOW_CONTEXT_FOR_TURN = bnl01_bot.build_tiktok_show_evidence_context_for_turn
 
 
 class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
@@ -223,6 +225,93 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(PUBLIC_MEMORY, prompt)
         self.assertNotIn(INTERNAL_MEMORY, prompt)
         self.assertNotIn(SEALED_MEMORY, prompt)
+
+    def _seed_finalized_show(self):
+        fixture = show_fixtures.TikTokShowEvidenceLedgerTests()
+        fixture.seed_source_and_memory(bnl01_bot.DB_FILE)
+        result = show_fixtures.sync_tiktok_show_evidence_ledgers(
+            bnl01_bot.DB_FILE, guild_id=77,
+            read_model=show_fixtures.authorized_read_model({
+                "currentShow": None, "latestShow": show_fixtures.archived_show(),
+                "shows": [],
+            }),
+            artist_identity_index=show_fixtures.artist_index(),
+            environ=show_fixtures.ENABLED_QUEUE_ENV,
+        )
+        self.assertEqual(result["showsFinalized"], 1)
+        self.guild_id = 77
+        self.user_id = 42
+        self.stack.enter_context(mock.patch.dict(os.environ, show_fixtures.ENABLED_QUEUE_ENV))
+        self.stack.enter_context(mock.patch.object(
+            bnl01_bot, "build_tiktok_show_evidence_context_for_turn",
+            side_effect=REAL_SHOW_CONTEXT_FOR_TURN,
+        ))
+
+    def _assert_show_source(self, prompt, bases):
+        selected = tuple(b for b in bases if isinstance(b, bnl01_bot.FinalizedShowPromptSourceBasis))
+        self.assertEqual(len(selected), 1)
+        self.assertIn("Source-linked authored examples:", prompt)
+        self.assertIn("the green visuals during this song are wild.", prompt)
+        self.assertNotIn("This private row must never enter", prompt)
+        self.assertTrue(selected[0].authored_excerpts)
+        self.assertTrue(all(
+            excerpt.source_text and excerpt.speaker_label
+            for excerpt in selected[0].authored_excerpts
+        ))
+        self.assertFalse(any(
+            excerpt.speaker_label == "BNL-01"
+            for excerpt in selected[0].authored_excerpts
+        ))
+        self.assertEqual(bnl01_bot.prompt_source_basis_failure(selected), "")
+        return selected
+
+    async def test_finalized_show_authored_sources_reach_real_direct_and_batch_assembly(self):
+        self._seed_finalized_show()
+        request = "What did the chat say during the show on 2026-08-28?"
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy, route="direct"):
+                prompt, metadata = await self._direct_prompt_async(policy, request=request)
+                self._assert_show_source(prompt, metadata["prompt_source_bases"])
+            with self.subTest(policy=policy, route="batch"):
+                _channel, generation, guard = await self._batch(policy, request=request)
+                self.assertTrue(generation.await_count)
+                self._assert_show_source(
+                    generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"],
+                )
+
+    async def test_finalized_source_disappearance_uses_existing_refresh_without_substitution(self):
+        self._seed_finalized_show()
+        prompt, metadata = await self._direct_prompt_async(
+            "sealed_test", request="What did the chat say during the show on 2026-08-28?",
+        )
+        bases = self._assert_show_source(prompt, metadata["prompt_source_bases"])
+        replacement_show = show_fixtures.archived_show()
+        replacement_show["sessionId"] = "test-replacement-show"
+        show_fixtures.sync_tiktok_show_evidence_ledgers(
+            bnl01_bot.DB_FILE, guild_id=77,
+            read_model=show_fixtures.authorized_read_model({
+                "currentShow": None, "latestShow": replacement_show,
+                "shows": [show_fixtures.archived_show()],
+            }),
+            artist_identity_index=show_fixtures.artist_index(),
+            environ=show_fixtures.ENABLED_QUEUE_ENV,
+        )
+        self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "")
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute(
+                "DELETE FROM tiktok_show_evidence_ledgers WHERE guild_id=77 AND show_key=?",
+                (bases[0].show_keys[0],),
+            )
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM tiktok_show_evidence_ledgers WHERE guild_id=77",
+            ).fetchone()[0], 1)
+        self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "show_episode_source_changed")
+        refreshed_prompt, fresh, changed, failed = bnl01_bot.refresh_prompt_source_bases(prompt, bases)
+        self.assertTrue(changed)
+        self.assertFalse(failed)
+        self.assertNotIn("the green visuals during this song are wild.", refreshed_prompt)
+        self.assertFalse(fresh[0].rendered_context)
+        self.assertFalse(fresh[0].authored_excerpts)
 
     def _seed_publications(self, *, public_excluded=(), memory_excluded=()):
         bnl_journal.ensure_schema(bnl01_bot.DB_FILE)
@@ -1044,6 +1133,97 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
                 conn.execute("UPDATE memory_ledger_entries SET normalized_value=? WHERE entry_id=?", ("The Silver Moth arrangement is the corrected music goal.", entry_id))
             self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "memory_source_changed")
 
+
+    async def test_personal_show_memory_composes_with_member_memory_in_direct_prompt(self):
+        show_context = (
+            "Durable BARCODE Radio show episode memory:\n"
+            "Attributed public TikTok/Discord evidence:\n"
+            "- Test Member asked BNL about the Copper Kite instrumental.\n"
+        )
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy), mock.patch.object(
+                bnl01_bot, "build_tiktok_show_evidence_context_for_turn",
+                return_value=show_context,
+            ), mock.patch.object(
+                bnl01_bot, "build_shared_brain_synthesis_basis",
+                wraps=bnl01_bot.build_shared_brain_synthesis_basis,
+            ) as synthesis:
+                prompt, metadata = self._direct_prompt(
+                    policy, request="What do you remember about me?",
+                )
+                self.assertIn(PUBLIC_MEMORY, prompt)
+                self.assertIn(show_context, prompt)
+                self.assertNotIn("Finalized BARCODE Radio episode priority:", prompt)
+                self.assertTrue(metadata["source_context_available"])
+                contexts = synthesis.call_args.kwargs["competing_factual_contexts"]
+                self.assertTrue(any(PUBLIC_MEMORY in value for value in contexts))
+                self.assertTrue(any(show_context in value for value in contexts))
+
+    async def _assert_personal_show_memory_batch_composition(self, policy):
+        show_context = (
+            "Durable BARCODE Radio show episode memory:\n"
+            "Attributed public TikTok/Discord evidence:\n"
+            "- Test Member asked BNL about the Copper Kite instrumental.\n"
+        )
+        answer = "Test Member shared the Copper Kite instrumental and asked about it during the show."
+        with mock.patch.object(
+            bnl01_bot, "build_tiktok_show_evidence_context_for_turn",
+            return_value=show_context,
+        ), mock.patch.object(
+            bnl01_bot, "build_shared_brain_synthesis_basis",
+            wraps=bnl01_bot.build_shared_brain_synthesis_basis,
+        ) as synthesis:
+            # The sealed legacy broad-recall shortcut is a distinct owner;
+            # this targeted wording enters its existing normal batch route.
+            request = (
+                "BNL, what do you remember me telling you about the Copper Kite instrumental?"
+                if policy == "sealed_test"
+                else "BNL, what do you remember about me?"
+            )
+            channel, generation, _guard = await self._batch(
+                policy, request=request, answer=answer,
+            )
+            prompt = generation.call_args.args[0]
+            self.assertIn(PUBLIC_MEMORY, prompt)
+            self.assertIn(show_context, prompt)
+            self.assertNotIn("Finalized BARCODE Radio episode priority:", prompt)
+            synthesis.assert_called_once()
+            contexts = synthesis.call_args.kwargs["competing_factual_contexts"]
+            self.assertTrue(any(PUBLIC_MEMORY in value for value in contexts))
+            self.assertTrue(any(show_context in value for value in contexts))
+            self.assertEqual(generation.await_count, 1)
+            self.assertEqual(channel.sent, [answer])
+            with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM conversations WHERE role='model' AND content=?",
+                    (answer,),
+                ).fetchone()[0], 1)
+
+    async def test_personal_show_memory_composes_in_public_batch(self):
+        await self._assert_personal_show_memory_batch_composition("public_home")
+
+    async def test_personal_show_memory_composes_in_sealed_batch(self):
+        await self._assert_personal_show_memory_batch_composition("sealed_test")
+
+    async def test_explicit_show_request_retains_show_priority_in_direct_and_batch(self):
+        show_context = (
+            "Durable BARCODE Radio show episode memory:\n"
+            "Attributed public TikTok/Discord evidence:\n"
+            "- Test Member asked BNL about the Copper Kite instrumental.\n"
+        )
+        request = "What happened during the last show?"
+        with mock.patch.object(
+            bnl01_bot, "build_tiktok_show_evidence_context_for_turn", return_value=show_context,
+        ):
+            prompt, _metadata = self._direct_prompt("sealed_test", request=request)
+            self.assertIn("Finalized BARCODE Radio episode priority:", prompt)
+            channel, generation, _guard = await self._batch(
+                "sealed_test", request=request,
+                answer="Test Member asked BNL about the Copper Kite instrumental.",
+            )
+            self.assertIn("Finalized BARCODE Radio episode priority:", generation.call_args.args[0])
+            self.assertEqual(generation.await_count, 1)
+            self.assertEqual(len(channel.sent), 1)
 
 if __name__ == "__main__":
     unittest.main()

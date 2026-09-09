@@ -4,6 +4,8 @@ from datetime import datetime, timezone, timedelta
 
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
+    MAX_RENDERED_CHARS,
+    MAX_RENDERED_LINE_CHARS,
     ConversationContextRequest,
     TransientDiscordReplySource,
     assess_payload_grounding,
@@ -1121,6 +1123,143 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
         self.assertEqual(res.final_char_count, len(res.rendered_context))
         self.assertEqual(len(res.selected_row_ids), res.same_room_paired_turn_count * 2 + res.cross_channel_paired_turn_count * 2 + res.unpaired_row_count)
         self.assertNotRegex(res.rendered_context, r"User/member: .*\Z")
+
+    def test_attribution_challenge_retains_bnls_original_late_authored_span(self):
+        introduction = "The discussion continued through several unrelated topics. " * 12
+        claimed_quote = '"The paper lantern blinked twice." — TestBeacon.'
+        original = introduction + claimed_quote
+        rows = [
+            row(1, "user", "Tell me more about the discussion.", minutes=6),
+            row(2, "model", original, minutes=6),
+            row(3, "user", "Who is TestBeacon?", minutes=3),
+            row(4, "model", "I have no evidence about TestBeacon.", minutes=3),
+        ]
+        result = assemble_conversation_context_v2(
+            rows, req(current_texts=("You said TestBeacon first.",))
+        )
+        original_line = next(
+            line for line in result.rendered_context.splitlines()
+            if claimed_quote in line
+        )
+        self.assertTrue(original_line.startswith("BNL-01: "))
+        self.assertIn("[text omitted]", original_line)
+        self.assertIn("I have no evidence about TestBeacon.", result.rendered_context)
+        self.assertIn(2, result.selected_row_ids)
+        self.assertIn("third-party facts", result.rendered_context)
+        self.assertLessEqual(
+            len(original_line.removeprefix("BNL-01: ")),
+            MAX_RENDERED_LINE_CHARS,
+        )
+        self.assertLessEqual(result.final_char_count, MAX_RENDERED_CHARS)
+        self.assertEqual(rows[1]["content"], original)
+
+    def test_excerpt_keeps_human_authored_correction_after_long_introduction(self):
+        original = (
+            "This paragraph explains unrelated details about the workshop. " * 10
+            + "The amber resonator needs twelve coils, never twenty."
+        )
+        result = assemble_conversation_context_v2(
+            [row(1, "user", original), row(2, "model", "I will check the design.")],
+            req(current_texts=("What did I say about the amber resonator?",)),
+        )
+        self.assertIn(
+            "The amber resonator needs twelve coils, never twenty.",
+            result.rendered_context,
+        )
+        self.assertIn("User/member: [text omitted]", result.rendered_context)
+        self.assertIn("BNL-01: I will check the design.", result.rendered_context)
+
+    def test_excerpt_keeps_quote_paragraph_and_its_attribution_together(self):
+        quote = '"I counted twelve blue windows above the station." — TestBeacon (opening set)'
+        original = (
+            "Unrelated introductory material. " * 20
+            + '\n\n"The red train arrived late." — TestEcho (second set)'
+            + "\n\n" + quote
+            + "\n\nThat was the last passage supplied."
+        )
+        result = assemble_conversation_context_v2(
+            [row(1, "user", "Give me the passages."), row(2, "model", original)],
+            req(current_texts=("Who is TestBeacon?",)),
+        )
+        self.assertIn("BNL-01: [text omitted] " + quote, result.rendered_context)
+        self.assertNotIn("TestEcho", result.rendered_context)
+
+    def test_excerpt_offsets_survive_unicode_case_mapping_expansion(self):
+        quote = '"The paper lantern blinked twice." — TestBeacon.'
+        original = "İnitial background details. " * 20 + "\n\n" + quote
+        result = assemble_conversation_context_v2(
+            [row(1, "user", "Tell me more."), row(2, "model", original)],
+            req(current_texts=("Who is TestBeacon?",)),
+        )
+        self.assertIn("BNL-01: [text omitted] " + quote, result.rendered_context)
+        self.assertLessEqual(result.final_char_count, MAX_RENDERED_CHARS)
+
+    def test_unrelated_followup_marks_a_clipped_prefix_without_inventing_a_span(self):
+        original = "An introductory observation. " + "More unrelated discussion follows. " * 20
+        result = assemble_conversation_context_v2(
+            [row(1, "user", "Tell me more."), row(2, "model", original)],
+            req(current_texts=("Continue?",)),
+        )
+        rendered = next(
+            line.removeprefix("BNL-01: ")
+            for line in result.rendered_context.splitlines()
+            if line.startswith("BNL-01: ")
+        )
+        self.assertTrue(rendered.startswith("An introductory observation."))
+        self.assertTrue(rendered.endswith("[text omitted]"))
+        self.assertTrue(original.startswith(rendered.removesuffix(" [text omitted]")))
+        self.assertLessEqual(len(rendered), MAX_RENDERED_LINE_CHARS)
+
+    def test_late_group_reply_span_retains_group_and_speaker_boundaries(self):
+        claimed_quote = '"The paper lantern blinked twice." — TestBeacon.'
+        original = "Unrelated workshop discussion. " * 25 + "\n\n" + claimed_quote
+        rows = [
+            row(1, "user", "Tell us about the station.", user=1, name="Test Member A"),
+            row(2, "user", "What was said there?", user=2, name="Test Member B"),
+            dict(row(3, "model", original, user=0), response_participant_ids=(1, 2)),
+        ]
+        result = assemble_conversation_context_v2(
+            rows,
+            req(current_texts=("You introduced TestBeacon.",), is_batch=True,
+                current_participants=frozenset({1, 2})),
+        )
+        self.assertIn(
+            "BNL-01 (reply to room/group): [text omitted] " + claimed_quote,
+            result.rendered_context,
+        )
+        self.assertIn('display name “Test Member A”', result.rendered_context)
+        self.assertIn('display name “Test Member B”', result.rendered_context)
+        self.assertEqual(result.selected_row_ids, (1, 2, 3))
+
+    def test_unpaired_member_span_keeps_late_current_anchor(self):
+        source = (
+            "Unrelated workshop discussion. " * 25
+            + "\n\nCan the amber resonator use twelve coils?"
+        )
+        result = assemble_conversation_context_v2(
+            [row(1, "user", source, user=2, name="Test Member")],
+            req(current_texts=("What about the amber resonator?",)),
+        )
+        self.assertIn(
+            'User/member (display name “Test Member”; open loop): '
+            '[text omitted] Can the amber resonator use twelve coils?',
+            result.rendered_context,
+        )
+        self.assertEqual(result.selected_row_ids, (1,))
+
+    def test_tail_anchor_does_not_make_private_or_stale_history_eligible(self):
+        source = "Unrelated introductory material. " * 20 + "TestBeacon said the lamp moved."
+        result = assemble_conversation_context_v2(
+            [
+                row(1, "user", "Tell me about the lamp.", policy="internal_controlled"),
+                row(2, "model", source, policy="internal_controlled"),
+                row(3, "user", "Tell me about the lamp.", minutes=46),
+                row(4, "model", source, minutes=46),
+            ],
+            req(current_texts=("Who introduced TestBeacon?",)),
+        )
+        self.assertEqual(result.rendered_context, "")
+        self.assertEqual(result.selected_row_ids, ())
 
 class BotConversationContextV2IntegrationTests(unittest.TestCase):
     def setUp(self):

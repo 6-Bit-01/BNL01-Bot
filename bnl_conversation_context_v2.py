@@ -1,6 +1,7 @@
 """Route-aware bounded conversation prompt context for BNL."""
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import re
@@ -288,7 +289,7 @@ class _ParsedTime:
 def normalize_text(text: str) -> str:
     return " ".join(_WORD_RE.findall((text or "").lower()))
 
-def sanitize_history_text(text: str, limit: int = MAX_RENDERED_LINE_CHARS) -> str:
+def _clean_history_text(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
     # Legacy rows can predate live mention resolution. Keep raw Discord IDs and
     # mass-mention tokens out of prompts so a model cannot echo them downstream.
@@ -297,9 +298,92 @@ def sanitize_history_text(text: str, limit: int = MAX_RENDERED_LINE_CHARS) -> st
     cleaned = re.sub(r"<#\d+>", "#channel", cleaned, flags=re.I)
     cleaned = re.sub(r"@(everyone|here)\b", r"\1", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(BNL-01|System|Current user request|User/member|User message)\s*:", lambda m: m.group(1).replace("-", "‑") + "﹕", cleaned, flags=re.I)
+    return cleaned
+
+
+def sanitize_history_text(text: str, limit: int = MAX_RENDERED_LINE_CHARS) -> str:
+    cleaned = _clean_history_text(text)
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _render_history_excerpt(text: str, current_text: str) -> str:
+    """Keep relevant authored text inside the existing ordinary-row budget.
+
+    Row eligibility and selection have already happened. This changes only
+    which contiguous source span is visible when that row is too long; it does
+    not summarize the source or promote a prior model claim into outside facts.
+    Exact Discord reply sources retain their separate structural rendering.
+    """
+    cleaned = _clean_history_text(text)
+    if len(cleaned) <= MAX_RENDERED_LINE_CHARS:
+        return cleaned
+    omitted = "[text omitted]"
+    width = MAX_RENDERED_LINE_CHARS - 2 * (len(omitted) + 1)
+    anchors = _tokens(current_text)
+    matches = tuple(
+        match for match in re.finditer(_WORD_RE.pattern, cleaned, re.I | re.ASCII)
+        if match.group().lower() in anchors
+    )
+    sentence_starts = {0}
+    sentence_starts.update(
+        match.end() for match in re.finditer(r"(?<=[.!?])\s+", cleaned)
+    )
+    paragraph_starts = {0}
+    cursor = 0
+    for paragraph in re.split(r"\n\s*\n", text):
+        normalized = _clean_history_text(paragraph)
+        if not normalized:
+            continue
+        position = cleaned.find(normalized, cursor)
+        if position >= 0:
+            paragraph_starts.add(position)
+            cursor = position + len(normalized)
+    sentence_starts.update(paragraph_starts)
+    ordered_sentence_starts = sorted(sentence_starts)
+    match_starts = tuple(match.start() for match in matches)
+    starts = {0}
+    for match in matches:
+        starts.update((
+            max(0, match.start() - width // 2),
+            max(0, match.end() - width),
+            ordered_sentence_starts[
+                bisect_right(ordered_sentence_starts, match.start()) - 1
+            ],
+        ))
+    best_score = (-1, -1, -1, -1, -1)
+    best_span = (0, width)
+    for proposed_start in sorted(starts):
+        start = proposed_start
+        if start and not cleaned[start - 1].isspace():
+            preceding_space = cleaned.rfind(" ", 0, start)
+            start = preceding_space + 1
+        end = min(len(cleaned), start + width)
+        if end < len(cleaned) and not cleaned[end].isspace():
+            preceding_space = cleaned.rfind(" ", start, end)
+            if preceding_space > start:
+                end = preceding_space
+        covered = {
+            match.group().lower() for match in matches[
+                bisect_left(match_starts, start):bisect_left(match_starts, end)
+            ]
+            if match.end() <= end
+        }
+        # Distinct lexical coverage favors informative anchors over repeated
+        # filler, with sentence starts and earlier text breaking equal scores.
+        score = (
+            sum(len(term) for term in covered), len(covered),
+            int(start in paragraph_starts), int(start in sentence_starts), -start,
+        )
+        if score > best_score:
+            best_score, best_span = score, (start, end)
+    start, end = best_span
+    return " ".join(part for part in (
+        omitted if start else "",
+        cleaned[start:end].strip(),
+        omitted if end < len(cleaned) else "",
+    ) if part)
 
 def sanitize_speaker_name(text: str, limit: int = 72) -> str:
     cleaned = "".join(ch if (ch.isalnum() or ch in " _.-") else " " for ch in str(text or ""))
@@ -2087,8 +2171,8 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                 if pair_row_ids & rendered_row_ids:
                     continue
                 block = [
-                    f"{_user_role_label(item['user'])}: {sanitize_history_text(item['user'].get('content') or '')}",
-                    f"{_model_role_label(item['user'])}: {sanitize_history_text(item['model'].get('content') or '')}",
+                    f"{_user_role_label(item['user'])}: {_render_history_excerpt(item['user'].get('content') or '', current_text)}",
+                    f"{_model_role_label(item['user'])}: {_render_history_excerpt(item['model'].get('content') or '', current_text)}",
                 ]
                 if not _append_block(lines, block, MAX_RENDERED_CHARS):
                     continue
@@ -2116,10 +2200,10 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                     continue
                 block = [
                     *[
-                        f"{_user_role_label(user)}: {sanitize_history_text(user.get('content') or '')}"
+                        f"{_user_role_label(user)}: {_render_history_excerpt(user.get('content') or '', current_text)}"
                         for user in users
                     ],
-                    f"BNL-01 (reply to room/group): {sanitize_history_text(item['model'].get('content') or '')}",
+                    f"BNL-01 (reply to room/group): {_render_history_excerpt(item['model'].get('content') or '', current_text)}",
                 ]
                 if not _append_block(lines, block, MAX_RENDERED_CHARS):
                     continue
@@ -2149,7 +2233,7 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                     if item.get("_unpaired_reason") == "immediate_referent_unpaired"
                     else "open loop"
                 )
-                block = [f"{_user_role_label(item, qualifier)}: {sanitize_history_text(item.get('content') or '')}"]
+                block = [f"{_user_role_label(item, qualifier)}: {_render_history_excerpt(item.get('content') or '', current_text)}"]
                 if not _append_block(lines, block, MAX_RENDERED_CHARS):
                     continue
                 row_ids.append(row_id)

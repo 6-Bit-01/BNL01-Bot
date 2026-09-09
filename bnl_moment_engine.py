@@ -4182,6 +4182,7 @@ def active_episode_for_assessment(
     topic_text: str,
     participant_keys: tuple[str, ...] = (),
     now: str | None = None,
+    expected_episode_id: str = "",
 ) -> ActiveEpisodeReference | None:
     """Select one active episode without creating schema or changing state."""
 
@@ -4212,6 +4213,8 @@ def active_episode_for_assessment(
     if len(candidates) != 1:
         return None
     candidate = candidates[0]
+    if expected_episode_id and str(candidate[0]) != str(expected_episode_id):
+        return None
     if (
         _parse_ts(now or _now())
         - _parse_ts(str(candidate[10] or ""))
@@ -4510,6 +4513,8 @@ def render_active_episode_canary_context(
     topic_text: str,
     participant_keys: tuple[str, ...] = (),
     now: str | None = None,
+    expected_episode_id: str = "",
+    reference_out: dict[str, ActiveEpisodeReference] | None = None,
 ) -> str:
     """Render source-revalidated aggregate episode context for sealed testing.
 
@@ -4519,6 +4524,8 @@ def render_active_episode_canary_context(
     participant names, ids, Moment ids, or episode ids.
     """
 
+    if reference_out is not None:
+        reference_out.clear()
     if (
         str(channel_policy or "").strip().lower() != "sealed_test"
         or int(guild_id or 0) <= 0
@@ -4534,6 +4541,7 @@ def render_active_episode_canary_context(
         topic_text=str(topic_text or "")[:8000],
         participant_keys=participant_keys,
         now=now,
+        expected_episode_id=expected_episode_id,
     )
     if reference is None:
         return ""
@@ -4663,6 +4671,8 @@ def render_active_episode_canary_context(
         ):
             return ""
 
+    if reference_out is not None:
+        reference_out["reference"] = reference
     topic_family = str(episode[0] or "topic_other")
     topic_label = TOPIC_GIST_LABELS.get(
         topic_family,
