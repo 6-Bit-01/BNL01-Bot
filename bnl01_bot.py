@@ -43,7 +43,9 @@ from bnl_tiktok_live_context import (
     is_tiktok_show_analysis_query,
     live_context_diagnostics,
     requested_show_date,
+    requested_show_dates,
     select_show_for_tiktok_analysis,
+    tiktok_show_records,
 )
 from bnl_tiktok_live_memory import (
     DEFAULT_ARCHIVE_SPOOL_PATH as DEFAULT_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH,
@@ -51,6 +53,7 @@ from bnl_tiktok_live_memory import (
     resolve_tiktok_identity,
 )
 from bnl_tiktok_show_ledger import (
+    TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT,
     build_tiktok_show_evidence_context,
     ensure_tiktok_show_evidence_schema,
     load_tiktok_show_source_events,
@@ -2498,7 +2501,7 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
         return False
     if _queue_read_model_query(normalized):
         return True
-    if is_live_show_reaction_query(normalized):
+    if is_live_show_reaction_query(normalized, check_show_date=False):
         return True
     if is_tiktok_show_analysis_query(normalized):
         return True
@@ -2863,11 +2866,31 @@ def build_bnl_read_model_context(
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
     source_context_items = _public_source_context_items(read_model)
     queue_query = _queue_read_model_query(user_text)
-    live_reaction_query = is_live_show_reaction_query(user_text)
+    current_show_date = (
+        _first_mapping(archive.get("currentShow")).get("showDate")
+        or _first_mapping(queue.get("session"), queue.get("currentSession")).get("showDate")
+        or ""
+    )
+    live_reaction_query = is_live_show_reaction_query(
+        user_text, current_show_date=str(current_show_date),
+    )
     show_analysis_text = (
         str(tiktok_show_analysis_request or "").strip()
-        or (user_text if is_tiktok_show_analysis_query(user_text) else "")
+        or (user_text if (
+            is_tiktok_show_analysis_query(user_text)
+            or (not live_reaction_query and is_live_show_reaction_query(
+                user_text, check_show_date=False,
+            ))
+        ) else "")
     )
+    if (
+        live_reaction_query
+        and not is_tiktok_show_analysis_query(user_text)
+        and " ".join(show_analysis_text.split()) == " ".join(str(user_text or "").split())
+    ):
+        # The website's ongoing show date owns current reactions, including
+        # when a normalized copy of the same request arrived from context.
+        show_analysis_text = ""
     show_analysis_query = bool(show_analysis_text)
     tiktok_context_query = live_reaction_query or show_analysis_query
     operational_query = queue_query or live_reaction_query or show_analysis_query
@@ -3096,19 +3119,41 @@ def build_bnl_read_model_context(
     if live_reaction_query or show_analysis_query:
         if access_scope in {"public", "private"}:
             if show_analysis_query:
-                durable_events = _load_durable_tiktok_show_events(
-                    archive,
-                    show_analysis_text,
-                )
-                lines.append(
-                    "\n"
-                    + build_durable_show_prompt_context(
-                        archive,
-                        durable_events,
-                        show_analysis_text,
+                dates = requested_show_dates(show_analysis_text)
+                scoped_archives = [("", archive)]
+                if len(dates) > 1:
+                    records = tiktok_show_records(archive)
+                    scoped_archives = []
+                    available_dates = 0
+                    for day in dates:
+                        shows = [
+                            show for show in records if show.get("showDate") == day
+                        ]
+                        scoped_archives.append((day, {"shows": shows}))
+                        if shows:
+                            available_dates += 1
+                        if available_dates >= TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT:
+                            break
+                for day, scoped_archive in scoped_archives:
+                    durable_events = _load_durable_tiktok_show_events(
+                        scoped_archive, show_analysis_text,
                     )
-                )
+                    if day:
+                        lines.append(f"\nRequested show date: {day}")
+                    lines.append(
+                        "\n" + build_durable_show_prompt_context(
+                            scoped_archive, durable_events, show_analysis_text,
+                        )
+                    )
             else:
+                if current_show_date:
+                    # Carry the authorized live scope with this rendered
+                    # source; persistence must not re-date it from the clock
+                    # or from a different queue session after midnight.
+                    lines.append(
+                        "\nTikTok live show scope: showDate="
+                        + _compact_public_text(current_show_date, 40)
+                    )
                 lines.append(
                     "\n"
                     + build_live_prompt_context(
@@ -3328,10 +3373,17 @@ def public_tiktok_interaction_memory_allowed(
 
     context = str(website_read_model_context or "")
     durable_show_context = "Durable TikTok show analysis context:" in context
+    live_show_date = re.search(
+        r"(?m)^TikTok live show scope: showDate=(20\d{2}-\d{2}-\d{2})$",
+        context,
+    )
     return bool(
         (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES
         and (
-            is_live_show_reaction_query(user_text)
+            is_live_show_reaction_query(
+                user_text,
+                current_show_date=live_show_date.group(1) if live_show_date else None,
+            )
             or is_tiktok_show_analysis_query(user_text)
             or durable_show_context
         )

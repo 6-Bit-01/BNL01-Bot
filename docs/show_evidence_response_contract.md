@@ -21,10 +21,29 @@ whether the model used an allowed phrase.
 - A public-only basis cannot gain requester-specific scope during refresh.
 - Website archive selection and finalized episode selection share the same
   show-date resolver. ISO dates and named calendar dates identify the same
-  record. An explicit historical date takes precedence over current-show
+  records. Every distinct valid explicit date remains available to the
+  existing bounded selectors; comparison requests are not reduced to their
+  first date. Within the existing bounds, each requested date gets a source
+  before additional sessions on the same date. The website adapter reads each
+  selected date separately within the existing two-show recall allowance.
+  Missing archive dates do not consume that allowance; selection continues
+  through requested dates until two available show dates are selected.
+  Missing requested shows do not
+  substitute another date or discard an independently available requested
+  show. An explicit historical date takes precedence over current-show
   wording and a website snapshot's date. An unavailable requested show or an
   invalid calendar date cannot silently select the latest show. Source refresh
   preserves that scope.
+- Dated live requests first reach the existing website reader. Once its
+  authorized current-show/session date is available, that date determines
+  whether to read current reactions, including a Friday show after Pacific
+  midnight. A historical recap still uses durable evidence; an explicit date
+  different from the ongoing show's date cannot read the live buffer as its
+  historical source. The rendered source carries that resolved live date into
+  the existing public-conversation persistence decision. Public delivered
+  replies retain their normal conversation row and continuation state after
+  midnight; the injected snapshot and sealed-channel replies retain their
+  existing no-store rules.
 - Independent valid sources stay available when one source changes. The
   existing response-repair owner reconstructs the prompt and makes a bounded
   corrective generation when necessary.
@@ -93,12 +112,27 @@ consent/source changes across generation. Supported mocked responses test
 transport and lifecycle behavior; they do not establish that arbitrary model
 output is factually correct.
 
-Inherited show-source selection still uses the existing reader's retrieval
-cues. For example, a prior explicit recap request is covered, whereas a prior
-bare quote/date request is not always recognized as a show-retrieval cue.
-Natural delivery and a preserved prior exchange do not alone prove that every
-desired source was retrieved. This preexisting selector limitation is not
-masked by the continuation tests or claimed fixed here.
+Existing request and conversation owners continue to decide which source
+context to retrieve. Once a show request is selected, the calendar helper
+preserves all distinct explicit dates without interpreting sentence structure.
+The selected records retain their date and source labels for Gemini to use
+with the current request and conversation.
+
+The draft's additional dated-request classifier and clause/noun/preposition
+parser have been removed. Its grammar-specific tests are removed with that
+abandoned behavior. Generic dated-show and quote-request admission stays on
+the deployed conversation path; this repair does not add a new interpretation
+layer. Already-selected two-date evidence remains available during follow-up
+refresh, including when the follow-up does not repeat both dates.
+
+Regressions use real SQLite archive/ledger readers, source refresh, a real
+collector snapshot, and direct/batch prompt assembly with external transport
+replaced. They cover both requested dates and their original speakers/text,
+partial source removal, same-date sessions, missing/invalid dates, the two-show
+source limit, current-date corrections, public reply persistence across Pacific
+midnight, and already-selected follow-up dates. Passive-batch admission rules
+are unchanged; the delivery comparison is an admitted question, while reader
+tests retain the existing show-context requests.
 
 Live acceptance still needs to check grounded show recall and quotes, an
 ordinary continuation, a factual correction, a mixed-source question, current
