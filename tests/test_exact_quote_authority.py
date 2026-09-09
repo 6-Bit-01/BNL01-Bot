@@ -209,7 +209,7 @@ class ExactQuoteAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(contract.exact_quote_requested)
         self.assertEqual(contract.requester_user_id, 101)
         self.assertEqual(contract.target_user_id, 202)
-        self.assertIn("summarize the named member's meaning", contract.prompt_block)
+        self.assertEqual(contract.prompt_block, "")
 
     async def test_batch_high_stakes_quote_uses_live_typed_authority(self):
         self.insert_source(
@@ -297,7 +297,7 @@ class ExactQuoteAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(contract.target_user_id, 0)
         self.assertIsNone(contract.exact_quote_authority)
 
-    def test_prompt_marks_typed_ordinary_attribution_as_gist_only(self):
+    def test_typed_ordinary_attribution_leaves_wording_to_original_sources(self):
         metadata = {}
         prompt, _allow_greeting, _style = bnl01_bot.build_user_aware_prompt(
             101,
@@ -314,10 +314,10 @@ class ExactQuoteAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(metadata["third_party_attribution_requested"])
         self.assertFalse(metadata["exact_quote_requested"])
         self.assertIsNone(metadata["exact_quote_authority"])
-        self.assertIn("Third-party attribution mode", prompt)
-        self.assertIn("summarize the named member's meaning", prompt)
+        self.assertNotIn("Third-party attribution mode", prompt)
+        self.assertIn("authored excerpts retain their original speaker", prompt.lower())
 
-    def test_plain_name_attribution_gets_same_gist_only_guard(self):
+    def test_plain_name_attribution_has_no_forced_paraphrase_contract(self):
         metadata = {}
         prompt, _allow_greeting, _style = bnl01_bot.build_user_aware_prompt(
             101,
@@ -334,7 +334,7 @@ class ExactQuoteAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(metadata["third_party_attribution_requested"])
         self.assertFalse(metadata["exact_quote_requested"])
         self.assertIsNone(metadata["exact_quote_authority"])
-        self.assertIn("Third-party attribution mode", prompt)
+        self.assertNotIn("Third-party attribution mode", prompt)
         for request in (
             "what did I say about the poster?",
             "what did you mean about the poster?",
@@ -986,7 +986,7 @@ class ExactQuoteAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(diagnostics["exact_quote_regenerated"])
         provider.assert_awaited_once()
 
-    async def test_ordinary_attribution_guard_regenerates_quote_to_gist(self):
+    async def test_ordinary_attribution_does_not_trigger_consequential_quote_guard(self):
         provider = mock.AsyncMock(
             return_value=(
                 "Crow's point was that the border should carry more visual weight."
@@ -1011,11 +1011,11 @@ class ExactQuoteAuthorityTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(
             response,
-            "Crow's point was that the border should carry more visual weight.",
+            'Crow said “make the border red.”',
         )
-        self.assertTrue(diagnostics["exact_quote_guard_triggered"])
-        self.assertTrue(diagnostics["exact_quote_regenerated"])
-        provider.assert_awaited_once()
+        self.assertFalse(diagnostics["exact_quote_guard_triggered"])
+        self.assertFalse(diagnostics["exact_quote_regenerated"])
+        provider.assert_not_awaited()
 
     async def test_guard_suppresses_when_source_disappears_during_retry(self):
         row_id = self.insert_source(

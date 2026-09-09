@@ -43,6 +43,33 @@ TikTok analysis/episode response checks, on direct and batched delivery paths.
 It introduces no replacement semantic judge, provider route, canned fallback,
 or persistent memory owner.
 
+## Named recall across sources
+
+An ordinary person/topic question can select original public Discord messages
+and relevant TikTok/show excerpts together. Platform words are not required.
+An older matching utterance outranks a newer unrelated appearance, and an
+undated named question can select multiple relevant show roots within the
+existing limits. An explicit date or pinned source refresh retains its scope.
+
+Complete current Discord member labels resolve through the live guild cache
+to stable account IDs. Duplicate labels remain ambiguous, and topic words do
+not become extra authors merely because another member uses that name.
+Cross-platform source identities remain separate unless the source already
+carries an exact identity binding.
+
+The existing conversation source basis now carries bounded, original public
+Discord history for the resolved subject, including messages outside broadcast
+windows. Stored author, channel, timestamp, row revision, and explicit forget
+or retraction controls remain attached and are revalidated before delivery.
+The same evidence reaches normal Gemini with the ordinary packet enabled or
+disabled; no deployment configuration is changed by this correction.
+
+Ordinary attribution no longer forces paraphrasing when original authored
+records are available. Untyped packet domain and coherence heuristics remain
+receipt diagnostics, without rejecting or rewriting a natural response.
+Source validity, control-marker privacy, provider accounting, and the separate
+consequential current-room quote verification path keep their existing checks.
+
 The separate existing Discord consequential exact-quote authority, publication
 controls, privacy boundaries, current queue authority, and stale-source
 revalidation are not removed by this change.

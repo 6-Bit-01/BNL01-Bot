@@ -216,6 +216,7 @@ from bnl_memory_preview import (
     snapshots_equivalent as memory_preview_snapshots_equivalent,
 )
 from bnl_unified_response_assessment import (
+    situation_subject_label_spans,
     ConversationOrchestrationDecision,
     ConversationOrchestrationInput,
     ConversationEvidenceItem,
@@ -10789,9 +10790,7 @@ def recover_guarded_response_obligation(
     source_neutral = _guard_recovery_requires_source_neutral_response(
         original_reason
     )
-    quote_guard_requested = bool(
-        exact_quote_requested or third_party_attribution_requested
-    )
+    quote_guard_requested = bool(exact_quote_requested)
     if not source_neutral and not force_model_rewrite:
         for candidate in candidates:
             if is_generic_non_answer_response(candidate):
@@ -14459,7 +14458,7 @@ _RAW_GOVERNED_SUBJECT_MENTION_PATTERNS = (
         re.I,
     ),
     re.compile(
-        r"\bwhat\s+(?:did|does|was|is)\s+<@!?(\d+)>\s+"
+        r"\bwhat\s+(?:did|does|has|had|was|is)\s+<@!?(\d+)>\s+"
         r"(?:say|said|mean|meant|think|thinking|do|doing)\b",
         re.I,
     ),
@@ -14485,6 +14484,98 @@ def _typed_governed_subject_user_ids(message) -> tuple[int, ...]:
             }
         )
     )
+
+
+def _named_public_member_subjects(
+    guild,
+    text: str,
+    *,
+    typed_subject_user_ids: tuple[int, ...] = (),
+    addressee_user_ids: tuple[int, ...] = (),
+) -> tuple[tuple[tuple[int, str], ...], tuple[str, ...]]:
+    """Resolve complete public member labels through the live guild cache.
+
+    A name is a lookup key for its Discord account, never authority to merge
+    that account with a similarly named person on another platform. Duplicate
+    labels stay unresolved unless the current turn already supplies one typed
+    subject identity. Canon names continue through the existing canon owner.
+    """
+    value = str(text or "")
+    if guild is None or not value.strip():
+        return (), ()
+    aliases: dict[str, set[int]] = {}
+    labels: dict[str, str] = {}
+    owner_user_id = int(BNL_OWNER_USER_ID or 0)
+    for member in getattr(guild, "members", ()) or ():
+        user_id = int(getattr(member, "id", 0) or 0)
+        if user_id <= 0 or bool(getattr(member, "bot", False)):
+            continue
+        # Public 6 Bit identity is already owned by the canon resolver. Do not
+        # inspect the owner's account display fields for additional aliases.
+        if user_id == owner_user_id:
+            continue
+        for raw in (
+            getattr(member, "display_name", ""),
+            getattr(member, "global_name", ""),
+            getattr(member, "name", ""),
+        ):
+            literal = str(raw or "").strip()
+            label = _safe_prompt_display_label(literal, "")
+            if not label or label.casefold() != literal.casefold():
+                continue
+            if any(
+                label.casefold() == str(alias).casefold()
+                for identity in CANON_ENTITY_IDENTITIES
+                for alias in (identity.name, *identity.aliases)
+            ):
+                continue
+            key = label.casefold()
+            labels.setdefault(key, label)
+            aliases.setdefault(key, set()).add(user_id)
+    matches = []
+    for key, user_ids in aliases.items():
+        for match in re.finditer(
+            r"(?<!\w)%s(?!\w)" % re.escape(labels[key]), value, re.I,
+        ):
+            matches.append((match.start(), match.end(), key, user_ids))
+    # A full long label must not also bind a different account whose name is
+    # merely one word inside it. Separate occurrences remain independent.
+    matches.sort(key=lambda item: (-(item[1] - item[0]), item[0], item[2]))
+    selected_spans: list[tuple[int, int]] = []
+    occurrences = []
+    for start, end, key, user_ids in matches:
+        if any(start < prior_end and end > prior_start for prior_start, prior_end in selected_spans):
+            continue
+        selected_spans.append((start, end))
+        occurrences.append((start, end, key, user_ids))
+    resolved: dict[int, str] = {}
+    unresolved = []
+    typed_ids = set(typed_subject_user_ids)
+    addressee_ids = set(addressee_user_ids)
+    eligible_occurrences = []
+    for start, end, key, user_ids in sorted(occurrences):
+        if (
+            value[:start].strip() in {"", "@"}
+            and re.match(r"\s*[,;:]", value[end:])
+            and user_ids & addressee_ids
+            and not user_ids & typed_ids
+        ):
+            continue
+        eligible_occurrences.append((start, end, key, user_ids))
+    subject_spans = set(situation_subject_label_spans(
+        value, [(start, end) for start, end, _key, _ids in eligible_occurrences],
+    ))
+    for start, end, key, user_ids in eligible_occurrences:
+        if (start, end) not in subject_spans:
+            continue
+        preferred = user_ids & typed_ids
+        candidates = preferred if len(preferred) == 1 else user_ids
+        if len(candidates) != 1:
+            unresolved.append(labels[key])
+            continue
+        user_id = next(iter(candidates))
+        resolved.setdefault(user_id, labels[key])
+    return tuple(resolved.items()), tuple(dict.fromkeys(unresolved))
 
 
 def resolve_discord_turn_addressing(
@@ -15618,12 +15709,10 @@ def build_batch_attribution_contract(
             "wording cannot be verified."
         )
     else:
-        prompt_block = (
-            "Third-party attribution mode: summarize the named member's meaning "
-            "in your own words from eligible context. Do not provide, reconstruct, "
-            "or claim exact wording. A Moment gist, memory tier, relationship note, "
-            "summary, or prior BNL reply is never quote authority."
-        )
+        # Ordinary recall uses the supplied original sources and their
+        # provenance. Only consequential current-room quote verification
+        # needs the separate live authority contract above.
+        prompt_block = ""
 
     return BatchAttributionContract(
         target_user_id=target_user_id,
@@ -26621,6 +26710,239 @@ class ConversationPromptSourceBasis:
     referent_scope_expanded: bool = False
     transient_referent_message_ids: tuple[int, ...] = ()
     transient_referent_texts: tuple[str, ...] = ()
+    public_recall_control_digest: str = ""
+
+
+def _public_conversation_recall_controls(
+    conn: sqlite3.Connection, *, guild_id: int, source_users: dict[int, int],
+) -> tuple[str, frozenset[int]]:
+    """Read explicit correction/forget controls without promoting ledger text."""
+    columns = {str(row[1]) for row in conn.execute(
+        "PRAGMA main.table_info(memory_ledger_entries)"
+    )}
+    if not columns or not source_users:
+        return _prompt_source_digest("[]"), frozenset()
+    required = {
+        "entry_id", "guild_id", "source_table", "source_row_id",
+        "subject_key", "lifecycle_status",
+    }
+    if not required.issubset(columns):
+        raise sqlite3.DatabaseError("conversation_control_schema_unavailable")
+    entries = {}
+    controls = []
+    blocked = set()
+    row_ids = sorted(source_users)
+    for start in range(0, len(row_ids), 400):
+        chunk = row_ids[start:start + 400]
+        rows = conn.execute(
+            """SELECT entry_id,source_row_id,subject_key,lifecycle_status
+            FROM main.memory_ledger_entries
+            WHERE guild_id=? AND source_table='conversations'
+              AND source_row_id IN (%s)""" % ",".join("?" for _ in chunk),
+            (int(guild_id), *(str(row_id) for row_id in chunk)),
+        ).fetchall()
+        for entry_id, source_row_id, subject, lifecycle in rows:
+            row_id = int(source_row_id)
+            if str(subject or "") != subject_key_for_user(source_users[row_id]):
+                continue
+            entries[str(entry_id)] = row_id
+            if str(lifecycle or "").lower() in {
+                "forgotten", "retracted", "deleted", "superseded", "retired", "revoked",
+            }:
+                blocked.add(row_id)
+                controls.append((row_id, str(entry_id), "lifecycle", str(lifecycle)))
+    lineage_columns = {str(row[1]) for row in conn.execute(
+        "PRAGMA main.table_info(memory_ledger_lineage)"
+    )}
+    if lineage_columns:
+        if not {"entry_id", "guild_id", "target_entry_id", "lineage_type"}.issubset(lineage_columns):
+            raise sqlite3.DatabaseError("conversation_control_lineage_unavailable")
+        entry_ids = sorted(entries)
+        for start in range(0, len(entry_ids), 400):
+            chunk = entry_ids[start:start + 400]
+            rows = conn.execute(
+                """SELECT entry_id,target_entry_id,lineage_type
+                FROM main.memory_ledger_lineage WHERE guild_id=?
+                  AND target_entry_id IN (%s)
+                  AND lineage_type IN ('retracts','supersedes','correction_of')"""
+                % ",".join("?" for _ in chunk),
+                (int(guild_id), *chunk),
+            ).fetchall()
+            for entry_id, target_id, kind in rows:
+                row_id = entries[str(target_id)]
+                blocked.add(row_id)
+                controls.append((row_id, str(target_id), str(kind), str(entry_id)))
+    digest = _prompt_source_digest(json.dumps(
+        sorted(controls), ensure_ascii=False, separators=(",", ":"),
+    ))
+    return digest, frozenset(blocked)
+
+
+def build_named_public_conversation_context(
+    *, situation_frame: SituationFrameV1 | None, guild_id: int,
+    route_mode: str, channel_policy: str, user_text: str,
+    channel_id: int = 0, channel_name: str = "",
+) -> tuple[str, ConversationPromptSourceBasis | None]:
+    """Read topic-relevant original public messages for frozen member targets.
+
+    This is historical source selection under the existing conversation owner,
+    separate from its immediate-room continuity window. A frame supplies stable
+    subject IDs; stored author labels and original rows supply the evidence.
+    """
+    from bnl_conversation_context_v2 import _unsafe_row
+
+    if (
+        not isinstance(situation_frame, SituationFrameV1)
+        or not situation_frame.route_allowed
+        or situation_frame.status == "ambiguous"
+        or situation_frame.route_mode != route_mode
+        or situation_frame.channel_policy != channel_policy
+        or route_mode != ROUTE_MODE_NORMAL_CHAT
+        or channel_policy not in PUBLIC_CHAT_POLICIES | {"sealed_test"}
+        or int(guild_id or 0) <= 0
+    ):
+        return "", None
+    subjects = tuple(
+        subject for subject in situation_frame.subjects
+        if int(subject.user_id or 0) > 0
+        and int(subject.user_id) != int(BNL_OWNER_USER_ID or 0)
+        and subject.binding_method == "existing_typed_target"
+        and subject.confidence == "high"
+    )
+    subject_ids = tuple(dict.fromkeys(int(s.user_id) for s in subjects))[:8]
+    if not subject_ids:
+        return "", None
+    selected_date = requested_show_date(user_text)
+    if has_explicit_show_date(user_text) and not selected_date:
+        return "", None
+    label_terms = set().union(*(
+        memory_relevance_terms(subject.label_hint) for subject in subjects
+    ))
+    query_terms = (
+        memory_relevance_terms(user_text)
+        - CONVERSATION_CONTEXT_STOPWORDS - label_terms
+        - {"said", "say", "says", "saying", "tell", "told", "spoken",
+           "talk", "talked", "talking", "bnl"}
+    )
+    if not query_terms:
+        return "", None
+    query = " ".join(sorted(query_terms))
+    candidates = []
+    try:
+        with closing(_open_member_memory_read_connection()) as conn:
+            conn.execute("BEGIN")
+            columns = {str(row[1]) for row in conn.execute(
+                "PRAGMA main.table_info(conversations)"
+            )}
+            required = {
+                "id", "guild_id", "user_id", "user_name", "role", "content",
+                "channel_id", "channel_policy", "timestamp",
+            }
+            if not required.issubset(columns):
+                return "", None
+            fields = (
+                "id", "role", "content", "user_id", "user_name", "channel_id",
+                "channel_name", "channel_policy", "timestamp", "message_id",
+            )
+            selections = tuple(
+                field if field in columns else "NULL AS " + field
+                for field in fields
+            )
+            for subject_id in subject_ids:
+                rows = conn.execute(
+                    "SELECT " + ",".join(selections) + """
+                    FROM main.conversations
+                    WHERE guild_id=? AND user_id=? AND role='user'
+                      AND channel_policy IN
+                          ('public_home','public_context','public_selective')
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (int(guild_id), subject_id, CONVERSATION_ROWS_PER_USER_MAX),
+                ).fetchall()
+                for row in rows:
+                    source = dict(zip(fields, row))
+                    source["channel_name"] = source.get("channel_name") or ""
+                    source["prompt_history_excluded"] = (
+                        should_exclude_from_prompt_history("user", source["content"])
+                    )
+                    if _unsafe_row(source):
+                        continue
+                    if selected_date:
+                        try:
+                            observed = datetime.fromisoformat(
+                                str(source["timestamp"] or "").replace("Z", "+00:00")
+                            )
+                            if observed.tzinfo is None:
+                                observed = observed.replace(tzinfo=timezone.utc)
+                            if observed.astimezone(PACIFIC_TZ).date().isoformat() != selected_date:
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                    label = _safe_prompt_display_label(source["user_name"], "")
+                    raw = str(source["content"] or "")
+                    # Preserve the complete sanitized utterance; never present
+                    # a budget-truncated paraphrase as its original wording.
+                    text = sanitize_history_text(raw, limit=max(1, len(raw)))
+                    if not label or not text:
+                        continue
+                    candidates.append((source, label, text))
+            _control_digest, blocked_rows = _public_conversation_recall_controls(
+                conn, guild_id=int(guild_id), source_users={
+                    int(source["id"]): int(source["user_id"])
+                    for source, _label, _text in candidates
+                },
+            )
+            candidates = [
+                candidate for candidate in candidates
+                if int(candidate[0]["id"]) not in blocked_rows
+            ]
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return "", None
+
+    relevance = _memory_query_relevance((c[2] for c in candidates), query)
+    ranked = sorted(
+        (candidate for candidate in candidates if relevance.get(candidate[2], 0) > 0),
+        key=lambda candidate: (relevance[candidate[2]], int(candidate[0]["id"])),
+        reverse=True,
+    )
+    header = "Relevant original public Discord messages:\n"
+    budget = max(0, MEMORY_PROMPT_BUDGET_PUBLIC)
+    used = len(header)
+    selected = []
+    for source, label, text in ranked:
+        place = _safe_prompt_display_label(source["channel_name"], "public Discord")
+        stamp = sanitize_history_text(str(source["timestamp"] or ""), limit=48)
+        line = f"- {label} in #{place} ({stamp}): {text}"
+        if used + len(line) + 1 > budget:
+            continue
+        selected.append((source, label, text, line))
+        used += len(line) + 1
+    if not selected:
+        return "", None
+    selected.sort(key=lambda item: int(item[0]["id"]))
+    rendered = header + "\n".join(item[3] for item in selected)
+    row_ids = tuple(int(item[0]["id"]) for item in selected)
+    digest = _prompt_source_digest(json.dumps(
+        [_conversation_prompt_row_snapshot(item[0]) for item in selected],
+        ensure_ascii=False, separators=(",", ":"),
+    ))
+    basis = ConversationPromptSourceBasis(
+        expected_digest=digest, rendered_context=rendered,
+        guild_id=int(guild_id), current_user_id=0, channel_id=int(channel_id or 0),
+        channel_name=channel_name, channel_policy=channel_policy,
+        source_row_ids=row_ids, revalidation_row_ids=row_ids,
+        # Every selected row passed the explicit-control read in the same
+        # snapshot. Later controls invalidate this original-message basis.
+        public_recall_control_digest=_prompt_source_digest("[]"),
+        participant_user_ids=tuple(dict.fromkeys(int(item[0]["user_id"]) for item in selected)),
+        speaker_labels=tuple(dict.fromkeys(item[1] for item in selected)),
+        evidence_items=tuple(build_conversation_evidence_item(
+            text=text, source_id=int(source["id"]),
+            speaker_user_id=int(source["user_id"]), speaker_label=label,
+            current_turn=False,
+        ) for source, label, text, _line in selected),
+    )
+    return rendered, basis
 
 
 @dataclass(frozen=True)
@@ -27482,6 +27804,21 @@ def build_live_conversation_orchestration_decision(
             if int(user_id or 0) > 0
         )
     )
+    cached_guild = client.get_guild(int(guild_id or 0))
+    named_member_subjects, unresolved_member_labels = (
+        _named_public_member_subjects(
+            cached_guild,
+            current_text,
+            typed_subject_user_ids=resolved_subject_user_ids,
+            addressee_user_ids=resolved_addressee_user_ids,
+        )
+        if route_allowed else ((), ())
+    )
+    named_member_labels = dict(named_member_subjects)
+    resolved_subject_user_ids = tuple(dict.fromkeys((
+        *resolved_subject_user_ids,
+        *(user_id for user_id, _label in named_member_subjects),
+    )))
     typed_canon_subjects = _typed_canon_subject_references(current_text)
     (
         exact_reply_canon_subjects,
@@ -27579,6 +27916,11 @@ def build_live_conversation_orchestration_decision(
         )
         if int(user_id or 0) > 0 and str(label or "").strip()
     }
+    frame_subject_labels_by_user_id = {
+        **dict(zip(subject_user_ids, subject_label_hints)),
+        **subject_labels_by_user_id,
+        **named_member_labels,
+    }
     frame_subject_labels = tuple(
         dict.fromkeys(
             str(label or "").lstrip("@").strip()[:72]
@@ -27586,6 +27928,7 @@ def build_live_conversation_orchestration_decision(
                 *subject_label_hints,
                 *(
                     subject_labels_by_user_id.get(user_id, "")
+                    or named_member_labels.get(user_id, "")
                     for user_id in resolved_subject_user_ids
                 ),
                 *(label for _entity_ref, label in typed_canon_subjects),
@@ -27647,6 +27990,8 @@ def build_live_conversation_orchestration_decision(
         ),
         subject_user_ids=resolved_subject_user_ids,
         subject_label_hints=frame_subject_labels,
+        subject_labels_by_user_id=frame_subject_labels_by_user_id,
+        unresolved_subject_label_hints=unresolved_member_labels,
         subject_entity_refs=resolved_subject_entity_refs,
         moment_id=(
             moment_situation.moment_id
@@ -28738,6 +29083,7 @@ def _conversation_prompt_row_snapshot(row: dict) -> tuple:
         int(row.get("id") or 0),
         str(row.get("role") or "").strip(),
         int(row.get("user_id") or 0),
+        str(row.get("user_name") or ""),
         int(row.get("channel_id") or 0),
         str(row.get("channel_name") or ""),
         str(row.get("channel_policy") or ""),
@@ -29615,8 +29961,24 @@ def refresh_prompt_source_basis(
         basis.transient_referent_message_ids,
         basis.transient_referent_texts,
     )
-    fresh = replace(basis, expected_digest=fresh_digest)
-    return fresh, fresh.expected_digest != basis.expected_digest
+    control_digest = basis.public_recall_control_digest
+    if control_digest:
+        with closing(_open_member_memory_read_connection()) as conn:
+            conn.execute("BEGIN")
+            control_digest, _blocked_rows = _public_conversation_recall_controls(
+                conn, guild_id=basis.guild_id, source_users={
+                    int(item.source_id): int(item.speaker_user_id)
+                    for item in basis.evidence_items if int(item.source_id or 0) > 0
+                },
+            )
+    fresh = replace(
+        basis, expected_digest=fresh_digest,
+        public_recall_control_digest=control_digest,
+    )
+    return fresh, bool(
+        fresh.expected_digest != basis.expected_digest
+        or fresh.public_recall_control_digest != basis.public_recall_control_digest
+    )
 
 
 def refresh_prompt_source_bases(
@@ -36914,6 +37276,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_situation_frame = (
                 orchestration_state["decision"].situation_frame
             )
+            (
+                batch_named_conversation_context,
+                batch_named_conversation_basis,
+            ) = build_named_public_conversation_context(
+                situation_frame=batch_situation_frame,
+                guild_id=guild_id,
+                route_mode=batch_route_mode,
+                channel_policy=channel_policy,
+                user_text=combined_text,
+                channel_id=channel_id,
+                channel_name=getattr(channel, "name", ""),
+            )
+            if batch_named_conversation_context:
+                prompt += "\n\n" + batch_named_conversation_context + "\n"
+                batch_source_context_available = True
             batch_publication_packet_owns_turn = (
                 publication_packet_owns_turn(batch_situation_frame)
             )
@@ -36958,6 +37335,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_current_direct = bool(
                 active_packet.get("addressed_to_bot")
                 or is_broad_personal_recall_request(combined_text)
+                or (
+                    decision == "answer"
+                    and conversation_surface_allows_free_speak(
+                        conversation_surface_for_channel_policy(channel_policy)
+                    )
+                )
             )
             batch_ordinary_chat_scope = ordinary_chat_route_scope_decision(
                 guild_id=guild_id,
@@ -37082,12 +37465,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         route_mode=batch_route_mode,
                         channel_policy=channel_policy,
                         user_text=combined_text,
-                        current_direct=bool(
-                            active_packet.get("addressed_to_bot")
-                            or is_broad_personal_recall_request(
-                                combined_text
-                            )
-                        ),
+                        current_direct=batch_current_direct,
                     )
                 )
                 batch_memory_context = build_user_memory_context(
@@ -37097,10 +37475,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     channel_policy=channel_policy,
                     user_text=combined_text,
                     is_owner_or_mod=batch_member_is_privileged,
-                    current_direct=bool(
-                        active_packet.get("addressed_to_bot")
-                        or is_broad_personal_recall_request(combined_text)
-                    ),
+                    current_direct=batch_current_direct,
                     governance_allowed=bool(memory_governance_live_enabled()),
                     channel_id=channel_id,
                     moment_attribution_target_user_id=(
@@ -37152,6 +37527,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         + "\n"
                     )
             batch_prompt_source_bases: list[PromptSourceBasis] = list(batch_member_memory_bases)
+            if batch_named_conversation_basis is not None:
+                batch_prompt_source_bases.append(batch_named_conversation_basis)
             if batch_show_basis is not None:
                 batch_prompt_source_bases.append(batch_show_basis)
             if batch_conversation_basis is not None:
@@ -37167,10 +37544,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     channel_policy=channel_policy,
                     user_text=combined_text,
                     is_owner_or_mod=batch_member_is_privileged,
-                    current_direct=bool(
-                        active_packet.get("addressed_to_bot")
-                        or is_broad_personal_recall_request(combined_text)
-                    ),
+                    current_direct=batch_current_direct,
                     governance_allowed=bool(
                         memory_governance_live_enabled()
                     ),
@@ -37240,7 +37614,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         ("current_exchange", True),
                         (
                             "conversation_context",
-                            batch_conversation_basis is not None,
+                            bool(batch_conversation_basis or batch_named_conversation_basis),
                         ),
                         (
                             (
@@ -37367,10 +37741,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     packet_operational_context_authorized=bool(
                         batch_publication_queue_packet_ready
                     ),
-                    current_direct=bool(
-                        active_packet.get("addressed_to_bot")
-                        or is_broad_personal_recall_request(combined_text)
-                    ),
+                    current_direct=batch_current_direct,
                     intelligence_packet_out=(
                         batch_intelligence_packet_out
                     ),
@@ -37420,6 +37791,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         block
                         for block in (
                             recent_room_prompt,
+                            batch_named_conversation_context,
                             batch_memory_prompt_block,
                             (
                                 batch_unified_moment_canary_basis.rendered_context
@@ -37477,10 +37849,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     channel_id=channel_id,
                     route_mode=batch_route_mode,
                     channel_policy=channel_policy,
-                    current_direct=bool(
-                        active_packet.get("addressed_to_bot")
-                        or is_broad_personal_recall_request(combined_text)
-                    ),
+                    current_direct=batch_current_direct,
                     user_text=combined_text,
                     packet=batch_intelligence_packet_out.get("packet"),
                     assessment=batch_unified_assessment,
@@ -37496,6 +37865,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         context
                         for context in (
                             batch_memory_context,
+                            batch_named_conversation_context,
                             batch_tiktok_show_evidence_prompt_block,
                         )
                         if context
@@ -37525,12 +37895,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         route_mode=batch_route_mode,
                         channel_policy=channel_policy,
                         user_text=combined_text,
-                        current_direct=bool(
-                            active_packet.get("addressed_to_bot")
-                            or is_broad_personal_recall_request(
-                                combined_text
-                            )
-                        ),
+                        current_direct=batch_current_direct,
                     )
                 )
                 if batch_recall_synthesis_contract:
@@ -39915,13 +40280,6 @@ def build_user_aware_prompt(
                 "wording cannot be verified.\n"
             )
         )
-    elif third_party_attribution_requested:
-        exact_quote_prompt_block = (
-            "Third-party attribution mode: summarize the named member's meaning "
-            "in your own words from eligible context. Do not provide, reconstruct, "
-            "or claim exact wording. A Moment gist, memory tier, relationship note, "
-            "summary, or prior BNL reply is never quote authority.\n"
-        )
     broadcast_specialized_owner = bool(
         _broadcast_memory_requires_specialized_owner(clean_content)
     )
@@ -40005,6 +40363,19 @@ def build_user_aware_prompt(
         )
         else None
     )
+    named_conversation_context, named_conversation_basis = (
+        build_named_public_conversation_context(
+            situation_frame=frozen_situation_frame,
+            guild_id=guild_id,
+            route_mode=route_mode,
+            channel_policy=channel_policy,
+            user_text=clean_content,
+            channel_id=channel_id,
+            channel_name=channel_name,
+        )
+    )
+    if named_conversation_basis is not None:
+        prompt_source_bases.append(named_conversation_basis)
     publication_packet_owns_current_turn = publication_packet_owns_turn(
         frozen_situation_frame
     )
@@ -40100,7 +40471,7 @@ def build_user_aware_prompt(
                 ("current_exchange", True),
                 (
                     "conversation_context",
-                    conversation_prompt_basis is not None,
+                    bool(conversation_prompt_basis or named_conversation_basis),
                 ),
                 (
                     "broadcast_memory",
@@ -40144,7 +40515,7 @@ def build_user_aware_prompt(
                     ("current_exchange", True),
                     (
                         "conversation_context",
-                        conversation_prompt_basis is not None,
+                        bool(conversation_prompt_basis or named_conversation_basis),
                     ),
                     (
                         (
@@ -40300,6 +40671,7 @@ def build_user_aware_prompt(
             context
             for context in (
                 memory_context,
+                named_conversation_context,
                 tiktok_show_evidence_prompt_block,
             )
             if context
@@ -40324,6 +40696,7 @@ def build_user_aware_prompt(
                 block
                 for block in (
                     room_context,
+                    named_conversation_context,
                     (
                         unified_moment_canary_basis.rendered_context
                         if unified_moment_canary_basis is not None
@@ -40382,6 +40755,7 @@ def build_user_aware_prompt(
             or website_read_model_context
             or queue_artist_memory_context
             or tiktok_show_evidence_context
+            or named_conversation_context
             or source_context_block
         )
         prompt_metadata["queue_artist_memory_context_present"] = bool(
@@ -40568,6 +40942,7 @@ def build_user_aware_prompt(
         f"{recall_interpretation_contract}"
         f"{recall_synthesis_contract}"
         f"{room_prompt_block}"
+        f"{named_conversation_context}\n"
         f"{continuity_prompt_block}"
         f"{unified_moment_canary_prompt_block}"
         f"{channel_prompt_block}"
@@ -42129,9 +42504,7 @@ async def exact_quote_presend_failure(
         return "exact_quote_basis_changed_before_send"
     return exact_quote_response_failure(
         response,
-        requested=bool(
-            exact_requested or third_party_attribution_requested
-        ),
+        requested=bool(exact_requested),
         authority=live_authority,
         exact_requested=exact_requested,
     )
@@ -42445,9 +42818,7 @@ async def apply_guarded_response_regeneration(
             combine_requested=combine_current_threads,
         )
 
-    quote_guard_requested = bool(
-        exact_quote_requested or third_party_attribution_requested
-    )
+    quote_guard_requested = bool(exact_quote_requested)
     had_exact_quote_authority = exact_quote_authority is not None
     if exact_quote_authority is not None:
         refreshed_quote_authority = (

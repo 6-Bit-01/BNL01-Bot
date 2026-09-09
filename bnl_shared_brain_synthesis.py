@@ -8593,9 +8593,11 @@ def evaluate_single_packet_response(
 ) -> SynthesisCanaryDecision:
     """Audit one generated response and persist its evidence receipt.
 
-    Selection is a draft-quality result, not authority to cancel the ordinary
-    response act. Callers rewrite a rejected draft through the same shared
-    brain route and keep this receipt as the reason for that repair.
+    Natural-language claim and coherence heuristics are receipt diagnostics;
+    they cannot reject ordinary Gemini prose or request a rewrite. Selection
+    still enforces source validity, provider accounting, nonempty output, and
+    control-marker privacy. Explicit typed-contract callers retain their
+    contract validation and coherence checks.
     """
 
     candidate = str(response or "").strip()
@@ -8662,9 +8664,7 @@ def evaluate_single_packet_response(
         fallback_reason = "generation_failed"
     elif output_leak:
         fallback_reason = "control_marker_leak"
-    elif unsupported_packet_domain_claims:
-        fallback_reason = "unsupported_packet_domain_claim"
-    elif coherence.status == "failed":
+    elif typed_contract_required and coherence.status == "failed":
         fallback_reason = "coherence_failed"
     candidate_selected = not fallback_reason
     conn.execute(

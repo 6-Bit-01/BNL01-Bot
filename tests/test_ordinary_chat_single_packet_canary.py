@@ -1868,7 +1868,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertEqual(report["invalidScopeRuns"], 0)
 
-    def test_unsupported_packet_domain_claims_are_rejected_before_selection(self):
+    def test_unsupported_packet_domain_claims_are_diagnostic_for_natural_prose(self):
         candidates = (
             "Your favorite movie is Blade Runner.",
             "You work as a network engineer.",
@@ -1886,11 +1886,9 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     corrective_call_count=0,
                     environ=self.flags,
                 )
-                self.assertFalse(decision.candidate_selected)
-                self.assertEqual(
-                    decision.fallback_reason,
-                    "unsupported_packet_domain_claim",
-                )
+                self.assertTrue(decision.candidate_selected)
+                self.assertEqual(decision.response, candidate)
+                self.assertEqual(decision.fallback_reason, "")
                 self.assertGreaterEqual(
                     decision.candidate_unsupported_factual_claim_count,
                     1,
@@ -3146,7 +3144,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     classifications,
                 )
 
-    def test_claim_specific_packet_domain_still_fails_closed(self):
+    def test_claim_specific_packet_domain_is_audited_without_prose_veto(self):
         cases = (
             "Your birthday is 1999-01-01.",
             "Your site is https://invented.example/.",
@@ -3233,13 +3231,14 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     corrective_call_count=0,
                     environ=self.flags,
                 )
-                self.assertFalse(decision.candidate_selected)
-                self.assertEqual(
-                    decision.fallback_reason,
-                    "unsupported_packet_domain_claim",
+                self.assertTrue(decision.candidate_selected)
+                self.assertEqual(decision.response, response)
+                self.assertEqual(decision.fallback_reason, "")
+                self.assertGreaterEqual(
+                    decision.candidate_unsupported_factual_claim_count, 1,
                 )
 
-    def test_ambiguous_member_fragments_and_internal_claims_fail_closed(self):
+    def test_ambiguous_member_fragments_and_internal_claims_retain_diagnostics(self):
         cases = (
             "At NASA.",
             "Works at NASA.",
@@ -3354,10 +3353,11 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     corrective_call_count=0,
                     environ=self.flags,
                 )
-                self.assertFalse(decision.candidate_selected)
-                self.assertEqual(
-                    decision.fallback_reason,
-                    "unsupported_packet_domain_claim",
+                self.assertTrue(decision.candidate_selected)
+                self.assertEqual(decision.response, response)
+                self.assertEqual(decision.fallback_reason, "")
+                self.assertGreaterEqual(
+                    decision.candidate_unsupported_factual_claim_count, 1,
                 )
 
     def test_safe_prefixes_questions_and_guidance_cannot_launder_claims(self):
@@ -3631,7 +3631,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     classifications,
                 )
 
-    def test_supported_claim_with_packet_comma_tail_fails_closed(self):
+    def test_supported_claim_with_packet_comma_tail_retains_audit(self):
         for response in (
             "Your favorite movie is Arrival, you were born in 1999.",
             "Your favorite movie is Arrival and the packet has 500 records.",
@@ -3657,9 +3657,12 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                     corrective_call_count=0,
                     environ=self.flags,
                 )
-                self.assertFalse(decision.candidate_selected)
+                self.assertTrue(decision.candidate_selected)
+                self.assertEqual(decision.response, response)
+                self.assertEqual(decision.fallback_reason, "")
+                self.assertEqual(decision.candidate_unsupported_factual_claim_count, 1)
 
-    def test_supported_member_claim_cannot_carry_unsupported_tail(self):
+    def test_supported_member_claim_records_unsupported_tail_diagnostic(self):
         response = (
             "Your favorite movie is Arrival because you watched it in Paris."
         )
@@ -3680,7 +3683,10 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             corrective_call_count=0,
             environ=self.flags,
         )
-        self.assertFalse(decision.candidate_selected)
+        self.assertTrue(decision.candidate_selected)
+        self.assertEqual(decision.response, response)
+        self.assertEqual(decision.fallback_reason, "")
+        self.assertEqual(decision.candidate_unsupported_factual_claim_count, 1)
 
     def test_nonhuman_external_claim_does_not_release_member_pronoun(self):
         cases = (
