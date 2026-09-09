@@ -45,6 +45,7 @@ from bnl_tiktok_live_context import (
     tiktok_show_evidence_key,
     tiktok_show_records,
 )
+from bnl_unified_response_assessment import situation_subject_label_spans
 
 
 TIKTOK_SHOW_EVIDENCE_TABLE = "tiktok_show_evidence_ledgers"
@@ -115,6 +116,19 @@ _QUERY_STOP_WORDS = frozenset(
         "during",
         "from",
         "have",
+        "has",
+        "say",
+        "says",
+        "does",
+        "their",
+        "tell",
+        "ever",
+        "anything",
+        "are",
+        "how",
+        "doing",
+        "today",
+        "yesterday",
         "live",
         "people",
         "radio",
@@ -1974,6 +1988,129 @@ def _phrase_in_query(query: str, value: Any) -> bool:
     return bool(len(phrase) >= 3 and phrase in query.casefold())
 
 
+def _participant_name_in_query(query: str, value: Any) -> bool:
+    phrase = _SPACE_RE.sub(" ", str(value or "")).strip().casefold().lstrip("@")
+    return bool(
+        len(phrase) >= 3
+        and re.search(r"(?<![\w])" + re.escape(phrase) + r"(?![\w])", query.casefold())
+    )
+
+
+def _participant_named(query: str, participant: Mapping[str, Any]) -> bool:
+    subject_ref = participant.get("subjectRef")
+    return any(_participant_name_in_query(query, value) for value in (
+        _public_show_speaker_label(subject_ref, participant.get("speakerLabel"), ""),
+        _public_show_speaker_label(subject_ref, participant.get("displayName"), ""),
+        participant.get("handle"),
+        *[item.get("artistName") for item in participant.get("artistAttributions") or ()
+          if isinstance(item, Mapping)],
+    ))
+
+
+def _participant_label_occurrences(
+    participants: Sequence[Mapping[str, Any]], user_text: str
+) -> list[tuple[int, int, Mapping[str, Any]]]:
+    occurrences = []
+    for participant in participants:
+        subject_ref = participant.get("subjectRef")
+        labels = (
+            _public_show_speaker_label(subject_ref, participant.get("speakerLabel"), ""),
+            _public_show_speaker_label(subject_ref, participant.get("displayName"), ""),
+            participant.get("handle"),
+            *[item.get("artistName") for item in participant.get("artistAttributions") or ()
+              if isinstance(item, Mapping)],
+        )
+        for raw in labels:
+            label = _SPACE_RE.sub(" ", str(raw or "")).strip().lstrip("@")
+            if len(label) < 3:
+                continue
+            for match in re.finditer(r"(?<!\w)" + re.escape(label) + r"(?!\w)", user_text, re.I):
+                occurrences.append((match.start(), match.end(), participant))
+    return occurrences
+
+
+def _named_recall_participants(
+    ledgers: Sequence[Mapping[str, Any]], user_text: str
+) -> list[Mapping[str, Any]]:
+    occurrences = _participant_label_occurrences([
+        participant for ledger in ledgers for participant in _episode_participants(ledger)
+    ], user_text)
+    subject_spans = set(situation_subject_label_spans(
+        user_text, [(start, end) for start, end, _participant in occurrences],
+    ))
+    return [participant for start, end, participant in occurrences
+            if (start, end) in subject_spans]
+
+
+def _authored_show_messages(ledger: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Read human utterances with their original source-owned identity."""
+
+    messages = [
+        {**item, "surface": "tiktok"}
+        for item in ledger.get("messages") or ()
+        if isinstance(item, Mapping)
+    ]
+    for exchange in ledger.get("discordInteractions") or ():
+        if not isinstance(exchange, Mapping):
+            continue
+        for message in exchange.get("userMessages") or ():
+            if not isinstance(message, Mapping):
+                continue
+            messages.append({
+                **message,
+                "eventId": "discord_conversation:" + str(message.get("conversationRowId") or ""),
+                "subjectRef": str(exchange.get("subjectRef") or ""),
+                "speakerLabel": _public_show_speaker_label(
+                    exchange.get("subjectRef"), exchange.get("speakerLabel"), "Discord member"
+                ),
+                "surface": "discord",
+            })
+    return messages
+
+
+def _participant_topic_terms(
+    user_text: str, participants: Sequence[Mapping[str, Any]]
+) -> set[str]:
+    spans = situation_subject_label_spans(user_text, [
+        (start, end) for start, end, _participant
+        in _participant_label_occurrences(participants, user_text)
+    ])
+    topic_parts = []
+    offset = 0
+    for start, end in spans:
+        topic_parts.append(user_text[offset:start])
+        offset = end
+    topic_parts.append(user_text[offset:])
+    return _query_terms(" ".join(topic_parts))
+
+
+def _general_participant_recall(
+    user_text: str, participants: Sequence[Mapping[str, Any]]
+) -> bool:
+    return bool(
+        participants
+        and not _subject_continuity_requested(user_text)
+        # Naming a source (TikTok, Discord, chat) does not choose an episode.
+        # Keep singular episode requests and calendar scope with their owner.
+        and not re.search(
+            r"\b(?:show|episode|broadcast|stream)\b", str(user_text or ""),
+            flags=re.IGNORECASE,
+        )
+        and not _requested_show_date(user_text)
+        and not has_explicit_show_date(user_text)
+    )
+
+
+def _named_recall_subject_refs(
+    ledgers: Sequence[Mapping[str, Any]], user_text: str
+) -> set[str]:
+    named = _named_recall_participants(ledgers, user_text)
+    if not _general_participant_recall(user_text, named):
+        return set()
+    return {str(item.get("subjectRef") or "") for item in named
+            if str(item.get("subjectRef") or "")}
+
+
 def _document_relevance(
     ledger: Mapping[str, Any],
     *,
@@ -1982,6 +2119,7 @@ def _document_relevance(
     recency_rank: int,
     allow_direct_subject: bool = False,
     requested_show_date: str = "",
+    named_subject_refs: Optional[set[str]] = None,
 ) -> tuple[int, list[Mapping[str, Any]]]:
     query = str(user_text or "")
     query_terms = _query_terms(query)
@@ -2009,33 +2147,21 @@ def _document_relevance(
             and subject_ref
             and participant_subject_ref == subject_ref
         )
-        named = any(
-            _phrase_in_query(query, value)
-            for value in (
-                _public_show_speaker_label(
-                    participant_subject_ref,
-                    participant.get("speakerLabel"),
-                    "",
-                ),
-                _public_show_speaker_label(
-                    participant_subject_ref,
-                    participant.get("displayName"),
-                    "",
-                ),
-                participant.get("handle"),
-            )
-        )
-        artist_named = any(
-            _phrase_in_query(query, attribution.get("artistName"))
-            for attribution in participant.get("artistAttributions") or ()
-            if isinstance(attribution, Mapping)
+        named = (
+            participant_subject_ref in named_subject_refs
+            if named_subject_refs else _participant_named(query, participant)
         )
         if direct_subject:
             direct_subject_candidates.append(participant)
-        if named or artist_named:
+        if named:
             participant_matches.append(participant)
             evidence_query_overlap = True
             score += 90
+    if named_subject_refs and not any(
+        str(item.get("subjectRef") or "") in named_subject_refs
+        for item in participant_matches
+    ):
+        return 0, []
     if _subject_continuity_requested(query) and not direct_subject_candidates:
         # An absent/ineligible requester is not a request for everybody else's
         # messages. In particular, consent lookup may intentionally remove the
@@ -2085,32 +2211,31 @@ def _document_relevance(
         if overlap:
             evidence_query_overlap = True
             score += min(60, 12 * len(overlap))
-    for exchange in ledger.get("discordInteractions") or ():
-        if not isinstance(exchange, Mapping):
-            continue
-        exchange_text = " ".join(
-            [
-                _public_show_speaker_label(
-                    exchange.get("subjectRef"),
-                    exchange.get("speakerLabel"),
-                    "",
-                ),
-                *[
-                    str(message.get("text") or "")
-                    for message in exchange.get("userMessages") or ()
-                    if isinstance(message, Mapping)
-                ],
-                str(
-                    (exchange.get("bnlResponse") or {}).get("text")
-                    if isinstance(exchange.get("bnlResponse"), Mapping)
-                    else ""
-                ),
-            ]
-        )
-        overlap = query_terms.intersection(_query_terms(exchange_text))
-        if overlap:
-            evidence_query_overlap = True
-            score += min(70, 14 * len(overlap))
+    participant_refs = {
+        str(item.get("subjectRef") or "") for item in participant_matches
+        if str(item.get("subjectRef") or "")
+    }
+    authored_subject_refs = participant_refs or (
+        {str(item.get("subjectRef") or "") for item in direct_subject_candidates}
+        if not explicit_episode_scope else set()
+    )
+    topic_terms = _participant_topic_terms(query, participant_matches)
+    authored_overlap = max((
+        len(topic_terms.intersection(_query_terms(str(message.get("text") or ""))))
+        for message in _authored_show_messages(ledger)
+        if not authored_subject_refs or str(message.get("subjectRef") or "") in authored_subject_refs
+    ), default=0)
+    if authored_overlap:
+        evidence_query_overlap = True
+        score += min(240, 80 * authored_overlap)
+    elif (
+        not requested_show_date
+        and _general_participant_recall(query, participant_matches)
+        and topic_terms
+    ):
+        # A newer appearance by the same person is not evidence about the
+        # requested topic. Nor are another speaker's or BNL's statements.
+        return 0, []
     if direct_subject_candidates and (
         explicit_episode_scope or evidence_query_overlap
     ):
@@ -2278,6 +2403,9 @@ def _ranked_show_ledgers(
         allow_subject_continuity
         or _subject_continuity_requested(user_text)
     )
+    named_subject_refs = _named_recall_subject_refs([
+        item["ledger"] for item in loaded if isinstance(item.get("ledger"), Mapping)
+    ], user_text)
     ranked = []
     for recency_rank, loaded_row in enumerate(loaded):
         ledger = loaded_row.get("ledger")
@@ -2290,6 +2418,7 @@ def _ranked_show_ledgers(
             recency_rank=recency_rank,
             allow_direct_subject=allow_direct_subject,
             requested_show_date=requested_date,
+            named_subject_refs=named_subject_refs,
         )
         if score > 0:
             ranked.append(
@@ -2654,7 +2783,11 @@ def _dialogue_episode_context_item(
     user_text: str,
     participant_matches: Sequence[Mapping[str, Any]],
 ) -> Optional[TikTokShowEpisodeContextItem]:
-    query_terms = _query_terms(user_text)
+    general_recall = _general_participant_recall(user_text, participant_matches)
+    query_terms = (
+        _participant_topic_terms(user_text, participant_matches)
+        if general_recall else _query_terms(user_text)
+    )
     participant_refs = {
         str(item.get("subjectRef") or "")
         for item in participant_matches
@@ -2666,6 +2799,14 @@ def _dialogue_episode_context_item(
     def ranked_relevant_messages(
         candidates: Sequence[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        if general_recall:
+            candidates = [
+                item for item in candidates
+                if str(item.get("subjectRef") or "") in participant_refs
+                and (not query_terms or query_terms.intersection(
+                    _query_terms(str(item.get("text") or ""))
+                ))
+            ]
         ranked = sorted(
             candidates,
             key=lambda item: _message_relevance(
@@ -2711,32 +2852,10 @@ def _dialogue_episode_context_item(
                     item.get("subjectRef"),
                     item.get("speakerLabel"),
                 ),
-                "surface": "TikTok",
+                "surface": "Discord" if item.get("surface") == "discord" else "TikTok",
             }
-            for item in ledger.get("messages") or ()
-            if isinstance(item, Mapping)
+            for item in _authored_show_messages(ledger)
         ]
-        for exchange in ledger.get("discordInteractions") or ():
-            if not isinstance(exchange, Mapping):
-                continue
-            for message in exchange.get("userMessages") or ():
-                if not isinstance(message, Mapping):
-                    continue
-                episode_messages.append(
-                    {
-                        **message,
-                        **episode,
-                        "eventId": "discord_conversation:%s"
-                        % str(message.get("conversationRowId") or ""),
-                        "subjectRef": str(exchange.get("subjectRef") or ""),
-                        "speakerLabel": _public_show_speaker_label(
-                            exchange.get("subjectRef"),
-                            exchange.get("speakerLabel"),
-                            "Discord member",
-                        ),
-                        "surface": "Discord",
-                    }
-                )
         messages.extend(ranked_relevant_messages(episode_messages)[:12])
     if not messages:
         return None
@@ -2871,6 +2990,7 @@ def select_tiktok_show_episode_context_items(
         return ()
     multi_show = bool(
         _MULTI_SHOW_QUERY_RE.search(str(user_text or ""))
+        or any(_general_participant_recall(user_text, item[3]) for item in ranked)
         or (
             _community_baseline_requested(user_text)
             and not _requested_show_date(user_text, now=now)
@@ -2984,8 +3104,6 @@ def build_tiktok_show_evidence_context(
         if has_explicit_show_date(user_text) or _requested_show_date(user_text)
         else selection_query
     )
-    if has_explicit_show_date(date_query) and not _requested_show_date(date_query):
-        return ""
     subject_ref = (
         f"discord_user:{int(subject_user_id)}"
         if int(subject_user_id or 0) > 0
@@ -3036,6 +3154,17 @@ def build_tiktok_show_evidence_context(
             or str(ledger.get("showKey") or "") in pinned_show_keys
         ):
             ledgers.append(ledger)
+    current_named = _named_recall_participants(ledgers, user_text)
+    if _general_participant_recall(user_text, current_named):
+        # A new named-person request owns its undated scope. An earlier recap
+        # may explain a bare continuation, but cannot date-pin this request.
+        selection_query = str(user_text or "")
+        requested_show_date = ""
+        date_query = selection_query
+        candidate_context = False
+    if has_explicit_show_date(date_query) and not _requested_show_date(date_query):
+        return ""
+    named_subject_refs = _named_recall_subject_refs(ledgers, selection_query)
     ranked = []
     for recency_rank, ledger in enumerate(ledgers):
         score, participant_matches = _document_relevance(
@@ -3045,6 +3174,7 @@ def build_tiktok_show_evidence_context(
             recency_rank=recency_rank,
             allow_direct_subject=allow_direct_subject,
             requested_show_date=requested_show_date,
+            named_subject_refs=named_subject_refs,
         )
         if score > 0:
             ranked.append((score, recency_rank, ledger, participant_matches))
@@ -3053,7 +3183,10 @@ def build_tiktok_show_evidence_context(
     ranked.sort(key=lambda item: (-item[0], item[1]))
     selected_limit = (
         max(1, min(int(show_limit or 1), 4))
-        if _MULTI_SHOW_QUERY_RE.search(selection_query)
+        if _MULTI_SHOW_QUERY_RE.search(selection_query) or (
+            not requested_show_date
+            and any(_general_participant_recall(selection_query, item[3]) for item in ranked)
+        )
         else 1
     )
     selected = ranked[:selected_limit]
@@ -3114,6 +3247,14 @@ def build_tiktok_show_evidence_context(
     wants_topics = bool(_TOPIC_QUERY_RE.search(user_text or ""))
     bounded_message_limit = max(1, min(int(message_limit or 1), 16))
     for _score, _recency, ledger, participant_matches in selected:
+        general_recall = bool(
+            not requested_show_date
+            and _general_participant_recall(user_text, participant_matches)
+        )
+        message_query_terms = (
+            _participant_topic_terms(user_text, participant_matches)
+            if general_recall else query_terms
+        )
         coverage = ledger.get("coverage") or {}
         interactions = ledger.get("interactions") or {}
         lines.append(
@@ -3298,46 +3439,34 @@ def build_tiktok_show_evidence_context(
         participant_refs = {
             str(item.get("subjectRef") or "") for item in participant_matches
         }
-        tiktok_messages = [
+        messages = [
             {
                 **item,
                 "speakerLabel": _public_show_speaker_label(
                     item.get("subjectRef"),
                     item.get("speakerLabel"),
                 ),
-                "surface": "tiktok",
             }
-            for item in ledger.get("messages") or ()
-            if isinstance(item, Mapping)
+            for item in _authored_show_messages(ledger)
         ]
         discord_interactions = [
             item
             for item in ledger.get("discordInteractions") or ()
             if isinstance(item, Mapping)
         ]
-        discord_messages = [
-            {
-                **message,
-                "eventId": "discord_conversation:"
-                + str(message.get("conversationRowId") or ""),
-                "subjectRef": str(exchange.get("subjectRef") or ""),
-                "speakerLabel": _public_show_speaker_label(
-                    exchange.get("subjectRef"),
-                    exchange.get("speakerLabel"),
-                    "Discord member",
-                ),
-                "surface": "discord",
-            }
-            for exchange in discord_interactions
-            for message in exchange.get("userMessages") or ()
-            if isinstance(message, Mapping)
-        ]
-        messages = [*tiktok_messages, *discord_messages]
+        if general_recall:
+            messages = [
+                item for item in messages
+                if str(item.get("subjectRef") or "") in participant_refs
+                and (not message_query_terms or message_query_terms.intersection(
+                    _query_terms(str(item.get("text") or ""))
+                ))
+            ]
         relevant_messages = sorted(
             messages,
             key=lambda item: _message_relevance(
                 item,
-                query_terms=query_terms,
+                query_terms=message_query_terms,
                 participant_refs=participant_refs,
                 evidence_boosts=evidence_boosts,
             ),
@@ -3411,18 +3540,24 @@ def build_tiktok_show_evidence_context(
                         for message in exchange.get("userMessages") or ()
                         if isinstance(message, Mapping)
                     ],
-                    str(
-                        (exchange.get("bnlResponse") or {}).get("text")
-                        if isinstance(exchange.get("bnlResponse"), Mapping)
-                        else ""
-                    ),
                 ]
             )
             exchange_score = 100 if exchange_subject in participant_refs else 0
             exchange_score += 10 * len(
                 query_terms.intersection(_query_terms(exchange_text))
             )
-            if participant_refs and _subject_continuity_requested(user_text):
+            if general_recall:
+                exchange_relevant = bool(
+                    exchange_subject in participant_refs
+                    and (not message_query_terms or any(
+                        message_query_terms.intersection(
+                            _query_terms(str(message.get("text") or ""))
+                        )
+                        for message in exchange.get("userMessages") or ()
+                        if isinstance(message, Mapping)
+                    ))
+                )
+            elif participant_refs and _subject_continuity_requested(user_text):
                 exchange_relevant = exchange_subject in participant_refs
             else:
                 exchange_relevant = bool(

@@ -1317,13 +1317,14 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
                 operational_context_snapshot=queue_snapshot,
                 operational_context_snapshot_provided=True,
             )
-            self.assertFalse(
+            self.assertTrue(
                 contradictory.candidate_selected,
                 contradictory,
             )
-            self.assertEqual(
-                contradictory.fallback_reason,
-                "unsupported_packet_domain_claim",
+            self.assertEqual(contradictory.fallback_reason, "")
+            self.assertGreaterEqual(
+                contradictory.candidate_unsupported_factual_claim_count,
+                1,
             )
             accepted_run = begin_single_packet_run(
                 self.conn,

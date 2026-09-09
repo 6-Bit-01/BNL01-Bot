@@ -1285,7 +1285,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await bnl01_bot._flush_channel_buffer(channel)
 
         self.assertEqual(len(prompts), 1)
-        self.assertIn("Third-party attribution mode", prompts[0])
+        self.assertNotIn("Third-party attribution mode", prompts[0])
         self.assertEqual(len(guard_kwargs), 1)
         self.assertTrue(
             guard_kwargs[0]["third_party_attribution_requested"]

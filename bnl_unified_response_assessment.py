@@ -716,6 +716,61 @@ def _situation_task_segments(text: str) -> Tuple[str, ...]:
     return parts or (str(text or ""),)
 
 
+def situation_subject_label_spans(
+    text: str, spans: Sequence[Tuple[int, int]]
+) -> Tuple[Tuple[int, int], ...]:
+    """Select subject-label occurrences, retaining topic labels as query text.
+
+    Callers supply already observed public labels. This helper owns only their
+    positions within request clauses, never account identity or source access.
+    """
+
+    value = str(text or "")
+    selected = []
+    for start, end in sorted(set(spans), key=lambda item: (-(item[1] - item[0]), item[0])):
+        if not 0 <= start < end <= len(value):
+            continue
+        if any(start < prior_end and end > prior_start for prior_start, prior_end in selected):
+            continue
+        selected.append((start, end))
+    task_starts = []
+    search_offset = 0
+    for segment in _situation_task_segments(value):
+        match = re.search(
+            re.escape(segment).replace(r"\ ", r"\s+"),
+            value[search_offset:], re.I,
+        )
+        if match is not None:
+            task_starts.append(search_offset + match.start())
+            search_offset += match.end()
+    previous_end = 0
+    subject_seen = False
+    topic_only = False
+    subjects = []
+    for start, end in sorted(selected):
+        between = value[previous_end:start]
+        if (
+            re.search(r"[?!;\n]|\.(?=\s|$)", between)
+            or any(previous_end <= task_start <= start for task_start in task_starts)
+        ):
+            subject_seen = False
+            topic_only = False
+        if subject_seen and not topic_only:
+            for boundary in re.finditer(r"\b(?:about|regarding|concerning|on)\b", between, re.I):
+                coordinated = re.search(
+                    r"\b(?:and|or)\s+(?:also\s+)?$",
+                    between[:boundary.start()], re.I,
+                )
+                if not coordinated:
+                    topic_only = True
+                    break
+        previous_end = end
+        if not topic_only:
+            subject_seen = True
+            subjects.append((start, end))
+    return tuple(subjects)
+
+
 def situation_task_texts(
     frame: SituationFrameV1 | None,
     *,
@@ -1032,6 +1087,8 @@ def build_situation_frame_v1(
     explicit_mention_count: int = 0,
     subject_user_ids: Sequence[int] = (),
     subject_label_hints: Sequence[str] = (),
+    subject_labels_by_user_id: Mapping[int, str] | None = None,
+    unresolved_subject_label_hints: Sequence[str] = (),
     subject_entity_refs: Sequence[str] = (),
     moment_id: str = "",
     moment_situation_state: str = "none",
@@ -1049,6 +1106,7 @@ def build_situation_frame_v1(
     target_ids = _unique_positive_ints(addressee_user_ids)
     subject_ids = _unique_positive_ints(subject_user_ids)
     label_hints = _unique_strings(subject_label_hints)[:8]
+    unresolved_labels = _unique_strings(unresolved_subject_label_hints)[:8]
     entity_refs = _unique_strings(subject_entity_refs)[:8]
     roles, domains = _situation_roles_domains(text)
     phase = _situation_phase(text)
@@ -1076,7 +1134,11 @@ def build_situation_frame_v1(
                 SituationSubjectReference(
                     user_id=user_id,
                     entity_ref="",
-                    label_hint=(label_hints[index] if index < len(label_hints) else ""),
+                    label_hint=(
+                        str(subject_labels_by_user_id.get(user_id, "") or "")
+                        if subject_labels_by_user_id is not None else
+                        label_hints[index] if index < len(label_hints) else ""
+                    ),
                     binding_method="existing_typed_target",
                     confidence="high",
                     role_hints=roles,
@@ -1118,6 +1180,16 @@ def build_situation_frame_v1(
                     domain_hints=domains,
                 )
             )
+    for label_hint in unresolved_labels:
+        subjects.append(
+            SituationSubjectReference(
+                label_hint=label_hint,
+                binding_method="reversible_label_hint",
+                confidence="low",
+                role_hints=roles,
+                domain_hints=domains,
+            )
+        )
     if (
         bnl_self_subject_cue
         and not any(subject.entity_ref == BNL01.key for subject in subjects)
@@ -1177,6 +1249,9 @@ def build_situation_frame_v1(
 
     ambiguity = []
     competing = []
+    if unresolved_labels:
+        ambiguity.append("member_label_unresolved")
+        competing.append("member_label_candidates")
     if normalized_referent in {"ambiguous", "unresolved"}:
         ambiguity.append("referent_%s" % normalized_referent)
         competing.append("nearby_referent_candidates")
