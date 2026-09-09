@@ -38,8 +38,8 @@ from bnl_memory_ledger import (
 from bnl_tiktok_live_context import (
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     build_tiktok_show_evidence_ledger,
-    explicit_show_dates,
     has_explicit_show_date,
+    is_dated_show_query,
     requested_show_date,
     requested_show_dates,
     show_timeline_bounds_ms,
@@ -2244,7 +2244,7 @@ def _document_relevance(
             if participant not in participant_matches:
                 participant_matches.append(participant)
                 score += 120
-    if _SHOW_QUERY_RE.search(query):
+    if _SHOW_QUERY_RE.search(query) or (requested_dates and is_dated_show_query(query)):
         score += 30
     elif _COMMUNITY_BASELINE_QUERY_RE.search(query):
         score += 24
@@ -3131,7 +3131,7 @@ def build_tiktok_show_evidence_context(
     # A current correction wins over a prior date. Once a generation owns
     # selected roots, relative-date rollover must not select a different show.
     requested_dates = (
-        explicit_show_dates(date_query) if has_explicit_show_date(date_query) else
+        requested_show_dates(date_query) if has_explicit_show_date(date_query) else
         () if pinned_show_keys else requested_show_dates(date_query)
     )
     allow_direct_subject = _subject_continuity_requested(user_text)

@@ -65,6 +65,7 @@ class RequestedShowDateTests(unittest.TestCase):
             "That episode from August 28, 2026.",
             "What's TikTok chat saying on September 4, 2026?",
             "What stood out in TikTok chat on August 28, 2026?",
+            "BNL, compare the August 28, 2026 and September 4, 2026 shows",
         ):
             with self.subTest(query=query):
                 self.assertTrue(is_dated_show_query(query))
@@ -120,6 +121,18 @@ class RequestedShowDateTests(unittest.TestCase):
         self.assertEqual(requested_show_dates(
             "Yesterday's show", now="2026-09-05T17:00:00Z",
         ), ("2026-09-04",))
+
+    def test_show_dates_do_not_include_other_clauses_dates(self):
+        for query in (
+            "Tell me about the August 28, 2026 show; my appointment is September 4, 2026.",
+            "My appointment is September 4, 2026; tell me about the August 28, 2026 show.",
+            "Tell me about the August 28, 2026 show, my appointment is September 4, 2026.",
+            "What's TikTok chat saying on August 28, 2026 and my appointment is September 4, 2026?",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(requested_show_dates(query), ("2026-08-28",))
+                self.assertEqual(requested_show_date(query), "2026-08-28")
+                self.assertEqual(len(explicit_show_dates(query)), 2)
 
     def test_live_date_matches_the_authoritative_show_and_not_the_calendar(self):
         for day, expected in (("September 4, 2026", True), ("September 5, 2026", False)):
@@ -259,6 +272,19 @@ class RequestedShowEvidenceTests(unittest.TestCase):
                 self.assertEqual(
                     {day for item in self.packet_items(query) for day in item.show_dates},
                     {"2026-08-28", "2026-09-04"},
+                )
+
+    def test_packet_dates_share_the_archive_show_association(self):
+        for query, expected in (
+            ("BNL, compare the August 28, 2026 and September 4, 2026 shows",
+             {"2026-08-28", "2026-09-04"}),
+            ("Tell me about the August 28, 2026 show; my appointment is September 4, 2026.",
+             {"2026-08-28"}),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(
+                    {day for item in self.packet_items(query) for day in item.show_dates},
+                    expected,
                 )
 
     def test_same_date_sessions_do_not_crowd_out_another_requested_date(self):

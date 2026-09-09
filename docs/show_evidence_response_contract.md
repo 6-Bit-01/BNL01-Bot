@@ -121,6 +121,12 @@ proof of what an audience member said. A date outside show context alone is
 not a show-retrieval cue. Dated-source admission uses an existing show/live
 analysis intent or a date-associated show noun phrase; ordinary verbs such as
 "show me" or "I live in" do not make an unrelated date a show reference.
+Coordinated dates may share a leading or trailing show noun. Admission,
+requested-date extraction, packet selection, and pinned source refresh reuse
+that association; an appointment date in another clause does not select a
+second show. The lexical date helper still recognizes all calendar dates, and
+existing source-owned date-only/subject-date lookups retain their compatibility
+fallback. That fallback does not admit a website/archive request.
 These bounded cases do not establish arbitrary
 follow-up understanding or live model factuality.
 

@@ -438,33 +438,54 @@ def explicit_show_dates(user_text: str) -> tuple[str, ...]:
     ))
 
 
-def is_dated_show_query(user_text: str) -> bool:
-    """A dated show reference can select evidence without a recap phrase."""
+def _show_scoped_date_matches(user_text: str) -> tuple[re.Match, ...]:
+    """Associate date lists with their show phrase or existing local intent."""
 
-    query = _SPACE_RE.sub(" ", str(user_text or "")).strip().lower()
+    query = str(user_text or "").strip().lower()
     dates = _explicit_show_date_matches(query)
     if not dates:
-        return False
-    if is_tiktok_show_analysis_query(query) or any(
-        re.search(pattern, query) for pattern in _LIVE_REACTION_PATTERNS
-    ):
-        # Admit the existing intent before the website resolves the show's
-        # actual date; this does not authorize a particular archive or buffer.
-        return True
+        return ()
+    groups = []
     for match in dates:
-        before, after = query[:match.start()], query[match.end():]
-        # A dated noun phrase can be a source reference without a recap verb.
-        # A bare "show me" or "I live in" elsewhere in the turn cannot.
+        if groups and re.fullmatch(
+            r"\s*(?:,|,?\s*(?:and|or)|&|/)\s*",
+            query[groups[-1][-1].end():match.start()],
+        ):
+            groups[-1].append(match)
+        else:
+            groups.append([match])
+    # Punctuation inside a calendar date and coordination inside a date list
+    # cannot split its scope. Outside the list, a new clause owns its dates.
+    protected = list(query)
+    for group in groups:
+        start, end = group[0].start(), group[-1].end()
+        protected[start:end] = " " * (end - start)
+    boundaries = tuple(re.finditer(r"[.!?;,\n]|\b(?:and|or)\b", "".join(protected)))
+    scoped = []
+    for group in groups:
+        start, end = group[0].start(), group[-1].end()
+        left = max((item.end() for item in boundaries if item.end() <= start), default=0)
+        right = min((item.start() for item in boundaries if item.start() >= end), default=len(query))
+        before, after = query[left:start], query[end:right]
+        clause = _SPACE_RE.sub(" ", query[left:right]).strip()
         if (
-            (not before or re.search(r"\b(?:the|this|that|a|an|our)\s+$", before))
+            (not before.strip() or re.search(r"\b(?:the|this|that|a|an|our)\s+$", before))
             and re.match(r"\s*(?:['’]s\s+)?(?:show|episode|stream|broadcast)s?\b", after)
         ) or re.search(
             r"\b(?:the|this|that|a|an|our)\s+(?:show|episode|stream|broadcast)s?"
             r"(?:\s+(?:on|of|from|for))?\s+$",
             before,
+        ) or is_tiktok_show_analysis_query(clause) or any(
+            re.search(pattern, clause) for pattern in _LIVE_REACTION_PATTERNS
         ):
-            return True
-    return False
+            scoped.extend(group)
+    return tuple(scoped)
+
+
+def is_dated_show_query(user_text: str) -> bool:
+    """A dated show reference can select evidence without a recap phrase."""
+
+    return bool(_show_scoped_date_matches(user_text))
 
 
 def _pacific_show_date(now: Any = None) -> date:
@@ -488,7 +509,7 @@ def requested_show_date(
     """Resolve the requested public show date for all existing show readers."""
 
     if has_explicit_show_date(user_text):
-        return explicit_show_date(user_text)
+        return next(iter(requested_show_dates(user_text, now=now)), "")
     query = str(user_text or "")
     if not _SHOW_DATE_SCOPE_RE.search(query):
         return ""
@@ -507,6 +528,15 @@ def requested_show_dates(
     """Resolve every requested date using the existing calendar rules."""
 
     if has_explicit_show_date(user_text):
+        scoped = _show_scoped_date_matches(user_text)
+        if scoped:
+            return tuple(dict.fromkeys(
+                value for match in scoped
+                if (value := _normalize_show_date_match(match))
+            ))
+        # Preserve bare-date/subject-date selection for callers that already
+        # own their source scope. This fallback cannot admit a website read:
+        # is_dated_show_query requires an associated show reference above.
         return explicit_show_dates(user_text)
     value = requested_show_date(
         user_text, now=now, include_current_relative=include_current_relative,
@@ -523,14 +553,17 @@ def is_live_show_reaction_query(
     if not normalized:
         return False
     if has_explicit_show_date(normalized):
-        dates = explicit_show_dates(normalized)
+        dates = requested_show_dates(normalized)
         active_date = (
             _pacific_show_date(now).isoformat()
             if current_show_date is None else str(current_show_date)
         )
         if dates != (active_date,) or any(
             not _normalize_show_date_match(match)
-            for match in _explicit_show_date_matches(normalized)
+            for match in (
+                _show_scoped_date_matches(normalized)
+                or _explicit_show_date_matches(normalized)
+            )
         ):
             return False
     elif _PAST_SHOW_DATE_RE.search(normalized) or _PAST_SHOW_REFERENCE_RE.search(normalized):

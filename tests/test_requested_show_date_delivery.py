@@ -198,6 +198,32 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(refreshed.authored_excerpts, basis.authored_excerpts)
                 self.assertEqual(bot.prompt_source_basis_failure((refreshed,)), "")
 
+    async def test_coordinated_show_dates_do_not_require_a_platform_word(self):
+        for request in (
+            "BNL, compare the August 28, 2026 and September 4, 2026 shows",
+            "BNL, compare the shows from August 28, 2026 and September 4, 2026",
+        ):
+            with self.subTest(request=request):
+                website, episode, basis = self._read(request)
+                for text in (AUGUST_COMMENT, SEPTEMBER_COMMENT):
+                    self.assertIn(text, website)
+                    self.assertIn(text, episode)
+                self.assertEqual(len(basis.show_keys), 2)
+
+    async def test_unrelated_date_cannot_select_or_refresh_another_show(self):
+        for request in (
+            "Tell me about the August 28, 2026 show; my appointment is September 4, 2026.",
+            "My appointment is September 4, 2026; tell me about the August 28, 2026 show.",
+        ):
+            with self.subTest(request=request):
+                website, episode, basis = self._read(request)
+                self.assertIn(AUGUST_COMMENT, website)
+                self.assertNotIn(SEPTEMBER_COMMENT, website)
+                self._assert_august_source(episode, basis)
+                refreshed, changed = bot.refresh_prompt_source_basis(basis)
+                self.assertFalse(changed)
+                self._assert_august_source(refreshed.rendered_context, refreshed)
+
     async def test_removed_second_show_refresh_retains_only_the_valid_source(self):
         _website, _episode, basis = self._read(COMPARE_REQUEST)
         self.assertEqual(len(basis.show_keys), 2)
