@@ -34,6 +34,12 @@ whether the model used an allowed phrase.
   wording and a website snapshot's date. An unavailable requested show or an
   invalid calendar date cannot silently select the latest show. Source refresh
   preserves that scope.
+- Follow-up retrieval reuses the same TikTok intent check as initial source
+  admission, before a current-show date is available. All dates selected by
+  the website adapter pass to the finalized ledger. When Conversation Context
+  resolves a prior human request, the ledger uses that selected row as its
+  retrieval cue, including when the website is unavailable. Prior model
+  replies cannot supply that cue; current dates still own corrections.
 - Dated live requests first reach the existing website reader. Once its
   authorized current-show/session date is available, that date determines
   whether to read current reactions, including a Friday show after Pacific
@@ -133,6 +139,14 @@ source limit, current-date corrections, public reply persistence across Pacific
 midnight, and already-selected follow-up dates. Passive-batch admission rules
 are unchanged; the delivery comparison is an admitted question, while reader
 tests retain the existing show-context requests.
+
+The continuation regression runs the comparison and quote follow-up in the
+same channel with real user-message capture, conversation selection, archive
+readers, and batch assembly. It checks original speaker/text pairs and both
+show roots at generation and source refresh, then a current-date correction.
+The packet-enabled case makes website transport unavailable on the follow-up
+and confirms stored ledger evidence reaches the actual packet assembly.
+These transport fixtures establish evidence delivery, not live model output.
 
 Live acceptance still needs to check grounded show recall and quotes, an
 ordinary continuation, a factual correction, a mixed-source question, current
