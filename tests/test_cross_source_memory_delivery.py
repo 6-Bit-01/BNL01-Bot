@@ -6,9 +6,11 @@ transport are fixtures. Supported replies demonstrate delivery, not live model
 factuality or production availability of any particular comment.
 """
 
+import asyncio
 import json
 import os
 import sqlite3
+import threading
 import unittest
 from itertools import product
 from types import SimpleNamespace
@@ -232,6 +234,50 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self._assert_sources(
                     generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"],
                 )
+
+    async def test_batch_ledger_read_leaves_discord_event_loop_responsive(self):
+        import bnl_memory_ledger as ledger
+
+        loop = asyncio.get_running_loop()
+        read_started = asyncio.Event()
+        release_read = threading.Event()
+        heartbeat_released_read = []
+        real_read = ledger._main_public_assessment_occurrence_candidates
+
+        def delayed_read(*args, **kwargs):
+            if not heartbeat_released_read:
+                loop.call_soon_threadsafe(read_started.set)
+                # Only an event-loop callback can release the first read.
+                # The timeout makes the old synchronous path fail safely.
+                heartbeat_released_read.append(release_read.wait(timeout=1))
+            return real_read(*args, **kwargs)
+
+        async def heartbeat():
+            await read_started.wait()
+            release_read.set()
+
+        pulse = asyncio.create_task(heartbeat())
+        try:
+            with self._packet_configuration(True, 8811), mock.patch.object(
+                ledger, "_main_public_assessment_occurrence_candidates",
+                side_effect=delayed_read,
+            ):
+                channel, generation, guard = await self.runtime._batch(
+                    "sealed_test", request=REQUEST,
+                    answer=self._provider_answer, privileged=False,
+                )
+        finally:
+            release_read.set()
+            pulse.cancel()
+            await asyncio.gather(pulse, return_exceptions=True)
+
+        self.assertEqual(heartbeat_released_read, [True])
+        self.assertEqual(channel.sent, [ANSWER])
+        generation.assert_awaited_once()
+        self._assert_sources(
+            generation.await_args.args[0],
+            guard.await_args.kwargs["prompt_source_bases"],
+        )
 
     async def test_public_discord_source_scope_change_is_detected_before_send(self):
         prompt, metadata = await self.runtime._direct_prompt_async(

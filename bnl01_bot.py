@@ -37674,8 +37674,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             )
             batch_intelligence_packet_out: dict = {}
+            # The packet owns its SQLite connection. Read it off the Discord
+            # loop so source assessment cannot stall heartbeats or messages.
             batch_unified_assessment = (
-                build_unified_response_assessment_shadow(
+                await asyncio.to_thread(
+                    build_unified_response_assessment_shadow,
                     guild_id=guild_id,
                     route_mode=batch_route_mode,
                     channel_policy=channel_policy,
