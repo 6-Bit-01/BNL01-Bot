@@ -47,6 +47,11 @@ member, guild, and room accepts short answers without a second length/word
 test. It does not authorize unrelated speakers, rooms, generic recent activity,
 or turns directed only at another human.
 
+A successfully delivered reply closes the previous answer window unless BNL
+asks a fresh question. Failed sends preserve the pending question for retry;
+a no-store reply clears the old window without extending conversation state.
+Supplemental retransmission marking preserves a newly opened question window.
+
 ## Verification and limits
 
 Tests verify unchanged source/speaker pairs, relevant inherited context,

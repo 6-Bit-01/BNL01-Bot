@@ -39354,6 +39354,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             return
         if not batch_model_persistence_allowed:
+            # Delivery completed, so the old question has been answered. Keep
+            # this no-store path from extending conversational state.
+            for uid in unique_user_ids:
+                state = _get_conversation_continuation_state(guild_id, channel_id, uid)
+                if state:
+                    state.pop("awaiting_answer_until", None)
             logging.info(
                 "batch_response_persistence_skipped "
                 "reason=%s channel_policy=%s",
@@ -41169,6 +41175,10 @@ def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_i
         state["awaiting_retransmission_until"] = now + timedelta(seconds=CONVERSATION_RETRANSMISSION_TTL_SECONDS)
     if awaiting_answer:
         state["awaiting_answer_until"] = now + timedelta(seconds=BNL_QUESTION_ANSWER_TTL_SECONDS)
+    elif not awaiting_retransmission:
+        # A committed reply replaces the previous question. Supplemental
+        # retransmission marking must preserve a question just opened above.
+        state.pop("awaiting_answer_until", None)
     _conversation_continuation_state[key] = state
     _mark_recent_direct_response(channel_id, user_id)
 

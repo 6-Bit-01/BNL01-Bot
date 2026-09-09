@@ -135,6 +135,118 @@ class AddressedContinuationDeliveryTests(unittest.IsolatedAsyncioTestCase):
             )
         return reply_message_id
 
+    def _next_answer_window(self, policy):
+        channel_id = 8811 + len(self.runtime.channel_ids)
+        self._seed_exchange(channel_id, policy)
+        bot._mark_conversation_continuation_state(77, channel_id, 42, awaiting_answer=True)
+        return channel_id, bot._conversation_continuation_state[(77, channel_id, 42)]
+
+    def _followup_packet(self, channel_id, policy, text="Thanks."):
+        return bot._build_active_response_packet(
+            channel_id, [("Test Member", text, 42)], False,
+            guild_id=77, channel_policy=policy,
+        )
+
+    async def test_successful_nonquestion_consumes_answer_window_before_next_short_turn(self):
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                channel_id, state = self._next_answer_window(policy)
+                answer = "Let's continue with the recap."
+                channel, generation, guard = await self.runtime._batch(
+                    policy, request="Continue.", answer=answer,
+                )
+                generation.assert_awaited_once()
+                guard.assert_awaited_once()
+                self.assertEqual(channel.sent, [answer])
+                self.assertNotIn("awaiting_answer_until", state)
+                # A normal recent exchange remains available to substantive
+                # follow-ups, but the answered question cannot force another
+                # response to a low-signal acknowledgement.
+                self.assertTrue(bot._is_recent_conversation_continuation(77, channel_id, 42))
+                packet = self._followup_packet(channel_id, policy)
+                self.assertNotEqual(packet["decision"], "answer")
+                self.assertNotEqual(packet["reason"], "same_user_awaiting_answer")
+
+    async def test_fresh_delivered_question_refreshes_window_and_survives_retransmission_mark(self):
+        for policy in ("public_home", "sealed_test"):
+            for requests_retransmission in (False, True):
+                with self.subTest(policy=policy, retransmission=requests_retransmission):
+                    channel_id, state = self._next_answer_window(policy)
+                    old_deadline = bot.datetime.now(bot.timezone.utc) + bot.timedelta(seconds=5)
+                    state["awaiting_answer_until"] = old_deadline
+                    answer = (
+                        "The recap covers that show's visuals. Could you send it again?"
+                        if requests_retransmission
+                        else "The recap covers that show's visuals. Would you like another comment?"
+                    )
+                    channel, generation, guard = await self.runtime._batch(
+                        policy, request="Continue.", answer=answer,
+                    )
+                    generation.assert_awaited_once()
+                    guard.assert_awaited_once()
+                    self.assertEqual(channel.sent, [answer])
+                    self.assertGreater(state["awaiting_answer_until"], old_deadline)
+                    self.assertEqual("awaiting_retransmission_until" in state, requests_retransmission)
+                    packet = self._followup_packet(channel_id, policy, "Yes.")
+                    self.assertEqual(packet["decision"], "answer")
+                    self.assertEqual(packet["reason"], "same_user_awaiting_answer")
+
+    async def test_failed_discord_send_preserves_answer_window_for_retry(self):
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                channel_id, state = self._next_answer_window(policy)
+                old_deadline = state["awaiting_answer_until"]
+                with mock.patch.object(
+                    network_fixture.FakeChannel, "send",
+                    new=mock.AsyncMock(side_effect=RuntimeError("test transport unavailable")),
+                ) as send:
+                    channel, generation, guard = await self.runtime._batch(
+                        policy, request="Continue.", answer="Let's continue with the recap.",
+                    )
+                generation.assert_awaited_once()
+                guard.assert_awaited_once()
+                send.assert_awaited_once()
+                self.assertEqual(channel.sent, [])
+                self.assertEqual(state["awaiting_answer_until"], old_deadline)
+                packet = self._followup_packet(channel_id, policy, "Continue.")
+                self.assertEqual(packet["decision"], "answer")
+                self.assertEqual(packet["reason"], "same_user_awaiting_answer")
+
+    async def test_successful_no_store_delivery_only_consumes_existing_question_state(self):
+        for policy in ("public_home", "sealed_test"):
+            for has_existing_window in (False, True):
+                with self.subTest(policy=policy, existing_window=has_existing_window):
+                    channel_id = 8811 + len(self.runtime.channel_ids)
+                    if has_existing_window:
+                        channel_id, state = self._next_answer_window(policy)
+                        previous_state = dict(state)
+                        participants = (("Test Member", "Continue.", 42),)
+                    else:
+                        self._seed_exchange(channel_id, policy)
+                        participants = (
+                            bot.BatchConversationTurn("Test Member", "Continue.", 42, addressing("mention")),
+                        )
+                    answer = "The recap covers that show's visuals. Would you like another comment?"
+                    with (
+                        mock.patch.object(bot, "model_response_persistence_allowed_with_website_context", return_value=False),
+                        mock.patch.object(bot, "save_model_message") as save,
+                    ):
+                        channel, generation, guard = await self.runtime._batch(
+                            policy, request="Continue.", answer=answer, participants=participants,
+                        )
+                    generation.assert_awaited_once()
+                    guard.assert_awaited_once()
+                    self.assertEqual(channel.sent, [answer])
+                    save.assert_not_called()
+                    if has_existing_window:
+                        previous_state.pop("awaiting_answer_until")
+                        self.assertEqual(state, previous_state)
+                    else:
+                        self.assertNotIn((77, channel_id, 42), bot._conversation_continuation_state)
+                    packet = self._followup_packet(channel_id, policy)
+                    self.assertNotEqual(packet["decision"], "answer")
+                    self.assertNotEqual(packet["reason"], "same_user_awaiting_answer")
+
     async def test_real_bare_continue_reaches_provider_with_its_existing_source_scope(self):
         # The fixture checks source handoff and delivery, not live semantic
         # quality. In particular, exact reply targets must not be broadened to
