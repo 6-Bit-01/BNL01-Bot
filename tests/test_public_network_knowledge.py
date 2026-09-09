@@ -253,6 +253,15 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Source-linked authored examples:", prompt)
         self.assertIn("the green visuals during this song are wild.", prompt)
         self.assertNotIn("This private row must never enter", prompt)
+        self.assertTrue(selected[0].authored_excerpts)
+        self.assertTrue(all(
+            excerpt.source_text and excerpt.speaker_label
+            for excerpt in selected[0].authored_excerpts
+        ))
+        self.assertFalse(any(
+            excerpt.speaker_label == "BNL-01"
+            for excerpt in selected[0].authored_excerpts
+        ))
         self.assertEqual(bnl01_bot.prompt_source_basis_failure(selected), "")
         return selected
 
@@ -302,6 +311,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(failed)
         self.assertNotIn("the green visuals during this song are wild.", refreshed_prompt)
         self.assertFalse(fresh[0].rendered_context)
+        self.assertFalse(fresh[0].authored_excerpts)
 
     def _seed_publications(self, *, public_excluded=(), memory_excluded=()):
         bnl_journal.ensure_schema(bnl01_bot.DB_FILE)

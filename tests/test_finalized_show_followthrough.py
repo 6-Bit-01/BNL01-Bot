@@ -207,6 +207,31 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
 
 
 class FinalizedShowCandidateAssemblyTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _seed_prior_show_requests(bot):
+        stamp = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            for channel_index, channel_id in enumerate((8810, 8811)):
+                for role_index, (role, content) in enumerate((
+                    ("user", "Give me a recap of the show on 2026-08-28."),
+                    ("model", "The archive contains attendee remarks."),
+                )):
+                    row_id = 9001 + channel_index * 2 + role_index
+                    conn.execute(
+                        """INSERT INTO conversations
+                        (id,user_id,user_name,guild_id,channel_name,
+                         channel_policy,route_mode,role,content,timestamp)
+                        VALUES (?,42,'Test Member',77,'bnl-testing',
+                                'sealed_test','normal_chat',?,?,?)""",
+                        (row_id, role, content, stamp),
+                    )
+                    conn.execute(
+                        """INSERT INTO conversation_discord_message_links
+                        (conversation_row_id,guild_id,channel_id,message_id)
+                        VALUES (?,77,?,?)""",
+                        (row_id, channel_id, 99000 + row_id),
+                    )
+
     async def test_generic_quote_candidates_reach_real_direct_and_batch_without_priority(self):
         from tests import test_public_network_knowledge as network_fixture
 
@@ -215,28 +240,7 @@ class FinalizedShowCandidateAssemblyTests(unittest.IsolatedAsyncioTestCase):
         try:
             fixture._seed_finalized_show()
             bot = network_fixture.bnl01_bot
-            stamp = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-            with sqlite3.connect(bot.DB_FILE) as conn:
-                for channel_index, channel_id in enumerate((8810, 8811)):
-                    for role_index, (role, content) in enumerate((
-                        ("user", "Give me a recap of the show on 2026-08-28."),
-                        ("model", "The archive contains attendee remarks."),
-                    )):
-                        row_id = 9001 + channel_index * 2 + role_index
-                        conn.execute(
-                            """INSERT INTO conversations
-                            (id,user_id,user_name,guild_id,channel_name,
-                             channel_policy,route_mode,role,content,timestamp)
-                            VALUES (?,42,'Test Member',77,'bnl-testing',
-                                    'sealed_test','normal_chat',?,?,?)""",
-                            (row_id, role, content, stamp),
-                        )
-                        conn.execute(
-                            """INSERT INTO conversation_discord_message_links
-                            (conversation_row_id,guild_id,channel_id,message_id)
-                            VALUES (?,77,?,?)""",
-                            (row_id, channel_id, 99000 + row_id),
-                        )
+            self._seed_prior_show_requests(bot)
             request = "Give me some quotes"
             prompt, metadata = await fixture._direct_prompt_async("sealed_test", request=request)
             sources = fixture._assert_show_source(prompt, metadata["prompt_source_bases"])
@@ -246,7 +250,10 @@ class FinalizedShowCandidateAssemblyTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(bot.finalized_show_packet_owner_requested(request, prompt))
             channel, generation, guard = await fixture._batch(
                 "sealed_test", request=request,
-                answer="Alex commented on the green visuals during the song.",
+                answer=(
+                    'Alex (@alex.signal): "BNL, the green visuals during '
+                    'this song are wild."'
+                ),
             )
             self.assertEqual(generation.await_count, 1)
             batch_prompt = generation.await_args.args[0]
@@ -265,6 +272,47 @@ class FinalizedShowCandidateAssemblyTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertNotIn("Finalized BARCODE Radio episode priority:", unrelated_prompt)
             self.assertFalse(bot.finalized_show_packet_owner_requested(unrelated, unrelated_prompt))
+        finally:
+            await fixture.asyncTearDown()
+
+    async def test_batch_rewrites_an_invented_show_speaker_and_quote(self):
+        from tests import test_public_network_knowledge as network_fixture
+
+        fixture = network_fixture.PublicNetworkKnowledgeTests()
+        await fixture.asyncSetUp()
+        try:
+            fixture._seed_finalized_show()
+            bot = network_fixture.bnl01_bot
+            self._seed_prior_show_requests(bot)
+            fabricated = (
+                'TestBeacon: "The paper lantern blinked twice."'
+            )
+            supported = (
+                'Alex (@alex.signal): "BNL, the green visuals during this '
+                'song are wild."'
+            )
+            replies = iter((fabricated, supported))
+
+            def next_reply(*_args, **_kwargs):
+                return next(replies)
+
+            channel, generation, guard = await fixture._batch(
+                "sealed_test",
+                request="Give me some quotes",
+                answer=next_reply,
+            )
+            self.assertEqual(generation.await_count, 2)
+            self.assertEqual(channel.sent, [supported])
+            self.assertEqual(guard.await_count, 1)
+            correction_prompt = generation.await_args_list[1].args[0]
+            self.assertIn(
+                "SHOW-AUTHORED EVIDENCE CORRECTION REQUIRED",
+                correction_prompt,
+            )
+            self.assertIn(
+                "Source-linked authored examples:",
+                correction_prompt,
+            )
         finally:
             await fixture.asyncTearDown()
 

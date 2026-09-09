@@ -3079,6 +3079,37 @@ def build_tiktok_show_evidence_context(
         else 1
     )
     selected = ranked[:selected_limit]
+    selected_authored_excerpts: list[tuple[str, ...]] = []
+    selected_authored_excerpt_keys: set[tuple[str, ...]] = set()
+
+    def remember_authored_excerpt(
+        ledger: Mapping[str, Any],
+        message: Mapping[str, Any],
+        *,
+        surface: str,
+        speaker_label: str,
+        event_id: str = "",
+    ) -> None:
+        """Keep typed authority for only the authored excerpts we render."""
+
+        source_text = str(message.get("text") or "").strip()
+        if not source_text:
+            return
+        excerpt = (
+            str(ledger.get("showKey") or ""),
+            str(ledger.get("sourceDigest") or ""),
+            str(event_id or message.get("eventId") or ""),
+            str(message.get("subjectRef") or ""),
+            str(speaker_label or "Show participant"),
+            source_text,
+            str(surface or message.get("surface") or "tiktok"),
+        )
+        key = (excerpt[0], excerpt[2], excerpt[3], excerpt[5])
+        if key in selected_authored_excerpt_keys:
+            return
+        selected_authored_excerpt_keys.add(key)
+        selected_authored_excerpts.append(excerpt)
+
     if selection_out is not None:
         selection_out.update(
             selection_user_text=selection_query,
@@ -3357,6 +3388,12 @@ def build_tiktok_show_evidence_context(
                     message.get("subjectRef"),
                     message.get("speakerLabel"),
                 )
+                remember_authored_excerpt(
+                    ledger,
+                    message,
+                    surface=str(message.get("surface") or "tiktok"),
+                    speaker_label=public_speaker_label,
+                )
                 operational_context = (
                     message.get("operationalContext")
                     if isinstance(message.get("operationalContext"), Mapping)
@@ -3434,6 +3471,19 @@ def build_tiktok_show_evidence_context(
                 for message in (exchange.get("userMessages") or ())[-3:]:
                     if not isinstance(message, Mapping):
                         continue
+                    remember_authored_excerpt(
+                        ledger,
+                        {
+                            **message,
+                            "subjectRef": str(exchange.get("subjectRef") or ""),
+                        },
+                        surface="discord",
+                        speaker_label=public_speaker_label,
+                        event_id=(
+                            "discord_conversation:"
+                            + str(message.get("conversationRowId") or "")
+                        ),
+                    )
                     lines.append(
                         f"- t+{float(message.get('minuteOffset') or 0.0):.1f}m "
                         f"{json.dumps(public_speaker_label, ensure_ascii=False)}: "
@@ -3463,6 +3513,8 @@ def build_tiktok_show_evidence_context(
             "- This show episode supports normal continuity without creating a dossier, relationship fact, verified external claim, or automatic canon promotion.",
         ]
     )
+    if selection_out is not None:
+        selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
     logging.info(
         "show_episode_evidence_context_loaded shows=%s subject_match=%s "
         "query_terms=%s chars=%s",

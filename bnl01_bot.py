@@ -11122,6 +11122,10 @@ _SOURCE_NEUTRAL_GUARD_RECOVERY_PREFIXES = (
 
 def _guard_recovery_requires_source_neutral_response(reason: str) -> bool:
     normalized = str(reason or "").strip().lower()
+    # A malformed show quote is an output failure, not a source failure. Keep
+    # the independently revalidatable authored events available for correction.
+    if normalized.startswith("show_authored_"):
+        return False
     return bool(
         any(
             normalized.startswith(prefix)
@@ -11144,6 +11148,7 @@ def recover_guarded_response_obligation(
     exact_quote_requested: bool = False,
     exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
     third_party_attribution_requested: bool = False,
+    prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
 ) -> str:
     """Recover an authorized reply after a draft guard exhausts repair.
 
@@ -11194,6 +11199,12 @@ def recover_guarded_response_obligation(
                 repaired,
                 prompt,
                 current_user_text=current_user_text,
+            ):
+                continue
+            if finalized_show_authored_response_failure(
+                repaired,
+                current_user_text=current_user_text,
+                prompt_source_bases=prompt_source_bases,
             ):
                 continue
             if contains_fake_lookup_claim(repaired):
@@ -11258,6 +11269,12 @@ def recover_guarded_response_obligation(
                 requested=quote_guard_requested,
                 authority=exact_quote_authority,
                 exact_requested=exact_quote_requested,
+            ):
+                continue
+            if finalized_show_authored_response_failure(
+                candidate,
+                current_user_text=current_user_text,
+                prompt_source_bases=prompt_source_bases,
             ):
                 continue
             diagnostics["response_obligation_recovery_kind"] = (
@@ -27079,6 +27096,19 @@ class ConversationPromptSourceBasis:
 
 
 @dataclass(frozen=True)
+class FinalizedShowAuthoredExcerpt:
+    """One immutable human-authored show excerpt and its exact speaker."""
+
+    show_key: str
+    source_digest: str
+    event_id: str
+    subject_ref: str
+    speaker_label: str
+    source_text: str
+    surface: str
+
+
+@dataclass(frozen=True)
 class FinalizedShowPromptSourceBasis:
     """Revalidate the existing finalized-show reader's selected source roots."""
 
@@ -27090,6 +27120,53 @@ class FinalizedShowPromptSourceBasis:
     subject_user_id: int
     show_keys: tuple[str, ...]
     candidate_context: bool = False
+    authored_excerpts: tuple[FinalizedShowAuthoredExcerpt, ...] = ()
+
+
+def _finalized_show_basis_digest(
+    refs: tuple,
+    rendered_context: str,
+    authored_excerpts: tuple[FinalizedShowAuthoredExcerpt, ...],
+) -> str:
+    excerpt_rows = tuple(
+        (
+            item.show_key,
+            item.source_digest,
+            item.event_id,
+            item.subject_ref,
+            item.speaker_label,
+            item.source_text,
+            item.surface,
+        )
+        for item in authored_excerpts
+    )
+    return _prompt_source_digest(
+        json.dumps((refs, rendered_context, excerpt_rows)),
+    )
+
+
+def _finalized_show_authored_excerpts_from_selection(
+    selection: Mapping[str, Any],
+    refs: tuple,
+) -> tuple[FinalizedShowAuthoredExcerpt, ...]:
+    selected_refs = {
+        (str(ref[0]), str(ref[1]))
+        for ref in refs
+        if isinstance(ref, (tuple, list)) and len(ref) >= 2
+    }
+    excerpts = []
+    for raw in selection.get("authored_excerpts") or ():
+        if not isinstance(raw, (tuple, list)) or len(raw) != 7:
+            continue
+        values = tuple(str(value or "").strip() for value in raw)
+        if (
+            (values[0], values[1]) not in selected_refs
+            or not values[4]
+            or not values[5]
+        ):
+            continue
+        excerpts.append(FinalizedShowAuthoredExcerpt(*values))
+    return tuple(excerpts)
 
 
 def build_finalized_show_prompt_source_basis(
@@ -27098,8 +27175,16 @@ def build_finalized_show_prompt_source_basis(
     refs = tuple(selection.get("source_refs") or ())
     if not rendered_context or not refs:
         return None
+    authored_excerpts = _finalized_show_authored_excerpts_from_selection(
+        selection,
+        refs,
+    )
     return FinalizedShowPromptSourceBasis(
-        expected_digest=_prompt_source_digest(json.dumps((refs, rendered_context))),
+        expected_digest=_finalized_show_basis_digest(
+            refs,
+            rendered_context,
+            authored_excerpts,
+        ),
         rendered_context=rendered_context,
         guild_id=int(guild_id),
         user_text=str(selection.get("user_text") or ""),
@@ -27107,6 +27192,7 @@ def build_finalized_show_prompt_source_basis(
         subject_user_id=int(selection.get("subject_user_id") or 0),
         show_keys=tuple(str(ref[0]) for ref in refs),
         candidate_context=bool(selection.get("candidate_context")),
+        authored_excerpts=authored_excerpts,
     )
 
 
@@ -29821,10 +29907,22 @@ def refresh_prompt_source_basis(
             if env_queue_production_enabled()
             else ""
         )
-        digest = _prompt_source_digest(
-            json.dumps((tuple(selection.get("source_refs") or ()), context)),
+        refs = tuple(selection.get("source_refs") or ())
+        authored_excerpts = _finalized_show_authored_excerpts_from_selection(
+            selection,
+            refs,
         )
-        fresh = replace(basis, expected_digest=digest, rendered_context=context)
+        digest = _finalized_show_basis_digest(
+            refs,
+            context,
+            authored_excerpts,
+        )
+        fresh = replace(
+            basis,
+            expected_digest=digest,
+            rendered_context=context,
+            authored_excerpts=authored_excerpts,
+        )
         return fresh, fresh.expected_digest != basis.expected_digest
     if isinstance(basis, PublicationPromptSourceBasis):
         return _refresh_publication_prompt_source_basis(
@@ -38879,6 +38977,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             or guard_diagnostics.get("community_visual_guard_triggered")
             or guard_diagnostics.get("exact_quote_guard_triggered")
             or guard_diagnostics.get(
+                "show_authored_evidence_guard_triggered"
+            )
+            or guard_diagnostics.get(
                 "current_payload_grounding_guard_triggered"
             )
             or guard_diagnostics.get(
@@ -39011,6 +39112,107 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         if guard_diagnostics.get("source_neutral_recovery"):
             batch_presend_source_bases = ()
         await _stop_batch_typing(channel_id, local_generation_id, reason="response_ready")
+        presend_show_authored_failure = ""
+        if not guard_diagnostics.get("source_neutral_recovery"):
+            presend_show_authored_failure = (
+                finalized_show_authored_response_failure(
+                    response,
+                    current_user_text=combined_text,
+                    prompt_source_bases=batch_presend_source_bases,
+                )
+            )
+        if presend_show_authored_failure:
+            logging.warning(
+                "batch_show_authored_rewrite_before_send reason=%s "
+                "channel_id=%s",
+                presend_show_authored_failure,
+                channel_id,
+            )
+            guard_diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": presend_show_authored_failure,
+                    "show_authored_evidence_guard_triggered": True,
+                    "show_authored_evidence_guard_reason": (
+                        presend_show_authored_failure
+                    ),
+                    "response_review_requires_rewrite": True,
+                }
+            )
+            (
+                response,
+                prompt,
+                rewritten_source_bases,
+                response_rewrite_calls,
+                source_neutral_rewrite,
+            ) = await resolve_guarded_response_obligation(
+                response,
+                baseline_response=(
+                    response
+                    if batch_single_packet_cutover
+                    else batch_baseline_response
+                ),
+                prompt=prompt,
+                current_user_text=combined_text,
+                diagnostics=guard_diagnostics,
+                route_mode=ROUTE_MODE_NORMAL_CHAT,
+                generation_route=generation_route,
+                channel_policy=channel_policy,
+                user_id=first_uid,
+                guild_id=guild_id,
+                channel=channel,
+                prompt_source_bases=batch_presend_source_bases,
+                source_context_available=(
+                    batch_response_source_context_available
+                ),
+                exact_quote_requested=(
+                    batch_attribution_contract.exact_quote_requested
+                ),
+                exact_quote_authority=None,
+                third_party_attribution_requested=(
+                    batch_attribution_contract
+                    .third_party_attribution_requested
+                ),
+                **({"image_inputs": batch_image_inputs} if batch_image_inputs else {}),
+            )
+            if batch_single_packet_cutover:
+                batch_single_packet_corrective_call_count += (
+                    response_rewrite_calls
+                )
+                batch_synthesis_decision = (
+                    await safely_record_ordinary_chat_single_packet_review(
+                        batch_synthesis_decision,
+                        reason=(
+                            "single_packet_show_authored_response_rewritten"
+                        ),
+                        corrective_call_count=(
+                            batch_single_packet_corrective_call_count
+                        ),
+                    )
+                    or batch_synthesis_decision
+                )
+            if not response:
+                await safely_finalize_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    final_response="",
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status="show_authored_response_rewrite_failed",
+                )
+                return
+            batch_presend_source_bases = tuple(rewritten_source_bases)
+            guard_diagnostics.update(
+                {
+                    "suppressed": False,
+                    "response_obligation_regenerated": True,
+                    "response_obligation_recovery_kind": "model_rewrite",
+                    "source_neutral_recovery": source_neutral_rewrite,
+                    "original_suppression_reason": (
+                        presend_show_authored_failure
+                    ),
+                }
+            )
+            batch_synthesis_candidate_active = False
         if (
             batch_attribution_contract.exact_quote_authority is not None
             and not guard_diagnostics.get("source_neutral_recovery")
@@ -42038,30 +42240,54 @@ async def _generate_direct_payload_session(session_key, reason: str):
     if _abort_if_invalidated("revision_changed_before_send"):
         logging.info("direct_session_pre_send_abort reason=revision_changed_before_send")
         return
+    show_authored_presend_failure = ""
     quote_presend_failure = ""
     if not guard_diagnostics.get("source_neutral_recovery"):
-        quote_presend_failure = await exact_quote_presend_failure(
-            response,
-            exact_requested=bool(
-                prompt_metadata.get("exact_quote_requested")
-            ),
-            third_party_attribution_requested=bool(
-                prompt_metadata.get("third_party_attribution_requested")
-            ),
-            authority=prompt_metadata.get("exact_quote_authority"),
-            channel=getattr(anchor_message, "channel", None),
+        show_authored_presend_failure = (
+            finalized_show_authored_response_failure(
+                response,
+                current_user_text=direct_content,
+                prompt_source_bases=direct_payload_presend_source_bases,
+            )
         )
-    if quote_presend_failure:
+        if not show_authored_presend_failure:
+            quote_presend_failure = await exact_quote_presend_failure(
+                response,
+                exact_requested=bool(
+                    prompt_metadata.get("exact_quote_requested")
+                ),
+                third_party_attribution_requested=bool(
+                    prompt_metadata.get("third_party_attribution_requested")
+                ),
+                authority=prompt_metadata.get("exact_quote_authority"),
+                channel=getattr(anchor_message, "channel", None),
+            )
+    presend_wording_failure = (
+        show_authored_presend_failure or quote_presend_failure
+    )
+    if presend_wording_failure:
         logging.warning(
-            "direct_payload_exact_quote_recovered_before_send reason=%s",
-            quote_presend_failure,
+            "direct_payload_wording_recovered_before_send reason=%s",
+            presend_wording_failure,
         )
         guard_diagnostics.update(
             {
                 "suppressed": True,
-                "suppression_reason": quote_presend_failure,
-                "exact_quote_guard_triggered": True,
-                "exact_quote_guard_reason": quote_presend_failure,
+                "suppression_reason": presend_wording_failure,
+                **(
+                    {
+                        "show_authored_evidence_guard_triggered": True,
+                        "show_authored_evidence_guard_reason": (
+                            show_authored_presend_failure
+                        ),
+                        "response_review_requires_rewrite": True,
+                    }
+                    if show_authored_presend_failure
+                    else {
+                        "exact_quote_guard_triggered": True,
+                        "exact_quote_guard_reason": quote_presend_failure,
+                    }
+                ),
             }
         )
         (
@@ -42096,7 +42322,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
             close_direct_payload_session_after_failed_generation(
                 session_key,
                 session,
-                "quote_response_regeneration_failed",
+                "wording_response_regeneration_failed",
             )
             return
     source_control_snapshot, source_control_provided = (
@@ -42377,6 +42603,420 @@ def _response_exact_quote_spans(text: str) -> tuple[tuple[int, int], ...]:
     return tuple(sorted(set(spans)))
 
 
+_FINALIZED_SHOW_QUOTATION_REQUEST_RE = re.compile(
+    r"\b(?:quotes?|quoting|quoted|transcripts?|verbatim|"
+    r"exact (?:words?|wording)|literal wording|word[- ]for[- ]word|"
+    r"who\s+(?:said|wrote|posted|commented|asked)|"
+    r"what\s+(?:did|does|was|were)\b.{0,80}\b"
+    r"(?:say|said|saying|write|wrote|post|posted|comment|commented)|"
+    r"said what|authored (?:text|comments?|messages?)|"
+    r"show (?:me )?(?:the )?(?:chat )?comments?)\b",
+    re.I,
+)
+_FINALIZED_SHOW_CONTINUATION_REQUEST_RE = re.compile(
+    r"^\s*(?:continue|go on|keep going|more|please|yes|yeah|yep|"
+    r"do it|show me|those|them)(?:\s+(?:please|then|now))?[.!?]*\s*$",
+    re.I,
+)
+_FINALIZED_SHOW_ATTRIBUTION_VERBS = (
+    r"said|wrote|posted|commented|asked|replied|noted|added|mentioned|"
+    r"observed|called|described|claimed|thought|believed|felt|reported|"
+    r"shared|answered"
+)
+_FINALIZED_SHOW_ATTRIBUTION_RE = re.compile(
+    r"(?:^|[.!?]\s+|,\s+|\n\s*|[-*+]\s+)"
+    r"(?P<label>[A-Za-z0-9@][^!?\n,:]{0,95}?)\s+"
+    rf"(?P<verb>{_FINALIZED_SHOW_ATTRIBUTION_VERBS})\b",
+    re.I,
+)
+_FINALIZED_SHOW_PARTICIPANT_CLAIM_RE = re.compile(
+    r"(?:^|[.!?]\s+|,\s+|\n\s*|[-*+]\s+)"
+    r"(?P<label>[A-Za-z0-9@][^!?\n,:]{0,95}?)\s+"
+    r"(?:was|is)\s+(?:one of\s+)?(?:an?\s+)?"
+    r"(?:participant|viewer|member|speaker|guest|in the chat|there)\b",
+    re.I,
+)
+_FINALIZED_SHOW_NONPERSON_LABELS = frozenset(
+    {
+        "a summary",
+        "according to the evidence",
+        "bnl",
+        "bnl 01",
+        "evidence",
+        "i",
+        "it",
+        "one excerpt",
+        "one message",
+        "the archive",
+        "the chat",
+        "the evidence",
+        "the episode",
+        "the ledger",
+        "the record",
+        "the room",
+        "the show",
+        "the source",
+        "this",
+        "we",
+    }
+)
+_FINALIZED_SHOW_ATTRIBUTION_STOP_WORDS = frozenset(
+    {
+        "about",
+        "added",
+        "and",
+        "answered",
+        "asked",
+        "believed",
+        "but",
+        "called",
+        "claimed",
+        "commented",
+        "described",
+        "felt",
+        "for",
+        "from",
+        "gist",
+        "into",
+        "mentioned",
+        "noted",
+        "observed",
+        "paraphrase",
+        "posted",
+        "reported",
+        "replied",
+        "roughly",
+        "said",
+        "shared",
+        "summary",
+        "that",
+        "the",
+        "their",
+        "they",
+        "this",
+        "thought",
+        "was",
+        "were",
+        "with",
+        "wrote",
+    }
+)
+
+
+def _finalized_show_attribution_terms(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(
+            r"[a-z0-9][a-z0-9'’-]{2,}",
+            str(value or "").casefold(),
+        )
+        if token not in _FINALIZED_SHOW_ATTRIBUTION_STOP_WORDS
+        and not token.isdigit()
+    }
+
+
+def _normalize_finalized_show_speaker_reference(value: str) -> str:
+    normalized = re.sub(r"[`*_~]", "", str(value or ""))
+    normalized = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", normalized)
+    normalized = re.sub(
+        r"^\s*(?:and|but|then|meanwhile|also|by|from)\s+",
+        "",
+        normalized,
+        flags=re.I,
+    )
+    normalized = normalized.strip(" \t\r\n:;,.-–—()[]{}\"'“”")
+    normalized = re.sub(r"\s+", " ", normalized).casefold()
+    return normalized
+
+
+def _finalized_show_speaker_variants(
+    excerpt: FinalizedShowAuthoredExcerpt,
+) -> frozenset[str]:
+    full = _normalize_finalized_show_speaker_reference(
+        excerpt.speaker_label
+    )
+    variants = {full} if full else set()
+    handles = re.findall(
+        r"(?<![A-Za-z0-9_.-])@([A-Za-z0-9_.-]{1,80})",
+        excerpt.speaker_label,
+    )
+    for handle in handles:
+        variants.add("@" + handle.casefold())
+        variants.add(handle.casefold())
+    return frozenset(variants)
+
+
+def _finalized_show_authority_applies(
+    basis: FinalizedShowPromptSourceBasis,
+    current_user_text: str,
+) -> bool:
+    request = str(current_user_text or basis.user_text or "").strip()
+    return bool(
+        not basis.candidate_context
+        or _FINALIZED_SHOW_QUOTATION_REQUEST_RE.search(request)
+        or _FINALIZED_SHOW_CONTINUATION_REQUEST_RE.fullmatch(request)
+    )
+
+
+def _finalized_show_authority_excerpts(
+    prompt_source_bases: tuple[PromptSourceBasis, ...],
+    current_user_text: str,
+) -> tuple[FinalizedShowAuthoredExcerpt, ...]:
+    return tuple(
+        excerpt
+        for basis in tuple(prompt_source_bases or ())
+        if isinstance(basis, FinalizedShowPromptSourceBasis)
+        and _finalized_show_authority_applies(basis, current_user_text)
+        for excerpt in basis.authored_excerpts
+    )
+
+
+def _finalized_show_authority_is_requested(
+    prompt_source_bases: tuple[PromptSourceBasis, ...],
+    current_user_text: str,
+) -> bool:
+    return any(
+        isinstance(basis, FinalizedShowPromptSourceBasis)
+        and _finalized_show_authority_applies(basis, current_user_text)
+        for basis in tuple(prompt_source_bases or ())
+    )
+
+
+def _response_show_quote_occurrences(
+    text: str,
+) -> tuple[tuple[str, int, int], ...]:
+    value = str(text or "")
+    occurrences = []
+    occupied_spans = []
+    for pattern in (
+        re.compile(r'"(?P<text>[^"\n]{1,500})"'),
+        re.compile(r"“(?P<text>[^”\n]{1,500})”"),
+        re.compile(r"`(?P<text>[^`\n]{1,500})`"),
+    ):
+        for match in pattern.finditer(value):
+            fragment = _normalized_quote_source_text(match.group("text"))
+            if fragment:
+                occurrences.append((fragment, match.start(), match.end()))
+                occupied_spans.append(match.span())
+    for match in re.finditer(r"(?m)^\s*>\s*(?P<text>.+?)\s*$", value):
+        if any(
+            start < match.end() and end > match.start()
+            for start, end in occupied_spans
+        ):
+            continue
+        fragment = _normalized_quote_source_text(match.group("text"))
+        if fragment:
+            occurrences.append((fragment, match.start(), match.end()))
+    return tuple(sorted(occurrences, key=lambda item: (item[1], item[2])))
+
+
+def _show_quote_attribution_label(
+    response: str,
+    start: int,
+    end: int,
+) -> str:
+    value = str(response or "")
+    line_start = value.rfind("\n", 0, start) + 1
+    line_end = value.find("\n", end)
+    if line_end < 0:
+        line_end = len(value)
+    before = value[line_start:start]
+    after = value[end:line_end]
+    before_patterns = (
+        re.compile(
+            rf"(?P<label>.+?)\s+(?:{_FINALIZED_SHOW_ATTRIBUTION_VERBS})"
+            r"\s*[,;:–—-]*\s*$",
+            re.I,
+        ),
+        re.compile(r"(?P<label>.+?)\s*[:–—-]\s*$"),
+    )
+    for pattern in before_patterns:
+        match = pattern.search(before)
+        if match:
+            label = _normalize_finalized_show_speaker_reference(
+                match.group("label")
+            )
+            if label:
+                return label
+    after_patterns = (
+        re.compile(
+            r"^\s*(?:[–—-]{1,2}|by\b|from\b)\s*"
+            r"(?P<label>[^,;!?\n]{1,160}?)\s*(?:[,;.!?]|$)\s*$",
+            re.I,
+        ),
+        re.compile(
+            r"^\s*\(\s*(?P<label>[^)\n]{1,160}?)\s*\)"
+        ),
+    )
+    for pattern in after_patterns:
+        match = pattern.search(after)
+        if match:
+            label = _normalize_finalized_show_speaker_reference(
+                match.group("label")
+            )
+            if label:
+                return label
+    if value[line_start:start].lstrip().startswith(">"):
+        next_line_end = value.find("\n", line_end + 1)
+        next_line = value[
+            line_end + 1 : next_line_end if next_line_end >= 0 else len(value)
+        ]
+        match = re.match(
+            r"\s*(?:[–—-]{1,2}|by\b|from\b)\s*"
+            r"(?P<label>[^,;!?\n]{1,160}?)\s*(?:[,;.!?]|$)\s*$",
+            next_line,
+            flags=re.I,
+        )
+        if match:
+            return _normalize_finalized_show_speaker_reference(
+                match.group("label")
+            )
+    return ""
+
+
+def _unquoted_finalized_show_attributions(
+    response: str,
+) -> tuple[tuple[str, str, bool], ...]:
+    value = str(response or "")
+    masked = list(value)
+    for _fragment, start, end in _response_show_quote_occurrences(value):
+        masked[start:end] = " " * (end - start)
+    unquoted = "".join(masked)
+    attributions = []
+    for pattern, wording_claim in (
+        (_FINALIZED_SHOW_ATTRIBUTION_RE, True),
+        (_FINALIZED_SHOW_PARTICIPANT_CLAIM_RE, False),
+    ):
+        for match in pattern.finditer(unquoted):
+            label = _normalize_finalized_show_speaker_reference(
+                match.group("label")
+            )
+            if label and label not in _FINALIZED_SHOW_NONPERSON_LABELS:
+                clause_start = max(
+                    unquoted.rfind(".", 0, match.start()),
+                    unquoted.rfind("!", 0, match.start()),
+                    unquoted.rfind("?", 0, match.start()),
+                    unquoted.rfind("\n", 0, match.start()),
+                ) + 1
+                clause_ends = tuple(
+                    end
+                    for end in (
+                        unquoted.find(".", match.end()),
+                        unquoted.find("!", match.end()),
+                        unquoted.find("?", match.end()),
+                        unquoted.find("\n", match.end()),
+                    )
+                    if end >= 0
+                )
+                clause_end = min(clause_ends) if clause_ends else len(unquoted)
+                clause = re.sub(
+                    r"\s+",
+                    " ",
+                    unquoted[clause_start:clause_end],
+                ).strip()
+                attributions.append((label, clause, wording_claim))
+    return tuple(dict.fromkeys(attributions))
+
+
+def finalized_show_authored_response_failure(
+    response: str,
+    *,
+    current_user_text: str,
+    prompt_source_bases: tuple[PromptSourceBasis, ...],
+) -> str:
+    """Bind historical show wording and participant claims to typed excerpts."""
+
+    if not _finalized_show_authority_is_requested(
+        prompt_source_bases,
+        current_user_text,
+    ):
+        return ""
+    excerpts = _finalized_show_authority_excerpts(
+        prompt_source_bases,
+        current_user_text,
+    )
+    for fragment, start, end in _response_show_quote_occurrences(response):
+        matching_excerpts = tuple(
+            excerpt
+            for excerpt in excerpts
+            if fragment
+            in _normalized_quote_source_text(excerpt.source_text)
+        )
+        if not matching_excerpts:
+            return "show_authored_quote_not_in_supplied_event"
+        attributed_speaker = _show_quote_attribution_label(
+            response,
+            start,
+            end,
+        )
+        if not attributed_speaker:
+            return "show_authored_quote_missing_speaker"
+        if not any(
+            attributed_speaker
+            in _finalized_show_speaker_variants(excerpt)
+            for excerpt in matching_excerpts
+        ):
+            return "show_authored_quote_speaker_mismatch"
+    for (
+        attributed_speaker,
+        attribution_clause,
+        wording_claim,
+    ) in _unquoted_finalized_show_attributions(
+        response
+    ):
+        speaker_excerpts = tuple(
+            excerpt
+            for excerpt in excerpts
+            if attributed_speaker
+            in _finalized_show_speaker_variants(excerpt)
+        )
+        if not speaker_excerpts:
+            return "show_authored_participant_not_in_supplied_events"
+        if wording_claim:
+            clause_terms = _finalized_show_attribution_terms(
+                attribution_clause
+            )
+            speaker_terms = set().union(
+                *(
+                    _finalized_show_attribution_terms(
+                        excerpt.source_text
+                    )
+                    for excerpt in speaker_excerpts
+                )
+            )
+            if clause_terms and not clause_terms.intersection(speaker_terms):
+                return "show_authored_attribution_not_supported"
+            request = str(current_user_text or "")
+            if (
+                _FINALIZED_SHOW_QUOTATION_REQUEST_RE.search(request)
+                and not _CLEAR_PARAPHRASE_LABEL_RE.search(
+                    attribution_clause
+                )
+            ):
+                return "show_authored_wording_requires_quote_or_labeled_gist"
+    return ""
+
+
+def build_finalized_show_authored_correction_prompt(
+    prompt: str,
+    failure: str,
+) -> str:
+    return (
+        str(prompt or "").rstrip()
+        + "\n\nSHOW-AUTHORED EVIDENCE CORRECTION REQUIRED ("
+        + str(failure or "speaker_text_pair")
+        + "):\n"
+        + "Use only human-authored excerpts in the supplied finalized show "
+        + "evidence. Every exact quote must be an unchanged substring of one "
+        + "authored event and must name that same event's speaker. Prefer the "
+        + '`Speaker: "exact excerpt"` format. Never take a participant, handle, '
+        + "or quote from a prior BNL reply, summary, participant count, track "
+        + "title, or inferred reconstruction. If the requested wording is not "
+        + "among the bounded authored events, state that specific uncertainty "
+        + "and answer the supported parts naturally."
+    )
+
+
 def _has_unlabeled_wording_attribution(text: str) -> bool:
     """Require each unquoted attribution clause to carry its own gist label."""
     value = str(text or "")
@@ -42561,6 +43201,9 @@ async def apply_guarded_response_regeneration(
         "exact_quote_regenerated": False,
         "exact_quote_guard_reason": "",
         "exact_quote_basis_stale": False,
+        "show_authored_evidence_guard_triggered": False,
+        "show_authored_evidence_regenerated": False,
+        "show_authored_evidence_guard_reason": "",
         "current_payload_grounding_guard_triggered": False,
         "current_payload_grounding_regenerated": False,
         "current_payload_grounding_status": "not_evaluated",
@@ -42909,6 +43552,13 @@ async def apply_guarded_response_regeneration(
             if show_episode_owner_applies else ""
         )
 
+    def show_authored_evidence_failure(candidate: str) -> str:
+        return finalized_show_authored_response_failure(
+            candidate,
+            current_user_text=current_user_text,
+            prompt_source_bases=prompt_source_bases,
+        )
+
     def retry_has_guard_failure(candidate: str) -> bool:
         candidate = (candidate or "").strip()
         return bool(
@@ -42920,6 +43570,7 @@ async def apply_guarded_response_regeneration(
             or is_generic_non_answer_response(candidate, user_display_name)
             or bool(show_analysis_failure(candidate))
             or bool(show_episode_failure(candidate))
+            or bool(show_authored_evidence_failure(candidate))
             or (
                 contextual_followthrough_required
                 and is_contextual_followthrough_deflection(candidate)
@@ -43078,6 +43729,56 @@ async def apply_guarded_response_regeneration(
                     "suppressed": True,
                     "suppression_reason": "stale_media_response_after_retry",
                     "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        response = regenerated
+
+    show_authored_failure = show_authored_evidence_failure(response)
+    if show_authored_failure:
+        diagnostics["show_authored_evidence_guard_triggered"] = True
+        diagnostics["show_authored_evidence_guard_reason"] = (
+            show_authored_failure
+        )
+        logging.warning(
+            "show_authored_evidence_guard_triggered reason=%s "
+            "route_mode=%s channel_policy=%s",
+            show_authored_failure,
+            route_mode,
+            channel_policy,
+        )
+        if not regeneration_allowed:
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": show_authored_failure,
+                    "guard_fallback_or_generic_non_answer": True,
+                    "response_review_requires_rewrite": True,
+                }
+            )
+            return "", diagnostics
+        regenerated = await regenerate(
+            build_finalized_show_authored_correction_prompt(
+                prompt,
+                show_authored_failure,
+            )
+        )
+        diagnostics["show_authored_evidence_regenerated"] = True
+        regenerated = str(regenerated or "").strip()
+        regenerated_failure = show_authored_evidence_failure(regenerated)
+        diagnostics["show_authored_evidence_guard_reason"] = (
+            regenerated_failure
+        )
+        if retry_has_guard_failure(regenerated):
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        regenerated_failure
+                        or "show_authored_evidence_after_retry"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                    "response_review_requires_rewrite": True,
                 }
             )
             return "", diagnostics
@@ -43768,6 +44469,21 @@ async def apply_guarded_response_regeneration(
                 "suppressed": True,
                 "suppression_reason": "exact_quote_basis_changed_before_send",
                 "guard_fallback_or_generic_non_answer": True,
+            }
+        )
+        return "", diagnostics
+    final_show_authored_failure = show_authored_evidence_failure(response)
+    if final_show_authored_failure:
+        diagnostics.update(
+            {
+                "show_authored_evidence_guard_triggered": True,
+                "show_authored_evidence_guard_reason": (
+                    final_show_authored_failure
+                ),
+                "suppressed": True,
+                "suppression_reason": final_show_authored_failure,
+                "guard_fallback_or_generic_non_answer": True,
+                "response_review_requires_rewrite": True,
             }
         )
         return "", diagnostics
@@ -44853,6 +45569,7 @@ async def resolve_guarded_response_obligation(
         third_party_attribution_requested=(
             third_party_attribution_requested
         ),
+        prompt_source_bases=tuple(prompt_source_bases or ()),
     )
     if recovered:
         retained_bases = tuple(
@@ -44914,6 +45631,47 @@ async def resolve_guarded_response_obligation(
         )
         provider_calls += retry_calls
         source_neutral = bool(prior_source_neutral or source_neutral)
+    rewritten_show_failure = finalized_show_authored_response_failure(
+        rewritten,
+        current_user_text=current_user_text,
+        prompt_source_bases=rewritten_bases,
+    )
+    if rewritten and rewritten_show_failure:
+        prior_source_neutral = source_neutral
+        (
+            rewritten,
+            rewritten_prompt,
+            rewritten_bases,
+            retry_calls,
+            source_neutral,
+        ) = await regenerate_ordinary_chat_response_obligation(
+            channel=channel,
+            prompt=rewritten_prompt,
+            reason=rewritten_show_failure,
+            prompt_source_bases=rewritten_bases,
+            user_id=user_id,
+            guild_id=guild_id,
+            source_context_available=bool(
+                source_context_available and not source_neutral
+            ),
+            current_user_text=current_user_text,
+            route_mode=route_mode,
+            generation_route=generation_route,
+            **({"image_inputs": image_inputs} if image_inputs else {}),
+        )
+        provider_calls += retry_calls
+        source_neutral = bool(prior_source_neutral or source_neutral)
+        rewritten_show_failure = finalized_show_authored_response_failure(
+            rewritten,
+            current_user_text=current_user_text,
+            prompt_source_bases=rewritten_bases,
+        )
+        if rewritten_show_failure:
+            logging.error(
+                "ordinary_chat_response_rewrite_exhausted reason=%s",
+                rewritten_show_failure,
+            )
+            rewritten = ""
     if rewritten and is_generic_non_answer_response(rewritten):
         logging.error(
             "ordinary_chat_response_rewrite_exhausted "
@@ -45369,6 +46127,9 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("community_visual_guard_triggered")
         or guard_diagnostics.get("exact_quote_guard_triggered")
         or guard_diagnostics.get(
+            "show_authored_evidence_guard_triggered"
+        )
+        or guard_diagnostics.get(
             "current_payload_grounding_guard_triggered"
         )
         or guard_diagnostics.get(
@@ -45528,29 +46289,54 @@ async def send_planned_conversation_response(
                 guard_status="stale_before_send_commit",
             )
         return model_decision
+    show_authored_presend_failure = ""
     quote_presend_failure = ""
     if not guard_diagnostics.get("source_neutral_recovery"):
-        quote_presend_failure = await exact_quote_presend_failure(
-            response,
-            exact_requested=exact_quote_requested,
-            third_party_attribution_requested=(
-                third_party_attribution_requested
-            ),
-            authority=exact_quote_authority,
-            channel=getattr(message, "channel", None),
+        show_authored_presend_failure = (
+            finalized_show_authored_response_failure(
+                response,
+                current_user_text=getattr(message, "content", ""),
+                prompt_source_bases=tuple(prompt_source_bases or ()),
+            )
         )
-    if quote_presend_failure:
+        if not show_authored_presend_failure:
+            quote_presend_failure = await exact_quote_presend_failure(
+                response,
+                exact_requested=exact_quote_requested,
+                third_party_attribution_requested=(
+                    third_party_attribution_requested
+                ),
+                authority=exact_quote_authority,
+                channel=getattr(message, "channel", None),
+            )
+    presend_wording_failure = (
+        show_authored_presend_failure or quote_presend_failure
+    )
+    if presend_wording_failure:
         logging.warning(
-            "direct_exact_quote_rewrite_before_send reason=%s",
-            quote_presend_failure,
+            "direct_wording_rewrite_before_send reason=%s",
+            presend_wording_failure,
+        )
+        wording_guard_diagnostics = (
+            {
+                "show_authored_evidence_guard_triggered": True,
+                "show_authored_evidence_guard_reason": (
+                    show_authored_presend_failure
+                ),
+                "response_review_requires_rewrite": True,
+            }
+            if show_authored_presend_failure
+            else {
+                "exact_quote_guard_triggered": True,
+                "exact_quote_guard_reason": quote_presend_failure,
+            }
         )
         if single_packet_cutover:
             guard_diagnostics.update(
                 {
                     "suppressed": True,
-                    "suppression_reason": quote_presend_failure,
-                    "exact_quote_guard_triggered": True,
-                    "exact_quote_guard_reason": quote_presend_failure,
+                    "suppression_reason": presend_wording_failure,
+                    **wording_guard_diagnostics,
                 }
             )
             (
@@ -45584,7 +46370,11 @@ async def send_planned_conversation_response(
             synthesis_decision = (
                 await safely_record_ordinary_chat_single_packet_review(
                     synthesis_decision,
-                    reason="single_packet_exact_quote_response_rewritten",
+                    reason=(
+                        "single_packet_show_authored_response_rewritten"
+                        if show_authored_presend_failure
+                        else "single_packet_exact_quote_response_rewritten"
+                    ),
                     corrective_call_count=single_packet_corrective_call_count,
                 )
                 or synthesis_decision
@@ -45595,7 +46385,7 @@ async def send_planned_conversation_response(
                     final_response="",
                     response_sent=False,
                     candidate_live=False,
-                    guard_status="exact_quote_response_rewrite_failed",
+                    guard_status="wording_response_rewrite_failed",
                 )
                 return model_decision
             guard_diagnostics.update(
@@ -45604,18 +46394,16 @@ async def send_planned_conversation_response(
                     "response_obligation_regenerated": True,
                     "response_obligation_recovery_kind": "model_rewrite",
                     "source_neutral_recovery": source_neutral_rewrite,
-                    "original_suppression_reason": quote_presend_failure,
-                    "exact_quote_guard_triggered": True,
-                    "exact_quote_guard_reason": quote_presend_failure,
+                    "original_suppression_reason": presend_wording_failure,
+                    **wording_guard_diagnostics,
                 }
             )
         else:
             guard_diagnostics.update(
                 {
                     "suppressed": True,
-                    "suppression_reason": quote_presend_failure,
-                    "exact_quote_guard_triggered": True,
-                    "exact_quote_guard_reason": quote_presend_failure,
+                    "suppression_reason": presend_wording_failure,
+                    **wording_guard_diagnostics,
                 }
             )
             (
