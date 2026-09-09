@@ -3125,12 +3125,17 @@ def build_bnl_read_model_context(
                 scoped_archives = [("", archive)]
                 if len(dates) > 1:
                     records = tiktok_show_records(archive)
-                    scoped_archives = [
-                        (day, {"shows": [
+                    scoped_archives = []
+                    available_dates = 0
+                    for day in dates:
+                        shows = [
                             show for show in records if show.get("showDate") == day
-                        ]})
-                        for day in dates[:TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT]
-                    ]
+                        ]
+                        scoped_archives.append((day, {"shows": shows}))
+                        if shows:
+                            available_dates += 1
+                        if available_dates >= TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT:
+                            break
                 for day, scoped_archive in scoped_archives:
                     durable_events = _load_durable_tiktok_show_events(
                         scoped_archive, show_analysis_text,
@@ -3143,6 +3148,14 @@ def build_bnl_read_model_context(
                         )
                     )
             else:
+                if current_show_date:
+                    # Carry the authorized live scope with this rendered
+                    # source; persistence must not re-date it from the clock
+                    # or from a different queue session after midnight.
+                    lines.append(
+                        "\nTikTok live show scope: showDate="
+                        + _compact_public_text(current_show_date, 40)
+                    )
                 lines.append(
                     "\n"
                     + build_live_prompt_context(
@@ -3362,10 +3375,17 @@ def public_tiktok_interaction_memory_allowed(
 
     context = str(website_read_model_context or "")
     durable_show_context = "Durable TikTok show analysis context:" in context
+    live_show_date = re.search(
+        r"(?m)^TikTok live show scope: showDate=(20\d{2}-\d{2}-\d{2})$",
+        context,
+    )
     return bool(
         (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES
         and (
-            is_live_show_reaction_query(user_text)
+            is_live_show_reaction_query(
+                user_text,
+                current_show_date=live_show_date.group(1) if live_show_date else None,
+            )
             or is_tiktok_show_analysis_query(user_text)
             or durable_show_context
         )

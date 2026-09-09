@@ -25,8 +25,10 @@ whether the model used an allowed phrase.
   existing bounded selectors; comparison requests are not reduced to their
   first date. Within the existing bounds, each requested date gets a source
   before additional sessions on the same date. The website adapter reads each
-  selected date separately within
-  the existing two-show recall allowance. Missing requested shows do not
+  selected date separately within the existing two-show recall allowance.
+  Missing archive dates do not consume that allowance; selection continues
+  through requested dates until two available show dates are selected.
+  Missing requested shows do not
   substitute another date or discard an independently available requested
   show. An explicit historical date takes precedence over current-show
   wording and a website snapshot's date. An unavailable requested show or an
@@ -37,7 +39,11 @@ whether the model used an allowed phrase.
   whether to read current reactions, including a Friday show after Pacific
   midnight. A historical recap still uses durable evidence; an explicit date
   different from the ongoing show's date cannot read the live buffer as its
-  historical source.
+  historical source. The rendered source carries that resolved live date into
+  the existing public-conversation persistence decision. Public delivered
+  replies retain their normal conversation row and continuation state after
+  midnight; the injected snapshot and sealed-channel replies retain their
+  existing no-store rules.
 - Independent valid sources stay available when one source changes. The
   existing response-repair owner reconstructs the prompt and makes a bounded
   corrective generation when necessary.
@@ -118,9 +124,9 @@ follow-up understanding or live model factuality.
 Regressions use real SQLite archive/ledger readers, source refresh, a real
 collector snapshot, and direct/batch prompt assembly with external transport
 replaced. They cover both requested dates and their original speakers/text,
-partial source removal, same-date sessions, missing/invalid dates, current-date
-corrections,
-Pacific midnight, and inherited dated requests. Passive-batch admission rules
+partial source removal, same-date sessions, missing/invalid dates, the two-show
+source limit, current-date corrections, public reply persistence across Pacific
+midnight, and inherited dated requests. Passive-batch admission rules
 are unchanged; the delivery comparison is an admitted question, while reader
 tests also retain the review's literal unaddressed comparison instruction.
 

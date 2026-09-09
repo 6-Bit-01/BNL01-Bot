@@ -223,6 +223,42 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(SEPTEMBER_COMMENT, episode)
         self.assertEqual(basis.show_keys, ("show-attendance-september",))
 
+    async def test_missing_earlier_date_does_not_consume_an_available_show_slot(self):
+        for dates in (
+            "August 14, 2026, August 28, 2026 and September 4, 2026",
+            "August 28, 2026, August 14, 2026 and September 4, 2026",
+        ):
+            for policy in ("public_home", "sealed_test"):
+                with self.subTest(dates=dates, policy=policy):
+                    request = "How does TikTok chat compare across the " + dates + " shows?"
+                    website, episode, basis = self._read(request, policy)
+                    self.assertIn("Requested show date: 2026-08-14", website)
+                    self.assertIn("no public show timeline", website)
+                    for text in (AUGUST_COMMENT, SEPTEMBER_COMMENT):
+                        self.assertIn(text, website)
+                        self.assertIn(text, episode)
+                    self.assertEqual(set(basis.show_keys), {
+                        "show-attendance-1", "show-attendance-september",
+                    })
+
+    async def test_available_requested_dates_still_stop_at_the_existing_show_limit(self):
+        third_show = json.loads(
+            json.dumps(self.read_model["sections"]["archive"]["latestShow"])
+            .replace("show-attendance-september", "show-attendance-third")
+            .replace("2026-09-04", "2026-09-11")
+            .replace("2026-09-05", "2026-09-12")
+        )
+        self.read_model["sections"]["archive"]["shows"].append(third_show)
+        request = (
+            "How does TikTok chat compare across the August 14, 2026, "
+            "August 28, 2026, September 4, 2026 and September 11, 2026 shows?"
+        )
+        website = REAL_READ_MODEL_CONTEXT(request, "public_home")
+        self.assertIn(AUGUST_COMMENT, website)
+        self.assertIn(SEPTEMBER_COMMENT, website)
+        self.assertNotIn("showDate=2026-09-11", website)
+        self.assertNotIn("Requested show date: 2026-09-11", website)
+
     async def test_batch_delivers_both_explicit_show_sources_with_one_call(self):
         for policy in ("public_home", "sealed_test"):
             with self.subTest(policy=policy):
@@ -306,6 +342,9 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "sessionId": "friday-live", "showDate": "2026-09-04",
             "status": "open", "milestones": [],
         }
+        # The archive's ongoing show owns the live scope even when the queue
+        # session date has advanced. Persistence must retain that same source.
+        self.read_model["sections"]["queue"]["session"]["showDate"] = "2026-09-05"
         with mock.patch("bnl_tiktok_live_context._pacific_show_date", return_value=date(2026, 9, 5)), \
                 mock.patch.object(bot, "BNL_TIKTOK_LIVE_CONTEXT_PATH", str(path)), \
                 mock.patch.object(bot, "BNL_TIKTOK_LIVE_CONTEXT_ENABLED", True):
@@ -319,6 +358,10 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("showDate=2026-09-04", website)
                     self.assertNotIn(AUGUST_COMMENT, website)
                     self.assertNotIn(SEPTEMBER_COMMENT, website)
+                    self.assertFalse(bot.public_tiktok_interaction_memory_allowed(
+                        "What's TikTok chat saying in the September 5, 2026 show right now?",
+                        policy, website,
+                    ))
                     self.assertIn("This track is wild.", REAL_READ_MODEL_CONTEXT(
                         "What's TikTok chat saying\nin the September 4, 2026 show right now?",
                         policy,
@@ -333,6 +376,21 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     generation.assert_awaited_once()
                     self.assertIn("This track is wild.", generation.await_args.args[0])
                     self.assertEqual(channel.sent, [answer])
+                    with sqlite3.connect(bot.DB_FILE) as conn:
+                        saved = conn.execute(
+                            "SELECT content FROM conversations WHERE role='model' AND channel_id=?",
+                            (channel.id,),
+                        ).fetchall()
+                    state = bot._get_conversation_continuation_state(
+                        self.runtime.guild_id, channel.id, self.runtime.user_id,
+                    )
+                    if policy == "public_home":
+                        self.assertEqual(saved, [(answer,)])
+                        self.assertIsNotNone(state)
+                        self.assertIn("last_bnl_reply_at", state)
+                    else:
+                        self.assertEqual(saved, [])
+                        self.assertFalse(state and state.get("last_bnl_reply_at"))
 
     async def test_real_batch_delivers_one_supported_answer_from_requested_date(self):
         for policy in ("public_home", "sealed_test"):
