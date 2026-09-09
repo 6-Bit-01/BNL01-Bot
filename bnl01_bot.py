@@ -38,7 +38,6 @@ from bnl_tiktok_live_context import (
     build_live_prompt_context,
     classify_tiktok_show_analysis_intent,
     has_explicit_show_date,
-    is_dated_show_query,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
@@ -2502,9 +2501,9 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
         return False
     if _queue_read_model_query(normalized):
         return True
-    if is_live_show_reaction_query(normalized):
+    if is_live_show_reaction_query(normalized, check_show_date=False):
         return True
-    if is_tiktok_show_analysis_query(normalized) or is_dated_show_query(normalized):
+    if is_tiktok_show_analysis_query(normalized):
         return True
 
     explicit_site_patterns = [
@@ -2564,7 +2563,7 @@ def resolve_tiktok_show_analysis_request(
     current = re.sub(r"\s+", " ", str(user_text or "")).strip()
     if not current:
         return ""
-    if is_tiktok_show_analysis_query(current) or is_dated_show_query(current):
+    if is_tiktok_show_analysis_query(current):
         return current
     if not is_tiktok_show_analysis_followup(current):
         return ""
@@ -2583,11 +2582,7 @@ def resolve_tiktok_show_analysis_request(
             # block. It is not a prior turn and cannot establish its own scope.
             skipped_current_copy = True
             continue
-        if (
-            is_tiktok_show_analysis_query(prior)
-            or is_live_show_reaction_query(prior)
-            or is_dated_show_query(prior)
-        ):
+        if is_tiktok_show_analysis_query(prior) or is_live_show_reaction_query(prior):
             chain = "\n".join(reversed(followup_chain))
             request = f"{prior}\n{chain}\nCurrent follow-up: {current}" if chain else (
                 f"{prior}\nCurrent follow-up: {current}"
@@ -2882,7 +2877,10 @@ def build_bnl_read_model_context(
     show_analysis_text = (
         str(tiktok_show_analysis_request or "").strip()
         or (user_text if (
-            is_tiktok_show_analysis_query(user_text) or is_dated_show_query(user_text)
+            is_tiktok_show_analysis_query(user_text)
+            or (not live_reaction_query and is_live_show_reaction_query(
+                user_text, check_show_date=False,
+            ))
         ) else "")
     )
     if (
@@ -2890,8 +2888,8 @@ def build_bnl_read_model_context(
         and not is_tiktok_show_analysis_query(user_text)
         and " ".join(show_analysis_text.split()) == " ".join(str(user_text or "").split())
     ):
-        # Date-only retrieval admission does not turn a live reaction request
-        # into historical analysis once the website identifies the live show.
+        # The website's ongoing show date owns current reactions, including
+        # when a normalized copy of the same request arrived from context.
         show_analysis_text = ""
     show_analysis_query = bool(show_analysis_text)
     tiktok_context_query = live_reaction_query or show_analysis_query
@@ -3631,11 +3629,8 @@ def build_tiktok_show_evidence_context_for_turn(
         ):
             if (
                 item.speaker_user_id == int(subject_user_id)
-                and (
-                    is_dated_show_query(item.text)
-                    or finalized_show_packet_owner_requested(
-                        item.text, "Durable BARCODE Radio show episode memory:"
-                    )
+                and finalized_show_packet_owner_requested(
+                    item.text, "Durable BARCODE Radio show episode memory:"
                 )
             ):
                 selection_query = tiktok_show_evidence_query + "\n" + item.text

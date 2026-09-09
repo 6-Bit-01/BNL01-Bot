@@ -54,8 +54,7 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
             environ=show_fixture.ENABLED_QUEUE_ENV,
         )
 
-    def _context(self, current, *, prior_user_id=42, exact_other_reply=False,
-                 prior_request="Give me a recap of the 2026-08-28 show."):
+    def _context(self, current, *, prior_user_id=42, exact_other_reply=False):
         with sqlite3.connect(self.db_file) as conn:
             conn.executemany(
                 """INSERT OR REPLACE INTO conversations
@@ -65,7 +64,7 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
                 [
                     (9001, prior_user_id, "Test Member", 77, "bnl-testing",
                      "sealed_test", "normal_chat", "user",
-                     prior_request,
+                     "Give me a recap of the 2026-08-28 show.",
                      (self.now - timedelta(minutes=2)).isoformat(), 9010, 99001),
                     (9002, prior_user_id, "BNL-01", 77, "bnl-testing",
                      "sealed_test", "normal_chat", "model",
@@ -133,42 +132,6 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
         self.assertTrue(selection["source_refs"])
         self.assertTrue(selection["candidate_context"])
         self.assertNotIn("Here is the recorded recap.", rendered)
-
-    def test_quote_and_date_requests_can_supply_followup_source_candidates(self):
-        for prior in (
-            "Give me three actual quotes from the August 28, 2026 show.",
-            "The 2026-08-28 show.",
-        ):
-            with self.subTest(prior=prior):
-                result, basis = self._context("Give me some quotes", prior_request=prior)
-                selection = {}
-                rendered = self.bot.build_tiktok_show_evidence_context_for_turn(
-                    guild_id=77, user_text="Give me some quotes", subject_user_id=42,
-                    conversation_basis=basis, conversation_context_result=result,
-                    selection_out=selection,
-                )
-                self.assertIn("the green visuals during this song are wild.", rendered)
-                self.assertTrue(selection["candidate_context"])
-                self.assertEqual([key for key, _ in selection["source_refs"]], ["show-attendance-1"])
-                self.assertFalse(self.bot.finalized_show_packet_owner_requested("Give me some quotes", rendered))
-
-    def test_dated_candidates_keep_speaker_reply_and_source_boundaries(self):
-        prior = "Give me three actual quotes from the August 28, 2026 show."
-        for changes in (
-            {"prior_user_id": 43},
-            {"exact_other_reply": True},
-            {"prior_request": "My birthday is August 28, 2026."},
-            {"prior_request": "Show me the schedule for August 28, 2026."},
-            {"prior_request": "I live in Test City and my appointment is August 28, 2026."},
-        ):
-            with self.subTest(changes=changes):
-                result, basis = self._context(
-                    "Give me some quotes", **{"prior_request": prior, **changes},
-                )
-                self.assertEqual(self.bot.build_tiktok_show_evidence_context_for_turn(
-                    guild_id=77, user_text="Give me some quotes", subject_user_id=42,
-                    conversation_basis=basis, conversation_context_result=result,
-                ), "")
 
     def test_generic_request_gets_labeled_candidates_without_show_ownership(self):
         for current in (

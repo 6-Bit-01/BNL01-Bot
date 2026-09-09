@@ -112,33 +112,27 @@ consent/source changes across generation. Supported mocked responses test
 transport and lifecycle behavior; they do not establish that arbitrary model
 output is factually correct.
 
-Inherited show-source selection accepts an eligible earlier dated show
-reference, including a quote request or a bare dated show reference, without
-requiring recap wording. The existing current-speaker, guild, conversation,
-and reply-target boundaries still apply. The prior request selects labeled
-background evidence; it does not take over the current response or become
-proof of what an audience member said. A date outside show context alone is
-not a show-retrieval cue. Dated-source admission uses an existing show/live
-analysis intent or a date-associated show noun phrase; ordinary verbs such as
-"show me" or "I live in" do not make an unrelated date a show reference.
-Coordinated dates may share a leading or trailing show noun, including a
-repeated date preposition such as "on August 28 and on September 4". Admission,
-requested-date extraction, packet selection, and pinned source refresh reuse
-that association; an appointment date in another clause does not select a
-second show. The lexical date helper still recognizes all calendar dates, and
-existing source-owned date-only/subject-date lookups retain their compatibility
-fallback. That fallback does not admit a website/archive request.
-These bounded cases do not establish arbitrary
-follow-up understanding or live model factuality.
+Existing request and conversation owners continue to decide which source
+context to retrieve. Once a show request is selected, the calendar helper
+preserves all distinct explicit dates without interpreting sentence structure.
+The selected records retain their date and source labels for Gemini to use
+with the current request and conversation.
+
+The draft's additional dated-request classifier and clause/noun/preposition
+parser have been removed. Its grammar-specific tests are removed with that
+abandoned behavior. Generic dated-show and quote-request admission stays on
+the deployed conversation path; this repair does not add a new interpretation
+layer. Already-selected two-date evidence remains available during follow-up
+refresh, including when the follow-up does not repeat both dates.
 
 Regressions use real SQLite archive/ledger readers, source refresh, a real
 collector snapshot, and direct/batch prompt assembly with external transport
 replaced. They cover both requested dates and their original speakers/text,
 partial source removal, same-date sessions, missing/invalid dates, the two-show
 source limit, current-date corrections, public reply persistence across Pacific
-midnight, and inherited dated requests. Passive-batch admission rules
+midnight, and already-selected follow-up dates. Passive-batch admission rules
 are unchanged; the delivery comparison is an admitted question, while reader
-tests also retain the review's literal unaddressed comparison instruction.
+tests retain the existing show-context requests.
 
 Live acceptance still needs to check grounded show recall and quotes, an
 ordinary continuation, a factual correction, a mixed-source question, current

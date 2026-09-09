@@ -11,7 +11,6 @@ from bnl_tiktok_live_context import (
     explicit_show_date,
     explicit_show_dates,
     has_explicit_show_date,
-    is_dated_show_query,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_query,
     requested_show_date,
@@ -49,27 +48,6 @@ def two_show_archive():
 
 
 class RequestedShowDateTests(unittest.TestCase):
-    def test_dated_source_admission_requires_a_show_reference_or_existing_intent(self):
-        for query in (
-            "Show me the schedule for September 4, 2026.",
-            "I live in Test City and my appointment is September 4, 2026.",
-            "On September 4, 2026 show me the schedule.",
-            "Stream the file saved on September 4, 2026.",
-        ):
-            with self.subTest(query=query):
-                self.assertFalse(is_dated_show_query(query))
-        for query in (
-            "Give me actual quotes from the August 28, 2026 show.",
-            "The 2026-08-28 show.",
-            "The show on August 28, 2026.",
-            "That episode from August 28, 2026.",
-            "What's TikTok chat saying on September 4, 2026?",
-            "What stood out in TikTok chat on August 28, 2026?",
-            "BNL, compare the August 28, 2026 and September 4, 2026 shows",
-        ):
-            with self.subTest(query=query):
-                self.assertTrue(is_dated_show_query(query))
-
     def test_month_names_ordinals_and_iso_resolve_to_same_calendar_date(self):
         for date_text in (
             "2026-08-28", "2026-8-28", "August 28, 2026", "August 28 2026",
@@ -121,18 +99,6 @@ class RequestedShowDateTests(unittest.TestCase):
         self.assertEqual(requested_show_dates(
             "Yesterday's show", now="2026-09-05T17:00:00Z",
         ), ("2026-09-04",))
-
-    def test_show_dates_do_not_include_other_clauses_dates(self):
-        for query in (
-            "Tell me about the August 28, 2026 show; my appointment is September 4, 2026.",
-            "My appointment is September 4, 2026; tell me about the August 28, 2026 show.",
-            "Tell me about the August 28, 2026 show, my appointment is September 4, 2026.",
-            "What's TikTok chat saying on August 28, 2026 and my appointment is September 4, 2026?",
-        ):
-            with self.subTest(query=query):
-                self.assertEqual(requested_show_dates(query), ("2026-08-28",))
-                self.assertEqual(requested_show_date(query), "2026-08-28")
-                self.assertEqual(len(explicit_show_dates(query)), 2)
 
     def test_live_date_matches_the_authoritative_show_and_not_the_calendar(self):
         for day, expected in (("September 4, 2026", True), ("September 5, 2026", False)):
@@ -272,21 +238,6 @@ class RequestedShowEvidenceTests(unittest.TestCase):
                 self.assertEqual(
                     {day for item in self.packet_items(query) for day in item.show_dates},
                     {"2026-08-28", "2026-09-04"},
-                )
-
-    def test_packet_dates_share_the_archive_show_association(self):
-        for query, expected in (
-            ("BNL, compare the August 28, 2026 and September 4, 2026 shows",
-             {"2026-08-28", "2026-09-04"}),
-            ("Compare the shows on August 28, 2026 and on September 4, 2026",
-             {"2026-08-28", "2026-09-04"}),
-            ("Tell me about the August 28, 2026 show; my appointment is September 4, 2026.",
-             {"2026-08-28"}),
-        ):
-            with self.subTest(query=query):
-                self.assertEqual(
-                    {day for item in self.packet_items(query) for day in item.show_dates},
-                    expected,
                 )
 
     def test_same_date_sessions_do_not_crowd_out_another_requested_date(self):

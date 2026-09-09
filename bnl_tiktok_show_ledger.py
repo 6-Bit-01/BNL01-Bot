@@ -39,7 +39,6 @@ from bnl_tiktok_live_context import (
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     build_tiktok_show_evidence_ledger,
     has_explicit_show_date,
-    is_dated_show_query,
     requested_show_date,
     requested_show_dates,
     show_timeline_bounds_ms,
@@ -2244,7 +2243,7 @@ def _document_relevance(
             if participant not in participant_matches:
                 participant_matches.append(participant)
                 score += 120
-    if _SHOW_QUERY_RE.search(query) or (requested_dates and is_dated_show_query(query)):
+    if _SHOW_QUERY_RE.search(query):
         score += 30
     elif _COMMUNITY_BASELINE_QUERY_RE.search(query):
         score += 24
