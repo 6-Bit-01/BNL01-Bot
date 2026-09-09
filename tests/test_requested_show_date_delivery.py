@@ -10,11 +10,16 @@ import json
 import os
 import sqlite3
 import unittest
+from datetime import date
+from pathlib import Path
+from time import time
 from unittest import mock
 
 import test_public_network_knowledge as network_fixture
 import test_tiktok_show_evidence_ledger as show_fixture
 from bnl_journal_source_store import record_source_event
+from bnl_tiktok_live_context import LiveContextSnapshotWriter
+from tests import test_tiktok_live_context_bridge as live_fixture
 
 
 bot = network_fixture.bnl01_bot
@@ -29,6 +34,13 @@ SEPTEMBER_COMMENT = "The amber lanterns are bright tonight."
 ANSWER = (
     'Alex said, "BNL, the green visuals during this song are wild." '
     'Neon Fox said, "The green visuals made that moment hit."'
+)
+# Exercise an admitted question here; reader tests retain the review's literal
+# unaddressed "Compare ..." wording without changing passive-batch admission.
+COMPARE_REQUEST = "How does TikTok chat compare across the August 28, 2026 and September 4, 2026 shows?"
+COMPARE_ANSWER = (
+    "Alex mentioned green visuals on August 28; "
+    "Test September mentioned amber lanterns on September 4."
 )
 
 
@@ -170,6 +182,63 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self._assert_august_source(refreshed.rendered_context, refreshed)
         self.assertEqual(bot.prompt_source_basis_failure((refreshed,)), "")
 
+    async def test_two_dates_reach_archive_ledger_and_source_refresh_together(self):
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                website, episode, basis = self._read(COMPARE_REQUEST, policy)
+                self.assertIsNotNone(basis)
+                for text in (AUGUST_COMMENT, SEPTEMBER_COMMENT):
+                    self.assertIn(text, website)
+                    self.assertIn(text, episode)
+                    self.assertTrue(any(text in excerpt.source_text for excerpt in basis.authored_excerpts))
+                self.assertNotIn("Present Signal", website)
+                self.assertEqual(set(basis.show_keys), {"show-attendance-1", "show-attendance-september"})
+                refreshed, changed = bot.refresh_prompt_source_basis(basis)
+                self.assertFalse(changed)
+                self.assertEqual(refreshed.authored_excerpts, basis.authored_excerpts)
+                self.assertEqual(bot.prompt_source_basis_failure((refreshed,)), "")
+
+    async def test_removed_second_show_refresh_retains_only_the_valid_source(self):
+        _website, _episode, basis = self._read(COMPARE_REQUEST)
+        self.assertEqual(len(basis.show_keys), 2)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute(
+                "DELETE FROM %s WHERE guild_id=? AND show_key=?" % show_fixture.TIKTOK_SHOW_EVIDENCE_TABLE,
+                (77, "show-attendance-september"),
+            )
+        refreshed, changed = bot.refresh_prompt_source_basis(basis)
+        self.assertTrue(changed)
+        self.assertIn(AUGUST_COMMENT, refreshed.rendered_context)
+        self.assertNotIn(SEPTEMBER_COMMENT, refreshed.rendered_context)
+        self.assertTrue(all(excerpt.show_key == "show-attendance-1" for excerpt in refreshed.authored_excerpts))
+
+    async def test_missing_compared_date_does_not_load_an_unrequested_show(self):
+        request = COMPARE_REQUEST.replace("August 28, 2026", "August 14, 2026")
+        website, episode, basis = self._read(request)
+        self.assertIn("Requested show date: 2026-08-14", website)
+        self.assertIn("no public show timeline", website)
+        self.assertNotIn(AUGUST_COMMENT, website)
+        self.assertNotIn(AUGUST_COMMENT, episode)
+        self.assertIn(SEPTEMBER_COMMENT, website)
+        self.assertIn(SEPTEMBER_COMMENT, episode)
+        self.assertEqual(basis.show_keys, ("show-attendance-september",))
+
+    async def test_batch_delivers_both_explicit_show_sources_with_one_call(self):
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                channel, generation, guard = await self.runtime._batch(
+                    policy, request=COMPARE_REQUEST, answer=COMPARE_ANSWER, privileged=False,
+                )
+                generation.assert_awaited_once()
+                self.assertEqual(channel.sent, [COMPARE_ANSWER])
+                prompt = generation.await_args.args[0]
+                self.assertIn(AUGUST_COMMENT, prompt)
+                self.assertIn(SEPTEMBER_COMMENT, prompt)
+                bases = [item for item in guard.await_args.kwargs["prompt_source_bases"]
+                         if isinstance(item, bot.FinalizedShowPromptSourceBasis)]
+                self.assertEqual(len(bases), 1)
+                self.assertEqual(set(bases[0].show_keys), {"show-attendance-1", "show-attendance-september"})
+
     async def test_current_date_correction_wins_over_an_earlier_show_request(self):
         for request in (REQUEST, ISO_REQUEST):
             with self.subTest(request=request):
@@ -212,6 +281,7 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("showDate=2026-08-28", website)
                     self.assertNotIn(AUGUST_COMMENT, website)
                     self.assertNotIn(SEPTEMBER_COMMENT, website)
+
                     self.assertEqual(episode, "")
                     self.assertIsNone(basis)
 
@@ -226,6 +296,43 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Present Signal", website)
                 self.assertNotIn(AUGUST_COMMENT, website)
                 self.assertNotIn(SEPTEMBER_COMMENT, website)
+
+    async def test_explicit_live_show_date_keeps_current_comments_after_midnight(self):
+        clock = live_fixture.Clock(time())
+        adapter = live_fixture.TikTokLiveContextBridgeTests().make_adapter(clock)
+        path = Path(bot.DB_FILE).with_name("live-context.json")
+        LiveContextSnapshotWriter(str(path), time_fn=clock).publish(adapter, force=True)
+        self.read_model["sections"]["archive"]["currentShow"] = {
+            "sessionId": "friday-live", "showDate": "2026-09-04",
+            "status": "open", "milestones": [],
+        }
+        with mock.patch("bnl_tiktok_live_context._pacific_show_date", return_value=date(2026, 9, 5)), \
+                mock.patch.object(bot, "BNL_TIKTOK_LIVE_CONTEXT_PATH", str(path)), \
+                mock.patch.object(bot, "BNL_TIKTOK_LIVE_CONTEXT_ENABLED", True):
+            for policy in ("public_home", "sealed_test"):
+                with self.subTest(policy=policy):
+                    website = REAL_READ_MODEL_CONTEXT(
+                        "What's TikTok chat saying in the September 4, 2026 show right now?",
+                        policy,
+                    )
+                    self.assertIn("This track is wild.", website)
+                    self.assertIn("showDate=2026-09-04", website)
+                    self.assertNotIn(AUGUST_COMMENT, website)
+                    self.assertNotIn(SEPTEMBER_COMMENT, website)
+                    self.assertIn("This track is wild.", REAL_READ_MODEL_CONTEXT(
+                        "What's TikTok chat saying\nin the September 4, 2026 show right now?",
+                        policy,
+                    ))
+
+                    answer = "Test Viewer says the current track is wild."
+                    channel, generation, _guard = await self.runtime._batch(
+                        policy,
+                        request="What's TikTok chat saying in the September 4, 2026 show right now?",
+                        answer=answer, privileged=False,
+                    )
+                    generation.assert_awaited_once()
+                    self.assertIn("This track is wild.", generation.await_args.args[0])
+                    self.assertEqual(channel.sent, [answer])
 
     async def test_real_batch_delivers_one_supported_answer_from_requested_date(self):
         for policy in ("public_home", "sealed_test"):

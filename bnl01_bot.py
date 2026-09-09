@@ -38,12 +38,15 @@ from bnl_tiktok_live_context import (
     build_live_prompt_context,
     classify_tiktok_show_analysis_intent,
     has_explicit_show_date,
+    is_dated_show_query,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
     live_context_diagnostics,
     requested_show_date,
+    requested_show_dates,
     select_show_for_tiktok_analysis,
+    tiktok_show_records,
 )
 from bnl_tiktok_live_memory import (
     DEFAULT_ARCHIVE_SPOOL_PATH as DEFAULT_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH,
@@ -51,6 +54,7 @@ from bnl_tiktok_live_memory import (
     resolve_tiktok_identity,
 )
 from bnl_tiktok_show_ledger import (
+    TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT,
     build_tiktok_show_evidence_context,
     ensure_tiktok_show_evidence_schema,
     load_tiktok_show_source_events,
@@ -2500,7 +2504,7 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
         return True
     if is_live_show_reaction_query(normalized):
         return True
-    if is_tiktok_show_analysis_query(normalized):
+    if is_tiktok_show_analysis_query(normalized) or is_dated_show_query(normalized):
         return True
 
     explicit_site_patterns = [
@@ -2560,7 +2564,7 @@ def resolve_tiktok_show_analysis_request(
     current = re.sub(r"\s+", " ", str(user_text or "")).strip()
     if not current:
         return ""
-    if is_tiktok_show_analysis_query(current):
+    if is_tiktok_show_analysis_query(current) or is_dated_show_query(current):
         return current
     if not is_tiktok_show_analysis_followup(current):
         return ""
@@ -2579,7 +2583,11 @@ def resolve_tiktok_show_analysis_request(
             # block. It is not a prior turn and cannot establish its own scope.
             skipped_current_copy = True
             continue
-        if is_tiktok_show_analysis_query(prior) or is_live_show_reaction_query(prior):
+        if (
+            is_tiktok_show_analysis_query(prior)
+            or is_live_show_reaction_query(prior)
+            or is_dated_show_query(prior)
+        ):
             chain = "\n".join(reversed(followup_chain))
             request = f"{prior}\n{chain}\nCurrent follow-up: {current}" if chain else (
                 f"{prior}\nCurrent follow-up: {current}"
@@ -2863,11 +2871,28 @@ def build_bnl_read_model_context(
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
     source_context_items = _public_source_context_items(read_model)
     queue_query = _queue_read_model_query(user_text)
-    live_reaction_query = is_live_show_reaction_query(user_text)
+    current_show_date = (
+        _first_mapping(archive.get("currentShow")).get("showDate")
+        or _first_mapping(queue.get("session"), queue.get("currentSession")).get("showDate")
+        or ""
+    )
+    live_reaction_query = is_live_show_reaction_query(
+        user_text, current_show_date=str(current_show_date),
+    )
     show_analysis_text = (
         str(tiktok_show_analysis_request or "").strip()
-        or (user_text if is_tiktok_show_analysis_query(user_text) else "")
+        or (user_text if (
+            is_tiktok_show_analysis_query(user_text) or is_dated_show_query(user_text)
+        ) else "")
     )
+    if (
+        live_reaction_query
+        and not is_tiktok_show_analysis_query(user_text)
+        and " ".join(show_analysis_text.split()) == " ".join(str(user_text or "").split())
+    ):
+        # Date-only retrieval admission does not turn a live reaction request
+        # into historical analysis once the website identifies the live show.
+        show_analysis_text = ""
     show_analysis_query = bool(show_analysis_text)
     tiktok_context_query = live_reaction_query or show_analysis_query
     operational_query = queue_query or live_reaction_query or show_analysis_query
@@ -3096,18 +3121,27 @@ def build_bnl_read_model_context(
     if live_reaction_query or show_analysis_query:
         if access_scope in {"public", "private"}:
             if show_analysis_query:
-                durable_events = _load_durable_tiktok_show_events(
-                    archive,
-                    show_analysis_text,
-                )
-                lines.append(
-                    "\n"
-                    + build_durable_show_prompt_context(
-                        archive,
-                        durable_events,
-                        show_analysis_text,
+                dates = requested_show_dates(show_analysis_text)
+                scoped_archives = [("", archive)]
+                if len(dates) > 1:
+                    records = tiktok_show_records(archive)
+                    scoped_archives = [
+                        (day, {"shows": [
+                            show for show in records if show.get("showDate") == day
+                        ]})
+                        for day in dates[:TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT]
+                    ]
+                for day, scoped_archive in scoped_archives:
+                    durable_events = _load_durable_tiktok_show_events(
+                        scoped_archive, show_analysis_text,
                     )
-                )
+                    if day:
+                        lines.append(f"\nRequested show date: {day}")
+                    lines.append(
+                        "\n" + build_durable_show_prompt_context(
+                            scoped_archive, durable_events, show_analysis_text,
+                        )
+                    )
             else:
                 lines.append(
                     "\n"
@@ -3577,8 +3611,11 @@ def build_tiktok_show_evidence_context_for_turn(
         ):
             if (
                 item.speaker_user_id == int(subject_user_id)
-                and finalized_show_packet_owner_requested(
-                    item.text, "Durable BARCODE Radio show episode memory:"
+                and (
+                    is_dated_show_query(item.text)
+                    or finalized_show_packet_owner_requested(
+                        item.text, "Durable BARCODE Radio show episode memory:"
+                    )
                 )
             ):
                 selection_query = tiktok_show_evidence_query + "\n" + item.text

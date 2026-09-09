@@ -1,4 +1,4 @@
-"""All existing show readers resolve one requested calendar date."""
+"""Existing show readers preserve the requested calendar dates."""
 
 import json
 import sqlite3
@@ -9,10 +9,12 @@ from pathlib import Path
 from bnl_journal_source_store import ensure_schema, record_source_event
 from bnl_tiktok_live_context import (
     explicit_show_date,
+    explicit_show_dates,
     has_explicit_show_date,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_query,
     requested_show_date,
+    requested_show_dates,
     select_show_for_tiktok_analysis,
 )
 from bnl_tiktok_show_ledger import (
@@ -83,6 +85,32 @@ class RequestedShowDateTests(unittest.TestCase):
             "2026-10-31",
         )
         self.assertEqual(requested_show_date("What did I do yesterday?", now=now), "")
+
+    def test_multiple_dates_keep_order_without_duplicate_or_invalid_entries(self):
+        query = "Compare the September 4, 2026, 2026-08-28 and August 28, 2026 shows."
+        self.assertEqual(explicit_show_dates(query), ("2026-09-04", "2026-08-28"))
+        self.assertEqual(requested_show_dates(query), explicit_show_dates(query))
+        self.assertEqual(explicit_show_date(query), "2026-09-04")
+        self.assertEqual(
+            requested_show_dates("Compare the February 30, 2026 and August 28, 2026 shows."),
+            ("2026-08-28",),
+        )
+        self.assertEqual(requested_show_dates("Show on February 30, 2026"), ())
+        self.assertEqual(requested_show_dates(
+            "Yesterday's show", now="2026-09-05T17:00:00Z",
+        ), ("2026-09-04",))
+
+    def test_live_date_matches_the_authoritative_show_and_not_the_calendar(self):
+        for day, expected in (("September 4, 2026", True), ("September 5, 2026", False)):
+            self.assertEqual(is_live_show_reaction_query(
+                "What's TikTok chat saying in the " + day + " show right now?",
+                now="2026-09-05T07:30:00Z", current_show_date="2026-09-04",
+            ), expected)
+        for day in ("February 30, 2026", "September 4, 2026 and September 5, 2026"):
+            self.assertFalse(is_live_show_reaction_query(
+                "What's TikTok chat saying in the " + day + " shows?",
+                now="2026-09-05T07:30:00Z", current_show_date="2026-09-04",
+            ))
 
     def test_historical_chat_request_is_not_current_live_reaction(self):
         now = "2026-09-09T17:00:00Z"
@@ -189,6 +217,72 @@ class RequestedShowEvidenceTests(unittest.TestCase):
             self.assertTrue(all(item.show_dates == ("2026-08-28",) for item in items))
         self.assertEqual(contexts[0], contexts[1])
 
+    def test_both_explicit_dates_reach_ledger_and_packet_selection(self):
+        for dates in (
+            "August 28, 2026 and September 4, 2026",
+            "2026-08-28 and 2026-09-04",
+            "September 4, 2026 and 2026-08-28",
+        ):
+            with self.subTest(dates=dates):
+                query = "Compare TikTok chat across the " + dates + " shows."
+                selected = {}
+                rendered = build_tiktok_show_evidence_context(
+                    self.db_file, guild_id=77, user_text=query, selection_out=selected,
+                )
+                self.assertEqual(
+                    {key for key, _ in selected["source_refs"]},
+                    {"show-attendance-1", "show-attendance-2"},
+                )
+                self.assertIn("on 2026-08-28;", rendered)
+                self.assertIn("on 2026-09-04;", rendered)
+                self.assertEqual(
+                    {day for item in self.packet_items(query) for day in item.show_dates},
+                    {"2026-08-28", "2026-09-04"},
+                )
+
+    def test_same_date_sessions_do_not_crowd_out_another_requested_date(self):
+        archive = two_show_archive()
+        second_september = json.loads(json.dumps(archive["latestShow"]))
+        second_september["sessionId"] = "show-attendance-3"
+        archive["shows"].insert(0, second_september)
+        result = sync_tiktok_show_evidence_ledgers(
+            self.db_file, guild_id=77, read_model=authorized_read_model(archive),
+            environ=ENABLED_QUEUE_ENV,
+        )
+        self.assertEqual(result["showsFinalized"], 3)
+        for dates in (
+            "September 4, 2026 and August 28, 2026",
+            "August 28, 2026 and September 4, 2026",
+        ):
+            with self.subTest(dates=dates):
+                query = "Compare TikTok chat across the " + dates + " shows."
+                rendered = build_tiktok_show_evidence_context(
+                    self.db_file, guild_id=77, user_text=query, show_limit=2,
+                )
+                self.assertIn("on 2026-08-28;", rendered)
+                self.assertIn("on 2026-09-04;", rendered)
+                with sqlite3.connect(self.db_file) as conn:
+                    items = select_tiktok_show_episode_context_items(
+                        conn, guild_id=77, user_text=query, max_shows=2,
+                    )
+                self.assertEqual({day for item in items for day in item.show_dates},
+                                 {"2026-08-28", "2026-09-04"})
+
+    def test_inherited_two_date_scope_survives_pinned_refresh_without_plural_cue(self):
+        prior = "TikTok chat from the August 28, 2026 show and September 4, 2026 show."
+        selected = {}
+        rendered = build_tiktok_show_evidence_context(
+            self.db_file, guild_id=77, user_text="Give me some quotes",
+            selection_user_text=prior, candidate_context=True, selection_out=selected,
+        )
+        self.assertEqual(len(selected["source_refs"]), 2)
+        refreshed = build_tiktok_show_evidence_context(
+            self.db_file, guild_id=77, user_text="Give me some quotes",
+            selection_user_text=prior, candidate_context=True,
+            pinned_show_keys=tuple(key for key, _ in selected["source_refs"]),
+        )
+        self.assertEqual(refreshed, rendered)
+
     def test_missing_or_invalid_requested_date_returns_no_other_episode(self):
         for date_text in ("August 21, 2026", "2026-08-21", "February 30, 2026", "2026-13-28"):
             with self.subTest(date_text=date_text):
@@ -197,6 +291,26 @@ class RequestedShowEvidenceTests(unittest.TestCase):
                     self.db_file, guild_id=77, user_text=query,
                 ), "")
                 self.assertEqual(self.packet_items(query), ())
+
+    def test_missing_or_invalid_date_keeps_the_other_requested_show_only(self):
+        for dates in (
+            "August 14, 2026 and August 28, 2026",
+            "August 28, 2026 and August 14, 2026",
+            "February 30, 2026 and August 28, 2026",
+        ):
+            with self.subTest(dates=dates):
+                query = "Compare TikTok chat across the " + dates + " shows."
+                selected = {}
+                rendered = build_tiktok_show_evidence_context(
+                    self.db_file, guild_id=77, user_text=query, selection_out=selected,
+                )
+                self.assertEqual([key for key, _ in selected["source_refs"]], ["show-attendance-1"])
+                self.assertIn("on 2026-08-28;", rendered)
+                self.assertNotIn("on 2026-09-04;", rendered)
+                self.assertEqual(
+                    {day for item in self.packet_items(query) for day in item.show_dates},
+                    {"2026-08-28"},
+                )
 
     def test_current_date_correction_wins_prior_cue_without_expanding_pinned_roots(self):
         previous = ACCEPTANCE_QUERY.replace("August 28, 2026", "September 4, 2026")

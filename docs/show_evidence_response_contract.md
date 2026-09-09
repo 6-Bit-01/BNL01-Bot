@@ -21,10 +21,23 @@ whether the model used an allowed phrase.
 - A public-only basis cannot gain requester-specific scope during refresh.
 - Website archive selection and finalized episode selection share the same
   show-date resolver. ISO dates and named calendar dates identify the same
-  record. An explicit historical date takes precedence over current-show
+  records. Every distinct valid explicit date remains available to the
+  existing bounded selectors; comparison requests are not reduced to their
+  first date. Within the existing bounds, each requested date gets a source
+  before additional sessions on the same date. The website adapter reads each
+  selected date separately within
+  the existing two-show recall allowance. Missing requested shows do not
+  substitute another date or discard an independently available requested
+  show. An explicit historical date takes precedence over current-show
   wording and a website snapshot's date. An unavailable requested show or an
   invalid calendar date cannot silently select the latest show. Source refresh
   preserves that scope.
+- Dated live requests first reach the existing website reader. Once its
+  authorized current-show/session date is available, that date determines
+  whether to read current reactions, including a Friday show after Pacific
+  midnight. A historical recap still uses durable evidence; an explicit date
+  different from the ongoing show's date cannot read the live buffer as its
+  historical source.
 - Independent valid sources stay available when one source changes. The
   existing response-repair owner reconstructs the prompt and makes a bounded
   corrective generation when necessary.
@@ -93,12 +106,23 @@ consent/source changes across generation. Supported mocked responses test
 transport and lifecycle behavior; they do not establish that arbitrary model
 output is factually correct.
 
-Inherited show-source selection still uses the existing reader's retrieval
-cues. For example, a prior explicit recap request is covered, whereas a prior
-bare quote/date request is not always recognized as a show-retrieval cue.
-Natural delivery and a preserved prior exchange do not alone prove that every
-desired source was retrieved. This preexisting selector limitation is not
-masked by the continuation tests or claimed fixed here.
+Inherited show-source selection accepts an eligible earlier dated show
+reference, including a quote request or a bare dated show reference, without
+requiring recap wording. The existing current-speaker, guild, conversation,
+and reply-target boundaries still apply. The prior request selects labeled
+background evidence; it does not take over the current response or become
+proof of what an audience member said. A date outside show context alone is
+not a show-retrieval cue. These bounded cases do not establish arbitrary
+follow-up understanding or live model factuality.
+
+Regressions use real SQLite archive/ledger readers, source refresh, a real
+collector snapshot, and direct/batch prompt assembly with external transport
+replaced. They cover both requested dates and their original speakers/text,
+partial source removal, same-date sessions, missing/invalid dates, current-date
+corrections,
+Pacific midnight, and inherited dated requests. Passive-batch admission rules
+are unchanged; the delivery comparison is an admitted question, while reader
+tests also retain the review's literal unaddressed comparison instruction.
 
 Live acceptance still needs to check grounded show recall and quotes, an
 ordinary continuation, a factual correction, a mixed-source question, current

@@ -390,12 +390,16 @@ _HEALTH_FIELDS = (
 )
 
 
+def _explicit_show_date_matches(user_text: str) -> tuple[re.Match, ...]:
+    return tuple(sorted(
+        (match for pattern in _EXPLICIT_SHOW_DATE_PATTERNS
+         for match in pattern.finditer(str(user_text or ""))),
+        key=lambda match: match.start(),
+    ))
+
+
 def _explicit_show_date_match(user_text: str) -> Optional[re.Match]:
-    matches = [
-        match for pattern in _EXPLICIT_SHOW_DATE_PATTERNS
-        if (match := pattern.search(str(user_text or ""))) is not None
-    ]
-    return min(matches, key=lambda match: match.start()) if matches else None
+    return next(iter(_explicit_show_date_matches(user_text)), None)
 
 
 def has_explicit_show_date(user_text: str) -> bool:
@@ -410,6 +414,10 @@ def explicit_show_date(user_text: str) -> str:
     match = _explicit_show_date_match(user_text)
     if match is None:
         return ""
+    return _normalize_show_date_match(match)
+
+
+def _normalize_show_date_match(match: re.Match) -> str:
     parts = match.groupdict()
     month = (
         _SHOW_MONTHS[parts["month_name"].casefold().rstrip(".")]
@@ -419,6 +427,24 @@ def explicit_show_date(user_text: str) -> str:
         return date(int(parts["year"]), month, int(parts["day"])).isoformat()
     except ValueError:
         return ""
+
+
+def explicit_show_dates(user_text: str) -> tuple[str, ...]:
+    """Keep all distinct valid explicit dates in request order."""
+
+    return tuple(dict.fromkeys(
+        value for match in _explicit_show_date_matches(user_text)
+        if (value := _normalize_show_date_match(match))
+    ))
+
+
+def is_dated_show_query(user_text: str) -> bool:
+    """A dated show reference can select evidence without a recap phrase."""
+
+    return bool(
+        has_explicit_show_date(user_text)
+        and _SHOW_DATE_SCOPE_RE.search(str(user_text or ""))
+    )
 
 
 def _pacific_show_date(now: Any = None) -> date:
@@ -455,14 +481,37 @@ def requested_show_date(
     return ""
 
 
-def is_live_show_reaction_query(text: str, *, now: Any = None) -> bool:
+def requested_show_dates(
+    user_text: str, *, now: Any = None, include_current_relative: bool = True,
+) -> tuple[str, ...]:
+    """Resolve every requested date using the existing calendar rules."""
+
+    if has_explicit_show_date(user_text):
+        return explicit_show_dates(user_text)
+    value = requested_show_date(
+        user_text, now=now, include_current_relative=include_current_relative,
+    )
+    return (value,) if value else ()
+
+
+def is_live_show_reaction_query(
+    text: str, *, now: Any = None, current_show_date: Optional[str] = None,
+) -> bool:
     """Return whether a request needs current TikTok/show reaction context."""
 
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
         return False
     if has_explicit_show_date(normalized):
-        if explicit_show_date(normalized) != _pacific_show_date(now).isoformat():
+        dates = explicit_show_dates(normalized)
+        active_date = (
+            _pacific_show_date(now).isoformat()
+            if current_show_date is None else str(current_show_date)
+        )
+        if dates != (active_date,) or any(
+            not _normalize_show_date_match(match)
+            for match in _explicit_show_date_matches(normalized)
+        ):
             return False
     elif _PAST_SHOW_DATE_RE.search(normalized) or _PAST_SHOW_REFERENCE_RE.search(normalized):
         return False
@@ -634,13 +683,14 @@ def select_show_for_tiktok_analysis(
     # The website owns an ongoing show's date across midnight. A request for
     # "tonight" still refers to that current record, while explicit dates and
     # past calendar days constrain historical selection.
-    requested_date = requested_show_date(
+    requested_dates = requested_show_dates(
         user_text, now=now, include_current_relative=False,
     )
-    if requested_date:
-        for source_key, show in candidates:
-            if _bounded_text(show.get("showDate"), 40) == requested_date:
-                return dict(show), source_key
+    if requested_dates:
+        for requested_date in requested_dates:
+            for source_key, show in candidates:
+                if _bounded_text(show.get("showDate"), 40) == requested_date:
+                    return dict(show), source_key
         return {}, "none"
     if has_explicit_show_date(user_text):
         return {}, "none"

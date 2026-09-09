@@ -38,9 +38,10 @@ from bnl_memory_ledger import (
 from bnl_tiktok_live_context import (
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     build_tiktok_show_evidence_ledger,
-    explicit_show_date,
+    explicit_show_dates,
     has_explicit_show_date,
     requested_show_date,
+    requested_show_dates,
     show_timeline_bounds_ms,
     tiktok_show_evidence_key,
     tiktok_show_records,
@@ -2118,7 +2119,7 @@ def _document_relevance(
     subject_ref: str,
     recency_rank: int,
     allow_direct_subject: bool = False,
-    requested_show_date: str = "",
+    requested_dates: Sequence[str] = (),
     named_subject_refs: Optional[set[str]] = None,
 ) -> tuple[int, list[Mapping[str, Any]]]:
     query = str(user_text or "")
@@ -2126,8 +2127,8 @@ def _document_relevance(
     explicit_episode_scope = _show_episode_scope_requested(query)
     evidence_query_overlap = False
     score = max(0, 20 - recency_rank)
-    if requested_show_date:
-        if requested_show_date != str(ledger.get("showDate") or ""):
+    if requested_dates:
+        if str(ledger.get("showDate") or "") not in requested_dates:
             return 0, []
         score += 150
     participants = [
@@ -2229,7 +2230,7 @@ def _document_relevance(
         evidence_query_overlap = True
         score += min(240, 80 * authored_overlap)
     elif (
-        not requested_show_date
+        not requested_dates
         and _general_participant_recall(query, participant_matches)
         and topic_terms
     ):
@@ -2388,6 +2389,23 @@ def _operational_event_line(event: Mapping[str, Any]) -> str:
     )
 
 
+def _prioritize_requested_show_dates(
+    ranked: list[tuple], dates: Sequence[str],
+) -> list[tuple]:
+    """Give each requested date one slot before additional same-date sessions."""
+
+    if len(dates) < 2:
+        return ranked
+    first_by_date = {}
+    for item in ranked:
+        row = item[2]
+        ledger = row.get("ledger", row)
+        first_by_date.setdefault(str(ledger.get("showDate") or ""), item)
+    first = [first_by_date[day] for day in dates if day in first_by_date]
+    selected_ranks = {item[1] for item in first}
+    return first + [item for item in ranked if item[1] not in selected_ranks]
+
+
 def _ranked_show_ledgers(
     loaded: Sequence[Mapping[str, Any]],
     *,
@@ -2396,8 +2414,8 @@ def _ranked_show_ledgers(
     allow_subject_continuity: bool = False,
     now: Any = None,
 ) -> list[tuple[int, int, Mapping[str, Any], list[Mapping[str, Any]]]]:
-    requested_date = _requested_show_date(user_text, now=now)
-    if has_explicit_show_date(user_text) and not requested_date:
+    requested_dates = requested_show_dates(user_text, now=now)
+    if has_explicit_show_date(user_text) and not requested_dates:
         return []
     allow_direct_subject = bool(
         allow_subject_continuity
@@ -2417,7 +2435,7 @@ def _ranked_show_ledgers(
             subject_ref=subject_ref,
             recency_rank=recency_rank,
             allow_direct_subject=allow_direct_subject,
-            requested_show_date=requested_date,
+            requested_dates=requested_dates,
             named_subject_refs=named_subject_refs,
         )
         if score > 0:
@@ -2425,7 +2443,7 @@ def _ranked_show_ledgers(
                 (score, recency_rank, loaded_row, participant_matches)
             )
     ranked.sort(key=lambda item: (-item[0], item[1]))
-    return ranked
+    return _prioritize_requested_show_dates(ranked, requested_dates)
 
 
 def _show_context_item(
@@ -2989,7 +3007,8 @@ def select_tiktok_show_episode_context_items(
     if not ranked:
         return ()
     multi_show = bool(
-        _MULTI_SHOW_QUERY_RE.search(str(user_text or ""))
+        len(requested_show_dates(user_text, now=now)) > 1
+        or _MULTI_SHOW_QUERY_RE.search(str(user_text or ""))
         or any(_general_participant_recall(user_text, item[3]) for item in ranked)
         or (
             _community_baseline_requested(user_text)
@@ -3111,9 +3130,9 @@ def build_tiktok_show_evidence_context(
     )
     # A current correction wins over a prior date. Once a generation owns
     # selected roots, relative-date rollover must not select a different show.
-    requested_show_date = explicit_show_date(user_text) or (
-        "" if pinned_show_keys else
-        (_requested_show_date(user_text) or _requested_show_date(selection_query))
+    requested_dates = (
+        explicit_show_dates(date_query) if has_explicit_show_date(date_query) else
+        () if pinned_show_keys else requested_show_dates(date_query)
     )
     allow_direct_subject = _subject_continuity_requested(user_text)
     conn: Optional[sqlite3.Connection] = None
@@ -3159,10 +3178,10 @@ def build_tiktok_show_evidence_context(
         # A new named-person request owns its undated scope. An earlier recap
         # may explain a bare continuation, but cannot date-pin this request.
         selection_query = str(user_text or "")
-        requested_show_date = ""
+        requested_dates = ()
         date_query = selection_query
         candidate_context = False
-    if has_explicit_show_date(date_query) and not _requested_show_date(date_query):
+    if has_explicit_show_date(date_query) and not requested_show_dates(date_query):
         return ""
     named_subject_refs = _named_recall_subject_refs(ledgers, selection_query)
     ranked = []
@@ -3173,7 +3192,7 @@ def build_tiktok_show_evidence_context(
             subject_ref=subject_ref,
             recency_rank=recency_rank,
             allow_direct_subject=allow_direct_subject,
-            requested_show_date=requested_show_date,
+            requested_dates=requested_dates,
             named_subject_refs=named_subject_refs,
         )
         if score > 0:
@@ -3181,10 +3200,11 @@ def build_tiktok_show_evidence_context(
     if not ranked:
         return ""
     ranked.sort(key=lambda item: (-item[0], item[1]))
+    ranked = _prioritize_requested_show_dates(ranked, requested_dates)
     selected_limit = (
         max(1, min(int(show_limit or 1), 4))
-        if _MULTI_SHOW_QUERY_RE.search(selection_query) or (
-            not requested_show_date
+        if len(requested_dates) > 1 or _MULTI_SHOW_QUERY_RE.search(selection_query) or (
+            not requested_dates
             and any(_general_participant_recall(selection_query, item[3]) for item in ranked)
         )
         else 1
@@ -3248,7 +3268,7 @@ def build_tiktok_show_evidence_context(
     bounded_message_limit = max(1, min(int(message_limit or 1), 16))
     for _score, _recency, ledger, participant_matches in selected:
         general_recall = bool(
-            not requested_show_date
+            not requested_dates
             and _general_participant_recall(user_text, participant_matches)
         )
         message_query_terms = (
