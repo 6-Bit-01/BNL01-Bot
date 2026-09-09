@@ -1354,6 +1354,59 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             )
             self.assertEqual(wrong_episode, "")
 
+    def test_authored_context_preserves_provenance_without_response_form_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            sync_tiktok_show_evidence_ledgers(
+                db_file,
+                guild_id=77,
+                read_model=authorized_read_model({
+                    "currentShow": None,
+                    "latestShow": archived_show(),
+                    "shows": [],
+                }),
+                artist_identity_index=artist_index(),
+                environ=ENABLED_QUEUE_ENV,
+            )
+            selection = {}
+            rendered = build_tiktok_show_evidence_context(
+                db_file,
+                guild_id=77,
+                user_text="What did I ask BNL during the live?",
+                subject_user_id=42,
+                selection_out=selection,
+            )
+
+            self.assertIn("on 2026-08-28", rendered)
+            self.assertIn("original speaker and event", rendered)
+            self.assertIn("distinct records, not audience transcripts", rendered)
+            self.assertIn("bounded excerpts of retained eligible evidence", rendered)
+            self.assertIn("BNL's own messages separately", rendered)
+            for response_form_rule in (
+                "Quotation rule:",
+                "Missing-detail rule:",
+                "Correction rule:",
+                "state that specific uncertainty",
+                "label a paraphrase",
+            ):
+                self.assertNotIn(response_form_rule, rendered)
+
+            authored = selection["authored_excerpts"]
+            self.assertTrue(authored)
+            self.assertTrue(all((item[0], item[1]) in selection["source_refs"]
+                                for item in authored))
+            member_message = "Did the Wheel put Queue Light up next, BNL?"
+            member_event = next(item for item in authored if item[5] == member_message)
+            self.assertEqual(member_event[2], "discord_conversation:101")
+            self.assertEqual(member_event[3], "discord_user:42")
+            self.assertEqual(member_event[4], "Alex")
+            self.assertEqual(member_event[6], "discord")
+            response = "Yes—the Wheel confirmed Queue Light, and it is playing now."
+            self.assertIn(response, rendered)
+            self.assertNotIn(response, {item[5] for item in authored})
+            self.assertNotIn("This private row", rendered)
+
     def test_requester_show_recall_keeps_own_evidence_in_both_views(self):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "bnl.db")

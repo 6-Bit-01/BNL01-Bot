@@ -749,12 +749,12 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
     def _assert_people_memory_contract(self, prompt):
         self.assertIn(
-            "summarize another member's meaning in your own words by default",
+            "People-and-memory provenance: authored excerpts retain their original speaker and event",
             prompt,
         )
         self.assertIn(
-            "use only supplied source-authored show excerpts and preserve each "
-            "excerpt's original speaker; never combine names and words from separate events",
+            "summaries, memory tiers, relationship notes, Moment gists, and prior BNL replies "
+            "are not audience transcripts",
             prompt,
         )
         self.assertIn(
@@ -762,9 +762,8 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "the typed Exact-quote authority block and its limits",
             prompt,
         )
-        self.assertIn(
-            "A derived summary, memory tier, relationship note, Moment gist, "
-            "or prior BNL reply cannot establish exact audience wording",
+        self.assertNotIn(
+            "summarize another member's meaning in your own words by default",
             prompt,
         )
 
@@ -1504,20 +1503,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "- TikTok t+2.0m Alex: \"the green visuals during this song are wild\"\n"
             "- Discord t+5.2m Alex: \"Did the Wheel put Queue Light up next, BNL?\""
         )
-        observed_refusal = (
-            "I don't have yesterday's broadcast logs or chat feed loaded in my "
-            "active buffer, 6 Bit. You'll need to check the raw recordings "
-            "directly or ask Sheila for the show breakdown."
-        )
-        repaired = (
+        answer = (
             "The retained episode clock begins at t+1.2m with Neon Fox's First "
             "Signal, followed by Alex calling out its green visuals in TikTok "
             "chat. At t+4.5m the Wheel confirmed Second Artist's Queue Light; "
             "Alex then asked BNL about that move in Discord."
-        )
-        retry_with_unsupported_lore = (
-            repaired
-            + " Cliff handled a studio-floor interruption between those events."
         )
         prompts = []
         source_context_flags = []
@@ -1529,11 +1519,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             source_context_flags.append(
                 bool(kwargs.get("source_context_available"))
             )
-            return (
-                observed_refusal
-                if len(prompts) == 1
-                else retry_with_unsupported_lore
-            )
+            return answer
 
         def assess(**kwargs):
             assessment_calls.append(kwargs)
@@ -1585,17 +1571,13 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bnl01_bot._flush_channel_buffer(channel)
 
-        self.assertEqual(len(prompts), 2)
+        self.assertEqual(len(prompts), 1)
         self.assertIn(episode_context, prompts[0])
         self.assertIn(
             "Finalized BARCODE Radio episode priority:",
             prompts[0],
         )
-        self.assertIn(
-            "FINALIZED SHOW EVIDENCE CORRECTION REQUIRED",
-            prompts[1],
-        )
-        self.assertEqual(source_context_flags, [True, True])
+        self.assertEqual(source_context_flags, [True])
         build_episode.assert_called_once_with(
             "missing-public-show-batch-test.db",
             guild_id=channel.guild.id,
@@ -1613,9 +1595,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             assessment_calls[0]["website_read_model_present"]
         )
-        self.assertEqual(channel.sent, [repaired])
-        self.assertNotIn(observed_refusal, channel.sent)
-        self.assertNotIn("Cliff", channel.sent[0])
+        self.assertEqual(channel.sent, [answer])
 
     async def test_batch_records_one_participant_neutral_unified_assessment_after_send(self):
         channel = self._channel(8137)

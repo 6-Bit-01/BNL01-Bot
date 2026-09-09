@@ -2068,11 +2068,12 @@ def _document_relevance(
             participant_matches.append(participant)
             evidence_query_overlap = True
             score += 90
-    if (
-        subject_ref
-        and _subject_continuity_requested(query)
-        and not direct_subject_candidates
-    ):
+    if _subject_continuity_requested(query) and not direct_subject_candidates:
+        # An absent/ineligible requester is not a request for everybody else's
+        # messages. In particular, consent lookup may intentionally remove the
+        # subject reference; do not expand that failed personal read into a
+        # broader public recap. Ordinary nonrequester show queries still rank
+        # independently below.
         return 0, []
     for track in ledger.get("trackMoments") or ():
         if isinstance(track, Mapping) and _phrase_in_query(
@@ -3123,7 +3124,7 @@ def build_tiktok_show_evidence_context(
     lines = [
         "Durable BARCODE Radio show episode memory:",
         (
-            "- Prior-conversation source candidate: an earlier eligible human request by the current speaker selected this archive. This does not establish that the current request concerns this show. Use it only when relevant; the current request, explicit dates, topic changes, and reply targets take precedence. The earlier request is only a retrieval cue, never proof of audience wording or identity."
+            "- Prior-conversation source candidate: selected using an earlier eligible request from the current speaker. That request is a retrieval cue, not current-topic or audience evidence; the current request, explicit dates, topic changes, and reply targets take precedence."
             if candidate_context else
             "- This is BNL's after-show continuation of the same public episode."
         ),
@@ -3502,9 +3503,8 @@ def build_tiktok_show_evidence_context(
     lines.extend(
         [
             "- Authority rule: queue/broadcast milestones and roster outcomes are operational facts from the website owner. TikTok and Discord text is attributed observation evidence; BNL's response proves the recorded exchange, not that BNL's wording independently proves a viewer claim.",
-            "- Quotation rule: quote only wording present in a supplied authored example, preserving the speaker from that same source event. Never invent a participant or handle, attach invented words to a real name, combine separate comments into a quote, or present a summary as a transcript. Participant counts, track titles, and BNL replies do not establish exact audience wording.",
-            "- Missing-detail rule: these are bounded excerpts. If a requested quote or speaker is unsupported here, state that specific uncertainty and answer the supported parts; do not conclude that the person never appeared or that all show evidence is unavailable.",
-            "- Correction rule: compare a challenged claim with the supplied speaker-labeled exchange and authored evidence. Acknowledge and correct unsupported BNL wording when shown. Never blame a member for BNL's own words or invent buffer failures, interpolation, or signal bleed as their cause.",
+            "- Authored evidence: each example pairs source text with its original speaker and event. Participant counts, track titles, summaries, and BNL responses are distinct records, not audience transcripts.",
+            "- Coverage: these are bounded excerpts of retained eligible evidence, not a complete attendee list or proof of absence. BNL exchanges record BNL's own messages separately from member-authored text.",
             "- Connection rule: connect a remark or question to the active track and nearest queue event by time. Treat timing as correlation, not causation, and never attribute one person's words to the room.",
             "- Identity rule: an exact source-owned subject reference may connect the same person across episode surfaces. A similar name, handle, or queue attribution alone must not merge TikTok, Discord, viewer, or artist identities.",
             "- Continuity rule: use the episode as real show memory when the current question is about that show, its people, tracks, chat, queue, or community pattern. A single show may support 'observed that night' but never 'regular,' 'usually,' or 'always.' Silence is not proof of absence.",

@@ -518,9 +518,8 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
         )
         self.assertIn("full eligible archive", contract)
         self.assertIn("cannot supply claims about what TikTok viewers said", contract)
-        self.assertIn("three to five supported subjects", contract)
 
-    def test_tiktok_topic_response_guard_detects_filler_and_missing_evidence(self):
+    def test_tiktok_topic_contract_preserves_source_authority_without_output_quota(self):
         prompt = (
             "Durable TikTok show analysis context:\n"
             "- Analysis intent=chat_topics.\n"
@@ -528,40 +527,10 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
             "  Support t+2.0m | First Track | @one: "
             "\"The green visuals are wild.\""
         )
-        filler = (
-            "Connection is much clearer. It was standard baseline chatter and "
-            "ambient banter, with nothing critical enough to escalate to production."
-        )
-        unsupported = "People mostly discussed generic things throughout the live."
-        grounded = (
-            "Green visuals were the clearest recurring subject: 3 messages "
-            "from 3 chatters called out the changing look."
-        )
-        self.assertEqual(
-            bnl01_bot.tiktok_show_analysis_response_failure(filler, prompt),
-            "operational_or_ambient_filler",
-        )
-        self.assertEqual(
-            bnl01_bot.tiktok_show_analysis_response_failure(unsupported, prompt),
-            "archive_evidence_not_used",
-        )
-        self.assertEqual(
-            bnl01_bot.tiktok_show_analysis_response_failure(grounded, prompt),
-            "",
-        )
-        empty_prompt = (
-            "Durable TikTok show analysis context:\n"
-            "- Analysis intent=chat_topics.\n"
-            "- Comment evidence: no eligible public TikTok comments/questions "
-            "were present in the selected show window."
-        )
-        self.assertEqual(
-            bnl01_bot.tiktok_show_analysis_response_failure(
-                "People spent the live discussing production techniques.",
-                empty_prompt,
-            ),
-            "no_comment_evidence_overclaimed",
-        )
+        contract = bnl01_bot.build_tiktok_show_analysis_turn_contract(prompt)
+        self.assertIn("full eligible archive", contract)
+        self.assertIn("cannot supply claims about what TikTok viewers said", contract)
+        self.assertNotIn("three to five", contract)
 
     def test_public_tiktok_exchange_uses_normal_memory_but_queue_only_does_not(self):
         public_context = (
@@ -659,7 +628,7 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
 
 
 class BNLLiveContextGuardTests(unittest.IsolatedAsyncioTestCase):
-    async def test_topic_guard_regenerates_operational_filler_from_archive_evidence(self):
+    async def test_topic_evidence_allows_natural_synonyms_without_a_rewrite(self):
         prompt = (
             "Current user request: Any recurring topics from chat tonight?\n"
             "Durable TikTok show analysis context:\n"
@@ -668,22 +637,18 @@ class BNLLiveContextGuardTests(unittest.IsolatedAsyncioTestCase):
             "  Support t+2.0m | First Track | @one: "
             "\"The green visuals are wild.\""
         )
-        initial = (
-            "Connection is much clearer. It was standard baseline chatter and "
-            "ambient banter, with nothing critical enough to escalate to production."
-        )
-        repaired = (
-            "Green visuals were the clearest recurring subject: 3 messages "
-            "from 3 chatters called out the changing look."
+        answer = (
+            "Three different viewers commented on the green look, "
+            "one remark apiece. One described it as wild during First Track."
         )
         with mock.patch.object(
             bnl01_bot,
             "get_gemini_response_with_optional_typing",
-            new=mock.AsyncMock(return_value=repaired),
+            new=mock.AsyncMock(),
         ) as regenerate:
             response, diagnostics = (
                 await bnl01_bot.apply_guarded_response_regeneration(
-                    initial,
+                    answer,
                     prompt=prompt,
                     user_id=1,
                     guild_id=77,
@@ -696,13 +661,14 @@ class BNLLiveContextGuardTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-        self.assertEqual(response, repaired)
-        self.assertTrue(
+        self.assertEqual(response, answer)
+        self.assertFalse(
             diagnostics["tiktok_show_analysis_guard_triggered"]
         )
-        self.assertTrue(diagnostics["tiktok_show_analysis_regenerated"])
+        self.assertFalse(diagnostics["tiktok_show_analysis_regenerated"])
         self.assertEqual(diagnostics["tiktok_show_analysis_guard_reason"], "")
-        regenerate.assert_awaited_once()
+        self.assertFalse(diagnostics["suppressed"])
+        regenerate.assert_not_awaited()
 
     async def test_direct_public_tiktok_reply_is_saved_as_conversation_not_snapshot(self):
         question = (

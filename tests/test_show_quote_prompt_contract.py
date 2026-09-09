@@ -1,4 +1,4 @@
-"""Provider-bound grounding instructions; these are not model-quality tests."""
+"""Provider-bound source provenance; these are not model-quality tests."""
 
 import os
 import unittest
@@ -11,6 +11,20 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot as bot
 from bnl_tiktok_live_context import build_durable_show_prompt_context
+
+
+AUTHORSHIP_PROVENANCE = (
+    "Authored excerpts retain their original speaker and event. Summaries, "
+    "participant lists, track titles, and prior BNL replies are not audience "
+    "transcripts."
+)
+BOUNDED_COVERAGE = (
+    "The supplied selection can be incomplete; absence here is not proof "
+    "of absence."
+)
+PRIOR_BNL_PROVENANCE = (
+    "Prior BNL replies document BNL's claims, not independent source confirmation."
+)
 
 
 def show_context(events_available=True):
@@ -55,7 +69,17 @@ def show_context(events_available=True):
 
 
 class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_authored_pairs_and_quote_contract_reach_both_provider_routes(self):
+    def assert_no_response_form_mandates(self, prompt):
+        normalized = " ".join(prompt.casefold().split())
+        for wording_mandate in (
+            "label a paraphrase as a summary",
+            "explicitly labeled as a gist",
+            "any non-exact wording must",
+            "every word must overlap",
+        ):
+            self.assertNotIn(wording_mandate, normalized)
+
+    async def test_authored_pairs_and_provenance_reach_both_provider_routes(self):
         context = show_context()
         batch = bot._format_batched_prompt(
             [("Test Member", "Give me some quotes.")], "balanced", "",
@@ -87,11 +111,10 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
                 request = " ".join(generate.await_args.args[0].split())
                 for pair in authored_pairs:
                     self.assertIn(pair, request)
-                self.assertIn("Never invent participants, handles, quotations, or transcripts", request)
-                self.assertIn("speaker on that same source event", request)
-                self.assertIn("acknowledge unsupported BNL wording", request)
-                self.assertIn("these bounded excerpts", request)
-                self.assertIn("consequential current-room exact-quote request still requires", request)
+                self.assertIn(AUTHORSHIP_PROVENANCE, request)
+                self.assertIn(BOUNDED_COVERAGE, request)
+                self.assertIn(PRIOR_BNL_PROVENANCE, request)
+                self.assert_no_response_form_mandates(request)
                 self.assertNotIn("Exact wording is allowed only when a typed", request)
                 self.assertNotIn("Does not repeat from its database verbatim", request)
                 self.assertFalse(bot.is_consequential_exact_quote_request("Give me some quotes."))
@@ -111,10 +134,11 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
         request = " ".join(generate.await_args.args[0].split())
         self.assertIn("durable TikTok event archive could not be read", request)
         self.assertIn("When one exact fact is unavailable, answer everything else that is supported", request)
-        self.assertIn("Missing bounded evidence does not prove a person or event never existed", request)
+        self.assertIn(BOUNDED_COVERAGE, request)
+        self.assert_no_response_form_mandates(request)
         self.assertNotIn("The green lights changed.", request)
 
-    async def test_each_optional_style_provider_receives_quote_preservation_contract(self):
+    async def test_each_optional_style_provider_preserves_facts_and_attribution(self):
         original = 'Test Member said, "The green lights changed."'
         for expected_route, rolls in (
             ("glitch_rewrite", [0.0, 1.0]),
@@ -143,8 +167,8 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(style.await_args.args[1], expected_route)
                 request = style.await_args.args[0]
                 self.assertIn(original, request)
-                self.assertIn("Preserve all supplied participant names, quoted wording, and speaker attribution unchanged", request)
-                self.assertIn("Lore may color the voice around the answer", request)
+                self.assertIn("Style changes must preserve factual content and source attribution.", request)
+                self.assert_no_response_form_mandates(request)
 
     def test_final_episode_contract_preserves_source_roles_and_scoped_uncertainty(self):
         context = (
@@ -155,10 +179,11 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
             '  BNL replied: "Test Phantom said the lights were blue."\n'
         )
         contract = bot.build_tiktok_show_episode_turn_contract(context)
-        self.assertIn("paired with the speaker on that same source event", contract)
-        self.assertIn("earlier BNL replies are not independent evidence of audience wording", contract)
-        self.assertIn("A missing detail does not establish that the person never appeared", contract)
-        self.assertIn("Acknowledge and correct BNL's own unsupported wording", contract)
+        normalized = " ".join(contract.split())
+        self.assertIn(AUTHORSHIP_PROVENANCE, normalized)
+        self.assertIn(BOUNDED_COVERAGE, normalized)
+        self.assertIn(PRIOR_BNL_PROVENANCE, normalized)
+        self.assert_no_response_form_mandates(contract)
         self.assertEqual(bot.build_tiktok_show_episode_turn_contract(""), "")
         self.assertEqual(bot.build_tiktok_show_episode_turn_contract("Current queue state: closed"), "")
 
