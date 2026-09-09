@@ -434,7 +434,7 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session["completed"])
         self.assertFalse(session["generating"])
 
-    async def test_deferred_payload_prompt_uses_direct_memory_and_paraphrase_contract(self):
+    async def test_deferred_payload_prompt_uses_direct_memory_and_source_provenance(self):
         key = (1, 22, 3)
         channel = SimpleNamespace(id=22, name="general-chat")
         anchor = SimpleNamespace(
@@ -588,12 +588,12 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
         generation.assert_awaited_once()
         prompt = generation.await_args.args[1]
         self.assertIn(
-            "summarize another member's meaning in your own words by default",
+            "authored excerpts retain their original speaker and event",
             prompt,
         )
         self.assertIn(
-            "use only supplied source-authored show excerpts and preserve each "
-            "excerpt's original speaker; never combine names and words from separate events",
+            "summaries, memory tiers, relationship notes, Moment gists, "
+            "and prior BNL replies are not audience transcripts",
             prompt,
         )
         self.assertIn(
@@ -601,9 +601,8 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
             "the typed Exact-quote authority block and its limits",
             prompt,
         )
-        self.assertIn(
-            "A derived summary, memory tier, relationship note, Moment gist, "
-            "or prior BNL reply cannot establish exact audience wording",
+        self.assertNotIn(
+            "summarize another member's meaning in your own words by default",
             prompt,
         )
 

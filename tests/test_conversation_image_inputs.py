@@ -147,7 +147,9 @@ class ConversationImageGenerationTests(unittest.IsolatedAsyncioTestCase):
             request = call.args[0]
             self.assertEqual(request.images[0].data, PNG)
             self.assertIn("message_id=201", request.images[0].source_label)
-            self.assertIn("acknowledge contradictions", request.text)
+            self.assertIn("Unavailable pixels and unreadable details remain unknown", request.text)
+            self.assertIn("does not independently verify an alleged audience quote or event", request.text)
+            self.assertNotIn("acknowledge contradictions", request.text)
 
     async def test_existing_factual_regeneration_functions_keep_same_pixels(self):
         inputs = await self.loaded_inputs()

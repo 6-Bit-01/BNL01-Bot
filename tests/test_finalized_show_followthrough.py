@@ -145,7 +145,7 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
                 self.assertEqual(result.referent_status, "not_requested")
                 self.assertTrue(selection["candidate_context"])
                 self.assertIn("Prior-conversation source candidate:", rendered)
-                self.assertIn("does not establish that the current request concerns this show", rendered)
+                self.assertIn("retrieval cue, not current-topic or audience evidence", rendered)
                 self.assertIn("Source-linked authored examples:", rendered)
                 self.assertIn("the green visuals during this song are wild.", rendered)
                 self.assertFalse(self.bot.finalized_show_packet_owner_requested(current, rendered))
@@ -275,7 +275,7 @@ class FinalizedShowCandidateAssemblyTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await fixture.asyncTearDown()
 
-    async def test_batch_rewrites_an_invented_show_speaker_and_quote(self):
+    async def test_batch_delivers_natural_show_paraphrase_from_inherited_context(self):
         from tests import test_public_network_knowledge as network_fixture
 
         fixture = network_fixture.PublicNetworkKnowledgeTests()
@@ -284,35 +284,25 @@ class FinalizedShowCandidateAssemblyTests(unittest.IsolatedAsyncioTestCase):
             fixture._seed_finalized_show()
             bot = network_fixture.bnl01_bot
             self._seed_prior_show_requests(bot)
-            fabricated = (
-                'TestBeacon: "The paper lantern blinked twice."'
-            )
             supported = (
-                'Alex (@alex.signal): "BNL, the green visuals during this '
-                'song are wild."'
+                "Alex said the green visuals during the song were wild, "
+                "addressing BNL in the show chat."
             )
-            replies = iter((fabricated, supported))
-
-            def next_reply(*_args, **_kwargs):
-                return next(replies)
-
             channel, generation, guard = await fixture._batch(
                 "sealed_test",
                 request="Give me some quotes",
-                answer=next_reply,
+                answer=supported,
             )
-            self.assertEqual(generation.await_count, 2)
+            generation.assert_awaited_once()
             self.assertEqual(channel.sent, [supported])
             self.assertEqual(guard.await_count, 1)
-            correction_prompt = generation.await_args_list[1].args[0]
-            self.assertIn(
-                "SHOW-AUTHORED EVIDENCE CORRECTION REQUIRED",
-                correction_prompt,
+            prompt = generation.await_args.args[0]
+            sources = fixture._assert_show_source(
+                prompt, guard.await_args.kwargs["prompt_source_bases"],
             )
-            self.assertIn(
-                "Source-linked authored examples:",
-                correction_prompt,
-            )
+            self.assertTrue(sources[0].candidate_context)
+            self.assertIn("2026-08-28", sources[0].selection_user_text)
+            self.assertIn("Give me some quotes", prompt)
         finally:
             await fixture.asyncTearDown()
 
