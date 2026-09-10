@@ -42,6 +42,7 @@ from bnl_tiktok_live_context import (
     is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
     live_context_diagnostics,
+    load_live_context_snapshot,
     requested_show_date,
     requested_show_dates,
     select_show_for_tiktok_analysis,
@@ -32541,6 +32542,65 @@ def _looks_like_internal_process_report(text: str) -> bool:
             return True
     return False
 
+def build_ambient_current_show_context(guild_id: int) -> str:
+    """Read bounded public show observations for the existing Ambient owner."""
+    unavailable = "Current BARCODE show observations: unavailable; current broadcast state is unknown."
+    # The configured website/collector belong to one Network. The volatile
+    # collector snapshot carries no guild field of its own.
+    if not BNL_PRIMARY_GUILD_ID or int(guild_id) != BNL_PRIMARY_GUILD_ID:
+        return unavailable
+
+    try:
+        read_model = fetch_bnl_read_model(force=True)
+    except Exception as exc:
+        logging.warning("ambient_website_observation_unavailable error_type=%s", type(exc).__name__)
+        read_model = {}
+    public_model = safe_bnl_read_model_for_consumption(read_model, "public_home")
+    queue = _website_read_model_queue(public_model)
+    session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+    status = _first_mapping(queue.get("status"), queue.get("queueStatus"), queue)
+    lines = ["Current BARCODE show observations (public sources):"]
+    bits = []
+    for label, keys in (
+        ("showDate", ("showDate",)),
+        ("status", ("status",)),
+        ("queueOpen", ("queueOpen",)),
+        ("phase", ("broadcastPhase", "phase")),
+    ):
+        value = _first_present_value(session, keys)
+        if value is None:
+            value = _first_present_value(status, keys)
+        if value is not None and value != "":
+            bits.append(f"{label}={_compact_public_text(value, 80)}")
+    lines.append(
+        "- Website production session: " + "; ".join(bits)
+        if bits else "- Public production session observations: unavailable."
+    )
+
+    # Public webcast connection state has its own authority. A missing or
+    # private website session must not hide the independent live observation.
+    # No comments, room metrics or queue-to-comment association are projected.
+    snapshot = {}
+    if BNL_TIKTOK_LIVE_CONTEXT_ENABLED:
+        try:
+            snapshot, _reason = load_live_context_snapshot(
+                BNL_TIKTOK_LIVE_CONTEXT_PATH,
+                max_age_seconds=BNL_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
+            )
+        except Exception as exc:
+            logging.warning("ambient_tiktok_observation_unavailable error_type=%s", type(exc).__name__)
+    if snapshot:
+        observed_at = datetime.fromtimestamp(
+            snapshot["generated_at"], tz=timezone.utc,
+        ).isoformat(timespec="seconds")
+        lines.append(
+            f"- TikTok webcast observation: state={snapshot['state']}; observedAt={observed_at}."
+        )
+    else:
+        lines.append("- Current TikTok webcast observation: unavailable; live state is unknown.")
+    return "\n".join(lines)
+
+
 async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     recent_user = get_recent_guild_user_messages(guild_id, limit=AMBIENT_CONTEXT_MESSAGES)
     recent_ambient = get_recent_ambient(guild_id, channel_id=channel_id, limit=AMBIENT_AVOID_LAST)
@@ -32552,10 +32612,15 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     temporal = get_temporal_context()
     ambient_mode = _select_ambient_mode(guild_id, temporal["show_phase"])
     ambient_broadcast_context = build_scoped_broadcast_memory_context(guild_id, scope="ambient", public_only=True, limit=3)
+    try:
+        current_show_context = await asyncio.to_thread(build_ambient_current_show_context, guild_id)
+    except Exception as exc:
+        logging.warning("ambient_show_context_unavailable error_type=%s", type(exc).__name__)
+        current_show_context = "Current BARCODE show observations: unavailable; current broadcast state is unknown."
     mode_guidance = {
         "room_observation": "Anchor in a fresh public-room pattern; stay concrete and understated.",
         "memory_echo": "Let memory tint the line, but keep recent public context as the subject.",
-        "show_cycle_awareness": "Use show-cycle timing only if supported by current phase; avoid hype.",
+        "show_cycle_awareness": "Use the calendar for scheduled timing and current observations for actual show activity; avoid hype.",
         "quiet_network_presence": "Minimal atmospheric presence; no status-report framing.",
         "community_pattern": "Observe a pattern across several recent public messages without naming users.",
     }
@@ -32563,16 +32628,16 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         "You are BNL-01. Generate ONE ambient Discord message to post.\n"
         f"Current network time: {temporal['now_str']}\n"
         f"Current weekday: {temporal['weekday']}\n"
-        f"Current show phase: {temporal['show_phase']}\n"
+        f"{current_show_context}\n"
         "Hard rules:\n"
         "- 1–3 sentences.\n"
         "- Do NOT quote users or repeat their exact phrasing.\n"
         "- No usernames, no @mentions, no hashtags.\n"
         "- No calls to action.\n"
-        "- If show_phase is off_cycle, do NOT imply a current show, tonight's show, this evening's broadcast, active uplink, or live broadcast.\n"
-        "- If show_phase is post_show, you may refer to residual signals, archives, aftermath, or the previous broadcast.\n"
-        "- If show_phase is show_day_prebroadcast, you may reference preparation for tonight's show or pre-broadcast checks.\n"
-        "- If show_phase is live_now, you may reference an active broadcast or live transmission.\n"
+        "- The weekday and clock describe the calendar only; they do not establish that a show has started, is live, or has ended.\n"
+        "- Website session status, phase and intake describe production operations. An open session, open queue or loaded track alone does not establish a live TikTok broadcast.\n"
+        "- A fresh TikTok connected observation supports an observed live webcast; ended supports an observed end. Reconnecting, disconnected, stopped, error or unavailable observations do not establish either current live transmission or an ended broadcast.\n"
+        "- Use current show observations only when relevant. If unavailable, continue naturally from public conversation; do not turn the message into a source-access or infrastructure report.\n"
         "- Preserve the impression that BNL-01 is aware of the passing of time.\n"
         "- Anchor the line in recent public conversation context first.\n"
         "- Memory/curiosity cues are background influence for tone and angle, not the main subject.\n"
