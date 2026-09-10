@@ -111,6 +111,59 @@ class OriginalShowQuoteLookupTests(unittest.TestCase):
         self.assertEqual(results["2026-08-28"]["queries"][0]["shown_match_count"], 8)
         self.assertEqual(results["2026-09-04"]["queries"][0]["matches"][0]["speakerLabel"], "Test Later (@latercopy)")
 
+    def test_formatting_candidates_preserve_originals_without_changing_literal_counts(self):
+        original = "  the amber lamp is blinking  "
+        self.add("formatting", original, "Test Original")
+        self.sync()
+        for literal in ("The amber lamp is blinking.", "the amber\nlamp is blinking", "the amber lamp is blinking!"):
+            with self.subTest(literal=literal):
+                context, selection = self.read(literal)
+                query = self.result(selection)["queries"][0]
+                self.assertEqual(query["match_count"], 0)
+                self.assertEqual(query["format_candidate_count"], 1)
+                self.assertEqual(query["shown_format_candidate_count"], 1)
+                row = query["format_candidates"][0]
+                self.assertEqual((row["eventId"], row["text"], row["speakerLabel"]),
+                                 ("formatting", original, "Test Original (@formatting)"))
+                self.assertIn("not verbatim matches or proof of equivalent meaning", context)
+                self.assertIn("formatCandidateRows=1", context)
+                self.assertTrue(any(item[2] == "formatting" and item[5] == original
+                                    for item in selection["authored_excerpts"]))
+                self.assertFalse(any(item[5] == literal for item in selection["authored_excerpts"]))
+        _context, selection = self.read(original)
+        query = self.result(selection)["queries"][0]
+        self.assertEqual((query["match_count"], query["format_candidate_count"]), (1, 0))
+
+    def test_formatting_candidates_require_contiguous_whole_words_and_current_eligibility(self):
+        self.add("changed", "the amber lamp is not blinking")
+        self.add("fragment", "the amber lamp is blinkingly bright")
+        self.add("reordered", "blinking is the amber lamp")
+        self.add("private", "the amber lamp is blinking", public=False)
+        self.add("other-window", "the amber lamp is blinking", offset=7 * 86400 * 1000)
+        self.sync()
+        context, selection = self.read("The amber lamp is blinking.")
+        query = self.result(selection)["queries"][0]
+        self.assertEqual((query["match_count"], query["format_candidate_count"]), (0, 0))
+        self.assertFalse(query["format_candidates"])
+        self.assertIn("No candidate does not rule out other wording", context)
+
+    def test_all_exact_results_take_display_priority_over_formatting_candidates(self):
+        for index in range(10):
+            self.add(f"variant{index}", "the amber lamp is blinking", f"Test Variant {index}", offset=index)
+        self.add("later-exact", "Keep this exact original.", "Test Exact", offset=20)
+        self.sync()
+        context, selection = self.read(request=(
+            'Verify TikTok chat during August 28, 2026: '
+            '"The amber lamp is blinking." "Keep this exact original."'
+        ))
+        queries = self.result(selection)["queries"]
+        self.assertEqual(queries[0]["format_candidate_count"], 10)
+        self.assertEqual(queries[0]["shown_format_candidate_count"], 7)
+        self.assertEqual(queries[1]["shown_match_count"], 1)
+        self.assertIn('speaker="Test Exact"; text="Keep this exact original."', context)
+        self.assertEqual(sum(q["shown_match_count"] + q["shown_format_candidate_count"] for q in queries), 8)
+        self.assertEqual(len({r["speakerLabel"] for r in queries[0]["format_candidates"]}), 7)
+
     def test_withdrawal_does_not_reintroduce_cached_quote_or_participant(self):
         self.add("withdrawn", "The copper lantern is dim.", "Test Withdrawn", subject="discord_user:4242")
         self.sync()

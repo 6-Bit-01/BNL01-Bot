@@ -3176,6 +3176,13 @@ def _current_show_quote_literals(user_text: str) -> tuple[str, ...]:
     ))
 
 
+def _quote_comparison_text(text: str) -> str:
+    """Bound whole words for candidate retrieval, never verbatim authority."""
+
+    words = re.findall(r"[^\W_]+", text.casefold())
+    return " " + " ".join(words) + " " if words else ""
+
+
 def _lookup_original_show_quotes(
     db_file: str, *, guild_id: int, ledger: Mapping[str, Any],
     literals: tuple[str, ...],
@@ -3231,7 +3238,7 @@ def _lookup_original_show_quotes(
         if safe is None or str(event.get("event_id") or "") in truncated:
             skipped += 1
             continue
-        eligible.append((event, safe))
+        eligible.append((event, safe, _quote_comparison_text(event["raw_text"])))
         current_projection[safe["event_id"]] = (
             safe["raw_text"], safe["subject_ref"], safe["speaker_label"],
             safe["occurred_at_ms"], safe["event_type"],
@@ -3256,12 +3263,15 @@ def _lookup_original_show_quotes(
     shown_remaining = 8
     for literal in literals[:8]:
         matches = []
-        for event, safe in eligible:
+        candidates = []
+        comparison = _quote_comparison_text(literal)
+        for event, safe, original_comparison in eligible:
             # Raw original characters are the matching authority; normalized
             # ledger prose, speaker claims, and previous bot replies are not.
-            if literal not in event["raw_text"]:
+            exact = literal in event["raw_text"]
+            if not exact and not (comparison and comparison in original_comparison):
                 continue
-            matches.append({
+            (matches if exact else candidates).append({
                 "eventId": safe["event_id"], "occurredAtMs": safe["occurred_at_ms"],
                 "subjectRef": safe["subject_ref"],
                 "speakerLabel": _public_show_speaker_label(safe["subject_ref"], safe["speaker_label"]),
@@ -3270,7 +3280,16 @@ def _lookup_original_show_quotes(
         shown = tuple(matches[:shown_remaining])
         shown_remaining -= len(shown)
         queries.append({"literal": literal, "match_count": len(matches),
-                        "shown_match_count": len(shown), "matches": shown})
+                        "shown_match_count": len(shown), "matches": shown,
+                        "format_candidate_count": len(candidates),
+                        "format_candidates": candidates})
+    # All exact results own the existing display allowance first. Formatting
+    # candidates use the remainder, so an earlier candidate cannot hide a later
+    # exact result. Counts cover all checked rows even when display is bounded.
+    for query in queries:
+        shown = tuple(query["format_candidates"][:shown_remaining])
+        shown_remaining -= len(shown)
+        query.update(format_candidates=shown, shown_format_candidate_count=len(shown))
     result["queries"] = tuple(queries)
     return result
 
@@ -3289,6 +3308,7 @@ def _original_quote_lookup_lines(result: Mapping[str, Any]) -> list[str]:
         f"eligibleOriginalRowsChecked={result['eligible_rows_checked']}; "
         f"sourceRowsRead={result['source_rows_read']}; skippedRows={result['skipped_rows']}.",
         "- Match method: case-, punctuation-, and whitespace-preserving contiguous literal text in currently eligible public TikTok originals. No author-absence search, Discord search, whole-platform search, or phrase-origin determination was performed.",
+        "- Separate formatting comparison: candidates contain the same contiguous word sequence after ignoring case, punctuation and whitespace. Candidates are original records, but not verbatim matches or proof of equivalent meaning, claimed speaker, playback timing or event chronology. Compare their actual text and speaker. A literal miss does not mean the comment is absent; report any candidate and the wording difference. No candidate does not rule out other wording or a transcription error.",
     ]
     if result.get("unsearched_literal_count"):
         lines.append(
@@ -3309,6 +3329,18 @@ def _original_quote_lookup_lines(result: Mapping[str, Any]) -> list[str]:
         for message in query["matches"]:
             lines.append(
                 f"  Original event={json.dumps(message['eventId'])}; "
+                f"timestampUTC={_utc_iso_from_ms(message['occurredAtMs'])}; "
+                f"speaker={json.dumps(message['speakerLabel'], ensure_ascii=False)}; "
+                f"text={json.dumps(message['text'], ensure_ascii=False)}"
+            )
+        lines.append(
+            f"  Formatting comparison: formatCandidateRows={query.get('format_candidate_count', 0)}; "
+            f"shownCandidates={query.get('shown_format_candidate_count', 0)}. "
+            "These counts use the same checked window and coverage; they do not change the literal match count."
+        )
+        for message in query.get("format_candidates", ()):
+            lines.append(
+                f"  Candidate original event={json.dumps(message['eventId'])}; "
                 f"timestampUTC={_utc_iso_from_ms(message['occurredAtMs'])}; "
                 f"speaker={json.dumps(message['speakerLabel'], ensure_ascii=False)}; "
                 f"text={json.dumps(message['text'], ensure_ascii=False)}"
@@ -3626,7 +3658,7 @@ def build_tiktok_show_evidence_context(
         if lookup is not None:
             lines.extend(_original_quote_lookup_lines(lookup))
             for query in lookup["queries"]:
-                for message in query["matches"]:
+                for message in (*query["matches"], *query.get("format_candidates", ())):
                     remember_authored_excerpt(
                         ledger, message, surface="tiktok", speaker_label=message["speakerLabel"],
                         preserve_original_text=True,
@@ -4028,13 +4060,24 @@ def build_tiktok_show_evidence_context(
         selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
     logging.info(
         "show_episode_evidence_context_loaded shows=%s subject_match=%s "
-        "query_terms=%s chars=%s show_keys=%s show_dates=%s",
+        "query_terms=%s chars=%s show_keys=%s show_dates=%s quote_lookups=%s",
         len(selected),
         int(any(item[3] for item in selected)),
         len(query_terms),
         sum(len(line) + 1 for line in lines),
         json.dumps(tuple(str(item[2].get("showKey") or "") for item in selected)),
         json.dumps(tuple(str(item[2].get("showDate") or "") for item in selected)),
+        json.dumps([
+            {"show_key": key, "coverage": lookup["status"],
+             "eligible_rows": lookup["eligible_rows_checked"],
+             "queries": [
+                 {"index": index + 1, "literal_matches": query["match_count"],
+                  "format_candidates": query.get("format_candidate_count", 0),
+                  "shown_exact_ids": [row["eventId"] for row in query["matches"]],
+                  "shown_candidate_ids": [row["eventId"] for row in query.get("format_candidates", ())]}
+                 for index, query in enumerate(lookup["queries"])
+             ]} for key, lookup in original_lookups.items()
+        ]),
     )
     return "\n".join(lines)
 
