@@ -2582,7 +2582,9 @@ def resolve_tiktok_show_analysis_request(
             # block. It is not a prior turn and cannot establish its own scope.
             skipped_current_copy = True
             continue
-        if is_tiktok_show_analysis_query(prior) or is_live_show_reaction_query(prior):
+        if is_tiktok_show_analysis_query(prior) or is_live_show_reaction_query(
+            prior, check_show_date=False,
+        ):
             chain = "\n".join(reversed(followup_chain))
             request = f"{prior}\n{chain}\nCurrent follow-up: {current}" if chain else (
                 f"{prior}\nCurrent follow-up: {current}"
@@ -3588,17 +3590,18 @@ def build_tiktok_show_evidence_context_for_turn(
             tiktok_show_evidence_query, include_current_relative=False,
         )
     )
-    selected_show_date = re.search(
+    selected_show_dates = tuple(dict.fromkeys(re.findall(
         r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b",
         website_read_model_context or "",
-    )
+    )))
     if (
-        selected_show_date
+        selected_show_dates
         and not request_owns_show_date
-        and selected_show_date.group(1) not in tiktok_show_evidence_query
     ):
+        # The website adapter may have selected a comparison. Pass its whole
+        # date scope to the ledger instead of narrowing it to the first show.
         tiktok_show_evidence_query = (
-            f"{tiktok_show_evidence_query} {selected_show_date.group(1)}"
+            f"{tiktok_show_evidence_query} {' '.join(selected_show_dates)}"
         ).strip()
     selection_query = tiktok_show_evidence_query
     candidate_context = False
@@ -3607,30 +3610,40 @@ def build_tiktok_show_evidence_context_for_turn(
         and conversation_context_result is not None
         and conversation_context_result.thread_focus_mode
         in {"continue_or_answer", "resume_thread", "exact_discord_reply"}
-        and conversation_context_result.referent_status == "not_requested"
+        and conversation_context_result.referent_status in {"not_requested", "resolved"}
         and int(subject_user_id or 0) > 0
         and conversation_basis.current_user_id == int(subject_user_id)
         and conversation_basis.guild_id == int(guild_id)
-        and not selected_show_date
         and not finalized_show_packet_owner_requested(
             user_text, "Durable BARCODE Radio show episode memory:"
         )
         and not is_live_show_reaction_query(user_text)
         and not _current_queue_state_query(user_text)
     ):
-        # Context presence does not establish topical continuation. Supply one
-        # prior human request's show as labeled background evidence for normal
-        # generation to assess, without changing current response ownership.
-        # Model responses and their invented claims are never retrieval cues.
+        # Reuse Context's selected human referent when one is resolved. With
+        # no referent request, retain the existing labeled background source.
+        # Intersect with human evidence so model replies cannot select shows.
+        source_items = conversation_basis.evidence_items
+        if conversation_context_result.referent_status == "resolved":
+            selected_row_ids = set(
+                conversation_context_result.referent_selected_row_ids
+            )
+            source_items = tuple(
+                item for item in source_items
+                if item.source_id in selected_row_ids
+            )
         for item in sorted(
-            conversation_basis.evidence_items,
+            source_items,
             key=lambda item: item.source_id,
             reverse=True,
         ):
             if (
                 item.speaker_user_id == int(subject_user_id)
-                and finalized_show_packet_owner_requested(
-                    item.text, "Durable BARCODE Radio show episode memory:"
+                and (
+                    finalized_show_packet_owner_requested(
+                        item.text, "Durable BARCODE Radio show episode memory:"
+                    )
+                    or is_live_show_reaction_query(item.text, check_show_date=False)
                 )
             ):
                 selection_query = tiktok_show_evidence_query + "\n" + item.text

@@ -6,6 +6,8 @@ SQLite evidence readers, batching decisions and source refresh remain real.
 Fixed supported replies prove delivery, not live model factuality.
 """
 
+import asyncio
+from contextlib import ExitStack
 import json
 import os
 import sqlite3
@@ -13,6 +15,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 from time import time
+from types import SimpleNamespace
 from unittest import mock
 
 import test_public_network_knowledge as network_fixture
@@ -20,6 +23,7 @@ import test_tiktok_show_evidence_ledger as show_fixture
 from bnl_journal_source_store import record_source_event
 from bnl_tiktok_live_context import LiveContextSnapshotWriter
 from tests import test_tiktok_live_context_bridge as live_fixture
+from test_conversation_batching import FakeChannel, FakeGuild
 
 
 bot = network_fixture.bnl01_bot
@@ -274,6 +278,146 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                          if isinstance(item, bot.FinalizedShowPromptSourceBasis)]
                 self.assertEqual(len(bases), 1)
                 self.assertEqual(set(bases[0].show_keys), {"show-attendance-1", "show-attendance-september"})
+
+    async def test_comparison_quote_followup_and_correction_keep_real_conversation_sources(self):
+        # One room and member retain the real captures between turns. Supplying
+        # selection_user_text directly would bypass the handoff being tested.
+        requests = (
+            COMPARE_REQUEST,
+            "Give me some actual quotes from those shows and who said them.",
+            REQUEST.replace("August 28, 2026", "September 4, 2026"),
+        )
+        answers = (
+            "Both shows had comments about their visuals.",
+            "The August comments mention green visuals; September's mention amber lanterns.",
+            "Test September mentioned amber lanterns on September 4.",
+        )
+        august_sources = {
+            event["event_id"]: (
+                event["raw_text"],
+                f'{event["private_display_name"]} (@{event["metadata"]["handle"]})',
+            )
+            for event in show_fixture.durable_events()
+        }
+        for packet_enabled in (False, True):
+            channel = FakeChannel(
+                8811 + len(self.runtime.channel_ids),
+                name="bnl-testing", guild=FakeGuild(self.runtime.guild_id),
+            )
+            self.runtime.channel_ids.add(channel.id)
+            self.addCleanup(
+                bot._recent_room_events.pop,
+                (self.runtime.guild_id, channel.id), None,
+            )
+            provider_answers = iter(answers)
+
+            async def provider_answer(*_args, **kwargs):
+                counter = kwargs.get("attempt_counter")
+                if counter is not None:
+                    counter.mark_started()
+                return next(provider_answers)
+
+            generation = mock.AsyncMock(side_effect=provider_answer)
+            guard = mock.AsyncMock(wraps=bot.apply_guarded_response_regeneration)
+            with self.subTest(packet_enabled=packet_enabled), ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {
+                    "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                    "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                    "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                    "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+                    "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": str(packet_enabled).lower(),
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": str(self.runtime.guild_id),
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": str(self.runtime.user_id),
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": str(channel.id),
+                }))
+                self.assertEqual(bot.ordinary_chat_configuration()["effective"], packet_enabled)
+                stack.enter_context(mock.patch.object(
+                    type(bot.client), "user", new_callable=mock.PropertyMock,
+                    return_value=SimpleNamespace(id=999, display_name="BNL-01"),
+                ))
+                for name, value in (
+                    ("resolve_channel_policy", "sealed_test"),
+                    ("get_guild_config", channel.id),
+                    ("is_privileged_member", False),
+                ):
+                    stack.enter_context(mock.patch.object(bot, name, return_value=value))
+                stack.enter_context(mock.patch.object(bot, "BNL_ACTIVE_BATCHING_ENABLED", True))
+                stack.enter_context(mock.patch.object(bot, "POST_GENERATION_CAPTURE_GRACE_SECONDS", 0))
+                stack.enter_context(mock.patch.object(bot, "get_gemini_response", new=generation))
+                stack.enter_context(mock.patch.object(bot, "apply_guarded_response_regeneration", new=guard))
+                for index, request in enumerate(requests):
+                    if index:
+                        await asyncio.sleep(bot.BATCH_REPLY_COOLDOWN_SECONDS + 0.05)
+                    # An unavailable website must not erase the already
+                    # captured human referent and finalized local sources.
+                    # With packet enabled this also exercises its real owner;
+                    # a present specialized website context keeps the existing
+                    # legacy route even when packet configuration is enabled.
+                    self.fetch.return_value = (
+                        {} if packet_enabled and index == 1 else self.read_model
+                    )
+                    message_id = channel.id * 10 + index
+                    bot.record_recent_room_event_from_message(
+                        guild_id=self.runtime.guild_id, channel_id=channel.id,
+                        author_id=self.runtime.user_id, author_display_name="Test Member",
+                        text=request, channel_policy="sealed_test",
+                        conversation_surface="free_speak_sealed_mirror",
+                        message_id=message_id, response_state="ignored",
+                    )
+                    bot.save_user_message(
+                        self.runtime.user_id, "Test Member", self.runtime.guild_id,
+                        request, channel_name=channel.name, channel_policy="sealed_test",
+                        channel_id=channel.id, message_id=message_id,
+                        route_mode="normal_chat", directed_to_bnl=False,
+                    )
+                    now = bot.datetime.now(bot.PACIFIC_TZ)
+                    bot._channel_buffers[channel.id].append(("Test Member", request, self.runtime.user_id))
+                    bot._channel_first_seen[channel.id] = now
+                    bot._channel_last_message_at[channel.id] = now
+                    await bot._flush_channel_buffer(channel)
+                    self.assertEqual(generation.await_count, index + 1)
+                    self.assertEqual(guard.await_count, index + 1)
+                    prompt = generation.await_args.args[0]
+                    bases = tuple(
+                        item for item in guard.await_args.kwargs["prompt_source_bases"]
+                        if isinstance(item, bot.FinalizedShowPromptSourceBasis)
+                    )
+                    self.assertEqual(len(bases), 1)
+                    expected_keys = {"show-attendance-september"}
+                    if index < 2:
+                        expected_keys.add("show-attendance-1")
+                    else:
+                        self.assertNotIn(AUGUST_COMMENT, prompt)
+                    self.assertIn(SEPTEMBER_COMMENT, prompt)
+                    self.assertEqual(set(bases[0].show_keys), expected_keys)
+                    self.assertTrue(any(
+                        excerpt.source_text == SEPTEMBER_COMMENT
+                        and excerpt.speaker_label == "Test September (@test.september)"
+                        for excerpt in bases[0].authored_excerpts
+                    ))
+                    if index < 2:
+                        august_excerpts = tuple(
+                            excerpt
+                            for excerpt in bases[0].authored_excerpts
+                            if excerpt.show_key == "show-attendance-1"
+                            and excerpt.event_id in august_sources
+                        )
+                        self.assertTrue(august_excerpts)
+                        for excerpt in august_excerpts:
+                            self.assertEqual(
+                                (excerpt.source_text, excerpt.speaker_label),
+                                august_sources[excerpt.event_id],
+                            )
+                            self.assertIn(excerpt.source_text, prompt)
+                    self.assertEqual(
+                        generation.await_args.kwargs["route"],
+                        bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE
+                        if packet_enabled and index == 1 else "get_gemini_response",
+                    )
+                # Model text is a transport fixture, not an output-wording rule.
+                self.assertEqual(channel.sent, list(answers))
 
     async def test_current_date_correction_wins_over_an_earlier_show_request(self):
         for request in (REQUEST, ISO_REQUEST):
