@@ -1,5 +1,54 @@
 # September 10 recovery completion checkpoint
 
+## Current continuation: original-record lookup
+
+PR525 is confirmed deployed at `1c422d727e8a496c505efadad5416e4c11ecf0c6`,
+with the bot online under PID 1598361. The 03:19–03:20 UTC verification turn
+retracted the unsupported attribution but again claimed zero author records
+and exact-quote absence across the finalized logs. Its source receipt showed
+one selected show, not a performed author or literal-record search. This
+affected verification capability remains open; retraction alone is insufficient.
+
+That turn used one successful physical provider request, with no retry or
+optional style rewrite shown. Logged handling to send was 51.314 seconds,
+including 30.105 seconds of provider generation. The application's usage-priced
+estimate was $0.01128750; its larger reservation was not spend. Website reads
+timed out during the interval, then recovered at 03:21:23 UTC. Subsequent show
+synchronization reported two unchanged finalized shows and zero projection
+errors. These observations support delivery and recovery, not exhaustive quote
+verification or a processing explanation for the earlier attribution.
+
+6 Bit authorized one bounded follow-up: give the existing finalized-show reader
+an actual literal lookup through its original public TikTok source owner.
+Current human double-quoted text supplies the lookup text. Existing show/date
+selection and pinned refresh scopes remain authoritative. Each selected show
+reports its UTC window, current eligible rows checked, exact matching original
+records and speakers, and complete, partial or unavailable coverage. A completed
+zero-match establishes absence only within those retained eligible windows.
+It does not establish author absence, whole-platform absence, or the origin of
+earlier BNL wording. A matching source supplies its actual author regardless of
+the author claimed in the request.
+
+Lookup results enter the existing rendered source context and authored-excerpt
+basis. Existing post-provider source refresh repeats that read; it invalidates
+an old result when original storage changes or a new matching record arrives,
+even before the cached show ledger synchronizes. Cached human projections that
+cannot be confirmed against current originals are omitted for that lookup turn;
+independent operational chronology and other valid shows retain their owners.
+Normal source records remain immutable. Regression tests use governed member
+deletion and source reinsertion in disposable databases; the runtime introduces no mutation,
+schema change, extra response judge, provider call, retry owner or gate change.
+
+After local review and the required gate, publish one PR. Following its merge
+and verified deployment, run the affected source-verification check once and
+collect its route receipt. Continue the remaining original acceptance below;
+do not restart the comparison trio, prior audits or group recruitment. Local
+fixed-provider tests establish source delivery and invalidation, not the live
+model's factual wording. Neither this candidate nor its deployment closes the
+remaining durable episode, screenshot, group or natural-publication cases.
+
+## Earlier checkpoint retained for continuity
+
 This continues the locked six-stage recovery plan and original eleven
 acceptance capabilities. It records the next actions after PR524 and the
 02:40–02:48 UTC live receipt; it does not replace that plan or reopen passed
