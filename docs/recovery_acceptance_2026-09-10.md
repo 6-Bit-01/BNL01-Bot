@@ -1,3 +1,94 @@
+# Public activation and integration health — September 10
+
+PR533 is merged and confirmed deployed at
+`37680139576c742dcedb96af2d3d0be089f6b0de`. The running process and subsequent
+Discord diagnostics both report ordinary-chat public scope effective with its
+prerequisites ready and no configuration conflicts. The earlier launch and
+recovery sections below are historical checkpoints; VPS activation is complete.
+Public activation still does not close the original live acceptance.
+
+The 18:38–18:41 UTC health capture confirms website heartbeat delivery, a running
+Relay task, retained conversation/tier/Moment/episode evidence, queue capability
+on both sides, and retained website dossiers and Broadcast Archive entries.
+Three prior Journal releases returned HTTP 200 at their normal scheduled times;
+the next release after public activation remains pending its natural window.
+The TikTok timer is enabled and active for September 12 at 01:50 UTC
+(September 11, 18:50 Pacific); the collector's successful inactive state outside
+its show window is expected. No show is started for this check.
+
+Two reliability findings remain distinct:
+
+- Website read-model refresh repeatedly times out between successful queue and
+  show-ledger syncs. Its existing three-second HTTP timeout and twenty-second
+  cache lifetime were not changed by PR533. These receipts establish intermittent
+  refresh failure, not its upstream cause or a loss of retained evidence.
+- At 18:40:43–18:40:44 UTC, Discord reports its heartbeat blocked for more than
+  thirty seconds. The loop traceback points through Journal control polling to
+  `_journal_control_flags_for_guild`, exclusion snapshot storage, and Journal
+  schema initialization. That operation and a concurrent show-ledger read both
+  raise `sqlite3.OperationalError: database is locked`. Discord resumes and a
+  website read succeeds shortly afterward. The trace does not identify the
+  connection holding the database lock.
+
+The bounded follow-up keeps Journal database waits off Discord's event loop
+at all seven async call sites. A real SQLite contention regression fails on the
+prior code and passes after offloading: a loop callback can release the test
+writer lock while Journal work waits, and confirmed controls/exclusions still
+persist. It covers scheduled and manual entry points and a control-plane outage.
+
+The health diagnostic also had a correlated receipt-count query that rescanned
+guild receipts once per ledger entry. Local fixtures on the existing schema
+showed roughly 16/64/144 million SQLite VM steps at 2,000/4,000/6,000 entries.
+Grouping successful receipt keys once reduced those counts to approximately
+110,000/240,000/350,000 with the same result. The query-only change preserves
+guild, outcome, duplicate and null/empty-ID semantics. A VM-step-budget regression
+covers the complete ledger diagnostic without changing data or schema. This
+establishes the query's cost; it does not establish the live lock holder.
+
+The repair preserves the existing exclusion snapshot, publication controls,
+schema migrations and release fence. Website/provider timeout changes, new
+memory owners and new public fixtures are outside this repair. Subsequent live
+evidence must distinguish heartbeat responsiveness, background sync completion
+and the still-open website refresh reliability issue.
+
+The shadow report's `blocked_live_authority_detected` label reflects its
+pre-cutover condition detecting the now-authorized ordinary-chat switch; it
+does not disable generation. Historical invariant/provider/coherence exceptions
+remain recorded and are not newly passed. The capture's current-runtime
+assessment count is zero, so it adds no post-launch conversational acceptance.
+
+Repair validation: all 24 focused Journal/diagnostic tests pass, and `make check`
+passes all 2,935 tests in 114.026 seconds. Independent review found no blocking
+issue. This is a tested candidate; it does not establish a VPS repair yet.
+
+After merging this repair, use the normal deployment:
+
+```bash
+cd /home/ubuntu/bnl01 || exit 1
+git pull --ff-only origin main || exit 1
+sudo systemctl restart bnl01
+systemctl is-active bnl01
+git rev-parse HEAD
+```
+
+For the focused live check, run `/bnl_memory_check` once as 6 Bit in
+`bnl-testing`, allow the next two normal queue/show sync cycles, then capture:
+
+```bash
+bnl_health_pid=$(systemctl show bnl01 -p MainPID --value)
+sudo journalctl -u bnl01 _PID="$bnl_health_pid" --utc --no-pager -o cat \
+  --since '-10 minutes' -n 80 \
+  --grep='heartbeat blocked|journal_memory_exclusion_snapshot_.*failed|bnl_read_model_(fetch_|cache_|invalid_shape)|queue_artist_memory_sync|barcode_show_episode_ledger_sync'
+```
+
+Evaluate the new process only: the diagnostic should finish without a Journal
+SQLite wait blocking the Discord heartbeat, and a successful website fetch
+should lead to a completed show-ledger sync. Retain exact exceptions if either
+fails. Unchanged-source sync is normal. A website timeout remains an open
+refresh issue, not evidence this repair changed provider policy. No forced
+Journal/Relay publication, show launch, public fixture or database lock is part
+of this live check. Keep the previously accepted recovery results closed.
+
 # Public shared-brain launch continuation — September 10
 
 6 Bit has now authorized launching the established shared-brain upgrade for

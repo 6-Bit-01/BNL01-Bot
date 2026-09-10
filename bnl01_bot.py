@@ -9414,7 +9414,8 @@ async def run_journal_automation_once(
             effective_flags = flags
             if effective_flags is None:
                 effective_flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=force)
-                effective_flags = _journal_control_flags_for_guild(
+                effective_flags = await asyncio.to_thread(
+                    _journal_control_flags_for_guild,
                     guild_id,
                     None,
                     effective_flags,
@@ -9514,7 +9515,11 @@ async def run_journal_automation_control_cycle(
     ):
         control = None
         control_error = control_error or "control_plane_response_invalid"
-    flags = _journal_control_flags_for_guild(guild_id, control, base_flags)
+    # This resolves and persists SQLite snapshots; lock waits must not block
+    # Discord's heartbeat or other event-loop work.
+    flags = await asyncio.to_thread(
+        _journal_control_flags_for_guild, guild_id, control, base_flags,
+    )
     if control is None:
         reason = "control_plane_unavailable:%s" % (control_error or "control_get_failed")
         # The control endpoint is useful for remote Run Now requests, but it
@@ -9626,7 +9631,9 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         if action == "status":
             flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
             control, control_error = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags_for_guild(guild_id, control, flags)
+            flags = await asyncio.to_thread(
+                _journal_control_flags_for_guild, guild_id, control, flags,
+            )
             status = await asyncio.to_thread(journal_automation_status, DB_FILE, guild_id)
             last_state = status.get("lastState") if isinstance(status.get("lastState"), dict) else {}
             await message.reply(
@@ -9643,7 +9650,9 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             cadence = "daily" if action == "run-daily" else "weekly"
             flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags_for_guild(guild_id, control, flags)
+            flags = await asyncio.to_thread(
+                _journal_control_flags_for_guild, guild_id, control, flags,
+            )
             results = await run_journal_automation_once(guild_id, cadence=cadence, force=True, flags=flags)
             for item in results:
                 await asyncio.to_thread(_journal_report_run_sync, item, guild_id=guild_id)
@@ -9677,7 +9686,9 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         if action == "create":
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags_for_guild(guild_id, control, {})
+            flags = await asyncio.to_thread(
+                _journal_control_flags_for_guild, guild_id, control, {},
+            )
             result = await asyncio.to_thread(
                 generate_and_store_journal_draft,
                 DB_FILE,
@@ -9695,7 +9706,9 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             entry_id = options.get("entry_id") or ""
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags_for_guild(guild_id, control, {})
+            flags = await asyncio.to_thread(
+                _journal_control_flags_for_guild, guild_id, control, {},
+            )
             result = await asyncio.to_thread(
                 regenerate_journal_draft,
                 DB_FILE,
@@ -9743,7 +9756,9 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
                 return True
             flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags_for_guild(guild_id, control, flags)
+            flags = await asyncio.to_thread(
+                _journal_control_flags_for_guild, guild_id, control, flags,
+            )
             result = await asyncio.to_thread(
                 release_prepared_journal_entry,
                 DB_FILE,
