@@ -1256,7 +1256,7 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 guild_id=77,
                 user_text="What recurring topics came up throughout the show?",
             )
-            self.assertIn("complete eligible TikTok chat ledger", broad)
+            self.assertIn("retained eligible TikTok chat", broad)
             self.assertIn('"green visuals": 3 messages / 3 participants', broad)
             self.assertIn("Alex (@alex.signal)", broad)
             self.assertIn("queue/wheel", broad)

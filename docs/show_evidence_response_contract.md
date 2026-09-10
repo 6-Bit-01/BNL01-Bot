@@ -112,6 +112,12 @@ Supplemental retransmission marking preserves a newly opened question window.
 
 ## Verification and limits
 
+The source block leads with its retrieval scope: aggregate totals and selected
+records. Its participant list and authored examples are partial, and the reader
+does not report an exhaustive author or exact-quote absence search. An omitted
+record may still exist in retained evidence. Prior BNL replies prove what BNL
+wrote, not audience authorship or the completion of a source search.
+
 Tests verify unchanged source/speaker pairs, relevant inherited context,
 natural response delivery without show-wording retries, and real SQLite
 consent/source changes across generation. Supported mocked responses test
@@ -177,3 +183,7 @@ retries cannot guarantee a response during provider failures.
 
 The correction does not deploy, restart services, alter production gates,
 change provider selection, add dependencies, or migrate the database.
+
+The [September 10 completion checkpoint](recovery_acceptance_2026-09-10.md)
+records retained live evidence, the bounded recovery-cost correction, and the
+remaining actions under the original acceptance plan.

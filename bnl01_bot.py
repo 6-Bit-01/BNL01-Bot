@@ -38130,6 +38130,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 len(collapsed_items),
                 f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f};indicator_active={int(typing_active)}",
             )
+            batch_ordinary_chat_generation_metadata: dict = {}
             batch_ordinary_chat_execution = (
                 await maybe_generate_ordinary_chat_single_packet(
                     channel=channel,
@@ -38163,6 +38164,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_ordinary_chat_basis
                         or batch_source_context_available
                     ),
+                    generation_metadata_out=batch_ordinary_chat_generation_metadata,
                 )
             )
             batch_single_packet_cutover = bool(
@@ -38188,7 +38190,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     guild_id=channel.guild.id,
                     route=generation_route,
                     source_context_available=batch_source_context_available,
-                    allow_style_rewrite=not initial_batch_generation_completed,
+                    allow_style_rewrite=bool(
+                        not initial_batch_generation_completed
+                        and not batch_ordinary_chat_generation_metadata.get(
+                            "provider_call_count", 0
+                        )
+                    ),
                     **({"image_inputs": batch_image_inputs} if batch_image_inputs else {}),
                 )
 
@@ -44515,6 +44522,7 @@ async def maybe_generate_ordinary_chat_single_packet(
     user_display_name: str,
     source_context_available: bool,
     prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
+    generation_metadata_out: dict | None = None,
 ) -> OrdinaryChatSinglePacketExecution | None:
     """Generate one natural response from the shared packet when available.
 
@@ -44611,6 +44619,16 @@ async def maybe_generate_ordinary_chat_single_packet(
         0,
         int(round((time.monotonic() - generation_started) * 1000)),
     )
+    if generation_metadata_out is not None:
+        # Returning None may mean either unused packet/preflight or a failed
+        # provider attempt. Keep that distinction local to this caller so normal
+        # answer recovery can skip optional decoration after work was attempted.
+        generation_metadata_out.update(
+            provider_call_count=provider_call_count,
+            generation_latency_ms=generation_latency_ms,
+            error_category=tracked_generation.error_category,
+            provider_error_code=tracked_generation.provider_error_code,
+        )
     try:
         decision = await asyncio.to_thread(
             _evaluate_ordinary_chat_single_packet_receipt,
@@ -47252,6 +47270,7 @@ async def on_message(message: discord.Message):
             show_state_route = "get_gemini_response"
             if show_state_ctx:
                 show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
+            ordinary_chat_generation_metadata: dict = {}
             ordinary_chat_execution = (
                 await maybe_generate_ordinary_chat_single_packet(
                     channel=message.channel,
@@ -47282,6 +47301,7 @@ async def on_message(message: discord.Message):
                     prompt_source_bases=tuple(
                         prompt_metadata.get("prompt_source_bases") or ()
                     ),
+                    generation_metadata_out=ordinary_chat_generation_metadata,
                 )
             )
             if ordinary_chat_execution is not None:
@@ -47300,6 +47320,9 @@ async def on_message(message: discord.Message):
                     message.guild.id,
                     route=show_state_route,
                     source_context_available=source_context_available,
+                    allow_style_rewrite=not ordinary_chat_generation_metadata.get(
+                        "provider_call_count", 0
+                    ),
                     **({"image_inputs": current_image_inputs} if current_image_inputs else {}),
                 )
             ordinary_chat_packet_controls_response = bool(
@@ -47785,6 +47808,7 @@ async def on_message(message: discord.Message):
         show_state_route = "get_gemini_response"
         if show_state_ctx:
             show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
+        ordinary_chat_generation_metadata: dict = {}
         ordinary_chat_execution = (
             await maybe_generate_ordinary_chat_single_packet(
                 channel=message.channel,
@@ -47815,6 +47839,7 @@ async def on_message(message: discord.Message):
                 prompt_source_bases=tuple(
                     prompt_metadata.get("prompt_source_bases") or ()
                 ),
+                generation_metadata_out=ordinary_chat_generation_metadata,
             )
         )
         if ordinary_chat_execution is not None:
@@ -47833,6 +47858,9 @@ async def on_message(message: discord.Message):
                 message.guild.id,
                 route=show_state_route,
                 source_context_available=source_context_available,
+                allow_style_rewrite=not ordinary_chat_generation_metadata.get(
+                    "provider_call_count", 0
+                ),
                 **({"image_inputs": current_image_inputs} if current_image_inputs else {}),
             )
         ordinary_chat_packet_controls_response = bool(
@@ -48260,6 +48288,7 @@ async def on_message(message: discord.Message):
         show_state_route = "get_gemini_response"
         if show_state_ctx:
             show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
+        ordinary_chat_generation_metadata: dict = {}
         ordinary_chat_execution = (
             await maybe_generate_ordinary_chat_single_packet(
                 channel=message.channel,
@@ -48290,6 +48319,7 @@ async def on_message(message: discord.Message):
                 prompt_source_bases=tuple(
                     prompt_metadata.get("prompt_source_bases") or ()
                 ),
+                generation_metadata_out=ordinary_chat_generation_metadata,
             )
         )
         if ordinary_chat_execution is not None:
@@ -48308,6 +48338,9 @@ async def on_message(message: discord.Message):
                 message.guild.id,
                 route=show_state_route,
                 source_context_available=source_context_available,
+                allow_style_rewrite=not ordinary_chat_generation_metadata.get(
+                    "provider_call_count", 0
+                ),
                 **({"image_inputs": current_image_inputs} if current_image_inputs else {}),
             )
         ordinary_chat_packet_controls_response = bool(
