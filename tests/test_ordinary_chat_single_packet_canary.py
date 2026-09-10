@@ -12,6 +12,7 @@ import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
 from bnl_shared_brain_synthesis import (
     ORDINARY_CHAT_AUTHORITY,
+    ORDINARY_CHAT_PUBLIC_ENABLED_ENV,
     ORDINARY_CHAT_ROUTE_FAMILY,
     ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV,
     audit_ordinary_chat_candidate_claims,
@@ -81,6 +82,7 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
             "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
             "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            ORDINARY_CHAT_PUBLIC_ENABLED_ENV: "false",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7",
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10",
@@ -618,9 +620,12 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         self.assertTrue(configured["effective"])
         self.assertEqual(
             configured["contract_version"],
-            "ordinary_chat_single_packet_v6",
+            "ordinary_chat_single_packet_v7",
         )
         self.assertEqual(configured["scope_mode"], "private_acceptance")
+        self.assertFalse(configured["public_configured_enabled"])
+        self.assertFalse(configured["public_effective"])
+        self.assertTrue(configured["private_scope_effective"])
         self.assertFalse(
             configured["scoped_expansion_configured_enabled"]
         )
@@ -874,6 +879,259 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 )
                 self.assertFalse(decision.eligible)
                 self.assertEqual(decision.reason, reason)
+
+    def _public_scope_decision(self, *, environ=None, **overrides):
+        return ordinary_chat_route_scope_decision(
+            **{
+                "guild_id": 1,
+                "user_id": 77,
+                "channel_id": 99,
+                "route_mode": "normal_chat",
+                "channel_policy": "public_home",
+                "current_direct": True,
+                "user_text": "BNL, how is everyone doing?",
+                "environ": (
+                    {
+                        **self.flags,
+                        ORDINARY_CHAT_PUBLIC_ENABLED_ENV: "true",
+                    }
+                    if environ is None
+                    else environ
+                ),
+                **overrides,
+            }
+        )
+
+    def test_public_scope_admits_new_members_and_channels_with_public_policy(self):
+        public_flags = {
+            **self.flags,
+            ORDINARY_CHAT_PUBLIC_ENABLED_ENV: "true",
+        }
+        configured = ordinary_chat_configuration(public_flags)
+        self.assertTrue(configured["effective"])
+        self.assertTrue(configured["public_configured_enabled"])
+        self.assertTrue(configured["public_effective"])
+        self.assertTrue(configured["private_scope_effective"])
+        self.assertEqual(configured["scope_mode"], "public_channels")
+        self.assertEqual(
+            configured["public_gate_env"], ORDINARY_CHAT_PUBLIC_ENABLED_ENV
+        )
+        self.assertEqual(
+            configured["public_channel_policies"],
+            ("public_context", "public_home"),
+        )
+        self.assertNotEqual(
+            configured["scope_digest"],
+            ordinary_chat_configuration(self.flags)["scope_digest"],
+        )
+        for policy in ("public_home", "public_context"):
+            with self.subTest(policy=policy):
+                self.assertTrue(
+                    self._public_scope_decision(channel_policy=policy).eligible
+                )
+        self.assertFalse(self._public_scope_decision(environ=self.flags).eligible)
+        self.assertFalse(
+            self._public_scope_decision(
+                environ={
+                    **public_flags,
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "false",
+                }
+            ).eligible
+        )
+
+    def test_public_scope_keeps_existing_sealed_scope_and_expansion_rules(self):
+        self.assertTrue(
+            self._public_scope_decision(
+                user_id=7, channel_id=10, channel_policy="sealed_test"
+            ).eligible
+        )
+        for overrides in ({"user_id": 77}, {"channel_id": 99}):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(
+                    self._public_scope_decision(
+                        **{
+                            "user_id": 7,
+                            "channel_id": 10,
+                            "channel_policy": "sealed_test",
+                            **overrides,
+                        }
+                    ).eligible
+                )
+        expanded_flags = {
+            **self.flags,
+            ORDINARY_CHAT_PUBLIC_ENABLED_ENV: "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7,8",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10,11",
+        }
+        self.assertFalse(
+            self._public_scope_decision(
+                user_id=8, channel_id=11, channel_policy="sealed_test",
+                environ=expanded_flags,
+            ).eligible
+        )
+        self.assertTrue(
+            self._public_scope_decision(
+                user_id=8, channel_id=11, channel_policy="sealed_test",
+                environ={
+                    **expanded_flags,
+                    ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV: "true",
+                },
+            ).eligible
+        )
+
+    def test_public_scope_is_independent_of_unavailable_private_lists(self):
+        for users, channels, expansion in (
+            ("", "", "false"),
+            ("malformed", "also-malformed", "false"),
+            ("7,8", "10,11", "false"),
+            ("1,2,3,4,5,6,7,8,9", "10", "true"),
+            ("7", "10,11,12,13,14", "true"),
+        ):
+            with self.subTest(users=users, channels=channels):
+                flags = {
+                    **self.flags,
+                    ORDINARY_CHAT_PUBLIC_ENABLED_ENV: "true",
+                    ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV: expansion,
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": users,
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": channels,
+                }
+                config = ordinary_chat_configuration(flags)
+                self.assertTrue(config["public_effective"])
+                self.assertFalse(config["private_scope_effective"])
+                self.assertFalse(config["scoped_expansion_effective"])
+                self.assertTrue(self._public_scope_decision(environ=flags).eligible)
+                self.assertFalse(
+                    self._public_scope_decision(
+                        user_id=7, channel_id=10, channel_policy="sealed_test",
+                        environ=flags,
+                    ).eligible
+                )
+
+    def test_public_scope_preserves_route_policy_and_identity_exclusions(self):
+        cases = (
+            {"guild_id": 2},
+            {"guild_id": 0},
+            {"user_id": 0},
+            {"user_id": -1},
+            {"channel_id": 0},
+            {"channel_id": -1},
+            {"channel_policy": "private"},
+            {"channel_policy": "unclassified"},
+            {"channel_policy": "sealed_test"},
+            {"route_mode": "direct_payload_task"},
+            {"has_media": True},
+            {"specialized_owner_present": True},
+            {"current_direct": False},
+            {"user_text": "   "},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.assertFalse(self._public_scope_decision(**overrides).eligible)
+        # An old allowlisted identity does not make a private channel public.
+        self.assertFalse(
+            self._public_scope_decision(
+                user_id=7, channel_id=10, channel_policy="private"
+            ).eligible
+        )
+
+    def test_public_scope_still_requires_one_guild_and_existing_prerequisites(self):
+        public_flags = {
+            **self.flags,
+            ORDINARY_CHAT_PUBLIC_ENABLED_ENV: "true",
+        }
+        for guilds in ("", "malformed", "0,-1", "1,2"):
+            with self.subTest(guilds=guilds):
+                flags = {
+                    **public_flags,
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": guilds,
+                }
+                self.assertFalse(ordinary_chat_configuration(flags)["public_effective"])
+                self.assertFalse(self._public_scope_decision(environ=flags).eligible)
+        for flag, value in (
+            ("BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED", "true"),
+            ("BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED", "true"),
+            ("BNL_MEMORY_GOVERNANCE_LIVE_ENABLED", "true"),
+            ("BNL_RELATIONSHIP_V2_LIVE_ENABLED", "true"),
+            ("BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED", "true"),
+            ("BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED", "false"),
+            ("BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED", "false"),
+        ):
+            with self.subTest(flag=flag):
+                flags = {**public_flags, flag: value}
+                self.assertFalse(ordinary_chat_configuration(flags)["public_effective"])
+                self.assertFalse(self._public_scope_decision(environ=flags).eligible)
+
+    def test_public_basis_revalidates_and_obeys_scope_withdrawal(self):
+        flags = {**self.flags, ORDINARY_CHAT_PUBLIC_ENABLED_ENV: "true"}
+        text = "BNL, how is everyone doing?"
+        request = IntelligencePacketRequest(
+            guild_id=1,
+            subject_user_id=77,
+            subject_display_name="New Member",
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_id=99,
+            channel_name="public-room",
+            channel_policy="public_home",
+            user_text=text,
+            participant_user_ids=(77,),
+            direct_state="direct",
+            now="2026-08-10T12:01:00+00:00",
+        )
+        packet = build_packet(self.conn, request, environ=flags)
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            conversation_surface="public_home",
+            current_speaker_user_ids=(77,),
+            participant_user_ids=(77,),
+            speaker_labels=("New Member",),
+            current_text=text,
+            packet_revalidation_status=packet.diagnostics.revalidation_status,
+        )
+        basis = build_ordinary_chat_basis(
+            guild_id=1,
+            user_id=77,
+            channel_id=99,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            current_direct=True,
+            user_text=text,
+            packet=packet,
+            assessment=assessment,
+            environ=flags,
+        )
+        self.assertIsNotNone(basis)
+        self.assertEqual(
+            revalidate_basis(self.conn, basis, environ=flags),
+            (True, "passed"),
+        )
+        for override in (
+            {ORDINARY_CHAT_PUBLIC_ENABLED_ENV: "false"},
+            {"BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "false"},
+            {"BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "2"},
+            {"BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "true"},
+        ):
+            with self.subTest(override=override):
+                self.assertEqual(
+                    revalidate_basis(self.conn, basis, environ={**flags, **override}),
+                    (False, "scope_or_basis_changed"),
+                )
+        for policy in ("private", "sealed_test"):
+            with self.subTest(policy=policy):
+                changed = replace(
+                    basis,
+                    channel_policy=policy,
+                    packet=replace(
+                        packet, request=replace(request, channel_policy=policy)
+                    ),
+                    assessment=replace(assessment, channel_policy=policy),
+                )
+                self.assertEqual(
+                    revalidate_basis(self.conn, changed, environ=flags),
+                    (False, "scope_or_basis_changed"),
+                )
 
     def test_publication_task_owns_topic_overlap_but_not_queue_task(self):
         journal_topic = build_situation_frame_v1(

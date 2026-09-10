@@ -80,9 +80,12 @@ PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
 )
 ORDINARY_CHAT_CAPABILITY_NAME = "ordinary_chat_single_packet_canary"
 ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION = (
-    "ordinary_chat_single_packet_v6"
+    "ordinary_chat_single_packet_v7"
 )
 ORDINARY_CHAT_ENABLED_ENV = "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED"
+ORDINARY_CHAT_PUBLIC_ENABLED_ENV = (
+    "BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED"
+)
 ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV = (
     "BNL_ORDINARY_CHAT_SINGLE_PACKET_SCOPED_EXPANSION_ENABLED"
 )
@@ -1755,9 +1758,12 @@ def configuration(
 def _ordinary_chat_configuration_details(
     environ: Mapping[str, str],
 ) -> dict[str, Any]:
-    """Resolve private or explicitly expanded ordinary-chat authority."""
+    """Resolve public authority and the independent bounded test scope."""
 
     requested = _flag(environ.get(ORDINARY_CHAT_ENABLED_ENV, ""))
+    public_requested = _flag(
+        environ.get(ORDINARY_CHAT_PUBLIC_ENABLED_ENV, "")
+    )
     scoped_expansion_requested = _flag(
         environ.get(ORDINARY_CHAT_SCOPED_EXPANSION_ENABLED_ENV, "")
     )
@@ -1783,10 +1789,20 @@ def _ordinary_chat_configuration_details(
     expansion_authorized = bool(
         not expanded_scope_present or scoped_expansion_requested
     )
-    scope_mode = (
+    private_scope_mode = (
         "bounded_expansion"
         if expanded_scope_present
         else "private_acceptance"
+    )
+    scope_mode = "public_channels" if public_requested else private_scope_mode
+    private_scope_ready = bool(
+        scope_present
+        and scope_within_limits
+        and expansion_authorized
+    )
+    public_scope_ready = bool(
+        public_requested
+        and len(guilds) == _MAX_ORDINARY_CHAT_GUILDS
     )
     packet_ready = packet_shadow_enabled(environ)
     assessment_ready = assessment_shadow_enabled(environ)
@@ -1821,9 +1837,7 @@ def _ordinary_chat_configuration_details(
     )
     fully_scoped = bool(
         requested
-        and scope_present
-        and scope_within_limits
-        and expansion_authorized
+        and (private_scope_ready or public_scope_ready)
     )
     effective = bool(
         fully_scoped
@@ -1833,10 +1847,11 @@ def _ordinary_chat_configuration_details(
     )
     if not requested:
         reason = "disabled"
-    elif scope_present and not scope_within_limits:
+    elif not public_scope_ready and scope_present and not scope_within_limits:
         reason = "scope_limit_exceeded"
     elif (
-        scope_present
+        not public_scope_ready
+        and scope_present
         and expanded_scope_present
         and not scoped_expansion_requested
     ):
@@ -1855,9 +1870,15 @@ def _ordinary_chat_configuration_details(
         reason = ORDINARY_CHAT_AUTHORITY
     return {
         "requested": requested,
+        "public_requested": public_requested,
+        "public_effective": bool(effective and public_scope_ready),
+        "private_scope_ready": private_scope_ready,
+        "private_scope_effective": bool(effective and private_scope_ready),
+        "private_scope_mode": private_scope_mode,
         "scoped_expansion_requested": scoped_expansion_requested,
         "scoped_expansion_effective": bool(
             effective
+            and private_scope_ready
             and expanded_scope_present
             and scoped_expansion_requested
         ),
@@ -1882,8 +1903,9 @@ def _ordinary_chat_configuration_details(
         "comparison_authority_requested": comparison_authority_requested,
         "scope_digest": (
             _digest(
-                "ordinary_chat_single_packet_scope_v2",
+                "ordinary_chat_single_packet_scope_v3",
                 scope_mode,
+                public_requested,
                 scoped_expansion_requested,
                 tuple(sorted(guilds)),
                 tuple(sorted(users)),
@@ -1895,6 +1917,38 @@ def _ordinary_chat_configuration_details(
             else ""
         ),
     }
+
+
+def _ordinary_chat_source_scope_reason(
+    details: Mapping[str, Any],
+    *,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    channel_policy: str,
+) -> str:
+    """Use the same public/private source scope at selection and send time."""
+
+    if not details["effective"]:
+        return "configuration_%s" % details["reason"]
+    if int(guild_id or 0) not in details["guilds"]:
+        return "guild_not_allowlisted"
+    policy = str(channel_policy or "").strip().lower()
+    if details["public_effective"] and policy in _CANARY_CHANNEL_POLICIES:
+        if int(user_id or 0) <= 0:
+            return "invalid_user_id"
+        if int(channel_id or 0) <= 0:
+            return "invalid_channel_id"
+        return "eligible"
+    if not details["private_scope_ready"]:
+        return "private_scope_unavailable"
+    if int(user_id or 0) not in details["users"]:
+        return "user_not_allowlisted"
+    if int(channel_id or 0) not in details["channels"]:
+        return "channel_not_allowlisted"
+    if policy not in details["channel_policies"]:
+        return "channel_policy_not_supported"
+    return "eligible"
 
 
 def ordinary_chat_configuration(
@@ -1921,6 +1975,12 @@ def ordinary_chat_configuration(
         "capability": ORDINARY_CHAT_CAPABILITY_NAME,
         "contract_version": ORDINARY_CHAT_CAPABILITY_CONTRACT_VERSION,
         "configured_enabled": details["requested"],
+        "public_configured_enabled": details["public_requested"],
+        "public_effective": details["public_effective"],
+        "public_gate_env": ORDINARY_CHAT_PUBLIC_ENABLED_ENV,
+        "public_channel_policies": tuple(sorted(_CANARY_CHANNEL_POLICIES)),
+        "private_scope_effective": details["private_scope_effective"],
+        "private_scope_mode": details["private_scope_mode"],
         "scoped_expansion_configured_enabled": details[
             "scoped_expansion_requested"
         ],
@@ -1975,31 +2035,24 @@ def ordinary_chat_route_scope_decision(
 
     env = os.environ if environ is None else environ
     details = _ordinary_chat_configuration_details(env)
-    if not details["effective"]:
-        reason = "configuration_%s" % details["reason"]
-    elif int(guild_id or 0) not in details["guilds"]:
-        reason = "guild_not_allowlisted"
-    elif int(user_id or 0) not in details["users"]:
-        reason = "user_not_allowlisted"
-    elif int(channel_id or 0) not in details["channels"]:
-        reason = "channel_not_allowlisted"
-    elif str(route_mode or "") != _ROUTE_MODE:
-        reason = "route_mode_not_supported"
-    elif (
-        str(channel_policy or "").strip().lower()
-        not in details["channel_policies"]
-    ):
-        reason = "channel_policy_not_supported"
-    elif not current_direct:
-        reason = "not_direct"
-    elif not str(user_text or "").strip():
-        reason = "empty_turn"
-    elif has_media:
-        reason = "media_present"
-    elif specialized_owner_present:
-        reason = "specialized_owner_present"
-    else:
-        reason = "eligible"
+    reason = _ordinary_chat_source_scope_reason(
+        details,
+        guild_id=guild_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        channel_policy=channel_policy,
+    )
+    if reason == "eligible":
+        if str(route_mode or "") != _ROUTE_MODE:
+            reason = "route_mode_not_supported"
+        elif not current_direct:
+            reason = "not_direct"
+        elif not str(user_text or "").strip():
+            reason = "empty_turn"
+        elif has_media:
+            reason = "media_present"
+        elif specialized_owner_present:
+            reason = "specialized_owner_present"
     return RouteScopeDecision(
         eligible=reason == "eligible",
         reason=reason,
@@ -3976,7 +4029,13 @@ def revalidate_basis(
     env = os.environ if environ is None else environ
     if basis.ordinary_chat_single_packet:
         details = _ordinary_chat_configuration_details(env)
-        config = ordinary_chat_configuration(env)
+        scope_reason = _ordinary_chat_source_scope_reason(
+            details,
+            guild_id=basis.guild_id,
+            user_id=basis.user_id,
+            channel_id=basis.channel_id,
+            channel_policy=basis.channel_policy,
+        )
         fresh_rendered, fresh_lane_counts, fresh_item_count, fresh_digests = (
             _ordinary_packet_context(basis.packet)
         )
@@ -3985,14 +4044,10 @@ def revalidate_basis(
             fresh_digests,
         )
         if (
-            not config["effective"]
+            scope_reason != "eligible"
             or basis.authority_mode != ORDINARY_CHAT_AUTHORITY
             or basis.route_family != ORDINARY_CHAT_ROUTE_FAMILY
-            or basis.guild_id not in details["guilds"]
-            or basis.user_id not in details["users"]
-            or basis.channel_id not in details["channels"]
             or basis.route_mode != _ROUTE_MODE
-            or basis.channel_policy not in details["channel_policies"]
             or basis.packet.schema_version != PACKET_SCHEMA_VERSION
             or basis.packet.request.guild_id != basis.guild_id
             or basis.packet.request.channel_id != basis.channel_id

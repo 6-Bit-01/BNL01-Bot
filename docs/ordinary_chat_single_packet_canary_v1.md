@@ -1,18 +1,19 @@
-# Ordinary-Chat Single-Packet Canary and Scoped Expansion
+# Ordinary-Chat Single-Packet Canary, Scoped Expansion and Public Launch
 
 This capability cuts an explicitly bounded ordinary-chat scope over to one
 composed shared-brain prompt and one natural response obligation. It is disabled by
 default and is separate from the broad-profile comparison canary and
 public-home recall owner. The default remains the original private acceptance
-scope; contract v4 adds a second gate for controlled multi-user or
-multi-channel expansion. An eligible turn uses its packet-owned prompt when it
+scope; contract v4 added controlled multi-user or multi-channel expansion.
+Contract v7 adds an explicit public scope using the same ordinary-chat owner.
+An eligible turn uses its packet-owned prompt when it
 is available. If packet preparation is unavailable, the established
 context-rich generation path still answers the user. Neither path emits a
 deterministic blocker or canned fallback message.
 
 ## Default-off private acceptance scope
 
-All four values are required:
+For the existing private acceptance scope, all four values are required:
 
 - `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED=true`
 - `BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS=<one guild id>`
@@ -64,6 +65,42 @@ Content-free configuration diagnostics expose the private or
 `bounded_expansion` scope mode, allowlist counts, hard caps, expansion-gate
 state, expansion-effective state, and a scope digest that changes when either
 the allowlists or expansion authorization changes. IDs are not exposed.
+
+## Explicit public scope
+
+The September 10 public rollout additionally supports:
+
+- `BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED=true`
+- `BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED=true`
+- `BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS=<exactly one guild id>`
+
+For that guild, eligible `public_home` and `public_context` turns do not require
+the private canary's user/channel allowlists. The existing channel policy and
+reply decision still determine whether BNL may answer. Private, sealed,
+unknown and other channel policies do not gain public authority from this
+switch. Sealed acceptance can continue independently under its existing exact
+scope. Invalid or absent private canary lists neither authorize sealed turns
+nor disable an otherwise valid public scope.
+
+The primary switch, prerequisite shadows, source/privacy checks, directness,
+media and specialized-owner exclusions remain effective. Simultaneous
+multi-person batches retain their established generation path; this scope
+extension does not cut them over to packet generation. Existing source capture
+and Moment observation remain separate from selecting the response generator.
+
+Diagnostics expose `public_configured_enabled`, `public_effective`,
+`private_scope_effective`, `private_scope_mode`, `public_gate_env` and
+`public_channel_policies`. `scope_mode=public_channels` identifies a requested
+public rollout; use `public_effective` to verify activation. The general
+`effective` field means at least one public/private scope is effective under
+the common prerequisites and conflicts. The scope digest includes public
+authorization. Existing ordinary-chat authority and receipt ownership remain
+unchanged.
+
+See [the September 10 launch runbook](shared_brain_public_launch_2026-09-10.md)
+for the owner-authorized configuration, reversible activation and real-event
+acceptance procedure. Global Governance, Relationship V2 and Active Engagement
+V2 live flags conflict with this capability and are not launch prerequisites.
 
 ## One shared understanding and one response
 
@@ -184,16 +221,19 @@ Expansion-only rollback keeps the accepted private canary available:
 3. Restart the bot and confirm `scope_mode=private_acceptance`,
    `scoped_expansion_effective=false`, and ordinary-chat effective `on`.
 
-With the switch off, ordinary-chat prompt bytes and established generation
-behavior remain unchanged. Deployment and private live acceptance are separate
-operations: merge the complete PR sequence first, run the combined automated
-suite and 60-case acceptance matrix, then enable only the exact private scope
-for the approved provider-shadow and owner acceptance runs.
+Public-only rollback disables
+`BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED` while preserving the primary
+switch and any valid private canary lists. Restart and verify
+`public_effective=false`; `private_scope_effective` reports whether private
+acceptance remains active. For a runbook-managed activation, restore or remove
+only its recorded late drop-in as described in that runbook.
 
-After private acceptance passes, deploy contract v4 with the expansion gate
-absent or false and confirm the existing private scope remains effective. Then
-enable expansion for one additional approved user in the already accepted
-channel. Validate one ordinary multi-subject turn and one explicit specialized
-Broadcast-memory turn before adding another user or any channel. Expand one
-dimension at a time; do not enable the global Memory Governance, Relationship,
-or Active Engagement live gates during this rollout.
+With the primary switch off, ordinary-chat prompt bytes and established
+generation behavior remain unchanged. Historical private and bounded-expansion
+acceptance remains valid for the scopes it actually covered. The September 10
+owner decision authorizes the public launch and natural public evidence for
+the remaining original acceptance capabilities. Do not repeat the historical
+private matrix or require recruited test participants as a new public launch
+gate. Deployment, effective runtime configuration and live acceptance remain
+separate findings. Keep the existing global Governance, Relationship and Active
+Engagement live flags off during this rollout.

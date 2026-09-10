@@ -1,3 +1,81 @@
+# Public shared-brain launch continuation — September 10
+
+6 Bit has now authorized launching the established shared-brain upgrade for
+public use and completing the remaining Moment and other public-dependent
+acceptance through real community activity. This supersedes the earlier
+restriction against public rollout for the capabilities needed by this launch.
+It is not a declaration that the unfinished live acceptance already passes.
+
+The deployed baseline is PR532 merge
+`175e6f02b975e4c6b9e322000a058ff601505591`, tree
+`1a8f7807ba480c44be8982d0500a9e34551b58ed`.
+Its repaired reply-to-Moment formation passed in `bnl-testing`: source rows
+8430–8432 belong to finalized Moment
+`mom_2493da7796b6542f63133d5a3b8b0d8a`, with the retained reply edge and
+initial episode `mep_ae88606c845ef88270b7787158e73c2f`.
+Preserve that pass and the earlier screenshot, original-quote, immediate
+detour/resume and valid canary off/on/restart rollback evidence.
+
+The concrete public launch gap is in the existing ordinary shared-brain
+response owner's scope: it accepts at most eight named users and four named
+channels. Its public channel-policy support alone does not make it a community
+rollout. The launch change adds an explicit public mode to this same owner,
+scoped to one guild and the existing public-home/public-context classifications.
+Existing private/sealed scope remains independently restricted; the primary
+kill switch and source/privacy checks remain in place. No second response
+owner, memory collector, store, provider policy, or memory schema is introduced.
+
+Validation: all 70 focused ordinary-packet tests pass; the required repository
+check passes all 2,928 tests in 114.613 seconds. Independent review found no
+blocking issue. The tracked activation configuration is public-effective in
+the local configuration check; VPS activation remains an operator action.
+
+Use [the public launch runbook](shared_brain_public_launch_2026-09-10.md)
+for activation, effective-configuration verification and rollback. Keep the
+packet's six observation/assessment prerequisites enabled. Keep the alternate
+Memory Governance, Relationship v2 and Active Engagement live authorities off:
+those switches conflict with this packet path. Journal, Relay, TikTok, site,
+Ambient and queue retain their existing operating controls and schedules.
+
+Moments remain source-linked experiences involving people, subject, situation,
+place and continuation. Processing windows do not define the intended lifetime
+of an experience. Recognizing or recalling an earlier experience need not create
+a new Moment or add new people to old history. Relationship observation and
+legacy conversational memory continue through their current owners.
+This public scope change does not itself implement broader associative episode
+retrieval, tier progression, cross-surface formation or new Relationship v2
+tone control; those capabilities must be assessed honestly against existing
+implementation and actual observations.
+
+Remaining acceptance follows the original recovery plan, with 6 Bit's updated
+natural-event method:
+
+- Trace a genuine interaction through retained sources, people/context,
+  qualified or appropriately unqualified Moment, episode/link records, and
+  applicable delivery evidence.
+- Use later genuine continuation/recurrence, corrections and source changes to
+  assess the outstanding lifecycle and attribution behavior. Source retirement
+  and privacy obligations remain; no destructive test is implied.
+- Let genuine multi-person activity provide the remaining group evidence and
+  natural show/publication windows provide TikTok, Journal, Relay, site and
+  Ambient evidence. One event may support several capabilities without
+  collapsing their pass/fail records.
+- Keep previously passed work closed. Mark capabilities awaiting a real event
+  as pending, not failed. Public enablement is not owner acceptance of all eleven
+  original capabilities.
+
+The response-time issue remains open under existing Row9. For the September10
+15:42 exchange, the first Gemini request waited119.269 seconds before HTTP504
+and the recovery request waited112.074 seconds before HTTP200. Accounting
+completed within23 milliseconds after HTTP200; delivery followed1.833 seconds
+after HTTP200. The request path dominates this stall; its upstream cause is
+unproven. This launch does not change provider timeouts/retries/models or claim
+to repair that delay.
+
+The historical checkpoints below preserve the original investigation; their
+instructions to repeat now-passed scripted exchanges are superseded by the
+verified passes and natural-event continuation above.
+
 # September 10 recovery completion checkpoint
 
 ## Current continuation: preserve Moments across conversational response routes
