@@ -1,6 +1,67 @@
 # September 10 recovery completion checkpoint
 
-## Current continuation: original attachment format and size
+## Current continuation: screenshot queries reach the original reader
+
+PR528 is confirmed deployed at `a845555ae5b1c67b41f330e853d11b4fa5658b98`,
+with the bot online under PID 1600365 after the 05:37:17 UTC restart. The two
+current images loaded and the replies now distinguish the first screenshot's
+retraction from the second screenshot's September 4 recap. Image transport and
+current-image identification pass this live run:
+
+| Message ID | Attachment ID | Loaded at UTC | Effective MIME | Actual bytes |
+| --- | --- | --- | --- | ---: |
+| 1547481821238001696 | 1547481821141270600 | 05:40:27.535 | image/png | 78,175 |
+| 1547482094593122364 | 1547482094278545509 | 05:41:28.242 | image/png | 121,811 |
+
+Original-record verification remains open. The first answer again asserted
+CipherDot's absence without an author-absence search. The second identified the
+pictured September 4 claims, then said only August 28 records were loaded. The
+source receipts report one show but omit its identity; the model's statement
+alone cannot establish which source root was actually selected. The read-model
+timeouts recovered before the second answer and do not establish the cause.
+
+The code selects show evidence from typed text and media metadata before vision
+generation. Its post-provider refresh pins those selected roots. Dates and
+quoted text discovered in the image therefore cannot inform that source read.
+This continuation adds a transient query preparation step through the existing
+native image/provider owner, then uses the existing original reader before the
+final answer. It is not a response judge or a new source store.
+
+Current explicit human dates retain precedence. Otherwise dates visible in an
+image select that image's show scope; quoted text from the same image becomes
+literal search targets. An undated or unreadable image remains unresolved and
+cannot borrow another image's date or a background episode. The original reader
+continues to own matches, speakers, coverage, source revisions and eligibility.
+Image text never becomes an authored original excerpt. Conflicting unbound
+website historical sections are omitted while independent sections remain.
+
+Direct and batched requests share this preparation. The admitted image reference
+caches the transient query for coalescing/retry; source freshness replays those
+cues against pinned roots without another extraction or image download. Existing
+Gemini budget/accounting applies to the additional vision request. This is one
+additional logical provider call for an eligible current-image show/record
+request; ordinary image descriptions keep their existing path. Optional persona
+rewrites are disabled for these source-verification answers.
+
+Validation: the 15 new focused tests cover initial direct/batch delivery,
+per-image date/literal scope, current-human precedence, failed extraction,
+concurrent reuse, original-source withdrawal and relative-date rollover.
+Provider and image fixtures establish plumbing, not live vision accuracy.
+The final `make check` passed all 2,897 tests in 111.524 seconds; independent
+review found no remaining material issue. Existing image transport and typed
+original-lookup regressions also remain green.
+
+After merge and verified deployment, continue only the outstanding screenshot
+verification checks. Require a current-image query receipt and identified show
+selection, then evaluate the answer against the actual original-reader result.
+A screenshot without a resolvable date may identify the pictured claim and state
+the missing scope; it must not claim a completed original search. A dated recap
+must reach that date's records and distinguish literal matches, unsupported
+attributions and chronology claims. The already-passed image transport and
+original-record lookup checks remain carried passes. The finite recovery plan
+below is unchanged.
+
+## Earlier continuation: original attachment format and size
 
 PR527 is confirmed deployed at `e81166f622dcbd1786c48d0da630db81738e6b54`,
 with the bot online under PID 1600121 after the 05:06:05 UTC restart. Both

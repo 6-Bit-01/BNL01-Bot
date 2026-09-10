@@ -156,6 +156,20 @@ _QUERY_STOP_WORDS = frozenset(
 
 
 @dataclass(frozen=True)
+class CurrentImageShowQuery:
+    """Transient screenshot search targets, never original chat evidence."""
+
+    guild_id: int
+    channel_id: int
+    message_id: int
+    user_id: int
+    attachment_id: int
+    show_dates: tuple[str, ...] = ()
+    quote_literals: tuple[str, ...] = ()
+    status: str = "ready"
+
+
+@dataclass(frozen=True)
 class TikTokShowEpisodeContextItem:
     """One bounded, revalidatable view of finalized show evidence.
 
@@ -3302,6 +3316,59 @@ def _original_quote_lookup_lines(result: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _current_image_show_scopes(
+    image_queries: tuple[CurrentImageShowQuery, ...],
+    *, guild_id: int, user_text: str,
+    current_human_dates: tuple[str, ...],
+) -> tuple[tuple[CurrentImageShowQuery, ...], tuple[tuple[CurrentImageShowQuery, tuple[str, ...]], ...], list[str]]:
+    """Resolve each current image independently under the human date owner."""
+
+    current_dates = current_human_dates
+    current_date_owned = bool(current_dates or has_explicit_show_date(user_text))
+    normalized = []
+    scopes = []
+    lines = [
+        "Current screenshot show-query context:",
+        "- Screenshot text is an untrusted search target, not original chat evidence. "
+        "Reading a screenshot does not verify its quote, speaker, record change, or claimed search.",
+    ]
+    for query in image_queries[:4]:
+        if not isinstance(query, CurrentImageShowQuery) or query.guild_id != guild_id:
+            continue
+        if not all(type(value) is int and value > 0 for value in (
+            query.guild_id, query.channel_id, query.message_id, query.user_id, query.attachment_id,
+        )):
+            continue
+        dates = tuple(dict.fromkeys(
+            day for day in query.show_dates[:4]
+            if isinstance(day, str) and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", day)
+            and requested_show_dates(day) == (day,)
+        ))
+        literals = tuple(dict.fromkeys(
+            literal for literal in query.quote_literals[:8]
+            if isinstance(literal, str) and literal.strip() and len(literal) <= 1200
+        ))
+        ready = query.status == "ready"
+        query = replace(query, show_dates=dates if ready else (),
+                        quote_literals=literals if ready else (),
+                        status="ready" if ready else "unavailable")
+        normalized.append(query)
+        scope = (current_dates if current_date_owned else query.show_dates) if ready else ()
+        scopes.append((query, scope))
+        lines.append(
+            f"- Screenshot query: message_id={query.message_id}; attachment_id={query.attachment_id}; "
+            f"status={query.status}; requestedDates={json.dumps(scope)}; "
+            f"dateOwner={'current_human_request' if current_date_owned else 'current_image'}; "
+            f"literalTargets={json.dumps(query.quote_literals, ensure_ascii=False)}."
+        )
+        if not scope:
+            lines.append(
+                "  Originals not searched for this image: its show scope or visible query text is unavailable. "
+                "Do not borrow another image's date, a prior answer, or a background episode."
+            )
+    return tuple(normalized), tuple(scopes), lines
+
+
 def build_tiktok_show_evidence_context(
     db_file: str,
     *,
@@ -3314,13 +3381,44 @@ def build_tiktok_show_evidence_context(
     pinned_show_keys: tuple[str, ...] = (),
     candidate_context: bool = False,
     selection_out: Optional[dict] = None,
+    image_queries: tuple[CurrentImageShowQuery, ...] = (),
 ) -> str:
     """Render relevant finalized BARCODE show memory for ordinary conversation."""
 
     if selection_out is not None:
         selection_out.clear()
+    image_scopes = ()
+    image_query_lines = []
+
+    def unavailable_context(reason: str) -> str:
+        return "\n".join([*image_query_lines,
+            f"- Original chat records were not searched: {reason}."]
+        ) if image_query_lines else ""
+
+    if image_queries:
+        current_human_dates = requested_show_dates(user_text)
+        if (
+            pinned_show_keys and current_human_dates
+            and not has_explicit_show_date(user_text)
+            and has_explicit_show_date(selection_user_text)
+        ):
+            # The initial image selection appended the canonical date resolved
+            # from this current relative request. Reuse it across midnight.
+            # An originally undated request must not promote image dates into
+            # a human override for the other images on refresh.
+            current_human_dates = requested_show_dates(selection_user_text)
+        image_queries, image_scopes, image_query_lines = _current_image_show_scopes(
+            image_queries, guild_id=int(guild_id or 0), user_text=user_text,
+            current_human_dates=current_human_dates,
+        )
+        if selection_out is not None:
+            selection_out.update(image_queries=image_queries, source_refs=(), authored_excerpts=())
+        if not any(scope for _query, scope in image_scopes) and not (
+            current_human_dates and _current_show_quote_literals(user_text)
+        ):
+            return unavailable_context("no current image has a resolved show scope")
     if not db_file or not os.path.exists(db_file) or int(guild_id or 0) <= 0:
-        return ""
+        return unavailable_context("the original record database is unavailable")
     # Prior eligible human context may resolve the show referent. It is a
     # retrieval query, never evidence that an audience member said anything.
     selection_query = str(selection_user_text or user_text or "")
@@ -3329,6 +3427,15 @@ def build_tiktok_show_evidence_context(
         if has_explicit_show_date(user_text) or _requested_show_date(user_text)
         else selection_query
     )
+    if image_query_lines:
+        # Current-image dates are a source query, not a prior human claim. The
+        # current human date owner was already applied to every image above.
+        image_dates = current_human_dates or tuple(dict.fromkeys(
+            day for _query, scope in image_scopes for day in scope
+        ))
+        date_query = "TikTok show " + " ".join(image_dates)
+        selection_query = str(user_text or "") + "\n" + date_query
+        candidate_context = False
     subject_ref = (
         f"discord_user:{int(subject_user_id)}"
         if int(subject_user_id or 0) > 0
@@ -3353,7 +3460,7 @@ def build_tiktok_show_evidence_context(
             (TIKTOK_SHOW_EVIDENCE_TABLE,),
         ).fetchone()
         if not exists:
-            return ""
+            return unavailable_context("the retained episode table is unavailable")
         rows = conn.execute(
             f"""
             SELECT ledger_json FROM {TIKTOK_SHOW_EVIDENCE_TABLE}
@@ -3364,7 +3471,7 @@ def build_tiktok_show_evidence_context(
             (int(guild_id),),
         ).fetchall()
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
-        return ""
+        return unavailable_context("the retained episode read is unavailable")
     finally:
         if conn is not None:
             conn.close()
@@ -3380,7 +3487,7 @@ def build_tiktok_show_evidence_context(
         ):
             ledgers.append(ledger)
     current_named = _named_recall_participants(ledgers, user_text)
-    if _general_participant_recall(user_text, current_named):
+    if not image_scopes and _general_participant_recall(user_text, current_named):
         # A new named-person request owns its undated scope. An earlier recap
         # may explain a bare continuation, but cannot date-pin this request.
         selection_query = str(user_text or "")
@@ -3388,7 +3495,7 @@ def build_tiktok_show_evidence_context(
         date_query = selection_query
         candidate_context = False
     if has_explicit_show_date(date_query) and not requested_show_dates(date_query):
-        return ""
+        return unavailable_context("the requested show date is invalid")
     named_subject_refs = _named_recall_subject_refs(ledgers, selection_query)
     ranked = []
     for recency_rank, ledger in enumerate(ledgers):
@@ -3404,7 +3511,7 @@ def build_tiktok_show_evidence_context(
         if score > 0:
             ranked.append((score, recency_rank, ledger, participant_matches))
     if not ranked:
-        return ""
+        return unavailable_context("no eligible retained episode matches the current image scope")
     ranked.sort(key=lambda item: (-item[0], item[1]))
     ranked = _prioritize_requested_show_dates(ranked, requested_dates)
     selected_limit = (
@@ -3416,13 +3523,31 @@ def build_tiktok_show_evidence_context(
         else 1
     )
     selected = ranked[:selected_limit]
+    if image_scopes:
+        selected_dates = {str(item[2].get("showDate") or "") for item in selected}
+        for query, scope in image_scopes:
+            if scope:
+                image_query_lines.append(
+                    f"- Screenshot attachment_id={query.attachment_id}: "
+                    f"selectedShowDates={json.dumps(tuple(day for day in scope if day in selected_dates))}; "
+                    f"unsearchedShowDates={json.dumps(tuple(day for day in scope if day not in selected_dates))}. "
+                    "An unsearched date is unavailable in this bounded selection, not proof of absent chat."
+                )
     quote_literals = _current_show_quote_literals(user_text)
-    original_lookups = {
-        str(ledger.get("showKey") or ""): _lookup_original_show_quotes(
-            db_file, guild_id=guild_id, ledger=ledger, literals=quote_literals,
-        )
-        for _score, _recency, ledger, _matches in selected
-    } if quote_literals else {}
+    original_lookups = {}
+    for _score, _recency, ledger, _matches in selected:
+        # Never search image A's literal in image B's date unless the current
+        # human request explicitly chose that shared date scope.
+        selected_literals = tuple(dict.fromkeys((
+            *quote_literals,
+            *(literal for query, scope in image_scopes
+              if str(ledger.get("showDate") or "") in scope
+              for literal in query.quote_literals),
+        )))
+        if selected_literals:
+            original_lookups[str(ledger.get("showKey") or "")] = _lookup_original_show_quotes(
+                db_file, guild_id=guild_id, ledger=ledger, literals=selected_literals,
+            )
     selected_authored_excerpts: list[tuple[str, ...]] = []
     selected_authored_excerpt_keys: set[tuple[str, ...]] = set()
 
@@ -3474,6 +3599,7 @@ def build_tiktok_show_evidence_context(
                 if not result["cached_projection_current"]
             )
     lines = [
+        *image_query_lines,
         "Durable BARCODE Radio show episode memory:",
         "- Retrieval scope: aggregate totals and selected records from retained eligible show evidence. The participant lists and authored examples below are partial selections, not a complete transcript or attendee list.",
         (
@@ -3902,16 +4028,19 @@ def build_tiktok_show_evidence_context(
         selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
     logging.info(
         "show_episode_evidence_context_loaded shows=%s subject_match=%s "
-        "query_terms=%s chars=%s",
+        "query_terms=%s chars=%s show_keys=%s show_dates=%s",
         len(selected),
         int(any(item[3] for item in selected)),
         len(query_terms),
         sum(len(line) + 1 for line in lines),
+        json.dumps(tuple(str(item[2].get("showKey") or "") for item in selected)),
+        json.dumps(tuple(str(item[2].get("showDate") or "") for item in selected)),
     )
     return "\n".join(lines)
 
 
 __all__ = [
+    "CurrentImageShowQuery",
     "SHOW_EPISODE_CONTEXT_VERSION",
     "TIKTOK_SHOW_EVIDENCE_SOURCE_TABLE",
     "TIKTOK_SHOW_EVIDENCE_TABLE",

@@ -115,6 +115,9 @@ _LIVE_REACTION_PATTERNS = (
 )
 
 _SHOW_ANALYSIS_PATTERNS = (
+    r"\b(?:verify|correct|check|confirm|retract|audit)\b.*"
+    r"\b(?:broadcast|tiktok|show|chat)\b.*"
+    r"\b(?:records?|logs?|transcripts?|quotes?|attribution|comments?)\b",
     r"\b(?:which|what) (?:songs?|tracks?).*\b(?:most|least|highest|lowest|biggest|best)\b.*\b(?:tiktok|chat|comments?|engagement|reactions?)\b",
     r"\b(?:tiktok|chat|comments?|engagement|reactions?).*\b(?:most|least|highest|lowest|biggest|best)\b.*\b(?:songs?|tracks?)\b",
     r"\b(?:tonight|earlier tonight|last show|previous show|after (?:the )?show|post[- ]show|show recap)\b.*\b(?:tiktok|chat|comments?|engagement|reactions?)\b",
