@@ -1,6 +1,51 @@
 # September 10 recovery completion checkpoint
 
-## Current continuation: WebP screenshot delivery
+## Current continuation: original attachment format and size
+
+PR527 is confirmed deployed at `e81166f622dcbd1786c48d0da630db81738e6b54`,
+with the bot online under PID 1600121 after the 05:06:05 UTC restart. Both
+screenshot inputs reached the loader, but their receipts at 05:06:56 and
+05:07:50 report `mime_type=image/webp status=invalid_image_data`. Neither
+current screenshot supplied pixels to the provider; media-context flags alone
+did not establish image delivery. The earlier WebP fixture proved delivery of
+actual WebP bytes, not the format returned for these original attachments.
+
+A subsequent read-only check used the installed Discord SDK's same
+`Attachment.read(use_cached=False)` method on the two exact attachments:
+
+| Attachment ID | Declared MIME | Declared bytes | Downloaded signature | Downloaded bytes |
+| --- | --- | ---: | --- | ---: |
+| 1547473357744640080 | image/webp | 53,526 | PNG | 83,413 |
+| 1547473631687479336 | image/webp | 92,426 | PNG | 131,797 |
+
+The original downloads differ from the attachment metadata in both format
+and size. The loader required the declared format's signature and separately
+limited the returned bytes to the declared size. Fixing only the signature
+would therefore leave both originals rejected by the size check.
+
+This continuation recognizes the existing supported PNG/JPEG/WebP signatures
+from the downloaded bytes and supplies that MIME to the existing native image
+part. It checks actual bytes against the fixed per-image and cumulative limits,
+without using the reported attachment size as an exact original-file ceiling.
+Conservative metadata preflight, scope, count, deadline, read-once ownership,
+and the existing provider path remain in place. The existing loading receipt
+includes declared and effective MIME plus declared and actual byte counts.
+No URLs, file contents, or credentials are logged.
+
+Regression coverage includes distinct PNG originals under smaller WebP
+metadata through actual ingress and provider composition, followed by a failed
+current read. Fixed actual-byte limits and rejection of unsupported payloads
+remain covered. Fixture replies establish transport and current-image identity;
+they do not establish live interpretation or original-chat verification.
+
+After merge and verified deployment, repeat only the same two screenshot
+checks. Require `status=loaded` and an effective MIME matching the downloaded
+bytes (`image/png` for the originals above), then assess whether the answers
+distinguish the first screenshot's retraction
+from the second screenshot's different recap. The original-record lookup pass
+and remaining finite acceptance below are unchanged.
+
+## Earlier continuation: WebP screenshot delivery
 
 PR526 is confirmed deployed at `8ec1000e550f23f9ff30b1cdd5f6056fc3afe2cf`,
 with the bot online under PID 1599742. The original-record diagnostic completed

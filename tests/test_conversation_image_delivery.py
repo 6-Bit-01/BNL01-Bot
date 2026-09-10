@@ -28,6 +28,8 @@ PNG = base64.b64decode(
 # can name these image.png while correctly declaring their image/webp MIME.
 WEBP_FIRST = base64.b64decode("UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAdQmVJUq/+BiOh/AAA=")
 WEBP_SECOND = base64.b64decode("UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAdQj0KVp/+BiOh/AAA=")
+PNG_FIRST = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+PNG_SECOND = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC")
 ANSWER = "The supplied screenshot is available for this conversation."
 
 
@@ -191,18 +193,30 @@ class ConversationImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
         message.attachments[0].read.assert_awaited_once()
 
     async def test_sequential_png_named_webp_screenshots_deliver_only_current_pixels(self):
+        await self.check_sequential_originals(
+            WEBP_FIRST, WEBP_SECOND, expected_mime="image/webp",
+        )
+
+    async def test_webp_metadata_with_larger_png_originals_delivers_current_png_pixels(self):
+        # Reproduce Discord's observed metadata/original-file mismatch without
+        # using real screenshot contents: both PNGs exceed the declared size.
+        await self.check_sequential_originals(
+            PNG_FIRST, PNG_SECOND, expected_mime="image/png", declared_size=32,
+        )
+
+    async def check_sequential_originals(self, first, second, *, expected_mime, declared_size=None):
         # Exercise the real Discord ingress, deferred batch, and native Gemini
         # parts together. A familiar filename/author must not replace the
         # current attachment's content with the previous screenshot's bytes.
         messages = []
         answers = ("First image fixture.", "Second image fixture.", "Current image unavailable.")
         self.provider.side_effect = [provider_response(answer) for answer in answers]
-        for index, payload in enumerate((WEBP_FIRST, WEBP_SECOND, WEBP_SECOND)):
+        for index, payload in enumerate((first, second, second)):
             message = self.message(attachment_id=7131 + index)
             attachment = message.attachments[0]
             attachment.filename = "image.png"
             attachment.content_type = "image/webp"
-            attachment.size = len(payload)
+            attachment.size = len(payload) if declared_size is None else declared_size
             attachment.read.return_value = payload
             if index == 2:
                 attachment.read.side_effect = OSError("fixture attachment unavailable")
@@ -220,7 +234,7 @@ class ConversationImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.provider.call_count, index + 1)
             self.assertEqual(self.channel.sent, list(answers[:index + 1]))
             text, images = self.provider_parts()
-            expected_images = [] if index == 2 else [("image/webp", payload)]
+            expected_images = [] if index == 2 else [(expected_mime, payload)]
             self.assertEqual([(part.mime_type, part.data) for part in images], expected_images)
             attachment.read.assert_awaited_once_with(use_cached=False)
             origins = [line for line in text.splitlines() if "Current image attachment:" in line]

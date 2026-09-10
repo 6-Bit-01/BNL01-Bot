@@ -10,8 +10,16 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 import bnl01_bot as bot
 
-PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
+# Valid, small images generated once; tests require no decoder dependency.
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
 WEBP = base64.b64decode("UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAdQmVJUq/+BiOh/AAA=")
+JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwg"
+    "JC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIy"
+    "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QA"
+    "FQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABgf/"
+    "xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCLAGVxf//Z"
+)
 
 
 def image_message(user_id=101, message_id=201, attachment_id=301, **overrides):
@@ -71,9 +79,38 @@ class ConversationImageInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("status=loaded", "\n".join(logs.output))
         message.attachments[0].read.assert_awaited_once_with(use_cached=False)
 
-    async def test_webp_mime_does_not_admit_other_riff_or_mismatched_image_bytes(self):
+    async def test_supported_original_format_and_size_override_declared_metadata(self):
+        for declared, actual, data in (
+            ("image/webp", "image/png", PNG),
+            ("image/png", "image/png", PNG),
+            ("image/webp", "image/jpeg", JPEG),
+            ("image/png", "image/webp", WEBP),
+        ):
+            with self.subTest(declared=declared, actual=actual):
+                message = image_message(
+                    filename="image.png", content_type=declared, size=16,
+                    read=mock.AsyncMock(return_value=data),
+                )
+                inputs = bot.capture_message_image_inputs(message)
+                self.assertGreater(len(data), inputs[0].size)
+                message.attachments[0].read.assert_not_awaited()
+                with self.assertLogs(level="INFO") as logs:
+                    loaded = await bot.load_conversation_image_inputs(inputs, guild_id=1, channel_id=2)
+                request = bot.compose_conversation_image_request("Read the current screenshot.", loaded)
+                self.assertEqual([(part.mime_type, part.data) for part in request.images], [(actual, data)])
+                receipt = "\n".join(logs.output)
+                self.assertIn(f"declared_mime_type={declared}", receipt)
+                self.assertIn(f" mime_type={actual}", receipt)
+                self.assertIn("declared_size=16", receipt)
+                self.assertIn(f"actual_size={len(data)}", receipt)
+                self.assertIn("status=loaded", receipt)
+                self.assertNotIn(message.attachments[0].url, receipt)
+                message.attachments[0].read.assert_awaited_once_with(use_cached=False)
+
+    async def test_webp_metadata_does_not_admit_unknown_html_or_other_riff_bytes(self):
         for data in (
-            b"RIFF", b"RIFF\x04\x00\x00\x00WEBP", PNG,
+            b"RIFF", b"RIFF\x04\x00\x00\x00WEBP", b"unknown image data",
+            b"<!doctype html><html>Unavailable</html>", b"GIF89a" + b"\0" * 20,
             WEBP[:8] + b"WAVE" + WEBP[12:],
             WEBP[:12] + b"JUNK" + WEBP[16:],
         ):
@@ -90,6 +127,39 @@ class ConversationImageInputTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(request, str)
                 self.assertIn("Pixels unavailable", request)
                 self.assertFalse(loaded[0].data)
+
+    async def test_understated_metadata_cannot_exceed_actual_per_image_limit(self):
+        message = image_message(
+            content_type="image/webp", size=16,
+            read=mock.AsyncMock(return_value=PNG),
+        )
+        inputs = bot.capture_message_image_inputs(message)
+        with mock.patch.object(bot, "CONVERSATION_IMAGE_MAX_BYTES", len(PNG) - 1):
+            loaded = await bot.load_conversation_image_inputs(inputs, guild_id=1, channel_id=2)
+            request = bot.compose_conversation_image_request("Read the screenshot.", loaded)
+        self.assertEqual(loaded[0].status, "image_byte_limit")
+        self.assertEqual(loaded[0].mime_type, "image/webp")
+        self.assertFalse(loaded[0].data)
+        self.assertIsInstance(request, str)
+        message.attachments[0].read.assert_awaited_once_with(use_cached=False)
+
+    async def test_understated_metadata_cannot_exceed_actual_total_byte_limit(self):
+        first = image_message(size=16)
+        second = image_message(
+            message_id=202, attachment_id=302, size=16,
+            read=mock.AsyncMock(return_value=WEBP),
+        )
+        inputs = bot.capture_message_image_inputs(first) + bot.capture_message_image_inputs(second)
+        with mock.patch.object(bot, "CONVERSATION_IMAGE_TOTAL_BYTES", len(PNG) + len(WEBP) - 1):
+            loaded = await bot.load_conversation_image_inputs(inputs, guild_id=1, channel_id=2)
+            request = bot.compose_conversation_image_request("Read both screenshots.", loaded)
+        self.assertEqual([item.status for item in loaded], ["loaded", "image_byte_limit"])
+        self.assertEqual([(part.mime_type, part.data) for part in request.images], [("image/png", PNG)])
+        self.assertFalse(loaded[1].data)
+        unavailable = next(line for line in request.text.splitlines() if "attachment_id=302." in line)
+        self.assertIn("Pixels unavailable in this request; metadata only.", unavailable)
+        for message in (first, second):
+            message.attachments[0].read.assert_awaited_once_with(use_cached=False)
 
     async def test_shared_reference_read_is_once_even_for_overlapping_consumers(self):
         message = image_message()
@@ -139,7 +209,7 @@ class ConversationImageInputTests(unittest.IsolatedAsyncioTestCase):
             {"width": None},
             {"height": 4097},
             {"size": bot.CONVERSATION_IMAGE_MAX_BYTES + 1},
-            {"size": 1},
+            {"size": 0},
             {"read": mock.AsyncMock(return_value=b"not-a-png")},
         )
         for values in cases:
