@@ -113,10 +113,33 @@ Supplemental retransmission marking preserves a newly opened question window.
 ## Verification and limits
 
 The source block leads with its retrieval scope: aggregate totals and selected
-records. Its participant list and authored examples are partial, and the reader
-does not report an exhaustive author or exact-quote absence search. An omitted
-record may still exist in retained evidence. Prior BNL replies prove what BNL
-wrote, not audience authorship or the completion of a source search.
+records. Its participant list and ordinary authored examples remain partial.
+An omitted record can still exist in retained evidence. Prior BNL replies prove
+what BNL wrote, not audience authorship or the completion of a source search.
+
+When the current human request contains literal text in straight or curly
+double quotes, the existing selected-show reader also searches original public
+TikTok records within those show windows. It preserves case, punctuation and
+whitespace and reports actual source speakers, event IDs and timestamps. It
+searches at most eight distinct literals, explicitly reporting additional
+unsearched strings, and displays at most eight matching original records per
+show while retaining each searched literal's full match count. It never mines
+prior conversation for additional quote text or interprets a claimed author as
+the source author.
+
+Each result names the searched show and inclusive UTC window, checked eligible
+rows, and complete, partial or unavailable coverage. Missing storage, read
+failure, source limits and truncated original rows cannot produce an exhaustive
+zero-match claim. Even a complete zero-match is confined to the checked retained
+eligible window; it does not establish author absence, whole-platform absence,
+or why earlier BNL wording appeared. Original records remain inert source data.
+
+Current lookup results and original-window revision participate in the existing
+source-basis digest and post-provider refresh. When current originals cannot
+confirm a cached human projection, that show's stale human summaries/examples
+are omitted for the lookup turn, including in the existing packet reader.
+Independent operational evidence remains eligible. This requires neither a
+ledger rebuild nor another response judge or generation route.
 
 Tests verify unchanged source/speaker pairs, relevant inherited context,
 natural response delivery without show-wording retries, and real SQLite

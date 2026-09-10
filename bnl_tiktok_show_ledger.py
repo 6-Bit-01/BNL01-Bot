@@ -39,6 +39,7 @@ from bnl_tiktok_live_context import (
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     _comment_timing_evidence,
     _event_subject_key,
+    _safe_durable_event,
     build_tiktok_show_evidence_ledger,
     has_explicit_show_date,
     requested_show_date,
@@ -407,7 +408,12 @@ def _load_show_source_events(
     guild_id: int,
     show: Mapping[str, Any],
     limit: int = TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS,
+    diagnostics_out: Optional[dict] = None,
 ) -> Optional[list[dict[str, Any]]]:
+    if diagnostics_out is not None:
+        diagnostics_out.clear()
+        diagnostics_out.update(status="unavailable", reason="invalid_show_window", rows_read=0,
+                               truncated_event_ids=())
     start_ms, end_ms = show_timeline_bounds_ms(show)
     if start_ms is None or end_ms is None or end_ms < start_ms:
         return None
@@ -418,6 +424,8 @@ def _load_show_source_events(
         """
     ).fetchone()
     if not exists:
+        if diagnostics_out is not None:
+            diagnostics_out["reason"] = "source_table_unavailable"
         return None
     safe_limit = max(1, min(int(limit or 1), TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS))
     rows = conn.execute(
@@ -433,6 +441,9 @@ def _load_show_source_events(
         (int(guild_id), int(start_ms), int(end_ms), safe_limit + 1),
     ).fetchall()
     if len(rows) > safe_limit:
+        if diagnostics_out is not None:
+            diagnostics_out.update(status="partial", reason="source_event_limit_exceeded",
+                                   rows_read=len(rows), row_limit=safe_limit)
         logging.error(
             "tiktok_show_evidence_source_limit_exceeded guild_id=%s "
             "show_date=%s limit=%s",
@@ -442,6 +453,7 @@ def _load_show_source_events(
         )
         return None
     events = []
+    truncated_event_ids = []
     for (
         source_key,
         occurred_at_ms,
@@ -458,6 +470,8 @@ def _load_show_source_events(
             metadata = {}
         if not isinstance(metadata, dict):
             metadata = {}
+        if diagnostics_out is not None and len(str(raw_text or "")) > 1000:
+            truncated_event_ids.append(str(source_key or "")[:240])
         events.append(
             {
                 "event_id": str(source_key or "")[:240],
@@ -470,6 +484,12 @@ def _load_show_source_events(
                 "metadata": metadata,
             }
         )
+    if diagnostics_out is not None:
+        diagnostics_out.update(
+            status="partial" if truncated_event_ids else "complete",
+            reason="raw_text_truncated" if truncated_event_ids else "source_window_read",
+            rows_read=len(events), truncated_event_ids=tuple(truncated_event_ids),
+        )
     return events
 
 
@@ -479,9 +499,14 @@ def load_tiktok_show_source_events(
     guild_id: int,
     show: Mapping[str, Any],
     limit: int = TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS,
+    diagnostics_out: Optional[dict] = None,
 ) -> Optional[list[dict[str, Any]]]:
     """Read the complete public source window for one show without mutation."""
 
+    if diagnostics_out is not None:
+        diagnostics_out.clear()
+        diagnostics_out.update(status="unavailable", reason="source_database_unavailable", rows_read=0,
+                               truncated_event_ids=())
     if not db_file or db_file == ":memory:" or not os.path.exists(db_file):
         return None
     try:
@@ -495,8 +520,11 @@ def load_tiktok_show_source_events(
                 guild_id=int(guild_id),
                 show=show,
                 limit=limit,
+                diagnostics_out=diagnostics_out,
             )
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        if diagnostics_out is not None:
+            diagnostics_out.update(status="unavailable", reason="source_read_failed", rows_read=0)
         return None
 
 
@@ -3024,23 +3052,51 @@ def select_tiktok_show_episode_context_items(
     selected_ranked = ranked[: (
         max(1, min(int(max_shows or 1), 12)) if multi_show else 1
     )]
+    quote_literals = _current_show_quote_literals(user_text)
+    if quote_literals:
+        # Match the ordinary reader's bounded show scope for fresh raw scans.
+        # Non-lookup community recall retains its existing broader selection.
+        selected_ranked = selected_ranked[:TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT]
     selected_rows = [item[2] for item in selected_ranked]
+    lookups = {
+        str(row.get("showKey") or ""): _lookup_original_show_quotes(
+            "", guild_id=guild_id, ledger=row["ledger"], literals=quote_literals,
+            source_conn=conn,
+        ) for row in selected_rows
+    } if quote_literals else {}
+    # A lookup's fresh originals also own whether human-derived cached packet
+    # views remain usable. Independently valid operations keep their owner.
+    authored_rows = [
+        row for row in selected_rows
+        if not lookups or lookups[str(row.get("showKey") or "")]["cached_projection_current"]
+    ]
     participant_matches = [
         participant
-        for _score, _rank, _row, matches in selected_ranked
+        for _score, _rank, row, matches in selected_ranked
+        if row in authored_rows
         for participant in matches
     ]
+    original_revision = tuple(
+        (key, value["source_digest"], value["status"], value["reason"])
+        for key, value in lookups.items()
+    )
+
+    def bind_original_revision(item: TikTokShowEpisodeContextItem) -> TikTokShowEpisodeContextItem:
+        return replace(item, source_digest=_context_digest(
+            item.source_digest, tuple(revision for revision in original_revision if revision[0] in item.show_keys),
+        )) if lookups else item
+
     items: list[TikTokShowEpisodeContextItem] = []
-    if (
+    if authored_rows and (
         _show_episode_scope_requested(user_text) or participant_matches
     ) and not (
         participant_matches and _subject_continuity_requested(user_text)
     ):
         items.append(
-            _community_episode_context_item(
-                selected_rows,
+            bind_original_revision(_community_episode_context_item(
+                authored_rows,
                 participant_matches=participant_matches,
-            )
+            ))
         )
     if _SHOW_QUERY_RE.search(str(user_text or "")) and (
         _TRACK_QUERY_RE.search(str(user_text or ""))
@@ -3062,12 +3118,12 @@ def select_tiktok_show_episode_context_items(
             if operation_item is not None:
                 items.append(operation_item)
     dialogue_item = _dialogue_episode_context_item(
-        selected_rows,
+        authored_rows,
         user_text=user_text,
         participant_matches=participant_matches,
     )
     if dialogue_item is not None:
-        items.append(dialogue_item)
+        items.append(bind_original_revision(dialogue_item))
     items.sort(key=lambda item: (-item.score, item.source_ref))
     return tuple(items[:4])
 
@@ -3095,6 +3151,155 @@ def tiktok_show_episode_context_item_version(
         if item.source_ref == str(source_ref or ""):
             return item.source_digest
     return ""
+
+
+def _current_show_quote_literals(user_text: str) -> tuple[str, ...]:
+    """Read literal quote delimiters only; infer neither intent nor speaker."""
+
+    return tuple(dict.fromkeys(
+        match.group(1) if match.group(1) is not None else match.group(2)
+        for match in re.finditer(r'"([^"]+)"|“([^”]+)”', str(user_text or ""))
+    ))
+
+
+def _lookup_original_show_quotes(
+    db_file: str, *, guild_id: int, ledger: Mapping[str, Any],
+    literals: tuple[str, ...],
+    source_conn: Optional[sqlite3.Connection] = None,
+) -> dict[str, Any]:
+    """Search current public originals within one already-selected show root."""
+
+    result: dict[str, Any] = {
+        "show_key": str(ledger.get("showKey") or ""),
+        "show_date": str(ledger.get("showDate") or "unknown date"),
+        "status": "unavailable", "reason": "invalid_show_window",
+        "eligible_rows_checked": 0, "source_rows_read": 0,
+        "skipped_rows": 0, "source_digest": "",
+        "cached_projection_current": False, "queries": (),
+        "requested_literal_count": len(literals), "unsearched_literal_count": max(0, len(literals) - 8),
+    }
+    try:
+        start_ms, end_ms = int(ledger["startedAtMs"]), int(ledger["endedAtMs"])
+        if start_ms < 0 or end_ms < start_ms:
+            return result
+        start = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc).isoformat()
+        end = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc).isoformat()
+    except (KeyError, OSError, OverflowError, TypeError, ValueError):
+        return result
+    result.update(start_ms=start_ms, end_ms=end_ms)
+    diagnostics: dict = {}
+    show = {"showDate": result["show_date"], "milestones": [
+            {"eventType": "broadcast_started", "occurredAt": start},
+            {"eventType": "session_archived", "occurredAt": end},
+        ]}
+    try:
+        events = (
+            _load_show_source_events(source_conn, guild_id=guild_id, show=show,
+                                     diagnostics_out=diagnostics)
+            if source_conn is not None else
+            load_tiktok_show_source_events(db_file, guild_id=guild_id, show=show,
+                                          diagnostics_out=diagnostics)
+        )
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        events = None
+        diagnostics.update(status="unavailable", reason="source_read_failed")
+    result.update(status=diagnostics.get("status", "unavailable"),
+                  reason=diagnostics.get("reason", "source_read_failed"),
+                  source_rows_read=int(diagnostics.get("rows_read") or 0))
+    if events is None:
+        return result
+    truncated = set(diagnostics.get("truncated_event_ids") or ())
+    eligible = []
+    current_projection = {}
+    skipped = 0
+    for event in events:
+        safe = _safe_durable_event(event)
+        if safe is None or str(event.get("event_id") or "") in truncated:
+            skipped += 1
+            continue
+        eligible.append((event, safe))
+        current_projection[safe["event_id"]] = (
+            safe["raw_text"], safe["subject_ref"], safe["speaker_label"],
+            safe["occurred_at_ms"], safe["event_type"],
+        )
+    cached_projection = {
+        str(message.get("eventId") or ""): (
+            str(message.get("text") or ""), str(message.get("subjectRef") or ""),
+            str(message.get("speakerLabel") or ""), int(message.get("occurredAtMs") or 0),
+            str(message.get("eventType") or "comment"),
+        ) for message in ledger.get("messages") or () if isinstance(message, Mapping)
+    }
+    result.update(
+        eligible_rows_checked=len(eligible), source_rows_read=len(events), skipped_rows=skipped,
+        source_digest=_context_digest(events, diagnostics),
+        cached_projection_current=bool(not skipped and current_projection == cached_projection),
+    )
+    if skipped:
+        result.update(status="partial", reason=(
+            "raw_text_truncated" if truncated else "unusable_source_rows"
+        ))
+    queries = []
+    shown_remaining = 8
+    for literal in literals[:8]:
+        matches = []
+        for event, safe in eligible:
+            # Raw original characters are the matching authority; normalized
+            # ledger prose, speaker claims, and previous bot replies are not.
+            if literal not in event["raw_text"]:
+                continue
+            matches.append({
+                "eventId": safe["event_id"], "occurredAtMs": safe["occurred_at_ms"],
+                "subjectRef": safe["subject_ref"],
+                "speakerLabel": _public_show_speaker_label(safe["subject_ref"], safe["speaker_label"]),
+                "text": event["raw_text"], "surface": "tiktok",
+            })
+        shown = tuple(matches[:shown_remaining])
+        shown_remaining -= len(shown)
+        queries.append({"literal": literal, "match_count": len(matches),
+                        "shown_match_count": len(shown), "matches": shown})
+    result["queries"] = tuple(queries)
+    return result
+
+
+def _original_quote_lookup_lines(result: Mapping[str, Any]) -> list[str]:
+    """Describe the performed lookup and its finite coverage, never origin."""
+
+    window = (
+        f"{_utc_iso_from_ms(result['start_ms'])} through {_utc_iso_from_ms(result['end_ms'])} inclusive"
+        if "start_ms" in result and "end_ms" in result else "unavailable"
+    )
+    lines = [
+        "\nOriginal TikTok quote lookup: "
+        f"showDate={result['show_date']}; showKey={json.dumps(result['show_key'])}; "
+        f"windowUTC={window}; coverage={result['status']}; reason={result['reason']}; "
+        f"eligibleOriginalRowsChecked={result['eligible_rows_checked']}; "
+        f"sourceRowsRead={result['source_rows_read']}; skippedRows={result['skipped_rows']}.",
+        "- Match method: case-, punctuation-, and whitespace-preserving contiguous literal text in currently eligible public TikTok originals. No author-absence search, Discord search, whole-platform search, or phrase-origin determination was performed.",
+    ]
+    if result.get("unsearched_literal_count"):
+        lines.append(
+            f"- Literal request limit: first 8 distinct quoted strings checked; {result['unsearched_literal_count']} additional quoted strings were not searched."
+        )
+    if result.get("source_digest"):
+        lines.append("- Original window revision: " + str(result["source_digest"]))
+    if not result.get("queries"):
+        lines.append("- No completed literal lookup result is available for this window.")
+    for query in result.get("queries") or ():
+        lines.append(
+            f"- Literal {json.dumps(query['literal'], ensure_ascii=False)}: "
+            f"matchedOriginalRows={query['match_count']}; shownMatches={query['shown_match_count']}. "
+            + ("Count covers the checked retained eligible original window only."
+               if result["status"] == "complete" else
+               "Coverage is incomplete; this is only the count in successfully checked rows.")
+        )
+        for message in query["matches"]:
+            lines.append(
+                f"  Original event={json.dumps(message['eventId'])}; "
+                f"timestampUTC={_utc_iso_from_ms(message['occurredAtMs'])}; "
+                f"speaker={json.dumps(message['speakerLabel'], ensure_ascii=False)}; "
+                f"text={json.dumps(message['text'], ensure_ascii=False)}"
+            )
+    return lines
 
 
 def build_tiktok_show_evidence_context(
@@ -3211,6 +3416,13 @@ def build_tiktok_show_evidence_context(
         else 1
     )
     selected = ranked[:selected_limit]
+    quote_literals = _current_show_quote_literals(user_text)
+    original_lookups = {
+        str(ledger.get("showKey") or ""): _lookup_original_show_quotes(
+            db_file, guild_id=guild_id, ledger=ledger, literals=quote_literals,
+        )
+        for _score, _recency, ledger, _matches in selected
+    } if quote_literals else {}
     selected_authored_excerpts: list[tuple[str, ...]] = []
     selected_authored_excerpt_keys: set[tuple[str, ...]] = set()
 
@@ -3221,11 +3433,14 @@ def build_tiktok_show_evidence_context(
         surface: str,
         speaker_label: str,
         event_id: str = "",
+        preserve_original_text: bool = False,
     ) -> None:
         """Keep typed authority for only the authored excerpts we render."""
 
-        source_text = str(message.get("text") or "").strip()
-        if not source_text:
+        source_text = str(message.get("text") or "")
+        if not preserve_original_text:
+            source_text = source_text.strip()
+        if not source_text.strip():
             return
         excerpt = (
             str(ledger.get("showKey") or ""),
@@ -3252,10 +3467,20 @@ def build_tiktok_show_evidence_context(
                 for _score, _recency, ledger, _matches in selected
             ),
         )
+        if original_lookups:
+            selection_out["original_quote_lookup"] = tuple(original_lookups.values())
+            selection_out["stale_projection_show_keys"] = tuple(
+                key for key, result in original_lookups.items()
+                if not result["cached_projection_current"]
+            )
     lines = [
         "Durable BARCODE Radio show episode memory:",
         "- Retrieval scope: aggregate totals and selected records from retained eligible show evidence. The participant lists and authored examples below are partial selections, not a complete transcript or attendee list.",
-        "- Verification scope: this reader does not report an exhaustive author or exact-quote absence search. A name or comment omitted from this selection can still exist in retained records; an unsupported earlier BNL attribution does not establish the origin of its wording.",
+        (
+            "- Verification scope: original TikTok literal lookup results below identify the selected show windows, current eligible records checked, exact matches, and complete/partial/unavailable coverage. They do not establish author absence or the origin of unsupported BNL wording."
+            if original_lookups else
+            "- Verification scope: this reader does not report an exhaustive author or exact-quote absence search. A name or comment omitted from this selection can still exist in retained records; an unsupported earlier BNL attribution does not establish the origin of its wording."
+        ),
         (
             "- Prior-conversation source candidate: selected using an earlier eligible request from the current speaker. That request is a retrieval cue, not current-topic or audience evidence; the current request, explicit dates, topic changes, and reply targets take precedence."
             if candidate_context else
@@ -3271,6 +3496,29 @@ def build_tiktok_show_evidence_context(
     wants_topics = bool(_TOPIC_QUERY_RE.search(user_text or ""))
     bounded_message_limit = max(1, min(int(message_limit or 1), 16))
     for _score, _recency, ledger, participant_matches in selected:
+        lookup = original_lookups.get(str(ledger.get("showKey") or ""))
+        if lookup is not None:
+            lines.extend(_original_quote_lookup_lines(lookup))
+            for query in lookup["queries"]:
+                for message in query["matches"]:
+                    remember_authored_excerpt(
+                        ledger, message, surface="tiktok", speaker_label=message["speakerLabel"],
+                        preserve_original_text=True,
+                    )
+            if not lookup["cached_projection_current"]:
+                lines.append(
+                    "- Cached human-derived episode projections are omitted for this lookup because current original rows could not confirm that projection. The current lookup above owns its stated scope; no old quote or participant summary is a substitute."
+                )
+                selected_operations = _selected_operational_events(
+                    [event for event in ledger.get("operationalEvents") or () if isinstance(event, Mapping)],
+                    user_text=user_text,
+                )
+                if selected_operations:
+                    lines.append(
+                        f"Independent recorded queue/broadcast chronology on {str(ledger.get('showDate') or 'unknown date')}:"
+                    )
+                    lines.extend(_operational_event_line(event) for event in selected_operations)
+                continue
         general_recall = bool(
             not requested_dates
             and _general_participant_recall(user_text, participant_matches)

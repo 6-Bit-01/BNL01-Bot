@@ -46,6 +46,7 @@ from bnl_tiktok_live_context import (
     requested_show_date,
     requested_show_dates,
     select_show_for_tiktok_analysis,
+    tiktok_show_evidence_key,
     tiktok_show_records,
 )
 from bnl_tiktok_live_memory import (
@@ -2844,6 +2845,34 @@ def _load_durable_tiktok_show_events(
     return events
 
 
+class WebsiteReadModelContext(str):
+    """Retain the website renderer's independent sections for composition."""
+
+    def __new__(
+        cls, text: str, *, rendered_lines: tuple[str, ...] = (),
+        historical_sections: tuple[tuple[str, tuple[int, ...]], ...] = (),
+    ):
+        context = super().__new__(cls, text)
+        context.rendered_lines = rendered_lines
+        context.historical_sections = historical_sections
+        return context
+
+    def for_original_quote_lookup(self, show_keys) -> str:
+        selected_keys = set(show_keys)
+        omitted_indexes = {
+            index
+            for show_key, indexes in self.historical_sections
+            if show_key in selected_keys
+            for index in indexes
+        }
+        if not omitted_indexes:
+            return str(self)
+        return "\n".join(
+            line for index, line in enumerate(self.rendered_lines)
+            if index not in omitted_indexes
+        )
+
+
 def build_bnl_read_model_context(
     read_model: dict,
     user_text: str,
@@ -2918,6 +2947,7 @@ def build_bnl_read_model_context(
             f"/ publicOnly={'false' if private_access else 'true'} / accessScope={access_scope} / version=1"
         ),
     ]
+    historical_show_analysis_sections: list[tuple[str, tuple[int, ...]]] = []
     schema_revision = _compact_public_text(read_model.get("schemaRevision"), 40)
     if schema_revision:
         lines[-1] += f" / schemaRevision={schema_revision}"
@@ -3138,6 +3168,10 @@ def build_bnl_read_model_context(
                         if available_dates >= TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT:
                             break
                 for day, scoped_archive in scoped_archives:
+                    historical_start = len(lines)
+                    selected_show, _ = select_show_for_tiktok_analysis(
+                        scoped_archive, show_analysis_text,
+                    )
                     durable_events = _load_durable_tiktok_show_events(
                         scoped_archive, show_analysis_text,
                     )
@@ -3148,6 +3182,11 @@ def build_bnl_read_model_context(
                             scoped_archive, durable_events, show_analysis_text,
                         )
                     )
+                    show_key = tiktok_show_evidence_key(selected_show)
+                    if show_key:
+                        historical_show_analysis_sections.append((
+                            show_key, tuple(range(historical_start, len(lines))),
+                        ))
             else:
                 if current_show_date:
                     # Carry the authorized live scope with this rendered
@@ -3293,7 +3332,14 @@ def build_bnl_read_model_context(
     if len(lines) > 80 and not show_analysis_query:
         content_limit = max(0, 80 - len(guardrail_lines))
         lines = [*lines[:content_limit], *guardrail_lines]
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    if historical_show_analysis_sections:
+        return WebsiteReadModelContext(
+            rendered,
+            rendered_lines=tuple(lines),
+            historical_sections=tuple(historical_show_analysis_sections),
+        )
+    return rendered
 
 
 def maybe_build_bnl_read_model_context(
@@ -27074,11 +27120,14 @@ def _finalized_show_authored_excerpts_from_selection(
     for raw in selection.get("authored_excerpts") or ():
         if not isinstance(raw, (tuple, list)) or len(raw) != 7:
             continue
-        values = tuple(str(value or "").strip() for value in raw)
+        values = tuple(
+            str(value or "") if index == 5 else str(value or "").strip()
+            for index, value in enumerate(raw)
+        )
         if (
             (values[0], values[1]) not in selected_refs
             or not values[4]
-            or not values[5]
+            or not values[5].strip()
         ):
             continue
         excerpts.append(FinalizedShowAuthoredExcerpt(*values))
@@ -37509,12 +37558,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             )
             batch_source_no_store_reason = "website_read_model_no_store"
+            batch_website_prompt_context = (
+                batch_website_read_model_context.for_original_quote_lookup(
+                    lookup["show_key"]
+                    for lookup in batch_show_selection["original_quote_lookup"]
+                )
+                if batch_show_selection.get("original_quote_lookup")
+                and isinstance(batch_website_read_model_context, WebsiteReadModelContext)
+                else batch_website_read_model_context
+            )
             batch_website_read_model_prompt_block = ""
-            if batch_website_read_model_context:
+            if batch_website_prompt_context:
                 batch_website_read_model_prompt_block = (
                     "\n\nAuthoritative current live-show context for this "
                     "request:\n"
-                    + batch_website_read_model_context
+                    + batch_website_prompt_context
                     + "\nAnswer current queue questions directly from this context. "
                     "Answer TikTok chat, reaction-analysis, and follow-up questions from the authorized live-show evidence when present. "
                     "Answer only what was asked; if the context marks a full-lineup "
@@ -40440,15 +40498,6 @@ def build_user_aware_prompt(
     if show_state_context:
         show_state_prompt_block = f"{show_state_context}\n"
 
-    website_read_model_prompt_block = ""
-    if website_read_model_context:
-        website_read_model_prompt_block = f"{website_read_model_context}\n"
-    tiktok_show_analysis_turn_contract = (
-        build_tiktok_show_analysis_turn_contract(
-            website_read_model_context
-        )
-    )
-
     source_context_prompt_block = ""
     if source_context_block:
         source_context_prompt_block = f"{source_context_block}\n"
@@ -40476,6 +40525,25 @@ def build_user_aware_prompt(
     show_basis = build_finalized_show_prompt_source_basis(
         tiktok_show_evidence_context,
         guild_id=guild_id, selection=show_selection,
+    )
+    # The finalized lookup has a revalidatable original-source basis. Keep
+    # independently useful website sections while omitting its duplicate,
+    # unbound historical excerpts. The original view still owns access and
+    # memory-policy decisions; this changes only factual prompt composition.
+    website_prompt_context = (
+        website_read_model_context.for_original_quote_lookup(
+            lookup["show_key"]
+            for lookup in show_selection["original_quote_lookup"]
+        )
+        if show_selection.get("original_quote_lookup")
+        and isinstance(website_read_model_context, WebsiteReadModelContext)
+        else website_read_model_context
+    )
+    website_read_model_prompt_block = (
+        f"{website_prompt_context}\n" if website_prompt_context else ""
+    )
+    tiktok_show_analysis_turn_contract = build_tiktok_show_analysis_turn_contract(
+        website_prompt_context
     )
     if show_basis is not None:
         prompt_source_bases.append(show_basis)
