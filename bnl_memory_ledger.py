@@ -14373,7 +14373,24 @@ def build_memory_ledger_evaluation(
     report["unresolvedCorrectionAttempts"] = int(cur.fetchone()[0] or 0)
     cur.execute(f"SELECT COUNT(*) FROM memory_ledger_shadow_receipts{where + (' AND' if where else ' WHERE')} outcome IN ('inserted','deduplicated') AND (entry_id='' OR entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE {'guild_id=? AND ' if guild_id is not None else ''} 1=1))", params + ([guild_id] if guild_id is not None else []))
     missing_receipt_entries = int(cur.fetchone()[0] or 0)
-    cur.execute(f"SELECT COUNT(*) FROM memory_ledger_entries e{where.replace('WHERE', 'WHERE e.') if where else ''} AND NOT EXISTS (SELECT 1 FROM memory_ledger_shadow_receipts r WHERE r.guild_id=e.guild_id AND r.entry_id=e.entry_id AND r.outcome IN ('inserted','deduplicated'))" if where else "SELECT COUNT(*) FROM memory_ledger_entries e WHERE NOT EXISTS (SELECT 1 FROM memory_ledger_shadow_receipts r WHERE r.guild_id=e.guild_id AND r.entry_id=e.entry_id AND r.outcome IN ('inserted','deduplicated'))", params)
+    # Build the successful receipt keys once. A correlated lookup otherwise
+    # rescans all guild receipts for every entry with the existing indexes.
+    cur.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM memory_ledger_entries e
+        LEFT JOIN (
+            SELECT guild_id,entry_id
+            FROM memory_ledger_shadow_receipts
+            WHERE outcome IN ('inserted','deduplicated')
+              {'AND guild_id=?' if guild_id is not None else ''}
+            GROUP BY guild_id,entry_id
+        ) r ON r.guild_id=e.guild_id AND r.entry_id=e.entry_id
+        WHERE r.entry_id IS NULL
+          {'AND e.guild_id=?' if guild_id is not None else ''}
+        """,
+        params + params,
+    )
     entries_without_receipts = int(cur.fetchone()[0] or 0)
     cur.execute(f"SELECT COUNT(*) FROM memory_ledger_lineage l{where.replace('WHERE', 'WHERE l.') if where else ''} AND NOT EXISTS (SELECT 1 FROM memory_ledger_entries e WHERE e.guild_id=l.guild_id AND e.entry_id=l.target_entry_id)" if where else "SELECT COUNT(*) FROM memory_ledger_lineage l WHERE NOT EXISTS (SELECT 1 FROM memory_ledger_entries e WHERE e.guild_id=l.guild_id AND e.entry_id=l.target_entry_id)", params)
     dangling_lineage = int(cur.fetchone()[0] or 0)
