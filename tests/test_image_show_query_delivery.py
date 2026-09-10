@@ -28,6 +28,9 @@ REQUEST = (
 SEPTEMBER_COMMENT = "The amber lanterns are bright tonight."
 SEPTEMBER_KEY = "show-image-september"
 ORIGINAL_KEY = "image-query-september-original"
+FORMAT_ORIGINAL_KEY = "image-query-format-original"
+FORMAT_ORIGINAL = "test member bring the amber lanterns back"
+FORMAT_LITERAL = "Test Member bring the amber lanterns back."
 CONFLICTING_LINES = (
     "Website public read model context:", "accessScope=public",
     "Durable TikTok show analysis context:",
@@ -82,13 +85,13 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(synced["showsSeen"], 2)
 
-    def extraction(self, message):
+    def extraction(self, message, *, literal=SEPTEMBER_COMMENT):
         return image_fixture.provider_response(json.dumps({
             "images": [{
                 "message_id": message.id,
                 "attachment_id": message.attachments[0].id,
                 "show_dates": ["2026-09-04"],
-                "quote_literals": [SEPTEMBER_COMMENT],
+                "quote_literals": [literal],
             }],
         }))
 
@@ -142,6 +145,113 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_screenshot_date_and_literal_reach_original_reader(self):
         await self.check_current_image_source_delivery(tagged=True)
+
+    def seed_format_original(self):
+        # Intentionally do not resync the episode projection: candidate
+        # retrieval must read the current eligible original window itself.
+        recorded = record_source_event(
+            bot.DB_FILE, guild_id=77, source_kind="tiktok_live_chat",
+            source_key=FORMAT_ORIGINAL_KEY,
+            occurred_at_ms=show_fixture.stamp("2026-09-05T00:03:00Z"),
+            raw_text=FORMAT_ORIGINAL, sanitized_summary=FORMAT_ORIGINAL,
+            channel_policy="public_context", public_usable=True,
+            subject_ref="discord_user:4243", private_display_name="Test Original",
+            metadata={"eventType": "comment", "handle": "test.original"},
+        )
+        self.assertTrue(recorded.ok)
+
+    def assert_format_original(self, text):
+        self.assertIn("showDate=2026-09-04;", text)
+        self.assertNotIn("showDate=2026-08-28;", text)
+        self.assertIn("matchedOriginalRows=0", text)
+        self.assertIn("formatCandidateRows=1", text)
+        self.assertIn("Candidate original event=", text)
+        self.assertIn(FORMAT_ORIGINAL_KEY, text)
+        self.assertIn("Test Original", text)
+        self.assertIn("text=" + json.dumps(FORMAT_ORIGINAL), text)
+
+    async def check_format_candidate_delivery(self, *, tagged):
+        self.seed_format_original()
+        message = self.message(REQUEST, tagged=tagged)
+        answer = "The original comment has different capitalization and punctuation."
+        self.provider.side_effect = [
+            self.extraction(message, literal=FORMAT_LITERAL),
+            image_fixture.provider_response(answer),
+        ]
+        if tagged:
+            await bot.on_message(message)
+            self.assertEqual(message.replies, [answer])
+        else:
+            with mock.patch.object(bot, "_reset_debounce"):
+                await bot.on_message(message)
+            await bot._flush_channel_buffer(self.channel)
+            self.assertEqual(self.channel.sent, [answer])
+        self.assertEqual(self.provider.call_count, 2)
+        extraction_text, extraction_images = self.provider_parts(0)
+        self.assertNotIn(FORMAT_ORIGINAL, extraction_text)
+        final_text, final_images = self.provider_parts(1)
+        self.assert_format_original(final_text)
+        self.assertEqual(len(final_images), 1)
+        self.assertEqual(
+            [(part.mime_type, part.data) for part in final_images],
+            [(part.mime_type, part.data) for part in extraction_images],
+        )
+        message.attachments[0].read.assert_awaited_once_with(use_cached=False)
+
+    async def test_direct_changed_format_delivers_original_candidate_to_answer(self):
+        await self.check_format_candidate_delivery(tagged=True)
+
+    async def test_batch_changed_format_delivers_original_candidate_to_answer(self):
+        await self.check_format_candidate_delivery(tagged=False)
+
+    async def test_candidate_basis_refresh_removes_withdrawn_unsynced_original(self):
+        self.seed_format_original()
+        message = self.message(REQUEST)
+        inputs = bot.capture_message_image_inputs(message)
+        self.provider.return_value = self.extraction(message, literal=FORMAT_LITERAL)
+        queries = await bot.prepare_current_image_show_queries(
+            REQUEST, inputs, guild_id=77, channel_id=self.channel.id,
+        )
+        selection = {}
+        context = network_fixture.REAL_SHOW_CONTEXT_FOR_TURN(
+            guild_id=77, user_text=REQUEST,
+            website_read_model_context=CONFLICTING_CONTEXT,
+            image_queries=queries, selection_out=selection,
+        )
+        self.assert_format_original(context)
+        query = selection["original_quote_lookup"][0]["queries"][0]
+        self.assertEqual(query["match_count"], 0)
+        self.assertEqual(query["matches"], ())
+        self.assertEqual(query["format_candidate_count"], 1)
+        self.assertEqual(query["format_candidates"][0]["text"], FORMAT_ORIGINAL)
+        basis = bot.build_finalized_show_prompt_source_basis(
+            context, guild_id=77, selection=selection,
+        )
+        self.assertIsNotNone(basis)
+        originals = [item for item in basis.authored_excerpts
+                     if item.event_id == FORMAT_ORIGINAL_KEY]
+        self.assertEqual(len(originals), 1)
+        self.assertEqual(originals[0].source_text, FORMAT_ORIGINAL)
+        self.assertIn("Test Original", originals[0].speaker_label)
+        self.assertFalse(any(item.source_text == FORMAT_LITERAL
+                             for item in basis.authored_excerpts))
+        refreshed, changed = bot.refresh_prompt_source_basis(basis)
+        self.assertFalse(changed)
+        self.assert_format_original(refreshed.rendered_context)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            purge_user_bound_conversation_sources_on_connection(conn, 77, 4243)
+        withdrawn, changed = bot.refresh_prompt_source_basis(refreshed)
+        self.assertTrue(changed)
+        self.assertEqual(withdrawn.show_keys, (SEPTEMBER_KEY,))
+        self.assertEqual(withdrawn.image_queries, queries)
+        self.assertIn("matchedOriginalRows=0", withdrawn.rendered_context)
+        self.assertIn("formatCandidateRows=0", withdrawn.rendered_context)
+        self.assertNotIn(FORMAT_ORIGINAL_KEY, withdrawn.rendered_context)
+        self.assertNotIn("text=" + json.dumps(FORMAT_ORIGINAL), withdrawn.rendered_context)
+        self.assertFalse(any(item.event_id == FORMAT_ORIGINAL_KEY
+                             for item in withdrawn.authored_excerpts))
+        self.assertEqual(self.provider.call_count, 1)
+        message.attachments[0].read.assert_awaited_once_with(use_cached=False)
 
     async def test_overlapping_preparation_reuses_one_query_and_attachment_read(self):
         message = self.message(REQUEST)

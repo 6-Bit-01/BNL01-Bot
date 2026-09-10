@@ -1,5 +1,61 @@
 # September 10 recovery completion checkpoint
 
+## Current continuation: compare pictured wording with original comments
+
+PR529 is confirmed deployed at `217cae45f0c625c8e626082b35bb66663543ec78`,
+with BNL online under PID 1600498 after the 06:16:07 UTC restart. The 06:22–06:24
+live run closes the undated screenshot check and confirms dated image selection.
+The first image correctly identifies the pictured retraction and reports that
+its unresolved show scope was not searched. The second image's query receipt
+reports `show_dates=2026-09-04 literal_count=3`; the source receipt identifies
+`session_mtno0ply_2g09o` both before generation and on refresh. Neither answer
+contains the earlier optional glitch insert. These remain carried passes.
+
+The dated answer still falsely rejects two authentic comments. 6 Bit's next
+read-only lookup checked all 1,437 eligible September 4 originals with complete
+coverage, zero skipped rows and the same source revision
+`88f048d0d2f6cc081b19cf8093d4652afb0f4c44921c2f159659f1f229b9b97a`.
+It returned one original for each fragment:
+
+| Fragment | Source speaker | Timestamp UTC on September 5 |
+| --- | --- | --- |
+| `bombed` | Corporate Satan (@corporate_satan) | 02:14:59.103 |
+| `ducking` | SHADOWSPIT (@deadite_ash) | 02:11:19.136 |
+| `threw a tantrum` | Oreaganomics (@oreaganomics) | 03:18:19.164 |
+
+Thus all three comment/speaker pairs exist in the retained originals. This does
+not authenticate the recap's playback or wheel-event chronology. The ended
+turn's extracted strings were transient and are not recoverable from its
+count-only receipt, so the exact live failure mechanism remains unproven.
+The pictured wording includes punctuation absent from the originals. A local
+reproduction confirms that punctuation/capitalization differences produce an
+exact miss without exposing the related original through that lookup.
+
+This change extends the existing original reader to return separate formatting
+candidates alongside unchanged character-exact results. It compares contiguous
+whole-word sequences without case, punctuation or whitespace differences,
+preserves the candidate's actual original text and author, and never labels it
+verbatim or semantically equivalent. All exact results receive the existing
+eight-record display allowance first; candidates share the remainder. Both
+use the same eligible rows, coverage, source revision and refresh ownership.
+The existing source receipt now includes per-query match/candidate counts and
+displayed event IDs, without logging screenshot text. This introduces no
+provider call, source store, response judge, schema or runtime-gate change.
+
+Validation: six new regressions cover formatting differences, whole-word
+boundaries, source eligibility, exact-result display priority, direct/batch
+delivery and withdrawal after an unsynced source change. All 2,903 tests passed
+the required `make check` in 114.147 seconds. Independent review found no
+blocking issue. Provider fixtures establish source delivery, not live answer
+accuracy.
+
+After review, the required test gate, merge and verified deployment, repeat only
+the outstanding dated recap screenshot. Require the September 4 original rows
+to reach the answer and distinguish the three authentic comments from wording
+differences and unsupported surrounding chronology. Do not rerun the undated
+screenshot, image transport, date-selection or earlier original-lookup checks.
+The finite recovery plan below remains unchanged.
+
 ## Current continuation: screenshot queries reach the original reader
 
 PR528 is confirmed deployed at `a845555ae5b1c67b41f330e853d11b4fa5658b98`,

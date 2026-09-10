@@ -127,6 +127,18 @@ show while retaining each searched literal's full match count. It never mines
 prior conversation for additional quote text or interprets a claimed author as
 the source author.
 
+The same original-row read also supplies separately labeled formatting
+candidates: contiguous whole-word sequences compared without case, punctuation
+or whitespace differences. Literal counts remain character-exact. Candidate
+text, speaker, timestamp and event ID come unchanged from the eligible original,
+not from the screenshot or a reconstructed sentence. Exact results take the
+eight-row display allowance first; candidates use its remainder, with separate
+total and displayed counts. A candidate is evidence to compare, not proof of a
+verbatim quote, equivalent meaning or surrounding event chronology. An exact
+miss must not become a claim that a comment is absent when a related original
+is supplied. No candidate does not rule out other wording or transcription
+errors. Candidates follow the same source revision and withdrawal lifecycle.
+
 Each result names the searched show and inclusive UTC window, checked eligible
 rows, and complete, partial or unavailable coverage. Missing storage, read
 failure, source limits and truncated original rows cannot produce an exhaustive
