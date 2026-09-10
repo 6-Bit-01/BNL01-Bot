@@ -380,6 +380,9 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(generation.await_count, index + 1)
                     self.assertEqual(guard.await_count, index + 1)
                     prompt = generation.await_args.args[0]
+                    self.assertIn("Retrieval scope: aggregate totals and selected records", prompt)
+                    self.assertIn("does not report an exhaustive author or exact-quote absence search", prompt)
+                    self.assertIn("Selected participant records (partial list):", prompt)
                     bases = tuple(
                         item for item in guard.await_args.kwargs["prompt_source_bases"]
                         if isinstance(item, bot.FinalizedShowPromptSourceBasis)
