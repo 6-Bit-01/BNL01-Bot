@@ -17,7 +17,10 @@ import sqlite3
 from typing import Any
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
-from bnl_conversation_context_v2 import EXPLICIT_NEW_TOPIC_RE
+from bnl_conversation_context_v2 import (
+    EXPLICIT_NEW_TOPIC_RE,
+    conversation_routes_compatible,
+)
 from bnl_memory_ledger import (
     BNL_SUBJECT_KEY,
     LedgerEntry,
@@ -2577,18 +2580,23 @@ def _reply_target_moment(conn: sqlite3.Connection, source: SourceEntry) -> str:
     if not target or target != targets[0][0]:
         return ""
     windows = conn.execute(
-        """SELECT w.moment_id,w.window_started_at,w.last_activity_at,w.public_usable
+        """SELECT w.moment_id,w.window_started_at,w.last_activity_at,w.public_usable,
+                  w.route_mode
            FROM memory_moment_members m
            JOIN memory_moment_windows w ON w.moment_id=m.moment_id
            WHERE m.ledger_entry_id=? AND w.lifecycle_status='open'
              AND w.guild_id=? AND w.channel_id=? AND w.channel_policy=?
-             AND w.route_mode=? AND w.visibility=?""",
+             AND w.visibility=?""",
         (target, source.guild_id, source.channel_id, source.channel_policy,
-         source.route_mode, source.visibility),
+         source.visibility),
     ).fetchall()
+    windows = [
+        window for window in windows
+        if conversation_routes_compatible(window[4], source.route_mode)
+    ]
     if len(windows) != 1:
         return ""
-    mid, started, last, public_usable = windows[0]
+    mid, started, last, public_usable, route_mode = windows[0]
     ts = _parse_ts(source.observed_at)
     if (
         not 0 <= (ts - _parse_ts(last)).total_seconds() <= INACTIVITY_SECONDS
@@ -2598,7 +2606,7 @@ def _reply_target_moment(conn: sqlite3.Connection, source: SourceEntry) -> str:
     failure, _ = _moment_source_failure(
         conn, moment_id=mid, rows=_entries(conn, mid),
         guild_id=source.guild_id, channel_id=source.channel_id,
-        channel_policy=source.channel_policy, route_mode=source.route_mode,
+        channel_policy=source.channel_policy, route_mode=route_mode,
         visibility=source.visibility, public_usable=bool(public_usable),
     )
     return "" if failure else mid
@@ -2675,7 +2683,11 @@ def observe_ledger_entry(conn: sqlite3.Connection, ledger_entry_id: str) -> Mome
         for row in open_rows:
             mid, started, last, policy, visibility, win_family, win_sig_raw, route = row
             expired = (ts - _parse_ts(last)).total_seconds() > INACTIVITY_SECONDS or (ts - _parse_ts(started)).total_seconds() > MAX_WINDOW_SECONDS
-            incompatible = policy != source.channel_policy or visibility != source.visibility or route != source.route_mode
+            incompatible = (
+                policy != source.channel_policy
+                or visibility != source.visibility
+                or not conversation_routes_compatible(route, source.route_mode)
+            )
             if expired or incompatible:
                 finalize_moment(conn, mid)
                 continue
@@ -2942,7 +2954,7 @@ def _moment_source_failure(
             source.guild_id != guild_id
             or source.channel_id != channel_id
             or source.channel_policy != channel_policy
-            or source.route_mode != route_mode
+            or not conversation_routes_compatible(source.route_mode, route_mode)
             or source.visibility != visibility
         ):
             return "source_scope_mismatch", "needs_review"
@@ -3717,7 +3729,9 @@ def link_episode_lineage(
         or source.guild_id != int(source_episode[1] or 0)
         or source.channel_id != int(source_episode[2] or 0)
         or source.channel_policy != str(source_episode[3] or "")
-        or source.route_mode != str(source_episode[4] or "")
+        or not conversation_routes_compatible(
+            source.route_mode, str(source_episode[4] or "")
+        )
         or source.visibility != str(source_episode[5] or "")
     ):
         return False
@@ -5151,7 +5165,7 @@ def _contribution_is_renderable(
             or source.guild_id != guild_id
             or source.channel_id != channel_id
             or source.channel_policy != channel_policy
-            or source.route_mode != route_mode
+            or not conversation_routes_compatible(source.route_mode, route_mode)
             or source.visibility != visibility
             or not source.public_usable
             or source.lifecycle_status not in SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS
