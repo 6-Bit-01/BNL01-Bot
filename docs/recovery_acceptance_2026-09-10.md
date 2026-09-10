@@ -1,6 +1,65 @@
 # September 10 recovery completion checkpoint
 
-## Current continuation: compare pictured wording with original comments
+## Current continuation: preserve directly addressed correction continuity
+
+PR530 is confirmed deployed at `b9abeb0feabf95e4e2f5478d5c92977da5db115f`,
+with BNL online under PID 1600886 after the 07:41:19 UTC restart. The following
+live recap answer authenticates all three original comment/speaker pairs. The
+subsequent timing answer retracts the unsupported playback association and
+after-resolution wheel claim. Carry these substantive passes forward along
+with the earlier image, date-selection and immediate detour-continuity passes.
+Playback remains unconfirmed, not disproven. The timing answer's statement that
+timeline records were updated has no supporting write receipt; it establishes
+only a correction expressed in conversation.
+
+The next read-only checks located the original 02:40–02:48 UTC conversation.
+User rows 8394, 8396, 8398 and 8400 all have ledger entries and Moment membership,
+but each belongs to a separate rejected window with no canonical entry or
+episode. All four report `low_signal_or_insufficient_continuity`. The first
+window's `topic_coherence_mismatch` diagnostic occurs when row 8396 arrives at
+02:42:36, 71 seconds after BNL's preceding reply. This is within the existing
+two-minute inactivity bound. The same turn's conversation-context receipt
+resolves `exact_discord_reply` with `discord_reply_source`.
+
+The failure is the handoff from trusted Discord addressing to persistence:
+the resolved reply row was available before saving, but the ledger adapter did
+not retain it. The Moment observer therefore used lexical overlap and split
+the directly addressed correction. A disposable-database reproduction matches
+the rejected fragments. Keeping the first two human turns and BNL replies in
+one window satisfies the existing qualification rule without changing it.
+
+This bounded repair carries that opaque reply row through the three existing
+normal conversation save paths. The ledger records a structural `reply_to`
+edge only to one retained BNL source with matching guild, channel, policy,
+route and visibility, usable lifecycle, earlier ordering and matching retained
+text projection. The Moment observer revalidates the reference and existing
+member scope before preferring its still-open window over lexical overlap.
+The existing explicit-new-topic signal is shared with conversation context;
+it still separates a deliberate detour. Inactivity, maximum window length,
+qualification, source authority and runtime gates remain unchanged.
+
+`reply_to` is not factual ancestry, a correction, supersession or permission
+to publish model output. The change adds no model request, response judge or
+parallel store. It does not reconstruct the historical rejected windows or
+invent their lost reply edges. New regressions cover the observed correction
+sequence, normal expiry into an episode, the checksum detour, raw-source
+withdrawal/change, ambiguous and incompatible references, time bounds, database
+reopening, actual save-to-observer delivery and all three normal ingress paths.
+
+Validation: all 86 focused Moment tests passed. The required `make check`
+passed all 2,916 tests in 115.150 seconds. Independent review found no blocking
+issue. These local results establish formation and persistence behavior;
+they do not certify live provider responses or episode delivery after restart.
+
+After review, the required repository checks, merge and verified deployment,
+validate this affected formation boundary once using the continuing discussion
+and a directly addressed follow-up. Locate its new source, reply edge, qualified
+Moment and episode through targeted read-only evidence. Episode formation alone
+does not close the outstanding continuation/recurrence, correction/retirement
+or restart-delivery acceptance. Continue those remaining parts of the finite
+plan below; do not repeat the passed screenshot or original-quote checks.
+
+## Earlier continuation: compare pictured wording with original comments
 
 PR529 is confirmed deployed at `217cae45f0c625c8e626082b35bb66663543ec78`,
 with BNL online under PID 1600498 after the 06:16:07 UTC restart. The 06:22–06:24

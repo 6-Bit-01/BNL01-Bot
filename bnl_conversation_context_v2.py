@@ -38,6 +38,11 @@ STOPWORDS = {
 }
 
 _WORD_RE = re.compile(r"[a-z0-9']+")
+EXPLICIT_NEW_TOPIC_RE = re.compile(
+    r"^\s*(?:new topic|unrelated (?:question|topic)|separate (?:question|topic)|"
+    r"changing subjects?|different subject)\b",
+    re.I,
+)
 CORRECTION_RE = re.compile(r"\b(?:actually|correction|correcting|i meant|instead|not\s+that|that's wrong|that is wrong)\b", re.I)
 BOUNDARY_RE = re.compile(r"\b(?:don't|do not|stop|never|please don't|no longer|boundary|avoid)\b", re.I)
 OPEN_LOOP_RE = re.compile(r"\?|\b(?:which one|choose|pick|decide|i will|i'll|remind me|next time|use the first|use the second|second one|first one)\b", re.I)
