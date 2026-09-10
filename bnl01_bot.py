@@ -19118,6 +19118,8 @@ async def load_conversation_image_inputs(
         selected.append(item)
         async with item._load_lock:
             if item.status == "pending":
+                declared_mime_type = item.mime_type
+                actual_size = 0
                 if item.mime_type not in CONVERSATION_IMAGE_MIME_TYPES:
                     item.status = "unsupported"
                 elif not (0 < item.width <= CONVERSATION_IMAGE_MAX_DIMENSION and 0 < item.height <= CONVERSATION_IMAGE_MAX_DIMENSION):
@@ -19136,20 +19138,28 @@ async def load_conversation_image_inputs(
                             item.attachment.read(use_cached=False),
                             timeout=max(0.001, deadline - time.monotonic()),
                         )
-                        valid_signature = isinstance(data, bytes) and (
-                            (item.mime_type == "image/png" and data.startswith(b"\x89PNG\r\n\x1a\n"))
-                            or (item.mime_type == "image/jpeg" and data.startswith(b"\xff\xd8\xff"))
-                            or (
-                                item.mime_type == "image/webp" and len(data) >= 20
-                                and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+                        # The original download can differ from Discord's
+                        # declared attachment MIME and size. Use its signature
+                        # for the provider MIME and its bytes for fixed limits.
+                        detected_mime_type = ""
+                        if isinstance(data, bytes):
+                            actual_size = len(data)
+                            if data.startswith(b"\x89PNG\r\n\x1a\n"):
+                                detected_mime_type = "image/png"
+                            elif data.startswith(b"\xff\xd8\xff"):
+                                detected_mime_type = "image/jpeg"
+                            elif (
+                                len(data) >= 20 and data.startswith(b"RIFF")
+                                and data[8:12] == b"WEBP"
                                 and data[12:16] in (b"VP8 ", b"VP8L", b"VP8X")
-                            )
-                        )
-                        if not valid_signature:
+                            ):
+                                detected_mime_type = "image/webp"
+                        if not detected_mime_type:
                             item.status = "invalid_image_data"
-                        elif not 0 < len(data) <= min(item.size, CONVERSATION_IMAGE_MAX_BYTES, CONVERSATION_IMAGE_TOTAL_BYTES - byte_count):
+                        elif not 0 < actual_size <= min(CONVERSATION_IMAGE_MAX_BYTES, CONVERSATION_IMAGE_TOTAL_BYTES - byte_count):
                             item.status = "image_byte_limit"
                         else:
+                            item.mime_type = detected_mime_type
                             item.data = data
                             item.status = "loaded"
                     except asyncio.TimeoutError:
@@ -19158,9 +19168,10 @@ async def load_conversation_image_inputs(
                         item.status = "read_unavailable"
                         logging.info("conversation_image_read_unavailable error_type=%s", type(exc).__name__)
                 logging.info(
-                    "conversation_image_input guild_id=%s channel_id=%s message_id=%s user_id=%s attachment_id=%s mime_type=%s status=%s",
+                    "conversation_image_input guild_id=%s channel_id=%s message_id=%s user_id=%s attachment_id=%s mime_type=%s status=%s declared_mime_type=%s declared_size=%s actual_size=%s",
                     item.guild_id, item.channel_id, item.message_id,
                     item.user_id, item.attachment_id, item.mime_type, item.status,
+                    declared_mime_type, item.size, actual_size,
                 )
             if item.status == "loaded":
                 loaded_count += 1
