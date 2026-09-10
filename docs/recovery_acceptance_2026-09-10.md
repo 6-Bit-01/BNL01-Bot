@@ -1,6 +1,41 @@
 # September 10 recovery completion checkpoint
 
-## Current continuation: original-record lookup
+## Current continuation: WebP screenshot delivery
+
+PR526 is confirmed deployed at `8ec1000e550f23f9ff30b1cdd5f6056fc3afe2cf`,
+with the bot online under PID 1599742. The original-record diagnostic completed
+the September 4 retained eligible window: 1,437 original rows read, no skipped
+rows, and zero contiguous literal matches for the requested visualizer quote.
+That scoped lookup check passes. It establishes neither author absence nor
+the origin of the unsupported wording.
+
+The two screenshot turns at 04:28 and 04:29 UTC failed current-image grounding.
+The first screenshot shows an attribution challenge and BNL's retraction; the
+second shows the Corporate Satan, Oreaganomics and SHADOWSPIT recap. BNL answered
+both as though they showed the CipherDot attribution. Media metadata was
+included, but neither turn emitted the existing image-loading receipt.
+
+Read-only inspection of retained user rows 8407 and 8409 identified the exact
+input shape: `image attachment (filename=image.png; type=image/webp)` for both.
+The existing capture owner accepted only PNG/JPEG MIME types, so it excluded
+both WebP attachments before download and native provider composition. The
+filename was not a reliable indication of the attachment's actual format.
+
+This bounded repair adds WebP to that same capture/load/provider path, checks
+its RIFF/WebP header, and includes the MIME type in the existing loading receipt.
+It retains the existing size, scope, request-budget and read-once boundaries.
+Regression coverage uses the actual ingress and native provider adapter for
+successive distinct WebP images with the same PNG filename, followed by a failed
+current read; prior pixels must never substitute for the current attachment.
+Fixture provider replies establish transport and attribution, not interpretation.
+
+After merge and verified deployment, repeat only these two screenshot checks
+with their route and image-loading receipts. Acceptance requires reading each
+current image accurately and separating prior BNL claims from original-record
+evidence. The passed original-record lookup and other carried passes remain
+closed; the rest of the original finite acceptance below remains in force.
+
+## Earlier continuation: original-record lookup
 
 PR525 is confirmed deployed at `1c422d727e8a496c505efadad5416e4c11ecf0c6`,
 with the bot online under PID 1598361. The 03:19–03:20 UTC verification turn

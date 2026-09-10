@@ -24,6 +24,10 @@ PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
     "/x8AAwMCAO+jB1kAAAAASUVORK5CYII="
 )
+# Distinct, valid 1x1 lossless WebP images generated once as fixtures. Discord
+# can name these image.png while correctly declaring their image/webp MIME.
+WEBP_FIRST = base64.b64decode("UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAdQmVJUq/+BiOh/AAA=")
+WEBP_SECOND = base64.b64decode("UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAdQj0KVp/+BiOh/AAA=")
 ANSWER = "The supplied screenshot is available for this conversation."
 
 
@@ -185,6 +189,53 @@ class ConversationImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
         _text, images = self.provider_parts()
         self.assertEqual([part.data for part in images], [PNG])
         message.attachments[0].read.assert_awaited_once()
+
+    async def test_sequential_png_named_webp_screenshots_deliver_only_current_pixels(self):
+        # Exercise the real Discord ingress, deferred batch, and native Gemini
+        # parts together. A familiar filename/author must not replace the
+        # current attachment's content with the previous screenshot's bytes.
+        messages = []
+        answers = ("First image fixture.", "Second image fixture.", "Current image unavailable.")
+        self.provider.side_effect = [provider_response(answer) for answer in answers]
+        for index, payload in enumerate((WEBP_FIRST, WEBP_SECOND, WEBP_SECOND)):
+            message = self.message(attachment_id=7131 + index)
+            attachment = message.attachments[0]
+            attachment.filename = "image.png"
+            attachment.content_type = "image/webp"
+            attachment.size = len(payload)
+            attachment.read.return_value = payload
+            if index == 2:
+                attachment.read.side_effect = OSError("fixture attachment unavailable")
+            messages.append(message)
+
+            with mock.patch.object(bot, "_reset_debounce"):
+                await bot.on_message(message)
+            attachment.read.assert_not_awaited()
+            self.assertEqual(self.provider.call_count, index)
+            bot._channel_last_reply_at[self.channel.id] = (
+                bot.datetime.now(bot.PACIFIC_TZ) - bot.timedelta(hours=2)
+            )
+            await bot._flush_channel_buffer(self.channel)
+
+            self.assertEqual(self.provider.call_count, index + 1)
+            self.assertEqual(self.channel.sent, list(answers[:index + 1]))
+            text, images = self.provider_parts()
+            expected_images = [] if index == 2 else [("image/webp", payload)]
+            self.assertEqual([(part.mime_type, part.data) for part in images], expected_images)
+            attachment.read.assert_awaited_once_with(use_cached=False)
+            origins = [line for line in text.splitlines() if "Current image attachment:" in line]
+            self.assertTrue(origins)
+            for origin in origins:
+                self.assertIn(f"message_id={message.id}; submitting_user_id=100", origin)
+                self.assertIn(f"attachment_id={attachment.id}", origin)
+                for previous in messages[:-1]:
+                    self.assertNotIn(f"attachment_id={previous.attachments[0].id}", origin)
+            if index == 2:
+                self.assertIn("Pixels unavailable in this request; metadata only.", text)
+                self.assertNotIn("Pixels supplied in this request.", text)
+
+        for message in messages:
+            message.attachments[0].read.assert_awaited_once_with(use_cached=False)
 
     async def test_unaddressed_image_outside_free_speak_is_not_downloaded(self):
         other = self.channel_fixture(8893)

@@ -11,6 +11,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 import bnl01_bot as bot
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
+WEBP = base64.b64decode("UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAdQmVJUq/+BiOh/AAA=")
 
 
 def image_message(user_id=101, message_id=201, attachment_id=301, **overrides):
@@ -53,6 +54,42 @@ class ConversationImageInputTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await bot.load_conversation_image_inputs(inputs, guild_id=guild_id, channel_id=channel_id), ())
         message.attachments[0].read.assert_not_awaited()
         self.assertEqual(inputs[0].status, "pending")
+
+    async def test_webp_mime_with_png_filename_is_loaded_without_conversion(self):
+        message = image_message(
+            filename="image.png", content_type="image/webp", size=len(WEBP),
+            read=mock.AsyncMock(return_value=WEBP),
+        )
+        inputs = bot.capture_message_image_inputs(message)
+        self.assertEqual(len(inputs), 1)
+        message.attachments[0].read.assert_not_awaited()
+        with self.assertLogs(level="INFO") as logs:
+            loaded = await bot.load_conversation_image_inputs(inputs, guild_id=1, channel_id=2)
+        request = bot.compose_conversation_image_request("Read the current screenshot.", loaded)
+        self.assertEqual([(part.mime_type, part.data) for part in request.images], [("image/webp", WEBP)])
+        self.assertIn("mime_type=image/webp", "\n".join(logs.output))
+        self.assertIn("status=loaded", "\n".join(logs.output))
+        message.attachments[0].read.assert_awaited_once_with(use_cached=False)
+
+    async def test_webp_mime_does_not_admit_other_riff_or_mismatched_image_bytes(self):
+        for data in (
+            b"RIFF", b"RIFF\x04\x00\x00\x00WEBP", PNG,
+            WEBP[:8] + b"WAVE" + WEBP[12:],
+            WEBP[:12] + b"JUNK" + WEBP[16:],
+        ):
+            with self.subTest(header=data[:16]):
+                message = image_message(
+                    content_type="image/webp", size=len(data),
+                    read=mock.AsyncMock(return_value=data),
+                )
+                inputs = bot.capture_message_image_inputs(message)
+                self.assertEqual(len(inputs), 1)
+                loaded = await bot.load_conversation_image_inputs(inputs, guild_id=1, channel_id=2)
+                self.assertEqual(loaded[0].status, "invalid_image_data")
+                request = bot.compose_conversation_image_request("Read this screenshot.", loaded)
+                self.assertIsInstance(request, str)
+                self.assertIn("Pixels unavailable", request)
+                self.assertFalse(loaded[0].data)
 
     async def test_shared_reference_read_is_once_even_for_overlapping_consumers(self):
         message = image_message()

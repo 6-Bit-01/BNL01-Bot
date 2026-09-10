@@ -19056,7 +19056,7 @@ CONVERSATION_IMAGE_MAX_BYTES = 4 * 1024 * 1024
 CONVERSATION_IMAGE_TOTAL_BYTES = 8 * 1024 * 1024
 CONVERSATION_IMAGE_MAX_DIMENSION = 4096
 CONVERSATION_IMAGE_READ_SECONDS = 8.0
-CONVERSATION_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg"})
+CONVERSATION_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 
 
 def capture_message_image_inputs(message) -> tuple[ConversationImageInput, ...]:
@@ -19139,6 +19139,11 @@ async def load_conversation_image_inputs(
                         valid_signature = isinstance(data, bytes) and (
                             (item.mime_type == "image/png" and data.startswith(b"\x89PNG\r\n\x1a\n"))
                             or (item.mime_type == "image/jpeg" and data.startswith(b"\xff\xd8\xff"))
+                            or (
+                                item.mime_type == "image/webp" and len(data) >= 20
+                                and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+                                and data[12:16] in (b"VP8 ", b"VP8L", b"VP8X")
+                            )
                         )
                         if not valid_signature:
                             item.status = "invalid_image_data"
@@ -19153,9 +19158,9 @@ async def load_conversation_image_inputs(
                         item.status = "read_unavailable"
                         logging.info("conversation_image_read_unavailable error_type=%s", type(exc).__name__)
                 logging.info(
-                    "conversation_image_input guild_id=%s channel_id=%s message_id=%s user_id=%s attachment_id=%s status=%s",
+                    "conversation_image_input guild_id=%s channel_id=%s message_id=%s user_id=%s attachment_id=%s mime_type=%s status=%s",
                     item.guild_id, item.channel_id, item.message_id,
-                    item.user_id, item.attachment_id, item.status,
+                    item.user_id, item.attachment_id, item.mime_type, item.status,
                 )
             if item.status == "loaded":
                 loaded_count += 1
