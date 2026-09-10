@@ -1643,7 +1643,7 @@ def _correlate_show_comments(
             continue
         aggregate = aggregates[track_key]
         aggregate["message_count"] += 1
-        aggregate["speakers"].add(event["speaker_key"])
+        aggregate["speakers"].add(_event_subject_key(event))
         if len(aggregate["samples"]) < 5:
             aggregate["samples"].append(event)
 
@@ -1716,7 +1716,7 @@ def _chat_topic_signals(
                 {"term": term, "message_indexes": set(), "speakers": set()},
             )
             signal["message_indexes"].add(index)
-            signal["speakers"].add(str(event.get("speaker_key") or ""))
+            signal["speakers"].add(_event_subject_key(event))
 
     candidates = []
     for signal in aggregates.values():
@@ -1932,7 +1932,80 @@ def _select_durable_comment_evidence(
     return sorted(selected, key=lambda item: int(item.get("occurred_at_ms") or 0))
 
 
-def _durable_comment_evidence_line(event: Mapping[str, Any]) -> str:
+def _comment_timing_evidence(
+    message: Mapping[str, Any],
+    operational_events: Sequence[Mapping[str, Any]],
+) -> str:
+    """Render occurrence-time evidence from retained chronology, including old ledgers."""
+
+    occurred_at_ms = int(message.get("occurredAtMs") or 0)
+    track_key = str(message.get("trackKey") or "")
+    track_label = str(message.get("trackLabel") or "")
+    events = sorted(
+        operational_events,
+        key=lambda event: (
+            int(event.get("occurredAtMs") or 0),
+            int(event.get("sequence") or 0),
+            str(event.get("eventId") or ""),
+        ),
+    )
+    previous = None
+    following = None
+    track_basis = None
+    active_key = ""
+    for event in events:
+        if int(event.get("occurredAtMs") or 0) > occurred_at_ms:
+            following = event
+            break
+        previous = event
+        event_type = str(event.get("eventType") or "")
+        event_track_key = str(event.get("trackKey") or "")
+        if event_type in _TRACK_WINDOW_START_TYPES:
+            # Every load starts a fresh window, including a reload of the same track.
+            active_key = event_track_key
+            track_basis = event
+        elif event_type in _TRACK_WINDOW_END_TYPES and (
+            not event_track_key or event_track_key == active_key
+        ):
+            active_key = ""
+            track_basis = None
+
+    def relative_event(event: Mapping[str, Any]) -> str:
+        event_type = str(event.get("eventType") or "unknown")
+        delta = int(event.get("occurredAtMs") or 0) - occurred_at_ms
+        relation = "before comment" if delta < 0 else "after comment" if delta > 0 else "at comment time"
+        return (
+            f"{event_type.replace('_', ' ')} ({event_type}) "
+            f"{abs(delta) / 1000:.3f}s {relation}"
+        )
+
+    parts = []
+    if track_label:
+        parts.append(f"track association={json.dumps(track_label, ensure_ascii=False)}")
+        if track_basis is not None and track_key and active_key == track_key:
+            parts.append("window basis: " + relative_event(track_basis))
+            if track_basis.get("eventType") == "track_loaded":
+                parts.append("playback unconfirmed (no recorded start in this window)")
+        else:
+            parts.append("window basis unavailable; playback unconfirmed")
+    else:
+        parts.append("show-level / between track windows")
+    if previous is not None:
+        parts.append("previous operation: " + relative_event(previous))
+    if following is not None:
+        parts.append("next operation: " + relative_event(following))
+    if events:
+        context = _operational_context_at(occurred_at_ms, events, ())
+        parts.append(f"wheel state at comment={context['wheelState']}")
+    else:
+        parts.append("operational timing unavailable")
+    return "; ".join(parts)
+
+
+def _durable_comment_evidence_line(
+    event: Mapping[str, Any],
+    operational_events: Sequence[Mapping[str, Any]] = (),
+) -> str:
     label = _bounded_text(event.get("track_label"), 180) or "show-level / between tracks"
     speaker = _bounded_text(event.get("speaker_label"), 90) or "TikTok viewer"
     text = _bounded_text(event.get("raw_text"), _DURABLE_EVIDENCE_TEXT_LIMIT)
@@ -1940,9 +2013,17 @@ def _durable_comment_evidence_line(event: Mapping[str, Any]) -> str:
         minute_offset = max(0.0, float(event.get("minute_offset") or 0.0))
     except (TypeError, ValueError, OverflowError):
         minute_offset = 0.0
+    timing = _comment_timing_evidence(
+        {
+            "occurredAtMs": event.get("occurred_at_ms"),
+            "trackKey": event.get("track_key"),
+            "trackLabel": event.get("track_label"),
+        },
+        operational_events,
+    )
     return (
         f"- t+{minute_offset:.1f}m | {label} | {speaker}: "
-        f"{json.dumps(text, ensure_ascii=False)}"
+        f"{json.dumps(text, ensure_ascii=False)} | {timing}"
     )
 
 
@@ -1990,8 +2071,8 @@ def tiktok_show_evidence_key(show: Any) -> str:
 
 def _event_subject_key(event: Mapping[str, Any]) -> str:
     return (
-        str(event.get("subject_ref") or "").strip()
-        or str(event.get("speaker_key") or "").strip()
+        str(event.get("subject_ref") or event.get("subjectRef") or "").strip()
+        or str(event.get("speaker_key") or event.get("speakerKey") or "").strip()
         or "unknown-viewer"
     )
 
@@ -2646,22 +2727,17 @@ def build_durable_show_prompt_context(
     )
     requested_keys = _requested_track_keys(user_text, ranked)
     total_messages = sum(int(item["message_count"]) for item in ranked)
-    unique_chatters = len(
-        {
-            str(event.get("speaker_key") or "")
-            for event in annotated_events
-            if str(event.get("speaker_key") or "")
-        }
-    )
+    unique_chatters = int((attendance_ledger.get("coverage") or {}).get("participantCount") or 0)
     lines = [
         "Durable TikTok show analysis context:",
         f"- Analysis intent={intent}.",
         f"- Show={show_label}; showDate={show_date}; status={status}; selectedFrom={source_key}.",
         (
             f"- Evidence: {len(annotated_events)} public TikTok comments/questions in the broadcast window; "
-            f"{total_messages} assigned to track windows; {unique_chatters} unique chatters; "
+            f"{total_messages} assigned to track windows; {unique_chatters} TikTok participants; "
             f"{unassigned} show-window messages were outside an active track window."
         ),
+        "- Participant counts (including unique chatters): distinct existing subject identities, falling back to source speaker keys when no subject is available.",
         (
             f"- Full-archive coverage: all {len(annotated_events)} eligible messages were considered for "
             "counts, recurrence, speaker breadth, timing, and representative-evidence selection. "
@@ -2785,7 +2861,7 @@ def build_durable_show_prompt_context(
                 ):
                     shown_evidence_keys.add(_durable_event_key(support))
                     lines.append(
-                        "  Support " + _durable_comment_evidence_line(support)[2:]
+                        "  Support " + _durable_comment_evidence_line(support, direct_operational_events)[2:]
                     )
         else:
             lines.append(
@@ -2806,7 +2882,7 @@ def build_durable_show_prompt_context(
             )
             for event in coverage_evidence:
                 shown_evidence_keys.add(_durable_event_key(event))
-                lines.append(_durable_comment_evidence_line(event))
+                lines.append(_durable_comment_evidence_line(event, direct_operational_events))
         lines.extend(
             [
                 "- Evidence authority: the grouped support and additional excerpts are the factual basis for claims about what people discussed. BNL's earlier replies are not evidence of what TikTok viewers discussed; track names, aggregate counts, and room continuity may only frame the request.",

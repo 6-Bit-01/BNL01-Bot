@@ -148,6 +148,28 @@ The packet-enabled case makes website transport unavailable on the follow-up
 and confirms stored ledger evidence reaches the actual packet assembly.
 These transport fixtures establish evidence delivery, not live model output.
 
+## Participant scope and comment timing
+
+Both show source renderers use the ledger's existing subject-first participant
+definition, falling back to the source speaker key when a subject is unavailable.
+TikTok participation, Discord participation, and combined-source identity totals
+are labeled separately. Track and language-signal breadth follow the same
+definition. Historical track counts are resolved from their retained message
+links at read time; this does not create identity bindings or rewrite ledgers.
+
+Each selected comment carries its surrounding operational event types and
+millisecond-derived time gaps, plus the wheel state at the comment's timestamp.
+An upcoming event is explicitly later than the comment. Track association also
+carries its recorded window basis: a load alone leaves playback unconfirmed;
+a recorded play-start belongs to that window, and a reload resets that basis.
+These are recorded chronology facts, not proof of causation or audible playback.
+
+The shared formatter derives this information from retained chronology, so
+already-finalized ledgers benefit without a migration or rebuild. Authored
+speaker/text pairs, source selection, date continuation, and natural generation
+remain with their existing owners. No new response classifier, wording guard,
+retry, fallback, or provider call is introduced.
+
 Live acceptance still needs to check grounded show recall and quotes, an
 ordinary continuation, a factual correction, a mixed-source question, current
 image interpretation, and provider-call/latency receipts. Finite generation
