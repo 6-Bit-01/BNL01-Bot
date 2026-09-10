@@ -447,6 +447,17 @@ def route_permits_continuity(route_mode: str, allowed_sources: Iterable[str] = (
     route = (route_mode or "").strip().lower()
     return route in CONVERSATION_CONTINUITY_ROUTES or "conversation_continuity" in set(allowed_sources or ())
 
+def conversation_routes_compatible(source_route: str, target_route: str) -> bool:
+    """Compare conversation scope without changing either source's route.
+
+    Response handling may change inside one conversation. This shares the
+    existing continuity routes; it does not grant source or public authority.
+    """
+    return source_route == target_route or (
+        route_permits_continuity(source_route)
+        and route_permits_continuity(target_route)
+    )
+
 def _tokens(text: str) -> set[str]:
     return {w for w in _WORD_RE.findall((text or "").lower()) if len(w) > 2 and w not in STOPWORDS}
 

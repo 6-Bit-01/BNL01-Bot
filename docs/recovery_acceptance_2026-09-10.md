@@ -1,6 +1,59 @@
 # September 10 recovery completion checkpoint
 
-## Current continuation: preserve directly addressed correction continuity
+## Current continuation: preserve Moments across conversational response routes
+
+PR531 is confirmed deployed at `51cdeeb089b50936c7360cb24739a11fa733a43c`,
+with the service restarted at 09:28:14 UTC under PID 1601101. The next live
+exchange in `bnl-testing` retained all four conversation rows, 8424 through
+8427, and their active ledger entries. Rows 8424/8425 used `normal_chat`;
+rows 8426/8427 used `direct_payload_task`. The directly addressed follow-up
+arrived at 09:30:19, nine seconds after the retained BNL answer.
+
+The follow-up wording supplied for the test included "about each", which the
+existing payload detector recognized as a list request. The source trace shows
+no `reply_to` edge, two rejected Moments with one human and one model entry
+each, and no canonical entry or episode. The first window was rejected when
+the route changed, well inside both time bounds. An isolated reproduction with
+the same first three texts and timestamps reproduces the split; changing only
+the follow-up route to `normal_chat` yields one qualified Moment and episode.
+
+The debug receipt's `model_save_skipped` was captured before the planned send
+path's actual persistence. The later log reports `saved=1` with
+`sealed_test_no_normal_durable_memory`, consistent with the stored rows.
+The receipt's memory-tier flag is not proof that conversation storage failed.
+BNL's new claims about a playback signal, track registration, and recording the
+clarification remain unsupported by the supplied evidence; they are not passes
+for answer grounding or a verified archive edit.
+
+This repair reuses Context v2's existing continuity route contract when
+resolving a retained reply, selecting and extending its Moment, and revalidating
+Moment members and human contributions. Source rows keep their original route
+labels, and the referenced raw answer is checked against its own retained
+route. Guild, channel, policy, visibility, source integrity, lifecycle, ordering,
+qualification, explicit topic changes, and time limits remain enforced.
+The change does not alter payload classification, public source-authority
+contracts, model-output authority, runtime gates, or historical rejected rows.
+
+Validation: all 92 focused Moment tests pass, including the exact live route
+transition and its reverse, database reopen, contribution rendering, mixed-route
+member lineage, and preserved source/scope checks. The required `make check`
+passes all 2,922 tests in 112.598 seconds. Independent review found no blocker.
+
+Scope remains the affected Moment formation and member-revalidation boundary,
+including its initial canonical entry and episode link. Existing episode
+selection/grouping across later response-route changes is not changed by this
+repair. Later continuation/recurrence, correction/retirement, and restart
+delivery still require their existing acceptance checks. Preserve the passed
+screenshot and original-quote checks.
+
+After merge and verified deployment, repeat the same two-message exchange with
+the actual Discord Reply action on the fresh BNL answer. Keep the follow-up
+inside the existing two-minute bound; its `direct_payload_task` route is part
+of this regression. After normal expiry, inspect the new source rows, retained
+reply edge, `window_reply_bound` receipt, qualified Moment, canonical entry, and
+initial episode link through targeted read-only evidence.
+
+## Earlier continuation: preserve directly addressed correction continuity
 
 PR530 is confirmed deployed at `b9abeb0feabf95e4e2f5478d5c92977da5db115f`,
 with BNL online under PID 1600886 after the 07:41:19 UTC restart. The following

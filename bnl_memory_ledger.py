@@ -18,6 +18,7 @@ import sqlite3
 from typing import Any, Iterable, Mapping
 import unicodedata
 
+from bnl_conversation_context_v2 import conversation_routes_compatible
 from bnl_canon_source_contract import (
     Confidence,
     LIVING_CANON_RECURRENCE_VERSION,
@@ -12590,8 +12591,9 @@ def resolve_conversation_reply_target(
     if (
         (role, entry_type, subject, predicate)
         != ("model", "derived_summary", BNL_SUBJECT_KEY, "model_output")
-        or (target_channel, policy, route, target_visibility)
-        != (channel_id, channel_policy, route_mode, visibility)
+        or (target_channel, policy, target_visibility)
+        != (channel_id, channel_policy, visibility)
+        or not conversation_routes_compatible(route, route_mode)
         or lifecycle not in {"active", "review_only"}
         or target_time is None
         or target_time > current_time
@@ -12608,7 +12610,7 @@ def resolve_conversation_reply_target(
         """SELECT content,timestamp FROM main.conversations
            WHERE id=? AND guild_id=? AND channel_id=? AND channel_policy=?
              AND route_mode=? AND role='model'""",
-        (target_row_id, guild_id, channel_id, channel_policy, route_mode),
+        (target_row_id, guild_id, channel_id, channel_policy, route),
     ).fetchone()
     if (
         original is None
