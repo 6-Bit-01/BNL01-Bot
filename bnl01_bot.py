@@ -157,6 +157,7 @@ from bnl_relationship_engine import (
 )
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
+    EXPLICIT_NEW_TOPIC_RE as _CONTEXTUAL_NEW_TOPIC_RE,
     STOPWORDS as CONVERSATION_CONTEXT_STOPWORDS,
     ConversationContextRequest,
     ConversationContextResult,
@@ -10559,11 +10560,6 @@ _CONTEXTUAL_FOLLOWTHROUGH_CUES_RE = re.compile(
     r"remember (?:that|this|when)|you (?:just|already|previously) said)\b",
     re.I,
 )
-_CONTEXTUAL_NEW_TOPIC_RE = re.compile(
-    r"^\s*(?:new topic|unrelated (?:question|topic)|separate (?:question|topic)|"
-    r"changing subjects?|different subject)\b",
-    re.I,
-)
 
 
 def contextual_followthrough_requested(text: str) -> bool:
@@ -18528,7 +18524,7 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     conn.close()
     return int(row[0] if row else 0) == 0
 
-def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, directed_to_bnl: bool = False):
+def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, directed_to_bnl: bool = False, reply_to_conversation_row_id: int = 0):
     decision = decide_memory_write_policy(route_mode, channel_policy, "user", content, False)
     if not decision.save_conversation:
         logging.info("memory_write_policy_skip_conversation role=user route_mode=%s reason=%s", route_mode, decision.reason)
@@ -18606,6 +18602,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
             ledger_conn, row_id=row_id, user_id=user_id, user_name=user_name, guild_id=guild_id, role="user",
             content=content, channel_name=(channel_name or "").lower()[:80], channel_policy=(channel_policy or "unknown")[:40],
             channel_id=int(channel_id or 0), message_id=int(message_id or 0) or None, route_mode=route_mode, observed_at=observed_at,
+            reply_to_conversation_row_id=reply_to_conversation_row_id,
         ),
         guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id),
     )
@@ -47165,7 +47162,7 @@ async def on_message(message: discord.Message):
             active_direct_session=active_same_user_session,
             conversation_surface=conversation_surface,
         )
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
 
         if await _maybe_start_deferred_payload_session(
             message,
@@ -47773,7 +47770,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
 
         self_reflection = (
             ""
@@ -48254,7 +48251,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan))
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
 
         self_reflection = (
             ""

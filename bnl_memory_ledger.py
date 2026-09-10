@@ -94,7 +94,7 @@ ENTRY_TYPES = frozenset({
     "observation", "claim", "event", "preference", "boundary", "goal", "open_loop", "commitment",
     "shared_moment", "relationship_event", "canon_reference", "show_event", "unresolved_question", "derived_summary",
 })
-LINEAGE_TYPES = frozenset({"derived_from", "correction_of", "supersedes", "retracts", "duplicate_of", "part_of_moment"})
+LINEAGE_TYPES = frozenset({"derived_from", "correction_of", "supersedes", "retracts", "duplicate_of", "part_of_moment", "reply_to"})
 OUTCOMES = frozenset({"inserted", "deduplicated", "skipped", "error"})
 ACTIVE_LIFECYCLE = "active"
 REVIEW_ONLY_LIFECYCLE = "review_only"
@@ -12539,6 +12539,86 @@ def _current_first_party_fact(
     return str(rows[0][0] or ""), str(rows[0][1] or "")
 
 
+def resolve_conversation_reply_target(
+    conn: sqlite3.Connection,
+    *,
+    reply_to_conversation_row_id: int,
+    row_id: int,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    route_mode: str,
+    visibility: str,
+    observed_at: str,
+    source_sequence: int,
+) -> str:
+    """Resolve a structural reply to one unchanged retained BNL source.
+
+    The caller supplies trusted Discord addressing, never an ID extracted from
+    prose. A reply is not a correction, factual ancestry, or public authority.
+    This same check runs again when the Moment observer consumes the edge.
+    """
+    target_row_id = int(reply_to_conversation_row_id or 0)
+    current_time = _parse_knowledge_time(observed_at)
+    if (
+        not 0 < target_row_id < int(row_id or 0)
+        or int(guild_id or 0) <= 0
+        or int(channel_id or 0) <= 0
+        or current_time is None
+        or not {"id", "guild_id", "channel_id", "channel_policy", "route_mode",
+                "role", "content", "timestamp"}.issubset(
+                    _main_table_columns(conn, "conversations")
+                )
+        or not _main_table_columns(conn, "memory_ledger_entries")
+    ):
+        return ""
+    rows = conn.execute(
+        """
+        SELECT entry_id,source_role,entry_type,subject_key,predicate_key,
+               channel_id,channel_policy,route_mode,visibility,lifecycle_status,
+               observed_at,source_sequence,normalized_value
+        FROM main.memory_ledger_entries
+        WHERE guild_id=? AND source_table='conversations' AND source_row_id=?
+        """,
+        (guild_id, str(target_row_id)),
+    ).fetchall()
+    if len(rows) != 1:
+        return ""
+    (entry_id, role, entry_type, subject, predicate, target_channel, policy,
+     route, target_visibility, lifecycle, target_at, sequence, value) = rows[0]
+    target_time = _parse_knowledge_time(target_at)
+    if (
+        (role, entry_type, subject, predicate)
+        != ("model", "derived_summary", BNL_SUBJECT_KEY, "model_output")
+        or (target_channel, policy, route, target_visibility)
+        != (channel_id, channel_policy, route_mode, visibility)
+        or lifecycle not in {"active", "review_only"}
+        or target_time is None
+        or target_time > current_time
+        or not 0 < int(sequence or 0) < int(source_sequence or 0)
+        or conn.execute(
+            """SELECT 1 FROM main.memory_ledger_lineage
+               WHERE target_entry_id=? AND lineage_type IN
+                 ('correction_of','supersedes','retracts') LIMIT 1""",
+            (entry_id,),
+        ).fetchone()
+    ):
+        return ""
+    original = conn.execute(
+        """SELECT content,timestamp FROM main.conversations
+           WHERE id=? AND guild_id=? AND channel_id=? AND channel_policy=?
+             AND route_mode=? AND role='model'""",
+        (target_row_id, guild_id, channel_id, channel_policy, route_mode),
+    ).fetchone()
+    if (
+        original is None
+        or str(original[0] or "")[:500] != value
+        or _parse_knowledge_time(original[1]) != target_time
+    ):
+        return ""
+    return str(entry_id)
+
+
 def shadow_conversation_row(
     conn: sqlite3.Connection,
     *,
@@ -12556,6 +12636,7 @@ def shadow_conversation_row(
     observed_at: str = "",
     source_sequence: int | None = None,
     conversation_target_user_ids: tuple[int, ...] = (),
+    reply_to_conversation_row_id: int = 0,
     environ: dict[str, str] | None = None,
 ) -> LedgerWriteResult:
     role_norm = (role or "").lower()
@@ -12602,6 +12683,19 @@ def shadow_conversation_row(
         visibility,
         Confidence.MEDIUM,
     )
+    observed_at = observed_at or _now()
+    reply_target = resolve_conversation_reply_target(
+        conn,
+        reply_to_conversation_row_id=reply_to_conversation_row_id,
+        row_id=row_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        channel_policy=channel_policy,
+        route_mode=route_mode,
+        visibility=visibility.value,
+        observed_at=observed_at,
+        source_sequence=int(source_sequence or row_id),
+    ) if reply_to_conversation_row_id else ""
     result = insert_ledger_entry(
         conn,
         LedgerEntry(
@@ -12628,6 +12722,7 @@ def shadow_conversation_row(
             observed_at=observed_at or _now(),
             source_sequence=int(source_sequence or row_id),
             participants=(LedgerParticipant(subject_key, user_name or "", "author", 0),),
+            lineage=(("reply_to", reply_target),) if reply_target else (),
         ),
     )
     if result.outcome == "inserted":

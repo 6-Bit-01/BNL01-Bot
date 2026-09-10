@@ -17,6 +17,7 @@ import sqlite3
 from typing import Any
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
+from bnl_conversation_context_v2 import EXPLICIT_NEW_TOPIC_RE
 from bnl_memory_ledger import (
     BNL_SUBJECT_KEY,
     LedgerEntry,
@@ -25,6 +26,7 @@ from bnl_memory_ledger import (
     form_atomic_candidates_from_moment,
     insert_ledger_entry,
     record_atomic_knowledge_processing_error,
+    resolve_conversation_reply_target,
     shadow_enabled as ledger_shadow_enabled,
 )
 
@@ -2541,6 +2543,67 @@ def _mark_targets_for_correction(conn: sqlite3.Connection, source: SourceEntry) 
     return count
 
 
+def _reply_target_moment(conn: sqlite3.Connection, source: SourceEntry) -> str:
+    """Find the still-open Moment named by one revalidated structural reply."""
+    if not source.is_human or EXPLICIT_NEW_TOPIC_RE.search(source.normalized_value):
+        return ""
+    targets = conn.execute(
+        """SELECT l.target_entry_id,e.source_row_id
+           FROM memory_ledger_lineage l
+           LEFT JOIN memory_ledger_entries e ON e.entry_id=l.target_entry_id
+           WHERE l.entry_id=? AND l.guild_id=? AND l.lineage_type='reply_to'""",
+        (source.entry_id, source.guild_id),
+    ).fetchall()
+    if len(targets) != 1 or not str(targets[0][1] or "").isdigit():
+        return ""
+    row_id = conn.execute(
+        "SELECT source_row_id FROM memory_ledger_entries WHERE entry_id=?",
+        (source.entry_id,),
+    ).fetchone()[0]
+    if not str(row_id or "").isdigit():
+        return ""
+    target = resolve_conversation_reply_target(
+        conn,
+        reply_to_conversation_row_id=int(targets[0][1]),
+        row_id=int(row_id),
+        guild_id=source.guild_id,
+        channel_id=source.channel_id,
+        channel_policy=source.channel_policy,
+        route_mode=source.route_mode,
+        visibility=source.visibility,
+        observed_at=source.observed_at,
+        source_sequence=source.source_sequence,
+    )
+    if not target or target != targets[0][0]:
+        return ""
+    windows = conn.execute(
+        """SELECT w.moment_id,w.window_started_at,w.last_activity_at,w.public_usable
+           FROM memory_moment_members m
+           JOIN memory_moment_windows w ON w.moment_id=m.moment_id
+           WHERE m.ledger_entry_id=? AND w.lifecycle_status='open'
+             AND w.guild_id=? AND w.channel_id=? AND w.channel_policy=?
+             AND w.route_mode=? AND w.visibility=?""",
+        (target, source.guild_id, source.channel_id, source.channel_policy,
+         source.route_mode, source.visibility),
+    ).fetchall()
+    if len(windows) != 1:
+        return ""
+    mid, started, last, public_usable = windows[0]
+    ts = _parse_ts(source.observed_at)
+    if (
+        not 0 <= (ts - _parse_ts(last)).total_seconds() <= INACTIVITY_SECONDS
+        or not 0 <= (ts - _parse_ts(started)).total_seconds() <= MAX_WINDOW_SECONDS
+    ):
+        return ""
+    failure, _ = _moment_source_failure(
+        conn, moment_id=mid, rows=_entries(conn, mid),
+        guild_id=source.guild_id, channel_id=source.channel_id,
+        channel_policy=source.channel_policy, route_mode=source.route_mode,
+        visibility=source.visibility, public_usable=bool(public_usable),
+    )
+    return "" if failure else mid
+
+
 def observe_ledger_entry(conn: sqlite3.Connection, ledger_entry_id: str) -> MomentObservationResult:
     if not shadow_enabled():
         return MomentObservationResult(reason_code="moment_gate_disabled", ledger_entry_id=ledger_entry_id)
@@ -2596,22 +2659,34 @@ def observe_ledger_entry(conn: sqlite3.Connection, ledger_entry_id: str) -> Mome
         meaningful = _meaningful(source.normalized_value, source.source_role, source.predicate_key)
         ts = _parse_ts(source.observed_at)
         chosen = ""
+        reply_moment = _reply_target_moment(conn, source)
+        new_topic = source.is_human and bool(EXPLICIT_NEW_TOPIC_RE.search(source.normalized_value))
         open_rows = conn.execute(
             """
-            SELECT moment_id,window_started_at,last_activity_at,channel_policy,visibility,topic_family,topic_signature
+            SELECT moment_id,window_started_at,last_activity_at,channel_policy,visibility,topic_family,topic_signature,route_mode
             FROM memory_moment_windows
             WHERE guild_id=? AND channel_id=? AND lifecycle_status='open'
             ORDER BY last_activity_at DESC, moment_id
             """,
             (source.guild_id, source.channel_id),
         ).fetchall()
+        if reply_moment:
+            open_rows.sort(key=lambda row: row[0] != reply_moment)
         for row in open_rows:
-            mid, started, last, policy, visibility, win_family, win_sig_raw = row
+            mid, started, last, policy, visibility, win_family, win_sig_raw, route = row
             expired = (ts - _parse_ts(last)).total_seconds() > INACTIVITY_SECONDS or (ts - _parse_ts(started)).total_seconds() > MAX_WINDOW_SECONDS
-            incompatible = policy != source.channel_policy or visibility != source.visibility
+            incompatible = policy != source.channel_policy or visibility != source.visibility or route != source.route_mode
             if expired or incompatible:
                 finalize_moment(conn, mid)
                 continue
+            if new_topic:
+                finalize_moment(conn, mid)
+                _diag(conn, source.guild_id, "window_split", "explicit_topic_change", mid, source.entry_id)
+                continue
+            if mid == reply_moment:
+                chosen = mid
+                _diag(conn, source.guild_id, "window_reply_bound", "exact_discord_reply", mid, source.entry_id)
+                break
             if source.is_model or not meaningful:
                 if not chosen:
                     chosen = mid
