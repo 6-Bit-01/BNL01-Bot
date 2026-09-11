@@ -14700,14 +14700,23 @@ def _named_public_member_subjects(
 
     A name is a lookup key for its Discord account, never authority to merge
     that account with a similarly named person on another platform. Duplicate
-    labels stay unresolved unless the current turn already supplies one typed
-    subject identity. Canon names continue through the existing canon owner.
+    labels, including spacing variants, stay unresolved unless the current
+    turn already supplies one typed subject identity. Word boundaries already
+    present in a spaced or CamelCase label may be written with or without
+    spaces. Canon names continue through the existing canon owner.
     """
     value = str(text or "")
     if guild is None or not value.strip():
         return (), ()
     aliases: dict[str, set[int]] = {}
     labels: dict[str, str] = {}
+    member_labels: dict[tuple[str, int], str] = {}
+    label_patterns: dict[str, set[str]] = {}
+    canon_keys = {
+        re.sub(r"\s+", "", str(alias)).casefold()
+        for identity in CANON_ENTITY_IDENTITIES
+        for alias in (identity.name, *identity.aliases)
+    }
     owner_user_id = int(BNL_OWNER_USER_ID or 0)
     for member in getattr(guild, "members", ()) or ():
         user_id = int(getattr(member, "id", 0) or 0)
@@ -14726,19 +14735,23 @@ def _named_public_member_subjects(
             label = _safe_prompt_display_label(literal, "")
             if not label or label.casefold() != literal.casefold():
                 continue
-            if any(
-                label.casefold() == str(alias).casefold()
-                for identity in CANON_ENTITY_IDENTITIES
-                for alias in (identity.name, *identity.aliases)
-            ):
+            key = re.sub(r"\s+", "", label).casefold()
+            if key in canon_keys:
                 continue
-            key = label.casefold()
             labels.setdefault(key, label)
+            member_labels.setdefault((key, user_id), label)
             aliases.setdefault(key, set()).add(user_id)
+            words = re.split(
+                r"\s+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])",
+                label,
+            )
+            label_patterns.setdefault(key, set()).add(
+                r"[^\S\r\n]*".join(re.escape(word) for word in words)
+            )
     matches = []
     for key, user_ids in aliases.items():
         for match in re.finditer(
-            r"(?<!\w)%s(?!\w)" % re.escape(labels[key]), value, re.I,
+            r"(?<!\w)(?:%s)(?!\w)" % "|".join(sorted(label_patterns[key])), value, re.I,
         ):
             matches.append((match.start(), match.end(), key, user_ids))
     # A full long label must not also bind a different account whose name is
@@ -14777,7 +14790,7 @@ def _named_public_member_subjects(
             unresolved.append(labels[key])
             continue
         user_id = next(iter(candidates))
-        resolved.setdefault(user_id, labels[key])
+        resolved.setdefault(user_id, member_labels[(key, user_id)])
     return tuple(resolved.items()), tuple(dict.fromkeys(unresolved))
 
 

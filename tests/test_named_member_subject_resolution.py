@@ -41,15 +41,16 @@ class NamedMemberSubjectResolutionTests(unittest.TestCase):
             name=username or label, bot=bot_member,
         )
 
-    def frame(self, text, *, addressings=(), policy="sealed_test"):
+    def frame(self, text, *, addressings=(), policy="sealed_test", speakers=(111,)):
         decision = bot.build_live_conversation_orchestration_decision(
             engagement_decision="answer", engagement_reason="question",
             channel_policy=policy, addressings=addressings,
             context_result=None, moment_situation=None, guild_id=1,
             channel_id=10, route_mode="normal_chat",
             conversation_surface=bot.conversation_surface_for_channel_policy(policy),
-            current_text=text, current_speaker_user_ids=(111,),
-            current_speaker_labels=("Test Requester",), influence_mode="live",
+            current_text=text, current_speaker_user_ids=speakers,
+            current_speaker_labels=tuple("Test Requester" for _ in speakers),
+            influence_mode="live",
         )
         return decision.situation_frame
 
@@ -126,6 +127,70 @@ class NamedMemberSubjectResolutionTests(unittest.TestCase):
         frame = self.frame("What has TEST_MARBLES said about the costumes?")
         self.assertEqual(tuple(s.user_id for s in frame.subjects), (222,))
         self.assertEqual(frame.subjects[0].label_hint, "test_marbles")
+
+    def test_complete_label_word_spacing_keeps_one_stable_subject(self):
+        for label, query_label in (
+            ("TestMarbles", "Test Marbles"),
+            ("TestMarbles", "test   marbles"),
+            ("Test Marbles", "TestMarbles"),
+            ("Test Marbles", "TEST MARBLES"),
+        ):
+            with self.subTest(label=label, query_label=query_label):
+                self.members[:] = [self.member(222, label)]
+                frame = self.frame(f"What has {query_label} said about costumes?")
+                self.assertEqual(frame.status, "resolved")
+                self.assertEqual(tuple(s.user_id for s in frame.subjects), (222,))
+                self.assertEqual(frame.subjects[0].label_hint, label)
+
+    def test_spacing_collision_requires_typed_disambiguation(self):
+        self.members.append(self.member(333, "Test Marbles"))
+        for label in ("TestMarbles", "Test Marbles"):
+            text = f"What has {label} said about costumes?"
+            with self.subTest(label=label):
+                frame = self.frame(text)
+                self.assertEqual(frame.status, "ambiguous")
+                self.assertIn("member_label_unresolved", frame.ambiguity_reasons)
+                for user_id, actual_label in ((222, "TestMarbles"), (333, "Test Marbles")):
+                    references, unresolved = bot._named_public_member_subjects(
+                        self.guild, text, typed_subject_user_ids=(user_id,),
+                    )
+                    self.assertEqual(references, ((user_id, actual_label),))
+                    self.assertEqual(unresolved, ())
+
+    def test_spacing_does_not_allow_fragments_or_punctuation_substitution(self):
+        for label in ("Marbles", "Test Marble", "Test MarblesExtra", "Test-Marbles", "T e s t M a r b l e s"):
+            with self.subTest(label=label):
+                self.assertEqual(bot._named_public_member_subjects(
+                    self.guild, f"What has {label} said about costumes?",
+                ), ((), ()))
+
+    def test_spaced_subject_in_two_person_batch_reads_original_public_author(self):
+        text = (
+            "What correction did I give you about the stage schedule?\n"
+            "What has Test Marbles said about stealing pants?"
+        )
+        authored = "I keep stealing pants from the costume rack."
+        self.seed(910, 222, authored)
+        self.seed(911, 111, "I steal pants from an unrelated set.")
+        self.seed(912, 222, "My private pants note stays here.", policy="internal_controlled")
+        frame = self.frame(text, speakers=(111, 444))
+        self.assertEqual(tuple(s.user_id for s in frame.subjects), (222,))
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = os.path.join(directory, "conversation-sources.db")
+            with sqlite3.connect(source_path) as disk_source:
+                self.conn.backup(disk_source)
+            with mock.patch.object(bot, "DB_FILE", source_path):
+                context, basis = bot.build_named_public_conversation_context(
+                    situation_frame=frame, guild_id=1,
+                    route_mode="normal_chat", channel_policy="sealed_test",
+                    user_text=text, channel_id=10, channel_name="bnl-testing",
+                )
+        self.assertIn(authored, context)
+        self.assertNotIn("unrelated set", context)
+        self.assertNotIn("private pants", context)
+        self.assertIsNotNone(basis)
+        self.assertEqual({item.speaker_user_id for item in basis.evidence_items}, {222})
 
     def test_longer_label_wins_only_for_the_same_text_span(self):
         self.members[:] = [self.member(222, "Test Member"), self.member(333, "Test")]
