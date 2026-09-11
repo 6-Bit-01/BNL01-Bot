@@ -5479,8 +5479,13 @@ def select_public_situation_moment_gists(
     freshness_days: int = 3650,
     allowed_channel_policies: tuple[str, ...] = (),
     max_results: int = 6,
+    require_topic_overlap: bool = False,
 ) -> tuple[PublicSituationMomentGist, ...]:
-    """Return bounded source-revalidated Moment summaries for event queries."""
+    """Return bounded source-revalidated Moment summaries for event queries.
+
+    Topic associations may carry existing participant gists, read from their
+    original owners. The canonical stored summary remains unchanged.
+    """
 
     ensure_moment_schema(conn)
     policies = tuple(
@@ -5495,6 +5500,8 @@ def select_public_situation_moment_gists(
     if not policies:
         return ()
     relevance_text = _recall_topic_focus(topic_text)
+    if require_topic_overlap:
+        relevance_text = re.sub(r"\bbnl\b", "", relevance_text, flags=re.I)
     family = _topic_family(relevance_text, "conversation")
     signature = _topic_signature(relevance_text, "conversation")
     if not broad_recall and not signature:
@@ -5524,12 +5531,14 @@ def select_public_situation_moment_gists(
     seen: set[str] = set()
     used_words = 0
     for row in rows:
+        if require_topic_overlap and len(selected) >= max(1, int(max_results or 0)):
+            break
         moment_id = str(row[0] or "")
         summary = re.sub(r"\s+", " ", str(row[1] or "")).strip()
         visibility = str(row[4] or "unknown")
         if (
             not summary
-            or summary.casefold() in seen
+            or (not require_topic_overlap and summary.casefold() in seen)
             or visibility not in {"public", "public_safe"}
         ):
             continue
@@ -5538,6 +5547,13 @@ def select_public_situation_moment_gists(
             signature,
             str(row[2] or ""),
             _load_sig(str(row[3] or "[]")),
+        ):
+            continue
+        # A broad topic family alone is insufficient for an unsolicited
+        # association. Keep the existing coherence rule and require at least
+        # one actual shared topic term as well.
+        if require_topic_overlap and not set(signature).intersection(
+            _load_sig(str(row[3] or "[]"))
         ):
             continue
         if not _moment_is_renderable(
@@ -5552,6 +5568,36 @@ def select_public_situation_moment_gists(
             canonical_ledger_entry_id=str(row[10] or ""),
         ):
             continue
+        if require_topic_overlap:
+            contributions = []
+            participants = conn.execute(
+                """
+                SELECT participant_key FROM memory_moment_participants
+                WHERE moment_id=? AND participant_role='human_author'
+                  AND authored_entry_count>0
+                ORDER BY participation_order,participant_key LIMIT 12
+                """,
+                (moment_id,),
+            ).fetchall()
+            for index, (participant_key,) in enumerate(participants, start=1):
+                gist, _historical_label = _contribution_is_renderable(
+                    conn,
+                    moment_id=moment_id,
+                    participant_key=str(participant_key),
+                    guild_id=int(guild_id or 0),
+                    channel_id=int(row[7] or 0),
+                    channel_policy=str(row[8] or ""),
+                    route_mode=str(row[9] or "unknown"),
+                    visibility=visibility,
+                )
+                if gist:
+                    contributions.append(f"Original participant {index}: {gist}")
+                if len(contributions) >= 3:
+                    break
+            if contributions:
+                summary += " Historical contributions: " + " | ".join(contributions)
+            if summary.casefold() in seen:
+                continue
         words = summary.split()
         if (
             used_words + len(words) > max(1, int(token_budget or 0))
@@ -5646,6 +5692,7 @@ def select_situation_aware_episode_gists(
     broad_recall: bool = False,
     allowed_channel_policies: tuple[str, ...] = (),
     max_results: int = 4,
+    topic_association: bool = False,
 ) -> tuple[SituationAwareEpisodeGist, ...]:
     """Apply one frame to existing Moment/episode projections, read-only."""
 
@@ -5657,6 +5704,10 @@ def select_situation_aware_episode_gists(
         )
         else ""
     )
+    # Association is historical subject-independent context. A caller may not
+    # use it to broaden a participant request or resume a different event.
+    if topic_association and (participant_key or frame_event_ref or broad_recall):
+        return ()
     source_rows: list[dict[str, Any]] = []
     if typed_participant:
         for gist in select_public_participant_moment_gists(
@@ -5692,7 +5743,8 @@ def select_situation_aware_episode_gists(
             token_budget=240,
             freshness_days=3650,
             allowed_channel_policies=allowed_channel_policies,
-            max_results=12,
+            max_results=max_results if topic_association else 12,
+            require_topic_overlap=topic_association,
         ):
             source_rows.append(
                 {
@@ -5711,7 +5763,9 @@ def select_situation_aware_episode_gists(
         return ()
 
     relation = str(frame_event_relation or "uncertain").strip().lower()
-    if relation in {"new_event_same_participant", "new_event_or_uncertain"}:
+    if not topic_association and relation in {
+        "new_event_same_participant", "new_event_or_uncertain"
+    }:
         return ()
     anchor = (
         _episode_projection_for_moment(conn, str(frame_event_ref or ""))
@@ -5734,7 +5788,7 @@ def select_situation_aware_episode_gists(
             or episode["episode_id"] != anchor["episode_id"]
         ):
             continue
-        if (
+        if not topic_association and (
             _EPISODE_NEXT_QUERY_RE.search(str(topic_text or ""))
             and anchor is not None
             and (
@@ -5744,7 +5798,7 @@ def select_situation_aware_episode_gists(
             )
         ):
             continue
-        if (
+        if not topic_association and (
             _EPISODE_OPEN_QUERY_RE.search(str(topic_text or ""))
             and (episode is None or episode["open_loop_count"] <= 0)
         ):
@@ -5754,16 +5808,24 @@ def select_situation_aware_episode_gists(
         )
         frame_type = str(source["frame_type"] or "")
         phase = str(frame_phase or "").strip().lower()
-        if (
+        if not topic_association and (
             (_EPISODE_CHANGE_QUERY_RE.search(str(topic_text or "")) or phase == "correction")
             and "correction" not in semantic_types
             and frame_type
             not in {"correction", "correction_replacement", "replacement"}
         ):
             continue
-        if phase == "retest" and "retest" not in semantic_types:
+        if (
+            not topic_association
+            and phase == "retest"
+            and "retest" not in semantic_types
+        ):
             continue
-        if phase == "completion" and "outcome" not in semantic_types:
+        if (
+            not topic_association
+            and phase == "completion"
+            and "outcome" not in semantic_types
+        ):
             continue
         link_role = str(episode["link_role"] if episode else "standalone")
         derived_relation = {
@@ -5796,15 +5858,19 @@ def select_situation_aware_episode_gists(
                     source["canonical_ledger_entry_id"] or ""
                 ),
                 subject_key=str(source["subject_key"] or ""),
-                event_relation=derived_relation,
+                event_relation=(
+                    "topic_related" if topic_association else derived_relation
+                ),
                 uncertainty_status=(
-                    "source_backed_episode"
+                    "topic_association_only"
+                    if topic_association
+                    else "source_backed_episode"
                     if episode is not None
                     else "standalone_moment_only"
                 ),
             )
         )
-    if relation == "resume" and not anchor:
+    if not topic_association and relation == "resume" and not anchor:
         episode_ids = {
             item.episode_id
             for item in selected
