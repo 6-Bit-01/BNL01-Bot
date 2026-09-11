@@ -2303,6 +2303,15 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
             (str(old_row_id),),
         )[0][0]
         with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            # This case exercises cleanup once no retained tier needs the
+            # source. Tier-backed retention is covered by its own lifecycle
+            # regressions; a useful retained tier must now prevent this purge.
+            conn.execute(
+                "DELETE FROM memory_tiers WHERE guild_id=1 AND id IN "
+                "(SELECT tier_row_id FROM memory_tier_conversation_sources "
+                "WHERE guild_id=1 AND conversation_row_id=?)",
+                (old_row_id,),
+            )
             legacy_raw = ledger.insert_ledger_entry(
                 conn,
                 ledger.LedgerEntry(
