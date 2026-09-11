@@ -2952,6 +2952,34 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertIn("journal_publication", selected_lanes)
         self.assertIn("website_read_model", selected_lanes)
 
+    def test_unresolved_episode_keeps_valid_conversation_without_guessing_a_subject(self):
+        self.add_conversation_context_row()
+        request = replace(
+            self.public_request(text="Continue our archive discussion. What remains unresolved?"),
+            frame_revision="sf_resume_context", frame_schema_version="situation_frame_v1",
+            frame_input_evidence_digest="d" * 64,
+            frame_status="ambiguous", frame_event_relation="resume_unresolved",
+            frame_subject_requirement="not_applicable",
+            frame_ambiguity_reasons=("resume_target_unresolved",),
+        )
+        packet = build_packet(self.conn, request, environ=self.flags)
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet.subject_resolution.status, "not_applicable")
+        self.assertIn("conversation:900", {item.source_ref for item in packet.items})
+        self.assertFalse(any(item.lane == "episode" for item in packet.items))
+        self.assertTrue(revalidate_packet(self.conn, packet).valid)
+        self.conn.execute("UPDATE conversations SET content='The project remains unconfirmed' WHERE id=900")
+        self.assertFalse(revalidate_packet(self.conn, packet).valid)
+
+        for changes in (
+            {"frame_subject_requirement": "required"},
+            {"frame_ambiguity_reasons": ("resume_target_unresolved", "multiple_subject_candidates")},
+            {"frame_status": "blocked"},
+        ):
+            with self.subTest(changes=changes):
+                blocked = build_packet(self.conn, replace(request, **changes), environ=self.flags)
+                self.assertFalse(any(item.lane == "conversation_context" for item in blocked.items))
+
     def test_publication_task_survives_only_unrelated_subject_ambiguity(self):
         publication = IntelligencePacketItem(
             lane="journal_publication",

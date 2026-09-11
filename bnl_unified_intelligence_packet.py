@@ -985,7 +985,16 @@ def resolve_packet_subject(
             candidate_count=len(candidates),
             reason_codes=("frame_blocked",),
         )
-    if frame_status == "ambiguous" or len(candidates) > 1:
+    # An unresolved episode referent is not an unresolved person. Keep the
+    # event ambiguity in the frame and episode reader, while allowing already
+    # scoped, source-revalidated conversation evidence to reach the packet.
+    event_only_ambiguity = bool(
+        frame_status == "ambiguous"
+        and set(request.frame_ambiguity_reasons) == {"resume_target_unresolved"}
+        and request.frame_subject_requirement == "not_applicable"
+        and not candidates
+    )
+    if (frame_status == "ambiguous" and not event_only_ambiguity) or len(candidates) > 1:
         return PacketSubjectResolution(
             status="ambiguous",
             candidate_count=len(candidates),
