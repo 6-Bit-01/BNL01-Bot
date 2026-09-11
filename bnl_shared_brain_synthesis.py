@@ -2979,7 +2979,11 @@ def render_packet_context(
         if item.lane == "moment":
             qualifier = "; paraphrase only"
         elif item.lane == "episode":
-            qualifier = "; frame-bound; paraphrase only"
+            if item.usage == "historical_topic_context":
+                label = "related historical Moment"
+                qualifier = "; topic association only; paraphrase only"
+            else:
+                qualifier = "; frame-bound; paraphrase only"
         elif item.lane == "show_episode":
             qualifier = (
                 "; first-party public chronology; no unseen studio events"
@@ -3148,6 +3152,10 @@ def render_packet_context(
     show_episode_present = any(
         item.lane == "show_episode" for item in packet.items
     )
+    topic_association_present = any(
+        item.lane == "episode" and item.usage == "historical_topic_context"
+        for item in packet.items
+    )
     lead_rule = (
         "- Lead with BNL noticing the familiar or similar signal, then connect "
         "it to the approved origin. Do not claim or imply a Discord activity "
@@ -3159,6 +3167,12 @@ def render_packet_context(
         else "- Lead with the requested show finding from the finalized show "
         "evidence. Do not lead with data availability, routing, or lore.\n"
         if show_episode_present
+        else "- Lead with the current conversation. Related historical Moments "
+        "are optional background when useful; no callback is required. Keep "
+        "their original people and situation distinct: sharing a topic does "
+        "not mean this speaker participated, that the old event is continuing, "
+        "or that one experience establishes a recurring pattern.\n"
+        if topic_association_present
         else "- Lead with member-specific substance. Relevant BARCODE canon "
         "may add one concise context anchor afterward, but can never "
         "substitute for the public assessment or become its governing "

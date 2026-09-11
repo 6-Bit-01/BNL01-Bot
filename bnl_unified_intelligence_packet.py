@@ -2862,6 +2862,28 @@ def _episode_projection_digest(
     )
 
 
+def _topic_association_requested(request: IntelligencePacketRequest) -> bool:
+    """Ordinary subject-independent talk may use related historical context."""
+
+    return bool(
+        request.frame_revision
+        and request.frame_status == "resolved"
+        and request.frame_subject_requirement == "not_applicable"
+        and not request.immediate_recap
+        and not _EPISODE_QUERY_RE.search(str(request.user_text or ""))
+    )
+
+
+def _historical_topic_item(item: IntelligencePacketItem) -> bool:
+    return bool(
+        item.lane == "episode"
+        and item.source_type == "historical_topic_gist"
+        and item.usage == "historical_topic_context"
+        and item.event_relation == "topic_related"
+        and item.uncertainty_status == "topic_association_only"
+    )
+
+
 def _episode_items(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
@@ -2871,7 +2893,10 @@ def _episode_items(
 ) -> list[IntelligencePacketItem]:
     """Read one frame-bound Moment/episode lane without owning lifecycle."""
 
-    if not _EPISODE_QUERY_RE.search(str(request.user_text or "")):
+    topic_association = _topic_association_requested(request)
+    if not topic_association and not _EPISODE_QUERY_RE.search(
+        str(request.user_text or "")
+    ):
         return []
     diagnostics.episode_query_status = "requested"
     subject_required = (
@@ -2891,20 +2916,32 @@ def _episode_items(
         guild_id=int(request.guild_id or 0),
         participant_key=participant_key,
         topic_text=str(request.user_text or "")[:8000],
-        frame_event_ref=str(request.frame_event_ref or ""),
-        frame_event_relation=str(request.frame_event_relation or "uncertain"),
-        frame_phase=str(request.frame_phase or ""),
-        broad_recall=bool(request.frame_event_ref),
+        frame_event_ref=(
+            "" if topic_association else str(request.frame_event_ref or "")
+        ),
+        frame_event_relation=(
+            "uncertain"
+            if topic_association
+            else str(request.frame_event_relation or "uncertain")
+        ),
+        frame_phase="" if topic_association else str(request.frame_phase or ""),
+        broad_recall=bool(request.frame_event_ref) and not topic_association,
         allowed_channel_policies=("public_home", "public_context"),
-        max_results=4,
+        max_results=2 if topic_association else 4,
+        topic_association=topic_association,
     )
     diagnostics.episode_candidate_count = len(rows)
-    diagnostics.episode_query_status = "selected" if rows else (
-        "ambiguous_or_unavailable"
-        if str(request.frame_event_relation or "")
-        in {"resume", "resume_unresolved", "concurrent_activity"}
-        else "no_applicable_episode"
-    )
+    if topic_association:
+        diagnostics.episode_query_status = (
+            "topic_association_selected" if rows else "no_topic_association"
+        )
+    else:
+        diagnostics.episode_query_status = "selected" if rows else (
+            "ambiguous_or_unavailable"
+            if str(request.frame_event_relation or "")
+            in {"resume", "resume_unresolved", "concurrent_activity"}
+            else "no_applicable_episode"
+        )
     items: list[IntelligencePacketItem] = []
     for row in rows:
         roots, occurrences = (
@@ -2937,7 +2974,9 @@ def _episode_items(
             lane="episode",
             source_class="moment_gist",
             source_type=(
-                "participant_episode_gist"
+                "historical_topic_gist"
+                if topic_association
+                else "participant_episode_gist"
                 if participant_key
                 else "situation_episode_summary"
             ),
@@ -2957,8 +2996,14 @@ def _episode_items(
             authority=_AUTHORITY_RANK["moment_gist"],
             lineage=roots,
             observed_at=row.last_activity_at,
-            usage="episode_paraphrase",
-            score=88.0 + min(4, row.sequence_index),
+            usage=(
+                "historical_topic_context"
+                if topic_association
+                else "episode_paraphrase"
+            ),
+            score=(
+                72.0 if topic_association else 88.0 + min(4, row.sequence_index)
+            ),
             revalidation_kind="episode",
             revalidation_key=row.moment_id,
             root_identities=roots,
@@ -2975,7 +3020,9 @@ def _episode_items(
             event_ref=row.moment_id,
             episode_ref=row.episode_id,
             event_relation=row.event_relation,
-            phase=str(request.frame_phase or ""),
+            phase=(
+                "historical" if topic_association else str(request.frame_phase or "")
+            ),
             uncertainty_status=row.uncertainty_status,
         )
         if not _route_allows_item(request, item):
@@ -5190,7 +5237,11 @@ def _filter_frame_applicable_candidates(
         ):
             exclude(item, "current_operational_source_precedence")
             continue
-        if item.lane in {"moment", "episode"} and frame_event_ref:
+        if (
+            item.lane in {"moment", "episode"}
+            and frame_event_ref
+            and not _historical_topic_item(item)
+        ):
             item_event_ref = str(
                 item.event_ref or item.revalidation_key or ""
             ).strip()
@@ -5862,6 +5913,9 @@ def _episode_version(
     packet: UnifiedIntelligencePacket,
     item: IntelligencePacketItem,
 ) -> str:
+    topic_association = _historical_topic_item(item)
+    if topic_association and not _topic_association_requested(packet.request):
+        return ""
     participant_key = (
         item.subject_key
         if item.source_type == "participant_episode_gist"
@@ -5872,14 +5926,21 @@ def _episode_version(
         guild_id=int(packet.request.guild_id or 0),
         participant_key=participant_key,
         topic_text=str(packet.request.user_text or "")[:8000],
-        frame_event_ref=str(packet.request.frame_event_ref or ""),
-        frame_event_relation=str(
-            packet.request.frame_event_relation or "uncertain"
+        frame_event_ref=(
+            "" if topic_association else str(packet.request.frame_event_ref or "")
         ),
-        frame_phase=str(packet.request.frame_phase or ""),
-        broad_recall=bool(packet.request.frame_event_ref),
+        frame_event_relation=(
+            "uncertain"
+            if topic_association
+            else str(packet.request.frame_event_relation or "uncertain")
+        ),
+        frame_phase=(
+            "" if topic_association else str(packet.request.frame_phase or "")
+        ),
+        broad_recall=bool(packet.request.frame_event_ref) and not topic_association,
         allowed_channel_policies=("public_home", "public_context"),
-        max_results=4,
+        max_results=2 if topic_association else 4,
+        topic_association=topic_association,
     )
     for row in rows:
         source_ref = "episode:%s:moment:%s" % (
@@ -6837,13 +6898,24 @@ def _packet_invariants(
         if item.lane == "episode" and not (
             item.revalidation_kind == "episode"
             and item.source_class == "moment_gist"
-            and item.source_type
-            in {"participant_episode_gist", "situation_episode_summary"}
             and item.event_ref
-            and item.uncertainty_status
-            in {"source_backed_episode", "standalone_moment_only"}
             and item.root_identities
             and item.occurrence_identities
+            and (
+                item.source_type
+                in {"participant_episode_gist", "situation_episode_summary"}
+                and item.uncertainty_status
+                in {"source_backed_episode", "standalone_moment_only"}
+                and item.usage == "episode_paraphrase"
+                or _historical_topic_item(item)
+                and _topic_association_requested(packet.request)
+                and item.subject_key
+                == "event:%s" % (item.episode_ref or item.event_ref)
+                and item.phase == "historical"
+                and not item.participants
+                and not item.point_identity
+                and not item.canon_status
+            )
         ):
             invalid.append("episode_lane_contract_violation")
         if item.lane == "show_episode" and not (

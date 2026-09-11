@@ -1,3 +1,76 @@
+# Row 6 continuation: ordinary historical topic recall — September 11 candidate
+
+PR536 is merged and confirmed deployed at
+`248ec9fd062faf364c902480aa2ec5ba19d20019`. The supplied VPS receipt shows
+the service active after restart. Its current-PID filter returned no matching
+prune receipts. That establishes neither a pruning failure nor a completed
+live retention test. PR535 Moment source protection and PR536 tier source
+protection are now part of the deployed baseline.
+
+The next bounded gap was ordinary topic recall: the existing episode packet
+entry required explicit episode/continuation wording, so ordinary conversation
+could miss older public experiences already available to the Moment reader.
+This candidate lets a resolved, subject-independent ordinary turn select up
+to two related public Moment gists through the existing episode lane. It uses
+the current bounded coherence selector with actual topic overlap; sharing a
+broad topic family alone is insufficient. This is conservative topic matching,
+not a claim of universal semantic or synonym recall.
+
+The canonical aggregate summary can be generic. For an association, the same
+reader also checks existing participant contribution gists from that Moment,
+including their original source links and reproducible semantic projections.
+It appends at most three eligible contributions under distinct original-person
+labels. It neither copies raw transcript excerpts nor rewrites stored summaries.
+When no eligible detailed projection exists, recall remains limited to the
+aggregate gist; this change does not invent missing historical meaning.
+
+Selected associations carry their original source roots and historical event
+identity. Their explicit usage is optional historical background. They do not
+assign old participation to the current speaker, resume an old event, create
+new Moments or contribute new recurrence evidence. Required-subject requests
+and explicit episode/continuation requests keep their existing paths. Current
+exchange precedence, current queue authority, packet budgets and visibility
+remain in effect. Post-provider revalidation repeats the same selector and
+source checks; removed or changed evidence cannot keep an old association valid.
+
+This change extends existing readers and rendering. It adds no memory store,
+lifecycle controller, provider request, queue operation or public activation
+gate. Tier retention and consolidation continue through the deployed owners.
+
+Validation: all 12 new focused regressions pass; the combined packet/Moment
+focused run passes 72 tests. `make check` passes all 2,982 tests in 123.347
+seconds. Independent runtime review has no remaining blockers. The regressions
+use real source-backed Moments and the actual Situation Frame builder, and
+verify historical details, unchanged participants/episodes, bounded selection,
+source/contribution invalidation, and subject/continuation separation. These
+local checks do not certify live provider wording or close live acceptance.
+
+After review and merge, use the established deployment procedure:
+
+```bash
+cd /home/ubuntu/bnl01 || exit 1
+git pull --ff-only origin main || exit 1
+sudo systemctl restart bnl01
+systemctl is-active bnl01
+git rev-parse HEAD
+```
+
+All live Moment, tier-transition, source-retention and associative-recall
+acceptance stays deferred together until genuine community activity supplies
+the relevant case. No conversation needs to be staged now, no pruning is
+forced, and waiting for those windows does not block other authorized work.
+When a real case occurs, collect its existing packet selection/application and
+delivery receipts, then inspect the exact original source, Moment and tier
+links as applicable. `episode_query_status=topic_association_selected` in the
+existing packet diagnostics establishes candidate selection; the rendered
+source and delivered answer establish actual use and attribution. No selected
+association is also a legitimate outcome when no relevant eligible gist exists.
+
+Shared-brain acceptance remains open under the original plan. Earlier passes
+remain closed. Durable live recall/aging, applicable source correction and
+retirement, remaining provider/packet accounting, applicable rollback evidence
+and final owner acceptance are still evaluated from their own evidence.
+
 # Row 6/8 continuation: existing tier source retention — September 11 candidate
 
 PR535 is merged at `8dbba2629cf32e6454b9580a0331c6a5b29b6a15`.
