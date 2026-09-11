@@ -205,6 +205,23 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
         self.assertIn("on 2026-08-21;", rendered)
         self.assertNotIn("on 2026-08-28;", rendered)
 
+    def test_website_latest_show_does_not_date_pin_a_broad_history_request(self):
+        for query, expected in (
+            ("Connect recurring TikTok and Discord community topics across shows.", 2),
+            ("What happened in the 2026-08-21 show?", 1),
+        ):
+            with self.subTest(query=query):
+                selection = {}
+                rendered = self.bot.build_tiktok_show_evidence_context_for_turn(
+                    guild_id=77, user_text=query, subject_user_id=42,
+                    website_read_model_context="Latest archived show: showDate=2026-08-28",
+                    selection_out=selection,
+                )
+                self.assertEqual(len(selection["source_refs"]), expected)
+                self.assertIn("2026-08-21", rendered)
+                if expected == 2:
+                    self.assertNotIn("showDate=", selection["selection_user_text"])
+
 
 class FinalizedShowCandidateAssemblyTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

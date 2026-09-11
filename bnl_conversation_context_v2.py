@@ -238,6 +238,7 @@ class ConversationContextRequest:
     referenced_conversation_row_ids: frozenset[int] = field(
         default_factory=frozenset
     )
+    retained_resume_row_ids: frozenset[int] = field(default_factory=frozenset)
     transient_reply_sources: tuple[TransientDiscordReplySource, ...] = ()
     is_direct_target: bool = False
     is_reply_to_bnl: bool = False
@@ -273,6 +274,9 @@ class ConversationContextResult:
     referent_scope_expanded: bool = False
     transient_referent_message_ids: tuple[int, ...] = ()
     transient_referent_texts: tuple[str, ...] = ()
+    retained_moment_ids: tuple[str, ...] = ()
+    retained_resume_query: str = ""
+    retained_resume_route_mode: str = "normal_chat"
 
 
 @dataclass(frozen=True)
@@ -1716,7 +1720,10 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         if same_room:
             if p != target_policy or (target_policy not in SAME_CHANNEL_CONTEXT_POLICIES):
                 return False, same_room
-            if not _row_age_ok(row, now, SAME_ROOM_RECENCY_MINUTES):
+            if not _row_age_ok(row, now, SAME_ROOM_RECENCY_MINUTES) and not (
+                int(row.get("id") or 0) in req.retained_resume_row_ids
+                and _row_age_ok(row, now, 30 * 24 * 60)
+            ):
                 return False, same_room
         else:
             if not _public_cross_compatible(p, target_policy):

@@ -57,6 +57,7 @@ from bnl_tiktok_live_memory import (
 from bnl_tiktok_show_ledger import (
     CurrentImageShowQuery,
     TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT,
+    broad_show_history_requested,
     build_tiktok_show_evidence_context,
     ensure_tiktok_show_evidence_schema,
     load_tiktok_show_source_events,
@@ -143,6 +144,8 @@ from bnl_moment_engine import (
     render_active_episode_canary_context,
     render_shadow_moment_context,
     recent_moment_situation_for_assessment,
+    resume_moment_conversation_sources,
+    resume_date_scope_requested,
     retained_moment_conversation_sources,
     shadow_enabled as moment_engine_shadow_enabled,
     sweep_expired_episodes,
@@ -3164,7 +3167,17 @@ def build_bnl_read_model_context(
             if show_analysis_query:
                 dates = requested_show_dates(show_analysis_text)
                 scoped_archives = [("", archive)]
-                if len(dates) > 1:
+                if not dates and broad_show_history_requested(show_analysis_text):
+                    # Broad history is already maintained by the shared show
+                    # ledger. Do not select a latest archive here and turn its
+                    # date into an unintended constraint on the next reader.
+                    scoped_archives = []
+                    lines.append(
+                        "\nHistorical scope: recurring community activity across "
+                        "available shows. Use the shared show evidence for "
+                        "attributed TikTok and Discord history."
+                    )
+                elif len(dates) > 1:
                     records = tiktok_show_records(archive)
                     scoped_archives = []
                     available_dates = 0
@@ -3655,6 +3668,7 @@ def build_tiktok_show_evidence_context_for_turn(
     if (
         selected_show_dates
         and not request_owns_show_date
+        and not broad_show_history_requested(user_text)
         and not image_queries
     ):
         # The website adapter may have selected a comparison. Pass its whole
@@ -21692,6 +21706,7 @@ def get_conversation_context_v2_rows(
     channel_policy: str = "unknown",
     referenced_message_ids: set[int] | frozenset[int] | None = None,
     referenced_conversation_row_ids: set[int] | frozenset[int] | None = None,
+    retained_conversation_row_ids: tuple[int, ...] = (),
 ) -> list[dict]:
     conn = sqlite3.connect(DB_FILE, timeout=0.1)
     cursor = conn.cursor()
@@ -21765,6 +21780,10 @@ def get_conversation_context_v2_rows(
     )
     exact_clauses = []
     exact_params: list[int] = [int(guild_id)]
+    retained_ids = tuple(sorted(set(retained_conversation_row_ids)))[:32]
+    if retained_ids:
+        exact_clauses.append("id IN (%s)" % ",".join("?" for _ in retained_ids))
+        exact_params.extend(retained_ids)
     if exact_row_ids:
         exact_clauses.append(
             "id IN (%s)" % ",".join("?" for _ in exact_row_ids)
@@ -21832,6 +21851,26 @@ def get_conversation_context_v2_rows(
         result.append(rendered_row)
     return result
 
+def _read_resume_conversation_sources(
+    *, guild_id, current_user_id, channel_id, channel_policy, route_mode,
+    query, now=None, expected_moment_ids=(),
+):
+    if not query or not os.path.exists(DB_FILE):
+        return (), ()
+    try:
+        with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
+            conn.execute("BEGIN")
+            return resume_moment_conversation_sources(
+                conn, guild_id=int(guild_id), channel_id=int(channel_id),
+                channel_policy=channel_policy, route_mode=route_mode,
+                topic_text=query, participant_key=subject_key_for_user(current_user_id),
+                now=(now.isoformat() if now is not None else None),
+                expected_moment_ids=expected_moment_ids,
+            )
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        return (), ()
+
+
 def build_conversation_context_v2_for_prompt(
     *, guild_id: int, current_user_id: int, channel_id: int = 0, channel_name: str = "",
     channel_policy: str = "unknown", route_mode: str = ROUTE_MODE_NORMAL_CHAT, conversation_surface: str = "unknown",
@@ -21849,6 +21888,15 @@ def build_conversation_context_v2_for_prompt(
         if result_out is not None:
             result_out["result"] = None
         return ""
+    resume_query = " ".join(current_texts or ())
+    retained_moments, retained_rows = (
+        _read_resume_conversation_sources(
+            guild_id=guild_id, current_user_id=current_user_id,
+            channel_id=channel_id, channel_policy=channel_policy,
+            route_mode=route_mode, query=resume_query, now=now,
+        ) if not (referenced_message_ids or referenced_conversation_row_ids or transient_reply_sources)
+        else ((), ())
+    )
     rows = get_conversation_context_v2_rows(
         guild_id,
         limit=80,
@@ -21858,7 +21906,12 @@ def build_conversation_context_v2_for_prompt(
         channel_policy=channel_policy,
         referenced_message_ids=referenced_message_ids,
         referenced_conversation_row_ids=referenced_conversation_row_ids,
+        retained_conversation_row_ids=retained_rows,
     )
+    if retained_rows and resume_date_scope_requested(resume_query):
+        # A dated, resolved occurrence owns this historical context. Recent
+        # messages about a different occurrence cannot replace its sources.
+        rows = [row for row in rows if int(row.get("id") or 0) in retained_rows]
     req = ConversationContextRequest(
         guild_id=int(guild_id or 0), current_user_id=int(current_user_id or 0), channel_id=int(channel_id or 0),
         channel_name=(channel_name or "").strip().lower(), channel_policy=(channel_policy or "unknown").strip().lower(),
@@ -21866,6 +21919,7 @@ def build_conversation_context_v2_for_prompt(
         current_message_ids=frozenset(int(x or 0) for x in (current_message_ids or set()) if x),
         current_texts=tuple(current_texts or ()),
         current_participants=frozenset(int(x or 0) for x in (current_participants or set()) if x),
+        retained_resume_row_ids=frozenset(retained_rows),
         referenced_message_ids=frozenset(
             int(x or 0) for x in (referenced_message_ids or set()) if x
         ),
@@ -21880,16 +21934,21 @@ def build_conversation_context_v2_for_prompt(
         route_allowed_sources=frozenset(route_allowed_sources or getattr(get_route_mode_contract(route_mode), "allowed_context_sources", frozenset())),
     )
     result = assemble_conversation_context_v2(rows, req)
+    if set(result.selected_row_ids).intersection(retained_rows):
+        result = replace(result, retained_moment_ids=retained_moments,
+                         retained_resume_query=resume_query,
+                         retained_resume_route_mode=route_mode)
     if result_out is not None:
         result_out["result"] = result
     update_conversation_context_v2_diagnostics(result, route_mode=route_mode, channel_policy=channel_policy, enabled=True)
     logging.info(
-        "conversation_context_v2 selected same_pairs=%s cross_pairs=%s unpaired=%s dupes=%s excluded=%s chars=%s reason=%s focus=%s anchors=%s matched=%s suppressed=%s referent_status=%s referent_candidates=%s referent_reason=%s",
+        "conversation_context_v2 selected same_pairs=%s cross_pairs=%s unpaired=%s dupes=%s excluded=%s chars=%s reason=%s focus=%s anchors=%s matched=%s suppressed=%s referent_status=%s referent_candidates=%s referent_reason=%s retained_moments=%s selected_source_rows=%s",
         result.same_room_paired_turn_count, result.cross_channel_paired_turn_count, result.unpaired_row_count,
         result.current_message_duplicates_removed, result.visibility_policy_exclusions, result.final_char_count, result.fallback_reason,
         result.thread_focus_mode, result.current_payload_anchor_count, result.matched_thread_count, result.suppressed_thread_count,
         result.referent_status, result.referent_candidate_count,
         result.referent_reason or "none",
+        json.dumps(result.retained_moment_ids), json.dumps(result.selected_row_ids),
     )
     return result.rendered_context
 
@@ -27111,6 +27170,9 @@ class ConversationPromptSourceBasis:
     transient_referent_message_ids: tuple[int, ...] = ()
     transient_referent_texts: tuple[str, ...] = ()
     public_recall_control_digest: str = ""
+    retained_moment_ids: tuple[str, ...] = ()
+    retained_resume_query: str = ""
+    retained_resume_route_mode: str = "normal_chat"
 
 
 def _public_conversation_recall_controls(
@@ -29912,7 +29974,7 @@ def build_conversation_prompt_source_basis(
             channel_id=channel_id,
             channel_name=channel_name,
             channel_policy=channel_policy,
-            referenced_conversation_row_ids=tracked_referent_row_ids,
+            referenced_conversation_row_ids=tracked_referent_row_ids | set(context_selected_row_ids),
         )
         rows_by_id = {
             int(row.get("id") or 0): row
@@ -30075,6 +30137,9 @@ def build_conversation_prompt_source_basis(
         channel_policy=(channel_policy or "unknown").strip().lower(),
         source_row_ids=source_row_ids,
         revalidation_row_ids=revalidation_row_ids,
+        retained_moment_ids=getattr(context_result, "retained_moment_ids", ()),
+        retained_resume_query=getattr(context_result, "retained_resume_query", ""),
+        retained_resume_route_mode=getattr(context_result, "retained_resume_route_mode", "normal_chat"),
         participant_user_ids=participant_user_ids,
         speaker_labels=speaker_labels,
         evidence_items=evidence_items,
@@ -30348,6 +30413,15 @@ def refresh_prompt_source_basis(
     tracked_conversation_row_ids = (
         basis.revalidation_row_ids or basis.source_row_ids
     )
+    if basis.retained_moment_ids:
+        current_moments, _rows = _read_resume_conversation_sources(
+            guild_id=basis.guild_id, current_user_id=basis.current_user_id,
+            channel_id=basis.channel_id, channel_policy=basis.channel_policy,
+            route_mode=basis.retained_resume_route_mode, query=basis.retained_resume_query,
+            expected_moment_ids=basis.retained_moment_ids,
+        )
+        if current_moments != basis.retained_moment_ids:
+            return replace(basis, expected_digest="retained_moment_source_unavailable"), True
     source_digest = (
         _conversation_prompt_selected_digest(
             guild_id=basis.guild_id,
@@ -40225,23 +40299,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="batch_discord_send_failed",
             )
             return
-        if not batch_model_persistence_allowed:
-            # Delivery completed, so the old question has been answered. Keep
-            # this no-store path from extending conversational state.
-            for uid in unique_user_ids:
-                state = _get_conversation_continuation_state(guild_id, channel_id, uid)
-                if state:
-                    state.pop("awaiting_answer_until", None)
-            logging.info(
-                "batch_response_persistence_skipped "
-                "reason=%s channel_policy=%s",
-                batch_source_no_store_reason,
-                channel_policy,
-            )
-            _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
-            _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-            return
         await safely_finalize_shared_brain_synthesis(
             batch_synthesis_decision,
             final_response=response,
@@ -40262,6 +40319,29 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 else "batch_established_path_sent"
             ),
         )
+        if not batch_model_persistence_allowed:
+            # Delivery completed, so the old question has been answered. Keep
+            # this no-store path from extending conversational state.
+            for uid in unique_user_ids:
+                state = _get_conversation_continuation_state(guild_id, channel_id, uid)
+                if state:
+                    state.pop("awaiting_answer_until", None)
+            logging.info(
+                "batch_response_persistence_skipped "
+                "reason=%s channel_policy=%s",
+                batch_source_no_store_reason,
+                channel_policy,
+            )
+            _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
+            _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+            await record_unified_response_assessment_shadow_after_send(
+                batch_unified_assessment,
+                response=response,
+                guard_diagnostics=guard_diagnostics,
+                response_sent=True,
+            )
+            return
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
         for uid in unique_user_ids:
             _consume_awaiting_retransmission(guild_id, channel_id, uid)

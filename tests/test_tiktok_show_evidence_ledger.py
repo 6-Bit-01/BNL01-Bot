@@ -1686,6 +1686,41 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
             self.assertIn("Alex", dialogue.text)
             self.assertIn("single episode does not establish a regular", community.text)
 
+            for query in (
+                "Make a song based on your TikTok chat and discord data, based "
+                "on all you can see like recurring topics or behaviors.",
+                "What recurring topics and behaviors connect our TikTok and Discord community?",
+                "Compare the August 21, 2026 and August 28, 2026 shows.",
+            ):
+                with self.subTest(query=query):
+                    selection = {}
+                    rendered = build_tiktok_show_evidence_context(
+                        db_file, guild_id=77, user_text=query, selection_out=selection,
+                    )
+                    with sqlite3.connect(db_file) as conn:
+                        packet_items = select_tiktok_show_episode_context_items(
+                            conn, guild_id=77, user_text=query,
+                            now="2026-08-29T12:00:00-07:00",
+                        )
+                    self.assertEqual(len(selection["source_refs"]), 2)
+                    self.assertEqual({root[0] for root in selection["source_refs"]}, {
+                        key for item in packet_items for key in item.show_keys
+                    })
+                    self.assertIn("Older Regular", rendered)
+                    self.assertIn("First Signal keeps bringing me back", rendered)
+                    self.assertIn("Alex", rendered)
+                    self.assertEqual({excerpt[0] for excerpt in selection["authored_excerpts"]},
+                                     {root[0] for root in selection["source_refs"]})
+                    self.assertLess(len(rendered), 18000)
+
+            selection = {}
+            build_tiktok_show_evidence_context(
+                db_file, guild_id=77,
+                user_text="What recurring topics came up in the August 28, 2026 show?",
+                selection_out=selection,
+            )
+            self.assertEqual(len(selection["source_refs"]), 1)
+
     def test_finalized_show_flows_through_existing_packet_and_revalidates(self):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "bnl.db")

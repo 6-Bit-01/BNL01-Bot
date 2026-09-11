@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import calendar
 import hashlib
 import json
 import os
@@ -5013,6 +5014,125 @@ def _moment_is_renderable(
         public_usable=True,
     )
     return not failure
+
+
+_RESUME_MONTH_NAMES = {label.casefold(): month for month in range(1, 13)
+                       for label in (calendar.month_name[month], calendar.month_abbr[month])}
+_RESUME_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+_RESUME_NAMED_DATE_RE = re.compile(
+    r"\b(" + "|".join(_RESUME_MONTH_NAMES) + r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?"
+    r"(?:,?\s+(\d{4}))?\b", re.I,
+)
+
+
+def resume_date_scope_requested(text: str) -> bool:
+    return bool(_RESUME_ISO_DATE_RE.search(text) or _RESUME_NAMED_DATE_RE.search(text)
+                or re.search(r"\byesterday\b", text, flags=re.I))
+
+
+def _resume_date_matches(text: str, observed_at: str, now: str) -> bool:
+    """Respect dated transcript requests in the stored UTC conversation clock."""
+
+    observed = _parse_ts(observed_at).astimezone(timezone.utc).date()
+    dates = [(int(year), int(month), int(day)) for year, month, day in
+             _RESUME_ISO_DATE_RE.findall(text)]
+    for match in _RESUME_NAMED_DATE_RE.finditer(text):
+        month, day, year = match.groups()
+        dates.append((int(year) if year else observed.year, _RESUME_MONTH_NAMES[month.casefold()], int(day)))
+    if dates:
+        return (observed.year, observed.month, observed.day) in dates
+    if re.search(r"\byesterday\b", text, flags=re.I):
+        return observed == (_parse_ts(now).astimezone(timezone.utc) - timedelta(days=1)).date()
+    return True
+
+
+def resume_moment_conversation_sources(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    route_mode: str,
+    topic_text: str,
+    participant_key: str,
+    now: str | None = None,
+    expected_moment_ids: tuple[str, ...] = (),
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """Resolve retained transcript references for Context v2, without writes.
+
+    A qualified Moment is a retrieval index, never a replacement transcript.
+    Ambiguous occurrences stay unresolved. Sealed sources remain in their
+    exact channel, and every source lifecycle is checked again before send.
+    """
+    if (not shadow_enabled() or not ledger_shadow_enabled()
+            or int(guild_id or 0) <= 0 or int(channel_id or 0) <= 0
+            or not re.fullmatch(r"discord_user:[1-9]\d*", participant_key)
+            or channel_policy not in {"public_home", "public_context", "sealed_test"}
+            or not _EPISODE_RESUME_RE.search(str(topic_text or ""))
+            or not _table_exists(conn, "memory_moment_windows")
+            or not _table_exists(conn, "conversations")):
+        return (), ()
+    moment_ids = expected_moment_ids or tuple(str(row[0]) for row in conn.execute(
+        """SELECT moment_id FROM memory_moment_windows
+        WHERE guild_id=? AND channel_id=? AND channel_policy=? AND route_mode=?
+          AND lifecycle_status='finalized'
+        ORDER BY last_activity_at DESC,moment_id DESC LIMIT 32""",
+        (guild_id, channel_id, channel_policy, route_mode),
+    ))
+    groups: dict[str, list[tuple[str, tuple[int, ...]]]] = {}
+    signature = _topic_signature(topic_text, "conversation")
+    family = _topic_family(topic_text, "conversation")
+    for moment_id in moment_ids:
+        if conn.execute(
+            "SELECT COUNT(*) FROM memory_moment_members WHERE moment_id=?", (moment_id,),
+        ).fetchone()[0] > 32:
+            continue
+        loaded = _moment_episode_basis(conn, moment_id)
+        if loaded is None:
+            continue
+        basis, sources = loaded
+        current_time = now or _now()
+        age = (_parse_ts(current_time) - _parse_ts(basis["last_activity_at"])).total_seconds()
+        if (basis["guild_id"] != guild_id or basis["channel_id"] != channel_id
+                or basis["channel_policy"] != channel_policy or basis["route_mode"] != route_mode
+                or not 0 <= age <= EPISODE_REOPEN_SECONDS
+                or not _resume_date_matches(topic_text, basis["last_activity_at"], current_time)
+                or not _human_participant_present(conn, moment_id, participant_key)
+                or not signature or not _coherent(family, signature,
+                    basis["topic_family"], basis["topic_signature"])):
+            continue
+        canonical = _fetch_entry(conn, basis["canonical_ledger_entry_id"])
+        if not canonical or canonical.lifecycle_status not in SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS:
+            continue
+        roots = conn.execute(
+            """SELECT c.id FROM memory_moment_members m
+            JOIN memory_ledger_entries e ON e.entry_id=m.ledger_entry_id
+            LEFT JOIN conversations c ON e.source_table='conversations'
+              AND e.source_row_id=CAST(c.id AS TEXT) AND c.guild_id=e.guild_id
+              AND c.channel_id=e.channel_id AND c.channel_policy=e.channel_policy
+              AND c.role=e.source_role AND c.route_mode=e.route_mode
+              AND (c.role!='user' OR e.subject_key='discord_user:' || CAST(c.user_id AS TEXT))
+            WHERE m.moment_id=? ORDER BY m.source_sequence,m.ledger_entry_id""",
+            (moment_id,),
+        ).fetchall()
+        if not roots or len(roots) != len(sources) or any(row[0] is None for row in roots):
+            continue
+        links = conn.execute(
+            "SELECT episode_id FROM memory_moment_episode_moments WHERE moment_id=?",
+            (moment_id,),
+        ).fetchall()
+        if len(links) > 1:
+            continue
+        key = "episode:" + str(links[0][0]) if links else "moment:" + moment_id
+        groups.setdefault(key, []).append((moment_id, tuple(int(row[0]) for row in roots)))
+    if len(groups) != 1:
+        return (), ()
+    selected = next(iter(groups.values()))
+    selected_moments = tuple(item[0] for item in selected)
+    selected_rows = tuple(dict.fromkeys(row_id for item in selected for row_id in item[1]))
+    if len(selected_rows) > 32 or (expected_moment_ids and set(selected_moments) != set(expected_moment_ids)):
+        return (), ()
+    return selected_moments, selected_rows
 
 
 def retained_moment_conversation_sources(

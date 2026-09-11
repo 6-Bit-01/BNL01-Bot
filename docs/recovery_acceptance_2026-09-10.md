@@ -1,3 +1,23 @@
+# September 11 consolidated private-test repair candidate
+
+The public activation rollback/restoration receipt is accepted:
+`public_effective=true -> false -> true`, private scope and prerequisites stayed
+true, and `RESTORED_CONFIGURATION_MATCHES_START` confirms exact restoration.
+This supersedes the earlier unexercised-rollback status below.
+
+The private collection block is complete. The general name/space repair and
+new two-person Moment formation remain accepted. Source breadth, retained
+recall/continuation, and successful no-store delivery receipts are grouped in
+one candidate, with one deployment and one focused retest batch. No runtime
+configuration or production source record was changed while preparing it.
+
+The integrated evidence, implementation limits, exact Discord prompts, VPS
+commands, and single return point are in
+[the consolidated retest sheet](shared_context_recovery_retest_2026-09-11.md).
+Broader public/elapsed-time acceptance and unclassified historical failures
+remain explicit there. Earlier notes below are chronological evidence, not
+instructions to repeat accepted tests or defer all private work.
+
 # Row 9 continuation: Relay deadline — September 11 candidate
 
 PR537 is merged on main at `295e3618ee24581f7a5d87ee5f690eea1cdcaf96`.
