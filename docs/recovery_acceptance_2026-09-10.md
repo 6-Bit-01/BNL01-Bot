@@ -1,3 +1,76 @@
+# Row 6 continuation: Moment source retention — September 11 candidate
+
+The confirmed bot deployment remains `2c46ffe62dfcb88ec7ec2110b1007f44f2d9daa0`
+(PR534). Public activation remains in effect. This candidate continues original
+Row 6 and its source-lifecycle dependency in Row 8; shared-brain acceptance is
+still open. Earlier passed cases below remain accepted.
+
+The source trace found that ordinary recent-transcript pruning called the same
+exact-source purge used for explicit deletion. Once a supporting message fell
+outside a member's recent-row allowance, that purge retracted its formed Moment,
+scrubbed the summary and removed its participant contributions. This is a
+demonstrated code path, not a claim that a particular live Moment was lost.
+
+The bounded repair computes the original newest-N cutoff first, then preserves
+overflow messages supporting a source-revalidated, finalized public Moment.
+Its existing canonical record, source lifecycles, policy and route scope must
+remain valid, and every supporting transcript must still exist. Human and BNL
+model sources stay in their original conversation/ledger owners, including group
+response participant mappings. No new store, tier copy or response controller
+is introduced. Protection depends on stored validity, so disabling formation
+flags does not itself erase already-valid history.
+
+Explicit user/guild clear, complete forget, correction and source invalidation
+retain their existing owners. Private/sealed, invalid and retracted Moments do
+not acquire this public retention exemption. Ordinary overflow still trims.
+Total transcript storage can now contain recent-N rows **plus supporting rows
+for eligible durable Moments**; N remains the recent-context allowance, not a
+hard total storage cap. Existing prompt read limits are unchanged. This repair
+does not restore sources previously purged or implement experience tier aging.
+
+Six focused regressions form actual source-backed Moments through existing
+owners. They cover recall of a 90-day-old experience after reopening the DB,
+original participant attribution, unrelated overflow, group model roots with
+flags off, invalid-source exclusion, explicit user/guild clear and guild
+isolation. Additional checks keep lookup work bounded in a guild with 2,000
+irrelevant Moments and preserve a newly finalized Moment when a concurrent
+writer changes the pruning snapshot. They expose the prior defects and pass
+with this candidate. Local evidence is separate from deployment and live
+acceptance.
+
+Validation: all six focused regressions pass; `make check` passes all 2,941
+tests in 112.891 seconds. Independent runtime review has no remaining blockers.
+
+After review and merge, use the established pull/restart procedure below.
+For live acceptance, use the next genuine community Moment and retain its
+source/Moment/episode IDs. Let ordinary activity reach the existing pruning
+cutoff; do not invoke pruning manually or seed public fixture messages. The
+new content-free receipt can be captured once when that occurs:
+
+```bash
+bnl_memory_pid=$(systemctl show bnl01 -p MainPID --value)
+sudo journalctl -u bnl01 _PID="$bnl_memory_pid" --utc --no-pager -o cat \
+  --since '-30 minutes' -n 30 \
+  --grep='conversation_prune_moment_sources_retained|conversation_prune_deferred_for_memory_lifecycle'
+```
+
+A retained-source count establishes a pruning decision only. Re-read the exact
+Moment's original roots, contributions and episode links, and check any actual
+recall packet/delivery separately. No receipt yet means the natural pruning
+condition has not been evidenced; it is not a failed test or permission to
+repeat synthetic conversations. Explicit deletion behavior is tested locally;
+use a real member deletion only when actually requested.
+
+The next separate Row 6 gap is ordinary associative topic recall: the general
+public Moment reader can retrieve an older related experience without assigning
+its participants to the current speaker, but the packet's episode entry path
+currently requires explicit episode/continuation language. That connection
+needs its own bounded change preserving historical-context versus same-event
+meaning. Adaptive per-user memory tiers already operate independently; their
+existence does not prove complete Moment/episode aging or cross-surface
+experience formation. Remaining original live acceptance and owner closure
+remain open.
+
 # Public activation and integration health — September 10
 
 PR533 is merged and confirmed deployed at
