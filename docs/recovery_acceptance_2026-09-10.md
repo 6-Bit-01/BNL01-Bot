@@ -1,3 +1,93 @@
+# Row 6/8 continuation: existing tier source retention — September 11 candidate
+
+PR535 is merged at `8dbba2629cf32e6454b9580a0331c6a5b29b6a15`.
+The latest supplied VPS deployment receipt remains PR534 at
+`2c46ffe62dfcb88ec7ec2110b1007f44f2d9daa0`; neither PR535 nor this candidate
+has a later VPS receipt in the evidence reviewed here. The authorized public
+activation and all earlier passed recovery cases remain in effect.
+
+The tier trace reproduced the remaining gap: meaningful ordinary conversation
+could enter short-term memory, later consolidate into medium/long-term memory,
+and still lose its original transcript during routine pruning. Its summary
+survived, but the tier had no exact reference to its original message. A
+Moment-only retention repair therefore did not cover the existing tier owners.
+
+This candidate attaches exact conversation IDs to existing `memory_tiers` via
+`memory_tier_conversation_sources`. It stores no extra memory text. Eligible
+source messages, their initial short tier and source links commit together.
+The existing consolidation owner carries those original links into medium and
+long tiers, including the prior destination's links when summaries merge.
+Parent retirement and genuine tier eviction release only that tier's references.
+Existing tier quality rules, salience, capacities, prompts and public gates stay
+with their current owners.
+
+Routine pruning computes the existing recent-row allowance, then preserves
+sources supporting either an eligible Moment or a retained tier. A later
+ordinary prune can remove old records once no retained memory needs them.
+The reference lookup and deletion share a transaction; concurrent memory
+formation defers cleanup instead of deleting newly required evidence.
+
+Legacy tier summaries have no trustworthy original-source mapping. The
+migration does not infer links from text or pretend they were backfilled.
+`source_lineage_complete` records this distinction and remains unresolved when
+an old unlinked component merges with new linked memory. Routine cleanup is
+conservatively deferred for that member/guild while retained tiers have
+unresolved provenance. This can retain extra history until those tiers retire;
+it does not affect other members' cleanup, prompt budgets or response behavior.
+Previously deleted sources cannot be restored by this repair.
+
+Explicit conversation clear/deletion, source correction and member forgetting
+remain authoritative. Losing or changing a mapped source invalidates the whole
+compressed tier that depends on it, removes its pins and scrubs its shadow
+projection; removing an ID alone would leave stale text usable. Complete member
+deletion continues through the existing owner. Tests cover these paths with
+shadow writing disabled as well as enabled. Existing legacy unlinked summaries
+cannot acquire exact-source invalidation retrospectively; full member deletion
+still removes that member's tier rows through its established owner.
+
+Validation: all 29 new focused regressions pass. `make check` passes all
+2,970 tests in 120.881 seconds. Independent review has no remaining blockers.
+The lifecycle regression includes 10,000 unrelated historical projections and
+keeps source invalidation below its bounded SQLite work budget. This candidate
+is not deployed and does not close shared-brain acceptance.
+
+After review and merge, deploy through the established procedure:
+
+```bash
+cd /home/ubuntu/bnl01 || exit 1
+git pull --ff-only origin main || exit 1
+sudo systemctl restart bnl01
+systemctl is-active bnl01
+git rev-parse HEAD
+```
+
+Use a genuine eligible community conversation for live evidence. Retain its
+exact original conversation ID and the corresponding tier/source links, then
+follow the same IDs as normal consolidation and cleanup occur. Do not force
+pruning, lower limits, invent a public Moment or perform an unsolicited forget.
+Capture the content-free receipts from the running process once ordinary
+activity produces them:
+
+```bash
+bnl_memory_pid=$(systemctl show bnl01 -p MainPID --value)
+sudo journalctl -u bnl01 _PID="$bnl_memory_pid" --utc --no-pager -o cat \
+  --since '-30 minutes' -n 40 \
+  --grep='conversation_prune_(tier_sources_retained|moment_sources_retained|deferred_unresolved_tier_sources|deferred_for_memory_lifecycle)'
+```
+
+A tier-retention receipt proves a cleanup decision. An unresolved-tier receipt
+proves conservative legacy deferral. Neither proves successful conversational
+recall, participant attribution, cross-surface linking or aging through all
+three tiers. Check those exact source/tier/Moment records and an actual selected
+response packet separately as real activity occurs. A naturally quiet period
+leaves the relevant acceptance case pending.
+
+Ordinary associative topic recall remains the next separate Row 6 change after
+this source-retention integration. Original Row 8 lifecycle evidence, remaining
+provider/packet accounting, applicable live rollback evidence and final owner
+acceptance remain open; the shared-brain recovery plan has not been reset or
+marked complete.
+
 # Row 6 continuation: Moment source retention — September 11 candidate
 
 The confirmed bot deployment remains `2c46ffe62dfcb88ec7ec2110b1007f44f2d9daa0`

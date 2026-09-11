@@ -1793,6 +1793,286 @@ class LedgerEntry:
         return stable_entry_id(guild_id=self.guild_id, source_table=self.source_table, source_row_id=self.source_row_id, entry_type=self.entry_type, subject_key=self.subject_key, predicate_key=self.predicate_key, source_revision=self.source_revision)
 
 
+def _tier_source_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if table not in {"conversations", "memory_tiers", "memory_tier_conversation_sources", "memory_ledger_entries"}:
+        return set()
+    return {str(row[1]) for row in conn.execute("PRAGMA main.table_info(%s)" % table)}
+
+
+def ensure_memory_tier_source_schema(conn: sqlite3.Connection) -> None:
+    """Attach exact source metadata to existing tiers, without owning a commit.
+
+    Legacy summaries remain unlinked. No text matching or historical source
+    inference is performed. Isolated ledger databases need not have tiers.
+    """
+    tier_cols = _tier_source_columns(conn, "memory_tiers")
+    conversation_cols = _tier_source_columns(conn, "conversations")
+    if not {"id", "guild_id", "user_id", "tier", "summary"}.issubset(tier_cols) or not {"id", "guild_id", "user_id"}.issubset(conversation_cols):
+        return
+    if "source_lineage_complete" not in tier_cols:
+        conn.execute("ALTER TABLE memory_tiers ADD COLUMN source_lineage_complete INTEGER NOT NULL DEFAULT 0")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_tiers_source_owner ON memory_tiers(guild_id,user_id,tier)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_tier_conversation_sources (
+          guild_id INTEGER NOT NULL,
+          tier_row_id INTEGER NOT NULL,
+          conversation_row_id INTEGER NOT NULL,
+          PRIMARY KEY (guild_id, tier_row_id, conversation_row_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_memory_tier_conversation_source
+        ON memory_tier_conversation_sources(guild_id, conversation_row_id, tier_row_id)
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_memory_tier_sources_tier_delete
+        AFTER DELETE ON memory_tiers
+        BEGIN
+          DELETE FROM memory_tier_conversation_sources
+          WHERE guild_id=OLD.guild_id AND tier_row_id=OLD.id;
+        END
+    """)
+
+    # Source invalidation scrubs the complete compressed summary. A summary
+    # cannot be safely reconstructed by removing an ID or a text substring.
+    ledger_present = bool(_tier_source_columns(conn, "memory_ledger_entries"))
+    def invalidation_body(source_id: str, source_ref: str) -> str:
+        affected = """
+            SELECT t.id
+            FROM memory_tier_conversation_sources s
+            CROSS JOIN memory_tiers t
+            WHERE s.guild_id=OLD.guild_id AND %s
+              AND t.guild_id=s.guild_id AND t.id=s.tier_row_id
+        """ % source_id
+        scrub = ""
+        if ledger_present:
+            scrub = """
+              UPDATE memory_ledger_entries
+              SET normalized_value='', lifecycle_status='retracted',
+                  public_usable=0, updated_at=CURRENT_TIMESTAMP
+              WHERE entry_id IN (
+                SELECT p.entry_id
+                FROM memory_tier_conversation_sources s
+                CROSS JOIN memory_ledger_entries p INDEXED BY idx_mle_source
+                WHERE s.guild_id=OLD.guild_id AND %s
+                  AND p.guild_id=s.guild_id AND p.source_table='memory_tiers'
+                  AND p.source_row_id=CAST(s.tier_row_id AS TEXT)
+                UNION
+                SELECT p.entry_id
+                FROM memory_ledger_entries r INDEXED BY idx_mle_source
+                CROSS JOIN memory_ledger_lineage l INDEXED BY idx_mll_guild
+                CROSS JOIN memory_ledger_entries p
+                WHERE r.guild_id=OLD.guild_id AND r.source_table='conversations'
+                  AND r.source_row_id=CAST(%s AS TEXT)
+                  AND l.guild_id=r.guild_id AND l.lineage_type='derived_from'
+                  AND l.target_entry_id=r.entry_id
+                  AND p.entry_id=l.entry_id AND p.guild_id=r.guild_id
+                  AND p.source_table='memory_tiers');
+            """ % (source_id, source_ref)
+        return scrub + """
+          DELETE FROM memory_tiers
+          WHERE id IN (%s);
+        """ % affected
+
+    # The pre-ledger triggers still enforce authoritative source deletion.
+    # Once ledger schema exists, use a distinct version that also scrubs its
+    # audit projections. No DDL is necessary during normal retention reads.
+    suffix = "ledger_v1" if ledger_present else "source_v1"
+    if ledger_present:
+        conn.execute("DROP TRIGGER IF EXISTS trg_memory_tier_conversation_delete_source_v1")
+        conn.execute("DROP TRIGGER IF EXISTS trg_memory_tier_conversation_change_source_v1")
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_memory_tier_conversation_delete_%s
+        BEFORE DELETE ON conversations
+        BEGIN %s END
+    """ % (suffix, invalidation_body("conversation_row_id=OLD.id", "OLD.id")))
+    change_cols = [col for col in ("id", "guild_id", "user_id", "content", "role", "channel_policy", "channel_id", "channel_name", "route_mode") if col in conversation_cols]
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_memory_tier_conversation_change_%s
+        BEFORE UPDATE OF %s ON conversations
+        WHEN %s
+        BEGIN %s END
+    """ % (suffix, ",".join(change_cols), " OR ".join("NEW.%s IS NOT OLD.%s" % (col, col) for col in change_cols), invalidation_body("conversation_row_id=OLD.id", "OLD.id")))
+    if ledger_present:
+        match_source = "conversation_row_id=CAST(OLD.source_row_id AS INTEGER) AND CAST(conversation_row_id AS TEXT)=OLD.source_row_id"
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_memory_tier_ledger_source_delete
+            BEFORE DELETE ON memory_ledger_entries
+            WHEN OLD.source_table='conversations'
+            BEGIN %s END
+        """ % invalidation_body(match_source, "OLD.source_row_id"))
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_memory_tier_ledger_source_change
+            AFTER UPDATE OF lifecycle_status,normalized_value,public_usable,
+              source_table,source_row_id,guild_id,source_role,channel_policy,visibility
+            ON memory_ledger_entries
+            WHEN OLD.source_table='conversations' AND (
+              NEW.lifecycle_status NOT IN ('active','review_only')
+              OR NEW.normalized_value IS NOT OLD.normalized_value
+              OR NEW.public_usable IS NOT OLD.public_usable
+              OR NEW.source_table IS NOT OLD.source_table
+              OR NEW.source_row_id IS NOT OLD.source_row_id
+              OR NEW.guild_id IS NOT OLD.guild_id
+              OR NEW.source_role IS NOT OLD.source_role
+              OR NEW.channel_policy IS NOT OLD.channel_policy
+              OR NEW.visibility IS NOT OLD.visibility)
+            BEGIN %s END
+        """ % invalidation_body(match_source, "OLD.source_row_id"))
+
+
+def _tier_source_ids(values: Iterable[int | str]) -> list[int]:
+    result: set[int] = set()
+    for value in values:
+        if isinstance(value, bool) or not re.fullmatch(r"[1-9][0-9]*", str(value)):
+            raise ValueError("invalid_memory_tier_source_id")
+        normalized = int(value)
+        if normalized > 9223372036854775807:
+            raise ValueError("invalid_memory_tier_source_id")
+        result.add(normalized)
+    return sorted(result)
+
+
+def _tier_source_owner(conn: sqlite3.Connection, guild_id: int, tier_row_id: int) -> tuple:
+    cols = _tier_source_columns(conn, "memory_tiers")
+    if not {"id", "guild_id", "user_id", "tier", "summary"}.issubset(cols):
+        raise ValueError("memory_tier_source_owner_unavailable")
+    role = "source_role" if "source_role" in cols else "'legacy_unknown'"
+    policy = "source_channel_policy" if "source_channel_policy" in cols else "'legacy_unknown'"
+    row = conn.execute("SELECT user_id,tier,%s,%s FROM memory_tiers WHERE guild_id=? AND id=? AND TRIM(COALESCE(summary,''))<>''" % (role, policy), (guild_id, tier_row_id)).fetchone()
+    if row is None or row[1] not in {"short", "medium", "long"}:
+        raise ValueError("memory_tier_source_owner_missing")
+    return tuple(row)
+
+
+def attach_memory_tier_conversation_sources(conn: sqlite3.Connection, *, guild_id: int, tier_row_id: int, source_row_ids: Iterable[int | str]) -> None:
+    """Validate and pin exact original rows in the caller's tier transaction."""
+    source_ids = _tier_source_ids(source_row_ids)
+    if not source_ids:
+        return
+    ensure_memory_tier_source_schema(conn)
+    owner = _tier_source_owner(conn, guild_id, tier_row_id)
+    cols = _tier_source_columns(conn, "conversations")
+    if not {"role", "channel_policy"}.issubset(cols):
+        raise ValueError("memory_tier_source_metadata_unavailable")
+    for source_id in source_ids:
+        source = conn.execute("SELECT user_id,role,channel_policy FROM conversations WHERE guild_id=? AND id=?", (guild_id, source_id)).fetchone()
+        if source is None or source[0] != owner[0]:
+            raise ValueError("memory_tier_source_owner_mismatch")
+        if owner[2] != "consolidation" and (source[1] != owner[2] or source[2] != owner[3]):
+            raise ValueError("memory_tier_source_scope_mismatch")
+        if _tier_source_columns(conn, "memory_ledger_entries") and conn.execute("""
+            SELECT 1 FROM memory_ledger_entries
+            WHERE guild_id=? AND source_table='conversations' AND source_row_id=?
+              AND lifecycle_status NOT IN ('active','review_only') LIMIT 1
+        """, (guild_id, str(source_id))).fetchone():
+            raise ValueError("memory_tier_source_retired")
+    conn.executemany("INSERT OR IGNORE INTO memory_tier_conversation_sources(guild_id,tier_row_id,conversation_row_id) VALUES(?,?,?)", [(guild_id, tier_row_id, source_id) for source_id in source_ids])
+    conn.execute("UPDATE memory_tiers SET source_lineage_complete=1 WHERE guild_id=? AND id=?", (guild_id, tier_row_id))
+
+
+def carry_memory_tier_conversation_sources(conn: sqlite3.Connection, *, guild_id: int, target_tier_row_id: int, source_tier_row_ids: Iterable[int | str]) -> None:
+    """Union original leaves before retiring consolidation parents."""
+    parent_ids = _tier_source_ids(source_tier_row_ids)
+    if not parent_ids:
+        return
+    ensure_memory_tier_source_schema(conn)
+    target = _tier_source_owner(conn, guild_id, target_tier_row_id)
+    complete = bool(conn.execute("SELECT source_lineage_complete FROM memory_tiers WHERE guild_id=? AND id=?", (guild_id, target_tier_row_id)).fetchone()[0])
+    source_ids: set[int] = set()
+    for parent_id in parent_ids:
+        parent = _tier_source_owner(conn, guild_id, parent_id)
+        if parent[0] != target[0]:
+            raise ValueError("memory_tier_consolidation_owner_mismatch")
+        complete = complete and bool(conn.execute("SELECT source_lineage_complete FROM memory_tiers WHERE guild_id=? AND id=?", (guild_id, parent_id)).fetchone()[0])
+        source_ids.update(int(row[0]) for row in conn.execute("SELECT conversation_row_id FROM memory_tier_conversation_sources WHERE guild_id=? AND tier_row_id=?", (guild_id, parent_id)))
+    for source_id in source_ids:
+        source = conn.execute("SELECT user_id FROM conversations WHERE guild_id=? AND id=?", (guild_id, source_id)).fetchone()
+        if source is None or source[0] != target[0]:
+            raise ValueError("memory_tier_consolidation_source_missing")
+    conn.executemany("INSERT OR IGNORE INTO memory_tier_conversation_sources(guild_id,tier_row_id,conversation_row_id) VALUES(?,?,?)", [(guild_id, target_tier_row_id, source_id) for source_id in sorted(source_ids)])
+    conn.execute("UPDATE memory_tiers SET source_lineage_complete=? WHERE guild_id=? AND id=?", (int(complete), guild_id, target_tier_row_id))
+
+
+def retained_tier_conversation_sources(conn: sqlite3.Connection, *, guild_id: int, source_row_ids: Iterable[int | str]) -> set[int]:
+    """Read indexed retention references without schema changes or commits."""
+    source_ids = _tier_source_ids(source_row_ids)
+    if not source_ids or not _tier_source_columns(conn, "memory_tier_conversation_sources") or not _tier_source_columns(conn, "memory_tiers"):
+        return set()
+    retained: set[int] = set()
+    for offset in range(0, len(source_ids), 400):
+        chunk = source_ids[offset:offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        retained.update(int(row[0]) for row in conn.execute("""
+            SELECT DISTINCT s.conversation_row_id
+            FROM memory_tier_conversation_sources s
+            JOIN memory_tiers t ON t.guild_id=s.guild_id AND t.id=s.tier_row_id
+            JOIN conversations c ON c.guild_id=s.guild_id AND c.id=s.conversation_row_id
+              AND c.user_id=t.user_id
+            WHERE s.guild_id=? AND s.conversation_row_id IN (%s)
+              AND t.tier IN ('short','medium','long')
+              AND TRIM(COALESCE(t.summary,''))<>''
+        """ % placeholders, (guild_id, *chunk)))
+    return retained
+
+
+def invalidate_memory_tiers_for_conversation_sources(conn: sqlite3.Connection, *, guild_id: int, source_row_ids: Iterable[int | str]) -> int:
+    """Honor an explicit source purge even without a raw ledger copy.
+
+    The caller owns the transaction. Ordinary pruning calls this only for
+    rows already determined to have no surviving tier or Moment dependency.
+    """
+    if not _tier_source_columns(conn, "memory_tier_conversation_sources"):
+        return 0
+    # Old orphan ledger rows may contain nonnumeric source references. Those
+    # cannot identify any exact tier pin and remain the purge owner's job.
+    source_ids = sorted({int(value) for value in source_row_ids
+                         if not isinstance(value, bool)
+                         and re.fullmatch(r"[1-9][0-9]*", str(value))
+                         and int(value) <= 9223372036854775807})
+    if not source_ids:
+        return 0
+    tier_ids: set[int] = set()
+    for offset in range(0, len(source_ids), 400):
+        chunk = source_ids[offset:offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        tier_ids.update(int(row[0]) for row in conn.execute("SELECT tier_row_id FROM memory_tier_conversation_sources WHERE guild_id=? AND conversation_row_id IN (%s)" % placeholders, (guild_id, *chunk)))
+        if _tier_source_columns(conn, "memory_ledger_entries"):
+            conn.execute("""
+                UPDATE memory_ledger_entries
+                SET normalized_value='',public_usable=0,lifecycle_status='retracted',updated_at=CURRENT_TIMESTAMP
+                WHERE entry_id IN (
+                  SELECT p.entry_id
+                  FROM memory_ledger_entries r INDEXED BY idx_mle_source
+                  CROSS JOIN memory_ledger_lineage l INDEXED BY idx_mll_guild
+                  CROSS JOIN memory_ledger_entries p
+                  WHERE r.guild_id=? AND r.source_table='conversations'
+                    AND r.source_row_id IN (%s)
+                    AND l.guild_id=r.guild_id AND l.lineage_type='derived_from'
+                    AND l.target_entry_id=r.entry_id
+                    AND p.entry_id=l.entry_id AND p.guild_id=r.guild_id
+                    AND p.source_table='memory_tiers')
+            """ % placeholders, (guild_id, *(str(source_id) for source_id in chunk)))
+    count = 0
+    ordered_tiers = sorted(tier_ids)
+    ledger_present = bool(_tier_source_columns(conn, "memory_ledger_entries"))
+    for offset in range(0, len(ordered_tiers), 400):
+        chunk = ordered_tiers[offset:offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        if ledger_present:
+            conn.execute("UPDATE memory_ledger_entries SET normalized_value='',public_usable=0,lifecycle_status='retracted',updated_at=CURRENT_TIMESTAMP WHERE guild_id=? AND source_table='memory_tiers' AND source_row_id IN (%s)" % placeholders, (guild_id, *(str(tier_id) for tier_id in chunk)))
+        count += conn.execute("DELETE FROM memory_tiers WHERE guild_id=? AND id IN (%s)" % placeholders, (guild_id, *chunk)).rowcount
+    return count
+
+
+def unresolved_memory_tier_sources_count(conn: sqlite3.Connection, *, guild_id: int, user_id: int) -> int:
+    """Report existing summaries whose complete source coverage is unknown."""
+    cols = _tier_source_columns(conn, "memory_tiers")
+    if not {"guild_id", "user_id", "tier", "summary"}.issubset(cols):
+        return 0
+    incomplete = "AND COALESCE(source_lineage_complete,0)<>1" if "source_lineage_complete" in cols else ""
+    return int(conn.execute("SELECT COUNT(*) FROM memory_tiers WHERE guild_id=? AND user_id=? AND tier IN ('short','medium','long') AND TRIM(COALESCE(summary,''))<>'' " + incomplete, (guild_id, user_id)).fetchone()[0])
+
+
 def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     cur.execute("""
@@ -2433,6 +2713,9 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         END
         """
     )
+
+
+    ensure_memory_tier_source_schema(conn)
 
 
 def record_shadow_receipt(conn: sqlite3.Connection, *, guild_id: int, writer: str, source_table: str, source_row_id: int | str, source_revision: str = "", source_event_key: str = "", outcome: str, reason_code: str, entry_id: str = "") -> None:
@@ -13147,8 +13430,35 @@ def _entry_ids_for_source_rows(conn: sqlite3.Connection, *, guild_id: int, sourc
 
 def shadow_memory_tier_row(conn: sqlite3.Connection, *, row_id: int, user_id: int, guild_id: int, tier: str, summary: str, salience: float = 0.5, channel_policy: str = "legacy_unknown", topic_key: str = "", updated_at: str = "", derived_from_entry_ids: tuple[str, ...] = (), derived_from_source_row_ids: tuple[int, ...] = ()) -> LedgerWriteResult:
     rev = source_revision_for(row_id, updated_at)
+    direct_source_ids: tuple[str, ...] = ()
+    if _tier_source_columns(conn, "memory_tier_conversation_sources"):
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        updated_column = "updated_at" if "updated_at" in _tier_source_columns(conn, "memory_tiers") else "''"
+        current = conn.execute("SELECT summary,%s FROM memory_tiers WHERE guild_id=? AND user_id=? AND id=? AND tier=? AND TRIM(COALESCE(summary,''))<>''" % updated_column, (guild_id, user_id, row_id, tier)).fetchone()
+        if current is None:
+            return skipped_result(guild_id=guild_id, source_table="memory_tiers", source_row_id=row_id, source_revision=rev, reason_code="tier_source_retired")
+        if str(current[0]) != str(summary) or (updated_at and current[1] and str(current[1]) != updated_at):
+            return skipped_result(guild_id=guild_id, source_table="memory_tiers", source_row_id=row_id, source_revision=rev, reason_code="tier_source_changed")
+        # Direct leaves survive retired intermediate tiers and repeated
+        # destination revisions; intermediate audit lineage remains intact.
+        direct_source_ids = tuple(str(row[0]) for row in conn.execute("""
+            SELECT DISTINCT e.entry_id
+            FROM memory_tier_conversation_sources s
+            JOIN memory_ledger_entries e
+              ON e.guild_id=s.guild_id AND e.source_table='conversations'
+              AND e.source_row_id=CAST(s.conversation_row_id AS TEXT)
+            WHERE s.guild_id=? AND s.tier_row_id=?
+              AND e.lifecycle_status IN ('active','review_only')
+              AND TRIM(COALESCE(e.normalized_value,''))<>''
+              AND ((e.source_role='user' AND e.entry_type='observation')
+                OR (e.source_role='model' AND e.entry_type='derived_summary')
+                OR (e.predicate_key='conversation' AND e.entry_type='observation')
+                OR (e.predicate_key='model_output' AND e.entry_type='derived_summary'))
+            ORDER BY e.entry_id
+        """, (guild_id, row_id)))
     real_source_ids = _entry_ids_for_source_rows(conn, guild_id=guild_id, source_table="memory_tiers", source_row_ids=derived_from_source_row_ids)
-    lineage = tuple(("derived_from", eid) for eid in sorted(set(tuple(derived_from_entry_ids) + real_source_ids)) if eid)
+    lineage = tuple(("derived_from", eid) for eid in sorted(set(tuple(derived_from_entry_ids) + real_source_ids + direct_source_ids)) if eid)
     return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="memory_tiers", source_row_id=row_id, source_revision=rev, source_role="derived_projection", entry_type="derived_summary", subject_key=subject_key_for_user(user_id), predicate_key=topic_key or f"memory_tier:{tier}", value=(summary or "")[:500], source_class=SourceClass.DERIVED_SUMMARY, visibility=Visibility.PRIVATE, confidence=Confidence.LOW, public_usable=False, derived=True, projection=True, salience=salience, observed_at=updated_at or _now(), source_sequence=int(row_id or 0), lifecycle_status=REVIEW_ONLY_LIFECYCLE, participants=(LedgerParticipant(subject_key_for_user(user_id), "", "subject", 0),), lineage=lineage))
 
 

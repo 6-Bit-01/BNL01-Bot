@@ -28,6 +28,7 @@ from bnl_journal_source_store import (
 from bnl_memory_ledger import (
     ensure_memory_ledger_schema,
     form_atomic_candidate_from_ledger_entry,
+    invalidate_memory_tiers_for_conversation_sources,
     purge_atomic_knowledge_for_subject,
     reconcile_atomic_knowledge_lifecycle_for_roots,
     record_atomic_knowledge_processing_error,
@@ -2088,6 +2089,11 @@ def purge_conversation_ledger_sources(
         "moment_contributions_deleted": 0,
         "moment_contribution_sources_deleted": 0,
     }
+    counts["memory_tiers_invalidated"] = invalidate_memory_tiers_for_conversation_sources(
+        conn,
+        guild_id=int(guild_id),
+        source_row_ids=row_ids,
+    )
     if not row_ids or not _table_exists(conn, "memory_ledger_entries"):
         return counts
 
