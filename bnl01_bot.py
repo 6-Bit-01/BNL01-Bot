@@ -138,6 +138,7 @@ from bnl_moment_engine import (
     render_active_episode_canary_context,
     render_shadow_moment_context,
     recent_moment_situation_for_assessment,
+    retained_moment_conversation_sources,
     shadow_enabled as moment_engine_shadow_enabled,
     sweep_expired_episodes,
     sweep_expired_windows as sweep_expired_moment_windows,
@@ -17298,28 +17299,53 @@ def _delete_conversation_response_participant_rows(
 def prune_conversation_history(user_id: int, guild_id: int, max_rows: int = MAX_CONVERSATION_ROWS_PER_USER):
     keep_rows = max(0, int(max_rows or 0))
     with sqlite3.connect(DB_FILE) as conn:
-        source_row_ids = [
-            int(row[0])
-            for row in conn.execute(
-                """
-                SELECT id
-                FROM conversations
-                WHERE user_id=? AND guild_id=?
-                ORDER BY id DESC
-                LIMIT -1 OFFSET ?
-                """,
-                (user_id, guild_id, keep_rows),
-            ).fetchall()
-        ]
-        if not source_row_ids:
-            return
         try:
-            purge_conversation_ledger_sources(
+            # Classify and delete in one snapshot. Concurrent finalization
+            # must not turn an unprotected row into a Moment root mid-prune.
+            conn.execute("BEGIN")
+            source_row_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT id
+                    FROM conversations
+                    WHERE user_id=? AND guild_id=?
+                    ORDER BY id DESC
+                    LIMIT -1 OFFSET ?
+                    """,
+                    (user_id, guild_id, keep_rows),
+                ).fetchall()
+            ]
+            if not source_row_ids:
+                return
+            retained_sources = retained_moment_conversation_sources(
                 conn,
                 guild_id=guild_id,
                 source_row_ids=source_row_ids,
-                reason="bounded_conversation_prune",
             )
+            source_row_ids = [
+                row_id for row_id in source_row_ids if row_id not in retained_sources
+            ]
+            if source_row_ids:
+                purge_conversation_ledger_sources(
+                    conn,
+                    guild_id=guild_id,
+                    source_row_ids=source_row_ids,
+                    reason="bounded_conversation_prune",
+                )
+                placeholders = ",".join("?" for _ in source_row_ids)
+                conn.execute(
+                    f"""
+                    DELETE FROM conversations
+                    WHERE guild_id=? AND user_id=? AND id IN ({placeholders})
+                    """,
+                    (guild_id, user_id, *source_row_ids),
+                )
+                _delete_conversation_response_participant_rows(
+                    conn,
+                    guild_id=guild_id,
+                    conversation_row_ids=source_row_ids,
+                )
         except Exception as exc:
             # The lifecycle helper and transcript deletion are one privacy
             # transaction. If lifecycle cleanup fails after making any
@@ -17333,18 +17359,11 @@ def prune_conversation_history(user_id: int, guild_id: int, max_rows: int = MAX_
                 type(exc).__name__,
             )
             return
-        placeholders = ",".join("?" for _ in source_row_ids)
-        conn.execute(
-            f"""
-            DELETE FROM conversations
-            WHERE guild_id=? AND user_id=? AND id IN ({placeholders})
-            """,
-            (guild_id, user_id, *source_row_ids),
-        )
-        _delete_conversation_response_participant_rows(
-            conn,
-            guild_id=guild_id,
-            conversation_row_ids=source_row_ids,
+    if retained_sources:
+        logging.info(
+            "conversation_prune_moment_sources_retained guild_id=%s user_id=%s "
+            "retained_sources=%s pruned_rows=%s recent_rows_limit=%s",
+            guild_id, user_id, len(retained_sources), len(source_row_ids), keep_rows,
         )
 
 def upsert_user_profile(user_id: int, guild_id: int, display_name: str):

@@ -14,7 +14,7 @@ import json
 import os
 import re
 import sqlite3
-from typing import Any
+from typing import Any, Iterable
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
 from bnl_conversation_context_v2 import (
@@ -5013,6 +5013,92 @@ def _moment_is_renderable(
         public_usable=True,
     )
     return not failure
+
+
+def retained_moment_conversation_sources(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    source_row_ids: Iterable[int],
+) -> set[int]:
+    """Keep existing public Moment evidence out of routine transcript pruning.
+
+    The caller supplies overflow *after* computing the newest-N cutoff. This
+    read-only check neither creates memory nor overrides explicit clear/forget.
+    Retained transcripts and their ledger roots remain in the existing owners,
+    so normal source correction and deletion continue to invalidate recall.
+    """
+    overflow = sorted({int(row_id) for row_id in source_row_ids})
+    if not overflow or not _table_exists(conn, "memory_moment_windows"):
+        return set()
+    retained: set[int] = set()
+    checked: set[str] = set()
+    overflow_set = set(overflow)
+    for offset in range(0, len(overflow), 400):
+        chunk = overflow[offset:offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        # Preserve the indexed overflow-source -> membership -> Moment order;
+        # SQLite may otherwise scan all guild Moments once per overflow chunk.
+        candidates = conn.execute(
+            f"""
+            SELECT DISTINCT w.moment_id,w.summary,w.channel_id,
+                   w.channel_policy,w.route_mode,w.visibility,
+                   w.canonical_ledger_entry_id
+            FROM memory_ledger_entries e
+            CROSS JOIN memory_moment_members m ON m.ledger_entry_id=e.entry_id
+            CROSS JOIN memory_moment_windows w ON w.moment_id=m.moment_id
+            WHERE e.guild_id=? AND e.source_table='conversations'
+              AND e.source_row_id IN ({placeholders})
+              AND w.guild_id=e.guild_id
+              AND w.lifecycle_status='finalized' AND w.public_usable=1
+              AND w.visibility IN ('public','public_safe')
+              AND w.channel_policy IN ('public_home','public_context')
+              AND w.route_mode IN (
+                  'normal_chat','direct_payload','direct_payload_task'
+              )
+            """,
+            (int(guild_id), *(str(row_id) for row_id in chunk)),
+        ).fetchall()
+        for row in candidates:
+            moment_id = str(row[0])
+            if moment_id in checked:
+                continue
+            checked.add(moment_id)
+            if not _moment_is_renderable(
+                conn,
+                moment_id=moment_id,
+                summary=str(row[1] or ""),
+                guild_id=int(guild_id),
+                channel_id=int(row[2] or 0),
+                channel_policy=str(row[3] or ""),
+                route_mode=str(row[4] or ""),
+                visibility=str(row[5] or ""),
+                canonical_ledger_entry_id=str(row[6] or ""),
+            ):
+                continue
+            # Validate every authoritative transcript, including BNL's model
+            # rows. Do not pin a partially orphaned experience or coerce an
+            # arbitrary ledger source ID into a different conversation ID.
+            roots = conn.execute(
+                """
+                SELECT c.id
+                FROM memory_moment_members m
+                JOIN memory_ledger_entries e ON e.entry_id=m.ledger_entry_id
+                LEFT JOIN conversations c
+                  ON c.id=e.source_row_id
+                  AND e.source_row_id=CAST(c.id AS TEXT)
+                  AND c.guild_id=e.guild_id AND c.role=e.source_role
+                  AND c.channel_id=e.channel_id
+                  AND c.channel_policy=e.channel_policy
+                WHERE m.moment_id=?
+                """,
+                (moment_id,),
+            ).fetchall()
+            if roots and all(root[0] is not None for root in roots):
+                retained.update(
+                    int(root[0]) for root in roots if int(root[0]) in overflow_set
+                )
+    return retained
 
 
 def _human_participant_present(
