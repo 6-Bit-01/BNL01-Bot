@@ -636,7 +636,9 @@ BNL_WEBSITE_QUIET_RELAY_INTERVAL_MINUTES = max(
     BNL_WEBSITE_RELAY_INTERVAL_MINUTES,
     _configured_quiet_relay_interval,
 )
-BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS", "25") or 25))
+# This is the Relay generation budget, including its existing grounding regeneration.
+# Live model calls can finish after 25 seconds, before Relay validation.
+BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS", "60") or 60))
 BNL_WEBSITE_RELAY_FRESHNESS_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_FRESHNESS_MINUTES", "120") or 120))
 BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES", "5") or 5))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)

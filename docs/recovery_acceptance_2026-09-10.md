@@ -1,3 +1,73 @@
+# Row 9 continuation: Relay deadline — September 11 candidate
+
+PR537 is merged on main at `295e3618ee24581f7a5d87ee5f690eea1cdcaf96`.
+The owner reported completing its deployment. The September 11 13:01 UTC
+VPS receipt separately confirms BNL active, PID `1606105`, started at 06:06:34
+UTC. The process inherits no provider-timeout or retry overrides, so the
+reviewed code uses 120 seconds per provider request and one normal-route retry;
+the ordinary single-packet route still overrides retries to zero and disables
+model fallback. Relay and its child grounding routes also use zero provider
+retries and no model fallback. The configured primary/fallback model pair
+remains Gemini 3.6/3.5 Flash; availability of that pair does not enable fallback
+on routes that prohibit it.
+
+The existing 06:06–13:01 UTC journal contains nine successful model attempts
+across seven hourly Relay cycles, including two grounding regenerations. The
+stored Relay outcomes establish:
+
+| Cycle (UTC) | Stored outcome |
+| --- | --- |
+| 06:10, 07:10 | Rejected: `lane_validation_failure` |
+| 08:10, 11:10, 12:10 | Published, with accepted Relay IDs and website timestamps |
+| 09:10, 10:10 | `provider_failed`, reason `relay_generation_timeout`; decision metadata marks the generation abandoned |
+
+Both abandoned cycles hit the existing 25-second Relay-generation deadline. Their
+physical model calls subsequently recorded success; start-to-accounting timing
+places those cycles around 27–28 seconds. The async `gemini_generation_completed`
+marker comes from `finally` and also appears when its awaiter is cancelled. It
+does not prove physical completion or website delivery. No ordinary-chat turn
+appears in this sample, so it does not close the earlier 119/112-second chat case.
+
+This candidate changes the existing Relay total-generation default from 25 to
+60 seconds. Explicit environment overrides remain authoritative. The extra
+time accommodates the observed paths with the same generation stages and retry
+policy. A longer budget can let an existing later stage run or finish where
+the previous deadline cancelled it.
+The existing deadline, cancellation, no-late-publication behavior, transaction
+serialization, cursor advancement, validation and schedule remain in place.
+Provider settings, ordinary chat, queue reads, show controls, Journal and
+memory behavior are unchanged. The configured asynchronous generation allowance
+increases by 35 seconds. This is not a whole-cycle wall-clock limit: transaction
+lock acquisition, control reads and publication sit outside the generation
+deadline, and synchronous work can delay cancellation.
+
+The timed-out drafts were not retained or validated to completion. More time
+therefore does not guarantee that they would publish. The two lane rejections
+remain separate. A source trace reproduced a literal-word restriction in the
+historical lane, but the actual rejected drafts are unavailable; this candidate
+does not change that validator or claim those rejections were false positives.
+
+Validation: the existing focused Relay suite passed all 76 tests; the required
+`make check PYTHON=python` gate passed all 2,982 tests.
+Independent review found no runtime blockers. Live acceptance remains pending
+deployment and a naturally scheduled Relay outcome.
+
+Row 10 readiness evidence now confirms the installed public-launch drop-in
+matches the reviewed file, `NeedDaemonReload=no`, and the recorded rollback
+choice is `previously-absent` (with no conflicting original-file backup).
+Actual public rollback has not been exercised. Earlier accepted canary
+off/on/restart evidence remains accepted.
+
+After merge, use the established pull/restart procedure and verify the running
+`BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS` input. Unset/empty means the new
+60-second default; an explicit 25-second override would retain the old cutoff.
+Use the next naturally scheduled Relay and its existing publication outcome
+for live acceptance. Do not force a relay, stage a conversation or replay the
+abandoned cycles. Natural Moment, association, tier-transition, retention,
+group and applicable source-lifecycle cases remain deferred together. Shared
+brain recovery remains open for those cases, remaining response/delivery
+evidence, applicable live rollback and final owner acceptance.
+
 # Row 6 continuation: ordinary historical topic recall — September 11 candidate
 
 PR536 is merged and confirmed deployed at
