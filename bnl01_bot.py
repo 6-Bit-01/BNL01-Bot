@@ -66,6 +66,7 @@ from bnl_tiktok_show_ledger import (
     load_show_timeline_discord_messages,
     load_show_preparation_context,
     show_preparation_requested,
+    show_preparation_only_requested,
     sync_tiktok_show_evidence_ledgers,
 )
 from bnl_occasion import (
@@ -2934,6 +2935,7 @@ def build_bnl_read_model_context(
             archive = {**archive, "currentShow": {
                 **current_show, "_evidenceObservedThroughMs": int(_bnl_read_model_cached_at.timestamp() * 1000),
             }}
+    preparation_context = ""
     if show_preparation_requested(user_text) and declared_access_scope == "public":
         show, _selected_source = select_show_for_tiktok_analysis(archive, user_text)
         if show:
@@ -2948,9 +2950,10 @@ def build_bnl_read_model_context(
                     same_date_show_count=sum(1 for item in tiktok_show_records(archive)
                         if item.get("showDate") == show.get("showDate")),
                 )
-                if context:
+                if context and show_preparation_only_requested(user_text):
                     return ("Website public read model context:\n- accessScope=public\n"
                             "Durable TikTok show analysis context:\n" + context)
+                preparation_context = context
     artists_section = sections.get("artists") if sections.get("artists") is not None else read_model.get("artists")
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
@@ -3009,6 +3012,8 @@ def build_bnl_read_model_context(
     schema_revision = _compact_public_text(read_model.get("schemaRevision"), 40)
     if schema_revision:
         lines[-1] += f" / schemaRevision={schema_revision}"
+    if preparation_context:
+        lines.append(preparation_context)
 
     include_public_site_canon = bool(
         source_context_items
@@ -3699,6 +3704,8 @@ def finalized_show_packet_owner_requested(
         and not _current_queue_state_query(clean_content)
         and (
             is_tiktok_show_analysis_query(clean_content)
+            or show_preparation_requested(clean_content)
+            or len(requested_show_dates(clean_content)) > 1
             or re.search(
                 r"\b(?:yesterday(?:'s)?|last night|last show|previous show|"
                 r"past show|timeline|recap|rundown|what happened|"
@@ -38116,6 +38123,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 specialized_owner_present=bool(
                     (
                         batch_website_read_model_context
+                        and not batch_finalized_show_packet_owner
                         and not batch_publication_packet_owns_turn
                         and not batch_publication_queue_packet_ready
                     )

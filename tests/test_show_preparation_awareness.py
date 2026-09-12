@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -19,7 +20,7 @@ import bnl_moment_engine as moments
 import bnl_tiktok_show_ledger as shows
 from bnl_journal_source_store import record_source_event
 from bnl_shared_brain_synthesis import render_packet_context
-from bnl_unified_intelligence_packet import IntelligencePacketRequest, build_packet, revalidate_packet
+from bnl_unified_intelligence_packet import IntelligencePacketRequest, PacketConversationEvidence, build_packet, revalidate_packet
 import test_tiktok_show_evidence_ledger as fixtures
 from test_tiktok_show_evidence_ledger import archived_show, authorized_read_model, stamp
 from test_show_interval_conversation import PACKET_ENV
@@ -183,6 +184,56 @@ class ShowPreparationTests(unittest.TestCase):
         basis = bot.build_finalized_show_prompt_source_basis(native, guild_id=77, selection=selection)
         self.assertIsNotNone(basis)
         self.assertEqual(len(basis.authored_excerpts), 26)
+
+    def test_combined_request_composes_preparation_moments_timeline_chat_and_conversation(self):
+        texts = (
+            "For the August 28, 2026 BARCODE Radio show I checked the audio cables and speaker routing.",
+            "I checked the audio cables and prefer the balanced speaker routing.",
+            "We checked the audio cables and agreed the balanced speaker routing works.",
+        )
+        for index, text in enumerate(texts):
+            self.add_discord(2001 + index, text,
+                at=f"2026-08-27T10:00:0{index}+00:00", user_id=901 + index, observe=True)
+        self.add_tiktok("prep-kettle", "The kettle finally boiled.")
+        self.add_tiktok("show-room-topic", "The room is talking about green lighting.", at="2026-08-29T00:02:00Z")
+        with sqlite3.connect(self.db) as conn:
+            moments.sweep_expired_windows(conn, now="2026-08-27T10:03:00+00:00")
+            moment_id = conn.execute("SELECT moment_id FROM memory_moment_windows WHERE lifecycle_status='finalized'").fetchone()[0]
+        self.sync()
+        correction = "Please keep room banter separate from actual equipment-check results."
+        self.add_discord(2010, correction, at="2026-08-29T12:00:00Z")
+        query = ("Give me the August 28, 2026 BARCODE Radio show timeline: session start, submissions, "
+                 "wheel spins, track starts and stops, removals, and show end. Include linked preparation "
+                 "and what TikTok and Discord chat discussed during the show.")
+        selection = {}
+        native = shows.build_tiktok_show_evidence_context(self.db, guild_id=77, user_text=query, selection_out=selection)
+        with mock.patch.multiple(bot, DB_FILE=self.db, BNL_PRIMARY_GUILD_ID=77):
+            website = bot.build_bnl_read_model_context(
+                fixtures.authorized_read_model({"latestShow": self.show}), query, "sealed_test")
+        with sqlite3.connect(self.db) as conn:
+            request = replace(self.request(), user_text=query, conversation_evidence=(
+                PacketConversationEvidence(text=correction, source_id=2010, speaker_user_id=901, speaker_label="Test Technician"),))
+            packet = build_packet(conn, request, persist=True, environ=PACKET_ENV)
+            self.assertEqual(packet.diagnostics.invalid_invariants, [])
+            rendered = render_packet_context(packet)[0]
+            self.assertIn("conversation_context", {item.lane for item in packet.items})
+            self.assertIn(correction, rendered)
+            items = [item for item in packet.items if item.lane == "show_episode"]
+            self.assertEqual(len({item.source_ref for item in items}), len(items))
+            self.assertTrue({"show_linked_preparation", "scoped_show_conversation"} <= {item.usage for item in items})
+            self.assertTrue(any(item.source_class == "first_party_record" for item in items))
+            self.assertTrue(revalidate_packet(conn, packet, environ=PACKET_ENV).valid)
+            conn.execute("UPDATE conversations SET content=? WHERE id=2001", ("The audio cables still need checking.",))
+            self.assertFalse(revalidate_packet(conn, packet, environ=PACKET_ENV).valid)
+        for reader in (native, website, rendered):
+            self.assertIn("Show-linked preparation Moment:", reader)
+            self.assertIn(moment_id, reader)
+            self.assertIn("The kettle finally boiled.", reader)
+            self.assertIn("[recorded operation] session_archived", reader)
+            self.assertIn("The room is talking about green lighting.", reader)
+            self.assertIn("window basis=recorded_show_timeline", reader)
+        self.assertTrue(bot.finalized_show_packet_owner_requested(query, native))
+        self.assertTrue(bot.finalized_show_packet_owner_requested(QUERY, native))
 
     def test_preparation_survives_ordinary_conversation_pruning(self):
         text = "For the August 28, 2026 BARCODE Radio show we reserved the spare mixer."
