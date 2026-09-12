@@ -30,6 +30,7 @@ from bnl_unified_intelligence_packet import (
     shadow_configuration,
 )
 from bnl_unified_response_assessment import (
+    build_situation_frame_v1,
     build_unified_response_assessment,
 )
 
@@ -2979,6 +2980,63 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 blocked = build_packet(self.conn, replace(request, **changes), environ=self.flags)
                 self.assertFalse(any(item.lane == "conversation_context" for item in blocked.items))
+
+    def test_unresolved_episode_keeps_valid_named_member_conversation(self):
+        self.add_conversation_context_row()
+        text = "Return to the archive discussion that Test Member joined. What remains unresolved?"
+        frame = build_situation_frame_v1(
+            route_allowed=True, route_mode="normal_chat",
+            conversation_surface="public_home", channel_policy="public_home",
+            current_text=text, current_speaker_user_ids=(8,),
+            current_speaker_labels=("Test Speaker",),
+            subject_user_ids=(7,), response_act="answer",
+        )
+        self.assertEqual(frame.ambiguity_reasons, ("resume_target_unresolved",))
+        request = replace(
+            self.public_request(text=text),
+            frame_revision=frame.frame_revision,
+            frame_schema_version=frame.schema_version,
+            frame_input_evidence_digest=frame.input_evidence_digest,
+            frame_status=frame.status,
+            frame_event_relation=frame.event_relation,
+            frame_subject_requirement=frame.subject_requirement,
+            frame_ambiguity_reasons=frame.ambiguity_reasons,
+            frame_subjects=(PacketFrameSubject(
+                user_id=7, binding_method="existing_typed_target", confidence="high",
+            ),),
+        )
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                packet = build_packet(self.conn, replace(
+                    request, channel_policy=policy,
+                    visibility_allowance="sealed_test" if policy == "sealed_test" else "public_safe",
+                ), environ=self.flags)
+                self.assertEqual(packet.subject_resolution.status, "resolved")
+                self.assertEqual(packet.subject_resolution.subject_user_id, 7)
+                self.assertIn("conversation:900", {item.source_ref for item in packet.items})
+                self.assertTrue(revalidate_packet(self.conn, packet).valid)
+        self.conn.execute("DELETE FROM conversations WHERE id=900")
+        self.assertFalse(revalidate_packet(self.conn, packet).valid)
+
+    def test_unresolved_episode_does_not_waive_subject_validation(self):
+        self.add_conversation_context_row()
+        request = replace(
+            self.public_request(text="Return to our archive discussion."),
+            frame_revision="sf_named_resume", frame_input_evidence_digest="d" * 64,
+            frame_status="ambiguous", frame_event_relation="resume_unresolved",
+            frame_subject_requirement="required",
+            frame_ambiguity_reasons=("resume_target_unresolved",),
+        )
+        for subjects in (
+            (),
+            (PacketFrameSubject(),),
+            (PacketFrameSubject(user_id=7, entity_ref="unknown_entity"),),
+            (PacketFrameSubject(user_id=7), PacketFrameSubject(user_id=8)),
+        ):
+            with self.subTest(subjects=subjects):
+                packet = build_packet(self.conn, replace(request, frame_subjects=subjects), environ=self.flags)
+                self.assertNotEqual(packet.subject_resolution.status, "resolved")
+                self.assertFalse(any(item.lane == "conversation_context" for item in packet.items))
 
     def test_publication_task_survives_only_unrelated_subject_ambiguity(self):
         publication = IntelligencePacketItem(

@@ -45,6 +45,36 @@ def req(**kw):
     return ConversationContextRequest(**base)
 
 class ConversationContextV2Tests(unittest.TestCase):
+    def test_numeric_selection_ranges_are_not_named_choice_payloads(self):
+        cases = (
+            ("Choose a year between 1974 and 2008 and combine two styles.",
+             "1986: brass funk with ambient dub."),
+            ("Pick any number between 12 and 30.", "17."),
+            ("Select a comfortable tempo between 90 and 120 BPM.", "105 BPM."),
+        )
+        for request, answer in cases:
+            with self.subTest(request=request):
+                anchors = extract_current_payload_anchors(request)
+                self.assertEqual(anchors, ())
+                self.assertFalse(assess_payload_grounding(
+                    answer, current_payload_anchors=anchors,
+                ).failed)
+
+    def test_numeric_range_does_not_remove_actual_named_alternatives(self):
+        request = (
+            'Choose a year between 1974 and 2008, then pick '
+            '"Amber Dock" or "Violet Roof" for the title.'
+        )
+        self.assertEqual(extract_current_payload_anchors(request),
+                         ("amber dock", "violet roof"))
+        for request in (
+            'Compare "1974" with "2008".',
+            'Choose between 1974 and 2008.',
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(extract_current_payload_anchors(request),
+                                 ("1974", "2008"))
+
     def test_resume_wording_requires_an_actual_thread_reference(self):
         self.assertFalse(
             thread_resume_requested("Which title sounds older?")
