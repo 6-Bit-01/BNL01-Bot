@@ -191,6 +191,11 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
         minimum=0,
         maximum=2,
     )
+    if normalized_route == 'moment_meaning_background':
+        return GeminiRoutePolicy(
+            lane='background', max_output_tokens=2048, legacy_thinking_budget=512,
+            provider_retries=0, allow_fallback=False,
+        )
     if normalized_route == "ordinary_chat_single_packet_canary":
         # The accepted cutover path is one logical and physical provider
         # attempt: no retry multiplication and no model fallback.
