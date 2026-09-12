@@ -2077,6 +2077,35 @@ def _requested_track_keys(user_text: str, ranked: Sequence[Mapping[str, Any]]) -
     return {key for score, key in matches if key and score == best}
 
 
+_SHOW_CONTEXT_REFERENCE_RE = re.compile(
+    r"\b(?:during|throughout|after)\s+"
+    r"(?:(?:all(?:\s+of)?|the|that|this|last|previous|prior|current|our|"
+    r"whole|entire|full|barcode|radio|tik\s?tok)\s+|"
+    r"(?:yesterday|today|last\s+night)['’]s\s+)*"
+    r"(?:show|broadcast|session|live(?:\s+stream)?|stream)\b",
+    re.IGNORECASE,
+)
+
+
+def _show_reference_text(user_text: str) -> str:
+    query = str(user_text or "")
+    for pattern in _EXPLICIT_SHOW_DATE_PATTERNS:
+        query = pattern.sub(" ", query)
+    return _SPACE_RE.sub(" ", query).strip()
+
+
+def show_context_reference_requested(user_text: str) -> bool:
+    """Recognize a direct show reference without consuming later requests."""
+
+    return bool(_SHOW_CONTEXT_REFERENCE_RE.search(_show_reference_text(user_text)))
+
+
+def _specific_show_interval_text(user_text: str) -> str:
+    # Remove only direct whole-show references. A separate named-track,
+    # operation or elapsed-time request must remain available to every reader.
+    return _SHOW_CONTEXT_REFERENCE_RE.sub(" ", _show_reference_text(user_text))
+
+
 def show_conversation_interval_requested(user_text: str) -> bool:
     """Recognize source-window references, without deciding whether to reply."""
 
@@ -2085,22 +2114,11 @@ def show_conversation_interval_requested(user_text: str) -> bool:
         r"\b(?:show|broadcast|session|radio)\b", query, re.I,
     ):
         return True
-    without_dates = query
-    for pattern in _EXPLICIT_SHOW_DATE_PATTERNS:
-        without_dates = pattern.sub("", without_dates)
-    if re.search(
-        r"\bduring\s+(?:(?:the|that|this|last|previous|prior|current|our)\s+|"
-        r"(?:yesterday|today|last night)['’]s\s+)*(?:show|broadcast|session|live)\b",
-        without_dates, re.I,
-    ) and not re.search(
-        r"\b(?:track|song|minute)\b|t\+", re.split(r"\bduring\b", without_dates, flags=re.I)[-1], re.I,
-    ):
-        return False
     return bool(
         re.search(r"\b(?:chat|comments?|viewers?|audience|said|say|saying|discussed|topics?)\b", query, re.I)
         and re.search(
             r"\b(?:during|(?:last|previous|prior|current|this) (?:track|song)|"
-            r"(?:between|from) (?:minute|t\+)\s*\d)", query, re.I,
+            r"(?:between|from) (?:minute|t\+)\s*\d)", _specific_show_interval_text(query), re.I,
         )
     )
 
@@ -2140,14 +2158,15 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
     # Event categories in a requested show chronology are additive. Only an
     # actual interval reference narrows it; mentioning "wheel spins" or
     # "track starts and stops" does not select those events exclusively.
+    interval_query = _specific_show_interval_text(query)
     interval_reference = re.search(
-        r"\bduring\b(?!\s+(?:(?:the|that|this)\s+)?(?:show|broadcast|session)\b)"
+        r"\bduring\b"
         r"|\b(?:last|previous|prior|current|this) (?:track|song)\b"
         r"|\b(?:of|for|around)\s+(?:the\s+)?"
         r"(?:last|previous|prior|current|this|latest)\s+"
         r"(?:track|song|wheel(?:\s+spin)?|sponsor(?:\s+break)?)\b"
         r"|\b(?:of|for|around)\s+the\s+(?:wheel\s+spin\b|wheel\b(?!\s+spins?\b)|"
-        r"sponsor\s+break\b|sponsor\b(?!\s+breaks?\b))", query, re.I,
+        r"sponsor\s+break\b|sponsor\b(?!\s+breaks?\b))", interval_query, re.I,
     )
     full_timeline = bool(re.search(r"\b(?:timeline|chronology|chronological)\b", query, re.I)
                          and not keys and not interval_reference)
@@ -2199,10 +2218,7 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
             selected = []
         basis = "recorded_operation_interval"
     elif not keys:
-        # "During the show" still belongs to the existing full-show reader.
-        if re.search(r"\bduring (?:the |that |this )?(?:show|broadcast|session|live)\b", query, re.I):
-            return None
-        if not re.search(r"\bduring\b|\b(?:track|song)\b", query, re.I):
+        if not re.search(r"\bduring\b|\b(?:track|song)\b", interval_query, re.I):
             return None
     surfaces = ("tiktok", "discord")
     tiktok = bool(re.search(r"\btik\s?tok\b", query, re.I))

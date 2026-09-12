@@ -44,3 +44,28 @@ The added integration coverage failed on the merged version before these two con
 The combined-source regression also exposed the old 950-character source view and 700-character rendering limits cutting off an already selected archive event. The bounded first-party operation view now survives the packet and rendering boundaries, using the same source-owner budget accounting as the transcript and preparation views. Broad timelines still carry the full retained chronology; the independent operation context is a bounded selection, not an exhaustive timeline.
 
 The same-PR review tests also preserve definite singular wheel/sponsor intervals, keep plural event-category lists on the requested show timeline, and prevent a later show/session noun from overriding a named-track reference. The integration acceptance case asks about track chat, linked preparation and the session ending together; all three source views must retain the original chat, preparation report and archive event. Hints scope evidence within the existing source owners; they do not change the conversation route or instruct BNL to recite a data dump.
+
+## Continuation after PR546 merged
+
+PR546 merged at `bbe83a4620366e1fae7e9eb1b9f5336939b54103`, with the tested full tree `b086c0d3a8c3baf42cb04ebf4e0611492eb41b0b`. Its final review identified one remaining issue: qualified references such as "during the BARCODE Radio show" and "during the entire TikTok live" could become an unresolved track window. The prior chat stopped with the regression test started. PR544 remains the last supplied VPS deployment receipt; the merge does not establish deployment.
+
+The continuation consolidates the duplicated direct-show-reference checks used by interval recognition, timeline selection and preparation composition. Dates, source qualifiers and whole-show qualifiers are handled consistently. Only the direct show phrase is removed from the interval-reference scan; a separate named-track, unknown-track, operation or elapsed-time request remains available. A later show noun does not consume an earlier track request. Preparation followed by a qualified show reference composes the existing on-air evidence and parent-show records.
+
+The affected integration cases fail against the merged PR546 runtime. The corrected focused suite passes 74 tests across interval, preparation/awareness and durable show-ledger coverage. Whole-show chat retains the existing bounded examples; a requested timeline keeps its retained chronology and transcript coverage. These tests do not establish complete production source coverage or removal of every keyword condition elsewhere in BNL. Existing source revalidation, privacy boundaries, one-provider generation, public activation, Journal/Relay schedules and general Moment admission are unchanged.
+
+After review and merge, use the ordinary bot deployment commands:
+
+```bash
+cd /home/ubuntu/bnl01
+git pull origin main
+sudo systemctl restart bnl01
+sudo systemctl status bnl01 --no-pager -l
+git rev-parse HEAD
+```
+
+Capture the deployed SHA and service output. After the existing sync, run the two already prepared historical-show questions separately in `bnl-testing`, adding the qualified whole-show reference to the first:
+
+1. "Give me the September 11, 2026 timeline for track starts and stops, submissions, wheel spins, removals, and show end during the entire BARCODE Radio show. Include the linked preparation and what TikTok and Discord chat discussed."
+2. "For the September 11, 2026 BARCODE Radio show, what did TikTok chat say during Bludgeon💔Heart — self therapy, what preparation was linked to that show, and how did the session end?"
+
+Capture each reply and immediately run `!bnl debug last route`. Compare the requested operation categories, attributed original chat, preparation claims and session ending with their original evidence. A shared-packet flag is insufficient for acceptance. Active-show awareness, the dropped correction, natural new-Moment evidence and all other open recovery items retain their prior status. Rollback is a revert of this bounded commit followed by the same ordinary deployment; this change introduces no schema or configuration migration.

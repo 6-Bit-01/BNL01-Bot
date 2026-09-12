@@ -43,6 +43,7 @@ from bnl_tiktok_live_context import (
     build_tiktok_show_evidence_ledger,
     build_show_interval_conversation,
     show_conversation_interval_requested,
+    show_context_reference_requested,
     show_episode_boundary_indexes,
     show_interval_episode_context,
     has_explicit_show_date,
@@ -77,8 +78,8 @@ def show_preparation_only_requested(text: str) -> bool:
     """Keep a preparation-only read small; compose explicit show follow-ons."""
     return bool(show_preparation_requested(text)
         and not show_conversation_interval_requested(text)
-        and not re.search(r"\b(?:recap|rundown)\b|\b(?:during|throughout|after) "
-                          r"(?:(?:the|that|this) )?(?:show|broadcast|session)\b", str(text or ""), re.I))
+        and not show_context_reference_requested(text)
+        and not re.search(r"\b(?:recap|rundown)\b", str(text or ""), re.I))
 
 _SPACE_RE = re.compile(r"\s+")
 _QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]{2,}", re.IGNORECASE)

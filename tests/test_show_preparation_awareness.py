@@ -247,6 +247,9 @@ class ShowPreparationTests(unittest.TestCase):
             "what happened in preparation and throughout the session?",
             "what happened in preparation and after the session?",
             "what did TikTok chat discuss in preparation and during the session?",
+            "what happened in preparation and during the entire BARCODE Radio show?",
+            "what happened in preparation and throughout the whole TikTok live stream?",
+            "what happened in preparation and after yesterday's full radio session?",
             "what did TikTok chat say during Neon Fox — First Signal, what preparation was linked, "
             "and how did the session end?",
         )
