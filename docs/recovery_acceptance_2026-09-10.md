@@ -1,3 +1,23 @@
+# September 12: completed private batch and focused follow-up
+
+PR #540 was merged and deployed at `a90c7cabcf7c14c96cf358f70ada36f78824568d`.
+All four Discord cases and the recovered VPS export have been reviewed together.
+September 10 source-backed recall, broad two-show retrieval, and all four delivery
+assessments are confirmed. Named-member recall still dropped five selected
+conversation items at packet subject resolution. Local reproduction also found
+that selecting a year inside a numeric range incorrectly treated its endpoints
+as named alternatives that the answer must repeat.
+
+One follow-up addresses these two existing-owner defects. The [batch findings
+and exact two-case retest](shared_context_followup_2026-09-12.md) contain the
+current next action, including capture setup that survives a new SSH shell.
+The original rollback, formation, and other scoped passes remain accepted.
+Episode linking/reopening, public and elapsed-time acceptance, and unclassified
+historical incidents retain their distinct status. Earlier chronological
+instructions below are preserved as history, not directions to repeat tests.
+
+---
+
 # September 11 consolidated private-test repair candidate
 
 The public activation rollback/restoration receipt is accepted:

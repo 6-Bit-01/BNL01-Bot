@@ -153,6 +153,11 @@ _BETWEEN_SINGLE_CHOICE_RE = re.compile(
     r"\s+and\s+(?P<second>[A-Za-z0-9][A-Za-z0-9'’\-]*)",
     re.I,
 )
+_VALUE_SELECTION_PREFIX_RE = re.compile(
+    r"\b(?:pick|choose|select)\s+(?:a|an|any|one)\s+"
+    r"(?:[A-Za-z][\w'’\-]*\s+){1,4}$",
+    re.I,
+)
 _LEADING_NAMED_OPTION_RE = re.compile(
     r"^\s*(?P<value>[A-Z][A-Za-z0-9'’\-]*"
     r"(?:\s+[A-Z][A-Za-z0-9'’\-]*){1,3})"
@@ -534,6 +539,15 @@ def _extract_named_anchors(text: str) -> tuple[str, ...]:
         _BETWEEN_SINGLE_CHOICE_RE,
     ):
         for match in pattern.finditer(raw):
+            if (
+                pattern is _BETWEEN_SINGLE_CHOICE_RE
+                and match.group("first").isdecimal()
+                and match.group("second").isdecimal()
+                and _VALUE_SELECTION_PREFIX_RE.search(raw[:match.start()])
+            ):
+                # Selecting a value within numeric bounds is not choosing
+                # between two named payloads. Preserve explicit quoted options.
+                continue
             values.extend((match.group("first"), match.group("second")))
     leading_option = _LEADING_NAMED_OPTION_RE.search(raw)
     if leading_option:

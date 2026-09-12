@@ -991,9 +991,9 @@ def resolve_packet_subject(
     event_only_ambiguity = bool(
         frame_status == "ambiguous"
         and set(request.frame_ambiguity_reasons) == {"resume_target_unresolved"}
-        and request.frame_subject_requirement == "not_applicable"
-        and not candidates
     )
+    # A named member still goes through the ordinary account-binding checks
+    # below; missing, competing, or invalid subjects remain unresolved.
     if (frame_status == "ambiguous" and not event_only_ambiguity) or len(candidates) > 1:
         return PacketSubjectResolution(
             status="ambiguous",
