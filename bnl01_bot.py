@@ -139,6 +139,9 @@ from bnl_memory_governance import (
 from bnl_moment_engine import (
     ActiveEpisodeReference,
     MomentSituationReference,
+    apply_moment_meaning,
+    claim_pending_moment_meaning,
+    fail_moment_meaning,
     active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
     render_active_episode_canary_context,
@@ -30995,6 +30998,8 @@ def _generation_config_for_model(
     config_kwargs = {
         "max_output_tokens": policy.max_output_tokens,
     }
+    if route == 'moment_meaning_background':
+        config_kwargs['response_mime_type'] = 'application/json'
     normalized_model = str(model_name or "").lower()
     if "gemini-2.5" in normalized_model:
         legacy_budget = min(
@@ -34846,6 +34851,75 @@ async def _before_tiktok_live_memory_ingest_task():
     await client.wait_until_ready()
 
 
+_moment_meaning_task: asyncio.Task | None = None
+
+
+def _moment_meaning_public_guilds() -> tuple[int, ...]:
+    """Use the existing authorized public scope, including its off switch."""
+    if (not moment_engine_shadow_enabled() or not memory_ledger_shadow_enabled()
+            or not ordinary_chat_configuration().get('public_effective')):
+        return ()
+    return tuple(sorted({int(value.strip()) for value in os.getenv(
+        'BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS', '').split(',')
+        if value.strip().isdigit() and int(value.strip()) > 0}))
+
+
+async def _process_one_moment_meaning() -> None:
+    """One accounted background attempt, with no SQLite lock during generation."""
+    request = None
+    def claim():
+        with closing(sqlite3.connect(DB_FILE, timeout=3)) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            return claim_pending_moment_meaning(conn, guild_ids=_moment_meaning_public_guilds())
+
+    def finish(*, text='', reason=''):
+        with closing(sqlite3.connect(DB_FILE, timeout=3)) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if request.guild_id not in _moment_meaning_public_guilds():
+                reason = 'scope_disabled'
+            if reason:
+                fail_moment_meaning(conn, request, reason=reason)
+                return False
+            return apply_moment_meaning(conn, request, text)
+
+    try:
+        if not _moment_meaning_public_guilds():
+            return
+        request = await asyncio.to_thread(claim)
+        if request is None:
+            return
+        attempts = ProviderAttemptCounter()
+        logging.info('moment_meaning_started moment_id=%s route=moment_meaning_background', request.moment_id)
+        result = await _generate_gemini_content_result_async(
+            request.prompt, 'moment_meaning_background', attempt_counter=attempts,
+        )
+        applied = await asyncio.to_thread(finish, text=result.text if result.success else '',
+                                         reason='' if result.success else 'provider_unavailable')
+        logging.info('moment_meaning_result moment_id=%s applied=%s provider_ok=%s '
+                     'physical_attempts=%s elapsed_seconds=%.3f estimated_cost_nanos=%s cost_priced=%s',
+                     request.moment_id, applied, result.success, attempts.count,
+                     float(getattr(result, 'elapsed_seconds', 0) or 0),
+                     int(getattr(result, 'estimated_cost_nanos', 0) or 0),
+                     bool(getattr(result, 'cost_priced', False)))
+    except asyncio.CancelledError:
+        if request is not None:
+            await asyncio.to_thread(finish, reason='interrupted')
+        raise
+    except Exception as exc:
+        logging.warning('moment_meaning_failed error_type=%s', type(exc).__name__)
+        if request is not None:
+            try:
+                await asyncio.to_thread(finish, reason='processing_error')
+            except Exception:
+                logging.warning('moment_meaning_outcome_write_failed')
+
+
+def _start_moment_meaning_work() -> None:
+    global _moment_meaning_task
+    if _moment_meaning_public_guilds() and (_moment_meaning_task is None or _moment_meaning_task.done()):
+        _moment_meaning_task = asyncio.create_task(_process_one_moment_meaning())
+
+
 @tasks.loop(minutes=1)
 async def moment_engine_sweep_task():
     if not memory_ledger_shadow_enabled():
@@ -34890,6 +34964,9 @@ async def moment_engine_sweep_task():
         moment_results, episode_results, lifecycle_result = (
             await asyncio.to_thread(_sweep)
         )
+        # The same Moment workflow performs one background summarization at a
+        # time; provider waits cannot delay this sweep or Discord handling.
+        _start_moment_meaning_work()
         if moment_results or episode_results:
             logging.info(
                 "moment_engine_sweep finalized_or_rejected=%s "
