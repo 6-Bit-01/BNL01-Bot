@@ -46,6 +46,7 @@ from bnl_tiktok_live_context import (
     requested_show_date,
     requested_show_dates,
     select_show_for_tiktok_analysis,
+    show_conversation_interval_requested,
     tiktok_show_evidence_key,
     tiktok_show_records,
 )
@@ -61,6 +62,7 @@ from bnl_tiktok_show_ledger import (
     build_tiktok_show_evidence_context,
     ensure_tiktok_show_evidence_schema,
     load_tiktok_show_source_events,
+    load_show_timeline_discord_messages,
     sync_tiktok_show_evidence_ledgers,
 )
 from bnl_occasion import (
@@ -2909,6 +2911,20 @@ def build_bnl_read_model_context(
 
     queue = _first_mapping(sections.get("queue"), read_model.get("queue"))
     archive = _first_mapping(sections.get("archive"), read_model.get("archive"))
+    if show_conversation_interval_requested(user_text):
+        current_show = _first_mapping(archive.get("currentShow"))
+        session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+        current_id = str(current_show.get("sessionId") or "")
+        session_id = str(session.get("id") or session.get("sessionId") or "")
+        if (current_id and current_id == session_id
+                and str(session.get("broadcastPhase") or "").lower() == "live"
+                and current_show.get("status") != "archived"
+                and _bnl_read_model_cached_at is not None):
+            # Freeze one read's live boundary before loading its source rows.
+            # Never extend an older/open session merely because time passed.
+            archive = {**archive, "currentShow": {
+                **current_show, "_evidenceObservedThroughMs": int(_bnl_read_model_cached_at.timestamp() * 1000),
+            }}
     artists_section = sections.get("artists") if sections.get("artists") is not None else read_model.get("artists")
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
@@ -3203,9 +3219,18 @@ def build_bnl_read_model_context(
                     )
                     if day:
                         lines.append(f"\nRequested show date: {day}")
+                    discord_interval_args = {}
+                    if show_conversation_interval_requested(show_analysis_text):
+                        discord_messages, discord_complete = load_show_timeline_discord_messages(
+                            DB_FILE, guild_id=BNL_PRIMARY_GUILD_ID, show=selected_show,
+                        )
+                        discord_interval_args = {
+                            "discord_messages": discord_messages, "discord_complete": discord_complete,
+                        }
                     lines.append(
                         "\n" + build_durable_show_prompt_context(
                             scoped_archive, durable_events, show_analysis_text,
+                            **discord_interval_args,
                         )
                     )
                     show_key = tiktok_show_evidence_key(selected_show)
@@ -28540,6 +28565,7 @@ def _build_unified_intelligence_packet_shadow(
     operational_context_snapshot: str,
     operational_context_authorized: bool,
     current_direct: bool,
+    show_episode_dates: tuple[str, ...] = (),
     situation_frame: SituationFrameV1 | None = None,
 ) -> UnifiedIntelligencePacket | None:
     """Build and persist one packet receipt without exposing it to the prompt."""
@@ -28683,6 +28709,7 @@ def _build_unified_intelligence_packet_shadow(
         channel_policy=str(channel_policy or "unknown"),
         visibility_allowance=visibility_allowance,
         user_text=str(current_text or "")[:8000],
+        show_episode_dates=show_episode_dates,
         participant_user_ids=participants,
         direct_state="direct" if current_direct else "indirect",
         conversation_evidence=evidence,
@@ -28826,6 +28853,7 @@ def build_unified_response_assessment_shadow(
     exact_quote_authority_present: bool = False,
     show_state_present: bool = False,
     website_read_model_present: bool = False,
+    show_episode_dates: tuple[str, ...] = (),
     source_context_present: bool = False,
     source_context_snapshot: str = "",
     packet_source_context_authorized: bool | None = None,
@@ -28980,6 +29008,7 @@ def build_unified_response_assessment_shadow(
         operational_context_authorized=bool(
             packet_operational_context_authorized
         ),
+        show_episode_dates=show_episode_dates,
         current_direct=current_direct,
         situation_frame=situation_frame,
     )
@@ -38397,6 +38426,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             and not batch_publication_packet_owns_turn
                         )
                     ),
+                    show_episode_dates=tuple(dict.fromkeys(re.findall(
+                        r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b", batch_website_read_model_context or "",
+                    ))) if show_conversation_interval_requested(combined_text) else (),
                     operational_context_snapshot=(
                         batch_operational_queue_packet_snapshot
                     ),
@@ -41283,6 +41315,9 @@ def build_user_aware_prompt(
         website_read_model_present=(
             assessment_website_read_model_present
         ),
+        show_episode_dates=tuple(dict.fromkeys(re.findall(
+            r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b", website_read_model_context or "",
+        ))) if show_conversation_interval_requested(clean_content) else (),
         source_context_present=(
             False
             if ordinary_chat_single_packet

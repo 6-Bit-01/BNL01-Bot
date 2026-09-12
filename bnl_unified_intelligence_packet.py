@@ -475,6 +475,9 @@ class IntelligencePacketRequest:
     channel_policy: str = "unknown"
     visibility_allowance: str = "public_safe"
     user_text: str = ""
+    # Date scope already selected by the authorized native show reader.
+    # It narrows retained recall; it grants no additional source authority.
+    show_episode_dates: tuple[str, ...] = ()
     participant_user_ids: tuple[int, ...] = ()
     direct_state: str = "direct"
     budget_chars: int = 2400
@@ -3051,6 +3054,16 @@ def _episode_items(
     return items
 
 
+def _show_episode_query(request: IntelligencePacketRequest) -> str:
+    from bnl_tiktok_live_context import has_explicit_show_date, requested_show_dates
+
+    query = str(request.user_text or "")[:8000]
+    if has_explicit_show_date(query) or requested_show_dates(query, now=request.now or None):
+        return query
+    dates = tuple(day for day in request.show_episode_dates if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", day))
+    return query + (" " + " ".join(dates) if dates else "")
+
+
 def _show_episode_items(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
@@ -3106,7 +3119,7 @@ def _show_episode_items(
     selected = select_tiktok_show_episode_context_items(
         conn,
         guild_id=int(request.guild_id or 0),
-        user_text=str(request.user_text or "")[:8000],
+        user_text=_show_episode_query(request),
         subject_user_id=subject_user_id,
         allow_subject_continuity=allow_subject_continuity,
         now=request.now or None,
@@ -5493,6 +5506,8 @@ def _select_items(
     lane_counts: Counter[str] = Counter()
     used = 0
     budget = min(max(int(request.budget_chars or 2400), 400), 6000)
+    budget += sum(len(item.text) + 36 for item in ordered
+                  if item.lane == "show_episode" and item.usage == "scoped_show_conversation")
     lane_caps = dict(
         _BROAD_PROFILE_LANE_CAPS if broad else _LANE_CAPS
     )
@@ -5575,6 +5590,8 @@ def _select_items(
         item_cost = (
             0
             if item.lane == "current_intent"
+            else len(item.text) + 36
+            if item.lane == "show_episode" and item.usage == "scoped_show_conversation"
             else min(len(item.text), 500) + 36
         )
         if used + item_cost > budget:
@@ -6007,7 +6024,7 @@ def _show_episode_version(
     return tiktok_show_episode_context_item_version(
         conn,
         guild_id=int(packet.request.guild_id or 0),
-        user_text=str(packet.request.user_text or "")[:8000],
+        user_text=_show_episode_query(packet.request),
         subject_user_id=subject_user_id,
         source_ref=str(item.revalidation_key or item.source_ref or ""),
         allow_subject_continuity=bool(
