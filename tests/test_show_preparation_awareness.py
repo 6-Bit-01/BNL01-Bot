@@ -235,6 +235,43 @@ class ShowPreparationTests(unittest.TestCase):
         self.assertTrue(bot.finalized_show_packet_owner_requested(query, native))
         self.assertTrue(bot.finalized_show_packet_owner_requested(QUERY, native))
 
+    def test_session_follow_on_composes_preparation_and_on_air_evidence(self):
+        preparation = "We reserved the spare mixer for the August 28, 2026 BARCODE Radio show."
+        on_air = "The room is talking about green lighting."
+        self.add_discord(2001, preparation)
+        self.add_tiktok("show-room-topic", on_air, at="2026-08-29T00:02:00Z")
+        self.sync()
+        model = authorized_read_model({"latestShow": self.show})
+        requests = (
+            "what happened in preparation and during the session?",
+            "what happened in preparation and throughout the session?",
+            "what happened in preparation and after the session?",
+            "what did TikTok chat discuss in preparation and during the session?",
+        )
+        for follow_on in requests:
+            query = "For the August 28, 2026 BARCODE Radio show, " + follow_on
+            native = shows.build_tiktok_show_evidence_context(self.db, guild_id=77, user_text=query)
+            with mock.patch.multiple(bot, DB_FILE=self.db, BNL_PRIMARY_GUILD_ID=77):
+                website = bot.build_bnl_read_model_context(model, query, "sealed_test")
+            with sqlite3.connect(self.db) as conn:
+                packet = build_packet(conn, replace(self.request(), user_text=query), environ=PACKET_ENV)
+                rendered = render_packet_context(packet)[0]
+                self.assertTrue(revalidate_packet(conn, packet, environ=PACKET_ENV).valid)
+            for reader in (native, website, rendered):
+                with self.subTest(follow_on=follow_on, reader=reader[:65]):
+                    self.assertIn(preparation, reader)
+                    self.assertIn(on_air, reader)
+        # A genuinely basic preparation request still uses the focused view.
+        native = shows.build_tiktok_show_evidence_context(self.db, guild_id=77, user_text=QUERY)
+        with mock.patch.multiple(bot, DB_FILE=self.db, BNL_PRIMARY_GUILD_ID=77):
+            website = bot.build_bnl_read_model_context(model, QUERY, "sealed_test")
+        with sqlite3.connect(self.db) as conn:
+            packet = build_packet(conn, self.request(), environ=PACKET_ENV)
+            rendered = render_packet_context(packet)[0]
+        for reader in (native, website, rendered):
+            self.assertIn(preparation, reader)
+            self.assertNotIn(on_air, reader)
+
     def test_preparation_survives_ordinary_conversation_pruning(self):
         text = "For the August 28, 2026 BARCODE Radio show we reserved the spare mixer."
         self.add_discord(2001, text)

@@ -2971,6 +2971,8 @@ def build_bnl_read_model_context(
         str(tiktok_show_analysis_request or "").strip()
         or (user_text if (
             is_tiktok_show_analysis_query(user_text)
+            or (show_preparation_requested(user_text)
+                and not show_preparation_only_requested(user_text))
             or (not live_reaction_query and is_live_show_reaction_query(
                 user_text, check_show_date=False,
             ))

@@ -2086,7 +2086,7 @@ def show_conversation_interval_requested(user_text: str) -> bool:
     ):
         return True
     without_dates = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", "", query)
-    if re.search(r"\bduring\b[^?\n]*\b(?:show|broadcast|live)[?.!\s]", without_dates + " ", re.I) and not re.search(
+    if re.search(r"\bduring\b[^?\n]*\b(?:show|broadcast|session|live)[?.!\s]", without_dates + " ", re.I) and not re.search(
         r"\b(?:track|song|minute)\b|t\+", re.split(r"\bduring\b", without_dates, flags=re.I)[-1], re.I,
     ):
         return False
@@ -2137,7 +2137,8 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
     interval_reference = re.search(
         r"\bduring\b(?!\s+(?:(?:the|that|this)\s+)?(?:show|broadcast|session)\b)"
         r"|\b(?:last|previous|prior|current|this) (?:track|song)\b"
-        r"|\b(?:of|for|around)\s+(?:(?:the|a|an|last|previous|prior|current|this|latest)\s+)*"
+        r"|\b(?:of|for|around)\s+(?:the\s+)?"
+        r"(?:last|previous|prior|current|this|latest)\s+"
         r"(?:track|song|wheel(?:\s+spin)?|sponsor(?:\s+break)?)\b", query, re.I,
     )
     full_timeline = bool(re.search(r"\b(?:timeline|chronology|chronological)\b", query, re.I)
@@ -2191,7 +2192,7 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
         basis = "recorded_operation_interval"
     elif not keys:
         # "During the show" still belongs to the existing full-show reader.
-        if re.search(r"\bduring (?:the |that |this )?(?:show|broadcast|live)\b", query, re.I):
+        if re.search(r"\bduring (?:the |that |this )?(?:show|broadcast|session|live)\b", query, re.I):
             return None
         if not re.search(r"\bduring\b|\b(?:track|song)\b", query, re.I):
             return None

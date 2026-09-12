@@ -27,3 +27,12 @@ The PR records the required repository check and exact tested tree. These are co
 After merge and deployment, repeat the failed timeline question and then ask a combined question: “Give me the September 11, 2026 BARCODE Radio show timeline: session start, submissions, wheel spins, track starts and stops, removals, and show end. Include the linked preparation and what TikTok and Discord chat discussed.” Capture each reply and its immediate route. The expected route uses the shared packet; the answer must cover the requested event categories from source records and keep preparation, operational facts and attributed conversation distinct. Missing source coverage must be stated precisely.
 
 Preparation claim accuracy, complete production source-to-answer coverage and genuine active-session awareness remain open until observed. The separate dropped-correction and natural new-Moment recovery checks keep their existing status.
+
+## Review follow-up before VPS deployment
+
+PR545 merged as `d99f82b90d0ef1bfd906ce5568931b06694d9fd8`. Its complete tree matched the tested tree. Automated review posted two findings after the merge, and both reproduced through the website reader, durable reader and rendered shared packet:
+
+- A category list introduced by "for track", "of song", or "for wheel" still selected a narrower interval. The relative-interval expression now requires an actual relative qualifier. Known named tracks, explicitly scoped unknown tracks, elapsed ranges and the existing relative interval cases retain their behavior.
+- "Preparation and during/throughout/after the session" took preparation-only early returns. Session follow-ons now compose with the show evidence just as show and broadcast follow-ons do. Chat questions about the session also use the whole-show reader rather than an unresolved track interval. The website reader carries the same combined-request decision into its existing show-analysis path, so removing the early return actually retrieves the additional show evidence. A basic preparation-only request remains focused.
+
+The added integration coverage failed on the merged version before these two conditions changed. It checks retained operations and original preparation/on-air messages through all three readers, including packet revalidation. This is a correction to the same show-context work, not evidence of live acceptance. PR544 remains the last deployment confirmed by a VPS receipt until a newer receipt is supplied.

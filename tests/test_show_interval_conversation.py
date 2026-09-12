@@ -150,7 +150,8 @@ class ShowIntervalConversationTests(unittest.TestCase):
         self.assertIn("complete=no", result["text"])
 
     def test_whole_show_person_recall_keeps_its_existing_owner(self):
-        for query in ("What did Neon Fox say during the show?", "What did 6 Bit say during yesterday's show?"):
+        for query in ("What did Neon Fox say during the show?", "What did 6 Bit say during yesterday's show?",
+                      "What did Neon Fox say during the session?"):
             with self.subTest(query=query):
                 self.assertIsNone(show_conversation_scope(self.ledger(), query))
 
@@ -371,30 +372,38 @@ class ShowIntervalConversationTests(unittest.TestCase):
 
         # The deployed request listed event categories. Those words must not
         # turn a whole-show timeline into a wheel-only interval.
-        query = ("Give me the August 28, 2026 BARCODE Radio show timeline in order: "
-                 "session start, submissions, wheel spins, track starts and stops, "
-                 "removals, and show end.")
+        queries = (
+            "Give me the August 28, 2026 BARCODE Radio show timeline in order: "
+            "session start, submissions, wheel spins, track starts and stops, removals, and show end.",
+            "Give me the August 28, 2026 BARCODE Radio show timeline for "
+            "track starts and stops, wheel spins, removals, and show end.",
+            "Give me the August 28, 2026 BARCODE Radio show chronology of "
+            "song starts and stops, wheel spins, submissions, and show end.",
+            "Give me the August 28, 2026 BARCODE Radio show timeline for "
+            "wheel spins, sponsor breaks, track starts and stops, and show end.",
+        )
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, PACKET_ENV):
             db = str(Path(directory) / "bnl.db")
             fixtures.TikTokShowEvidenceLedgerTests().seed_source_and_memory(db)
             model = authorized_read_model({"latestShow": archived_show()})
             sync_tiktok_show_evidence_ledgers(db, guild_id=77, read_model=model, environ=ENABLED_QUEUE_ENV)
-            native = build_tiktok_show_evidence_context(db, guild_id=77, user_text=query)
-            with mock.patch.multiple(bot, DB_FILE=db, BNL_PRIMARY_GUILD_ID=77), \
-                 mock.patch.object(bot, "_load_durable_tiktok_show_events", return_value=interval_events()):
-                website = bot.build_bnl_read_model_context(model, query, "sealed_test")
-            with sqlite3.connect(db) as conn:
-                packet = build_packet(conn, IntelligencePacketRequest(
-                    guild_id=77, subject_user_id=0, channel_id=9001, channel_policy="sealed_test",
-                    route_mode="normal_chat", conversation_surface="free_speak_sealed_mirror",
-                    visibility_allowance="public_safe", user_text=query, direct_state="direct",
-                    now="2026-08-29T12:00:00-07:00"), persist=True, environ=PACKET_ENV)
-                rendered = render_packet_context(packet)[0]
-            for reader in (native, website, rendered):
-                with self.subTest(reader=reader[:65]):
-                    self.assertIn("window basis=recorded_show_timeline", reader)
-                    for operation in self.ledger()["operationalEvents"]:
-                        self.assertIn("[recorded operation] " + operation["eventType"], reader)
+            for query in queries:
+                native = build_tiktok_show_evidence_context(db, guild_id=77, user_text=query)
+                with mock.patch.multiple(bot, DB_FILE=db, BNL_PRIMARY_GUILD_ID=77), \
+                     mock.patch.object(bot, "_load_durable_tiktok_show_events", return_value=interval_events()):
+                    website = bot.build_bnl_read_model_context(model, query, "sealed_test")
+                with sqlite3.connect(db) as conn:
+                    packet = build_packet(conn, IntelligencePacketRequest(
+                        guild_id=77, subject_user_id=0, channel_id=9001, channel_policy="sealed_test",
+                        route_mode="normal_chat", conversation_surface="free_speak_sealed_mirror",
+                        visibility_allowance="public_safe", user_text=query, direct_state="direct",
+                        now="2026-08-29T12:00:00-07:00"), persist=True, environ=PACKET_ENV)
+                    rendered = render_packet_context(packet)[0]
+                for reader in (native, website, rendered):
+                    with self.subTest(query=query, reader=reader[:65]):
+                        self.assertIn("window basis=recorded_show_timeline", reader)
+                        for operation in self.ledger()["operationalEvents"]:
+                            self.assertIn("[recorded operation] " + operation["eventType"], reader)
 
     def test_timeline_of_a_specific_interval_does_not_expand_to_the_show(self):
         ledger = self.ledger()
@@ -402,6 +411,7 @@ class ShowIntervalConversationTests(unittest.TestCase):
             "occurredAtMs": stamp("2026-08-29T00:04:21Z")})
         for query, basis in (
             ("Give me the show timeline during Neon Fox — First Signal.", "named_track"),
+            ("Give me the show timeline for Neon Fox — First Signal.", "named_track"),
             ("Give me the show timeline for the last track.", "latest_completed_playback_window"),
             ("Give me the show timeline during the last wheel spin.", "recorded_operation_interval"),
             ("Give me the timeline of the last wheel spin in the show.", "recorded_operation_interval"),
