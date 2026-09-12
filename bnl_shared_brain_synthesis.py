@@ -2902,7 +2902,7 @@ def render_packet_context(
     # memory-synopsis allowance must not silently reduce it to 700 characters.
     # Its source owner bounds size and reports any omission before this point.
     interval_items = tuple(item for item in ordered_items
-                           if item.lane == "show_episode" and item.usage in {"scoped_show_conversation", "show_linked_preparation"})
+                           if item.lane == "show_episode" and item.usage in {"scoped_show_conversation", "show_linked_preparation", "authoritative_show_chronology"})
     if interval_items:
         max_chars += sum(len(item.text) + 240 for item in interval_items)
         ordered_items = interval_items + tuple(item for item in ordered_items if item not in interval_items)

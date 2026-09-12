@@ -43,6 +43,8 @@ from bnl_tiktok_live_context import (
     build_tiktok_show_evidence_ledger,
     build_show_interval_conversation,
     show_conversation_interval_requested,
+    show_episode_boundary_indexes,
+    show_interval_episode_context,
     has_explicit_show_date,
     requested_show_date,
     requested_show_dates,
@@ -76,7 +78,7 @@ def show_preparation_only_requested(text: str) -> bool:
     return bool(show_preparation_requested(text)
         and not show_conversation_interval_requested(text)
         and not re.search(r"\b(?:recap|rundown)\b|\b(?:during|throughout|after) "
-                          r"(?:(?:the|that|this) )?(?:show|broadcast)\b", str(text or ""), re.I))
+                          r"(?:(?:the|that|this) )?(?:show|broadcast|session)\b", str(text or ""), re.I))
 
 _SPACE_RE = re.compile(r"\s+")
 _QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]{2,}", re.IGNORECASE)
@@ -2817,10 +2819,12 @@ def _selected_operational_events(
             score += 45
         if score > 0:
             scored.append((score, index))
-    selected_indexes: set[int] = set()
+    selected_indexes = show_episode_boundary_indexes(events, limit=safe_limit)
     if scored:
         for _score, index in sorted(scored, key=lambda item: (-item[0], item[1])):
             for candidate in (index - 1, index, index + 1):
+                if len(selected_indexes) >= safe_limit:
+                    break
                 if 0 <= candidate < len(events):
                     selected_indexes.add(candidate)
                 if len(selected_indexes) >= safe_limit:
@@ -2851,16 +2855,18 @@ def _selected_operational_events(
             if str(event.get("eventType") or "") in anchor_types
         ]
         if len(candidates) <= safe_limit:
-            selected_indexes.update(candidates)
+            for index in candidates:
+                if len(selected_indexes) >= safe_limit:
+                    break
+                selected_indexes.add(index)
         elif safe_limit == 1:
-            selected_indexes.add(candidates[len(candidates) // 2])
+            if not selected_indexes:
+                selected_indexes.add(candidates[len(candidates) // 2])
         else:
-            selected_indexes.update(
-                candidates[
-                    round(index * (len(candidates) - 1) / (safe_limit - 1))
-                ]
-                for index in range(safe_limit)
-            )
+            for index in range(safe_limit):
+                if len(selected_indexes) >= safe_limit:
+                    break
+                selected_indexes.add(candidates[round(index * (len(candidates) - 1) / (safe_limit - 1))])
     return [events[index] for index in sorted(selected_indexes)[:safe_limit]]
 
 
@@ -3013,7 +3019,7 @@ def _show_context_item(
         show_keys=tuple(key for key, _digest in sources),
         show_dates=show_dates,
         subject_key=str(subject_key or "barcode_radio"),
-        text=text if usage in {"scoped_show_conversation", "show_linked_preparation"} else _safe_label(
+        text=text if usage in {"scoped_show_conversation", "show_linked_preparation", "authoritative_show_chronology"} else _safe_label(
             text,
             950 if kind in {"operations", "dialogue"} else 840,
         ),
@@ -3596,9 +3602,6 @@ def select_tiktok_show_episode_context_items(
                 usage="scoped_show_conversation",
                 uncertainty_status="speaker_attributed_timing_correlation",
             )
-            if interval["basis"] != "recorded_show_timeline":
-                return (*preparation_items, interval_item)
-
     items: list[TikTokShowEpisodeContextItem] = list(preparation_items)
     if authored_rows and (
         _show_episode_scope_requested(user_text) or participant_matches
@@ -3611,7 +3614,7 @@ def select_tiktok_show_episode_context_items(
                 participant_matches=participant_matches,
             ))
         )
-    if _SHOW_QUERY_RE.search(str(user_text or "")) and (
+    if interval_item is not None or (_SHOW_QUERY_RE.search(str(user_text or "")) and (
         _TRACK_QUERY_RE.search(str(user_text or ""))
         or _TIMELINE_QUERY_RE.search(str(user_text or ""))
         or re.search(
@@ -3621,7 +3624,7 @@ def select_tiktok_show_episode_context_items(
             str(user_text or ""),
             flags=re.IGNORECASE,
         )
-    ):
+    )):
         operation_limit = 2 if multi_show else 1
         for row in selected_rows[:operation_limit]:
             operation_item = _operational_episode_context_item(
@@ -4184,7 +4187,9 @@ def build_tiktok_show_evidence_context(
             if selection_out is not None:
                 selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
                 selection_out["interval_coverage"] = {key: value for key, value in interval.items() if key != "text"}
-            return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join([*preparation_contexts, interval["text"]])
+            return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join([
+                *preparation_contexts, show_interval_episode_context(ledger, interval, user_text),
+            ])
     lines = [
         *image_query_lines,
         "Durable BARCODE Radio show episode memory:",
