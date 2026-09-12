@@ -352,9 +352,9 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.sleep(bot.BATCH_REPLY_COOLDOWN_SECONDS + 0.05)
                     # An unavailable website must not erase the already
                     # captured human referent and finalized local sources.
-                    # With packet enabled this also exercises its real owner;
-                    # a present specialized website context keeps the existing
-                    # legacy route even when packet configuration is enabled.
+                    # Finalized show and website evidence compose through the
+                    # same packet when enabled, including with the website
+                    # available. Its presence must not force a legacy bypass.
                     self.fetch.return_value = (
                         {} if packet_enabled and index == 1 else self.read_model
                     )
@@ -417,7 +417,7 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         generation.await_args.kwargs["route"],
                         bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE
-                        if packet_enabled and index == 1 else "get_gemini_response",
+                        if packet_enabled else "get_gemini_response",
                     )
                 # Model text is a transport fixture, not an output-wording rule.
                 self.assertEqual(channel.sent, list(answers))

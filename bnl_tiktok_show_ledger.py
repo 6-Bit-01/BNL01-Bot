@@ -70,6 +70,14 @@ def show_preparation_requested(text: str) -> bool:
         r"before (?:the )?(?:show|broadcast|session))\b", str(text or ""), re.I,
     ))
 
+
+def show_preparation_only_requested(text: str) -> bool:
+    """Keep a preparation-only read small; compose explicit show follow-ons."""
+    return bool(show_preparation_requested(text)
+        and not show_conversation_interval_requested(text)
+        and not re.search(r"\b(?:recap|rundown)\b|\b(?:during|throughout|after) "
+                          r"(?:(?:the|that|this) )?(?:show|broadcast)\b", str(text or ""), re.I))
+
 _SPACE_RE = re.compile(r"\s+")
 _QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]{2,}", re.IGNORECASE)
 _SHOW_QUERY_RE = re.compile(
@@ -2518,6 +2526,9 @@ def _render_show_preparation(view: Mapping[str, Any], *, max_chars: int = 96000,
         "These sources keep their original times. They precede on-air playback; "
         "session-time chat can include unrelated banter. Human reports are attributed "
         "observations; website events are operational records; BNL replies are model output.",
+        "Report a check result, decision, removal reason, or unresolved task only when an "
+        "original record supports it. Pre-show timing alone does not make banter a preflight "
+        "task or a queue action a successful technical check.",
     ]
     used = sum(map(len, lines)) + 1000
     rendered = 0
@@ -2975,9 +2986,12 @@ def _show_context_item(
         tuple(dict.fromkeys(str(value or "") for value in participants)),
         uncertainty_status,
     )
+    # Preparation and on-air dialogue can be present in the same packet.
+    # Their separate revisions must not collide under one source reference.
+    reference_kind = "preparation" if usage == "show_linked_preparation" else kind
     source_ref = "show_episode:%s:%s" % (
-        kind,
-        _context_digest(kind, tuple(key for key, _digest in sources))[:32],
+        reference_kind,
+        _context_digest(reference_kind, tuple(key for key, _digest in sources))[:32],
     )
     show_dates = tuple(
         dict.fromkeys(
@@ -3512,9 +3526,9 @@ def select_tiktok_show_episode_context_items(
     selected_ranked = ranked[: (
         max(1, min(int(max_shows or 1), 12)) if multi_show else 1
     )]
+    preparation_items = []
     if show_preparation_requested(user_text):
         related = _load_show_related_sources(conn, guild_id=guild_id)
-        preparation_items = []
         for _score, _rank, row, _matches in selected_ranked[:2]:
             view = _show_preparation_view(
                 conn, guild_id=guild_id, ledger=row["ledger"], related_sources=related,
@@ -3529,7 +3543,8 @@ def select_tiktok_show_episode_context_items(
                 score=205.0, usage="show_linked_preparation",
                 uncertainty_status="linked_pre_show_evidence_not_on_air",
             ))
-        return tuple(preparation_items)
+        if show_preparation_only_requested(user_text):
+            return tuple(preparation_items)
     quote_literals = _current_show_quote_literals(user_text)
     if quote_literals:
         # Match the ordinary reader's bounded show scope for fresh raw scans.
@@ -3582,9 +3597,9 @@ def select_tiktok_show_episode_context_items(
                 uncertainty_status="speaker_attributed_timing_correlation",
             )
             if interval["basis"] != "recorded_show_timeline":
-                return (interval_item,)
+                return (*preparation_items, interval_item)
 
-    items: list[TikTokShowEpisodeContextItem] = []
+    items: list[TikTokShowEpisodeContextItem] = list(preparation_items)
     if authored_rows and (
         _show_episode_scope_requested(user_text) or participant_matches
     ) and not (
@@ -4131,8 +4146,8 @@ def build_tiktok_show_evidence_context(
                 key for key, result in original_lookups.items()
                 if not result["cached_projection_current"]
             )
+    preparation_contexts = []
     if show_preparation_requested(user_text) and selected:
-        contexts = []
         with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as prep_conn:
             related = _load_show_related_sources(prep_conn, guild_id=guild_id)
             for _score, _recency, ledger, _matches in selected[:2]:
@@ -4142,7 +4157,7 @@ def build_tiktok_show_evidence_context(
                         if item.get("showDate") == ledger.get("showDate")),
                 )
                 rendered_messages = []
-                contexts.append(_render_show_preparation(view, rendered_messages_out=rendered_messages))
+                preparation_contexts.append(_render_show_preparation(view, rendered_messages_out=rendered_messages))
                 for message in rendered_messages:
                     if message.get("role") == "user":
                         remember_authored_excerpt(
@@ -4151,7 +4166,8 @@ def build_tiktok_show_evidence_context(
                         )
         if selection_out is not None:
             selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
-        return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join(contexts)
+        if show_preparation_only_requested(user_text):
+            return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join(preparation_contexts)
     if len(selected) == 1 and not original_lookups and not image_scopes and show_conversation_interval_requested(user_text):
         ledger = selected[0][2]
         with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as interval_conn:
@@ -4168,10 +4184,11 @@ def build_tiktok_show_evidence_context(
             if selection_out is not None:
                 selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
                 selection_out["interval_coverage"] = {key: value for key, value in interval.items() if key != "text"}
-            return "Durable BARCODE Radio show episode memory:\n" + interval["text"]
+            return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join([*preparation_contexts, interval["text"]])
     lines = [
         *image_query_lines,
         "Durable BARCODE Radio show episode memory:",
+        *preparation_contexts,
         "- Retrieval scope: aggregate totals and selected records from retained eligible show evidence. The participant lists and authored examples below are partial selections, not a complete transcript or attendee list.",
         (
             "- Verification scope: original TikTok literal lookup results below identify the selected show windows, current eligible records checked, exact matches, and complete/partial/unavailable coverage. They do not establish author absence or the origin of unsupported BNL wording."

@@ -3607,6 +3607,68 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("ground that answer cleanly", channel.sent[0])
 
+    async def test_combined_show_sources_keep_the_ordinary_shared_packet_route(self):
+        channel = self._channel(8137)
+        request = ("Give me the August 28, 2026 BARCODE Radio show timeline: session start, "
+                   "submissions, wheel spins, track starts and stops, removals, and show end. "
+                   "Include linked preparation and what chat discussed.")
+        show_context = ("Durable BARCODE Radio show episode memory:\n"
+                        "Show-linked preparation Moment: test-show:preparation\n"
+                        "TIMELINE AND CHAT SOURCE")
+        website_context = "Website public read model context: PUBLIC SHOW SOURCE"
+        basis, packet, assessment, memory_basis, show_basis = (object() for _ in range(5))
+        decision = SimpleNamespace(candidate_selected=True)
+        execution = bnl01_bot.OrdinaryChatSinglePacketExecution(
+            decision=decision, response="The show timeline includes the linked preparation and chat.",
+            prompt="composed show packet", prompt_source_bases=(basis,), candidate_active=True,
+            provider_call_count=1, corrective_call_count=0)
+        ordinary_generation = mock.AsyncMock(return_value=execution)
+        scope_calls, assessment_calls = [], []
+
+        def scope_decision(**kwargs):
+            scope_calls.append(kwargs)
+            return SimpleNamespace(eligible=not kwargs.get("specialized_owner_present", False), reason="eligible")
+
+        def build_assessment(*_args, **kwargs):
+            assessment_calls.append(kwargs)
+            kwargs["intelligence_packet_out"]["packet"] = packet
+            return assessment
+
+        async def legacy_generation(*_args, **_kwargs):
+            raise AssertionError("historical website/show context must compose in the shared packet")
+
+        self._prime_flush(channel, request)
+        with (
+            self._flush_runtime(channel.id, legacy_generation),
+            mock.patch.object(bnl01_bot, "publication_packet_owns_turn", return_value=False),
+            mock.patch.object(bnl01_bot, "publication_packet_composes_current_queue", return_value=False),
+            mock.patch.object(bnl01_bot, "maybe_build_bnl_read_model_context", return_value=website_context),
+            mock.patch.object(bnl01_bot, "build_tiktok_show_evidence_context_for_turn", return_value=show_context),
+            mock.patch.object(bnl01_bot, "build_finalized_show_prompt_source_basis", return_value=show_basis),
+            mock.patch.object(bnl01_bot, "build_user_memory_context", return_value="RELEVANT DURABLE MEMORY"),
+            mock.patch.object(bnl01_bot, "build_memory_prompt_source_basis", return_value=memory_basis),
+            mock.patch.object(bnl01_bot, "ordinary_chat_route_scope_decision", side_effect=scope_decision),
+            mock.patch.object(bnl01_bot, "build_unified_response_assessment_shadow", side_effect=build_assessment),
+            mock.patch.object(bnl01_bot, "build_ordinary_chat_basis", return_value=basis) as ordinary_basis,
+            mock.patch.object(bnl01_bot, "maybe_generate_ordinary_chat_single_packet", new=ordinary_generation),
+            mock.patch.object(bnl01_bot, "build_shared_brain_synthesis_basis", return_value=None),
+            mock.patch.object(bnl01_bot, "prompt_source_basis_failure", return_value=""),
+            mock.patch.object(bnl01_bot, "safely_finalize_shared_brain_synthesis", new=mock.AsyncMock(return_value=True)),
+            mock.patch.object(bnl01_bot, "record_unified_response_assessment_shadow_after_send", new=mock.AsyncMock()),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+        self.assertEqual(channel.sent, [execution.response])
+        self.assertFalse(scope_calls[-1]["specialized_owner_present"])
+        self.assertEqual(len(assessment_calls), 1)
+        self.assertFalse(assessment_calls[0]["website_read_model_present"])
+        self.assertIn(show_basis, assessment_calls[0]["prompt_source_bases"])
+        self.assertIn(memory_basis, assessment_calls[0]["prompt_source_bases"])
+        ordinary_generation.assert_awaited_once()
+        ordinary_basis.assert_called_once()
+        competing = ordinary_basis.call_args.kwargs["competing_factual_contexts"]
+        for evidence in (website_context, show_context, "RELEVANT DURABLE MEMORY"):
+            self.assertTrue(any(evidence in block for block in competing))
+
     async def test_late_fragment_stales_batch_single_packet_without_second_call(
         self,
     ):

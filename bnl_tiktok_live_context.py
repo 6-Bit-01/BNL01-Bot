@@ -2131,8 +2131,17 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
     keys = _requested_track_keys(query, list(tracks.values()))
     selected = [window for window in windows if window["track_key"] in keys]
     basis = "named_track"
+    # Event categories in a requested show chronology are additive. Only an
+    # actual interval reference narrows it; mentioning "wheel spins" or
+    # "track starts and stops" does not select those events exclusively.
+    interval_reference = re.search(
+        r"\bduring\b(?!\s+(?:(?:the|that|this)\s+)?(?:show|broadcast|session)\b)"
+        r"|\b(?:last|previous|prior|current|this) (?:track|song)\b"
+        r"|\b(?:of|for|around)\s+(?:(?:the|a|an|last|previous|prior|current|this|latest)\s+)*"
+        r"(?:track|song|wheel(?:\s+spin)?|sponsor(?:\s+break)?)\b", query, re.I,
+    )
     full_timeline = bool(re.search(r"\b(?:timeline|chronology|chronological)\b", query, re.I)
-                         and not keys and not re.search(r"\b(?:during|track|song|wheel|sponsor)\b", query, re.I))
+                         and not keys and not interval_reference)
     elapsed = re.search(
         r"\b(?:between|from) (?:minutes?\s*|t\+)(\d+(?:\.\d+)?)\s*(?:m\b)?\s*"
         r"(?:and|to|–|-)\s*(?:minutes?\s*|t\+)?(\d+(?:\.\d+)?)", query, re.I,
@@ -2246,6 +2255,7 @@ def build_show_interval_conversation(
     ledger: Mapping[str, Any], user_text: str, *,
     messages: Sequence[Mapping[str, Any]] | None = None,
     discord_complete: bool = True,
+    tiktok_complete: bool = True,
 ) -> dict[str, Any] | None:
     """Render the requested window's retained human conversation and coverage.
 
@@ -2311,9 +2321,11 @@ def build_show_interval_conversation(
                      "Chat coverage is the recorded broadcast window above; earlier or later session chat has not been established by this view.")
     if "discord" in scope["surfaces"] and not discord_complete:
         lines.append("Discord source coverage is incomplete or unavailable for this read. Do not report a complete cross-platform conversation or infer silence.")
+    if "tiktok" in scope["surfaces"] and not tiktok_complete:
+        lines.append("TikTok source coverage is unavailable for this read. Recorded operations remain usable; missing chat access does not establish silence.")
     if scope["status"] == "unresolved":
         lines.append("The requested time window could not be established. This does not establish zero chat; do not substitute a different track or show.")
-    elif not selected:
+    elif not selected and tiktok_complete and discord_complete:
         lines.append("No retained human messages fall in this recorded window. This is archive coverage, not proof nobody spoke.")
     if signals:
         lines.append("Repeated-language counts over the entire retained interval (search aids, not semantic conclusions): " + "; ".join(
@@ -2351,18 +2363,35 @@ def build_show_interval_conversation(
             channel = (" #" + str(item.get("channelName"))) if item.get("channelName") else ""
             transcript.append(prefix + ("Discord" if item.get("surface") == "discord" else "TikTok")
                               + channel + " " + label + ": " + json.dumps(str(item.get("text") or ""), ensure_ascii=False))
-    available = SHOW_INTERVAL_CONTEXT_MAX_CHARS - len("\n".join(lines)) - 400
+    available = SHOW_INTERVAL_CONTEXT_MAX_CHARS - len("\n".join(lines)) - 650
+    operation_indexes = [index for index, event in enumerate(timeline) if event.get("role") == "operation"]
     indexes = list(range(len(transcript)))
     if sum(len(line) + 1 for line in transcript) > available:
-        # Whole utterances, chronological coverage, and explicit omission.
-        # Never silently chop the last speaker or call a sample complete.
-        count = max(0, available // max(len(line) + 1 for line in transcript))
-        indexes = sorted({round(index * (len(transcript) - 1) / max(1, count - 1)) for index in range(count)})
+        # A busy room must not crowd the requested operation chronology out.
+        # Retain its operations first, then whole chat entries spread across
+        # the same interval. Disclose both counts if either exceeds the bound.
+        priority = operation_indexes if scope["basis"] == "recorded_show_timeline" else []
+        priority_set = set(priority)
+        indexes = []
+        for candidates in (priority, [i for i in range(len(transcript)) if i not in priority_set]):
+            if not candidates or available <= 0:
+                continue
+            chosen = candidates
+            if sum(len(transcript[i]) + 1 for i in candidates) > available:
+                count = max(0, available // max(len(transcript[i]) + 1 for i in candidates))
+                chosen = [candidates[round(i * (len(candidates) - 1) / max(1, count - 1))] for i in range(count)]
+            indexes.extend(chosen)
+            available -= sum(len(transcript[i]) + 1 for i in chosen)
+        indexes.sort()
     rendered_ids = tuple(str(timeline[index].get("eventId") or "") for index in indexes
                          if (str(timeline[index].get("surface") or "tiktok"), str(timeline[index].get("eventId") or "")) in selected_keys)
     complete = (len(rendered_ids) == len(selected) and len(indexes) == len(timeline)
                 and not source_text_partial and scope["status"] == "resolved"
-                and (discord_complete or "discord" not in scope["surfaces"]))
+                and (discord_complete or "discord" not in scope["surfaces"])
+                and (tiktok_complete or "tiktok" not in scope["surfaces"]))
+    rendered_operations = len(set(indexes).intersection(operation_indexes))
+    lines.append(f"Operation coverage: {rendered_operations}/{len(operation_indexes)} retained operations rendered. "
+                 "Omitted records do not establish missing events.")
     lines.append(
         f"Transcript coverage: {len(rendered_ids)}/{len(selected)} retained messages rendered; "
         f"{source_text_partial} retained texts differ from their original text digest; complete={'yes' if complete else 'no'}. "
@@ -2374,6 +2403,7 @@ def build_show_interval_conversation(
         **scope, "text": text, "message_count": len(selected), "participants": participants,
         "rendered_count": len(rendered_ids), "complete": complete, "source_text_partial": source_text_partial,
         "timeline_event_count": len(timeline), "rendered_timeline_event_count": len(indexes),
+        "operation_count": len(operation_indexes), "rendered_operation_count": rendered_operations,
         "event_ids": tuple(str(item.get("eventId") or "") for item in selected),
         "rendered_event_ids": rendered_ids,
     }
@@ -3039,6 +3069,16 @@ def build_durable_show_prompt_context(
         user_text,
     )
     if durable_events is None:
+        # Timeline evidence is independently owned by the website. A failed
+        # chat archive read must not reduce it to a ranked operation sample.
+        operations_ledger = build_tiktok_show_evidence_ledger(show, [])
+        scope = show_conversation_scope(operations_ledger, user_text)
+        if scope and scope["basis"] == "recorded_show_timeline":
+            interval = build_show_interval_conversation(
+                operations_ledger, user_text, messages=discord_messages or (),
+                discord_complete=discord_complete, tiktok_complete=False,
+            )
+            return "Durable BARCODE show analysis context:\n" + interval["text"]
         unavailable_lines = [
             "Durable BARCODE show analysis context:",
             f"- Analysis intent={intent}.",
