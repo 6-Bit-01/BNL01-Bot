@@ -5507,7 +5507,7 @@ def _select_items(
     used = 0
     budget = min(max(int(request.budget_chars or 2400), 400), 6000)
     budget += sum(len(item.text) + 36 for item in ordered
-                  if item.lane == "show_episode" and item.usage in {"scoped_show_conversation", "show_linked_preparation"})
+                  if item.lane == "show_episode" and item.usage in {"scoped_show_conversation", "show_linked_preparation", "authoritative_show_chronology"})
     lane_caps = dict(
         _BROAD_PROFILE_LANE_CAPS if broad else _LANE_CAPS
     )
@@ -5591,7 +5591,7 @@ def _select_items(
             0
             if item.lane == "current_intent"
             else len(item.text) + 36
-            if item.lane == "show_episode" and item.usage in {"scoped_show_conversation", "show_linked_preparation"}
+            if item.lane == "show_episode" and item.usage in {"scoped_show_conversation", "show_linked_preparation", "authoritative_show_chronology"}
             else min(len(item.text), 500) + 36
         )
         if used + item_cost > budget:

@@ -247,6 +247,8 @@ class ShowPreparationTests(unittest.TestCase):
             "what happened in preparation and throughout the session?",
             "what happened in preparation and after the session?",
             "what did TikTok chat discuss in preparation and during the session?",
+            "what did TikTok chat say during Neon Fox — First Signal, what preparation was linked, "
+            "and how did the session end?",
         )
         for follow_on in requests:
             query = "For the August 28, 2026 BARCODE Radio show, " + follow_on
@@ -261,6 +263,7 @@ class ShowPreparationTests(unittest.TestCase):
                 with self.subTest(follow_on=follow_on, reader=reader[:65]):
                     self.assertIn(preparation, reader)
                     self.assertIn(on_air, reader)
+                    self.assertRegex(reader, r"session[_ ]archived")
         # A genuinely basic preparation request still uses the focused view.
         native = shows.build_tiktok_show_evidence_context(self.db, guild_id=77, user_text=QUERY)
         with mock.patch.multiple(bot, DB_FILE=self.db, BNL_PRIMARY_GUILD_ID=77):

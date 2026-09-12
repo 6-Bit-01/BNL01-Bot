@@ -2085,8 +2085,14 @@ def show_conversation_interval_requested(user_text: str) -> bool:
         r"\b(?:show|broadcast|session|radio)\b", query, re.I,
     ):
         return True
-    without_dates = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", "", query)
-    if re.search(r"\bduring\b[^?\n]*\b(?:show|broadcast|session|live)[?.!\s]", without_dates + " ", re.I) and not re.search(
+    without_dates = query
+    for pattern in _EXPLICIT_SHOW_DATE_PATTERNS:
+        without_dates = pattern.sub("", without_dates)
+    if re.search(
+        r"\bduring\s+(?:(?:the|that|this|last|previous|prior|current|our)\s+|"
+        r"(?:yesterday|today|last night)['’]s\s+)*(?:show|broadcast|session|live)\b",
+        without_dates, re.I,
+    ) and not re.search(
         r"\b(?:track|song|minute)\b|t\+", re.split(r"\bduring\b", without_dates, flags=re.I)[-1], re.I,
     ):
         return False
@@ -2139,7 +2145,9 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
         r"|\b(?:last|previous|prior|current|this) (?:track|song)\b"
         r"|\b(?:of|for|around)\s+(?:the\s+)?"
         r"(?:last|previous|prior|current|this|latest)\s+"
-        r"(?:track|song|wheel(?:\s+spin)?|sponsor(?:\s+break)?)\b", query, re.I,
+        r"(?:track|song|wheel(?:\s+spin)?|sponsor(?:\s+break)?)\b"
+        r"|\b(?:of|for|around)\s+the\s+(?:wheel\s+spin\b|wheel\b(?!\s+spins?\b)|"
+        r"sponsor\s+break\b|sponsor\b(?!\s+breaks?\b))", query, re.I,
     )
     full_timeline = bool(re.search(r"\b(?:timeline|chronology|chronological)\b", query, re.I)
                          and not keys and not interval_reference)
@@ -2951,13 +2959,25 @@ def build_tiktok_show_evidence_ledger(
     return ledger
 
 
+def show_episode_boundary_indexes(events: Sequence[Mapping[str, Any]], *, limit: int) -> set[int]:
+    """Keep recorded parent boundaries available beside a focused source view."""
+    indexes: dict[str, int] = {}
+    for index, event in enumerate(events):
+        kind = str(event.get("eventType") or "")
+        if kind in {"session_created", "broadcast_started", "session_archived"}:
+            if kind not in indexes or kind == "session_archived":
+                indexes[kind] = index
+    return set(list(indexes.values())[:limit])
+
+
 def _direct_operational_evidence_lines(
     events: Sequence[Mapping[str, Any]],
     user_text: str,
     *,
     limit: int = 10,
+    include_episode_context: bool = False,
 ) -> list[str]:
-    if not events or not _SHOW_OPERATIONAL_QUERY_RE.search(user_text or ""):
+    if not events or not (include_episode_context or _SHOW_OPERATIONAL_QUERY_RE.search(user_text or "")):
         return []
     safe_limit = max(1, min(int(limit or 1), 12))
     query_terms = {
@@ -2983,10 +3003,12 @@ def _direct_operational_evidence_lines(
         score = len(overlap)
         if score:
             scored.append((score, index))
-    indexes: set[int] = set()
+    indexes = show_episode_boundary_indexes(events, limit=safe_limit) if include_episode_context else set()
     if scored:
         for _score, index in sorted(scored, key=lambda item: (-item[0], item[1])):
             for candidate in (index - 1, index, index + 1):
+                if len(indexes) >= safe_limit:
+                    break
                 if 0 <= candidate < len(events):
                     indexes.add(candidate)
                 if len(indexes) >= safe_limit:
@@ -3012,7 +3034,10 @@ def _direct_operational_evidence_lines(
                 "session_archived",
             }
         ]
-        indexes.update(anchors[:safe_limit])
+        for index in anchors:
+            if len(indexes) >= safe_limit:
+                break
+            indexes.add(index)
     lines = []
     for index in sorted(indexes)[:safe_limit]:
         event = events[index]
@@ -3038,6 +3063,25 @@ def _direct_operational_evidence_lines(
             + (f" — {suffix}" if suffix else "")
         )
     return lines
+
+
+def show_interval_episode_context(
+    ledger: Mapping[str, Any], interval: Mapping[str, Any], user_text: str,
+) -> str:
+    """Compose the focused transcript with independent parent-show evidence."""
+    if interval.get("basis") == "recorded_show_timeline":
+        return str(interval["text"])
+    outside = [event for event in ledger.get("operationalEvents", ())
+               if isinstance(event, Mapping) and not any(
+                   window["start_ms"] <= int(event.get("occurredAtMs") or 0) <= window["end_ms"]
+                   for window in interval.get("windows", ()))]
+    related = _direct_operational_evidence_lines(outside, user_text, include_episode_context=True)
+    if not related:
+        return str(interval["text"])
+    return (str(interval["text"]) + "\n\nIndependent records from the same show outside the conversation interval. "
+            "Use these with the focused chat when they answer another part of the request; "
+            "they do not expand its transcript coverage. Answer the request naturally rather than reciting the records.\n"
+            + "\n".join(related))
 
 
 def build_durable_show_prompt_context(
@@ -3068,6 +3112,7 @@ def build_durable_show_prompt_context(
     direct_operational_lines = _direct_operational_evidence_lines(
         direct_operational_events,
         user_text,
+        include_episode_context=True,
     )
     if durable_events is None:
         # Timeline evidence is independently owned by the website. A failed
@@ -3112,7 +3157,7 @@ def build_durable_show_prompt_context(
         attendance_ledger, user_text, messages=interval_messages, discord_complete=discord_complete,
     )
     if interval is not None:
-        return "Durable TikTok show analysis context:\n" + interval["text"]
+        return "Durable TikTok show analysis context:\n" + show_interval_episode_context(attendance_ledger, interval, user_text)
     requested_keys = _requested_track_keys(user_text, ranked)
     total_messages = sum(int(item["message_count"]) for item in ranked)
     unique_chatters = int((attendance_ledger.get("coverage") or {}).get("participantCount") or 0)

@@ -155,10 +155,23 @@ class ShowIntervalConversationTests(unittest.TestCase):
             with self.subTest(query=query):
                 self.assertIsNone(show_conversation_scope(self.ledger(), query))
 
+    def test_later_show_noun_does_not_override_the_named_track_interval(self):
+        for follow_on in ("session", "show", "broadcast"):
+            query = QUERY.rstrip("?") + ", and how did the " + follow_on + " end?"
+            with self.subTest(follow_on=follow_on):
+                result = build_show_interval_conversation(self.ledger(), query)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["basis"], "named_track")
+                self.assertEqual(result["track_keys"], ("track_id:track-first-signal",))
+                self.assertEqual(result["message_count"], 26)
+                self.assertIn("Observation 025:", result["text"])
+
     def test_live_and_archived_builders_share_the_complete_interval_view(self):
         prompt = build_durable_show_prompt_context({"latestShow": archived_show()}, interval_events(), QUERY)
         result = build_show_interval_conversation(self.ledger(interval_events()), QUERY)
-        self.assertEqual(prompt, "Durable TikTok show analysis context:\n" + result["text"])
+        self.assertTrue(prompt.startswith("Durable TikTok show analysis context:\n" + result["text"]))
+        self.assertIn("Independent records from the same show", prompt)
+        self.assertIn("[session archived]", prompt)
 
     def test_real_database_packet_default_renderer_and_native_reader_keep_all_rows(self):
         from bnl_journal_source_store import record_source_event
@@ -381,6 +394,8 @@ class ShowIntervalConversationTests(unittest.TestCase):
             "song starts and stops, wheel spins, submissions, and show end.",
             "Give me the August 28, 2026 BARCODE Radio show timeline for "
             "wheel spins, sponsor breaks, track starts and stops, and show end.",
+            "Give me the August 28, 2026 BARCODE Radio show timeline of "
+            "the wheel spins, the sponsor breaks, track starts and stops, and show end.",
         )
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, PACKET_ENV):
             db = str(Path(directory) / "bnl.db")
@@ -422,6 +437,22 @@ class ShowIntervalConversationTests(unittest.TestCase):
                 scope = show_conversation_scope(ledger, query)
                 self.assertEqual(scope["basis"], basis)
                 self.assertNotEqual(scope["basis"], "recorded_show_timeline")
+
+    def test_definite_singular_operation_timeline_keeps_the_requested_window(self):
+        ledger = self.ledger()
+        ledger["operationalEvents"].extend([
+            {"eventId": "wheel-start", "eventType": "wheel_launched",
+             "occurredAtMs": stamp("2026-08-29T00:04:21Z")},
+        ])
+        for reference, label in (("around the wheel spin", "Wheel spin"),
+                                 ("of the sponsor break", "Sponsor break"),
+                                 ("for the wheel", "Wheel spin")):
+            with self.subTest(reference=reference):
+                result = build_show_interval_conversation(ledger, "Give me the show timeline " + reference + ".")
+                self.assertEqual(result["basis"], "recorded_operation_interval")
+                self.assertEqual(result["status"], "resolved")
+                self.assertEqual(result["labels"], (label,))
+                self.assertNotIn("[recorded operation] session_archived", result["text"])
 
     def test_busy_show_timeline_keeps_operations_before_sampling_chat(self):
         ledger = self.ledger()
