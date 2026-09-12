@@ -19,7 +19,6 @@ import sqlite3
 from typing import Any, Mapping, Optional, Sequence
 
 from bnl_canon_source_contract import (
-    SIX_BIT,
     Confidence,
     SourceClass,
     Visibility,
@@ -40,7 +39,10 @@ from bnl_tiktok_live_context import (
     _comment_timing_evidence,
     _event_subject_key,
     _safe_durable_event,
+    _public_show_speaker_label,
     build_tiktok_show_evidence_ledger,
+    build_show_interval_conversation,
+    show_conversation_interval_requested,
     has_explicit_show_date,
     requested_show_date,
     requested_show_dates,
@@ -217,27 +219,6 @@ def _canonical_json(value: Any) -> str:
 
 def _safe_label(value: Any, limit: int = 220) -> str:
     return _SPACE_RE.sub(" ", str(value or "")).strip()[:limit].rstrip()
-
-
-def _configured_owner_subject_ref() -> str:
-    try:
-        owner_user_id = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
-    except (OverflowError, TypeError, ValueError):
-        return ""
-    return f"discord_user:{owner_user_id}" if owner_user_id > 0 else ""
-
-
-def _public_show_speaker_label(
-    subject_ref: Any,
-    value: Any,
-    fallback: str = "Show participant",
-    *,
-    limit: int = 160,
-) -> str:
-    owner_subject_ref = _configured_owner_subject_ref()
-    if owner_subject_ref and str(subject_ref or "") == owner_subject_ref:
-        return SIX_BIT.name
-    return _safe_label(value, limit) or fallback
 
 
 def _safe_document(value: Any) -> Optional[dict[str, Any]]:
@@ -598,6 +579,8 @@ def _load_show_discord_exchanges(
     guild_id: int,
     show: Mapping[str, Any],
     limit: int = TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS,
+    messages_out: list[dict[str, Any]] | None = None,
+    window_bounds: tuple[int, int] | None = None,
 ) -> Optional[list[dict[str, Any]]]:
     """Pair public in-show Discord messages with BNL's recorded responses.
 
@@ -608,13 +591,13 @@ def _load_show_discord_exchanges(
     mislabeled as an interaction with BNL.
     """
 
-    start_ms, end_ms = show_timeline_bounds_ms(show)
+    start_ms, end_ms = window_bounds or show_timeline_bounds_ms(show)
     if start_ms is None or end_ms is None or end_ms < start_ms:
         return None
     if not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversations'"
     ).fetchone():
-        return []
+        return None if messages_out is not None else []
     columns = _table_columns(conn, "conversations")
     required = {
         "id",
@@ -627,7 +610,7 @@ def _load_show_discord_exchanges(
         "channel_policy",
     }
     if not required.issubset(columns):
-        return []
+        return None if messages_out is not None else []
 
     def expression(column: str, fallback: str) -> str:
         return column if column in columns else fallback
@@ -689,6 +672,7 @@ def _load_show_discord_exchanges(
                 "userName": _safe_label(row[2], 160),
                 "role": role,
                 "content": content[:4000],
+                "textDigest": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "occurredAtMs": int(occurred_at_ms),
                 "channelId": int(row[6] or 0),
                 "channelName": _safe_label(row[7], 80).casefold(),
@@ -700,6 +684,19 @@ def _load_show_discord_exchanges(
     normalized_rows.sort(
         key=lambda item: (int(item["occurredAtMs"]), int(item["id"]))
     )
+    if messages_out is not None:
+        # The timeline retains ordinary public chatter independently of BNL
+        # response pairing. It never marks those messages as addressed to BNL.
+        messages_out.extend({
+            "eventId": f"discord_conversation:{row['id']}", "conversationRowId": row["id"],
+            "messageId": row["messageId"], "occurredAtMs": row["occurredAtMs"],
+            "subjectRef": f"discord_user:{row['userId']}" if row["role"] == "user" else "bnl_model",
+            "speakerLabel": _public_show_speaker_label(f"discord_user:{row['userId']}", row["userName"])
+            if row["role"] == "user" else "BNL-01",
+            "text": row["content"], "textDigest": row["textDigest"],
+            "role": row["role"], "surface": "discord", "channelId": row["channelId"],
+            "channelName": row["channelName"], "channelPolicy": row["channelPolicy"],
+        } for row in normalized_rows if start_ms <= row["occurredAtMs"] <= end_ms)
 
     model_row_ids = [
         int(row["id"]) for row in normalized_rows if row["role"] == "model"
@@ -918,6 +915,27 @@ def _load_show_discord_exchanges(
                 metadata = json.loads(metadata_json or "{}")
             except (json.JSONDecodeError, TypeError, ValueError):
                 metadata = {}
+            if messages_out is not None and isinstance(metadata, Mapping) and str(channel_policy or "") in {
+                "public_home", "public_context", "public_selective",
+            }:
+                row_id = int(metadata.get("conversationRowId") or 0)
+                message_id = int(metadata.get("messageId") or 0)
+                if not any(
+                    (row_id > 0 and item.get("conversationRowId") == row_id)
+                    or (message_id > 0 and item.get("messageId") == message_id)
+                    for item in messages_out
+                ) and re.fullmatch(r"discord_user:[1-9][0-9]{0,24}", str(subject_ref or "")):
+                    messages_out.append({
+                        "eventId": "discord_source:" + str(source_key or ""),
+                        "conversationRowId": row_id, "messageId": message_id,
+                        "occurredAtMs": int(occurred_at_ms), "subjectRef": str(subject_ref),
+                        "speakerLabel": _public_show_speaker_label(subject_ref, display_name),
+                        "text": str(raw_text or "")[:4000],
+                        "textDigest": hashlib.sha256(str(raw_text or "").encode("utf-8")).hexdigest(),
+                        "role": "user", "surface": "discord", "channelId": int(channel_id or 0),
+                        "channelName": _safe_label(metadata.get("channelName"), 80),
+                        "channelPolicy": str(channel_policy),
+                    })
             if not isinstance(metadata, Mapping) or metadata.get(
                 "directedToBnl"
             ) is not True:
@@ -2106,7 +2124,9 @@ def _authored_show_messages(ledger: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Read human utterances with their original source-owned identity."""
 
     messages = [
-        {**item, "surface": "tiktok"}
+        {**item, "surface": "tiktok", "speakerLabel": _public_show_speaker_label(
+            item.get("subjectRef"), item.get("speakerLabel"),
+        )}
         for item in ledger.get("messages") or ()
         if isinstance(item, Mapping)
     ]
@@ -2126,6 +2146,47 @@ def _authored_show_messages(ledger: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "surface": "discord",
             })
     return messages
+
+
+def _show_interval_messages(
+    conn: sqlite3.Connection, *, guild_id: int, ledger: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Enrich a selected interval from its existing public conversation owner.
+
+    Older ledgers need no rewrite/backfill. Their BNL interaction projection
+    is kept separate from ordinary public chatter loaded on this read.
+    """
+
+    discord_rows: list[dict[str, Any]] = []
+    try:
+        result = _load_show_discord_exchanges(
+            conn, guild_id=guild_id, show={}, messages_out=discord_rows,
+            window_bounds=(int(ledger.get("startedAtMs") or 0), int(ledger.get("endedAtMs") or 0)),
+        )
+    except (sqlite3.DatabaseError, TypeError, ValueError):
+        result = None
+    # An incomplete fresh scan must not be mislabeled as complete Discord
+    # coverage. Its prior retained interactions remain individually usable.
+    if result is None:
+        return [item for item in _authored_show_messages(ledger) if item.get("surface") == "tiktok"], False
+    existing = _authored_show_messages(ledger)
+    return [*discord_rows, *(item for item in existing if item.get("surface") == "tiktok")], True
+
+
+def load_show_timeline_discord_messages(
+    db_file: str, *, guild_id: int, show: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read ordinary public Discord chatter for a native live show snapshot."""
+
+    rows: list[dict[str, Any]] = []
+    if not db_file or not os.path.exists(db_file):
+        return rows, False
+    try:
+        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as conn:
+            result = _load_show_discord_exchanges(conn, guild_id=guild_id, show=show, messages_out=rows)
+        return (rows, True) if result is not None else ([], False)
+    except (sqlite3.DatabaseError, TypeError, ValueError):
+        return [], False
 
 
 def _participant_topic_terms(
@@ -2559,7 +2620,7 @@ def _show_context_item(
         show_keys=tuple(key for key, _digest in sources),
         show_dates=show_dates,
         subject_key=str(subject_key or "barcode_radio"),
-        text=_safe_label(
+        text=text if usage == "scoped_show_conversation" else _safe_label(
             text,
             950 if kind in {"operations", "dialogue"} else 840,
         ),
@@ -3106,6 +3167,26 @@ def select_tiktok_show_episode_context_items(
             item.source_digest, tuple(revision for revision in original_revision if revision[0] in item.show_keys),
         )) if lookups else item
 
+    interval_item = None
+    if len(authored_rows) == 1 and not quote_literals and show_conversation_interval_requested(user_text):
+        row = authored_rows[0]
+        messages, discord_complete = _show_interval_messages(conn, guild_id=guild_id, ledger=row["ledger"])
+        interval = build_show_interval_conversation(
+            row["ledger"], user_text, messages=messages, discord_complete=discord_complete,
+        )
+        if interval is not None:
+            interval_item = _show_context_item(
+                kind="dialogue", loaded_rows=(row,),
+                source_class=SourceClass.EVIDENCE_PROJECTION.value,
+                confidence=Confidence.HIGH.value,
+                subject_key="barcode_radio", text=interval["text"],
+                participants=interval["participants"], score=200.0,
+                usage="scoped_show_conversation",
+                uncertainty_status="speaker_attributed_timing_correlation",
+            )
+            if interval["basis"] != "recorded_show_timeline":
+                return (interval_item,)
+
     items: list[TikTokShowEpisodeContextItem] = []
     if authored_rows and (
         _show_episode_scope_requested(user_text) or participant_matches
@@ -3137,7 +3218,10 @@ def select_tiktok_show_episode_context_items(
             )
             if operation_item is not None:
                 items.append(operation_item)
-    dialogue_item = _dialogue_episode_context_item(
+    # A full-show request keeps the first-party operations and revisable
+    # community items with their existing source classes. Only its shortened
+    # dialogue view is replaced by the complete chronological conversation.
+    dialogue_item = interval_item or _dialogue_episode_context_item(
         authored_rows,
         user_text=user_text,
         participant_matches=participant_matches,
@@ -3645,6 +3729,23 @@ def build_tiktok_show_evidence_context(
                 key for key, result in original_lookups.items()
                 if not result["cached_projection_current"]
             )
+    if len(selected) == 1 and not original_lookups and not image_scopes and show_conversation_interval_requested(user_text):
+        ledger = selected[0][2]
+        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as interval_conn:
+            messages, discord_complete = _show_interval_messages(interval_conn, guild_id=guild_id, ledger=ledger)
+        interval = build_show_interval_conversation(ledger, user_text, messages=messages, discord_complete=discord_complete)
+        if interval is not None:
+            for message in messages:
+                if str(message.get("eventId") or "") in interval["rendered_event_ids"]:
+                    remember_authored_excerpt(
+                        ledger, message, surface=str(message.get("surface") or "tiktok"),
+                        speaker_label=_public_show_speaker_label(message.get("subjectRef"), message.get("speakerLabel")),
+                        preserve_original_text=True,
+                    )
+            if selection_out is not None:
+                selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
+                selection_out["interval_coverage"] = {key: value for key, value in interval.items() if key != "text"}
+            return "Durable BARCODE Radio show episode memory:\n" + interval["text"]
     lines = [
         *image_query_lines,
         "Durable BARCODE Radio show episode memory:",
