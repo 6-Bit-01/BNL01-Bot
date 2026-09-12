@@ -2471,6 +2471,9 @@ def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, use
                     and isinstance(ledger.get("messages"), list)
                     else []
                 )
+                preparation = ledger.get("preparationMoment") if isinstance(ledger, dict) else None
+                if isinstance(preparation, dict):
+                    messages = [*messages, *(preparation.get("messages") or [])]
                 discord_participants = (
                     ledger.get("discordParticipants")
                     if isinstance(ledger, dict)
