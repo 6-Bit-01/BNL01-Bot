@@ -1214,7 +1214,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bnl01_bot._flush_channel_buffer(channel)
 
-        context_builder.assert_called_once_with("queue status", "sealed_test")
+        context_builder.assert_called_once_with("queue status", "sealed_test", guild_id=channel.guild.id)
         self.assertEqual(len(generation_calls), 1)
         self.assertIn(queue_context, generation_calls[0][0])
         self.assertTrue(generation_calls[0][1]["source_context_available"])

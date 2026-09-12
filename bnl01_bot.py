@@ -35,6 +35,7 @@ from bnl_tiktok_live_context import (
     DEFAULT_CONTEXT_PATH as DEFAULT_TIKTOK_LIVE_CONTEXT_PATH,
     DEFAULT_MAX_AGE_SECONDS as DEFAULT_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
     build_durable_show_prompt_context,
+    build_tiktok_show_evidence_ledger,
     build_live_prompt_context,
     classify_tiktok_show_analysis_intent,
     has_explicit_show_date,
@@ -63,6 +64,8 @@ from bnl_tiktok_show_ledger import (
     ensure_tiktok_show_evidence_schema,
     load_tiktok_show_source_events,
     load_show_timeline_discord_messages,
+    load_show_preparation_context,
+    show_preparation_requested,
     sync_tiktok_show_evidence_ledgers,
 )
 from bnl_occasion import (
@@ -1928,6 +1931,10 @@ Shared understanding:
 - The supplied selection can be incomplete; absence here is not proof of absence.
 - Use the conversation and source evidence to answer the current request and
   correct earlier factual mistakes.
+- When current show context is supplied, use it as a light contextual nudge.
+  Explicit subjects, topic changes and corrections prevail. Preparation stays
+  distinct from on-air events; coincident banter is not automatically a song
+  reaction. Share supplied public show/song links when useful.
 - General public knowledge may answer ordinary external questions when useful,
   but never present it as private BARCODE evidence or a current operational
   fact.
@@ -2869,10 +2876,12 @@ class WebsiteReadModelContext(str):
     def __new__(
         cls, text: str, *, rendered_lines: tuple[str, ...] = (),
         historical_sections: tuple[tuple[str, tuple[int, ...]], ...] = (),
+        show_awareness_only: bool = False,
     ):
         context = super().__new__(cls, text)
         context.rendered_lines = rendered_lines
         context.historical_sections = historical_sections
+        context.show_awareness_only = show_awareness_only
         return context
 
     def for_original_quote_lookup(self, show_keys, *, current_images: bool = False) -> str:
@@ -2917,7 +2926,7 @@ def build_bnl_read_model_context(
         current_id = str(current_show.get("sessionId") or "")
         session_id = str(session.get("id") or session.get("sessionId") or "")
         if (current_id and current_id == session_id
-                and str(session.get("broadcastPhase") or "").lower() == "live"
+                and str(session.get("broadcastPhase") or "").lower() in {"live", "broadcast_active"}
                 and current_show.get("status") != "archived"
                 and _bnl_read_model_cached_at is not None):
             # Freeze one read's live boundary before loading its source rows.
@@ -2925,6 +2934,23 @@ def build_bnl_read_model_context(
             archive = {**archive, "currentShow": {
                 **current_show, "_evidenceObservedThroughMs": int(_bnl_read_model_cached_at.timestamp() * 1000),
             }}
+    if show_preparation_requested(user_text) and declared_access_scope == "public":
+        show, _selected_source = select_show_for_tiktok_analysis(archive, user_text)
+        if show:
+            parent = build_tiktok_show_evidence_ledger(show, [])
+            if parent:
+                current = _first_mapping(archive.get("currentShow"))
+                if (show.get("sessionId") == current.get("sessionId")
+                        and show.get("status") != "archived" and _bnl_read_model_cached_at is not None):
+                    parent["preparationObservedThroughMs"] = int(_bnl_read_model_cached_at.timestamp() * 1000)
+                context = load_show_preparation_context(
+                    DB_FILE, guild_id=BNL_PRIMARY_GUILD_ID, ledger=parent,
+                    same_date_show_count=sum(1 for item in tiktok_show_records(archive)
+                        if item.get("showDate") == show.get("showDate")),
+                )
+                if context:
+                    return ("Website public read model context:\n- accessScope=public\n"
+                            "Durable TikTok show analysis context:\n" + context)
     artists_section = sections.get("artists") if sections.get("artists") is not None else read_model.get("artists")
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
@@ -3393,11 +3419,53 @@ def build_bnl_read_model_context(
     return rendered
 
 
+def build_light_show_awareness(read_model: dict, channel_policy: str) -> str:
+    """A current public session referent, owned by the existing read model.
+
+    This is prompt context only. It neither starts a second recorder nor changes
+    reply eligibility, and never establishes that coincident chat is about a song.
+    """
+    if channel_policy not in PUBLIC_CHAT_POLICIES | {"sealed_test"}:
+        return ""
+    public_model = safe_bnl_read_model_for_consumption(read_model, "public_home")
+    if website_queue_access_scope(public_model) != "public":
+        return ""
+    queue = _website_read_model_queue(public_model)
+    session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+    phase = str(session.get("broadcastPhase") or session.get("phase") or "").lower()
+    if (not session.get("id") or session.get("status") not in {"prepared", "open", "closed"}
+            or phase not in {"warmup", "submission_window", "broadcast_active", "live"}):
+        return ""
+    lines = [
+        "Current public BARCODE show context (temporary):",
+        "- " + "; ".join(f"{key}={_compact_public_text(session.get(key), 100)}"
+                          for key in ("id", "title", "showDate", "status", "broadcastPhase")
+                          if session.get(key) is not None),
+        "- Use this show as a possible referent for ambiguous show-room conversation. "
+        "Explicit subjects, another date, topic changes and corrections take precedence. "
+        "Preparation is not on-air playback. Chat during a track may be unrelated banter; "
+        "use the actual conversation and timeline evidence to understand it.",
+    ]
+    now_playing = _first_mapping(queue.get("nowPlaying"), queue.get("currentTrack"))
+    if phase in {"broadcast_active", "live"} and now_playing:
+        lines.append("- Now playing: " + _track_label(
+            now_playing, include_lane=False, include_public_source_url=True))
+    queue_url = str(queue.get("queueUrl") or "")
+    parsed = urllib.parse.urlparse(queue_url)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        lines.append("- Show queue: " + queue_url)
+    lines.append("- Offer the supplied public show or song link when useful. "
+                 "Do not invent artist links, promote every reply, infer missing chat, "
+                 "or treat BNL's earlier claims as audience testimony.")
+    return WebsiteReadModelContext("\n".join(lines), show_awareness_only=True)
+
+
 def maybe_build_bnl_read_model_context(
     user_text: str,
     channel_policy: str,
     *,
     conversation_context: str = "",
+    guild_id: int = 0,
 ) -> str:
     explicit_show_analysis = is_tiktok_show_analysis_query(user_text)
     contextual_candidate = bool(
@@ -3432,7 +3500,16 @@ def maybe_build_bnl_read_model_context(
     if not (
         is_bnl_read_model_relevant(user_text, channel_policy)
         or show_analysis_request
+        or show_preparation_requested(user_text)
     ):
+        if (BNL_PRIMARY_GUILD_ID and int(guild_id or 0) == BNL_PRIMARY_GUILD_ID
+                and channel_policy in PUBLIC_CHAT_POLICIES | {"sealed_test"}
+                and build_light_show_awareness(_bnl_read_model_cache or {}, channel_policy)):
+            # Reuse the existing authenticated, revocation-aware 20-second
+            # cache, initially populated by the existing show sync. The old
+            # snapshot is only a refresh cue: fetch must return current data.
+            # Ordinary off-show conversation starts no new website request.
+            return build_light_show_awareness(fetch_bnl_read_model(), channel_policy)
         return ""
     queue_query = _queue_read_model_query(user_text)
     live_reaction_query = is_live_show_reaction_query(user_text)
@@ -3471,6 +3548,10 @@ def public_tiktok_interaction_memory_allowed(
 ) -> bool:
     """Allow the public BNL exchange to persist, never the injected snapshot."""
 
+    if (isinstance(website_read_model_context, WebsiteReadModelContext)
+            and website_read_model_context.show_awareness_only):
+        # Only the delivered public conversation persists, never this snapshot.
+        return channel_policy in PUBLIC_CHAT_POLICIES
     context = str(website_read_model_context or "")
     durable_show_context = "Durable TikTok show analysis context:" in context
     live_show_date = re.search(
@@ -3549,7 +3630,7 @@ def model_response_persistence_allowed_with_website_context(
         or public_tiktok_interaction_memory_allowed(
             user_text,
             channel_policy,
-            context,
+            website_read_model_context,
         )
     )
 
@@ -37884,11 +37965,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     combined_text,
                     channel_policy,
                     conversation_context=recent_room_prompt,
+                    guild_id=guild_id,
                 )
             else:
                 batch_website_read_model_context = maybe_build_bnl_read_model_context(
                     combined_text,
                     channel_policy,
+                    guild_id=guild_id,
                 )
             # Keep images attached to the original admitted turns through every
             # coalescing/retry pass. Loading updates these transient references
@@ -42587,6 +42670,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         direct_content,
         session.get("channel_policy", "unknown"),
         conversation_context=room_context,
+        guild_id=session["guild_id"],
     )
     source_context_block = await maybe_build_source_context_for_direct_message(
         anchor_message,
@@ -47772,6 +47856,7 @@ async def on_message(message: discord.Message):
                 direct_content,
                 channel_policy,
                 conversation_context=room_context,
+                guild_id=message.guild.id,
             )
             source_context_block = await maybe_build_source_context_for_direct_message(
                 message,
@@ -48299,6 +48384,7 @@ async def on_message(message: discord.Message):
             direct_content,
             channel_policy,
             conversation_context=room_context,
+            guild_id=message.guild.id,
         )
         source_context_block = await maybe_build_source_context_for_direct_message(
             message,
@@ -48780,6 +48866,7 @@ async def on_message(message: discord.Message):
             direct_content,
             channel_policy,
             conversation_context=room_context,
+            guild_id=message.guild.id,
         )
         source_context_block = await maybe_build_source_context_for_direct_message(
             message,

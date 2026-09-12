@@ -61,12 +61,20 @@ TIKTOK_SHOW_EVIDENCE_RESPONSE_WINDOW_MS = 15 * 60 * 1000
 TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT = 2
 TIKTOK_SHOW_EVIDENCE_RECALL_MESSAGE_LIMIT = 10
 SHOW_EPISODE_CONTEXT_VERSION = "barcode_show_episode_context_v1"
+SHOW_PREPARATION_CONTEXT_VERSION = "barcode_show_preparation_v1"
+
+
+def show_preparation_requested(text: str) -> bool:
+    return bool(re.search(
+        r"\b(?:pre[- ]?show|preflight|pre[- ]flight|preparation|preparing|"
+        r"before (?:the )?(?:show|broadcast|session))\b", str(text or ""), re.I,
+    ))
 
 _SPACE_RE = re.compile(r"\s+")
 _QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]{2,}", re.IGNORECASE)
 _SHOW_QUERY_RE = re.compile(
     r"\b(?:tiktok|tik tok|barcode radio|broadcast|shows?|episodes?|live|chat|viewers?|"
-    r"audience|track|song|queue|wheel|submissions?|intake|sponsor|break|"
+    r"audience|track|song|queue|wheel|submissions?|intake|sponsor|break|preparation|preflight|pre-show|"
     r"signal hold|paused?|stalled?|resumed?|skipped?|removed?|returned?|"
     r"restored?|started?|finished?|timeline|"
     r"last show|previous show|past show|show chat|talked about)\b",
@@ -1297,7 +1305,16 @@ def _project_finalized_show(
                 if isinstance(binding, Mapping)
             ][:12],
             "sourceDigest": source_digest,
+            "preparationMoment": {
+                "momentId": (ledger.get("preparationMoment") or {}).get("momentId", ""),
+                "sourceCount": len((ledger.get("preparationMoment") or {}).get("messages") or ()),
+                "linkedDiscordMomentIds": [
+                    item["momentId"] for item in (ledger.get("preparationMoment") or {}).get("linkedDiscordMoments", ())
+                ],
+                "phase": "pre_show",
+            },
             "epistemicStatus": (
+
                 "authoritative public queue chronology plus source-linked "
                 "public show observations"
             ),
@@ -1812,6 +1829,7 @@ def sync_tiktok_show_evidence_ledgers(
     try:
         ensure_tiktok_show_evidence_schema(conn)
         ensure_memory_ledger_schema(conn)
+        related_sources = _load_show_related_sources(conn, guild_id=int(guild_id))
         for show in shows:
             show_key = tiktok_show_evidence_key(show)
             if not show_key:
@@ -1852,15 +1870,27 @@ def sync_tiktok_show_evidence_ledgers(
                 discord_exchanges,
                 prior_ledger,
             )
-            ledger = _seal_authorized_show_ledger(
-                build_tiktok_show_evidence_ledger(
-                    show,
-                    source_events,
-                    artist_identity_index=artist_identity_index,
-                    discord_exchanges=discord_exchanges,
-                ),
-                authorization_receipt,
+            base_ledger = build_tiktok_show_evidence_ledger(
+                show, source_events, artist_identity_index=artist_identity_index,
+                discord_exchanges=discord_exchanges,
             )
+            if not base_ledger:
+                continue
+            current = archive.get("currentShow") or {}
+            if (current.get("sessionId") == show.get("sessionId")
+                    and show.get("status") != "archived"):
+                observed = _timestamp_epoch_ms(read_model.get("generatedAt"))
+                if observed:
+                    base_ledger["preparationObservedThroughMs"] = observed
+            if prior_ledger and prior_ledger.get("preparationMoment"):
+                base_ledger["preparationMoment"] = prior_ledger["preparationMoment"]
+            base_ledger["preparationMoment"] = _show_preparation_view(
+                conn, guild_id=int(guild_id), ledger=base_ledger,
+                related_sources=related_sources,
+                same_date_show_count=sum(1 for candidate in shows
+                    if candidate.get("showDate") == show.get("showDate")),
+            )
+            ledger = _seal_authorized_show_ledger(base_ledger, authorization_receipt)
             if ledger is None:
                 continue
             result["sourceEvents"] += len(ledger.get("messages") or ())
@@ -2187,6 +2217,350 @@ def load_show_timeline_discord_messages(
         return (rows, True) if result is not None else ([], False)
     except (sqlite3.DatabaseError, TypeError, ValueError):
         return [], False
+
+
+def _load_show_related_sources(
+    conn: sqlite3.Connection, *, guild_id: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read original public sources once; no broadcast-only admission rule.
+
+    The row ceilings are reported coverage limits, never silent proof of an
+    empty preparation. Sources remain in their original owners.
+    """
+    records: dict[tuple[str, str], dict[str, Any]] = {}
+    coverage: dict[str, Any] = {"scope": "retained_public_sources", "complete": True,
+                                "unavailable": [], "limited": [], "invalid": 0}
+    policies = {"public_home", "public_context", "public_selective"}
+    columns = _table_columns(conn, "conversations")
+    if {"id", "guild_id", "user_id", "user_name", "role", "content",
+            "timestamp", "channel_policy"}.issubset(columns):
+        channel = "channel_id" if "channel_id" in columns else "0"
+        message = "message_id" if "message_id" in columns else "0"
+        rows = conn.execute(
+            f"""SELECT id,user_id,user_name,role,content,timestamp,channel_policy,
+                       {channel},{message}
+                FROM conversations WHERE guild_id=?
+                  AND role IN ('user','model')
+                  AND channel_policy IN ('public_home','public_context','public_selective')
+                ORDER BY datetime(timestamp) DESC,id DESC LIMIT ?""",
+            (guild_id, TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS + 1),
+        ).fetchall()
+        if len(rows) > TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS:
+            coverage["limited"].append("discord_conversation_rows")
+        for row in rows[:TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS]:
+            occurred = _timestamp_epoch_ms(row[5])
+            if occurred is None or not str(row[4] or "").strip():
+                continue
+            subject = f"discord_user:{row[1]}" if row[3] == "user" else "bnl_model"
+            records[("discord", str(row[0]))] = {
+                "eventId": f"discord_conversation:{row[0]}",
+                "conversationRowId": int(row[0]), "messageId": int(row[8] or 0),
+                "occurredAtMs": occurred, "surface": "discord", "role": row[3],
+                "subjectRef": subject,
+                "speakerLabel": _public_show_speaker_label(subject, row[2])
+                if row[3] == "user" else "BNL-01",
+                "channelId": int(row[7] or 0), "channelPolicy": row[6],
+                "text": str(row[4]), "textDigest": _context_digest(str(row[4])),
+            }
+    else:
+        coverage["unavailable"].append("discord_conversations")
+    known_messages = {r["messageId"] for r in records.values() if r.get("messageId")}
+    if _table_columns(conn, "bnl_journal_source_events"):
+        rows = conn.execute(
+            """SELECT source_kind,source_key,occurred_at_ms,subject_ref,
+                      private_display_name,raw_text,metadata_json,content_hash,
+                      channel_id,channel_policy
+               FROM bnl_journal_source_events
+               WHERE guild_id=? AND public_usable=1
+                 AND source_kind IN ('tiktok_live_chat','discord_message')
+               ORDER BY occurred_at_ms DESC,event_seq DESC LIMIT ?""",
+            (guild_id, TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS + 1),
+        ).fetchall()
+        if len(rows) > TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS:
+            coverage["limited"].append("journal_source_rows")
+        for kind, key, occurred, subject, label, raw, meta, digest, channel, policy in rows[:TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS]:
+            try:
+                metadata = json.loads(meta or "{}")
+            except (ValueError, TypeError):
+                coverage["invalid"] += 1
+                continue
+            if (not isinstance(metadata, dict) or policy not in policies
+                    or hashlib.sha256(str(raw or "").encode()).hexdigest() != digest):
+                coverage["invalid"] += 1
+                continue
+            surface = "tiktok" if kind == "tiktok_live_chat" else "discord"
+            try:
+                row_id = int(metadata.get("conversationRowId") or metadata.get("legacyRowId") or
+                             (str(key).split(":", 1)[1] if str(key).startswith("legacy_row:") else 0))
+                message_id = int(metadata.get("messageId") or metadata.get("legacyMessageId") or
+                                 (key if surface == "discord" and str(key).isdigit() else 0))
+            except (TypeError, ValueError, OverflowError):
+                coverage["invalid"] += 1
+                continue
+            if surface == "discord" and (
+                    ("discord", str(row_id)) in records
+                    or (message_id and message_id in known_messages)):
+                continue
+            # A Journal copy cannot restore an extant private, edited, invalid
+            # or scan-limited conversation. Its original owner wins even when
+            # that original did not enter this public scan.
+            if surface == "discord" and {"id", "guild_id"}.issubset(columns):
+                if row_id and conn.execute(
+                    "SELECT 1 FROM conversations WHERE guild_id=? AND id=?", (guild_id, row_id)
+                ).fetchone():
+                    continue
+                if message_id and "message_id" in columns and conn.execute(
+                    "SELECT 1 FROM conversations WHERE guild_id=? AND message_id=?", (guild_id, message_id)
+                ).fetchone():
+                    continue
+            identity = (surface, str(row_id) if surface == "discord" and row_id else str(key))
+            records[identity] = {
+                "eventId": str(key) if surface == "tiktok" else f"discord_source:{key}",
+                "conversationRowId": row_id, "messageId": message_id,
+                "occurredAtMs": int(occurred or 0), "surface": surface,
+                "role": "user", "subjectRef": str(subject or ""),
+                "speakerLabel": _public_show_speaker_label(subject, label),
+                "channelId": int(channel or 0), "channelPolicy": policy,
+                "text": str(raw or ""), "textDigest": str(digest),
+                "explicitSessionId": str(metadata.get("sessionId") or metadata.get("showSessionId") or ""),
+            }
+    else:
+        coverage["unavailable"].append("journal_sources")
+    # A superseded/retracted ledger source cannot become a new show link.
+    if _table_columns(conn, "memory_ledger_entries"):
+        rejected = set()
+        superseded = {str(r[0]) for r in conn.execute(
+            """SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=?
+               AND lineage_type IN ('correction_of','supersedes','retracts')""", (guild_id,))}
+        for table, row_id, lifecycle, public, text, entry_id in conn.execute(
+            """SELECT source_table,source_row_id,lifecycle_status,public_usable,
+                      normalized_value,entry_id FROM memory_ledger_entries
+               WHERE guild_id=? AND source_table IN ('conversations','tiktok_live_chat')
+                 AND entry_type IN ('observation','derived_summary')""", (guild_id,),
+        ):
+            key = ("discord", str(row_id)) if table == "conversations" else ("tiktok", str(row_id))
+            if lifecycle not in {"active", "review_only"} or (not public and records.get(key, {}).get("role") != "model"):
+                rejected.add(key)
+                continue
+            if str(entry_id) in superseded:
+                rejected.add(key)
+            elif key in records:
+                records[key]["ledgerEntryId"] = entry_id
+        for key in rejected:
+            records.pop(key, None)
+    values = sorted(records.values(), key=lambda r: (r["occurredAtMs"], r["eventId"]))
+    for record in values:
+        text = record["text"]
+        record["explicitShowDates"] = requested_show_dates(text) if has_explicit_show_date(text) else ()
+    coverage["complete"] = not (coverage["limited"] or coverage["unavailable"] or coverage["invalid"])
+    coverage["recordsRead"] = len(values)
+    return values, coverage
+
+
+def _show_preparation_view(
+    conn: sqlite3.Connection, *, guild_id: int, ledger: Mapping[str, Any],
+    related_sources: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
+    same_date_show_count: int = 1,
+) -> dict[str, Any]:
+    """A preparation Moment inside the existing show episode, with source links.
+
+    No generic TikTok Moments, new participants, retimed events, or invented
+    decisions. An explicit date can connect preparation before session creation.
+    A date shared by several known shows needs an exact session reference.
+    """
+    from bnl_moment_engine import _moment_is_renderable
+    records, scan = related_sources or _load_show_related_sources(conn, guild_id=guild_id)
+    records = list(records)
+    current_ids = {r["eventId"] for r in records}
+    prior = ledger.get("preparationMoment") or {}
+    retained_count = 0
+    for stored in prior.get("messages", ()) if isinstance(prior, Mapping) else ():
+        if not isinstance(stored, Mapping) or stored.get("eventId") in current_ids:
+            continue
+        # The existing show owner can preserve admitted evidence after normal
+        # source pruning. An extant changed/private original always wins; the
+        # full-delete owner removes this parent as well as the original rows.
+        surface = stored.get("surface")
+        row_id = int(stored.get("conversationRowId") or 0)
+        if surface == "discord" and row_id and _table_columns(conn, "conversations"):
+            if conn.execute("SELECT 1 FROM conversations WHERE guild_id=? AND id=?", (guild_id, row_id)).fetchone():
+                continue
+        event_id = str(stored.get("eventId") or "")
+        source_key = event_id.removeprefix("discord_source:")
+        if _table_columns(conn, "bnl_journal_source_events") and conn.execute(
+            "SELECT 1 FROM bnl_journal_source_events WHERE guild_id=? AND source_key=?",
+            (guild_id, source_key),
+        ).fetchone():
+            continue
+        entry_id = str(stored.get("ledgerEntryId") or "")
+        if entry_id and _table_columns(conn, "memory_ledger_entries"):
+            entry = conn.execute(
+                "SELECT lifecycle_status,public_usable,normalized_value FROM memory_ledger_entries WHERE guild_id=? AND entry_id=?",
+                (guild_id, entry_id),
+            ).fetchone()
+            if entry and (entry[0] not in {"active", "review_only"}
+                    or (not entry[1] and stored.get("role") != "model")
+                    or str(entry[2]) != str(stored.get("text") or "")[:500 if surface == "discord" else 1000]):
+                continue
+            if conn.execute(
+                """SELECT 1 FROM memory_ledger_lineage WHERE guild_id=? AND target_entry_id=?
+                   AND lineage_type IN ('correction_of','supersedes','retracts')""", (guild_id, entry_id),
+            ).fetchone():
+                continue
+        records.append({**stored, "explicitShowDates": requested_show_dates(stored["text"])
+                        if has_explicit_show_date(stored["text"]) else ()})
+        retained_count += 1
+    show_key = str(ledger.get("showKey") or "")
+    session_id = str(ledger.get("sessionId") or (show_key if not show_key.startswith("show:") else ""))
+    show_date = str(ledger.get("showDate") or "")
+    operations = [e for e in ledger.get("operationalEvents", ()) if isinstance(e, Mapping)]
+    starts = [int(e.get("occurredAtMs") or 0) for e in operations
+              if e.get("eventType") == "broadcast_started"]
+    if not starts:
+        starts = [int(e.get("occurredAtMs") or 0) for e in operations
+                  if e.get("eventType") in {"track_play_started", "track_resumed"}]
+    broadcast_start = min(starts) if starts else None
+    created = [int(e.get("occurredAtMs") or 0) for e in operations
+               if e.get("eventType") == "session_created"]
+    session_start = min(created) if created else None
+    cutoff = broadcast_start or int(ledger.get("preparationObservedThroughMs") or ledger.get("endedAtMs") or 0) + 1
+    selected: list[dict[str, Any]] = []
+    explicit_roots: set[str] = set()
+    for record in records:
+        if not 0 < record["occurredAtMs"] < cutoff:
+            continue
+        dates = tuple(record.get("explicitShowDates") or ())
+        exact_session = bool(session_id and (
+            record.get("explicitSessionId") == session_id
+            or re.search(r"(?<![\w-])" + re.escape(session_id) + r"(?![\w-])", record["text"])))
+        dated = bool(dates == (show_date,) and same_date_show_count == 1
+                     and re.search(r"\b(?:show|broadcast|radio|session)\b", record["text"], re.I))
+        # An explicit other show/date defeats the ambient time correlation.
+        if ((dates and not dated) or (record.get("explicitSessionId") and not exact_session)) and not exact_session:
+            continue
+        reason = "explicit_session" if exact_session else "explicit_show_date" if dated else ""
+        if (not reason and same_date_show_count == 1 and session_start is not None
+                and session_start <= record["occurredAtMs"]):
+            reason = "session_time_context"
+        if not reason:
+            continue
+        entry = {k: v for k, v in record.items() if k != "explicitShowDates"}
+        entry["associationReason"] = reason
+        entry["phase"] = "pre_show"
+        selected.append(entry)
+        if reason.startswith("explicit_") and record.get("ledgerEntryId"):
+            explicit_roots.add(str(record["ledgerEntryId"]))
+    linked_moments = []
+    # Existing Discord Moments retain their identity, source membership and age.
+    if explicit_roots and _table_columns(conn, "memory_moment_windows"):
+        for mid, summary, channel, policy, route, visibility, canonical, started, ended in conn.execute(
+            """SELECT moment_id,summary,channel_id,channel_policy,route_mode,visibility,
+                      canonical_ledger_entry_id,window_started_at,last_activity_at
+               FROM memory_moment_windows WHERE guild_id=? AND lifecycle_status='finalized'
+                 AND public_usable=1""", (guild_id,),
+        ):
+            roots = {str(r[0]) for r in conn.execute(
+                "SELECT ledger_entry_id FROM memory_moment_members WHERE moment_id=?", (mid,))}
+            if not roots.intersection(explicit_roots):
+                continue
+            if _moment_is_renderable(
+                conn, moment_id=mid, summary=summary, guild_id=guild_id,
+                channel_id=channel, channel_policy=policy, route_mode=route,
+                visibility=visibility, canonical_ledger_entry_id=canonical,
+            ):
+                linked_moments.append({
+                    "momentId": mid, "summary": summary, "startedAt": started,
+                    "endedAt": ended, "supportingEntryIds": sorted(roots.intersection(explicit_roots)),
+                    "associationReason": "explicit_show_reference_in_moment",
+                })
+                selected_ids = {r["eventId"] for r in selected}
+                for record in records:
+                    if (record.get("ledgerEntryId") in roots and record["eventId"] not in selected_ids
+                            and 0 < record["occurredAtMs"] < cutoff):
+                        selected.append({
+                            **{k: v for k, v in record.items()
+                               if k != "explicitShowDates"},
+                            "associationReason": "source_linked_discord_moment", "phase": "pre_show",
+                        })
+                        selected_ids.add(record["eventId"])
+    selected.sort(key=lambda r: (r["occurredAtMs"], r["eventId"]))
+    prep_operations = [dict(e) for e in operations
+                       if 0 < int(e.get("occurredAtMs") or 0) < cutoff
+                       and (broadcast_start is None or int(e.get("occurredAtMs") or 0) < broadcast_start)]
+    view = {
+        "schemaVersion": SHOW_PREPARATION_CONTEXT_VERSION,
+        "momentId": show_key + ":preparation", "showKey": show_key,
+        "showDate": show_date, "phase": "pre_show",
+        "messages": selected, "operationalEvents": prep_operations,
+        "linkedDiscordMoments": linked_moments,
+        "coverage": {**{k: v for k, v in scan.items() if k != "recordsRead"},
+                     "selectedSourceCount": len(selected), "retainedPriorSources": retained_count},
+        "associationBoundary": "session timing is context, not proof every remark concerns the show",
+    }
+    view["sourceDigest"] = _context_digest(view)
+    return view
+
+
+def _render_show_preparation(view: Mapping[str, Any], *, max_chars: int = 96000,
+                             rendered_messages_out: list | None = None) -> str:
+    records = []
+    for event in view.get("operationalEvents", ()):
+        records.append((int(event.get("occurredAtMs") or 0),
+            f"Website event {event.get('eventId')}: " + json.dumps(event, ensure_ascii=False), None))
+    for message in view.get("messages", ()):
+        records.append((message["occurredAtMs"],
+            f"{message['surface']} {message['role']} {message['speakerLabel']} "
+            f"[{message['eventId']}; {message['associationReason']}]: "
+            + json.dumps(message["text"], ensure_ascii=False), message))
+    records.sort(key=lambda r: (r[0], r[1]))
+    lines = [
+        f"Show-linked preparation Moment: {view['momentId']}; showDate={view['showDate']}.",
+        "These sources keep their original times. They precede on-air playback; "
+        "session-time chat can include unrelated banter. Human reports are attributed "
+        "observations; website events are operational records; BNL replies are model output.",
+    ]
+    used = sum(map(len, lines)) + 1000
+    rendered = 0
+    for timestamp, text, message in records:
+        line = _utc_iso_from_ms(timestamp) + " " + text
+        if used + len(line) + 1 > max_chars:
+            continue
+        lines.append(line)
+        used += len(line) + 1
+        rendered += 1
+        if message is not None and rendered_messages_out is not None:
+            rendered_messages_out.append(message)
+    for moment in view.get("linkedDiscordMoments", ()):
+        line = "Linked Discord Moment (original timing): " + json.dumps(moment, ensure_ascii=False)
+        if used + len(line) + 1 <= max_chars:
+            lines.append(line)
+            used += len(line) + 1
+    lines.append(f"Coverage: {rendered}/{len(records)} selected records rendered; "
+                 f"original-source scan={json.dumps(view['coverage'], sort_keys=True)}. "
+                 "This describes retained evidence, not proof of complete platform capture.")
+    return "\n".join(lines)
+
+
+def load_show_preparation_context(
+    db_file: str, *, guild_id: int, ledger: Mapping[str, Any], same_date_show_count: int = 1,
+) -> str:
+    if not db_file or not os.path.exists(db_file):
+        return ""
+    try:
+        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as conn:
+            if _table_columns(conn, TIKTOK_SHOW_EVIDENCE_TABLE):
+                row = conn.execute(
+                    f"SELECT ledger_json FROM {TIKTOK_SHOW_EVIDENCE_TABLE} WHERE guild_id=? AND show_key=?",
+                    (guild_id, str(ledger.get("showKey") or "")),
+                ).fetchone()
+                retained = _safe_document(json.loads(row[0])) if row else None
+                if retained and retained.get("preparationMoment"):
+                    ledger = {**ledger, "preparationMoment": retained["preparationMoment"]}
+            view = _show_preparation_view(
+                conn, guild_id=guild_id, ledger=ledger, same_date_show_count=same_date_show_count)
+        return _render_show_preparation(view)
+    except (sqlite3.DatabaseError, TypeError, ValueError):
+        return "Show-linked preparation evidence is unavailable for this read."
 
 
 def _participant_topic_terms(
@@ -2534,6 +2908,11 @@ def _ranked_show_ledgers(
     allow_subject_continuity: bool = False,
     now: Any = None,
 ) -> list[tuple[int, int, Mapping[str, Any], list[Mapping[str, Any]]]]:
+    exact_keys = {str(row.get("showKey") or "") for row in loaded
+                  if row.get("showKey") and re.search(
+                      r"(?<![\w-])" + re.escape(str(row["showKey"])) + r"(?![\w-])", user_text)}
+    if exact_keys:
+        loaded = [row for row in loaded if row.get("showKey") in exact_keys]
     requested_dates = requested_show_dates(user_text, now=now)
     if has_explicit_show_date(user_text) and not requested_dates:
         return []
@@ -2620,7 +2999,7 @@ def _show_context_item(
         show_keys=tuple(key for key, _digest in sources),
         show_dates=show_dates,
         subject_key=str(subject_key or "barcode_radio"),
-        text=text if usage == "scoped_show_conversation" else _safe_label(
+        text=text if usage in {"scoped_show_conversation", "show_linked_preparation"} else _safe_label(
             text,
             950 if kind in {"operations", "dialogue"} else 840,
         ),
@@ -3133,6 +3512,24 @@ def select_tiktok_show_episode_context_items(
     selected_ranked = ranked[: (
         max(1, min(int(max_shows or 1), 12)) if multi_show else 1
     )]
+    if show_preparation_requested(user_text):
+        related = _load_show_related_sources(conn, guild_id=guild_id)
+        preparation_items = []
+        for _score, _rank, row, _matches in selected_ranked[:2]:
+            view = _show_preparation_view(
+                conn, guild_id=guild_id, ledger=row["ledger"], related_sources=related,
+                same_date_show_count=sum(1 for candidate in loaded
+                    if candidate["ledger"].get("showDate") == row["ledger"].get("showDate")),
+            )
+            preparation_items.append(_show_context_item(
+                kind="dialogue", loaded_rows=(row,), source_class=SourceClass.EVIDENCE_PROJECTION.value,
+                confidence=Confidence.HIGH.value, subject_key="barcode_radio",
+                text=_render_show_preparation(view),
+                participants=tuple(m["subjectRef"] for m in view["messages"] if m["role"] == "user"),
+                score=205.0, usage="show_linked_preparation",
+                uncertainty_status="linked_pre_show_evidence_not_on_air",
+            ))
+        return tuple(preparation_items)
     quote_literals = _current_show_quote_literals(user_text)
     if quote_literals:
         # Match the ordinary reader's bounded show scope for fresh raw scans.
@@ -3619,8 +4016,13 @@ def build_tiktok_show_evidence_context(
     if has_explicit_show_date(date_query) and not requested_show_dates(date_query):
         return unavailable_context("the requested show date is invalid")
     named_subject_refs = _named_recall_subject_refs(ledgers, selection_query)
+    exact_show_keys = {str(ledger["showKey"]) for ledger in ledgers
+                      if re.search(r"(?<![\w-])" + re.escape(str(ledger["showKey"]))
+                                   + r"(?![\w-])", selection_query)}
     ranked = []
     for recency_rank, ledger in enumerate(ledgers):
+        if exact_show_keys and ledger.get("showKey") not in exact_show_keys:
+            continue
         score, participant_matches = _document_relevance(
             ledger,
             user_text=selection_query,
@@ -3675,7 +4077,7 @@ def build_tiktok_show_evidence_context(
               if str(ledger.get("showDate") or "") in scope
               for literal in query.quote_literals),
         )))
-        if selected_literals:
+        if selected_literals and not show_preparation_requested(user_text):
             original_lookups[str(ledger.get("showKey") or "")] = _lookup_original_show_quotes(
                 db_file, guild_id=guild_id, ledger=ledger, literals=selected_literals,
             )
@@ -3729,6 +4131,27 @@ def build_tiktok_show_evidence_context(
                 key for key, result in original_lookups.items()
                 if not result["cached_projection_current"]
             )
+    if show_preparation_requested(user_text) and selected:
+        contexts = []
+        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as prep_conn:
+            related = _load_show_related_sources(prep_conn, guild_id=guild_id)
+            for _score, _recency, ledger, _matches in selected[:2]:
+                view = _show_preparation_view(
+                    prep_conn, guild_id=guild_id, ledger=ledger, related_sources=related,
+                    same_date_show_count=sum(1 for item in ledgers
+                        if item.get("showDate") == ledger.get("showDate")),
+                )
+                rendered_messages = []
+                contexts.append(_render_show_preparation(view, rendered_messages_out=rendered_messages))
+                for message in rendered_messages:
+                    if message.get("role") == "user":
+                        remember_authored_excerpt(
+                            ledger, message, surface=message["surface"],
+                            speaker_label=message["speakerLabel"], preserve_original_text=True,
+                        )
+        if selection_out is not None:
+            selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
+        return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join(contexts)
     if len(selected) == 1 and not original_lookups and not image_scopes and show_conversation_interval_requested(user_text):
         ledger = selected[0][2]
         with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as interval_conn:
