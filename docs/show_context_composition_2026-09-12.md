@@ -1,5 +1,69 @@
 # Show context composition after deployment
 
+## Current revision — September 13
+
+6 Bit's instruction is that the existing systems work together, with response
+depth appropriate to the situation. The original recovery plan requires
+equivalent admitted requests to reach the same authorized sources without
+magic wording. The preparation-only conditions and qualified-show phrase list
+described in the historical sections below did not meet that requirement and
+are superseded by this revision of PR547.
+
+The review held the recorded show and sources constant. "What happened in
+preparation and during the session?" retained preparation, chat and the ending.
+"Connect preparation with what happened on air and how the session ended"
+returned preparation alone. "Connect what we sorted out beforehand with the
+on-air discussion and how we wrapped up" omitted preparation and lost the
+ending in the packet. All three used the same explicitly dated BARCODE Radio
+show. Source revalidation passed even for the incomplete selections: the
+sources existed, but the readers withheld them before generation.
+
+The correction changes those existing readers:
+
+- The selected show supplies its linked preparation and independent chronology
+  alongside attributed dialogue. Preparation wording no longer returns early
+  or suppresses a requested original-quote lookup. Empty preparation dialogue
+  is not inserted as another view of already available operations.
+  Website follow-ups and comparisons use the same selected show for preparation
+  as for chronology and chat, including when an older source is superseded.
+- The program name and date can identify the show without classifying the
+  follow-on question's phrasing. Existing live-reaction date handling remains
+  with the current-show owner. A generic date, "show me", or "I live" does not
+  select BARCODE Radio.
+- The qualified-show phrase list is removed. A temporal reference is matched
+  against the recorded track roster and clock; an unrecognized phrase after
+  "during" does not by itself establish an unknown track. Explicit missing
+  track references, real elapsed ranges and operation windows retain their
+  bounded coverage and uncertainty.
+- A two-show comparison combines preparation views together and chronology
+  views together within their existing authority classes. Each original show
+  key, date, text and revision remains bound. The four existing show slots can
+  then retain preparation, operations, community context and dialogue together.
+  General named-person recall keeps its existing subject scope.
+
+Regression coverage reproduces the failures on the initial PR547 tree, then
+checks the website reader, durable reader and rendered packet. Direct and
+batch cases use the real affected show readers, Context/Frame assembly, packet
+preparation and provider dispatch with fixture external services. The three
+equivalent mixed requests reach the provider with all three evidence layers in
+both public home and sealed test contexts. Each case makes one physical
+provider attempt. A simple preparation question delivers the fixture's short
+answer unchanged in one attempt; available evidence does not require reciting
+every layer. This proves source handoff and delivery behavior, not arbitrary
+live Gemini answer quality.
+
+The comparison regression also verifies both shows' preparation, attributed
+discussion and archive events, and invalidation after an original preparation
+record changes. Existing quote, date, privacy, personal-memory and publication
+tests remain part of the verification. The PR records final check counts and
+the tested tree. No schema, provider, schedule, production setting, ingestion
+or deployment changes are included. PR544 remains the last supplied VPS
+deployment receipt. The existing recovery rows and live acceptance work retain
+their status; the deployment commands and historical questions below remain
+the handoff after review and merge.
+
+## Preserved implementation history
+
 The September 12 tests after merge `2b8335c` showed a broader named-track answer, but the timeline answer listed wheel results and removals while omitting other requested operations. The preparation answer reached linked sources but overstated some observations as successful technical checks. A service restart and component tests do not establish feature acceptance.
 
 ## Reproduced causes
