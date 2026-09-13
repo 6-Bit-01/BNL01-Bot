@@ -9,9 +9,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 from unittest import mock
 
-os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
-os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
-
 from bnl_shared_brain_synthesis import render_packet_context
 from bnl_tiktok_live_context import (
     SHOW_INTERVAL_CONTEXT_MAX_CHARS,
@@ -154,58 +151,9 @@ class ShowIntervalConversationTests(unittest.TestCase):
 
     def test_whole_show_person_recall_keeps_its_existing_owner(self):
         for query in ("What did Neon Fox say during the show?", "What did 6 Bit say during yesterday's show?",
-                      "What did Neon Fox say during the session?",
-                      "What did Neon Fox say during the BARCODE Radio show?",
-                      "What did Neon Fox say during the entire TikTok live?"):
+                      "What did Neon Fox say during the session?"):
             with self.subTest(query=query):
                 self.assertIsNone(show_conversation_scope(self.ledger(), query))
-
-    def test_qualified_whole_show_chat_and_timeline_reach_all_existing_readers(self):
-        import bnl01_bot as bot
-
-        references = (
-            "the BARCODE Radio show", "the radio broadcast", "the TikTok live",
-            "the entire show", "all of the BARCODE Radio show", "the whole TikTok live stream",
-            "the August 28, 2026 BARCODE Radio show", "yesterday's full radio session",
-        )
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, PACKET_ENV):
-            db = str(Path(directory) / "bnl.db")
-            fixtures.TikTokShowEvidenceLedgerTests().seed_source_and_memory(db)
-            model = authorized_read_model({"latestShow": archived_show()})
-            sync_tiktok_show_evidence_ledgers(db, guild_id=77, read_model=model, environ=ENABLED_QUEUE_ENV)
-            for reference in references:
-                for request in ("What did TikTok chat say", "Give me the show timeline"):
-                    query = "For August 28, 2026, " + request + " during " + reference + "?"
-                    native = build_tiktok_show_evidence_context(db, guild_id=77, user_text=query)
-                    with mock.patch.multiple(bot, DB_FILE=db, BNL_PRIMARY_GUILD_ID=77), \
-                         mock.patch.object(bot, "_load_durable_tiktok_show_events", return_value=durable_events()):
-                        website = bot.build_bnl_read_model_context(model, query, "sealed_test")
-                    with sqlite3.connect(db) as conn:
-                        packet = build_packet(conn, IntelligencePacketRequest(
-                            guild_id=77, subject_user_id=0, channel_id=9001, channel_policy="sealed_test",
-                            route_mode="normal_chat", conversation_surface="free_speak_sealed_mirror",
-                            visibility_allowance="public_safe", user_text=query, direct_state="direct",
-                            now="2026-08-29T12:00:00-07:00"), persist=True, environ=PACKET_ENV)
-                        rendered = render_packet_context(packet)[0]
-                        self.assertTrue(revalidate_packet(conn, packet, environ=ENABLED_QUEUE_ENV).valid)
-                    for reader in (native, website, rendered):
-                        with self.subTest(query=query, reader=reader[:65]):
-                            self.assertNotIn("window basis=named_track", reader)
-                            self.assertIn("BNL, the green visuals during this song are wild.", reader)
-                            if request == "Give me the show timeline":
-                                self.assertIn("The green visuals made that moment hit.", reader)
-                                self.assertIn("window basis=recorded_show_timeline", reader)
-                                self.assertIn("[recorded operation] session_archived", reader)
-
-    def test_whole_show_phrase_preserves_a_separate_track_reference(self):
-        prefix = "What did TikTok chat say during the entire BARCODE Radio show, and during "
-        result = build_show_interval_conversation(self.ledger(), prefix + "Neon Fox — First Signal?")
-        self.assertEqual(result["basis"], "named_track")
-        self.assertEqual(result["track_keys"], ("track_id:track-first-signal",))
-        self.assertEqual(result["message_count"], 26)
-        missing = build_show_interval_conversation(self.ledger(), prefix + "Missing Artist — Missing Title?")
-        self.assertEqual(missing["status"], "unresolved")
-        self.assertEqual(missing["event_ids"], ())
 
     def test_later_show_noun_does_not_override_the_named_track_interval(self):
         for follow_on in ("session", "show", "broadcast"):

@@ -73,6 +73,13 @@ def show_preparation_requested(text: str) -> bool:
     ))
 
 
+def show_preparation_only_requested(text: str) -> bool:
+    """Keep a preparation-only read small; compose explicit show follow-ons."""
+    return bool(show_preparation_requested(text)
+        and not show_conversation_interval_requested(text)
+        and not re.search(r"\b(?:recap|rundown)\b|\b(?:during|throughout|after) "
+                          r"(?:(?:the|that|this) )?(?:show|broadcast|session)\b", str(text or ""), re.I))
+
 _SPACE_RE = re.compile(r"\s+")
 _QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]{2,}", re.IGNORECASE)
 _SHOW_QUERY_RE = re.compile(
@@ -3526,9 +3533,7 @@ def select_tiktok_show_episode_context_items(
         max(1, min(int(max_shows or 1), 12)) if multi_show else 1
     )]
     preparation_items = []
-    # The selected episode owns its linked preparation. Wording may rank
-    # evidence, but cannot turn a mixed request into a preparation-only read.
-    if not any(_general_participant_recall(user_text, item[3]) for item in selected_ranked):
+    if show_preparation_requested(user_text):
         related = _load_show_related_sources(conn, guild_id=guild_id)
         for _score, _rank, row, _matches in selected_ranked[:2]:
             view = _show_preparation_view(
@@ -3536,10 +3541,6 @@ def select_tiktok_show_episode_context_items(
                 same_date_show_count=sum(1 for candidate in loaded
                     if candidate["ledger"].get("showDate") == row["ledger"].get("showDate")),
             )
-            # Operational preparation is already in the independent chronology.
-            # Do not spend a dialogue slot on a duplicate or empty source view.
-            if not view["messages"] and not view["linkedDiscordMoments"]:
-                continue
             preparation_items.append(_show_context_item(
                 kind="dialogue", loaded_rows=(row,), source_class=SourceClass.EVIDENCE_PROJECTION.value,
                 confidence=Confidence.HIGH.value, subject_key="barcode_radio",
@@ -3548,6 +3549,8 @@ def select_tiktok_show_episode_context_items(
                 score=205.0, usage="show_linked_preparation",
                 uncertainty_status="linked_pre_show_evidence_not_on_air",
             ))
+        if show_preparation_only_requested(user_text):
+            return tuple(preparation_items)
     quote_literals = _current_show_quote_literals(user_text)
     if quote_literals:
         # Match the ordinary reader's bounded show scope for fresh raw scans.
@@ -3611,7 +3614,17 @@ def select_tiktok_show_episode_context_items(
                 participant_matches=participant_matches,
             ))
         )
-    if not any(_general_participant_recall(user_text, item[3]) for item in selected_ranked):
+    if interval_item is not None or (_SHOW_QUERY_RE.search(str(user_text or "")) and (
+        _TRACK_QUERY_RE.search(str(user_text or ""))
+        or _TIMELINE_QUERY_RE.search(str(user_text or ""))
+        or re.search(
+            r"\b(?:queue|wheel|submissions?|intake|playback|played|skipped?|"
+            r"removed?|signal hold|sponsor break|broadcast (?:started|ended)|"
+            r"show (?:started|ended)|session archived)\b",
+            str(user_text or ""),
+            flags=re.IGNORECASE,
+        )
+    )):
         operation_limit = 2 if multi_show else 1
         for row in selected_rows[:operation_limit]:
             operation_item = _operational_episode_context_item(
@@ -3630,23 +3643,6 @@ def select_tiktok_show_episode_context_items(
     )
     if dialogue_item is not None:
         items.append(bind_original_revision(dialogue_item))
-    # Comparisons share four authority views, not four per-show fragments.
-    # Keep every selected root/date bound when combining the same view so two
-    # preparations and two chronologies cannot evict all on-air dialogue.
-    for usage in ("show_linked_preparation", "authoritative_show_chronology"):
-        group = [item for item in items if item.usage == usage]
-        if len(group) < 2:
-            continue
-        first = group[0]
-        keys = {key for item in group for key in item.show_keys}
-        combined = _show_context_item(
-            kind=first.kind, loaded_rows=tuple(row for row in selected_rows if row["showKey"] in keys),
-            source_class=first.source_class, confidence=first.confidence,
-            subject_key=first.subject_key, text="\n\n".join(item.text for item in group),
-            participants=tuple(subject for item in group for subject in item.participants),
-            score=first.score, usage=usage, uncertainty_status=first.uncertainty_status,
-        )
-        items = [item for item in items if item.usage != usage] + [combined]
     items.sort(key=lambda item: (-item.score, item.source_ref))
     return tuple(items[:4])
 
@@ -4099,7 +4095,7 @@ def build_tiktok_show_evidence_context(
               if str(ledger.get("showDate") or "") in scope
               for literal in query.quote_literals),
         )))
-        if selected_literals:
+        if selected_literals and not show_preparation_requested(user_text):
             original_lookups[str(ledger.get("showKey") or "")] = _lookup_original_show_quotes(
                 db_file, guild_id=guild_id, ledger=ledger, literals=selected_literals,
             )
@@ -4154,7 +4150,7 @@ def build_tiktok_show_evidence_context(
                 if not result["cached_projection_current"]
             )
     preparation_contexts = []
-    if selected and not any(_general_participant_recall(user_text, item[3]) for item in selected):
+    if show_preparation_requested(user_text) and selected:
         with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as prep_conn:
             related = _load_show_related_sources(prep_conn, guild_id=guild_id)
             for _score, _recency, ledger, _matches in selected[:2]:
@@ -4163,8 +4159,6 @@ def build_tiktok_show_evidence_context(
                     same_date_show_count=sum(1 for item in ledgers
                         if item.get("showDate") == ledger.get("showDate")),
                 )
-                if not view["messages"] and not view["linkedDiscordMoments"]:
-                    continue
                 rendered_messages = []
                 preparation_contexts.append(_render_show_preparation(view, rendered_messages_out=rendered_messages))
                 for message in rendered_messages:
@@ -4175,6 +4169,8 @@ def build_tiktok_show_evidence_context(
                         )
         if selection_out is not None:
             selection_out["authored_excerpts"] = tuple(selected_authored_excerpts)
+        if show_preparation_only_requested(user_text):
+            return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join(preparation_contexts)
     if len(selected) == 1 and not original_lookups and not image_scopes and show_conversation_interval_requested(user_text):
         ledger = selected[0][2]
         with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as interval_conn:
