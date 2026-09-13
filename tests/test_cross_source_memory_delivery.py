@@ -279,6 +279,46 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
             guard.await_args.kwargs["prompt_source_bases"],
         )
 
+    async def test_batch_show_reads_and_final_validation_yield_to_event_loop(self):
+        loop = asyncio.get_running_loop()
+        reads = []
+        names = (
+            "maybe_build_bnl_read_model_context",
+            "build_tiktok_show_evidence_context_for_turn",
+            "prompt_source_basis_failure",
+        )
+        originals = {name: getattr(bot, name) for name in names}
+
+        def read(name, *args, **kwargs):
+            release = threading.Event()
+            # Only Discord's event loop can release this source read. The
+            # timeout lets the old synchronous call site fail without hanging.
+            loop.call_soon_threadsafe(release.set)
+            reads.append((name, release.wait(timeout=1)))
+            return originals[name](*args, **kwargs)
+
+        with self._packet_configuration(True, 8811):
+            from contextlib import ExitStack
+            with ExitStack() as stack:
+                for name in names:
+                    stack.enter_context(mock.patch.object(
+                        bot, name,
+                        side_effect=lambda *args, _name=name, **kwargs: read(_name, *args, **kwargs),
+                    ))
+                channel, generation, guard = await self.runtime._batch(
+                    "sealed_test", request=REQUEST,
+                    answer=self._provider_answer, privileged=False,
+                )
+
+        self.assertEqual({name for name, _released in reads}, set(names))
+        self.assertTrue(all(released for _name, released in reads), reads)
+        self.assertEqual(channel.sent, [ANSWER])
+        generation.assert_awaited_once()
+        self._assert_sources(
+            generation.await_args.args[0],
+            guard.await_args.kwargs["prompt_source_bases"],
+        )
+
     async def test_public_discord_source_scope_change_is_detected_before_send(self):
         prompt, metadata = await self.runtime._direct_prompt_async(
             "public_home", request=REQUEST, privileged=False,

@@ -2275,6 +2275,20 @@ def _load_show_related_sources(
     else:
         coverage["unavailable"].append("discord_conversations")
     known_messages = {r["messageId"] for r in records.values() if r.get("messageId")}
+    # Read identities, including non-public originals, once for this snapshot.
+    # Checking each Journal copy separately makes a guild-sized source scan
+    # quadratic on installations without a conversations.message_id index.
+    original_rows: set[int] = set()
+    original_messages: set[int] = set()
+    if {"id", "guild_id"}.issubset(columns):
+        message_column = "message_id" if "message_id" in columns else "0"
+        for original_id, original_message in conn.execute(
+            f"SELECT id,{message_column} FROM conversations WHERE guild_id=?",
+            (guild_id,),
+        ):
+            original_rows.add(original_id)
+            if original_message:
+                original_messages.add(original_message)
     if _table_columns(conn, "bnl_journal_source_events"):
         rows = conn.execute(
             """SELECT source_kind,source_key,occurred_at_ms,subject_ref,
@@ -2314,15 +2328,11 @@ def _load_show_related_sources(
             # A Journal copy cannot restore an extant private, edited, invalid
             # or scan-limited conversation. Its original owner wins even when
             # that original did not enter this public scan.
-            if surface == "discord" and {"id", "guild_id"}.issubset(columns):
-                if row_id and conn.execute(
-                    "SELECT 1 FROM conversations WHERE guild_id=? AND id=?", (guild_id, row_id)
-                ).fetchone():
-                    continue
-                if message_id and "message_id" in columns and conn.execute(
-                    "SELECT 1 FROM conversations WHERE guild_id=? AND message_id=?", (guild_id, message_id)
-                ).fetchone():
-                    continue
+            if surface == "discord" and (
+                (row_id and row_id in original_rows)
+                or (message_id and message_id in original_messages)
+            ):
+                continue
             identity = (surface, str(row_id) if surface == "discord" and row_id else str(key))
             records[identity] = {
                 "eventId": str(key) if surface == "tiktok" else f"discord_source:{key}",
@@ -3659,17 +3669,29 @@ def tiktok_show_episode_context_item_version(
 ) -> str:
     """Rebuild a selected item and return its current source digest."""
 
-    for item in select_tiktok_show_episode_context_items(
+    return tiktok_show_episode_context_item_versions(
+        conn, guild_id=guild_id, user_text=user_text,
+        subject_user_id=subject_user_id,
+        allow_subject_continuity=allow_subject_continuity, now=now,
+    ).get(str(source_ref or ""), "")
+
+
+def tiktok_show_episode_context_item_versions(
+    conn: sqlite3.Connection, *, guild_id: int, user_text: str,
+    subject_user_id: int, allow_subject_continuity: bool = False,
+    now: Any = None,
+) -> dict[str, str]:
+    """Rebuild linked show views together within the caller's fresh snapshot."""
+
+    items = select_tiktok_show_episode_context_items(
         conn,
         guild_id=guild_id,
         user_text=user_text,
         subject_user_id=subject_user_id,
         allow_subject_continuity=allow_subject_continuity,
         now=now,
-    ):
-        if item.source_ref == str(source_ref or ""):
-            return item.source_digest
-    return ""
+    )
+    return {item.source_ref: item.source_digest for item in items}
 
 
 def _current_show_quote_literals(user_text: str) -> tuple[str, ...]:
@@ -4709,4 +4731,5 @@ __all__ = [
     "select_tiktok_show_episode_context_items",
     "sync_tiktok_show_evidence_ledgers",
     "tiktok_show_episode_context_item_version",
+    "tiktok_show_episode_context_item_versions",
 ]

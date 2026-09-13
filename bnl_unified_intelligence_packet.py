@@ -88,7 +88,7 @@ from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import proactive_consent_decision, shadow_packet_posture
 from bnl_tiktok_show_ledger import (
     select_tiktok_show_episode_context_items,
-    tiktok_show_episode_context_item_version,
+    tiktok_show_episode_context_item_versions,
 )
 from bnl_website_relay_state import (
     render_accepted_relay_publication,
@@ -5998,17 +5998,16 @@ def _episode_version(
     return ""
 
 
-def _show_episode_version(
+def _show_episode_versions(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
-    item: IntelligencePacketItem,
     *,
     environ: Mapping[str, str] | None = None,
-) -> str:
+) -> dict[str, str]:
     if not env_queue_production_enabled(
         dict(environ) if environ is not None else None
     ):
-        return ""
+        return {}
 
     requested_subject_user_id = int(packet.request.subject_user_id or 0)
     subject_user_id = requested_subject_user_id
@@ -6021,12 +6020,11 @@ def _show_episode_version(
         )
         if not consent_allowed:
             subject_user_id = 0
-    return tiktok_show_episode_context_item_version(
+    return tiktok_show_episode_context_item_versions(
         conn,
         guild_id=int(packet.request.guild_id or 0),
         user_text=_show_episode_query(packet.request),
         subject_user_id=subject_user_id,
-        source_ref=str(item.revalidation_key or item.source_ref or ""),
         allow_subject_continuity=bool(
             consent_allowed
             and subject_user_id > 0
@@ -6478,6 +6476,10 @@ def _revalidate_packet_in_snapshot(
             != current_journal_control.authority_identity
         ):
             changed += 1
+    # All linked views use this validation's database snapshot. Never retain
+    # these digests across validation boundaries: edits and privacy changes
+    # must be observed again before generation and delivery.
+    show_versions: dict[str, str] | None = None
     for item in revalidation_items:
         try:
             if item.revalidation_kind == "conversation":
@@ -6526,11 +6528,12 @@ def _revalidate_packet_in_snapshot(
             elif item.revalidation_kind == "episode":
                 current = _episode_version(conn, packet, item)
             elif item.revalidation_kind == "show_episode":
-                current = _show_episode_version(
-                    conn,
-                    packet,
-                    item,
-                    environ=environ,
+                if show_versions is None:
+                    show_versions = _show_episode_versions(
+                        conn, packet, environ=environ,
+                    )
+                current = show_versions.get(
+                    str(item.revalidation_key or item.source_ref or ""), "",
                 )
             elif item.revalidation_kind == "atomic":
                 current = (
