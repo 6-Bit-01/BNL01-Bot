@@ -26,6 +26,14 @@ from test_tiktok_show_evidence_ledger import archived_show, authorized_read_mode
 from test_show_interval_conversation import PACKET_ENV
 
 QUERY = "What happened in preparation for the August 28, 2026 BARCODE Radio show?"
+MIXED_REQUESTS = tuple(
+    "For the August 28, 2026 BARCODE Radio show, " + text
+    for text in (
+        "what happened in preparation and during the session?",
+        "connect preparation with what happened on air and how the session ended.",
+        "connect what we sorted out beforehand with the on-air discussion and how we wrapped up.",
+    )
+)
 
 
 class ShowPreparationTests(unittest.TestCase):
@@ -183,7 +191,8 @@ class ShowPreparationTests(unittest.TestCase):
         self.assertIn("Preparation remark 25:", native)
         basis = bot.build_finalized_show_prompt_source_basis(native, guild_id=77, selection=selection)
         self.assertIsNotNone(basis)
-        self.assertEqual(len(basis.authored_excerpts), 26)
+        self.assertEqual(sum(excerpt.source_text.startswith("Preparation remark ")
+                             for excerpt in basis.authored_excerpts), 26)
 
     def test_combined_request_composes_preparation_moments_timeline_chat_and_conversation(self):
         texts = (
@@ -247,6 +256,11 @@ class ShowPreparationTests(unittest.TestCase):
             "what happened in preparation and throughout the session?",
             "what happened in preparation and after the session?",
             "what did TikTok chat discuss in preparation and during the session?",
+            "what happened in preparation and during the entire BARCODE Radio show?",
+            "what happened in preparation and throughout the whole TikTok live stream?",
+            "what happened in preparation and after yesterday's full radio session?",
+            "connect preparation with what happened on air and how the session ended.",
+            "connect what we sorted out beforehand with the on-air discussion and how we wrapped up.",
             "what did TikTok chat say during Neon Fox — First Signal, what preparation was linked, "
             "and how did the session end?",
         )
@@ -264,7 +278,8 @@ class ShowPreparationTests(unittest.TestCase):
                     self.assertIn(preparation, reader)
                     self.assertIn(on_air, reader)
                     self.assertRegex(reader, r"session[_ ]archived")
-        # A genuinely basic preparation request still uses the focused view.
+        # The question determines the answer's focus. Available linked evidence
+        # must not be removed to force a short answer; delivery is tested below.
         native = shows.build_tiktok_show_evidence_context(self.db, guild_id=77, user_text=QUERY)
         with mock.patch.multiple(bot, DB_FILE=self.db, BNL_PRIMARY_GUILD_ID=77):
             website = bot.build_bnl_read_model_context(model, QUERY, "sealed_test")
@@ -273,7 +288,7 @@ class ShowPreparationTests(unittest.TestCase):
             rendered = render_packet_context(packet)[0]
         for reader in (native, website, rendered):
             self.assertIn(preparation, reader)
-            self.assertNotIn(on_air, reader)
+            self.assertIn(on_air, reader)
 
     def test_preparation_survives_ordinary_conversation_pruning(self):
         text = "For the August 28, 2026 BARCODE Radio show we reserved the spare mixer."
@@ -289,6 +304,51 @@ class ShowPreparationTests(unittest.TestCase):
             website = bot.build_bnl_read_model_context(
                 authorized_read_model({"latestShow": self.show}), QUERY, "public_home")
         self.assertIn(text, website)
+
+    def test_two_show_comparison_keeps_each_preparation_dialogue_and_chronology(self):
+        second = json.loads(json.dumps(self.show).replace("2026-08-29", "2026-08-30")
+                            .replace("2026-08-28", "2026-08-29"))
+        second["sessionId"] = "test-second-show"
+        evidence = []
+        for index, day, air_day in ((0, "28", "29"), (1, "29", "30")):
+            preparation = f"We reserved mixer {index} for the August {day}, 2026 BARCODE Radio show."
+            discussion = f"The room is discussing lighting design {index}."
+            self.add_discord(2001 + index, preparation)
+            self.add_tiktok(f"compare-chat-{index}", discussion, at=f"2026-08-{air_day}T00:02:00Z")
+            evidence.extend((preparation, discussion))
+        self.sync((second,))
+        query = "Compare the August 28, 2026 and August 29, 2026 BARCODE Radio shows, from preparation through the on-air lighting discussion and closing."
+        model = authorized_read_model({"latestShow": second, "shows": [self.show]})
+        with mock.patch.multiple(bot, DB_FILE=self.db, BNL_PRIMARY_GUILD_ID=77):
+            website = bot.build_bnl_read_model_context(model, query, "public_home")
+            # A resolved earlier-show follow-up must not acquire preparation
+            # from the newest archive merely because its own words omit a date.
+            followup = bot.build_bnl_read_model_context(
+                model, "Connect what we sorted out beforehand with how it wrapped up.", "public_home",
+                tiktok_show_analysis_request=MIXED_REQUESTS[2],
+            )
+        self.assertIn(evidence[0], followup)
+        self.assertNotIn(evidence[2], followup)
+        for text in evidence:
+            self.assertIn(text, website)
+        # A fresh original-quote view supersedes the matching website show
+        # block, including its preparation, without discarding the other show.
+        replaced = website.for_original_quote_lookup((self.show["sessionId"],))
+        self.assertNotIn(evidence[0], replaced)
+        self.assertIn(evidence[2], replaced)
+        with sqlite3.connect(self.db) as conn:
+            packet = build_packet(conn, replace(self.request(), user_text=query), environ=PACKET_ENV)
+            rendered = render_packet_context(packet)[0]
+            for text in evidence:
+                self.assertIn(text, rendered)
+            items = [item for item in packet.items if item.lane == "show_episode"]
+            self.assertEqual(len(items), 4)
+            operations = next(item for item in items if item.usage == "authoritative_show_chronology")
+            self.assertEqual(operations.source_class, "first_party_record")
+            self.assertEqual(operations.text.count("[session archived]"), 2)
+            self.assertTrue(revalidate_packet(conn, packet, environ=PACKET_ENV).valid)
+            conn.execute("UPDATE conversations SET content='The mixer is unavailable.' WHERE id=2002")
+            self.assertFalse(revalidate_packet(conn, packet, environ=PACKET_ENV).valid)
 
     def test_metadata_session_link_is_retained_before_session_creation(self):
         self.add_tiktok("early-preflight", "The spare mixer is reserved.",
@@ -525,6 +585,112 @@ class LightShowAwarenessTests(unittest.TestCase):
             bot._bnl_read_model_cached_at = real_now - timedelta(seconds=30)
             http.side_effect = TimeoutError("fixture timeout")
             self.assertEqual(bot.maybe_build_bnl_read_model_context("These colors look good.", "public_home", guild_id=77), "")
+
+
+class ShowCompositionDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import test_public_network_knowledge as network
+
+        self.real_generate = bot.get_gemini_response
+        self.real_website = bot.maybe_build_bnl_read_model_context
+        self.network = network.PublicNetworkKnowledgeTests()
+        await self.network.asyncSetUp()
+        self.addAsyncCleanup(self.network.asyncTearDown)
+        self.network._seed_finalized_show()
+        self.sources = ShowPreparationTests()
+        self.sources.db = bot.DB_FILE
+        self.sources.show = archived_show()
+        self.sources.show["milestones"].insert(0, {
+            "sequence": 0, "eventType": "session_created",
+            "occurredAt": "2026-08-28T23:30:00Z", "track": None,
+        })
+        self.preparation = "We reserved the spare mixer for the August 28, 2026 BARCODE Radio show."
+        self.on_air = "The room is talking about green lighting."
+        self.sources.add_discord(2001, self.preparation)
+        self.sources.add_tiktok("composition-room-topic", self.on_air, at="2026-08-29T00:02:00Z")
+        self.sources.sync()
+        self.model = authorized_read_model({"latestShow": self.sources.show})
+        self.network.stack.enter_context(mock.patch.dict(os.environ, {
+            **PACKET_ENV,
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "77",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "42",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "8810",
+        }))
+        self.network.stack.enter_context(mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", 77))
+        # Keep the affected show readers, packet assembly, provider preparation,
+        # refresh and send real. Website HTTP, Gemini and Discord are fixtures.
+        self.network.stack.enter_context(mock.patch.object(bot, "fetch_bnl_read_model", return_value=self.model))
+        self.network.stack.enter_context(mock.patch.object(bot, "maybe_build_bnl_read_model_context", new=self.real_website))
+        self.network.stack.enter_context(mock.patch.object(bot, "check_quota_availability", return_value=True))
+
+    def assert_composed(self, prompt):
+        self.assertIn(self.preparation, prompt)
+        self.assertIn(self.on_air, prompt)
+        self.assertRegex(prompt, r"session[_ ]archived")
+        self.assertIn("Show-linked preparation Moment:", prompt)
+        self.assertIn("Recorded BARCODE Radio chronology", prompt)
+        self.assertNotIn("This private row must never enter", prompt)
+
+    def provider(self, answer):
+        async def generate(contents, route, *, attempt_counter=None):
+            if attempt_counter is not None:
+                attempt_counter.mark_started()
+            return bot.GenerationResult(True, answer, route=route)
+        return mock.AsyncMock(side_effect=generate)
+
+    async def test_equivalent_mixed_requests_reach_actual_direct_and_batch_provider_inputs(self):
+        answer = "The spare mixer was reserved beforehand, the room discussed green lighting on air, and the session was archived."
+        for policy in ("public_home", "sealed_test"):
+            for request in MIXED_REQUESTS:
+                for route in ("direct", "batch"):
+                    with self.subTest(policy=policy, request=request, route=route):
+                        provider = self.provider(answer)
+                        channel_id = 8810 if route == "direct" else 8811 + len(self.network.channel_ids)
+                        with mock.patch.object(bot, "_generate_gemini_content_result_async", new=provider), \
+                             mock.patch.dict(os.environ, {"BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": str(channel_id)}):
+                            if route == "direct":
+                                prompt, metadata = await self.network._direct_prompt_async(policy, request=request)
+                                self.assertTrue(metadata["ordinary_chat_single_packet_applied"])
+                                basis = metadata["ordinary_chat_single_packet_basis"]
+                                self.assertIsNotNone(basis)
+                                execution = await bot.maybe_generate_ordinary_chat_single_packet(
+                                    channel=None, prompt=prompt, basis=basis,
+                                    scope_applied=True,
+                                    preflight_reason=metadata["ordinary_chat_single_packet_preflight_reason"],
+                                    situation_frame=metadata["situation_frame_shadow"],
+                                    situation_frame_current_text=request,
+                                    route_mode="normal_chat", channel_policy=policy,
+                                    conversation_surface=metadata["situation_frame_shadow"].conversation_surface,
+                                    user_id=42, guild_id=77, user_display_name="Test Member",
+                                    source_context_available=metadata["source_context_available"],
+                                    prompt_source_bases=metadata["prompt_source_bases"],
+                                )
+                                self.assertIsNotNone(execution)
+                                self.assertEqual(execution.response, answer)
+                            else:
+                                channel, generation, _guard = await self.network._batch(
+                                    policy, request=request, answer=self.real_generate,
+                                )
+                                generation.assert_awaited_once()
+                                self.assertEqual(channel.sent, [answer])
+                        provider.assert_awaited_once()
+                        self.assert_composed(provider.await_args.args[0])
+
+    async def test_simple_preparation_question_delivers_one_sentence_without_reciting_other_layers(self):
+        answer = "The spare mixer was reserved."
+        provider = self.provider(answer)
+        with mock.patch.object(bot, "_generate_gemini_content_result_async", new=provider), \
+             mock.patch.dict(os.environ, {"BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "8811"}):
+            channel, generation, _guard = await self.network._batch(
+                "public_home", request=QUERY, answer=self.real_generate,
+            )
+        generation.assert_awaited_once()
+        provider.assert_awaited_once()
+        self.assert_composed(provider.await_args.args[0])
+        self.assertEqual(channel.sent, [answer])
 
 
 if __name__ == "__main__":

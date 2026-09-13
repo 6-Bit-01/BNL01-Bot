@@ -531,7 +531,12 @@ def is_tiktok_show_analysis_query(text: str) -> bool:
     if not normalized:
         return False
     return bool(
-        show_conversation_interval_requested(normalized)
+        # The program's name and date identify a show source regardless of
+        # the requested interpretation. Generic verbs such as "show me" or
+        # "I live" do not identify BARCODE Radio.
+        (re.search(r"\bbarcode radio\b", normalized) and has_explicit_show_date(normalized)
+         and not is_live_show_reaction_query(normalized, check_show_date=False))
+        or show_conversation_interval_requested(normalized)
         or any(re.search(pattern, normalized) for pattern in _SHOW_ANALYSIS_PATTERNS)
     )
 
@@ -2078,24 +2083,13 @@ def _requested_track_keys(user_text: str, ranked: Sequence[Mapping[str, Any]]) -
 
 
 def show_conversation_interval_requested(user_text: str) -> bool:
-    """Recognize source-window references, without deciding whether to reply."""
+    """An acquisition hint; only the source clock can resolve an interval."""
 
     query = str(user_text or "")
     if re.search(r"\b(?:timeline|chronology|chronological)\b", query, re.I) and re.search(
         r"\b(?:show|broadcast|session|radio)\b", query, re.I,
     ):
         return True
-    without_dates = query
-    for pattern in _EXPLICIT_SHOW_DATE_PATTERNS:
-        without_dates = pattern.sub("", without_dates)
-    if re.search(
-        r"\bduring\s+(?:(?:the|that|this|last|previous|prior|current|our)\s+|"
-        r"(?:yesterday|today|last night)['’]s\s+)*(?:show|broadcast|session|live)\b",
-        without_dates, re.I,
-    ) and not re.search(
-        r"\b(?:track|song|minute)\b|t\+", re.split(r"\bduring\b", without_dates, flags=re.I)[-1], re.I,
-    ):
-        return False
     return bool(
         re.search(r"\b(?:chat|comments?|viewers?|audience|said|say|saying|discussed|topics?)\b", query, re.I)
         and re.search(
@@ -2134,23 +2128,33 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
         for item in (*ledger.get("trackMoments", ()), *ledger.get("trackRoster", ()))
         if isinstance(item, Mapping) and item.get("trackKey")
     }
-    keys = _requested_track_keys(query, list(tracks.values()))
+    # A speaker named before "during" is not the requested playback window.
+    # Match the temporal referent against the actual roster, not a growing
+    # list of ways to describe the whole show.
+    during = re.search(r"\bduring\b", query, re.I)
+    interval_query = query[during.end():] if during else query
+    keys = _requested_track_keys(interval_query, list(tracks.values()))
     selected = [window for window in windows if window["track_key"] in keys]
     basis = "named_track"
     # Event categories in a requested show chronology are additive. Only an
     # actual interval reference narrows it; mentioning "wheel spins" or
     # "track starts and stops" does not select those events exclusively.
     interval_reference = re.search(
-        r"\bduring\b(?!\s+(?:(?:the|that|this)\s+)?(?:show|broadcast|session)\b)"
-        r"|\b(?:last|previous|prior|current|this) (?:track|song)\b"
-        r"|\b(?:of|for|around)\s+(?:the\s+)?"
+        r"\b(?:last|previous|prior|current|this) (?:track|song)\b"
+        r"|\b(?:during|of|for|around)\s+(?:the\s+)?"
         r"(?:last|previous|prior|current|this|latest)\s+"
         r"(?:track|song|wheel(?:\s+spin)?|sponsor(?:\s+break)?)\b"
-        r"|\b(?:of|for|around)\s+the\s+(?:wheel\s+spin\b|wheel\b(?!\s+spins?\b)|"
+        r"|\b(?:during|of|for|around)\s+the\s+(?:wheel\s+spin\b|wheel\b(?!\s+spins?\b)|"
         r"sponsor\s+break\b|sponsor\b(?!\s+breaks?\b))", query, re.I,
     )
+    # An explicitly named but missing track keeps an unresolved source scope.
+    # An unrecognized phrase after "during" is not evidence of a track.
+    unknown_track = bool(during and (
+        re.search(r"\b(?:track|song)\b", re.split(r"[,;?!\n]", interval_query, maxsplit=1)[0], re.I)
+        or " — " in interval_query
+    ))
     full_timeline = bool(re.search(r"\b(?:timeline|chronology|chronological)\b", query, re.I)
-                         and not keys and not interval_reference)
+                         and not keys and not interval_reference and not unknown_track)
     elapsed = re.search(
         r"\b(?:between|from) (?:minutes?\s*|t\+)(\d+(?:\.\d+)?)\s*(?:m\b)?\s*"
         r"(?:and|to|–|-)\s*(?:minutes?\s*|t\+)?(\d+(?:\.\d+)?)", query, re.I,
@@ -2177,7 +2181,7 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
         selected = [window for window in windows
                     if not window.get("recorded_end") and ledger.get("lifecycle") != "finalized"][-1:]
         basis = "active_window_at_observation_bound"
-    elif not keys and re.search(r"\b(?:wheel|sponsor break)\b", query, re.I):
+    elif not keys and re.search(r"\b(?:wheel|sponsor break)\b", interval_query, re.I):
         wheel = bool(re.search(r"\bwheel\b", query, re.I))
         starts = {"wheel_launched", "wheel_spin_started"} if wheel else {"sponsor_break_started"}
         ends = {"wheel_confirmed"} if wheel else {"sponsor_break_completed"}
@@ -2199,10 +2203,7 @@ def show_conversation_scope(ledger: Mapping[str, Any], user_text: str) -> dict[s
             selected = []
         basis = "recorded_operation_interval"
     elif not keys:
-        # "During the show" still belongs to the existing full-show reader.
-        if re.search(r"\bduring (?:the |that |this )?(?:show|broadcast|session|live)\b", query, re.I):
-            return None
-        if not re.search(r"\bduring\b|\b(?:track|song)\b", query, re.I):
+        if not unknown_track:
             return None
     surfaces = ("tiktok", "discord")
     tiktok = bool(re.search(r"\btik\s?tok\b", query, re.I))

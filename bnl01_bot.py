@@ -66,7 +66,6 @@ from bnl_tiktok_show_ledger import (
     load_show_timeline_discord_messages,
     load_show_preparation_context,
     show_preparation_requested,
-    show_preparation_only_requested,
     sync_tiktok_show_evidence_ledgers,
 )
 from bnl_occasion import (
@@ -2935,25 +2934,6 @@ def build_bnl_read_model_context(
             archive = {**archive, "currentShow": {
                 **current_show, "_evidenceObservedThroughMs": int(_bnl_read_model_cached_at.timestamp() * 1000),
             }}
-    preparation_context = ""
-    if show_preparation_requested(user_text) and declared_access_scope == "public":
-        show, _selected_source = select_show_for_tiktok_analysis(archive, user_text)
-        if show:
-            parent = build_tiktok_show_evidence_ledger(show, [])
-            if parent:
-                current = _first_mapping(archive.get("currentShow"))
-                if (show.get("sessionId") == current.get("sessionId")
-                        and show.get("status") != "archived" and _bnl_read_model_cached_at is not None):
-                    parent["preparationObservedThroughMs"] = int(_bnl_read_model_cached_at.timestamp() * 1000)
-                context = load_show_preparation_context(
-                    DB_FILE, guild_id=BNL_PRIMARY_GUILD_ID, ledger=parent,
-                    same_date_show_count=sum(1 for item in tiktok_show_records(archive)
-                        if item.get("showDate") == show.get("showDate")),
-                )
-                if context and show_preparation_only_requested(user_text):
-                    return ("Website public read model context:\n- accessScope=public\n"
-                            "Durable TikTok show analysis context:\n" + context)
-                preparation_context = context
     artists_section = sections.get("artists") if sections.get("artists") is not None else read_model.get("artists")
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
@@ -2971,8 +2951,7 @@ def build_bnl_read_model_context(
         str(tiktok_show_analysis_request or "").strip()
         or (user_text if (
             is_tiktok_show_analysis_query(user_text)
-            or (show_preparation_requested(user_text)
-                and not show_preparation_only_requested(user_text))
+            or show_preparation_requested(user_text)
             or (not live_reaction_query and is_live_show_reaction_query(
                 user_text, check_show_date=False,
             ))
@@ -3014,8 +2993,6 @@ def build_bnl_read_model_context(
     schema_revision = _compact_public_text(read_model.get("schemaRevision"), 40)
     if schema_revision:
         lines[-1] += f" / schemaRevision={schema_revision}"
-    if preparation_context:
-        lines.append(preparation_context)
 
     include_public_site_canon = bool(
         source_context_items
@@ -3252,6 +3229,24 @@ def build_bnl_read_model_context(
                     )
                     if day:
                         lines.append(f"\nRequested show date: {day}")
+                    # Join preparation to the show actually selected by the
+                    # existing date/continuity owner, including comparisons.
+                    # It also leaves with that same source when superseded.
+                    if selected_show and declared_access_scope == "public":
+                        parent = build_tiktok_show_evidence_ledger(selected_show, [])
+                        if parent:
+                            current = _first_mapping(archive.get("currentShow"))
+                            if (selected_show.get("sessionId") == current.get("sessionId")
+                                    and selected_show.get("status") != "archived"
+                                    and _bnl_read_model_cached_at is not None):
+                                parent["preparationObservedThroughMs"] = int(_bnl_read_model_cached_at.timestamp() * 1000)
+                            preparation = load_show_preparation_context(
+                                DB_FILE, guild_id=BNL_PRIMARY_GUILD_ID, ledger=parent,
+                                same_date_show_count=sum(1 for item in tiktok_show_records(archive)
+                                    if item.get("showDate") == selected_show.get("showDate")),
+                            )
+                            if preparation:
+                                lines.append(preparation)
                     discord_interval_args = {}
                     if show_conversation_interval_requested(show_analysis_text):
                         discord_messages, discord_complete = load_show_timeline_discord_messages(
