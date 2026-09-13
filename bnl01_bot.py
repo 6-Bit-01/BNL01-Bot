@@ -30665,7 +30665,7 @@ def prompt_source_basis_failure(
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
 ) -> str:
-    """Return a fail-closed reason at the last synchronous pre-send boundary."""
+    """Return a fail-closed reason from a fresh source validation pass."""
     bases = tuple(bases or ())
     try:
         for basis in bases:
@@ -30718,6 +30718,20 @@ def prompt_source_basis_failure(
             ),
         )
     return ""
+
+
+async def prompt_source_basis_failure_async(
+    bases: tuple[PromptSourceBasis, ...],
+    *,
+    journal_control_snapshot: JournalControlSnapshot | None = None,
+    journal_control_snapshot_provided: bool = False,
+) -> str:
+    """Keep fresh pre-send reads off Discord's heartbeat/event loop."""
+    return await asyncio.to_thread(
+        prompt_source_basis_failure, bases,
+        journal_control_snapshot=journal_control_snapshot,
+        journal_control_snapshot_provided=journal_control_snapshot_provided,
+    )
 
 
 async def journal_control_snapshot_for_source_fence(
@@ -37970,14 +37984,16 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 context_result=orchestration_state.get("context_result"),
             )
             if recent_room_prompt:
-                batch_website_read_model_context = maybe_build_bnl_read_model_context(
+                batch_website_read_model_context = await asyncio.to_thread(
+                    maybe_build_bnl_read_model_context,
                     combined_text,
                     channel_policy,
                     conversation_context=recent_room_prompt,
                     guild_id=guild_id,
                 )
             else:
-                batch_website_read_model_context = maybe_build_bnl_read_model_context(
+                batch_website_read_model_context = await asyncio.to_thread(
+                    maybe_build_bnl_read_model_context,
                     combined_text,
                     channel_policy,
                     guild_id=guild_id,
@@ -38008,7 +38024,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             batch_show_selection: dict = {}
             batch_tiktok_show_evidence_context = (
-                build_tiktok_show_evidence_context_for_turn(
+                await asyncio.to_thread(
+                    build_tiktok_show_evidence_context_for_turn,
                     guild_id=guild_id,
                     user_text=combined_text,
                     subject_user_id=(
@@ -39965,7 +39982,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         source_control_snapshot, source_control_provided = (
             await journal_control_snapshot_for_source_fence(batch_presend_source_bases)
         )
-        batch_source_failure = prompt_source_basis_failure(
+        batch_source_failure = await prompt_source_basis_failure_async(
             batch_presend_source_bases,
             journal_control_snapshot=source_control_snapshot,
             journal_control_snapshot_provided=source_control_provided,
@@ -40209,7 +40226,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             source_control_snapshot, source_control_provided = (
                 await journal_control_snapshot_for_source_fence(batch_presend_source_bases)
             )
-            batch_source_failure = prompt_source_basis_failure(
+            batch_source_failure = await prompt_source_basis_failure_async(
                 batch_presend_source_bases,
                 journal_control_snapshot=source_control_snapshot,
                 journal_control_snapshot_provided=source_control_provided,
@@ -42676,7 +42693,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
         ),
         **session_owner_states,
     )
-    website_read_model_context = maybe_build_bnl_read_model_context(
+    website_read_model_context = await asyncio.to_thread(
+        maybe_build_bnl_read_model_context,
         direct_content,
         session.get("channel_policy", "unknown"),
         conversation_context=room_context,
@@ -42940,7 +42958,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
     source_control_snapshot, source_control_provided = (
         await journal_control_snapshot_for_source_fence(direct_payload_presend_source_bases)
     )
-    direct_payload_source_failure = prompt_source_basis_failure(
+    direct_payload_source_failure = await prompt_source_basis_failure_async(
         direct_payload_presend_source_bases,
         journal_control_snapshot=source_control_snapshot,
         journal_control_snapshot_provided=source_control_provided,
@@ -43026,6 +43044,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
             session_frame_revalidation.status,
             len(session_frame_revalidation.reason_codes),
         )
+    if _abort_if_invalidated("revision_changed_during_source_validation"):
+        return
     sent_message_ids = []
     try:
         if len(response) <= 2000:
@@ -46324,7 +46344,7 @@ async def send_planned_conversation_response(
     source_control_snapshot, source_control_provided = (
         await journal_control_snapshot_for_source_fence(prompt_source_bases)
     )
-    direct_source_failure = prompt_source_basis_failure(
+    direct_source_failure = await prompt_source_basis_failure_async(
         prompt_source_bases,
         journal_control_snapshot=source_control_snapshot,
         journal_control_snapshot_provided=source_control_provided,
@@ -46457,7 +46477,7 @@ async def send_planned_conversation_response(
         source_control_snapshot, source_control_provided = (
             await journal_control_snapshot_for_source_fence(prompt_source_bases)
         )
-        direct_source_failure = prompt_source_basis_failure(
+        direct_source_failure = await prompt_source_basis_failure_async(
             prompt_source_bases,
             journal_control_snapshot=source_control_snapshot,
             journal_control_snapshot_provided=source_control_provided,
@@ -47279,7 +47299,9 @@ async def on_message(message: discord.Message):
             suggested_lane = "R&D website read-model classifier"
         else:
             ops_context = build_operations_brief_context(message.guild.id, clean_content)
-            rd_read_model_context = maybe_build_bnl_read_model_context(clean_content, channel_policy)
+            rd_read_model_context = await asyncio.to_thread(
+                maybe_build_bnl_read_model_context, clean_content, channel_policy,
+            )
             ops_prompt = (
                 "This is an internal BARCODE operations answer.\n"
                 "Be plain, useful, short, and action-oriented.\n"
@@ -47862,7 +47884,8 @@ async def on_message(message: discord.Message):
                     **direct_owner_states,
                 )
             )
-            website_read_model_context = maybe_build_bnl_read_model_context(
+            website_read_model_context = await asyncio.to_thread(
+                maybe_build_bnl_read_model_context,
                 direct_content,
                 channel_policy,
                 conversation_context=room_context,
@@ -48390,7 +48413,8 @@ async def on_message(message: discord.Message):
             ),
             **direct_owner_states,
         )
-        website_read_model_context = maybe_build_bnl_read_model_context(
+        website_read_model_context = await asyncio.to_thread(
+            maybe_build_bnl_read_model_context,
             direct_content,
             channel_policy,
             conversation_context=room_context,
@@ -48872,7 +48896,8 @@ async def on_message(message: discord.Message):
             ),
             **direct_owner_states,
         )
-        website_read_model_context = maybe_build_bnl_read_model_context(
+        website_read_model_context = await asyncio.to_thread(
+            maybe_build_bnl_read_model_context,
             direct_content,
             channel_policy,
             conversation_context=room_context,
