@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack, closing, nullcontext
 from pathlib import Path
-from bnl_creative_protocol import GLITCH_PROTOCOL, SUNO_LYRIC_PROTOCOL, creative_variation_hint
+from bnl_creative_protocol import GLITCH_PROTOCOL, SUNO_LYRIC_PROTOCOL, creative_variation_hint, has_vocal_copy
 from typing import Any, Awaitable, Callable, Mapping, Union
 
 from bnl_canon_source_contract import (
@@ -2942,11 +2942,13 @@ class WebsiteReadModelContext(str):
         cls, text: str, *, rendered_lines: tuple[str, ...] = (),
         historical_sections: tuple[tuple[str, tuple[int, ...]], ...] = (),
         show_awareness_only: bool = False,
+        continuation_show_dates: tuple[str, ...] = (),
     ):
         context = super().__new__(cls, text)
         context.rendered_lines = rendered_lines
         context.historical_sections = historical_sections
         context.show_awareness_only = show_awareness_only
+        context.continuation_show_dates = continuation_show_dates
         return context
 
     def for_original_quote_lookup(self, show_keys, *, current_images: bool = False) -> str:
@@ -2971,6 +2973,7 @@ def build_bnl_read_model_context(
     channel_policy: str,
     *,
     tiktok_show_analysis_request: str = "",
+    prior_queue_request: str = "",
 ) -> str:
     """Build a compact prompt block from the channel-authorized read model."""
 
@@ -3022,7 +3025,11 @@ def build_bnl_read_model_context(
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
     source_context_items = _public_source_context_items(read_model)
-    queue_query = _queue_read_model_query(user_text)
+    # Context's human turns select fresh source candidates; a prior BNL reply
+    # never supplies the credits or playback facts. Keep the current request
+    # separate so this does not seize the archive or other source owners.
+    queue_lookup_text = "\n".join(filter(None, (prior_queue_request, user_text)))
+    queue_query = _queue_read_model_query(queue_lookup_text)
     current_show_date = (
         _first_mapping(archive.get("currentShow")).get("showDate")
         or _first_mapping(queue.get("session"), queue.get("currentSession")).get("showDate")
@@ -3053,7 +3060,7 @@ def build_bnl_read_model_context(
     show_analysis_query = bool(show_analysis_text)
     tiktok_context_query = live_reaction_query or show_analysis_query
     operational_query = queue_query or live_reaction_query or show_analysis_query
-    queue_focus = _queue_query_focus(user_text) if operational_query else {}
+    queue_focus = _queue_query_focus(queue_lookup_text) if operational_query else {}
     if live_reaction_query:
         queue_focus["show_reaction"] = True
 
@@ -3080,6 +3087,20 @@ def build_bnl_read_model_context(
         lines[-1] += f" / schemaRevision={schema_revision}"
     if preparation_context:
         lines.append(preparation_context)
+    if prior_queue_request:
+        lines.extend([
+            "\nPrior-conversation queue source candidate (refreshed this turn):",
+            "- Earlier human request: " + _compact_public_text(prior_queue_request, 2000),
+            "- These records ground follow-ups to that request, including creative revisions. The current user request controls the task and show; a format or style revision does not change its factual subject.",
+            "- Do not replace the requested session with another public or private show. Earlier BNL prose is continuity, not proof of credits or playback. Use unrelated source candidates only when the current request calls for them.",
+        ])
+        prior_dates = requested_show_dates(prior_queue_request)
+        session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+        if prior_dates and str(session.get("showDate") or "") not in prior_dates:
+            # The source may have advanced between turns. Keep the missing
+            # referent explicit instead of silently substituting the new queue.
+            queue = {}
+            lines.append("- The earlier session is unavailable in the authorized current snapshot. Do not infer its facts from a different session or from prior BNL prose.")
 
     include_public_site_canon = bool(
         source_context_items
@@ -3245,7 +3266,7 @@ def build_bnl_read_model_context(
             lines.append(f"- Priority Signal: enabled={priority_enabled if priority_enabled is not None else 'unknown'}" + (f", label={priority_label}" if priority_label else ""))
         selected_queued_tracks = _queue_tracks_for_request(
             queued_tracks,
-            user_text,
+            queue_lookup_text,
             queue_focus,
         ) if queue_query else ([] if tiktok_context_query else queued_tracks[:8])
         if selected_queued_tracks:
@@ -3262,7 +3283,7 @@ def build_bnl_read_model_context(
                     lines.append(f"- {label}")
         matched_completed_tracks = [
             track for track in completed_tracks
-            if isinstance(track, dict) and _queue_track_matches_query(track, user_text)
+            if isinstance(track, dict) and _queue_track_matches_query(track, queue_lookup_text)
         ]
         if queue_focus.get("completed") and not matched_completed_tracks:
             matched_completed_tracks = [
@@ -3276,7 +3297,7 @@ def build_bnl_read_model_context(
                     lines.append(f"- {label}")
         matched_removed_tracks = [
             track for track in removed_tracks
-            if isinstance(track, dict) and _queue_track_matches_query(track, user_text)
+            if isinstance(track, dict) and _queue_track_matches_query(track, queue_lookup_text)
         ]
         if matched_removed_tracks:
             lines.append("\nRelevant removed tracks:")
@@ -3503,11 +3524,12 @@ def build_bnl_read_model_context(
         content_limit = max(0, 80 - len(guardrail_lines))
         lines = [*lines[:content_limit], *guardrail_lines]
     rendered = "\n".join(lines)
-    if historical_show_analysis_sections:
+    if historical_show_analysis_sections or prior_queue_request:
         return WebsiteReadModelContext(
             rendered,
             rendered_lines=tuple(lines),
             historical_sections=tuple(historical_show_analysis_sections),
+            continuation_show_dates=requested_show_dates(prior_queue_request),
         )
     return rendered
 
@@ -3553,13 +3575,70 @@ def build_light_show_awareness(read_model: dict, channel_policy: str) -> str:
     return WebsiteReadModelContext("\n".join(lines), show_awareness_only=True)
 
 
+def _prior_queue_request_for_context(
+    user_text: str, *, conversation_basis, context_result,
+) -> str:
+    """Reuse the existing Context selection to refresh queue source evidence.
+
+    This supplies a candidate, not a new intent/router or remembered snapshot.
+    Current explicit dates/current-state requests retain their own selection.
+    """
+    if (
+        conversation_basis is None or context_result is None
+        or context_result.thread_focus_mode not in {
+            "continue_or_answer", "resume_thread", "exact_discord_reply",
+        }
+        or context_result.referent_status not in {"not_requested", "resolved"}
+        or has_explicit_show_date(user_text)
+        or is_tiktok_show_analysis_query(user_text)
+        or is_live_show_reaction_query(user_text, check_show_date=False)
+        or show_preparation_requested(user_text)
+        or requested_show_date(user_text, include_current_relative=False)
+        or broad_show_history_requested(user_text, include_community_baseline=False)
+        or _current_queue_state_query(user_text)
+    ):
+        return ""
+    selected_ids = set(context_result.selected_row_ids)
+    if context_result.referent_status == "resolved":
+        selected_ids.intersection_update(context_result.referent_selected_row_ids)
+    requests = []
+    for item in sorted(conversation_basis.evidence_items, key=lambda item: item.source_id, reverse=True):
+        if (item.source_id in selected_ids
+                and item.speaker_user_id == conversation_basis.current_user_id
+                and item.text.strip().casefold() != str(user_text).strip().casefold()
+                and _queue_read_model_query(item.text)):
+            requests.append(item.text)
+            if has_explicit_show_date(item.text):
+                # Do not combine two distinct named sessions from older turns.
+                break
+    # These are bounded, visibility-checked human evidence items, never model
+    # replies. Retain the earlier lookup as well as later creative feedback.
+    return "\n".join(reversed(requests))[:2000]
+
+
 def maybe_build_bnl_read_model_context(
     user_text: str,
     channel_policy: str,
     *,
     conversation_context: str = "",
     guild_id: int = 0,
+    subject_user_id: int = 0,
+    channel_id: int = 0,
+    channel_name: str = "",
+    conversation_context_result: ConversationContextResult | None = None,
 ) -> str:
+    conversation_basis = None
+    if subject_user_id and conversation_context_result is not None:
+        conversation_basis = build_conversation_prompt_source_basis(
+            conversation_context, guild_id=guild_id,
+            current_user_id=subject_user_id, channel_id=channel_id,
+            channel_name=channel_name, channel_policy=channel_policy,
+            context_result=conversation_context_result,
+        )
+    prior_queue_request = _prior_queue_request_for_context(
+        user_text, conversation_basis=conversation_basis,
+        context_result=conversation_context_result,
+    )
     explicit_show_analysis = is_tiktok_show_analysis_query(user_text)
     contextual_candidate = bool(
         not explicit_show_analysis
@@ -3594,6 +3673,7 @@ def maybe_build_bnl_read_model_context(
         is_bnl_read_model_relevant(user_text, channel_policy)
         or show_analysis_request
         or show_preparation_requested(user_text)
+        or prior_queue_request
     ):
         if (BNL_PRIMARY_GUILD_ID and int(guild_id or 0) == BNL_PRIMARY_GUILD_ID
                 and channel_policy in PUBLIC_CHAT_POLICIES | {"sealed_test"}
@@ -3608,7 +3688,7 @@ def maybe_build_bnl_read_model_context(
     live_reaction_query = is_live_show_reaction_query(user_text)
     show_analysis_query = bool(show_analysis_request)
     read_model = fetch_bnl_read_model(
-        force=queue_query or live_reaction_query or show_analysis_query
+        force=bool(queue_query or live_reaction_query or show_analysis_query or prior_queue_request)
     )
     if not read_model:
         return ""
@@ -3631,6 +3711,7 @@ def maybe_build_bnl_read_model_context(
         user_text,
         channel_policy,
         tiktok_show_analysis_request=show_analysis_request,
+        prior_queue_request=prior_queue_request,
     )
 
 
@@ -3865,25 +3946,37 @@ def build_tiktok_show_evidence_context_for_turn(
             tiktok_show_evidence_query, include_current_relative=False,
         )
     )
-    selected_show_dates = tuple(dict.fromkeys(re.findall(
+    continuation_dates = getattr(website_read_model_context, "continuation_show_dates", ())
+    selected_show_dates = continuation_dates or tuple(dict.fromkeys(re.findall(
         r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b",
         website_read_model_context or "",
     )))
+    continuation_selection_query = ""
     if (
         selected_show_dates
         and not request_owns_show_date
-        and not broad_show_history_requested(user_text)
+        and not broad_show_history_requested(
+            user_text, include_community_baseline=not bool(continuation_dates),
+        )
         and not image_queries
     ):
         # The website adapter may have selected a comparison. Pass its whole
         # date scope to the ledger instead of narrowing it to the first show.
-        tiktok_show_evidence_query = (
+        dated_selection = (
             f"{tiktok_show_evidence_query} {' '.join(selected_show_dates)}"
         ).strip()
-    selection_query = tiktok_show_evidence_query
-    candidate_context = False
+        if continuation_dates:
+            # A prior human referent is a source candidate, not a date the
+            # current speaker supplied. Keep the real request intact so the
+            # ledger can honor a new named-person or independent recall task.
+            continuation_selection_query = dated_selection
+        else:
+            tiktok_show_evidence_query = dated_selection
+    selection_query = continuation_selection_query or tiktok_show_evidence_query
+    candidate_context = bool(continuation_selection_query)
     if (
         conversation_basis is not None
+        and not continuation_selection_query
         and not image_queries
         and conversation_context_result is not None
         and conversation_context_result.thread_focus_mode
@@ -32623,7 +32716,8 @@ async def get_gemini_response(
                 "- Do not let glitch/adjacent-reality language become the cause.\n"
             )
 
-        variation_hint = creative_variation_hint()
+        vocal_task = has_vocal_copy(_current_request_from_prompt(prompt) or prompt)
+        variation_hint = creative_variation_hint(vocal_task=vocal_task)
         if one_call_packet_route:
             # The caller has already composed the authorized turn context and
             # selected packet evidence into one shared-brain prompt. Keep that
@@ -32671,6 +32765,11 @@ async def get_gemini_response(
             # The parsed visible text still passes typed selection,
             # control-leak, source/frame, exact-quote, and delivery checks.
             return text
+
+        # Optional voice rewrites must not reintroduce decorative corruption,
+        # shorten a song or alter its credits after the primary draft. Preserve
+        # the provider's lyrics; this is not a text scrubber or a second call.
+        allow_style_rewrite = allow_style_rewrite and not (vocal_task or has_vocal_copy(text))
 
         # -------- AI Generated Glitch Event --------
         if (
@@ -38084,6 +38183,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     channel_policy,
                     conversation_context=recent_room_prompt,
                     guild_id=guild_id,
+                    subject_user_id=first_uid if len(unique_user_ids) == 1 else 0,
+                    channel_id=channel_id,
+                    channel_name=getattr(channel, "name", ""),
+                    conversation_context_result=orchestration_state.get("context_result"),
                 )
             else:
                 batch_website_read_model_context = await asyncio.to_thread(
@@ -42793,6 +42896,10 @@ async def _generate_direct_payload_session(session_key, reason: str):
         session.get("channel_policy", "unknown"),
         conversation_context=room_context,
         guild_id=session["guild_id"],
+        subject_user_id=session["requester_user_id"],
+        channel_id=session.get("channel_id", 0),
+        channel_name=getattr(getattr(anchor_message, "channel", None), "name", ""),
+        conversation_context_result=session_context_result_out.get("result"),
     )
     source_context_block = await maybe_build_source_context_for_direct_message(
         anchor_message,
@@ -47984,6 +48091,10 @@ async def on_message(message: discord.Message):
                 channel_policy,
                 conversation_context=room_context,
                 guild_id=message.guild.id,
+                subject_user_id=message.author.id,
+                channel_id=message.channel.id,
+                channel_name=getattr(message.channel, "name", ""),
+                conversation_context_result=direct_context_result_out.get("result"),
             )
             source_context_block = await maybe_build_source_context_for_direct_message(
                 message,
@@ -48513,6 +48624,10 @@ async def on_message(message: discord.Message):
             channel_policy,
             conversation_context=room_context,
             guild_id=message.guild.id,
+            subject_user_id=message.author.id,
+            channel_id=message.channel.id,
+            channel_name=getattr(message.channel, "name", ""),
+            conversation_context_result=direct_context_result_out.get("result"),
         )
         source_context_block = await maybe_build_source_context_for_direct_message(
             message,
@@ -48996,6 +49111,10 @@ async def on_message(message: discord.Message):
             channel_policy,
             conversation_context=room_context,
             guild_id=message.guild.id,
+            subject_user_id=message.author.id,
+            channel_id=message.channel.id,
+            channel_name=getattr(message.channel, "name", ""),
+            conversation_context_result=direct_context_result_out.get("result"),
         )
         source_context_block = await maybe_build_source_context_for_direct_message(
             message,

@@ -5,6 +5,7 @@ This module has no storage, network, identity, or memory-write authority.
 
 from collections import deque
 import random
+import re
 from threading import Lock
 
 
@@ -30,12 +31,19 @@ SUNO_LYRIC_PROTOCOL = """Songwriting defaults (only when asked for a song, lyric
   explicit user genre, era, format or length override, including hip hop.
 - These are paste-ready lyrics and Style for Suno Custom mode, not a claim that
   you operated Suno, generated audio, published a release or learned a new fact.
+- Lyrics, their headings and Style contain no decorative glitch glyphs, corrupted
+  fragments or spoken glitch effects. Normal punctuation and structure labels
+  remain. This applies to revisions and short overrides too; optional glitch
+  variation elsewhere in the voice instructions never applies to a song draft.
 - For an end-of-show song, use authorized show context: credit submitted artist
   and track labels exactly; distinguish submissions, actual plays and banter.
   Keep creative imagery separate from factual claims about real participants.
 - Use supplied approved feedback and prior song context to improve variety and
   structure. Do not invent feedback, promise persistent learning or store creative
   lyrics as factual memory. Existing consent and memory governance still apply.
+- A request to change a chorus, genre or format keeps the same show and verified
+  credits unless the user changes the subject. Do not substitute the latest public
+  show for a requested rehearsal. Queue Finish counts do not establish full plays.
 """
 
 _GLITCH_FORMS = (
@@ -55,7 +63,7 @@ _recent_styles = deque(maxlen=64)
 _variation_lock = Lock()
 
 
-def creative_variation_hint(rng=None):
+def creative_variation_hint(rng=None, *, vocal_task=False):
     """Supply suggestions, never force a glitch/song or override the request.
 
     Recent repetition avoidance is process-local and bounded; no lifetime
@@ -84,7 +92,19 @@ def creative_variation_hint(rng=None):
         _recent_styles.append(style)
     return (
         "Optional variation for this reply (not factual context): "
-        f"if a glitch fits, try {form}, drawing from {glyphs}. "
+        + ("This is vocal copy: use readable lyrics and headings without decorative corruption. "
+           if vocal_task else
+           f"Outside songs, lyrics and their Style sections only, if a glitch fits, try {form}, drawing from {glyphs}. ")
+        +
         f"If default song Style is requested, consider {style}. "
         "The user's instructions and supplied recent feedback take precedence."
     )
+
+
+def has_vocal_copy(text):
+    """Recognize requested or formatted vocal copy for optional style only.
+
+    This never selects sources, routes a request, changes text or validates facts.
+    Broad matching is safe here: it merely omits an optional decoration/rewrite.
+    """
+    return bool(re.search(r"\b(?:lyrics?|suno|chorus|verse|songwriting)\b", str(text or ""), re.I))

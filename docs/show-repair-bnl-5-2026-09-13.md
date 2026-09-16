@@ -1,5 +1,51 @@
 # Show repairs, package 5: creative behavior and broadcast credits
 
+## September 16 follow-through repair on #551
+
+The earlier implementation below did not complete creative acceptance. The
+private `BARCODE Radio [09-15-2026]` B2/B3 lookup passed, but its subsequent song
+lost playback/credit grounding, and a revision used another public show's facts.
+Decorative symbols also remained in lyrics. Existing queue, lookup, commercial,
+override-format and mixed-source acceptance stays credited.
+
+The repair reuses Context's selected, visibility-checked human requests to
+refresh the existing website queue source for follow-ups. Prior model prose is
+never the evidence. Direct, deferred-payload and batched routes pass the same
+Context selection and requester identity. Fresh submitted credits and playback
+milestones remain attached to the source session. A changed/unavailable session
+does not supply replacement queue facts. Explicit current show/date requests and
+multi-show requests retain their source scope. The shared date reader now
+recognizes the website's bracketed MM-DD-YYYY titles. A known continuation date
+is retained when a generic noun such as "artists" would otherwise broaden the
+historical read; general public-history behavior retains its existing default.
+
+The shared lyric contract explicitly excludes decorative corruption from lyrics,
+headings and Style, including revisions and overrides. Vocal requests omit the
+optional glyph suggestions; detected vocal drafts skip legacy decorative rewrite
+calls. Ordinary glitch expression remains available. No lyrics are silently
+scrubbed, no packet JSON is rewritten, and no extra generation call is added.
+
+`test_rehearsal_song_followthrough.py` exercises actual Context, direct prompt
+assembly, batch assembly, source readers and delivery guards with controlled
+website/provider boundaries. It covers lookup → song → feedback → short override,
+an unrelated public episode, intentional public-show changes, source access loss,
+a changed session, other speakers, ambiguous referents and model-only claims.
+Creative protocol tests cover unchanged packet envelopes and one-call vocal
+drafts even when optional rewrite randomness is forced on.
+
+**Live acceptance remains open.** After the reviewed repair is deployed, repeat
+the failed default-song, feedback and symbol cases in the private testing channel.
+Use the accepted session's current authorized source records. If they are no
+longer available, stop that case and establish an explicitly selected replacement
+fixture; do not substitute a public show. Check exact submitted credits, natural
+completion versus partial playback, no invented full-play count, clean vocal copy,
+preserved requested format and provider-call count. The short override's format
+already passed; inspect its unresolved symbols without reopening unrelated tests.
+Keep the actual replies and deployed SHA as the acceptance receipt. Local tests
+with a substituted provider do not prove live model quality or deployment.
+
+## Original September 13 implementation record
+
 Base: `edbe937fd0733d8affc7f08e64f799f2720bf169` in `6-Bit-01/BNL01-Bot`. This completes the bot credit companion to site PR 423 and the B01–B03 prompt/behavior work. Shared-brain repair remains paused. No live gate, database, conversation, memory, queue, submission, payment or show-history value is changed by this draft.
 
 ## Evidence and implementation

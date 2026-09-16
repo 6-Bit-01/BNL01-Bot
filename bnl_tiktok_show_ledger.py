@@ -325,7 +325,9 @@ def _community_baseline_requested(user_text: str) -> bool:
     return bool(_COMMUNITY_BASELINE_QUERY_RE.search(str(user_text or "")))
 
 
-def broad_show_history_requested(user_text: str, *, now: Any = None) -> bool:
+def broad_show_history_requested(
+    user_text: str, *, now: Any = None, include_community_baseline: bool = True,
+) -> bool:
     """Share the existing history scope across archive and packet readers."""
 
     text = str(user_text or "")
@@ -338,7 +340,9 @@ def broad_show_history_requested(user_text: str, *, now: Any = None) -> bool:
         text, flags=re.IGNORECASE,
     ):
         return False
-    return bool(_MULTI_SHOW_QUERY_RE.search(text) or _community_baseline_requested(text))
+    return bool(_MULTI_SHOW_QUERY_RE.search(text) or (
+        include_community_baseline and _community_baseline_requested(text)
+    ))
 
 
 def _show_episode_scope_requested(user_text: str) -> bool:
