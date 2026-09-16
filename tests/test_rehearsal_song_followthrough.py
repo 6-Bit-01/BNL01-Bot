@@ -114,6 +114,31 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Prior-conversation queue source candidate", website)
         self.assertIn("the green visuals during this song are wild", prompt)
 
+    async def test_older_public_topic_cannot_replace_the_newer_rehearsal_candidate(self):
+        self.seed(("Give me a recap of the public show on 2026-08-28.", REQUEST))
+        prompt, _website = await self.direct(SONG)
+        self.assert_fresh_facts(prompt)
+
+    async def test_new_named_person_recall_keeps_independent_public_history(self):
+        from tests.test_cross_source_show_recall import CrossSourceShowRecallTests, QUERY
+
+        history = CrossSourceShowRecallTests()
+        history.db = bot.DB_FILE
+        history.shows = []
+        history.sequence = 10000
+        day = history.add_show()
+        history.message(day, "I brought amber lanterns for the courtyard.")
+        day = history.add_show("2026-09-04", "2026-09-05")
+        history.message(day, "The amber lanterns are beside the doorway.")
+        history.sync()
+        baseline, _website = await self.direct(QUERY)
+        self.assertIn("I brought amber lanterns for the courtyard.", baseline)
+        self.assertIn("The amber lanterns are beside the doorway.", baseline)
+        self.seed((REQUEST, SONG))
+        prompt, _website = await self.direct(QUERY)
+        self.assertIn("I brought amber lanterns for the courtyard.", prompt)
+        self.assertIn("The amber lanterns are beside the doorway.", prompt)
+
     def test_website_title_dates_use_calendar_validation_without_guessing_numeric_prose(self):
         self.assertEqual(bot.requested_show_dates("BARCODE Radio [09-15-2026]"), ("2026-09-15",))
         self.assertTrue(bot.has_explicit_show_date("BARCODE Radio [02-30-2026]"))

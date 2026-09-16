@@ -3951,6 +3951,7 @@ def build_tiktok_show_evidence_context_for_turn(
         r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b",
         website_read_model_context or "",
     )))
+    continuation_selection_query = ""
     if (
         selected_show_dates
         and not request_owns_show_date
@@ -3961,13 +3962,21 @@ def build_tiktok_show_evidence_context_for_turn(
     ):
         # The website adapter may have selected a comparison. Pass its whole
         # date scope to the ledger instead of narrowing it to the first show.
-        tiktok_show_evidence_query = (
+        dated_selection = (
             f"{tiktok_show_evidence_query} {' '.join(selected_show_dates)}"
         ).strip()
-    selection_query = tiktok_show_evidence_query
-    candidate_context = False
+        if continuation_dates:
+            # A prior human referent is a source candidate, not a date the
+            # current speaker supplied. Keep the real request intact so the
+            # ledger can honor a new named-person or independent recall task.
+            continuation_selection_query = dated_selection
+        else:
+            tiktok_show_evidence_query = dated_selection
+    selection_query = continuation_selection_query or tiktok_show_evidence_query
+    candidate_context = bool(continuation_selection_query)
     if (
         conversation_basis is not None
+        and not continuation_selection_query
         and not image_queries
         and conversation_context_result is not None
         and conversation_context_result.thread_focus_mode
