@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack, closing, nullcontext
 from pathlib import Path
+from bnl_creative_protocol import GLITCH_PROTOCOL, SUNO_LYRIC_PROTOCOL, creative_variation_hint
 from typing import Any, Awaitable, Callable, Mapping, Union
 
 from bnl_canon_source_contract import (
@@ -1857,6 +1858,9 @@ BARCODE history summary (canonical):
 - You may occasionally reference earlier signals from the Network archive only when the user is explicitly asking for recall, follow-up, or continuity. Do not introduce older archived details into simple greetings, casual replies, or new topic changes.
 - If durable user memory context is provided, use it accurately when asked for recall. Do not ignore known user facts in direct memory questions.
 
+{GLITCH_PROTOCOL}
+{SUNO_LYRIC_PROTOCOL}
+
 ## GLITCH GUIDANCE
 - Allowed occasionally: brief pauses, mild redactions, short system notes, then return to normal tone.
 - Never break character. Never admit you are an AI model or LLM.
@@ -1912,7 +1916,7 @@ You are BNL-01. The BARCODE Network is watching. You are functioning as intended
 ORDINARY_CHAT_SINGLE_PACKET_ROUTE = (
     "ordinary_chat_single_packet_canary"
 )
-BNL01_PACKET_OWNED_SYSTEM_PROMPT = """You are BNL-01, the BARCODE Network Liaison Entity.
+BNL01_PACKET_OWNED_SYSTEM_PROMPT = f"""You are BNL-01, the BARCODE Network Liaison Entity.
 
 Voice: calm, concise, observant, friendly, lightly corporate, with restrained
 dry wit. Vary response length and shape to fit the exact turn. Answer the
@@ -1942,6 +1946,9 @@ Shared understanding:
 - When one exact fact is unavailable, answer everything else that is supported
   and state only that specific uncertainty naturally. Missing bounded
   evidence does not prove a person or event never existed.
+
+{GLITCH_PROTOCOL}
+{SUNO_LYRIC_PROTOCOL}
 
 Style may be mechanical or mildly strange, but style cannot create facts.
 Never mention packets, selectors, evidence labels, canaries, gates, or internal
@@ -2689,25 +2696,21 @@ def _track_label(
     if not isinstance(track, dict):
         return ""
     artist = _compact_public_text(_first_present_value(track, (
-        "detectedArtistName",
         "submittedArtistName",
         "artist",
         "artistName",
         "artist_name",
-        "name",
     )), 80)
     title = _compact_public_text(_first_present_value(track, (
-        "detectedSongTitle",
         "submittedSongTitle",
-        "providerTitle",
         "title",
         "trackTitle",
         "track_title",
         "songTitle",
     )), 90)
-    label = " — ".join(part for part in (artist, title) if part)
-    if not label:
-        label = _compact_public_text(track.get("label") or track.get("displayName"), 120)
+    if not artist and not title:
+        return _compact_public_text(track.get("label") or track.get("displayName"), 120)
+    label = " — ".join((artist or "Unknown artist", title or "Unknown title"))
     extras = []
     if include_lane:
         lane = _compact_public_text(
@@ -32537,16 +32540,19 @@ async def get_gemini_response(
                 "- Do not let glitch/adjacent-reality language become the cause.\n"
             )
 
+        variation_hint = creative_variation_hint()
         if one_call_packet_route:
             # The caller has already composed the authorized turn context and
             # selected packet evidence into one shared-brain prompt. Keep that
             # prompt intact; this system block supplies voice and safety only.
             request_contents = f"""{BNL01_PACKET_OWNED_SYSTEM_PROMPT}
+{variation_hint}
 
         User: {prompt}
         BNL-01:"""
         else:
             request_contents = f"""{BNL01_SYSTEM_PROMPT}
+{variation_hint}
 
         Conversation history:
         {conversation_context}
@@ -32601,6 +32607,8 @@ async def get_gemini_response(
         """
             glitch_prompt = f"""
         Rewrite the following BNL-01 response into a more obvious BARCODE-style glitch event.
+{GLITCH_PROTOCOL}
+{variation_hint}
 
         Rules:
         - Keep the core meaning of the original response, but allow it to become stranger, more cryptic, more unstable, and more eerie.
@@ -32682,6 +32690,9 @@ async def get_gemini_response(
         - Preserve that the episode is unavailable/canceled/paused.
         """
             bleed_prompt = f"""
+{GLITCH_PROTOCOL}
+{variation_hint}
+
         Rewrite the response as if a minor interdimensional broadcast bleed briefly affected BNL-01.
 
         Requirements:
