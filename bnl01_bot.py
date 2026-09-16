@@ -2417,6 +2417,10 @@ def _queue_query_focus(text: str) -> dict:
         r"\b(?:completed tracks?|who played|what played|already played)\b",
         normalized,
     ))
+    playback_evidence = bool(re.search(
+        r"\b(?:playback|played|loaded|finished|completed|removed|paused|resumed)\b",
+        normalized,
+    ))
     return {
         "now_playing": now_playing,
         "track_link": track_link,
@@ -2427,6 +2431,7 @@ def _queue_query_focus(text: str) -> dict:
         "personal_lookup": personal_lookup,
         "position_lookup": position_lookup,
         "completed": completed,
+        "playback_evidence": playback_evidence,
     }
 
 
@@ -2498,6 +2503,18 @@ def _queue_read_model_query(text: str) -> bool:
     if not normalized:
         return False
     if _current_queue_state_query(normalized):
+        return True
+    # Session-credit/playback requests need the same website owner even when
+    # the member never says "queue". Require a read request and track facts,
+    # not a lone mention of a rehearsal in otherwise unrelated conversation.
+    if (
+        re.search(r"\b(?:rehearsal|barcode radio|(?:current|this|private|live) "
+                  r"(?:show|session))\b", normalized)
+        and re.search(r"\b(?:read|check|give|show|list|tell|who|which|what|was|"
+                      r"were|did|distinguish|verify|confirm)\b", normalized)
+        and re.search(r"\b(?:tracks?|songs?|artists?|credits?|playback|played|"
+                      r"loaded|submitted|queued|removed|titles?)\b", normalized)
+    ):
         return True
     return any(
         re.search(pattern, normalized)
@@ -2805,6 +2822,45 @@ def _queue_event_label(event: dict) -> str:
     return " | ".join(bits)
 
 
+def _queue_track_readout(track: dict, *, playback_events=None, **label_options) -> str:
+    """Keep submitted credits and actual playback evidence in the same readout."""
+    label = _track_label(track, **label_options)
+    if not label or playback_events is None:
+        return label
+    track_id = str(track.get("id") or track.get("trackId") or "")
+    event_counts = {}
+    seen = set()
+    for event in playback_events:
+        event_track = _first_mapping(event.get("track"))
+        if not track_id or str(event_track.get("trackId") or event_track.get("id") or "") != track_id:
+            continue
+        event_type = event.get("eventType")
+        if event_type not in {
+            "track_loaded", "track_play_started", "track_paused", "track_resumed",
+            "track_finished", "track_skipped", "track_removed", "track_stalled",
+            "track_playback_error",
+        }:
+            continue
+        identity = (event_type, str(event.get("sequence")), str(event.get("occurredAt")))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        event_counts[event_type] = event_counts.get(event_type, 0) + 1
+    playback = _first_mapping(track.get("playback"))
+    confirmed = bool(
+        event_counts.get("track_play_started") or event_counts.get("track_resumed")
+        or playback.get("endedNaturally") is True
+    )
+    facts = ["actualPlayback=" + ("confirmed" if confirmed else "not_evidenced")]
+    if track.get("stage"):
+        facts.append("stage=" + _compact_public_text(track["stage"], 30))
+    facts.extend(f"{kind}={count}" for kind, count in sorted(event_counts.items()))
+    for key in ("outcome", "endedNaturally", "earlyCutoff", "endPositionSeconds"):
+        if playback.get(key) is not None:
+            facts.append(f"{key}={_compact_public_text(playback[key], 40)}")
+    return label + " | " + ", ".join(facts)
+
+
 def _queue_request_focus_lines(focus: dict, queue_url: str) -> list:
     lines = [
         "- Response scope: answer only the queue fact(s) actually requested; do not dump unrelated counts, tracks, or show statistics.",
@@ -2832,6 +2888,11 @@ def _queue_request_focus_lines(focus: dict, queue_url: str) -> list:
         lines.append("- Wheel request: use the current Wheel state and the latest confirmed winner; do not treat an unconfirmed result as a winner.")
     if focus.get("show_reaction"):
         lines.append("- Live-reaction request: use the queue snapshot as authoritative show state, then describe only the bounded TikTok reaction evidence supplied below.")
+    if focus.get("playback_evidence"):
+        lines.extend([
+            "- Actual playback: track_play_started, track_resumed or endedNaturally=true confirm that playback began. Loading, playedAt, a Finish outcome, removal and a seek position alone do not prove playback.",
+            "- actualPlayback=not_evidenced means no confirming evidence in the supplied record; do not turn missing evidence into a claim that playback never happened. A confirmed start does not establish a full play; retain earlyCutoff and endedNaturally distinctions.",
+        ])
     return lines
 
 
@@ -3063,11 +3124,31 @@ def build_bnl_read_model_context(
         wheel_timing = _first_mapping(queue.get("wheelTiming"), wheel.get("timing"))
         playback_timing = _first_mapping(queue.get("playbackTiming"))
         recent_events = _first_list(queue.get("recentEvents"))
+        playback_events = None
+        if queue_focus.get("playback_evidence"):
+            session_id = str(session.get("sessionId") or session.get("id") or "")
+            playback_events = [
+                event for event in recent_events
+                if isinstance(event, dict)
+                and (not event.get("sessionId") or event.get("sessionId") == session_id)
+            ]
+            current_show = _first_mapping(archive.get("currentShow"))
+            if session_id and current_show.get("sessionId") == session_id:
+                # The current session's existing timeline retains starts that
+                # have rolled out of the compact recent-events window. Never
+                # borrow another show's events or infer playback from Finish.
+                playback_events.extend(
+                    event for event in _first_list(current_show.get("milestones"))
+                    if isinstance(event, dict)
+                    and (not event.get("sessionId") or event.get("sessionId") == session_id)
+                )
         lines.append("\nQueue:")
         if operational_query:
             lines.extend(_queue_request_focus_lines(queue_focus, queue_url))
+            lines.append("- Session scope: the queue facts below belong only to this snapshot's session. Match any requested title, session ID or date; do not substitute another session when the requested one is unavailable.")
         session_bits = []
         session_field_specs = (
+            ("sessionId", ("sessionId", "id")),
             ("Session", ("title",)),
             ("showDate", ("showDate",)),
             ("status", ("status",)),
@@ -3094,8 +3175,9 @@ def build_bnl_read_model_context(
         revision = _first_present_value(queue, ("revision",))
         if revision is not None:
             lines.append(f"- Queue revision: {_compact_public_text(revision, 30)}")
-        now_label = _track_label(
+        now_label = _queue_track_readout(
             now_playing,
+            playback_events=playback_events,
             include_queue_details=True,
             include_public_source_url=bool(queue_focus.get("track_link")),
         )
@@ -3103,7 +3185,7 @@ def build_bnl_read_model_context(
             lines.append(f"- Now playing: {now_label}")
         else:
             lines.append("- Now playing: none")
-        next_label = _track_label(up_next, include_queue_details=True)
+        next_label = _queue_track_readout(up_next, playback_events=playback_events, include_queue_details=True)
         if next_label:
             lines.append(f"- Up next: {next_label}")
         else:
@@ -3169,8 +3251,9 @@ def build_bnl_read_model_context(
         if selected_queued_tracks:
             lines.append("\nRelevant queued tracks:")
             for track in selected_queued_tracks:
-                label = _track_label(
+                label = _queue_track_readout(
                     track,
+                    playback_events=playback_events,
                     include_lane=True,
                     include_source=True,
                     include_queue_details=True,
@@ -3188,7 +3271,7 @@ def build_bnl_read_model_context(
         if matched_completed_tracks:
             lines.append("\nRelevant completed tracks:")
             for track in matched_completed_tracks:
-                label = _track_label(track, include_lane=False)
+                label = _queue_track_readout(track, playback_events=playback_events, include_lane=False)
                 if label:
                     lines.append(f"- {label}")
         matched_removed_tracks = [
@@ -3198,7 +3281,7 @@ def build_bnl_read_model_context(
         if matched_removed_tracks:
             lines.append("\nRelevant removed tracks:")
             for track in matched_removed_tracks:
-                label = _track_label(track, include_lane=True)
+                label = _queue_track_readout(track, playback_events=playback_events, include_lane=True)
                 if label:
                     lines.append(f"- {label}")
         if queue_focus.get("wheel") or queue_focus.get("movement") or queue_focus.get("show_reaction"):
