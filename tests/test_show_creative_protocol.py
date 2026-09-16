@@ -77,13 +77,39 @@ class ShowCreativeProtocolTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bot, "check_quota_availability", return_value=True), \
              mock.patch.object(bot, "conversation_context_v2_enabled", return_value=True), \
              mock.patch.object(bot, "_generate_gemini_content_result_async", provider):
-            result = await bot.get_gemini_response(request, 7, 1, allow_style_rewrite=False)
+            with mock.patch.object(bot.random, "random", return_value=0.0), \
+                 mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", side_effect=AssertionError("No decorative rewrite of lyrics")):
+                result = await bot.get_gemini_response(request, 7, 1, allow_style_rewrite=True)
         self.assertEqual(result.strip(), answer.strip())
         provider.assert_awaited_once()
         prompt = provider.call_args.args[0]
         self.assertIn(request, prompt)
         self.assertIn("explicit user genre, era, format or length override", prompt)
         self.assertIn("Optional variation", prompt)
+        hint = next(line for line in prompt.splitlines() if line.startswith("Optional variation"))
+        self.assertNotIn("drawing from", hint)
+        self.assertFalse(any(glyph in hint for glyph in protocol._GLYPHS))
+
+    async def test_unlabeled_followup_with_formatted_lyrics_skips_automatic_rewrites(self):
+        answer = "1. Lyrics\n[Verse]\nThe lantern carries our melody home.\n2. Style\n1982: bluegrass + industrial."
+        provider = mock.AsyncMock(return_value=bot.GenerationResult(True, answer))
+        with mock.patch.object(bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bot, "conversation_context_v2_enabled", return_value=True), \
+             mock.patch.object(bot, "_generate_gemini_content_result_async", provider), \
+             mock.patch.object(bot.random, "random", return_value=0.0), \
+             mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", side_effect=AssertionError("No style call")):
+            result = await bot.get_gemini_response("Make it less repetitive.", 7, 1)
+        self.assertEqual(result, answer)
+        provider.assert_awaited_once()
+
+    async def test_packet_envelope_remains_untouched(self):
+        envelope = '{"response_text":"[Chorus]\\nA clean line.","support":[]}'
+        provider = mock.AsyncMock(return_value=bot.GenerationResult(True, envelope))
+        with mock.patch.object(bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bot, "_generate_gemini_content_result_async", provider):
+            result = await bot.get_gemini_response("Write a chorus.", 7, 1, route=bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE)
+        self.assertEqual(result, envelope)
+        provider.assert_awaited_once()
 
 
 if __name__ == "__main__":

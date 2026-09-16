@@ -83,6 +83,9 @@ _SHOW_MONTH_PATTERN = "(?:" + "|".join(
 ) + r")\.?"
 _EXPLICIT_SHOW_DATE_PATTERNS = (
     re.compile(r"\b(?P<year>\d{4})-(?P<month_number>\d{1,2})-(?P<day>\d{1,2})\b"),
+    # The website's canonical session titles use BARCODE Radio [MM-DD-YYYY].
+    # Require brackets so arbitrary numeric prose does not acquire a locale.
+    re.compile(r"\[(?P<month_number>\d{1,2})-(?P<day>\d{1,2})-(?P<year>\d{4})\]"),
     re.compile(
         rf"\b(?P<month_name>{_SHOW_MONTH_PATTERN})\s*(?P<day>\d{{1,2}})"
         r"(?:st|nd|rd|th)?(?:\s*,\s*|\s+)(?P<year>\d{4})\b",
