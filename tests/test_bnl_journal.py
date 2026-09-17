@@ -104,6 +104,60 @@ class JournalTests(unittest.TestCase):
                 c.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE lifecycle_state='draft'").fetchone()[0],
             )
 
+    def test_repair_receives_complete_draft_and_all_leak_locations_without_logging_prose(self):
+        calls = []
+        packet = self.packet()
+        original = json.loads(article_json(packet, leak=' https://example.test/private-marker'))
+        original['excerpt'] += ' @TestMember'
+        original['metadata']['continuityNotes'] = [
+            'Fictional retained continuity note with enough detail to exercise a complete response. ' + str(index)
+            for index in range(70)
+        ]
+        original['metadata']['contextUses'] = []
+        raw = json.dumps(original)
+        self.assertGreater(raw.index('"contextUses"'), 6000)
+
+        def generator(_packet, prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return raw
+            previous = json.loads(prompt.split('Complete previous draft (not evidence):\n', 1)[1])
+            self.assertEqual(original, previous)
+            self.assertIn('"field":"excerpt","check":"mention"', prompt)
+            self.assertIn('"field":"sections[0].body","check":"url"', prompt)
+            self.assertNotIn('Rewrite it completely', prompt)
+            return article_json(_packet)
+
+        with self.assertLogs(level='INFO') as captured:
+            result = j.generate_and_store_packet_draft(self.db, 1, packet, generator)
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(2, len(calls))
+        logs = '\n'.join(captured.output)
+        self.assertIn('journal_repair_requested', logs)
+        self.assertIn('targets=excerpt:mention,sections[0].body:url', logs)
+        self.assertNotIn('private-marker', logs)
+        self.assertNotIn('@TestMember', logs)
+        self.assertNotIn(original['sections'][0]['body'], logs)
+
+    def test_leak_repair_pointers_are_bounded_and_do_not_weaken_rejection(self):
+        packet = self.packet()
+        article = j.parse_generated_json(article_json(
+            packet, leak=' ' + ' '.join('@TestMember' for _ in range(20)),
+        ))
+        details = []
+        self.assertEqual('public_leak_pattern', j.validate_article(
+            article, packet, [], blocking_only=True, repair_details=details,
+        ))
+        self.assertEqual(12, len(details))
+        body = article['sections'][0]['body']
+        for issue in details:
+            self.assertEqual('sections[0].body', issue['field'])
+            self.assertEqual('@TestMember', body[issue['start']:issue['end']])
+        self.assertNotIn('TestMember', json.dumps(details))
+        clean = j.parse_generated_json(article_json(packet))
+        self.assertEqual('', j.validate_article(clean, packet, [], repair_details=details))
+        self.assertEqual([], details)
+
     def test_clinical_or_sensitive_copy_gets_rejected_and_rewritten(self):
         packet = self.packet()
         clinical = j.parse_generated_json(article_json(packet, title='Clinical Pass', leak=' Records indicate continuous effort across entities.'))

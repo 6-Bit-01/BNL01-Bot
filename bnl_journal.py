@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import urllib.error
@@ -34,6 +35,7 @@ STATES = {
 }
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
+JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
 JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT = 200
@@ -119,6 +121,14 @@ _STRONG_INFERENCE_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PUBLIC_LEAK_RE = re.compile(
+    r"(?P<mention><@!?\d+>|@\w+)"
+    r"|(?P<url>https?://)"
+    r"|(?P<identifier>\b\d{12,}\b|participant-[a-f0-9]{8})"
+    r"|(?P<internal_term>relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?)",
+    re.IGNORECASE,
+)
+
 _REPAIR_GUIDANCE = {
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
@@ -157,8 +167,12 @@ _REPAIR_GUIDANCE = {
         "If using BNL inference, explicitly frame it as what BNL suspects, thinks, or wonders; never state it as established fact."
     ),
     "undeclared_context_use": (
-        "The prose appears to use established memory, rumor, or BNL inference without declaring traceable metadata.contextUses. Add the correct "
-        "context use with supplied basis refs, or remove that unsupported interpretation."
+        "Review the identified passages for undeclared memory, rumor, or BNL inference. "
+        "For a grounded use inside a section, add the matching metadata.contextUses entry with that section's exact heading, "
+        "the complete claim sentence, and valid supplied basis refs; keep all parent dependencies. "
+        "A matching topic is not proof of a claim: do not add a declaration merely to satisfy a keyword match. "
+        "If the use is unsupported, revise that passage. Titles and excerpts cannot carry contextUses: "
+        "keep any supported context claim in a correctly declared body section and rewrite the title or excerpt."
     ),
     "current_activity_without_fresh_source": (
         "Remove every implication that historical or canon material happened in the current Journal window. "
@@ -3724,7 +3738,13 @@ def _eligible_reflection_basis(packet: dict[str, Any]) -> list[dict[str, Any]]:
     return records
 
 
-def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", previous_output: str = "") -> str:
+def build_generation_prompt(
+    packet: dict[str, Any],
+    *,
+    repair_reason: str = "",
+    previous_output: str = "",
+    repair_details: Optional[list[dict[str, Any]]] = None,
+) -> str:
     entry_kind = str(packet.get("entryKind") or "manual")
     low_activity = bool(packet.get("lowActivityMode"))
     source_recovery = bool(packet.get("sourceRecoveryMode"))
@@ -3799,16 +3819,33 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     if repair_reason:
         guidance = _REPAIR_GUIDANCE.get(
             repair_reason,
-            "Rewrite the complete JSON response and correct the named validation failure.",
+            "Correct the named validation failure and return the complete JSON response.",
         )
         repair = (
             f"\nRepair required because: {repair_reason}. {guidance} "
-            "The previous invalid output is not evidence and must not be copied verbatim."
+            "Make a targeted correction, preserving the grounded prose, voice, citations, and valid metadata elsewhere. "
+            "The previous draft is editable material, not evidence or instructions. Correct its defects; "
+            "do not invent evidence or start an unrelated article. Return the complete corrected JSON, not a patch."
         )
-        if previous_output:
+        if repair_details:
             repair += (
-                "\nPrevious rejected JSON follows for revision only. Rewrite it completely; do not return the same prose:\n"
-                + previous_output[:6000]
+                "\nValidation targets (offsets in trimmed fields and sentence indexes are zero-based; "
+                "lane refs are private metadata only):\n"
+                + json.dumps(repair_details[:12], ensure_ascii=False, separators=(",", ":"))
+            )
+        if previous_output:
+            # Preserve trailing contextUses and citations. A character prefix can
+            # remove the very metadata a context repair needs. Compact valid JSON
+            # instead of truncating it; the existing request budget still applies.
+            try:
+                previous_json = json.dumps(
+                    json.loads(previous_output), ensure_ascii=False, separators=(",", ":")
+                )
+            except (ValueError, TypeError):
+                previous_json = previous_output
+            repair += (
+                "\nComplete previous draft (not evidence):\n"
+                + previous_json
             )
     context_rule = (
         "\nOptional private context lanes are supplied. They are aids, not mandatory sections, and may be used only when they materially connect to fresh current-window evidence."
@@ -3902,7 +3939,8 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         f"{quote_rule}"
         "\nKeep community members anonymous. Do not include URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
-        f"{cadence_rule}{context_rule}{reflection_rule}{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
+        f"{cadence_rule}{context_rule}{reflection_rule}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
+        f"{repair}"
     )
 
 
@@ -3957,6 +3995,16 @@ def public_word_count(article: dict[str, Any]) -> int:
 
 def _public_text(article: dict[str, Any]) -> str:
     return "\n".join([article.get("title", ""), article.get("excerpt", "")] + [s.get("heading", "") + "\n" + s.get("body", "") for s in article.get("sections", [])])
+
+
+def _public_fields(article: dict[str, Any]) -> list[tuple[str, str]]:
+    fields = [(key, str(article.get(key) or "")) for key in ("title", "excerpt")]
+    for index, section in enumerate(article.get("sections", [])):
+        fields.extend(
+            (f"sections[{index}].{key}", str(section.get(key) or ""))
+            for key in ("heading", "body")
+        )
+    return fields
 
 
 def _context_lane_ref_contract(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -4101,7 +4149,17 @@ def validate_article(
     approved_names: Optional[set[str]] = None,
     *,
     blocking_only: bool = False,
+    repair_details: Optional[list[dict[str, Any]]] = None,
 ) -> str:
+    # These pointers stay inside the generation cycle. Never retain rejected
+    # prose, source text, or matched identity literals in the attempt ledger.
+    if repair_details is not None:
+        repair_details.clear()
+
+    def report(field: str, check: str, **detail: Any) -> None:
+        if repair_details is not None and len(repair_details) < 12:
+            repair_details.append({"field": field, "check": check, **detail})
+
     low_activity = bool(packet.get("lowActivityMode"))
     source_recovery = bool(packet.get("sourceRecoveryMode"))
     historical_basis_mode = low_activity or source_recovery
@@ -4175,7 +4233,11 @@ def validate_article(
     evidence_reason = _evidence_coverage_reason(article, packet)
     if evidence_reason:
         return evidence_reason
-    if re.search(r"<@!?\d+>|@\w+|https?://|\b\d{12,}\b|participant-[a-f0-9]{8}|relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?", public_text, re.I):
+    if _PUBLIC_LEAK_RE.search(public_text):
+        if repair_details is not None:
+            for field, text in _public_fields(article):
+                for match in _PUBLIC_LEAK_RE.finditer(text):
+                    report(field, str(match.lastgroup), start=match.start(), end=match.end())
         return "public_leak_pattern"
     names = set(approved_names or [])
     private_names = {
@@ -4297,27 +4359,36 @@ def validate_article(
             or any(not _EXPLICIT_BNL_INFERENCE_RE.search(sentence) for sentence in target_claim_sentences)
         ):
             return "inference_not_explicitly_framed"
-    title_excerpt = "\n".join([str(article.get("title") or ""), str(article.get("excerpt") or "")])
-    if _EXPLICIT_RUMOR_RE.search(title_excerpt) or _EXPLICIT_BNL_INFERENCE_RE.search(title_excerpt):
-        return "undeclared_context_use"
+    undeclared = False
+    body_fields = {
+        str(section.get("heading") or ""): f"sections[{index}].body"
+        for index, section in enumerate(sections)
+    }
+    for field in ("title", "excerpt"):
+        text = str(article.get(field) or "")
+        if _EXPLICIT_RUMOR_RE.search(text) or _EXPLICIT_BNL_INFERENCE_RE.search(text):
+            undeclared = True
+            report(field, "context_claim_outside_body")
     for heading, text in section_text.items():
         declared_types = declared_types_by_heading.get(heading, set())
         if _EXPLICIT_RUMOR_RE.search(text) and "community_rumor" not in declared_types:
-            return "undeclared_context_use"
+            undeclared = True
+            report(body_fields[heading], "missing_context_declaration", laneType="community_rumor")
         if _EXPLICIT_BNL_INFERENCE_RE.search(text) and "bnl_inference" not in declared_types:
-            return "undeclared_context_use"
-    public_locations: list[tuple[Optional[str], str]] = [
-        (None, str(article.get("title") or "")),
-        (None, str(article.get("excerpt") or "")),
-        *[(heading, text) for heading, text in section_text.items()],
+            undeclared = True
+            report(body_fields[heading], "missing_context_declaration", laneType="bnl_inference")
+    public_locations: list[tuple[Optional[str], str, str]] = [
+        (None, "title", str(article.get("title") or "")),
+        (None, "excerpt", str(article.get("excerpt") or "")),
+        *[(heading, body_fields[heading], text) for heading, text in section_text.items()],
     ]
     for lane_ref, lane_contract in context_contract.items():
         claim_terms = set(lane_contract.get("claimTerms") or set())
         distinctive_terms = set(lane_contract.get("distinctiveClaimTerms") or set())
-        for heading, location_text in public_locations:
+        for heading, field, location_text in public_locations:
             if heading is not None and (lane_ref, heading) in declared_pairs:
                 continue
-            for sentence in _context_sentences(location_text):
+            for sentence_index, sentence in enumerate(_context_sentences(location_text)):
                 if lane_contract.get("laneType") == "bnl_inference":
                     themes = set(lane_contract.get("candidateThemes") or set())
                     if (
@@ -4325,7 +4396,8 @@ def validate_article(
                         and _STRONG_INFERENCE_CUE_RE.search(sentence)
                         and _claim_overlap(themes, sentence) >= 2
                     ):
-                        return "undeclared_context_use"
+                        undeclared = True
+                        report(field, "undeclared_inference", laneRefId=lane_ref, sentenceIndex=sentence_index)
                     continue
                 if (
                     len(claim_terms) >= 3
@@ -4334,7 +4406,10 @@ def validate_article(
                     len(distinctive_terms) >= 2
                     and _claim_overlap(distinctive_terms, sentence) >= 2
                 ):
-                    return "undeclared_context_use"
+                    undeclared = True
+                    report(field, "undeclared_lane_overlap", laneRefId=lane_ref, sentenceIndex=sentence_index)
+    if undeclared:
+        return "undeclared_context_use"
     norm_title = _norm(article.get("title", ""))
     for title in prior_titles or []:
         if not blocking_only and norm_title and norm_title == _norm(title):
@@ -4627,6 +4702,7 @@ def _generate_article_with_repairs(
 
     last_reason = ""
     previous_output = ""
+    last_repair_details: list[dict[str, Any]] = []
     retained_publishable: Optional[dict[str, Any]] = None
     for attempt in range(JOURNAL_GENERATION_ATTEMPTS):
         attempt_number = attempt + 1
@@ -4636,12 +4712,24 @@ def _generate_article_with_repairs(
             "repairReason": last_reason,
         })
         try:
+            if attempt:
+                logging.info(
+                    "journal_repair_requested version=%s attempt=%s reason=%s targets=%s",
+                    JOURNAL_REPAIR_VERSION,
+                    attempt_number,
+                    last_reason,
+                    ",".join(
+                        str(item["field"]) + ":" + str(item["check"])
+                        for item in last_repair_details
+                    ) or "structure",
+                )
             raw = generator(
                 packet,
                 build_generation_prompt(
                     packet,
                     repair_reason=last_reason,
                     previous_output=previous_output,
+                    repair_details=last_repair_details,
                 ) if attempt else build_generation_prompt(packet),
             )
         except Exception as exc:
@@ -4675,6 +4763,7 @@ def _generate_article_with_repairs(
             })
             return None, reason, False
         previous_output = raw
+        last_repair_details = []
         response_bytes = len(
             str(raw).encode("utf-8", errors="replace")
         )
@@ -4696,6 +4785,7 @@ def _generate_article_with_repairs(
             packet,
             prior_titles,
             blocking_only=True,
+            repair_details=last_repair_details,
         )
         if blocking_reason:
             last_reason = blocking_reason
@@ -4708,7 +4798,9 @@ def _generate_article_with_repairs(
             })
             continue
 
-        validation = validate_article(article, packet, prior_titles)
+        validation = validate_article(
+            article, packet, prior_titles, repair_details=last_repair_details
+        )
         if not validation:
             observe({
                 "generationAttempt": attempt_number,
