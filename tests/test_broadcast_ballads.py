@@ -115,6 +115,60 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
         selected = next(v for v in history if v["selectedForShow"])
         self.assertEqual(selected["producerFeedback"], "Keep that dry humor; try a gentler hook.")
 
+    async def test_new_draft_keeps_history_without_replaying_the_previous_verse(self):
+        original = (await self.run_command())["version"]
+        command = {**self.command, "id": "fresh-2", "baseVersion": original["id"],
+                   "options": {"feedback": "A fresh composition with richer verse rhymes."}}
+        await self.run_command(command)
+        prompt = self.generate.await_args.args[0]
+        history_text, remainder = prompt.split("PRIOR CREATIVE CATALOG:\n", 1)[1].split(
+            "\nEXISTING DRAFT (only revise if requested):\n", 1)
+        history = json.loads(history_text)
+        self.assertEqual(history[0]["showId"], original["showId"])
+        self.assertEqual(history[0]["title"], original["title"])
+        self.assertEqual(history[0]["style"], original["style"])
+        self.assertEqual(history[0]["palette"]["hook"], original["palette"]["hook"])
+        self.assertIn("the last one home.", history[0]["lineEndingsUsed"])
+        self.assertNotIn("lyrics", history[0])
+        self.assertNotIn("The chairs stayed warm after the room went quiet.", prompt)
+        self.assertIsNone(json.loads(remainder.split("\nWRITING REMINDER:", 1)[0]))
+        self.assertIn("A fresh composition with richer verse rhymes.", prompt)
+        self.assertEqual(versions(self.db, 77, "show-1")[0], original)
+        self.assertEqual(self.generate.await_count, 2)
+
+    async def test_polish_receives_one_complete_source_lyric_and_preserves_it(self):
+        original = (await self.run_command())["version"]
+        await self.run_command({**self.command, "id": "polish-2", "kind": "polish",
+                                "baseVersion": original["id"], "options": {"feedback": "Keep the hook."}})
+        prompt = self.generate.await_args.args[0]
+        serialized_lyrics = json.dumps(original["lyrics"], ensure_ascii=False)
+        self.assertEqual(prompt.count(serialized_lyrics), 1)
+        revision = json.loads(prompt.split("EXISTING DRAFT (only revise if requested):\n", 1)[1]
+                              .split("\nWRITING REMINDER:", 1)[0])
+        self.assertEqual(revision["lyrics"], original["lyrics"])
+        self.assertEqual(revision["style"], original["style"])
+        self.assertNotIn("rawOutput", revision)
+        self.assertIn("Keep the hook.", prompt)
+        self.assertEqual(versions(self.db, 77, "show-1")[0], original)
+        self.assertEqual(self.generate.await_count, 2)
+
+    async def test_compact_catalog_uses_the_selected_recording_version(self):
+        original = (await self.run_command())["version"]
+        await self.run_command({**self.command, "id": "edit-2", "kind": "edit",
+                                "baseVersion": original["id"], "content": dict(
+                                    title="Unselected experiment", lyrics="Different words entirely.", style="1999 ska")})
+        await self.run_command({**self.command, "id": "other-show", "showId": "show-2",
+                                "catalogVersions": {"show-1": original["id"]}})
+        prompt = self.generate.await_args.args[0]
+        history = json.loads(prompt.split("PRIOR CREATIVE CATALOG:\n", 1)[1].split(
+            "\nEXISTING DRAFT (only revise if requested):\n", 1)[0])
+        self.assertTrue(history[0]["selectedForShow"])
+        self.assertEqual(history[0]["title"], original["title"])
+        self.assertIn("the last one home.", history[0]["lineEndingsUsed"])
+        self.assertNotIn("Unselected experiment", prompt)
+        self.assertNotIn("Different words entirely.", prompt)
+        self.assertEqual(len(versions(self.db, 77, "show-1")), 2)
+
     def test_manual_and_automatic_commands_use_their_budget_priority(self):
         self.assertEqual(route_for_command(self.command), MANUAL_ROUTE)
         self.assertEqual(route_for_command({**self.command, "kind": "polish"}), MANUAL_ROUTE)

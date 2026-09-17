@@ -1,5 +1,42 @@
 # BNL Broadcast Ballads v1
 
+## Verse craft and prompt revision 4
+
+`broadcast-ballad-4` responds to a live draft that still relied on simple end
+couplets after revision 3. The shared Discord/site guidance now demonstrates
+multisyllabic writing in a melodic four-line scene and denser rhythmic phrasing,
+with a concrete instruction to compose each verse around related sound families.
+The examples are original fictional teaching material, explicitly separate from
+show evidence and lyrics to reuse. The guidance preserves natural stress, humor,
+genre choice and room for a simpler hook. Google's
+[prompting guidance](https://ai.google.dev/gemini-api/docs/prompting-strategies)
+supports using complete, varied examples to demonstrate the desired pattern.
+
+The catalog previously supplied up to 2,200 characters of each prior lyric,
+including the current show's last attempt, to a fresh Generate request. That is
+an observed input issue and a plausible source of imitation, not a proven sole
+cause of weak rhymes. Fresh drafts now receive compact references: title, style,
+palette (including hook, topics and imagery), producer feedback and up to 24
+distinct literal line endings, each up to 80 characters. These references record
+what has been used; they are not exemplar verses or a rhyme blacklist. Selection
+still favors the confirmed recording's lyric version. Older matching songs are
+still retrieved using their full stored lyrics and palette. Full lyrics, all
+versions and their site display remain intact.
+
+Only an explicit Polish supplies the full existing lyric to revise, once; its
+duplicated raw response is omitted from the model input. Generate asks for a new
+composition in the saved producer direction. Both retain one provider attempt,
+unchanged model/budget settings, optional track stories and usable-output retention.
+There is no rhyme classifier, rejection threshold, critic or retry loop.
+
+Regression tests exercise fresh generation after a prior draft, an explicit
+polish, confirmed-version catalog selection and original-version preservation.
+They establish the input and storage behavior, not live creative acceptance.
+For the next audition, use one new Generate request with the same show/direction;
+compare sustained phrase rhymes across both verses rather than accepting one
+isolated two-syllable pair. Check the saved generated version's `promptVersion`
+is `broadcast-ballad-4`; a checked-out file alone does not identify an older draft.
+
 ## Rhyme guidance and prompt revision 3
 
 `broadcast-ballad-3` strengthens the shared songwriting guidance used by both
