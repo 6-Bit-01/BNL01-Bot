@@ -104,6 +104,35 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
                 previous.append(request)
         self.assertTrue(all(call.kwargs.get("force") for call in self.fetch.call_args_list))
 
+    async def test_song_and_revision_receive_other_tracks_in_the_same_session(self):
+        queue = self.model["sections"]["queue"]
+        queue["completed"][0]["submittedArtistName"] = "Test Artist A"
+        queue["queue"][0]["submittedArtistName"] = "Test Artist C"
+        previous = [REQUEST]
+        for request in (SONG, FEEDBACK):
+            with self.subTest(request=request):
+                self.seed(previous)
+                direct_prompt, _website = await self.direct(request)
+                _channel, generation, _guard = await self.fixture._batch(
+                    "sealed_test", request="BNL, " + request,
+                    answer="[Chorus]\nAn original refrain.",
+                )
+                generation.assert_awaited_once()
+                for prompt in (direct_prompt, generation.await_args.args[0]):
+                    self.assert_fresh_facts(prompt)
+                    for credit, state in (
+                        ("Test Artist A — A1 Loaded Only", "stage=completed"),
+                        ("Test Artist C — Waiting Song", "stage=queued"),
+                        ("Test Artist B — Removed Song", "stage=removed"),
+                    ):
+                        self.assertIn(credit, prompt)
+                        row = next(line for line in prompt.splitlines() if credit in line)
+                        self.assertIn(state, row)
+                        self.assertIn("actualPlayback=not_evidenced", row)
+                    self.assertIn("not proof of the complete show history", prompt)
+                previous.append(request)
+        self.assertTrue(all(call.kwargs.get("force") for call in self.fetch.call_args_list))
+
     async def test_explicit_public_show_correction_keeps_its_own_sources(self):
         self.seed((REQUEST, SONG))
         prompt, website = await self.direct("Instead, recap the public show on 2026-08-28.")

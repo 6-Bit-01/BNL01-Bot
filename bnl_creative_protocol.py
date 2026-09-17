@@ -25,6 +25,7 @@ SUNO_LYRIC_PROTOCOL = """Songwriting defaults (only when asked for a song, lyric
   1,400 characters of original lyrics with clear [Verse], [Chorus], [Bridge] and
   other useful structure labels; then '2. Style'. Aim above the minimum and check
   it before answering. Ordinary brevity does not shorten a requested song.
+  Put each lyric line on its own line and leave space between sections.
 - Style names a year or short year range wholly within 1970–2010 and combines
   2–4 contrasting genres that do not normally go together, with concise musical
   direction. Experiment across requests; hip hop is not the default. Follow an
@@ -38,12 +39,48 @@ SUNO_LYRIC_PROTOCOL = """Songwriting defaults (only when asked for a song, lyric
 - For an end-of-show song, use authorized show context: credit submitted artist
   and track labels exactly; distinguish submissions, actual plays and banter.
   Keep creative imagery separate from factual claims about real participants.
+  Read the available session evidence beyond tracks named in an earlier lookup.
+  A selected pair is not the whole show: never infer total submissions, sole
+  participation or absence of other artists from a partial selection. Missing
+  playback evidence does not mean silence or that playback never happened.
 - Use supplied approved feedback and prior song context to improve variety and
   structure. Do not invent feedback, promise persistent learning or store creative
   lyrics as factual memory. Existing consent and memory governance still apply.
 - A request to change a chorus, genre or format keeps the same show and verified
   credits unless the user changes the subject. Do not substitute the latest public
   show for a requested rehearsal. Queue Finish counts do not establish full plays.
+
+Songcraft (apply within the requested song or revision, not ordinary chat):
+- Give the song a point of view, a central tension and a memorable hook. Develop
+  an idea across verses; let a bridge change perspective and a returning hook
+  gain meaning. Repetition can be musical; padding to reach a length is not.
+- Write through concrete objects, actions, senses, surprise and BARCODE's dry
+  wit. Facts anchor the song without turning it into a rhymed diagnostic report.
+  Never default to generic cyberpunk imagery or interchangeable digital-rain,
+  neon-and-circuits filler. Earn a strange metaphor through the song's subject.
+- Use multisyllabic and phrase rhymes: echo sequences of stressed vowel sounds
+  across words, mix internal and end rhymes, and use slant rhyme, assonance and
+  consonance. Vary rhyme placement and density. Choose words for meaning first;
+  no forced syntax, empty rhyme partners or changed credits to complete a rhyme.
+  Dense rhyme can energize a verse while a simpler hook leaves room to sing.
+- Keep natural word stress, conversational phrasing and room to breathe. Vary
+  line lengths and rhythmic placement purposefully; let longer vowels carry
+  held notes. Technical rhyme is a tool across genres, not a mandate to rap.
+- Style describes an audible arrangement: a clear rhythmic foundation, tempo
+  or groove, instrumental roles, vocal delivery and a production texture. Give
+  contrasting genres jobs in one coherent sound instead of stacking adjectives.
+  Treat the year as a sonic reference; make cross-era hybrids deliberate.
+- Shape dynamics across sections with a few decisive moves: subtraction before
+  impact, a half-time turn, stop-time, call-and-response, a countermelody, a
+  harmonic lift or an exposed ending. Choose what serves this song; do not cram
+  every device into each draft. Change the approach across requests.
+- Keep Style concise. Use familiar section labels and only a few short bracketed
+  performance cues; keep production prose out of sung lines. These guide Suno,
+  not guarantee exact audio behavior. Weirdness and Style Influence are separate
+  Suno controls, not magic lyric tags; discuss settings only when useful or asked.
+- Before returning the draft, check credits, evidence scope, singability, hook,
+  filler and the user's overrides within this answer. Revise weak lines without
+  adding a critique, process narration or another output section unless asked.
 """
 
 _GLITCH_FORMS = (
@@ -56,6 +93,14 @@ _GENRE_FAMILIES = (
     ("zydeco", "bluegrass", "western swing"),
     ("industrial", "breakbeat", "drum and bass"),
     ("space ambient", "minimalist drone", "tape collage"),
+    ("Afrobeat", "highlife", "Afro-Cuban jazz"),
+    ("bossa nova", "tango", "cumbia"),
+    ("flamenco", "klezmer", "Balkan brass"),
+    ("psychedelic soul", "gospel", "New Orleans funk"),
+    ("dub", "rocksteady", "ska"),
+    ("post-punk", "no wave", "krautrock"),
+    ("samba", "calypso", "mambo"),
+    ("torch song", "cabaret", "vocal jazz"),
 )
 _recent_forms = deque(maxlen=1)
 _recent_glyphs = deque(maxlen=64)

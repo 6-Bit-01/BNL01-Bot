@@ -65,6 +65,7 @@ class ShowCreativeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Never perform a glitch", prompt)
         self.assertIn("approved feedback", prompt)
         self.assertIn("Optional variation", prompt)
+        self.assertIn(protocol.SUNO_LYRIC_PROTOCOL, prompt)
         chunks = bot.split_message(result)
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk) <= 1900 for chunk in chunks))
@@ -85,6 +86,7 @@ class ShowCreativeProtocolTests(unittest.IsolatedAsyncioTestCase):
         prompt = provider.call_args.args[0]
         self.assertIn(request, prompt)
         self.assertIn("explicit user genre, era, format or length override", prompt)
+        self.assertIn(protocol.SUNO_LYRIC_PROTOCOL, prompt)
         self.assertIn("Optional variation", prompt)
         hint = next(line for line in prompt.splitlines() if line.startswith("Optional variation"))
         self.assertNotIn("drawing from", hint)
@@ -101,6 +103,9 @@ class ShowCreativeProtocolTests(unittest.IsolatedAsyncioTestCase):
             result = await bot.get_gemini_response("Make it less repetitive.", 7, 1)
         self.assertEqual(result, answer)
         provider.assert_awaited_once()
+        # The existing prompt carries craft guidance even when feedback does
+        # not repeat "song" or "Suno". There is no extra critic/provider call.
+        self.assertIn(protocol.SUNO_LYRIC_PROTOCOL, provider.call_args.args[0])
 
     async def test_packet_envelope_remains_untouched(self):
         envelope = '{"response_text":"[Chorus]\\nA clean line.","support":[]}'
