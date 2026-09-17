@@ -196,9 +196,21 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             lane='background', max_output_tokens=2048, legacy_thinking_budget=512,
             provider_retries=0, allow_fallback=False,
         )
-    if normalized_route in {"ordinary_chat_single_packet_canary", "broadcast_ballad_manual"}:
-        # Direct chat and producer-requested writing each use one physical
-        # attempt: no retry multiplication and no model fallback.
+    if normalized_route in {"broadcast_ballad_manual", "broadcast_ballad_background"}:
+        # A full song plus metadata and model thinking needs its own allowance.
+        # Existing token/dollar reservations price this bound before one call.
+        return GeminiRoutePolicy(
+            lane=lane,
+            max_output_tokens=_bounded_env_int(
+                "BNL_GEMINI_BALLAD_MAX_OUTPUT_TOKENS", 16_384,
+                minimum=4_096, maximum=32_768,
+            ),
+            legacy_thinking_budget=2_048,
+            provider_retries=0, allow_fallback=False,
+            showday_protected=normalized_route == "broadcast_ballad_background",
+        )
+    if normalized_route == "ordinary_chat_single_packet_canary":
+        # Direct chat uses one physical attempt, without model fallback.
         return GeminiRoutePolicy(
             lane=lane,
             max_output_tokens=_bounded_env_int(

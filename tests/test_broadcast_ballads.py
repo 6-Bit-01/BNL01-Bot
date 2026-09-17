@@ -5,7 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from bnl_broadcast_ballads import execute_command, versions, creative_history, route_for_command, parse_draft, PROMPT_VERSION, ROUTE, MANUAL_ROUTE
+from bnl_broadcast_ballads import (
+    execute_command, versions, creative_history, route_for_command, parse_draft,
+    BalladGeneration, PROMPT_VERSION, ROUTE, MANUAL_ROUTE,
+)
 from bnl_gemini_routing import policy_for_route
 
 
@@ -83,6 +86,104 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt["version"]["lyrics"], self.generate.return_value)
         self.assertEqual(receipt["version"]["rawOutput"], self.generate.return_value)
         self.generate.assert_awaited_once()
+
+    async def test_interrupted_json_recovers_readable_fields_and_replays_without_retry(self):
+        raw = '{"title":"Last Light","lyrics":"[Verse]\\nA warm light waits.\\n[Chorus]\\nLeave a'
+        self.generate.return_value = BalladGeneration(raw, "MAX_TOKENS")
+        with self.assertLogs(level="INFO") as logs:
+            receipt = await self.run_command()
+        draft = receipt["version"]
+        self.assertEqual(draft["title"], "Last Light")
+        self.assertEqual(draft["lyrics"], "[Verse]\nA warm light waits.\n[Chorus]\nLeave a")
+        self.assertEqual(draft["rawOutput"], raw)
+        self.assertEqual(draft["generationStatus"], "incomplete")
+        self.assertEqual(draft["finishReason"], "MAX_TOKENS")
+        self.assertIn("Incomplete response", draft["note"])
+        self.assertFalse(draft["style"])
+        self.assertFalse(any(draft["linerNotes"].values()))
+        self.assertIn("status=incomplete finish_reason=MAX_TOKENS", " ".join(logs.output))
+        self.assertNotIn("A warm light", " ".join(logs.output))
+        self.assertEqual(await self.run_command(), receipt)
+        self.generate.assert_awaited_once()
+        restored = await self.run_command({**self.command, "id": "restore-2", "kind": "restore",
+                                          "baseVersion": "draft-1", "restoreVersion": "draft-1"})
+        self.assertEqual(restored["version"]["generationStatus"], "incomplete")
+        self.assertEqual(restored["version"]["note"], draft["note"])
+
+    def test_interruption_at_each_escaped_lyric_character_preserves_only_received_text(self):
+        lyrics = '[Verse]\nA "style": "echo" sings café 🎵 along the C:\\road.\n[Outro]\nHome.'
+        prefix = '{"title":"Last Light","style":"Chamber soul","lyrics":'
+        encoded = json.dumps(lyrics, ensure_ascii=True)
+        for length in range(2, len(encoded)):
+            raw = prefix + encoded[:length]
+            with self.subTest(cut=length):
+                draft = parse_draft(raw, "2026-09-11")
+                self.assertTrue(lyrics.startswith(draft["lyrics"]))
+                self.assertEqual(draft["title"], "Last Light")
+                self.assertEqual(draft["style"], "Chamber soul")
+                self.assertEqual(draft["generationStatus"], "incomplete")
+                draft["lyrics"].encode("utf-8")  # no broken surrogate escapes
+        draft = parse_draft(prefix + encoded + '}', "2026-09-11", "STOP")
+        self.assertEqual(draft["lyrics"], lyrics)
+        self.assertEqual(draft["generationStatus"], "complete")
+
+    def test_cutoff_in_nested_notes_and_fenced_output_keeps_available_fields(self):
+        raw = '```json\n{"title":"Light","lyrics":"Leave a light.","style":"Soul",' \
+              '"linerNotes":{"about":"A late goodbye.","inspiration":"I kept the'
+        draft = parse_draft(raw, "2026-09-11")
+        self.assertEqual(draft["lyrics"], "Leave a light.")
+        self.assertEqual(draft["linerNotes"]["about"], "A late goodbye.")
+        self.assertEqual(draft["linerNotes"]["inspiration"], "I kept the")
+        self.assertEqual(draft["linerNotes"]["mentions"], "")
+        self.assertEqual(draft["generationStatus"], "incomplete")
+
+    def test_valid_json_still_warns_when_provider_reports_output_limit(self):
+        draft = parse_draft(self.generate.return_value, "2026-09-11", "MAX_TOKENS")
+        self.assertEqual(draft["generationStatus"], "incomplete")
+        self.assertIn("Polish saved draft", draft["note"])
+
+    async def test_unusable_json_is_a_visible_format_failure_without_overwriting_or_retry(self):
+        original = (await self.run_command())["version"]
+        command = {**self.command, "id": "broken-2", "baseVersion": original["id"]}
+        self.generate.return_value = '{"title":"Light","style":"Soul'
+        result = await self.run_command(command)
+        self.assertEqual(result["error"], "incomplete_response_without_lyrics_try_manually")
+        self.assertEqual(await self.run_command(command), result)
+        self.assertEqual(versions(self.db, 77, "show-1"), [original])
+        self.assertEqual(self.generate.await_count, 2)
+
+    async def test_polish_recovers_legacy_json_fallback_without_mutating_saved_version(self):
+        original = (await self.run_command())["version"]
+        raw = '{"title":"Last Light","lyrics":"[Verse]\\nA warm light waits.\\n[Chorus]\\nLeave a'
+        # Emulate the old parser's saved fallback, without rewriting on deploy.
+        original.update(title="Broadcast Ballad 2026-09-11", lyrics=raw, rawOutput=raw, style="",
+                        linerNotes={}, note="Original output preserved.", promptVersion="broadcast-ballad-4")
+        original.pop("generationStatus", None)
+        original.pop("finishReason", None)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE bnl_ballad_versions SET document=?", (json.dumps(original),))
+        command = {**self.command, "id": "polish-2", "kind": "polish", "baseVersion": original["id"]}
+        result = await self.run_command(command)
+        prompt = self.generate.await_args.args[0]
+        revision = json.loads(prompt.split("EXISTING DRAFT (only revise if requested):\n", 1)[1]
+                              .split("\nWRITING REMINDER:", 1)[0])
+        self.assertEqual(revision["title"], "Last Light")
+        self.assertEqual(revision["lyrics"], "[Verse]\nA warm light waits.\n[Chorus]\nLeave a")
+        self.assertIn("finish the interrupted ending", prompt)
+        self.assertIn("Do not start a new composition", prompt)
+        self.assertEqual(versions(self.db, 77, "show-1")[0], original)
+        self.assertEqual(await self.run_command(command), result)
+        self.assertEqual(self.generate.await_count, 2)
+
+    async def test_polish_does_not_replace_producer_edits_with_legacy_raw_response(self):
+        original = (await self.run_command())["version"]
+        original["rawOutput"] = '{"title":"Different","lyrics":"Wrong prior text'
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE bnl_ballad_versions SET document=?", (json.dumps(original),))
+        await self.run_command({**self.command, "id": "polish-2", "kind": "polish", "baseVersion": original["id"]})
+        prompt = self.generate.await_args.args[0]
+        self.assertNotIn("Wrong prior text", prompt)
+        self.assertIn(json.dumps(original["lyrics"])[1:-1], prompt)
 
     async def test_edit_restore_and_conflict_preserve_history(self):
         original = (await self.run_command())["version"]

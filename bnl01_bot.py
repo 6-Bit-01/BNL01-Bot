@@ -474,7 +474,11 @@ from discord import app_commands
 from discord.ext import tasks
 from google import genai
 
-from bnl_broadcast_ballads import execute_command as execute_ballad_command, ROUTE as BALLAD_ROUTE, route_for_command as ballad_route_for_command
+from bnl_broadcast_ballads import (
+    execute_command as execute_ballad_command, ROUTE as BALLAD_ROUTE,
+    MANUAL_ROUTE as BALLAD_MANUAL_ROUTE, route_for_command as ballad_route_for_command,
+    BalladGeneration, response_schema as ballad_response_schema,
+)
 from bnl_tiktok_show_ledger import build_broadcast_ballad_evidence
 
 from bnl_gemini_routing import (
@@ -740,6 +744,7 @@ class GenerationResult:
     cached_tokens: int = 0
     estimated_cost_nanos: int = 0
     cost_priced: bool = False
+    finish_reason: str = "unknown"
 
 
 @dataclass
@@ -31399,6 +31404,14 @@ async def add_contextual_reaction(message: discord.Message) -> bool:
 
 # ==================== GEMINI API INTERACTION ====================
 
+def _gemini_finish_reason(response):
+    candidates = getattr(response, "candidates", None)
+    candidate = candidates[0] if candidates else None
+    finish = getattr(candidate, "finish_reason", None)
+    finish = str(getattr(finish, "value", finish) or "unknown")
+    return finish if re.fullmatch(r"[A-Z_]{1,40}", finish) else "unknown"
+
+
 def _extract_text_and_tokens(response):
     try:
         cand0 = response.candidates[0] if response and response.candidates else None
@@ -31410,12 +31423,9 @@ def _extract_text_and_tokens(response):
             if isinstance(getattr(part, "text", None), str)
             and getattr(part, "thought", False) is not True
         )
-        finish = getattr(cand0, "finish_reason", None)
-        finish = str(getattr(finish, "value", finish) or "unknown")
-        finish = finish if re.fullmatch(r"[A-Z_]{1,40}", finish) else "unknown"
         logging.info(
             "gemini_response_shape finish_reason=%s parts=%s text_chars=%s",
-            finish, len(parts or ()), len(text),
+            _gemini_finish_reason(response), len(parts or ()), len(text),
         )
         usage = getattr(response, "usage_metadata", None)
         tokens = getattr(usage, "total_token_count", None) if usage else None
@@ -31444,6 +31454,9 @@ def _generation_config_for_model(
     }
     if route == 'moment_meaning_background':
         config_kwargs['response_mime_type'] = 'application/json'
+    if route in {BALLAD_ROUTE, BALLAD_MANUAL_ROUTE}:
+        config_kwargs['response_mime_type'] = 'application/json'
+        config_kwargs['response_schema'] = ballad_response_schema()
     normalized_model = str(model_name or "").lower()
     if "gemini-2.5" in normalized_model:
         legacy_budget = min(
@@ -31521,6 +31534,7 @@ async def _generate_gemini_content_result_async(
                 int(cost_estimate.estimated_cost_nanos or 0),
             ),
             "cost_priced": bool(cost_estimate.priced),
+            "finish_reason": _gemini_finish_reason(response),
         }
         elapsed = time.monotonic() - started
         if not text:
@@ -35983,7 +35997,7 @@ async def _run_ballad_control_cycle():
                         reason = result.provider_error_code or GENERATION_ERROR_LOCAL_MODEL_BUDGET
                         raise ValueError(f"budget_restricted:{reason}")
                     raise ValueError("generation_unavailable_try_manually")
-                return result.text
+                return BalladGeneration(result.text, result.finish_reason)
 
             evidence = await asyncio.to_thread(
                 build_broadcast_ballad_evidence, DB_FILE, BNL_PRIMARY_GUILD_ID, command["showId"],

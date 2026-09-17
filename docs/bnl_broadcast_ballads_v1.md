@@ -1,5 +1,74 @@
 # BNL Broadcast Ballads v1
 
+## Complete response fields and prompt revision 5
+
+The September 17 revision-4 audition returned an unfinished JSON string. The
+old fallback saved the whole response as lyrics, including escaped newlines,
+and substituted the dated title. Style and track-story fields after the cutoff
+were never received. The supplied evidence proves incomplete output; it does
+not contain the provider's finish reason, so token exhaustion is not confirmed
+for that particular call. The site accepts substantially longer lyrics; this
+failure is in response generation/parsing, not its textarea length.
+
+`broadcast-ballad-5` retains revision 4's songwriting guidance. Both Ballad
+routes now request `application/json` with the existing Google SDK's
+`response_schema`. The required keys are ordered `title`, `style`, `palette`,
+`linerNotes`, `lyrics`, keeping short track fields ahead of the long lyric.
+Palette and the four track-story keys are also required strings; empty strings
+remain allowed when there is no supported information. See Google's
+[structured output documentation](https://ai.google.dev/gemini-api/docs/structured-output).
+No second model call writes the notes.
+
+Ballads have their own 16,384-token response allowance, replacing the generic
+4,096-token allowance. `BNL_GEMINI_BALLAD_MAX_OUTPUT_TOKENS` can override it
+within 4,096–32,768. Existing reservations include this larger upper bound;
+daily/monthly dollar limits, token ceilings, billing buffer and protected
+reserves still apply. Actual spend can increase for longer responses. Manual
+and automatic priorities remain distinct, with one provider attempt and no
+fallback, automatic completion or retry. Other routes keep their settings.
+
+Interrupted JSON with usable lyrics is decoded into readable fields without
+inventing missing words. Complete escaped characters survive; partial escapes
+are left out of the displayed text. The full original response stays in that
+immutable version's `rawOutput`. A visible note explains the incomplete draft
+and the manual completion action. `generationStatus` and `finishReason` record
+the technical result; `MAX_TOKENS` marks a draft incomplete even if the JSON
+closed. Plain-text songs remain usable. An object with no recoverable lyrics
+returns a visible format failure, leaving prior versions intact. Missing or
+malformed optional track notes still do not reject usable lyrics.
+
+Deployment does not change old versions. For the affected existing song,
+**Polish saved draft** recognizes the old raw-JSON fallback, recovers its title
+and readable lyrics in the prompt, and asks to finish the ending and fill Style
+and track notes while preserving the existing wording. This uses one explicit
+generation and creates a new version; neither the original nor any selected
+recording is replaced. Missing words cannot be recovered byte-for-byte because
+they were not received. Producer edits are not replaced with older raw output.
+
+No site code change or data migration is needed. After merging and deploying
+the bot, select the affected show's latest draft, use Polish saved draft once,
+and verify title, actual lyric line breaks, the final section, separate Style,
+and Track story & people for the new version. Optional recording metadata
+(Suno URL/model/settings or artwork) is still entered by the producer.
+
+The content-free log below identifies the actual new generation, unlike an
+installed-file check. Expect `prompt_version=broadcast-ballad-5`,
+`status=complete`, `finish_reason=STOP`, nonzero lyric/Style counts and the
+applicable track notes. An `incomplete` status remains visible and must not be
+treated as a finished song. A blank note can be appropriate where no person is
+mentioned; it must not be fabricated just to fill a field.
+
+```bash
+sudo journalctl -u bnl01 --since "10 minutes ago" --no-pager \
+  --grep='ballad_draft_saved' -n 5
+```
+
+Focused regressions cover long complete structured responses through the real
+worker with a fake provider, cutoff at escaped lyric characters, nested notes,
+provider finish status, old-draft Polish, unchanged prior versions, receipt
+replay, route reservations and unrelated output formats. These offline checks
+do not establish live model completion or the next song's artistic quality.
+
 ## Verse craft and prompt revision 4
 
 `broadcast-ballad-4` responds to a live draft that still relied on simple end
