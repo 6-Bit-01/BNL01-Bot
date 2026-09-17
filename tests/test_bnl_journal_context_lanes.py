@@ -154,7 +154,7 @@ class JournalContextLaneTests(unittest.TestCase):
                 for index in range(sections)
             ],
             "sourceRefIds": {
-                (heading if index == 0 else f"Another Thread {index}"): [fresh_ref]
+                (heading if index == 0 else f"Another Thread {index}"): list(dict.fromkeys([fresh_ref] + [source["refId"] for source in packet["safeSources"]]))
                 for index in range(sections)
             },
             "metadata": {
@@ -333,6 +333,8 @@ class JournalContextLaneTests(unittest.TestCase):
             basis=basis,
         )
         wrong_section_basis["sourceRefIds"]["What BNL Made of It"] = [unrelated_ref]
+        wrong_section_basis["sections"].append({"heading": "Separate Evidence", "body": _long_body("A producer shared a chorus.")})
+        wrong_section_basis["sourceRefIds"]["Separate Evidence"] = [source["refId"] for source in packet["safeSources"]]
         self.assertEqual("invalid_context_use", journal.validate_article(wrong_section_basis, packet, []))
 
         second_fresh_ref = rumor["evidence"][1]["sourceRefId"]
@@ -344,6 +346,8 @@ class JournalContextLaneTests(unittest.TestCase):
             basis=[rumor["laneRefId"], fresh_ref, second_fresh_ref],
         )
         partial_section_basis["sourceRefIds"]["What BNL Made of It"] = [fresh_ref]
+        partial_section_basis["sections"].append({"heading": "Separate Evidence", "body": _long_body("A producer shared a chorus.")})
+        partial_section_basis["sourceRefIds"]["Separate Evidence"] = [source["refId"] for source in packet["safeSources"]]
         self.assertEqual("invalid_context_use", journal.validate_article(partial_section_basis, packet, []))
 
         scattered_claim = self.article(
@@ -398,7 +402,7 @@ class JournalContextLaneTests(unittest.TestCase):
             packet, claim, lane_type="established_broadcast_memory",
             lane_ref=memory["laneRefId"], basis=[memory["laneRefId"], fresh_ref],
         )
-        candidate["sections"][0]["sourceRefIds"] = [fresh_ref]
+        candidate["sections"][0]["sourceRefIds"] = [source["refId"] for source in packet["safeSources"]]
         del candidate["sourceRefIds"]
         candidate["metadata"]["continuityNotes"] = ["Fictional continuity " * 6] * 60
         candidate["metadata"]["contextUses"] = []

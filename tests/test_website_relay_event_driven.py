@@ -14,6 +14,24 @@ import bnl_website_relay_state as state
 
 
 class WebsiteRelayEventDrivenTests(unittest.TestCase):
+    def test_fresh_and_continuity_reads_honor_shared_memory_public_eligibility(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("ALTER TABLE conversations ADD COLUMN public_usable INTEGER DEFAULT 1")
+            conn.execute("ALTER TABLE conversations ADD COLUMN visibility TEXT DEFAULT 'public_safe'")
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("A fictional producer shared a brighter chorus revision.")
+        self.add_row("UnusableMarker describes a private unreleased arrangement.")
+        self.add_row("HiddenMarker describes a separate private musical experiment.")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE conversations SET public_usable=0 WHERE content LIKE 'UnusableMarker%'")
+            conn.execute("UPDATE conversations SET visibility='private' WHERE content LIKE 'HiddenMarker%'")
+        rows, _cursor, _reason = asyncio.run(bnl01_bot._fetch_fresh_public_relay_rows(42))
+        self.assertEqual(1, len(rows))
+        continuity = bnl01_bot._select_relay_safe_continuity_source(42, 0, 3)
+        self.assertIsNotNone(continuity)
+        self.assertNotIn("UnusableMarker", continuity.context)
+        self.assertNotIn("HiddenMarker", continuity.context)
+
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(delete=False)
         self.tmp.close()

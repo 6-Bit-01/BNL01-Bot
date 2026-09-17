@@ -316,7 +316,7 @@ class JournalAutomationTests(unittest.TestCase):
         self.assertEqual(2, len(calls))
         self.assertTrue(
             all(
-                "Write 1-3 sections and 250-500 total words; prefer 2 sections and roughly 300-420 words."
+                "Write 1-3 sections and 250-500 total words."
                 in prompt
                 for prompt in calls
             )

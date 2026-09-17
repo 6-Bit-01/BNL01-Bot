@@ -59,12 +59,12 @@ class JournalTests(unittest.TestCase):
     def packet(self):
         return j.build_source_packet(self.db, 1, 24, '2026-07-18T01:00:00Z')
 
-    def test_source_policy_public_usable_user_authored_and_anonymized(self):
+    def test_source_policy_public_usable_user_authored_and_public_names(self):
         packet = self.packet()
         self.assertEqual(len([s for s in packet['privateSources'] if s['sourceKind'] == 'conversation']), 2)
         prompt = j.build_generation_prompt(packet)
         self.assertIn('"sourceKind": "conversation"', prompt)
-        self.assertNotIn('KnownUser', prompt)
+        self.assertIn('KnownUser', prompt)
         self.assertNotIn('discord_user:7', prompt)
         self.assertNotIn('relationship_journal', json.dumps(packet))
         self.assertNotIn('secret internal', json.dumps(packet))
@@ -262,7 +262,7 @@ class JournalTests(unittest.TestCase):
     def test_validation_rejects_names_refs_urls_mentions_and_ids(self):
         packet = self.packet(); good = j.parse_generated_json(article_json(packet))
         self.assertEqual('', j.validate_article(good, packet, []))
-        for leak, reason in [(' KnownUser', 'community_name_leak'), (' fresh:101', 'source_ref_leak'), (' https://x.test', 'public_leak_pattern'), (' @KnownUser', 'public_leak_pattern'), (' 1234567890123', 'public_leak_pattern')]:
+        for leak, reason in [(' fresh:101', 'source_ref_leak'), (' https://x.test', 'public_leak_pattern'), (' @KnownUser', 'public_leak_pattern'), (' 1234567890123', 'public_leak_pattern')]:
             bad = j.parse_generated_json(article_json(packet, title='Unique ' + reason, leak=leak))
             self.assertEqual(reason, j.validate_article(bad, packet, []), leak)
 

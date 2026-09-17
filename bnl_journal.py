@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import urllib.error
@@ -36,6 +37,7 @@ STATES = {
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
 JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
+JOURNAL_EDITORIAL_VERSION = "journal-public-voices-1"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
 JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT = 200
@@ -2762,6 +2764,92 @@ def sanitize_source_summary(text: str, names: Optional[list[str]] = None, *, lim
     return re.sub(r"\s+", " ", clean).strip()[:max(1, int(limit))]
 
 
+def _confirmed_journal_nickname(conn: sqlite3.Connection, guild_id: int, user_id: int) -> str:
+    """Use the existing member-fact authority, never a source-blind profile guess."""
+    required = {
+        "id", "guild_id", "user_id", "fact_key", "fact_value", "lifecycle_status",
+        "source_directed", "source_kind", "source_conversation_row_id",
+        "source_channel_policy", "source_control_ref", "updated_at",
+    }
+    if not required <= _cols(conn, "user_memory_facts"):
+        return ""
+    rows = conn.execute("""
+        SELECT fact_value FROM user_memory_facts
+        WHERE guild_id=? AND user_id=? AND fact_key='preferred_name'
+          AND lifecycle_status='active' AND source_directed=1
+          AND ((source_kind IN ('member_self_report','member_correction')
+                AND source_conversation_row_id>0
+                AND source_channel_policy IN ('public_home','public_context'))
+            OR (source_kind='member_control' AND source_channel_policy='member_control'
+                AND TRIM(COALESCE(source_control_ref,''))<>''))
+        ORDER BY updated_at DESC,id DESC
+    """, (guild_id, user_id)).fetchall()
+    from bnl_memory_governance import _normalize_member_scalar_control_value
+    for row in rows:
+        name = _public_journal_name(_normalize_member_scalar_control_value("preferred_name", row[0]))
+        if name:
+            return name
+    return ""
+
+
+def _public_journal_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if not name or len(name) > 40 or any(c in name for c in "\n\r<>@`"):
+        return ""
+    if _PUBLIC_LEAK_RE.search(name) or re.search(r"\b(?:system|developer|instructions?)\s*:", name, re.I):
+        return ""
+    return name
+
+
+def _journal_public_people(
+    conn: sqlite3.Connection, guild_id: int, sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve only authors of eligible public Discord evidence, by stable ID."""
+    by_subject: dict[str, dict[str, Any]] = {}
+    for source in sorted(sources, key=lambda s: str(s.get("observedAt") or "")):
+        subject = str(source.get("subjectRef") or "")
+        if (
+            source.get("sourceKind") != "conversation"
+            or source.get("channelPolicy") not in PUBLIC_POLICIES
+            or source.get("conversationSurface", "discord") != "discord"
+            or not re.fullmatch(r"discord_user:[0-9]+", subject)
+        ):
+            continue
+        by_subject[subject] = source
+    people = []
+    for subject, source in by_subject.items():
+        user_id = subject.split(":", 1)[1]
+        owner = user_id == str(os.getenv("BNL_OWNER_USER_ID", "")).strip()
+        nickname = "" if owner else _confirmed_journal_nickname(conn, guild_id, int(user_id))
+        public_name = "6 Bit" if owner else (nickname or _public_journal_name(source.get("displayName")))
+        if public_name:
+            people.append({
+                "subjectRef": subject,
+                "participantAlias": "participant-" + _hash("journal-participant", guild_id, subject)[:8],
+                "publicName": public_name,
+                "nameBasis": "public_canon" if owner else ("confirmed_nickname" if nickname else "discord_display_name"),
+                "sourceRefIds": [s["refId"] for s in sources if s.get("subjectRef") == subject],
+            })
+    # A shared label is not an account link. Keep those authors separate and
+    # unnamed rather than assigning one member's story to their namesake.
+    return [p for p in people if sum(q["publicName"].casefold() == p["publicName"].casefold() for q in people) == 1]
+
+
+def journal_public_people_are_current(
+    conn: sqlite3.Connection, guild_id: int, people: list[dict[str, Any]],
+) -> bool:
+    """Recheck a chosen nickname before releasing an already prepared article."""
+    for person in people:
+        if person.get("nameBasis") != "confirmed_nickname":
+            continue
+        subject = str(person.get("subjectRef") or "")
+        if not re.fullmatch(r"discord_user:[0-9]+", subject):
+            return False
+        if _confirmed_journal_nickname(conn, guild_id, int(subject.split(":", 1)[1])) != person.get("publicName"):
+            return False
+    return True
+
+
 def _anon_ref(prefix: str, idx: int) -> str:
     return f"{prefix}:{idx}"
 
@@ -2801,10 +2889,11 @@ def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, en
                 "sourceKind": "conversation",
                 "messageId": int(row[0]),
                 "subjectRef": f"discord_user:{row[1]}",
-                "participantAlias": "participant-" + _hash("journal-participant", guild_id, row[1])[:8],
+                "participantAlias": "participant-" + _hash("journal-participant", guild_id, f"discord_user:{row[1]}")[:8],
                 "displayName": str(row[2] or "").strip(),
                 "channelPolicy": row[3],
                 "summary": summary,
+                "rawSummary": str(row[5] or ""),
                 "observedAt": row[6],
             })
     return out
@@ -2820,6 +2909,7 @@ def _source_for_prompt(source: dict[str, Any]) -> dict[str, Any]:
         "channelPolicy",
         "participantAlias",
         "conversationSurface",
+        "publicSpeakerName",
     }
     return {k: v for k, v in source.items() if k in allowed and v not in (None, "")}
 
@@ -3410,15 +3500,45 @@ def build_packet_from_sources(
         end=end,
         entry_kind=entry_kind,
     )
-    safe_sources = []
-    for source in private_sources:
-        safe_source = _source_for_prompt(source)
-        if "summary" in safe_source:
-            safe_source["summary"] = sanitize_source_summary(
-                str(safe_source.get("summary") or ""),
-                window_display_names,
-                limit=1000,
+    with sqlite3.connect(db_path) as conn:
+        people = _journal_public_people(conn, guild_id, private_sources)
+        identity_tokens = _journal_identity_tokens(conn, guild_id)
+    public_by_subject = {p["subjectRef"]: p for p in people}
+    replacements: dict[str, set[str]] = {}
+    for source in list(relays) + list(conversations):
+        name = str(source.get("displayName") or "").strip()
+        if name:
+            replacements.setdefault(name.casefold(), set()).add(
+                public_by_subject.get(source.get("subjectRef"), {}).get("publicName", "someone")
             )
+    for person in people:
+        replacements.setdefault(person["publicName"].casefold(), set()).add(person["publicName"])
+    literal_names = set(window_display_names + identity_tokens + [p["publicName"] for p in people])
+    patterns = [_identity_literal_pattern(name) for name in sorted(literal_names, key=len, reverse=True)]
+    pattern = re.compile("|".join(p.pattern for p in patterns if p), re.I) if patterns else None
+
+    def project_summary(text: str) -> str:
+        if pattern:
+            def replace_name(match: re.Match[str]) -> str:
+                choices = replacements.get(match.group().casefold(), set())
+                return next(iter(choices)) if len(choices) == 1 else "someone"
+            text = pattern.sub(replace_name, text)
+        text = re.sub(r"<@!?(\d+)>", lambda m: public_by_subject.get(
+            "discord_user:" + m.group(1), {}).get("publicName", "someone"), text)
+        return sanitize_source_summary(text, limit=1000)
+
+    safe_sources = []
+    private_sources = [dict(source) for source in private_sources]
+    for source in private_sources:
+        person = public_by_subject.get(source.get("subjectRef"))
+        if person:
+            source["publicSpeakerName"] = person["publicName"]
+            source["participantAlias"] = person["participantAlias"]
+        # The private archive retains original evidence. Only this public
+        # projection enters a frozen packet; raw text is not a second memory.
+        raw = source.pop("rawSummary", None)
+        source["summary"] = project_summary(str(raw if raw is not None else source.get("summary") or ""))
+        safe_source = _source_for_prompt(source)
         if safe_source.get("summary"):
             safe_sources.append(safe_source)
     counts = dict(aggregate_counts or {})
@@ -3435,6 +3555,8 @@ def build_packet_from_sources(
         "safeSources": safe_sources,
         "privateSources": private_sources,
         "privateWindowDisplayNames": window_display_names,
+        "privatePublicPeople": people,
+        "editorialVersion": JOURNAL_EDITORIAL_VERSION,
         "candidateTopicTags": list(journal_topic_counts(safe_sources, limit=30)),
         "aggregateCounts": counts,
         "coverageComplete": bool(coverage_complete),
@@ -3567,6 +3689,12 @@ def build_source_packet_between(
                     "subjectRef": subject_ref,
                     "participantAlias": "participant-" + _hash("journal-participant", guild_id, subject_ref)[:8] if subject_ref else "",
                     "displayName": str(event.get("private_display_name") or ""),
+                    "rawSummary": (
+                        str(event.get("raw_text") or event.get("sanitized_summary") or "")
+                        if event.get("source_kind") == "discord_message"
+                        and event.get("channel_policy") in PUBLIC_POLICIES
+                        else str(event.get("sanitized_summary") or "")
+                    ),
                     "channelPolicy": str(event.get("channel_policy") or ""),
                     "conversationSurface": (
                         "tiktok_live_chat"
@@ -3767,10 +3895,15 @@ def build_generation_prompt(
         "freshSources": safe_sources,
         "evidenceCoverageContract": coverage_contract,
         "editorialContract": {
-            "requiresFirstPersonReaction": len(safe_sources) >= 5,
-            "requiredBeatsAcrossEntry": ["concreteMoment", "peopleOrObservableRoles", "communityPattern", "bnlReaction"],
+            "version": JOURNAL_EDITORIAL_VERSION,
+            "requiresFirstPersonReaction": False,
+            "requiredBeatsAcrossEntry": [],
             "fixedSectionTemplate": False,
         },
+        "publicPeople": [
+            {key: person[key] for key in ("participantAlias", "publicName", "sourceRefIds")}
+            for person in packet.get("privatePublicPeople", [])
+        ],
         "history": _bounded_history_for_prompt(packet.get("history", {})),
         "aggregateCounts": packet.get("aggregateCounts", {}),
         "dailyObservations": packet.get("weeklyDailyPeriodContexts", packet.get("observationContext", []))[:6],
@@ -3789,11 +3922,7 @@ def build_generation_prompt(
     if low_activity:
         safe_packet["editorialContract"] = {
             "requiresFirstPersonReaction": False,
-            "requiredBeatsAcrossEntry": [
-                "verifiedHistoricalOrCanonGrounding",
-                "coherentReflection",
-                "bnlReaction",
-            ],
+            "requiredBeatsAcrossEntry": [],
             "fixedSectionTemplate": False,
             "sameVoiceAndQualityBar": True,
         }
@@ -3858,9 +3987,9 @@ def build_generation_prompt(
         else "\nNo optional context lane qualified for this window. Do not invent broadcast memory, rumors, or BNL theories. Return metadata.contextUses as an empty list."
     )
     beats_rule = (
-        "\nAcross the complete entry, build a grounded reflection with three natural beats: a verified historical, continuity, or canon detail; the larger community or musical pattern it genuinely supports; and one brief first-person BNL reaction. Do not invent a current-window moment or imply that a reflection-basis subject happened during this period. Do not label the beats or force them into a fixed section template."
+        "\nBuild a grounded reflection around a verified historical, continuity, or canon detail. Let the material determine its shape. Do not invent a current-window moment or imply that a reflection-basis subject happened during this period."
         if low_activity
-        else "\nAcross the complete entry, naturally include four beats: a concrete current-window moment; the people or observable roles who made it happen; a social, musical, or recurring community pattern; and one brief first-person BNL reaction. Blend them in any order and any combination. Do not label the beats or force them into a fixed section template."
+        else "\nChoose an editorial angle from the strongest concrete current-window evidence. A developing project, a funny exchange, a change in someone's work, or a contrast between moments can carry the entry. Let the evidence determine its shape; there is no required sequence of scene, community lesson, and BNL reaction. A pattern needs distinct supporting observations, not several retellings of one event."
     )
     daily_spine_rule = (
         "\nFor a low-activity daily entry, do not manufacture a relay chronology or Discord digest. A reflection may connect eligible historical, canon, or continuity material, but every claim about activity inside the current window must cite a fresh sourceRefId from that window."
@@ -3881,9 +4010,15 @@ def build_generation_prompt(
         )
     )
     people_rule = (
+        "\nUse the supplied publicPeople names and publicSpeakerName when they make an action clearer. These are public Discord names or confirmed chosen nicknames, linked to distinct participant aliases. Do not invent nicknames or resolve identities by similar names, topics, writing styles, or proximity. Never call people entities or organisms."
+        "\nKeep each person's contributions attached to that person's source refs. The speaker authored a message; they are not automatically the person described in it. Distinguish who proposed, made, tested, replied to, or merely mentioned something. An unresolved someone or they stays unresolved. A quoted joke or roleplay claim remains attributed banter, not verified conduct or a real policy violation."
+        "\nOnly the supplied public name may identify a member. Historical anonymous memories do not inherit a current person's name merely because the subject matches. Do not force a roll call; preserve the people who actually matter to this story."
+        if packet.get("editorialVersion") == JOURNAL_EDITORIAL_VERSION
+        else (
         "\nKeep historical community members anonymous. Use a role such as producer, listener, or artist only when the cited reflection basis establishes it. Named approved-canon subjects may retain their supplied canon names. Never invent nicknames, honorifics, or a person acting in the current window."
         if low_activity
         else "\nDescribe anonymous humans with a concrete, recognizable action from their cited public message whenever possible, so a regular may recognize their own moment without being exposed. Use producer, listener, or artist only when that role is grounded; otherwise use a regular, a person in the room, or the room. Never call people entities or organisms. Do not invent nicknames or honorifics."
+        )
     )
     coverage_rule = (
         "\nThe evidenceCoverageContract remains mandatory for fresh evidence. Reflection-basis refs never count as fresh sources, current participants, current source kinds, or current-window segments. Every cited fresh or reflection ref must materially support its section."
@@ -3904,9 +4039,9 @@ def build_generation_prompt(
         )
     )
     quote_rule = (
-        "\nParaphrase reflection summaries. Do not turn a historical summary into dialogue or a quote. Use a direct quote only from an unusually valuable fresh public-safe source, cite it in that section, and keep the speaker anonymous."
+        "\nParaphrase reflection summaries. Do not turn a historical summary into dialogue or a quote. Use a direct quote only from an unusually valuable fresh public-safe source and cite it in that section. A publicPeople name is required to name its speaker."
         if low_activity
-        else "\nParaphrase source summaries by default. Use a direct quote only rarely, when one brief public-safe line is unusually worth preserving. Put quoted wording inside clear double quotation marks, cite its fresh source in that section, and keep the speaker anonymous."
+        else "\nParaphrase source summaries by default. Use a direct quote only rarely, when one brief public-safe line is unusually worth preserving. Put quoted wording inside clear double quotation marks and cite its fresh source in that section. A publicPeople name is required to name its speaker."
     )
     reflection_rule = (
         "\nLOW-ACTIVITY EVIDENCE RULE: This is the same Journal voice, prose standard, validator, and four-attempt generation path—not a fallback persona or a stock nothing-happened template. Use only supplied reflectionBasis records. Their stable reflection: refs are valid citations but never fresh evidence. Keep historical and canon tense explicit, preserve corrected canon, and never describe 6 Bit as BARCODE's music producer; the supplied corrected canon identifies GALAKNOISE as the producer."
@@ -3920,24 +4055,25 @@ def build_generation_prompt(
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
-        "\nWrite 1-3 sections and 250-500 total words; prefer 2 sections and roughly 300-420 words. Give every section a real narrative job instead of inventorying activity."
+        "\nWrite 1-3 sections and 250-500 total words. Choose the section count and length to suit this entry's material. Give every section a real narrative job instead of inventorying activity."
         "\nJOURNAL EDITORIAL OVERRIDE: For this route, a lived community chronicle takes priority over BNL's general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
         f"{beats_rule}"
         "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
         "\nFreely vary and combine scene reporting, named-canon color, dry archive notes, recognizable community detail, callbacks, restrained glitches, self-revision, and—only when qualified—the rumor desk. Do not reuse a stock cadence, signature line, or joke merely because an older entry used it."
         "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
         "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
-        "\nUse first person sparingly but genuinely. A BNL reaction may describe BNL's response without adding an external fact: I noticed, I admit, I found myself returning to it, I remain curious, or I may be developing a preference. Reserve I suspect, I think, and I wonder for a properly declared bnl_inference context use."
+        "\nBNL's personality can live in the selection, phrasing, dry humor, and point of view. A first-person reaction is welcome when it adds something, but is not required. Avoid repeating a stock confession or affectionate closing. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
         "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
         f"{daily_spine_rule}"
         f"{window_rule}"
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
+        "\nHistory is continuity evidence, not a prose template. Check its recent titles, openings, section shapes, and endings before writing; choose a different approach when they repeat. Avoid defaulting to a title listing three topics, two equal recap sections, and a warm moral at the end. These are creative directions, not quotas: do not manufacture events or discard good material to appear different."
         f"{people_rule}"
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
         f"{coverage_rule}"
         f"{section_source_rule}"
         f"{quote_rule}"
-        "\nKeep community members anonymous. Do not include URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
+        "\nDo not include URLs, Discord pings, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms. Public names do not authorize private details."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
         f"{cadence_rule}{context_rule}{reflection_rule}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
         f"{repair}"
@@ -4239,7 +4375,8 @@ def validate_article(
                 for match in _PUBLIC_LEAK_RE.finditer(text):
                     report(field, str(match.lastgroup), start=match.start(), end=match.end())
         return "public_leak_pattern"
-    names = set(approved_names or [])
+    names = {str(name).casefold() for name in (approved_names or [])}
+    names.update(str(person.get("publicName") or "").casefold() for person in packet.get("privatePublicPeople", []))
     private_names = {
         str(name or "").strip()
         for name in packet.get("privateWindowDisplayNames", [])
@@ -4250,8 +4387,11 @@ def validate_article(
         for src in packet.get("privateSources", [])
         if str(src.get("displayName") or "").strip()
     )
+    identity_check_text = public_text
+    for allowed_name in sorted(names, key=len, reverse=True):
+        identity_check_text = _replace_identity_literal(identity_check_text, allowed_name, "")
     for name in private_names:
-        if name and name not in names and _contains_identity_literal(public_text, name):
+        if name and name.casefold() not in names and _contains_identity_literal(identity_check_text, name):
             return "community_name_leak"
     if any(re.search(pattern, public_text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS):
         return "sensitive_personal_detail"
@@ -4260,13 +4400,6 @@ def validate_article(
         return "overly_clinical_voice"
     if not blocking_only and any(_REPORT_STYLE_OPENING_RE.search(str(section.get("body") or "")) for section in sections):
         return "flat_report_voice"
-    if not blocking_only and not low_activity and len(packet.get("safeSources", [])) >= 5 and not _BNL_REACTION_RE.search(
-        "\n".join(
-            _DIRECT_QUOTE_SPAN_RE.sub(" ", str(section.get("body") or ""))
-            for section in sections
-        )
-    ):
-        return "missing_bnl_reaction"
     context_contract = _context_lane_ref_contract(packet)
     section_text = {
         str(section.get("heading") or ""): str(section.get("body") or "")
@@ -4628,6 +4761,9 @@ def _draft_records(
         ]
     ))
     meta.update({
+        "editorialVersion": packet.get("editorialVersion", "legacy-anonymous"),
+        "publicPeople": [person for person in packet.get("privatePublicPeople", [])
+                         if set(person.get("sourceRefIds", [])) & _article_cited_refs(article)],
         "entryKind": packet.get("entryKind", "manual"),
         "publicWordCount": public_word_count(article),
         "sourceWindowStart": packet["sourceWindowStart"],
@@ -5170,6 +5306,15 @@ def deliver_approved(
     delivery_preflight: Optional[Callable[[sqlite3.Connection], str]] = None,
 ) -> JournalResult:
     ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        identity_row = conn.execute(
+            "SELECT metadata_json FROM bnl_journal_private_metadata WHERE guild_id=? AND entry_id=? "
+            + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"),
+            (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id),
+        ).fetchone()
+        identity_meta = json.loads(identity_row[0] or "{}") if identity_row else {}
+        if not journal_public_people_are_current(conn, guild_id, identity_meta.get("publicPeople", [])):
+            return JournalResult(False, "not_deliverable", "privacy_memory_ineligible", entry_id, int(revision or 0))
     if delivery_fence is not None:
         # Privacy/deletion writers share this narrow Journal fence. The main
         # SQLite transaction is deliberately released before the network wait,

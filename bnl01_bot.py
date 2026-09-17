@@ -6023,13 +6023,17 @@ async def _fetch_fresh_public_relay_rows(guild_id: int) -> tuple[list[tuple], in
     """Return only fresh eligible public Discord user rows newer than the relay cursor."""
     cursor_value = relay_get_cursor(DB_FILE, guild_id)
     with sqlite3.connect(DB_FILE) as conn:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(conversations)")}
+        eligibility = (" AND public_usable=1" if "public_usable" in columns else "")
+        eligibility += (" AND visibility IN ('public','public_safe')" if "visibility" in columns else "")
         cur = conn.cursor()
         cur.execute(
-            """
+            f"""
             SELECT COALESCE(MAX(id), 0)
             FROM conversations
             WHERE guild_id = ? AND role = 'user'
               AND channel_policy IN ('public_home', 'public_context', 'public_selective')
+              {eligibility}
             """,
             (guild_id,),
         )
@@ -6040,13 +6044,14 @@ async def _fetch_fresh_public_relay_rows(guild_id: int) -> tuple[list[tuple], in
             return [], highest, "bootstrap_no_publish"
         cutoff = (datetime.utcnow() - timedelta(minutes=BNL_WEBSITE_RELAY_FRESHNESS_MINUTES)).replace(microsecond=0).isoformat(sep=" ")
         cur.execute(
-            """
-            SELECT id, user_name, content, channel_policy, channel_name, timestamp
+            f"""
+            SELECT id, user_name, content, channel_policy, channel_name, timestamp, user_id
             FROM conversations
             WHERE guild_id = ? AND role = 'user'
               AND channel_policy IN ('public_home', 'public_context', 'public_selective')
+              {eligibility}
               AND id > ?
-              AND timestamp >= ?
+              AND datetime(timestamp) >= datetime(?)
             ORDER BY id DESC
             LIMIT 24
             """,
@@ -6127,12 +6132,16 @@ def _select_relay_safe_continuity_source(guild_id: int, cursor_value: int, highe
     """Return anonymized thematic continuity from recent eligible public rows only."""
     cutoff = (datetime.utcnow() - timedelta(hours=RELAY_CONTINUITY_FRESHNESS_HOURS)).replace(microsecond=0).isoformat(sep=" ")
     with sqlite3.connect(DB_FILE) as conn:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(conversations)")}
+        eligibility = (" AND public_usable=1" if "public_usable" in columns else "")
+        eligibility += (" AND visibility IN ('public','public_safe')" if "visibility" in columns else "")
         rows = conn.execute(
-            """
+            f"""
             SELECT id, user_id, user_name, content, channel_policy, timestamp
             FROM conversations
             WHERE guild_id=? AND role='user'
               AND channel_policy IN ('public_home','public_context','public_selective')
+              {eligibility}
               AND datetime(timestamp) >= datetime(?)
             ORDER BY id DESC LIMIT ?
             """,
@@ -6437,14 +6446,18 @@ async def generate_dynamic_website_relay(guild_id: int, *, allow_quiet_sources: 
         return await _generate_quiet_website_relay(guild_id, source_cursor=source_cursor, highest=source_cursor)
 
     messages = [str(r[2] or "").strip() for r in rows if str(r[2] or "").strip()]
-    unique_users = len({str(r[1] or "").strip().lower() for r in rows if str(r[1] or "").strip()})
+    # The same display name is not proof of the same person.
+    speakers = {str(r[6] if len(r) > 6 else r[1]) for r in rows}
+    unique_users = len(speakers)
+    speaker_aliases = {speaker: f"speaker_{index}" for index, speaker in enumerate(sorted(speakers), 1)}
     total_chars = sum(len(m) for m in messages)
     eligible_policies = sorted({str(r[3] or "").strip() for r in rows if str(r[3] or "").strip()})
     relay_context_lines = []
     for idx, r in enumerate(rows, start=1):
         content = clean_website_text(str(r[2] or ""))[:180]
         if content:
-            relay_context_lines.append(f"[fresh_public_message_{idx}]\npolicy: {r[3] or 'unknown_policy'}\nchannel: {r[4] or 'unknown'}\ncontent: {content}")
+            alias = speaker_aliases[str(r[6] if len(r) > 6 else r[1])]
+            relay_context_lines.append(f"[fresh_public_message_{idx}]\nspeaker: {alias}\npolicy: {r[3] or 'unknown_policy'}\nchannel: {r[4] or 'unknown'}\ncontent: {content}")
     relay_context = "\n\n".join(relay_context_lines)
     strength_messages = messages[-12:]
     context_is_strong, context_reason = _assess_relay_context_strength(strength_messages, relay_context, unique_users=unique_users, total_chars=sum(len(m) for m in strength_messages))
@@ -6462,6 +6475,7 @@ async def generate_dynamic_website_relay(guild_id: int, *, allow_quiet_sources: 
         "Write a BNL website relay only about the fresh eligible public Discord context supplied below.\n"
         "Return exactly two lines: public relay message, then operator directive.\n"
         "Line 1 public observation: describe one specific, materially supported event, pattern, question, or change from the fresh Discord context. Do not describe internal processing.\n"
+        "Speaker labels keep different people's contributions separate and must never appear publicly. A speaker mentioning another person did not necessarily perform that person's action. Keep jokes and roleplay attributed as banter; repeated retellings of one event do not establish a recurring pattern.\n"
         "Line 2 current directive: express a specific line of inquiry, follow-up posture, recognition target, or relevant invitation supported by that event. It must not fit every unrelated relay.\n"
         "Forbidden sources: queue state, read-model state, now-playing, up-next, queue counts, payment state, availability, and inferred site/runtime conditions.\n"
         "Radio, releases, dossiers, Transmissions, music, events, and other BARCODE subjects may be mentioned only when the supplied Discord context explicitly supports them. Do not infer live operational state.\n"

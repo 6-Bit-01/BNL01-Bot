@@ -169,7 +169,7 @@ class JournalLowActivityTests(unittest.TestCase):
         self.assertNotIn("a concrete current-window moment", prompt)
         self.assertEqual("", journal.validate_article(reflection_article(first), first, []))
 
-    def test_active_window_prompt_remains_byte_compatible(self):
+    def test_active_window_keeps_evidence_rules_without_fixed_editorial_shape(self):
         relays = [
             {
                 "refId": f"fresh:r{index}",
@@ -207,10 +207,9 @@ class JournalLowActivityTests(unittest.TestCase):
         self.assertNotIn("lowActivityMode", packet)
         self.assertNotIn("reflectionBasis", packet)
         self.assertNotIn("LOW-ACTIVITY EVIDENCE RULE", prompt)
-        self.assertEqual(
-            "ee42f35a6cceb13317a857635263ea710b12b066239affc30fccd40fcad69c85",
-            hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-        )
+        self.assertEqual(journal.JOURNAL_EDITORIAL_VERSION, packet["editorialVersion"])
+        self.assertNotIn("prefer 2 sections", prompt)
+        self.assertIn("evidenceCoverageContract is mandatory", prompt)
 
     def test_historical_projection_excludes_private_and_test_lanes_and_rechecks_deletion(self):
         public_seq = self.record(
