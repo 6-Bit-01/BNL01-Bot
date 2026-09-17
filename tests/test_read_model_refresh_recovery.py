@@ -1,6 +1,9 @@
 import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import threading
+import time
 import unittest
 import urllib.error
 from contextlib import ExitStack
@@ -70,6 +73,56 @@ class ReadModelRefreshRecoveryTests(unittest.TestCase):
         self.http.return_value = Response(payload or snapshot())
         return bnl01_bot.fetch_bnl_read_model(force=True)
 
+    def test_slow_private_rehearsal_read_delivers_verified_track_context(self):
+        from tests.test_rehearsal_read_model import REQUEST, rehearsal_model
+
+        payload = rehearsal_model()
+        payload["sections"]["queue"]["session"]["status"] = "archived"
+        body = json.dumps(payload).encode("utf-8")
+        received = []
+
+        class SlowReadModel(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append((self.path, self.headers.get("x-api-key")))
+                # The observed private feed took 3.54 seconds to send headers.
+                # Exercise actual socket waiting, not a mocked timeout value.
+                time.sleep(3.6)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), SlowReadModel) as server:
+            serving = threading.Thread(target=server.serve_forever, daemon=True)
+            serving.start()
+            self.http.side_effect = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+            ).open
+            try:
+                with mock.patch.object(
+                    bnl01_bot, "BNL_READ_MODEL_URL",
+                    f"http://127.0.0.1:{server.server_port}/api/bnl/read-model",
+                ), mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}):
+                    context = bnl01_bot.maybe_build_bnl_read_model_context(
+                        REQUEST, "sealed_test",
+                    )
+                self.assertIn("Test Artist B — B2 Complete", context)
+                self.assertIn("Test Artist B — B3 Partial Priority", context)
+                self.assertIn("status=archived", context)
+                self.assertIn("earlyCutoff=True", context)
+                self.assertEqual(received, [("/api/bnl/read-model", "test-service-key")])
+                self.http.assert_called_once()
+            finally:
+                server.shutdown()
+                serving.join(timeout=2)
+
     def test_forced_timeout_retains_same_scope_snapshot_without_extending_ttl(self):
         original = self.seed()
         original_time = bnl01_bot._bnl_read_model_cached_at
@@ -79,7 +132,7 @@ class ReadModelRefreshRecoveryTests(unittest.TestCase):
         self.assertEqual(bnl01_bot.fetch_bnl_read_model(force=True), original)
         request = self.http.call_args.args[0]
         self.assertEqual(request.get_header("Cache-control"), "no-cache")
-        self.assertEqual(self.http.call_args.kwargs["timeout"], 3)
+        self.assertEqual(self.http.call_args.kwargs["timeout"], 8)
         self.assertEqual(bnl01_bot._bnl_read_model_cached_at, original_time)
         self.advance(10)
         self.assertEqual(bnl01_bot.fetch_bnl_read_model(force=True), {})
@@ -90,11 +143,25 @@ class ReadModelRefreshRecoveryTests(unittest.TestCase):
         self.advance(19)
 
         def timeout_after_wait(*_args, **_kwargs):
-            self.advance(3)
+            self.advance(8)
             raise TimeoutError("test timeout")
 
         self.http.side_effect = timeout_after_wait
         self.assertEqual(bnl01_bot.fetch_bnl_read_model(force=True), {})
+
+    def test_exhausted_read_timeout_does_not_retry_or_invent_context(self):
+        from tests.test_rehearsal_read_model import REQUEST
+
+        def timeout_after_wait(*_args, **kwargs):
+            self.advance(kwargs["timeout"])
+            raise TimeoutError("test timeout")
+
+        self.http.side_effect = timeout_after_wait
+        with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}):
+            context = bnl01_bot.maybe_build_bnl_read_model_context(REQUEST, "sealed_test")
+        self.assertEqual(context, "")
+        self.http.assert_called_once()
+        self.assertIsNone(bnl01_bot._bnl_read_model_cache)
 
     def test_successful_forced_refresh_replaces_snapshot(self):
         self.seed()

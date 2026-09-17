@@ -2030,6 +2030,9 @@ _bnl_control_flags_has_remote_snapshot = False
 _bnl_control_flags_404_warned = False
 _bnl_control_flags_last_source_url = None
 BNL_READ_MODEL_TTL_SECONDS = 20
+# The authenticated feed can take more than three seconds to send headers.
+# Allow that response to arrive without retries or extending snapshot freshness.
+BNL_READ_MODEL_TIMEOUT_SECONDS = 8
 _bnl_read_model_cache = None
 _bnl_read_model_cached_at = None
 _bnl_read_model_cache_scope = None
@@ -2264,7 +2267,7 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
         headers["x-api-key"] = api_key
     req = urllib.request.Request(source_url, method="GET", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=3) as response:
+        with urllib.request.urlopen(req, timeout=BNL_READ_MODEL_TIMEOUT_SECONDS) as response:
             code = getattr(response, "status", None) or response.getcode()
             if not (200 <= code < 300):
                 logging.warning("bnl_read_model_fetch_failed reason=http_status")

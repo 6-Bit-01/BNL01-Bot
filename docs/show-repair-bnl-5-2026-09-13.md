@@ -1,5 +1,37 @@
 # Show repairs, package 5: creative behavior and broadcast credits
 
+## September 16 deployed lookup transport repair
+
+After #552 was deployed, the explicit rehearsal lookup returned unavailable.
+The first read-only VPS probe timed out using the bot's three-second socket
+timeout. A second authenticated request with a longer diagnostic timeout
+returned HTTP 200: headers arrived after 3.54 seconds, the 1,276,268-byte body
+finished after 3.74 seconds, and the private feed contained the archived
+`BARCODE Radio [09-15-2026]` rehearsal and both B2/B3 tracks. The earlier reply
+logs were not recovered, so this establishes a reproducible transport failure,
+not an exact historical trace of those model calls.
+
+The existing fetch owner now uses an eight-second socket timeout. It makes
+one request, accepts fast responses immediately, and retains the original
+20-second cache freshness, authentication, revocation and channel boundaries.
+There is no retry, new configuration, new store or new publication path. A
+stalled socket may now wait five seconds longer before the existing failure
+handling applies; this is a per-operation socket timeout, not a total request
+deadline. Queue/session data and all production gates remain unchanged.
+
+A real loopback HTTP regression delays headers for 3.6 seconds and passes an
+archived private rehearsal through the normal fetch and prompt-context owners.
+It fails against the prior three-second timeout and succeeds with this repair,
+delivering submitted credits and partial-playback evidence in one request.
+The exhausted-timeout test confirms that missing evidence is neither retried
+nor invented; existing cache-expiry, revocation and creative-continuity tests
+remain required.
+
+Live acceptance remains open. After merge and deployment, resume the existing
+private rehearsal lookup, then the unfinished song, feedback and clean-lyrics
+checks. Revert only this transport change to roll back; no data restoration or
+configuration change is needed.
+
 ## September 16 follow-through repair on #551
 
 The earlier implementation below did not complete creative acceptance. The
