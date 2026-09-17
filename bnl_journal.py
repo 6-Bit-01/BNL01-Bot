@@ -40,7 +40,7 @@ JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
 JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
 JOURNAL_EDITORIAL_VERSION = "journal-public-voices-1"
-JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-1"
+JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-2"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
 JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT = 200
@@ -4301,6 +4301,56 @@ def _evidence_coverage_reason(article: dict[str, Any], packet: dict[str, Any]) -
     return ""
 
 
+def _article_privacy_reason(
+    article: dict[str, Any],
+    packet: dict[str, Any],
+    approved_names: Optional[set[str]] = None,
+    repair_details: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    """Check prose independently of citation/coverage/editorial acceptance.
+
+    Private previews use this even when an earlier publication check would have
+    returned first. Do not expose source provenance or matched identity text.
+    """
+    public_text = _public_text(article)
+    refs = {
+        str(source["refId"])
+        for source in [*packet.get("safeSources", []), *_eligible_reflection_basis(packet)]
+        if source.get("refId")
+    }
+    if any(ref in public_text for ref in refs) or re.search(r"\b(?:fresh|week|memory|rumor|inference|reflection):[a-z0-9:._-]+\b", public_text, re.I):
+        return "source_ref_leak"
+    if _PUBLIC_LEAK_RE.search(public_text):
+        if repair_details is not None:
+            for field, text in _public_fields(article):
+                for match in _PUBLIC_LEAK_RE.finditer(text):
+                    if len(repair_details) < 12:
+                        repair_details.append({"field": field, "check": str(match.lastgroup),
+                                               "start": match.start(), "end": match.end()})
+        return "public_leak_pattern"
+    names = {str(name).casefold() for name in (approved_names or [])}
+    names.update(str(person.get("publicName") or "").casefold() for person in packet.get("privatePublicPeople", []))
+    private_names = {
+        str(name or "").strip()
+        for name in packet.get("privateWindowDisplayNames", [])
+        if str(name or "").strip()
+    }
+    private_names.update(
+        str(src.get("displayName") or "").strip()
+        for src in packet.get("privateSources", [])
+        if str(src.get("displayName") or "").strip()
+    )
+    identity_check_text = public_text
+    for allowed_name in sorted(names, key=len, reverse=True):
+        identity_check_text = _replace_identity_literal(identity_check_text, allowed_name, "")
+    for name in private_names:
+        if name and name.casefold() not in names and _contains_identity_literal(identity_check_text, name):
+            return "community_name_leak"
+    if any(re.search(pattern, public_text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS):
+        return "sensitive_personal_detail"
+    return ""
+
+
 def validate_article(
     article: dict[str, Any],
     packet: dict[str, Any],
@@ -4392,32 +4442,9 @@ def validate_article(
     evidence_reason = _evidence_coverage_reason(article, packet)
     if evidence_reason:
         return evidence_reason
-    if _PUBLIC_LEAK_RE.search(public_text):
-        if repair_details is not None:
-            for field, text in _public_fields(article):
-                for match in _PUBLIC_LEAK_RE.finditer(text):
-                    report(field, str(match.lastgroup), start=match.start(), end=match.end())
-        return "public_leak_pattern"
-    names = {str(name).casefold() for name in (approved_names or [])}
-    names.update(str(person.get("publicName") or "").casefold() for person in packet.get("privatePublicPeople", []))
-    private_names = {
-        str(name or "").strip()
-        for name in packet.get("privateWindowDisplayNames", [])
-        if str(name or "").strip()
-    }
-    private_names.update(
-        str(src.get("displayName") or "").strip()
-        for src in packet.get("privateSources", [])
-        if str(src.get("displayName") or "").strip()
-    )
-    identity_check_text = public_text
-    for allowed_name in sorted(names, key=len, reverse=True):
-        identity_check_text = _replace_identity_literal(identity_check_text, allowed_name, "")
-    for name in private_names:
-        if name and name.casefold() not in names and _contains_identity_literal(identity_check_text, name):
-            return "community_name_leak"
-    if any(re.search(pattern, public_text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS):
-        return "sensitive_personal_detail"
+    privacy_reason = _article_privacy_reason(article, packet, approved_names, repair_details)
+    if privacy_reason:
+        return privacy_reason
     narrative_text = _DIRECT_QUOTE_SPAN_RE.sub(" ", public_text)
     if not blocking_only and any(re.search(pattern, narrative_text, re.I) for pattern in _OVERLY_CLINICAL_PATTERNS):
         return "overly_clinical_voice"
@@ -4843,6 +4870,17 @@ def _insert_draft_rows(conn: sqlite3.Connection, entry_row: tuple[Any, ...], met
     conn.execute("INSERT INTO bnl_journal_private_metadata VALUES (?,?,?,?,?,?,?,?)", meta_row)
 
 
+def _generation_error_details(exc: Exception) -> tuple[str, str]:
+    lowered = str(exc).lower()
+    if "local_model_budget_exhausted" in lowered:
+        return "local_budget_unavailable", "local_budget_refusal"
+    if "quota" in lowered:
+        return "quota_unavailable", "provider_quota_failure"
+    if "journal_preparation_timeout" in lowered:
+        return "journal_preparation_timeout", "preparation_timeout"
+    return "provider_failure", "provider_failure"
+
+
 def _generate_article_with_repairs(
     packet: dict[str, Any],
     generator: Callable[[dict[str, Any], str], str],
@@ -4904,19 +4942,7 @@ def _generate_article_with_repairs(
                     "retainedPublishable": True,
                 })
                 return retained_publishable, "", True
-            lowered = str(exc).lower()
-            if "local_model_budget_exhausted" in lowered:
-                reason = "local_budget_unavailable"
-                outcome = "local_budget_refusal"
-            elif "quota" in lowered:
-                reason = "quota_unavailable"
-                outcome = "provider_quota_failure"
-            elif "journal_preparation_timeout" in lowered:
-                reason = "journal_preparation_timeout"
-                outcome = "preparation_timeout"
-            else:
-                reason = "provider_failure"
-                outcome = "provider_failure"
+            reason, outcome = _generation_error_details(exc)
             observe({
                 "generationAttempt": attempt_number,
                 "phase": "finished",
@@ -5149,15 +5175,38 @@ def generate_test_preview(
     if not packet.get("safeSources") and not _eligible_reflection_basis(packet):
         result["reason"] = "insufficient_grounded_material"
         return result
-    article, reason, advisory = _generate_article_with_repairs(
-        packet, generator, prior_titles, max_attempts=1,
-    )
-    if article is None:
-        result["reason"] = reason
+    # A preview is an inspection, not a publication candidate. Keep the first
+    # parseable, privacy-clean result even when attribution or coverage needs
+    # attention. Never enter the production repair or storage lifecycle.
+    try:
+        raw = generator(packet, build_generation_prompt(packet))
+    except Exception as exc:
+        result["reason"] = _generation_error_details(exc)[0]
         return result
+    try:
+        article = parse_generated_json(raw)
+    except ValueError as exc:
+        result["reason"] = str(exc)
+        return result
+    privacy_reason = _article_privacy_reason(article, packet)
+    if privacy_reason:
+        result["reason"] = privacy_reason
+        return result
+    details: list[dict[str, Any]] = []
+    publication_reason = validate_article(
+        article, packet, prior_titles, blocking_only=True, repair_details=details,
+    )
+    advisory_reason = "" if publication_reason else validate_article(article, packet, prior_titles)
     result.update({
         "ok": True,
-        "editorialAdvisory": advisory,
+        "editorialAdvisory": bool(advisory_reason),
+        "publicationCheck": {
+            "ok": not bool(publication_reason),
+            "reason": publication_reason,
+            # Only structural pointers; no private claims, IDs, or lane refs.
+            "locations": [{k: v for k, v in item.items() if k in {"field", "check", "sentenceIndex"}}
+                          for item in details],
+        },
         "article": {
             "title": article["title"], "excerpt": article["excerpt"],
             "sections": [{"heading": s["heading"], "body": s["body"]} for s in article["sections"]],

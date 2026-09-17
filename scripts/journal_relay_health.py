@@ -71,6 +71,21 @@ def inspect(db_path: str, guild_id: int, *, now: datetime = None) -> dict:
             "available": rejected is not None,
             "counts": {str(reason or "unknown"): count for reason, count in rejected or []},
         }
+        profiles = rows("memory_moment_windows", """SELECT qualification_reason,
+                human_entry_count,model_entry_count,participant_count,COUNT(*)
+            FROM memory_moment_windows WHERE guild_id=? AND datetime(last_activity_at)>=datetime(?)
+              AND lifecycle_status='rejected'
+            GROUP BY qualification_reason,human_entry_count,model_entry_count,participant_count
+            ORDER BY COUNT(*) DESC,qualification_reason,human_entry_count,model_entry_count,participant_count
+            LIMIT 50""", (guild_id, cutoff))
+        result["momentRejectionProfiles24h"] = {
+            "available": profiles is not None,
+            "profileLimit": 50,
+            "profiles": [dict(reason=str(reason or "unknown"), meaningfulHumanEntries=int(humans or 0),
+                              modelEntries=int(models or 0), humanParticipants=int(people or 0), windows=count)
+                         for reason, humans, models, people, count in profiles or []],
+            "meaning": "stored qualification counts per window, not deleted messages or a content-quality verdict",
+        }
 
         errors = rows("bnl_journal_automation_runs", """SELECT reason,COUNT(*)
             FROM bnl_journal_automation_runs WHERE guild_id=? AND datetime(updated_at)>=datetime(?)
