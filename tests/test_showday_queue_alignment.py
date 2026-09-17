@@ -92,7 +92,7 @@ class ShowdayQueueAlignmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["accessScope"], "private")
         self.assertEqual(captured["request"].get_header("X-api-key"), "shared-bnl-key")
         self.assertEqual(captured["request"].get_header("Cache-control"), "no-cache")
-        self.assertEqual(captured["timeout"], 3)
+        self.assertEqual(captured["timeout"], 8)
 
     def test_private_read_model_is_rejected_without_service_key(self):
         payload = private_read_model()
