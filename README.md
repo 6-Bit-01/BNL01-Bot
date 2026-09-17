@@ -90,6 +90,10 @@ The allowance never bypasses the effective hard limit or the Journal and
 interactive dollar reserves. Show-day generation remains background-shaped but
 time-sensitive, so the generic monthly/daily pace gate cannot suppress a
 claimed show phase while those harder limits still permit it.
+Broadcast Ballads use that same show-work priority for the single automatic
+post-show draft. Manual Generate/Polish requests use direct-conversation dollar
+priority. Both remain one provider attempt, without fallback; neither raises any
+spending cap or consumes the Journal's reserved budget.
 
 Native queue context has two independent production gates plus one website-owned access scope. The local bot variable `BNL_QUEUE_PRODUCTION_ENABLED` defaults off and accepts only `true` (case-insensitive); the website read model must also report `capabilities.queueProduction=true`. The website then declares `accessScope=none`, `private`, or `public`. `none` is always stripped. `private` is accepted only from an authenticated response obtained with the existing `BNL_API_KEY`, and only `sealed_test` and `internal_controlled` channel policies may retain its queue/history fields. Those Discord channels are permission-locked for explicitly admitted rehearsal testers and operators; ordinary server members remain excluded. Discord channel access is the authorization boundary, so the bot deliberately does not add a second owner-only requester check inside those already restricted channels. In `#bnl-testing`, read-only queue questions create a response obligation regardless of the participant's owner/admin/mod status. `public` may support public queue context. Merging queue-aware code does not enable either production gate or change a site's session access choice.
 

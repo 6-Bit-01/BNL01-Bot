@@ -4,11 +4,15 @@ Only transport/provider and the website read boundary are substituted. These
 tests prove source delivery and scope, not live Gemini creative acceptance.
 """
 
+import json
+import os
 import sqlite3
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from tests import test_public_network_knowledge as network
 from tests.test_rehearsal_read_model import REQUEST, rehearsal_model
@@ -107,6 +111,77 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_receipt, second_receipt)
         self.assertEqual(first_receipt["outcome"], "complete")
         self.assertEqual(first_receipt["version"]["title"], "Last Light")
+
+    async def test_ballad_budget_refusal_keeps_reason_and_replays_without_retry(self):
+        command = dict(id="budget-draft-1", showId="show-attendance-1", showDate="2026-08-28",
+                       kind="generate", baseVersion=None, options={})
+        control = {"contractVersion": 1, "commands": [command], "catalogVersions": {}}
+        result = bot.GenerationResult(
+            False, error_category=bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+            provider_error_code="monthly_hard_limit",
+            provider_error_message_safe="Provider detail must not enter the receipt",
+        )
+        with mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", self.fixture.guild_id), \
+             mock.patch.object(bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(return_value=result)) as generate, \
+             mock.patch.object(bot, "_ballad_control_request_sync", side_effect=[control, {"ok": True}, control, {"ok": True}]) as transport:
+            await bot._run_ballad_control_cycle()
+            await bot._run_ballad_control_cycle()
+        generate.assert_awaited_once()
+        receipt = transport.call_args_list[1].args[1]
+        self.assertEqual(receipt, transport.call_args_list[3].args[1])
+        self.assertEqual(receipt["outcome"], "failed")
+        self.assertEqual(receipt["error"], "budget_restricted:monthly_hard_limit")
+        self.assertNotIn("version", receipt)
+
+    async def ballad_reaches_provider_at_reported_spend(self, command_id, expected_route):
+        """Real worker, evidence, reservation, generation and receipt; SDK is fake."""
+        command = dict(id=command_id, showId="show-attendance-1", showDate="2026-08-28",
+                       kind="generate", baseVersion=None, options={})
+        control = {"contractVersion": 1, "commands": [command], "catalogVersions": {}}
+        output = json.dumps(dict(title="Last Light", lyrics="[Chorus]\nLeave a light",
+                                 style="1977 chamber soul", palette={}))
+        provider = mock.Mock(return_value=SimpleNamespace(
+            candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text=output)]))],
+            usage_metadata=SimpleNamespace(total_token_count=1400, prompt_token_count=1000,
+                candidates_token_count=100, thoughts_token_count=300, cached_content_token_count=0),
+        ))
+        env = {
+            "BNL_GEMINI_MONTHLY_TARGET_USD": "20", "BNL_GEMINI_MONTHLY_HARD_LIMIT_USD": "24",
+            "BNL_GEMINI_DAILY_SOFT_LIMIT_USD": "0.65", "BNL_GEMINI_BUDGET_ENFORCEMENT_ENABLED": "true",
+            "BNL_GEMINI_BILLING_LAG_BUFFER_USD": "0.50", "BNL_GEMINI_JOURNAL_RESERVE_USD": "1",
+            "BNL_GEMINI_INTERACTIVE_RESERVE_USD": "2",
+        }
+        def usage(_conn, start, _end):
+            return dict(estimated_cost_nanos=1_376_212_500 if start == "2026-09-16" else 11_481_236_100,
+                        unpriced_calls=0, unpriced_guardrail_nanos=0)
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", self.fixture.guild_id), \
+             mock.patch.object(bot, "_pacific_now", return_value=datetime(2026, 9, 16, 20, 30, tzinfo=ZoneInfo("America/Los_Angeles"))), \
+             mock.patch.object(bot, "_event_cost_rollup", side_effect=usage), \
+             mock.patch.object(bot, "_estimated_request_cost_nanos", return_value=42_967_500), \
+             mock.patch.object(bot, "_dollar_budget_decision", wraps=bot._dollar_budget_decision) as budget, \
+             mock.patch.object(bot, "gemini_client", SimpleNamespace(models=SimpleNamespace(generate_content=provider))), \
+             mock.patch.object(bot, "_ballad_control_request_sync", side_effect=[control, {"ok": True}, control, {"ok": True}]) as transport:
+            await bot._run_ballad_control_cycle()
+            await bot._run_ballad_control_cycle()
+        provider.assert_called_once()
+        budget.assert_called_once()
+        self.assertEqual(budget.call_args.kwargs["route"], expected_route)
+        self.assertEqual(budget.call_args.kwargs["month_nanos"], 11_481_236_100)
+        receipt = transport.call_args_list[1].args[1]
+        self.assertEqual(receipt["outcome"], "complete")
+        self.assertEqual(receipt["version"]["title"], "Last Light")
+        self.assertEqual(receipt, transport.call_args_list[3].args[1])
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM token_usage_events WHERE route=?",
+                                         (expected_route,)).fetchone()[0], 1)
+
+    async def test_manual_ballad_reaches_provider_at_reported_spend(self):
+        await self.ballad_reaches_provider_at_reported_spend("manual-draft-1", "broadcast_ballad_manual")
+
+    async def test_automatic_ballad_reaches_provider_at_reported_spend(self):
+        await self.ballad_reaches_provider_at_reported_spend("auto-show-attendance-1", "broadcast_ballad_background")
 
     async def test_revision_intent_does_not_promote_casual_phrases(self):
         self.assertTrue(bot._detect_request_intent(FEEDBACK)[0])

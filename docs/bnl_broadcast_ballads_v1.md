@@ -49,9 +49,18 @@ The existing website heartbeat starts one independent Ballad control cycle at a
 time. The primary configured guild handles the shared site queue. GET/POST use
 `/api/bnl/ballads`, the existing website base URL and `BNL_API_KEY`; no new credential
 or timer owner is introduced. Source evidence loading runs off the Discord loop.
-The provider call uses existing tracked/budgeted generation with route
-`broadcast_ballad_background`: one attempt, no provider retry or fallback, a bounded
-wait, and no general chat post-processing loop. It preserves existing budget reserves.
+The provider call uses existing tracked/budgeted generation: one attempt, no
+provider retry or fallback, a bounded wait, and no general chat post-processing loop.
+Manual Generate/Polish commands use `broadcast_ballad_manual` with the same dollar
+priority as direct Discord requests. Automatic commands use
+`broadcast_ballad_background` with the existing show-day priority. The authenticated
+site creates automatic command IDs as `auto-<showId>` and admin command IDs as UUIDs;
+that existing contract selects the route, including commands queued before this fix.
+The generic optional-work pace check no longer suppresses requested songs or the
+single automatic show draft. No budget amounts increase. The global hard ceiling,
+billing buffer, token limits and Journal reserve still apply; automatic drafts also
+leave the interactive reserve untouched. A real budget refusal is delivered as
+`budget_restricted:<reason>`. The failed receipt is cached without model retries.
 
 The site defaults automation off. A saved producer setting enables future finalized
 public shows. Manual Generate/Edit/Restore requests remain separate from Publish.

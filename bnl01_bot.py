@@ -473,7 +473,7 @@ from discord import app_commands
 from discord.ext import tasks
 from google import genai
 
-from bnl_broadcast_ballads import execute_command as execute_ballad_command, ROUTE as BALLAD_ROUTE
+from bnl_broadcast_ballads import execute_command as execute_ballad_command, ROUTE as BALLAD_ROUTE, route_for_command as ballad_route_for_command
 from bnl_tiktok_show_ledger import build_broadcast_ballad_evidence
 
 from bnl_gemini_routing import (
@@ -23640,8 +23640,8 @@ def _dollar_budget_decision(
     if projected_month > background_limit:
         return False, "interactive_and_journal_reserve"
 
-    # Show-day generation is low-frequency, atomically claimed, and tied to a
-    # real broadcast window. Keep its background one-attempt/no-fallback
+    # Show-related generation is low-frequency, atomically claimed, and tied to
+    # a broadcast phase or one finalized show's Ballad. Keep one attempt/no fallback
     # provider policy while preventing the generic pace gate from suppressing
     # time-sensitive copy. The hard limit and both dollar reserves still win.
     if policy.showday_protected:
@@ -35880,13 +35880,17 @@ async def _run_ballad_control_cycle():
             return
         for command in control.get("commands", [])[:2]:
             command = {**command, "catalogVersions": control.get("catalogVersions", {})}
+            route = ballad_route_for_command(command)
             async def generate(prompt):
-                if not check_quota_availability(BALLAD_ROUTE):
+                if not check_quota_availability(route):
                     raise ValueError("local_model_budget_exhausted")
                 result = await asyncio.wait_for(_generate_gemini_content_result_async(
-                    BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + prompt, BALLAD_ROUTE,
+                    BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + prompt, route,
                 ), timeout=120)
                 if not result.success:
+                    if result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET:
+                        reason = result.provider_error_code or GENERATION_ERROR_LOCAL_MODEL_BUDGET
+                        raise ValueError(f"budget_restricted:{reason}")
                     raise ValueError("generation_unavailable_try_manually")
                 return result.text
 

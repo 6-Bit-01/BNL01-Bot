@@ -196,11 +196,11 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             lane='background', max_output_tokens=2048, legacy_thinking_budget=512,
             provider_retries=0, allow_fallback=False,
         )
-    if normalized_route == "ordinary_chat_single_packet_canary":
-        # The accepted cutover path is one logical and physical provider
+    if normalized_route in {"ordinary_chat_single_packet_canary", "broadcast_ballad_manual"}:
+        # Direct chat and producer-requested writing each use one physical
         # attempt: no retry multiplication and no model fallback.
         return GeminiRoutePolicy(
-            lane="protected",
+            lane=lane,
             max_output_tokens=_bounded_env_int(
                 "BNL_GEMINI_CONVERSATION_MAX_OUTPUT_TOKENS",
                 4_096,
@@ -283,7 +283,9 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             provider_retries=0,
             allow_fallback=False,
             relay_protected="relay" in normalized_route,
-            showday_protected="showday" in normalized_route,
+            # A single automatic draft for a finalized show is scheduled show
+            # work. It retains the hard ceiling and both dollar reserves.
+            showday_protected="showday" in normalized_route or normalized_route == "broadcast_ballad_background",
         )
     return GeminiRoutePolicy(
         lane=lane,

@@ -15,7 +15,15 @@ from typing import Callable
 from bnl_creative_protocol import SUNO_LYRIC_PROTOCOL
 
 ROUTE = "broadcast_ballad_background"
+MANUAL_ROUTE = "broadcast_ballad_manual"
 PROMPT_VERSION = "broadcast-ballad-1"
+
+
+def route_for_command(command):
+    """The authenticated site owns command IDs: automatic show ID or admin UUID."""
+    if command.get("id") == "auto-" + str(command.get("showId") or ""):
+        return ROUTE
+    return MANUAL_ROUTE
 
 
 def _now():

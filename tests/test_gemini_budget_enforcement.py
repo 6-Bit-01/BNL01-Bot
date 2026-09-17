@@ -16,6 +16,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
+from bnl_broadcast_ballads import MANUAL_ROUTE
 
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -143,6 +144,28 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
         self.assertEqual(background, (False, "monthly_target_pace"))
         self.assertEqual(interactive, (True, "interactive_available"))
 
+    def test_ballad_priority_uses_existing_budget_without_raising_limits(self):
+        self.now = datetime(2026, 9, 16, 20, 30, tzinfo=PACIFIC)
+        with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
+            for route, expected in (
+                (MANUAL_ROUTE, (True, "interactive_available")),
+                ("ordinary_chat_single_packet_canary", (True, "interactive_available")),
+                (bnl01_bot.BALLAD_ROUTE, (True, "showday_protected")),
+                ("ambient_generation", (False, "monthly_target_pace")),
+            ):
+                with self.subTest(route=route):
+                    self.assertEqual(self.decision(route, request="0.0429675",
+                        month="11.4812361", today="1.3762125"), expected)
+
+    def test_ballads_preserve_interactive_and_journal_reserves(self):
+        with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
+            self.assertEqual(self.decision(bnl01_bot.BALLAD_ROUTE,
+                request="0.01", month="20.50", today="0.10"),
+                (False, "interactive_and_journal_reserve"))
+            self.assertEqual(self.decision(MANUAL_ROUTE,
+                request="0.10", month="22.45", today="0.10"),
+                (False, "journal_reserve"))
+
     def test_relay_uses_bounded_pace_allowance_while_ambient_stays_restricted(self):
         with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
             relay = self.decision(
@@ -236,6 +259,8 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
                 "website_relay_event",
                 "normal_chat",
                 bnl01_bot.JOURNAL_ROUTE,
+                bnl01_bot.BALLAD_ROUTE,
+                MANUAL_ROUTE,
             ):
                 with self.subTest(route=route):
                     self.assertEqual(
