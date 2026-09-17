@@ -91,6 +91,7 @@ class JournalTestPreviewTests(unittest.TestCase):
         for conn in connections:
             conn.close()
         self.assertTrue(result["ok"], result)
+        self.assertEqual({"ok": True, "reason": "", "locations": []}, result["publicationCheck"])
         self.assertEqual(1, len(calls))
         self.assertEqual(before, hashlib.sha256(Path(self.db).read_bytes()).hexdigest())
         self.assertEqual({"title", "excerpt", "sections"}, set(result["article"]))
@@ -122,7 +123,38 @@ class JournalTestPreviewTests(unittest.TestCase):
         self.assertEqual("incomplete_source_window", result["reason"])
         generate.assert_not_called()
 
-    def test_blocking_output_is_not_returned_or_rewritten(self):
+    def test_publication_findings_keep_the_private_writing_without_retry_or_writes(self):
+        for finding in ("undeclared_context_use", "invalid_section_source_refs"):
+            with self.subTest(finding=finding):
+                before = Path(self.db).read_bytes()
+
+                def flagged_article(packet, prompt):
+                    article = json.loads(article_for(packet))
+                    if finding == "undeclared_context_use":
+                        article["excerpt"] = "I think the rhythm deserves a second listen."
+                    else:
+                        article["sections"][0]["sourceRefIds"] = []
+                    raw = json.dumps(article)
+                    # The production publication rule still rejects this exact
+                    # candidate; only the isolated inspection path may show it.
+                    self.assertEqual(finding, journal.validate_article(
+                        journal.parse_generated_json(raw), packet, blocking_only=True))
+                    return raw
+
+                generate = Mock(side_effect=flagged_article)
+                with patch.object(journal, "_generate_article_with_repairs", side_effect=AssertionError("repair loop")):
+                    result = self.preview(generate)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual("", result["reason"])
+                self.assertEqual(finding, result["publicationCheck"]["reason"])
+                self.assertFalse(result["publicationCheck"]["ok"])
+                self.assertIn("fresh rhythm", result["article"]["sections"][0]["body"])
+                if finding == "undeclared_context_use":
+                    self.assertIn("excerpt", [item["field"] for item in result["publicationCheck"]["locations"]])
+                self.assertEqual(before, Path(self.db).read_bytes())
+                generate.assert_called_once()
+
+    def test_privacy_output_is_not_returned_or_rewritten(self):
         def unsafe_article(packet, prompt):
             article = json.loads(article_for(packet))
             article["excerpt"] += " https://example.test/private-marker"
@@ -134,6 +166,50 @@ class JournalTestPreviewTests(unittest.TestCase):
         self.assertNotIn("article", result)
         self.assertNotIn("private-marker", json.dumps(result))
         generate.assert_called_once()
+
+    def test_early_publication_failure_cannot_mask_privacy_failure(self):
+        for sensitive_text, reason in (
+            ("https://example.test/private-marker", "public_leak_pattern"),
+            ("participant-1234abcd", "public_leak_pattern"),
+            ("fresh:private-marker", "source_ref_leak"),
+        ):
+            with self.subTest(reason=reason, text=sensitive_text):
+                def unsafe_article(packet, prompt):
+                    article = json.loads(article_for(packet))
+                    article["sections"][0]["sourceRefIds"] = []
+                    article["excerpt"] += " " + sensitive_text
+                    return json.dumps(article)
+
+                generate = Mock(side_effect=unsafe_article)
+                result = self.preview(generate)
+                self.assertFalse(result["ok"])
+                self.assertEqual(reason, result["reason"])
+                self.assertNotIn("article", result)
+                self.assertNotIn(sensitive_text, json.dumps(result))
+                generate.assert_called_once()
+
+    def test_privacy_name_projection_still_allows_public_speakers(self):
+        def named_article(packet, prompt):
+            article = json.loads(article_for(packet))
+            article["excerpt"] = "Test Composer brought a new bass rhythm to the public music room."
+            return json.dumps(article)
+        result = self.preview(named_article)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Test Composer", result["article"]["excerpt"])
+
+    def test_provider_failures_are_content_free_and_do_not_retry(self):
+        for error, reason in (
+            ("quota; PrivateProviderDetail", "quota_unavailable"),
+            ("journal_preparation_timeout; PrivateProviderDetail", "journal_preparation_timeout"),
+            ("PrivateProviderDetail", "provider_failure"),
+        ):
+            with self.subTest(reason=reason):
+                generate = Mock(side_effect=RuntimeError(error))
+                result = self.preview(generate)
+                self.assertFalse(result["ok"])
+                self.assertEqual(reason, result["reason"])
+                self.assertNotIn("PrivateProviderDetail", json.dumps(result))
+                generate.assert_called_once()
 
     def test_missing_database_is_not_created(self):
         missing = str(Path(self.temp.name) / "missing.db")
@@ -155,6 +231,7 @@ class JournalTestCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.preview = {
             "ok": True, "reason": "", "editorialVersion": journal.JOURNAL_EDITORIAL_VERSION,
+            "previewVersion": journal.JOURNAL_TEST_PREVIEW_VERSION,
             "sourceWindowStart": "start", "sourceWindowEnd": "end",
             "article": {"title": "Test Preview Title", "excerpt": "Test preview excerpt.",
                         "sections": [{"heading": "Test heading", "body": "Test preview body."}]},
@@ -190,6 +267,25 @@ class JournalTestCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.handle()
         self.generator.assert_not_called()
         self.message.channel.send.assert_not_called()
+
+    async def test_publication_finding_is_delivered_with_the_writing_only_in_dm(self):
+        self.preview["publicationCheck"] = {
+            "ok": False, "reason": "undeclared_context_use",
+            "locations": [{"field": "excerpt", "check": "missing_context_declaration"}],
+        }
+        with self.assertLogs(level="INFO") as logs:
+            await self.handle()
+        dm_text = "\n".join(c.args[0] for c in self.message.author.send.call_args_list)
+        self.assertIn("Test preview body.", dm_text)
+        self.assertIn("undeclared_context_use", dm_text)
+        self.assertIn("check excerpt", dm_text)
+        self.assertIn("not approved for publication", dm_text)
+        self.assertNotIn("Journal test stopped", dm_text)
+        self.assertNotIn("Test preview body.", str(self.message.reply.call_args_list))
+        self.assertNotIn("Test preview body.", str(logs.output))
+        self.assertIn("ok=True reason=none publication_check=undeclared_context_use stored=false published=false", str(logs.output))
+        self.message.channel.send.assert_not_called()
+        self.generator.assert_called_once()
 
     async def test_control_outage_does_not_generate(self):
         self.control.return_value = (None, "control_snapshot_unavailable")

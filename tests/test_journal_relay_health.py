@@ -29,6 +29,7 @@ class JournalRelayHealthTests(unittest.TestCase):
             self.assertEqual(1, report["acceptedRelaysMissingArchiveReceipt24h"])
             self.assertEqual(1, report["relayPublications"]["last24h"])
             self.assertFalse(report["moments"]["available"])
+            self.assertFalse(report["momentRejectionProfiles24h"]["available"])
             self.assertEqual({"journal_publication": 1, "relay_publication": 2}, report["sharedBrainReceipts24h"]["lanesInSentPrompts"])
 
     def test_moment_rejection_reasons_are_time_and_guild_scoped(self):
@@ -46,6 +47,38 @@ class JournalRelayHealthTests(unittest.TestCase):
             before = path.read_bytes()
             report = inspect(str(path), 1, now=datetime(2026, 9, 17, 2, tzinfo=timezone.utc))
             self.assertEqual({"available": True, "counts": {"low_signal_or_insufficient_continuity": 2}}, report["momentRejectionReasons24h"])
+            self.assertEqual(before, path.read_bytes())
+            self.assertFalse(report["momentRejectionProfiles24h"]["available"])
+
+    def test_moment_rejection_profiles_explain_threshold_inputs_without_content(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "health.db"
+            with sqlite3.connect(path) as conn:
+                conn.execute("""CREATE TABLE memory_moment_windows(guild_id INTEGER,last_activity_at TEXT,
+                    lifecycle_status TEXT,qualification_reason TEXT,human_entry_count INTEGER,
+                    model_entry_count INTEGER,participant_count INTEGER,summary TEXT)""")
+                recent = "2026-09-17T01:00:00Z"
+                reason = "low_signal_or_insufficient_continuity"
+                conn.executemany("INSERT INTO memory_moment_windows VALUES(?,?,?,?,?,?,?,?)", [
+                    (1, recent, "rejected", reason, 1, 0, 1, "PrivateWindowText"),
+                    (1, recent, "rejected", reason, 1, 0, 1, "PrivateWindowText"),
+                    (1, recent, "rejected", reason, 2, 1, 1, "PrivateWindowText"),
+                    (1, recent, "rejected", reason, 3, 0, 1, "PrivateWindowText"),
+                    (1, recent, "finalized", "qualified", 3, 1, 2, "PrivateWindowText"),
+                    (2, recent, "rejected", reason, 9, 9, 9, "PrivateWindowText"),
+                    (1, "2026-09-15T01:00:00Z", "rejected", reason, 9, 9, 9, "PrivateWindowText"),
+                ])
+            before = path.read_bytes()
+            report = inspect(str(path), 1, now=datetime(2026, 9, 17, 2, tzinfo=timezone.utc))
+            profiles = report["momentRejectionProfiles24h"]
+            self.assertTrue(profiles["available"])
+            self.assertEqual([
+                dict(reason=reason, meaningfulHumanEntries=1, modelEntries=0, humanParticipants=1, windows=2),
+                dict(reason=reason, meaningfulHumanEntries=2, modelEntries=1, humanParticipants=1, windows=1),
+                dict(reason=reason, meaningfulHumanEntries=3, modelEntries=0, humanParticipants=1, windows=1),
+            ], profiles["profiles"])
+            self.assertEqual(4, sum(item["windows"] for item in profiles["profiles"]))
+            self.assertNotIn("PrivateWindowText", json.dumps(report))
             self.assertEqual(before, path.read_bytes())
 
     def test_missing_file_does_not_create_a_database(self):

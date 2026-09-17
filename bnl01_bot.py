@@ -10056,10 +10056,23 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
             text = f"Journal test stopped: `{result['reason']}`. Nothing was saved or published; no automatic rewrite ran."
         else:
             article = result["article"]
+            publication_check = result.get("publicationCheck") or {}
+            review_note = ""
+            if publication_check.get("reason"):
+                locations = list(dict.fromkeys(
+                    str(item["field"]) for item in publication_check.get("locations", []) if item.get("field")
+                ))
+                review_note = (
+                    f"**Publication review:** `{publication_check['reason']}`"
+                    + (f" — check {', '.join(locations)}" if locations else "")
+                    + ".\nThe writing is included below for inspection. This test is not approved for publication.\n\n"
+                )
             text = (
                 "**Private Journal test — not saved or published**\n"
+                f"Preview version: `{result.get('previewVersion', 'unknown')}`\n"
                 f"Writing version: `{result['editorialVersion']}`\n"
                 f"Window: {result['sourceWindowStart']} to {result['sourceWindowEnd']}\n\n"
+                f"{review_note}"
                 f"**{article['title']}**\n{article['excerpt']}\n"
                 + "\n".join(f"\n**{s['heading']}**\n{s['body']}" for s in article["sections"])
             )
@@ -10071,7 +10084,11 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
         except discord.HTTPException:
             await message.reply("Discord couldn't deliver the complete test DM. Nothing was saved or published.")
             return
-        logging.info("journal_private_test_finished guild=%s ok=%s reason=%s stored=false published=false", guild_id, result["ok"], result["reason"] or "none")
+        logging.info(
+            "journal_private_test_finished guild=%s ok=%s reason=%s publication_check=%s stored=false published=false",
+            guild_id, result["ok"], result["reason"] or "none",
+            (result.get("publicationCheck") or {}).get("reason") or "none",
+        )
         await message.reply("Journal test result sent to your DMs. Nothing was saved or published.")
 
 
