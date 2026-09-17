@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack, closing, nullcontext
 from pathlib import Path
-from bnl_creative_protocol import GLITCH_PROTOCOL, SUNO_LYRIC_PROTOCOL, creative_variation_hint, has_vocal_copy
+from bnl_creative_protocol import GLITCH_PROTOCOL, SUNO_LYRIC_PROTOCOL, bound_suno_style_copy, creative_variation_hint, has_vocal_copy
 from typing import Any, Awaitable, Callable, Mapping, Union
 
 from bnl_canon_source_contract import (
@@ -31297,7 +31297,20 @@ def _extract_text_and_tokens(response):
     try:
         cand0 = response.candidates[0] if response and response.candidates else None
         parts = getattr(getattr(cand0, "content", None), "parts", None) if cand0 else None
-        text = getattr(parts[0], "text", None) if parts else None
+        # A visible answer can span several provider parts, even mid-word.
+        # Match the SDK text accessor: concatenate text, omit thought parts.
+        text = "".join(
+            part.text for part in (parts or ())
+            if isinstance(getattr(part, "text", None), str)
+            and getattr(part, "thought", False) is not True
+        )
+        finish = getattr(cand0, "finish_reason", None)
+        finish = str(getattr(finish, "value", finish) or "unknown")
+        finish = finish if re.fullmatch(r"[A-Z_]{1,40}", finish) else "unknown"
+        logging.info(
+            "gemini_response_shape finish_reason=%s parts=%s text_chars=%s",
+            finish, len(parts or ()), len(text),
+        )
         usage = getattr(response, "usage_metadata", None)
         tokens = getattr(usage, "total_token_count", None) if usage else None
         return (text or "").strip(), tokens
@@ -44598,6 +44611,8 @@ async def apply_guarded_response_regeneration(
                 )
                 return "", diagnostics
             response = regenerated
+    if not exact_quote_requested:
+        response = bound_suno_style_copy(response)
     # No provider await may occur after this source-of-truth recheck. If a
     # deletion, clear, or correction changed the supporting rows during any
     # regeneration above, suppress instead of sending a stale grounded claim.
