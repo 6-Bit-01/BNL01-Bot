@@ -139,15 +139,20 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt["error"], "budget_restricted:monthly_hard_limit")
         self.assertNotIn("version", receipt)
 
-    async def ballad_reaches_provider_at_reported_spend(self, command_id, expected_route):
+    async def ballad_reaches_provider_at_reported_spend(self, command_id, expected_route, *, interrupted=False):
         """Real worker, evidence, reservation, generation and receipt; SDK is fake."""
         command = dict(id=command_id, showId="show-attendance-1", showDate="2026-08-28",
                        kind="generate", baseVersion=None, options={})
         control = {"contractVersion": 1, "commands": [command], "catalogVersions": {}}
-        output = json.dumps(dict(title="Last Light", lyrics="[Chorus]\nLeave a light",
-                                 style="1977 chamber soul", palette={}))
+        lyrics = "[Verse]\n" + "A warm light waits by the door.\n" * 180 + "[Outro]\nLeave a light."
+        notes = dict(about="The last goodbye.", inspiration="I kept the porch light glowing.",
+                     mentions="Test Member waits by the door.", inspiredBy="The public sign-off.")
+        output = json.dumps(dict(title="Last Light", style="1977 chamber soul", palette={}, linerNotes=notes, lyrics=lyrics))
+        if interrupted:
+            output = output[:-12]
         provider = mock.Mock(return_value=SimpleNamespace(
-            candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text=output)]))],
+            candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text=output)]),
+                        finish_reason=bot.genai.types.FinishReason.MAX_TOKENS if interrupted else bot.genai.types.FinishReason.STOP)],
             usage_metadata=SimpleNamespace(total_token_count=1400, prompt_token_count=1000,
                 candidates_token_count=100, thoughts_token_count=300, cached_content_token_count=0),
         ))
@@ -177,6 +182,24 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
         receipt = transport.call_args_list[1].args[1]
         self.assertEqual(receipt["outcome"], "complete")
         self.assertEqual(receipt["version"]["title"], "Last Light")
+        self.assertEqual(receipt["version"]["linerNotes"], notes)
+        self.assertEqual(receipt["version"]["style"], "1977 chamber soul")
+        self.assertEqual(receipt["version"]["rawOutput"], output)
+        self.assertEqual(receipt["version"]["finishReason"], "MAX_TOKENS" if interrupted else "STOP")
+        self.assertEqual(receipt["version"]["generationStatus"], "incomplete" if interrupted else "complete")
+        if interrupted:
+            self.assertTrue(lyrics.startswith(receipt["version"]["lyrics"]))
+            self.assertIn("Incomplete response", receipt["version"]["note"])
+        else:
+            self.assertEqual(receipt["version"]["lyrics"], lyrics)
+        config = provider.call_args.kwargs["config"]
+        self.assertEqual(config.max_output_tokens, 16_384)
+        self.assertEqual(config.response_mime_type, "application/json")
+        schema = bot.genai.types.Schema.model_validate(config.response_schema)
+        self.assertEqual(schema.property_ordering, ["title", "style", "palette", "linerNotes", "lyrics"])
+        self.assertEqual(set(schema.required), set(schema.property_ordering))
+        self.assertEqual(set(schema.properties["linerNotes"].required), set(notes))
+        self.assertIsNone(config.thinking_config)
         self.assertEqual(receipt, transport.call_args_list[3].args[1])
         with sqlite3.connect(bot.DB_FILE) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM token_usage_events WHERE route=?",
@@ -187,6 +210,15 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_automatic_ballad_reaches_provider_at_reported_spend(self):
         await self.ballad_reaches_provider_at_reported_spend("auto-show-attendance-1", "broadcast_ballad_background")
+
+    async def test_interrupted_ballad_keeps_metadata_and_finish_reason_through_worker(self):
+        await self.ballad_reaches_provider_at_reported_spend("manual-cutoff-1", "broadcast_ballad_manual", interrupted=True)
+
+    def test_ballad_schema_does_not_change_chat_or_journal_output_format(self):
+        for route in ("ordinary_chat_single_packet_canary", "bnl_journal_generation", "website_relay_event"):
+            config = bot._generation_config_for_model("gemini-3.6-flash", route)
+            self.assertIsNone(config.response_schema)
+            self.assertIsNone(config.response_mime_type)
 
     async def test_revision_intent_does_not_promote_casual_phrases(self):
         self.assertTrue(bot._detect_request_intent(FEEDBACK)[0])

@@ -92,6 +92,27 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             policy = routing.policy_for_route("website_relay_event")
         self.assertEqual(policy.max_output_tokens, 4_096)
 
+    def test_ballad_allowance_is_reserved_once_without_changing_other_routes(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            for route in ("broadcast_ballad_manual", "broadcast_ballad_background"):
+                policy = routing.policy_for_route(route)
+                self.assertEqual(policy.max_output_tokens, 16_384)
+                self.assertEqual(routing.estimated_generation_reservation("abc", policy), 16_385)
+                self.assertEqual(policy.provider_retries, 0)
+                self.assertFalse(policy.allow_fallback)
+                self.assertEqual(policy.showday_protected, route.endswith("background"))
+            self.assertEqual(routing.policy_for_route("ordinary_chat_single_packet_canary").max_output_tokens, 4_096)
+            self.assertEqual(routing.policy_for_route("website_relay_event").max_output_tokens, 4_096)
+            self.assertEqual(routing.policy_for_route("bnl_journal_generation").max_output_tokens, 16_384)
+
+    def test_ballad_override_is_bounded_and_independent_from_generic_limits(self):
+        for value, expected in (("1", 4096), ("8192", 8192), ("999999", 32768), ("invalid", 16384)):
+            with mock.patch.dict("os.environ", {"BNL_GEMINI_BALLAD_MAX_OUTPUT_TOKENS": value,
+                                 "BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS": "1024",
+                                 "BNL_GEMINI_CONVERSATION_MAX_OUTPUT_TOKENS": "1024"}, clear=False):
+                for route in ("broadcast_ballad_manual", "broadcast_ballad_background"):
+                    self.assertEqual(routing.policy_for_route(route).max_output_tokens, expected)
+
     def test_relay_and_showday_keep_distinct_background_protection_flags(self):
         relay = routing.policy_for_route("website_relay_event")
         showday = routing.policy_for_route("showday_generation")
