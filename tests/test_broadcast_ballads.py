@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from bnl_broadcast_ballads import execute_command, versions, creative_history, ROUTE
+from bnl_broadcast_ballads import execute_command, versions, creative_history, route_for_command, ROUTE, MANUAL_ROUTE
 from bnl_gemini_routing import policy_for_route
 
 
@@ -77,10 +77,17 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No novelty threshold", prompt)
         self.assertTrue(creative_history(self.db, 77))
 
-    def test_background_policy_is_one_attempt_no_fallback(self):
-        policy = policy_for_route(ROUTE)
-        self.assertEqual(policy.provider_retries, 0)
-        self.assertFalse(policy.allow_fallback)
+    def test_manual_and_automatic_commands_use_their_budget_priority(self):
+        self.assertEqual(route_for_command(self.command), MANUAL_ROUTE)
+        self.assertEqual(route_for_command({**self.command, "kind": "polish"}), MANUAL_ROUTE)
+        self.assertEqual(route_for_command({**self.command, "id": "auto-show-1"}), ROUTE)
+        self.assertEqual(route_for_command({**self.command, "id": "auto-other-show"}), MANUAL_ROUTE)
+        self.assertEqual(policy_for_route(MANUAL_ROUTE).lane, "conversation")
+        self.assertTrue(policy_for_route(ROUTE).showday_protected)
+        for route in (ROUTE, MANUAL_ROUTE):
+            policy = policy_for_route(route)
+            self.assertEqual(policy.provider_retries, 0)
+            self.assertFalse(policy.allow_fallback)
 
 
 if __name__ == "__main__":
