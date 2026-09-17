@@ -348,3 +348,15 @@ class CanonSourceContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PublishedBalladContextTests(unittest.TestCase):
+    def test_public_release_metadata_is_available_without_treating_lyrics_as_evidence(self):
+        model = hostile_read_model(queue_production=False)
+        model["sections"]["ballads"] = {"available": True, "songs": [{"title": "The Last Light", "showTitle": "Friday Radio", "showDate": "2026-09-11", "url": "https://www.barcode-network.com/radio/ballads?show=show-1", "lyrics": "DO_NOT_RENDER_CREATIVE_LYRICS"}]}
+        result = build_bnl_read_model_context(model, "Tell me about BNL's released music", "public")
+        self.assertIn("The Last Light", result)
+        self.assertIn("https://www.barcode-network.com/radio/ballads?show=show-1", result)
+        self.assertIn("never corroboration", result)
+        self.assertNotIn("DO_NOT_RENDER_CREATIVE_LYRICS", result)
+        model["sections"]["ballads"]["available"] = False
+        self.assertNotIn("The Last Light", build_bnl_read_model_context(model, "BNL music", "public"))

@@ -346,6 +346,11 @@ async def execute_command(db_file, guild_id, command, *, evidence_reader: Callab
         kind = command.get("kind")
         if kind not in {"generate", "polish", "edit", "restore"}:
             raise ValueError("invalid_command_kind")
+        source = latest
+        if kind in {"polish", "edit"} and command.get("sourceVersion"):
+            source = next((v for v in existing if v["id"] == command["sourceVersion"]), None)
+            if source is None:
+                raise ValueError("version_not_found")
         raw = ""
         source_digest = latest.get("sourceDigest", "") if latest else ""
         if kind in {"generate", "polish"}:
@@ -356,7 +361,7 @@ async def execute_command(db_file, guild_id, command, *, evidence_reader: Callab
                 raise ValueError("draft_required")
             generated = await generate(build_prompt(command, evidence,
                 creative_history(db_file, guild_id, json.dumps(command.get("options", {})), command.get("catalogVersions")),
-                latest if kind == "polish" else None))
+                source if kind == "polish" else None))
             raw = generated.text if isinstance(generated, BalladGeneration) else generated
             if not raw or not raw.strip():
                 raise ValueError("generation_unavailable_try_manually")
@@ -376,12 +381,12 @@ async def execute_command(db_file, guild_id, command, *, evidence_reader: Callab
                 raise ValueError("invalid_draft_fields")
             if not content["title"].strip() or not content["lyrics"].strip():
                 raise ValueError("title_and_lyrics_required")
-            palette = content.get("palette", latest["palette"] if latest else {})
+            palette = content.get("palette", source["palette"] if source else {})
             if not isinstance(palette, dict) or any(not isinstance(v, str) for v in palette.values()):
                 raise ValueError("invalid_catalog_notes")
             content = {k: content[k] for k in ("title", "lyrics", "style")}
             content.update(palette=palette, note="Producer edit saved.")
-            content["linerNotes"] = liner_notes(latest.get("linerNotes") if latest else None)
+            content["linerNotes"] = liner_notes(source.get("linerNotes") if source else None)
         version = {**content, "id": command["id"], "showId": command["showId"],
                    "ordinal": len(existing) + 1, "parentId": latest["id"] if latest else None,
                    "createdAt": _now(), "kind": kind, "sourceDigest": source_digest,
