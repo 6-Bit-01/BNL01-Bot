@@ -473,6 +473,9 @@ from discord import app_commands
 from discord.ext import tasks
 from google import genai
 
+from bnl_broadcast_ballads import execute_command as execute_ballad_command, ROUTE as BALLAD_ROUTE
+from bnl_tiktok_show_ledger import build_broadcast_ballad_evidence
+
 from bnl_gemini_routing import (
     DEFAULT_FALLBACK_MODEL,
     DEFAULT_PRIMARY_MODEL,
@@ -2499,6 +2502,18 @@ def _channel_allows_private_bnl_queue(channel_policy: str = "") -> bool:
     return str(channel_policy or "").strip().lower() in _PRIVATE_BNL_QUEUE_POLICIES
 
 
+def _show_song_source_request(text: str) -> bool:
+    """An explicit creative brief can request show evidence without a prior lookup."""
+    return bool(
+        re.search(r"\b(?:write|draft|compose|create|rewrite|revise)\b", text, re.I)
+        and re.search(r"\b(?:song|ballad|lyrics|chorus)\b", text, re.I)
+        and re.search(r"\b(?:rehearsal|barcode radio|show|broadcast|session)\b", text, re.I)
+        and (has_explicit_show_date(text) or re.search(
+            r"\b(?:current|this)\s+(?:show|broadcast|session|rehearsal)\b", text, re.I,
+        ))
+    )
+
+
 def _queue_read_model_query(text: str) -> bool:
     """Recognize read-only live queue questions without inspecting requester identity."""
 
@@ -2506,6 +2521,8 @@ def _queue_read_model_query(text: str) -> bool:
     if not normalized:
         return False
     if _current_queue_state_query(normalized):
+        return True
+    if _show_song_source_request(normalized):
         return True
     # Session-credit/playback requests need the same website owner even when
     # the member never says "queue". Require a read request and track facts,
@@ -3064,7 +3081,7 @@ def build_bnl_read_model_context(
     tiktok_context_query = live_reaction_query or show_analysis_query
     operational_query = queue_query or live_reaction_query or show_analysis_query
     queue_focus = _queue_query_focus(queue_lookup_text) if operational_query else {}
-    if prior_queue_request:
+    if prior_queue_request or _show_song_source_request(user_text):
         # The earlier request identifies the source session, not a permanent
         # track filter or answer format. Context has already selected this
         # continuation; let the current task use the available session records.
@@ -3277,7 +3294,7 @@ def build_bnl_read_model_context(
             lines.append(f"- Priority Signal: enabled={priority_enabled if priority_enabled is not None else 'unknown'}" + (f", label={priority_label}" if priority_label else ""))
         selected_queued_tracks = [
             track for track in queued_tracks if isinstance(track, dict)
-        ] if prior_queue_request else _queue_tracks_for_request(
+        ] if (prior_queue_request or _show_song_source_request(user_text)) else _queue_tracks_for_request(
             queued_tracks,
             queue_lookup_text,
             queue_focus,
@@ -3296,7 +3313,7 @@ def build_bnl_read_model_context(
                     lines.append(f"- {label}")
         matched_completed_tracks = [
             track for track in completed_tracks
-            if isinstance(track, dict) and (prior_queue_request or _queue_track_matches_query(track, queue_lookup_text))
+            if isinstance(track, dict) and (prior_queue_request or _show_song_source_request(user_text) or _queue_track_matches_query(track, queue_lookup_text))
         ]
         if queue_focus.get("completed") and not matched_completed_tracks:
             matched_completed_tracks = [
@@ -3310,7 +3327,7 @@ def build_bnl_read_model_context(
                     lines.append(f"- {label}")
         matched_removed_tracks = [
             track for track in removed_tracks
-            if isinstance(track, dict) and (prior_queue_request or _queue_track_matches_query(track, queue_lookup_text))
+            if isinstance(track, dict) and (prior_queue_request or _show_song_source_request(user_text) or _queue_track_matches_query(track, queue_lookup_text))
         ]
         if matched_removed_tracks:
             lines.append("\nRelevant removed tracks:")
@@ -35838,8 +35855,58 @@ async def _generate_website_relay_guarded(guild_id: int, *, allow_quiet_sources:
         return WebsiteRelayDecision(False, skipReason="relay_generation_timeout", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_timeout"})
 
 
+_ballad_cycle_task = None
+
+
+def _ballad_control_request_sync(method="GET", payload=None):
+    base = _journal_website_base_url()
+    if not base or not BNL_API_KEY:
+        return None
+    headers = {"Accept": "application/json", "x-api-key": BNL_API_KEY}
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(base + "/api/bnl/ballads", data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read(2_000_000).decode("utf-8"))
+
+
+async def _run_ballad_control_cycle():
+    """Existing website heartbeat polls; one isolated task cannot stall Discord or Journal."""
+    try:
+        control = await asyncio.to_thread(_ballad_control_request_sync)
+        if not isinstance(control, dict) or control.get("contractVersion") != 1:
+            return
+        for command in control.get("commands", [])[:2]:
+            command = {**command, "catalogVersions": control.get("catalogVersions", {})}
+            async def generate(prompt):
+                if not check_quota_availability(BALLAD_ROUTE):
+                    raise ValueError("local_model_budget_exhausted")
+                result = await asyncio.wait_for(_generate_gemini_content_result_async(
+                    BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + prompt, BALLAD_ROUTE,
+                ), timeout=120)
+                if not result.success:
+                    raise ValueError("generation_unavailable_try_manually")
+                return result.text
+
+            evidence = await asyncio.to_thread(
+                build_broadcast_ballad_evidence, DB_FILE, BNL_PRIMARY_GUILD_ID, command["showId"],
+            ) if command.get("kind") in {"generate", "polish"} else ("", "")
+            receipt = await execute_ballad_command(
+                DB_FILE, BNL_PRIMARY_GUILD_ID, command,
+                evidence_reader=lambda _cmd: evidence, generate=generate,
+            )
+            await asyncio.to_thread(_ballad_control_request_sync, "POST", receipt)
+    except Exception as exc:
+        logging.info("ballad_control_cycle_unavailable error_type=%s", type(exc).__name__)
+
+
 @tasks.loop(minutes=1)
 async def website_presence_heartbeat_task():
+    global _ballad_cycle_task
+    if BNL_PRIMARY_GUILD_ID and (_ballad_cycle_task is None or _ballad_cycle_task.done()):
+        _ballad_cycle_task = asyncio.create_task(_run_ballad_control_cycle())
     if BNL_WEBSITE_CONTRACT_VERSION != "2":
         return
     flags = get_bnl_control_flags()
@@ -36588,6 +36655,13 @@ def _detect_request_intent(text: str):
         return True, "exact_name_echo"
     if "?" in t:
         return True, "question_mark"
+    if re.search(
+        r"^(?:please\s+)?(?:(?:rewrite|revise|rework|edit|shorten|expand|tighten|replace)"
+        r"\s+(?:that|this|it|the|your|those|these)\b|(?:make|change|keep)"
+        r"\s+(?:that|this|the|your)\s+(?:song|lyrics|chorus|verse|bridge|hook|style|"
+        r"genre|prompt|answer|response|draft|paragraph|story|poem)\b)", t,
+    ):
+        return True, "revision_instruction"
     patterns = [
         r"(?:^|\s/\s)\s*(?:please\s+)?remember\b", r"\btell me\b", r"\bmake me\b", r"\bwrite\b", r"\bdraft\b",
         r"\bgive me\b", r"\bexplain\b", r"\bhelp\b", r"\bfix\b", r"\bsummarize\b",

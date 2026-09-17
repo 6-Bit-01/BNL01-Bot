@@ -4737,3 +4737,18 @@ __all__ = [
     "tiktok_show_episode_context_item_version",
     "tiktok_show_episode_context_item_versions",
 ]
+
+
+def build_broadcast_ballad_evidence(db_file: str, guild_id: int, show_id: str) -> tuple[str, str]:
+    """Read one finalized, authorized show through its existing evidence owner."""
+    with sqlite3.connect(db_file, timeout=2) as conn:
+        rows = _load_finalized_show_ledgers(conn, guild_id=guild_id, limit=500)
+    row = next((row for row in rows if str(row["ledger"].get("sessionId") or row["showKey"]) == show_id), None)
+    if row is None:
+        return "", ""
+    text = build_tiktok_show_evidence_context(
+        db_file, guild_id=guild_id,
+        user_text="Recap the entire show: music, actual playback, conversations, memorable moments and themes.",
+        pinned_show_keys=(row["showKey"],), show_limit=1,
+    )
+    return text, row["sourceDigest"]
