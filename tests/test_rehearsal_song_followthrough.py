@@ -133,6 +133,61 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
                 previous.append(request)
         self.assertTrue(all(call.kwargs.get("force") for call in self.fetch.call_args_list))
 
+    async def test_no_store_replies_and_checkins_keep_the_named_rehearsal_for_override(self):
+        # This is the live no-store sequence, not idealized user/model pairs.
+        # A later public show exists in the fixture and must not take over.
+        self.seed((REQUEST, SONG, FEEDBACK, "yo!", "You get that BNL?"))
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("DELETE FROM conversations WHERE role='model'")
+        direct_prompt, website = await self.direct(OVERRIDE)
+        channel, generation, _guard = await self.fixture._batch(
+            "sealed_test", request="BNL, " + OVERRIDE,
+            answer="[Chorus]\nTest Artist B brought B2 Complete.",
+        )
+        generation.assert_awaited_once()
+        self.assertTrue(channel.sent)
+        for prompt in (direct_prompt, generation.await_args.args[0]):
+            self.assert_fresh_facts(prompt)
+            self.assertIn("BARCODE Radio [09-15-2026]", prompt)
+        self.assertIn("Prior-conversation queue source candidate", website)
+        # The bounded human request identifies the session; stale source facts
+        # cannot be substituted if the private feed has moved to another one.
+        self.model["sections"]["queue"]["session"]["showDate"] = "2026-09-16"
+        _prompt, changed = await self.direct(OVERRIDE)
+        self.assertIn("earlier session is unavailable", changed)
+        self.assertNotIn("actualPlayback=confirmed", changed)
+        _prompt, public = await self.direct(OVERRIDE, "public_home")
+        self.assertNotIn("B2 Complete", public)
+
+    async def test_style_ceiling_reaches_delivery_without_regeneration_or_lyric_changes(self):
+        self.seed()
+        lyrics = "1. Lyrics\n[Chorus]\nTest Artist B brings B2 Complete.\n"
+        style = "1983: psychedelic soul + breakbeat. " + "Muted bass under a dry lead vocal. " * 40
+        answer = lyrics + "\n2. Style\n" + style
+        channel, generation, guard = await self.fixture._batch(
+            "sealed_test", request="BNL, " + SONG, answer=answer,
+        )
+        generation.assert_awaited_once()
+        guard.assert_awaited_once()
+        self.assertEqual(len(channel.sent), 1)
+        delivered = channel.sent[0]
+        self.assertTrue(delivered.startswith(lyrics))
+        self.assertLessEqual(len(delivered.split("2. Style\n", 1)[1]), 500)
+        self.assertIn("psychedelic soul + breakbeat", delivered)
+        # Typed packet generation still returns its raw envelope; the common
+        # visible-response boundary applies the same formatting after parsing.
+        prompt, _website = await self.direct(SONG)
+        for route in ("get_gemini_response", bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE):
+            checked, diagnostics = await bot.apply_guarded_response_regeneration(
+                answer, prompt=prompt, current_user_text=SONG,
+                user_id=self.fixture.user_id, guild_id=self.fixture.guild_id,
+                route_mode="normal_chat", channel_policy="sealed_test",
+                generation_route=route, source_context_available=True,
+                regeneration_allowed=False,
+            )
+            self.assertEqual(checked, delivered)
+            self.assertFalse(diagnostics["suppressed"])
+
     async def test_explicit_public_show_correction_keeps_its_own_sources(self):
         self.seed((REQUEST, SONG))
         prompt, website = await self.direct("Instead, recap the public show on 2026-08-28.")

@@ -13,7 +13,11 @@ CROSS_CHANNEL_RECENCY_MINUTES = 30
 MAX_CANDIDATE_ROWS = 80
 MAX_SAME_ROOM_PAIRS = 4
 MAX_CROSS_CHANNEL_PAIRS = 1
-MAX_UNPAIRED_ROWS = 2
+# Website-backed replies can intentionally be no-store, leaving human turns
+# unpaired. Retain the same turn depth as paired exchanges so a brief check-in
+# does not discard the earlier request. The shared character/recency bounds and
+# relevance/privacy filtering still apply.
+MAX_UNPAIRED_ROWS = MAX_SAME_ROOM_PAIRS
 IMMEDIATE_REFERENT_RECENCY_MINUTES = 10
 MAX_REFERENT_LINE_CHARS = 1200
 IMMEDIATE_ROOM_RECAP_RECENCY_MINUTES = 12

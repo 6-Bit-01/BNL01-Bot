@@ -2,6 +2,7 @@ import os
 import random
 import re
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
@@ -12,6 +13,31 @@ import bnl_creative_protocol as protocol
 
 
 class ShowCreativeProtocolTests(unittest.IsolatedAsyncioTestCase):
+    def test_provider_preserves_all_visible_parts_without_thoughts_or_other_candidates(self):
+        # A first part ending at "Test Artist" must not discard the rest of
+        # the song. Preserve byte adjacency for split words and JSON too.
+        for pieces in (
+            ("1. Lyrics\n[Verse]\nTest Artist", " B sings.\n", "2. Style\n1983: soul + dub."),
+            ('{"response_', 'text":"A complete answer.","support":[]}'),
+        ):
+            parts = [SimpleNamespace(text="Private reasoning", thought=True)]
+            parts += [SimpleNamespace(text=piece) for piece in pieces]
+            parts += [SimpleNamespace(text=None)]
+            response = SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(content=SimpleNamespace(parts=parts), finish_reason="STOP"),
+                    SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text="Another candidate")])),
+                ],
+                usage_metadata=SimpleNamespace(total_token_count=123),
+            )
+            with self.assertLogs(level="INFO") as logs:
+                result, tokens = bot._extract_text_and_tokens(response)
+            self.assertEqual(result, "".join(pieces))
+            self.assertEqual(tokens, 123)
+            self.assertIn("finish_reason=STOP", " ".join(logs.output))
+            self.assertNotIn("Private reasoning", " ".join(logs.output))
+        self.assertEqual(bot._extract_text_and_tokens(None), ("", None))
+
     def test_submitted_credits_win_over_filename_and_uploader_metadata(self):
         track = {
             "submittedArtistName": "Test Creator", "submittedSongTitle": "Original Song",
@@ -85,7 +111,7 @@ class ShowCreativeProtocolTests(unittest.IsolatedAsyncioTestCase):
         provider.assert_awaited_once()
         prompt = provider.call_args.args[0]
         self.assertIn(request, prompt)
-        self.assertIn("explicit user genre, era, format or length override", prompt)
+        self.assertIn("Honor an explicit era, lyric length or no-Style request", prompt)
         self.assertIn(protocol.SUNO_LYRIC_PROTOCOL, prompt)
         self.assertIn("Optional variation", prompt)
         hint = next(line for line in prompt.splitlines() if line.startswith("Optional variation"))
@@ -115,6 +141,62 @@ class ShowCreativeProtocolTests(unittest.IsolatedAsyncioTestCase):
             result = await bot.get_gemini_response("Write a chorus.", 7, 1, route=bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE)
         self.assertEqual(result, envelope)
         provider.assert_awaited_once()
+
+
+class SunoStyleLimitTests(unittest.TestCase):
+    def test_long_style_preserves_lyrics_blend_and_separate_notes(self):
+        lyrics = "1. Lyrics\n[Verse]\n" + "A specific original lyric line.\n" * 80
+        blend = "1983: psychedelic soul + breakbeat. "
+        style = blend + "Muted bass supports a close lead vocal. " * 40
+        notes = "\n\n3. Exclude\nDistorted guitars.\n\nNotes\n" + "Long review note. " * 40
+        text = lyrics + "\n2. Style\n" + style + notes
+        result = protocol.bound_suno_style_copy(text)
+        self.assertTrue(result.startswith(lyrics + "\n2. Style\n" + blend))
+        self.assertTrue(result.endswith(notes))
+        delivered = result.split("2. Style\n", 1)[1].split("\n\n3. Exclude", 1)[0]
+        self.assertLessEqual(len(delivered), 500)
+        self.assertTrue(delivered.endswith("."))
+        self.assertEqual(protocol.bound_suno_style_copy(result), result)
+
+    def test_style_only_markdown_and_fenced_field(self):
+        body = "1978: cabaret + dub; " + "accordion answers the bass; " * 70
+        for heading in ("Suno Style", "**Suno Style:**", "### Suno Style"):
+            with self.subTest(heading=heading):
+                text = heading + "\n```text\n" + body + "\n```"
+                result = protocol.bound_suno_style_copy(text)
+                self.assertTrue(result.startswith(heading + "\n```\n1978: cabaret + dub;"))
+                self.assertTrue(result.endswith("\n```"))
+                self.assertLessEqual(len(result.split("```\n", 1)[1].rsplit("\n```", 1)[0]), 500)
+
+    def test_exact_limit_short_style_and_lyric_only_are_unchanged(self):
+        for text in (
+            "Suno Style\n" + "a" * 500,
+            "1. Lyrics\n[Chorus]\nA line.\n2. Style\n1978: cabaret + dub.",
+            "[Chorus]\n" + "A complete original lyric line.\n" * 80,
+        ):
+            with self.subTest(prefix=text[:30]):
+                self.assertEqual(protocol.bound_suno_style_copy(text), text)
+
+    def test_prose_quotes_and_non_song_style_headings_are_unchanged(self):
+        large = "A detailed explanation. " * 80
+        for text in (
+            large,
+            "2. Style\n" + large,
+            "```\n1. Lyrics\nA quoted line.\n2. Style\n" + large + "\n```",
+            "> Suno Style\n> " + large,
+        ):
+            with self.subTest(prefix=text[:30]):
+                self.assertEqual(protocol.bound_suno_style_copy(text), text)
+
+    def test_no_sentence_boundary_still_respects_ceiling_and_whole_words(self):
+        core = "2000: cumbia + post-punk "
+        text = "Suno Style\n" + core + "interlocking guitars " * 80
+        result = protocol.bound_suno_style_copy(text).split("\n", 1)[1]
+        self.assertTrue(result.startswith(core))
+        self.assertLessEqual(len(result), 500)
+        self.assertIn(result.split()[-1], ("interlocking", "guitars"))
+        oversized_token = "Suno Style\n" + "a" * 800
+        self.assertEqual(len(protocol.bound_suno_style_copy(oversized_token).split("\n", 1)[1]), 500)
 
 
 if __name__ == "__main__":
