@@ -263,3 +263,21 @@ verify one private workspace run against an existing public show, then save auto
 when ready. No VPS restart, live model call, Discord post or public publication was
 performed during implementation. Rollback by disabling site automation and reverting
 the paired code changes, retaining SQLite tables, site records and audio history.
+
+## Selected workspace version and released-song context
+
+Edit and polish commands may carry `sourceVersion`, validated against versions of
+the same guild/show. Omission preserves the existing latest-version behavior.
+`baseVersion` still checks the latest canonical revision and remains the new
+version's parent; selecting older wording does not bypass stale-command protection.
+Polish receives the selected song, while edit inherits that song's generated notes.
+The website preserves producer story overrides for the same source version.
+
+The normal website context can render `sections.ballads` public release metadata:
+title, broadcast/date and the public song link. Creative lyrics never enter this
+block or corroborate show events. Unavailable releases are not inferred from older
+catalog entries. Journal/Relay writer integration is a separate unfinished scope.
+
+Deploy this bot change before the paired workspace. No migration, provider, budget,
+settings, gate or public action is needed. Existing clients work with this version.
+Rollback the site first, then revert this bot change and restart; keep stored history.

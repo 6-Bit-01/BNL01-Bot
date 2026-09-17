@@ -3150,6 +3150,21 @@ def build_bnl_read_model_context(
             if title and summary:
                 lines.append(f"- {title}: {summary}")
 
+    ballads = sections.get("ballads")
+    if isinstance(ballads, dict) and ballads.get("available") is True:
+        songs = ballads.get("songs")
+        if isinstance(songs, list) and songs:
+            lines.append("\nPublished Broadcast Ballads (release metadata only; lyrics are creative interpretation, never corroboration of show events):")
+            for song in songs[:30]:
+                if not isinstance(song, dict):
+                    continue
+                title = _compact_public_text(song.get("title"), 180)
+                show = _compact_public_text(song.get("showTitle"), 120)
+                date = _compact_public_text(song.get("showDate"), 30)
+                url = str(song.get("url") or "")
+                if title and url.startswith("https://www.barcode-network.com/radio/ballads?show="):
+                    lines.append(f"- BNL-01 — {title}; {show} ({date}): {url}")
+
     # Durable post-show analysis is owned by the archive/timeline block below.
     # Rendering the current queue snapshot here adds unrelated current-state
     # detail, crowds out comment evidence, and biases topic answers toward

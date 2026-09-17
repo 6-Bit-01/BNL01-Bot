@@ -285,3 +285,23 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SelectedVersionTests(unittest.IsolatedAsyncioTestCase):
+    setUp = BalladTests.setUp
+    run_command = BalladTests.run_command
+    async def test_polish_reads_selected_older_song_and_preserves_latest_parent(self):
+        first = await self.run_command()
+        await self.run_command({**self.command, "id": "edit-2", "kind": "edit", "baseVersion": "draft-1", "content": {"title": "Different song", "lyrics": "NEWEST_UNRELATED_LYRIC", "style": "different"}})
+        result = await self.run_command({**self.command, "id": "polish-3", "kind": "polish", "baseVersion": "edit-2", "sourceVersion": "draft-1"})
+        self.assertEqual(result["outcome"], "complete")
+        self.assertEqual(result["version"]["parentId"], "edit-2")
+        prompt = self.generate.call_args.args[0]
+        self.assertIn(first["version"]["lyrics"].splitlines()[1], prompt)
+        self.assertNotIn("NEWEST_UNRELATED_LYRIC", prompt.split("EXISTING DRAFT (only revise if requested):")[1])
+
+    async def test_unknown_selected_version_never_calls_model(self):
+        await self.run_command()
+        self.generate.reset_mock()
+        result = await self.run_command({**self.command, "id": "polish-2", "kind": "polish", "baseVersion": "draft-1", "sourceVersion": "other-show"})
+        self.assertEqual(result["error"], "version_not_found")
+        self.generate.assert_not_awaited()
