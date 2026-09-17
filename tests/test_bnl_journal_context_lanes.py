@@ -366,6 +366,69 @@ class JournalContextLaneTests(unittest.TestCase):
         )
         self.assertEqual("undeclared_context_use", journal.validate_article(undeclared, packet, []))
 
+    def test_context_repair_identifies_all_affected_fields_and_supplied_lanes(self):
+        packet = self.packet()
+        memory_ref = packet["generationContextLanes"]["establishedBroadcastMemory"][0]["laneRefId"]
+        article = self.article(
+            packet,
+            "A silver synth chorus was recorded during the Friday broadcast.",
+        )
+        article["title"] = "A Rumor Finds Its Rhythm"
+        article["excerpt"] = "I think the rhythm deserves a second listen."
+        details = []
+        self.assertEqual("undeclared_context_use", journal.validate_article(
+            article, packet, [], blocking_only=True, repair_details=details,
+        ))
+        self.assertIn({"field": "title", "check": "context_claim_outside_body"}, details)
+        self.assertIn({"field": "excerpt", "check": "context_claim_outside_body"}, details)
+        self.assertTrue(any(
+            issue["field"] == "sections[0].body"
+            and issue.get("laneRefId") == memory_ref
+            and issue.get("sentenceIndex") == 0
+            for issue in details
+        ), details)
+        self.assertNotIn("silver synth chorus", json.dumps(details))
+
+    def test_context_repair_round_trip_keeps_metadata_and_still_requires_grounded_declaration(self):
+        packet = self.packet()
+        memory = packet["generationContextLanes"]["establishedBroadcastMemory"][0]
+        fresh_ref = memory["matchedFreshSourceRefIds"][0]
+        claim = "A silver synth chorus was recorded during the Friday broadcast."
+        candidate = self.article(
+            packet, claim, lane_type="established_broadcast_memory",
+            lane_ref=memory["laneRefId"], basis=[memory["laneRefId"], fresh_ref],
+        )
+        candidate["sections"][0]["sourceRefIds"] = [fresh_ref]
+        del candidate["sourceRefIds"]
+        candidate["metadata"]["continuityNotes"] = ["Fictional continuity " * 6] * 60
+        candidate["metadata"]["contextUses"] = []
+        raw = json.dumps(candidate)
+        self.assertGreater(raw.index('"contextUses"'), 6000)
+        calls = []
+
+        def generator(_packet, prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return raw
+            previous = json.loads(prompt.split("Complete previous draft (not evidence):\n", 1)[1])
+            self.assertEqual(candidate, previous)
+            self.assertIn(memory["laneRefId"], prompt.split("Validation targets", 1)[1])
+            previous["metadata"]["contextUses"] = [{
+                "laneType": "established_broadcast_memory",
+                "laneRefId": memory["laneRefId"],
+                "sectionHeading": candidate["sections"][0]["heading"],
+                "claim": claim,
+                "basisRefIds": [memory["laneRefId"], fresh_ref],
+            }]
+            return json.dumps(previous)
+
+        article, reason, advisory = journal._generate_article_with_repairs(packet, generator, [])
+        self.assertEqual("", reason)
+        self.assertFalse(advisory)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(candidate["sections"][0]["body"].strip(), article["sections"][0]["body"])
+        self.assertEqual("", journal.validate_article(article, packet, []))
+
     def test_context_authority_is_bound_to_the_named_section(self):
         packet = self.packet()
         rumor = packet["generationContextLanes"]["communityRumors"][0]
