@@ -21,6 +21,7 @@ from bnl_journal import (
     deliver_approved,
     generate_and_store_packet_draft,
     journal_broadcast_memory_provenance_is_eligible,
+    journal_public_people_are_current,
     journal_topic_counts,
     utc_now_iso,
 )
@@ -1546,6 +1547,8 @@ def _frozen_packet_invalidation_reason(
     guild_id: int,
     packet: dict[str, Any],
 ) -> str:
+    if not journal_public_people_are_current(conn, guild_id, packet.get("privatePublicPeople", [])):
+        return "privacy_memory_ineligible"
     refs = {
         str(source.get("refId") or "")
         for source in packet.get("privateSources", [])
@@ -2605,6 +2608,8 @@ def _prepared_invalidation_reason(
     metadata: dict[str, Any],
     memory_excluded_entry_ids: set[str],
 ) -> str:
+    if not journal_public_people_are_current(conn, guild_id, metadata.get("publicPeople", [])):
+        return "privacy_memory_ineligible"
     related = {
         str(value)
         for value in metadata.get("relatedPriorJournalEntryIds", [])

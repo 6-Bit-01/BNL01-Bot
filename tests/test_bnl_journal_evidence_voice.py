@@ -96,11 +96,11 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
     def test_prompt_uses_mixed_voice_without_a_fixed_style_template(self):
         prompt = journal.build_generation_prompt(self.packet)
         self.assertIn("JOURNAL EDITORIAL OVERRIDE", prompt)
-        self.assertIn("four beats", prompt)
-        self.assertIn("Blend them in any order and any combination", prompt)
-        self.assertIn("fixed section template", prompt)
+        self.assertIn("no required sequence", prompt)
+        self.assertIn("Let the evidence determine its shape", prompt)
+        self.assertIn("fixedSectionTemplate", prompt)
         self.assertIn("evidenceCoverageContract", prompt)
-        self.assertIn("concrete, recognizable action", prompt)
+        self.assertIn("concrete current-window evidence", prompt)
         self.assertIn("Never invent a time, place, object, action", prompt)
         self.assertIn("Use a direct quote only rarely", prompt)
         self.assertIn("relay stream is the primary chronology and narrative spine", prompt)
@@ -496,7 +496,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             },
         )
 
-    def test_report_opening_clinical_language_and_missing_reaction_are_rejected(self):
+    def test_clinical_report_is_advisory_but_first_person_is_optional(self):
         report = _article(self.packet, opening="The Network observes a producer carrying a bass sketch through the room.")
         self.assertEqual("flat_report_voice", journal.validate_article(report, self.packet, []))
 
@@ -504,7 +504,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertEqual("overly_clinical_voice", journal.validate_article(clinical, self.packet, []))
 
         no_reaction = _article(self.packet, reaction=False)
-        self.assertEqual("missing_bnl_reaction", journal.validate_article(no_reaction, self.packet, []))
+        self.assertEqual("", journal.validate_article(no_reaction, self.packet, []))
 
     def test_affective_first_person_reaction_is_not_an_inference_claim(self):
         for reaction in (
@@ -518,13 +518,13 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
                 article = _article(self.packet, reaction_text=reaction)
                 self.assertEqual("", journal.validate_article(article, self.packet, []))
 
-    def test_quoted_first_person_line_does_not_replace_bnl_reaction(self):
+    def test_quoted_first_person_does_not_require_another_bnl_reaction(self):
         article = _article(
             self.packet,
             reaction=False,
             opening='A producer brought a bass sketch and said “I smiled when the loop finally landed.”',
         )
-        self.assertEqual("missing_bnl_reaction", journal.validate_article(article, self.packet, []))
+        self.assertEqual("", journal.validate_article(article, self.packet, []))
 
     def test_reaction_repair_names_natural_validator_compatible_stems(self):
         prompt = journal.build_generation_prompt(
@@ -549,7 +549,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             }
             for index in range(journal.MAX_PROMPT_SOURCES + 1)
         ]
-        sampled = journal._sample_source_kinds([], conversations)
+        sampled = journal._sample_source_kinds([], conversations, start="2026-07-19T00:00:00Z", end="2026-07-20T00:00:00Z", entry_kind="daily")
         sampled_names = {source["displayName"] for source in sampled}
         omitted_name = next(source["displayName"] for source in conversations if source["displayName"] not in sampled_names)
         for source in conversations:
