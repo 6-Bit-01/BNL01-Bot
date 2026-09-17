@@ -16,6 +16,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import fcntl
@@ -401,14 +402,17 @@ def record_source_event(
         )
 
 
-def query_source_events(db_path: str, guild_id: int, start_ms: int, end_ms: int) -> SourceQueryResult:
+def query_source_events(
+    db_path: str, guild_id: int, start_ms: int, end_ms: int, *, prepare_schema: bool = True,
+) -> SourceQueryResult:
     """Return every event in the exact half-open interval ``[start_ms, end_ms)``."""
     start = int(start_ms)
     end = int(end_ms)
     if start < 0 or end < start:
         raise ValueError("invalid_source_window")
-    ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    if prepare_schema:
+        ensure_schema(db_path)
+    with sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
         state = conn.execute(
             "SELECT activated_at_ms FROM bnl_journal_source_archive_state WHERE guild_id=?",
