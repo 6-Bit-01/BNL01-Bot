@@ -16,7 +16,7 @@ from bnl_creative_protocol import SUNO_LYRIC_PROTOCOL
 
 ROUTE = "broadcast_ballad_background"
 MANUAL_ROUTE = "broadcast_ballad_manual"
-PROMPT_VERSION = "broadcast-ballad-2"
+PROMPT_VERSION = "broadcast-ballad-3"
 LINER_NOTE_FIELDS = ("about", "inspiration", "mentions", "inspiredBy")
 
 
@@ -124,6 +124,11 @@ def build_prompt(command, evidence, history, previous=None):
         "AUTHORIZED SHOW EVIDENCE:\n" + evidence,
         "PRIOR CREATIVE CATALOG:\n" + json.dumps(history, ensure_ascii=False),
         "EXISTING DRAFT (only revise if requested):\n" + json.dumps(previous, ensure_ascii=False),
+        "WRITING REMINDER: Build this song's verses around multisyllabic and word-spanning rhyme "
+        "families, with internal echoes and natural phrasing. Give the hook room to sing. Prior lyrics "
+        "are creative history, not a rhyme template to copy. Keep the requested show, musical direction "
+        "and BNL's character. Deliver the song and its notes in the requested JSON, without a critique "
+        "or a separate rhyme worksheet.",
     ])
 
 

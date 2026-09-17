@@ -35885,7 +35885,9 @@ async def _run_ballad_control_cycle():
                 if not check_quota_availability(route):
                     raise ValueError("local_model_budget_exhausted")
                 result = await asyncio.wait_for(_generate_gemini_content_result_async(
-                    BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + prompt, route,
+                    # The system prompt already carries the shared songwriting
+                    # protocol; retain one copy plus the Ballad-specific brief.
+                    BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + prompt.removeprefix(SUNO_LYRIC_PROTOCOL + "\n"), route,
                 ), timeout=120)
                 if not result.success:
                     if result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET:

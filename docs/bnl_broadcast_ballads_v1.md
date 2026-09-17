@@ -1,5 +1,29 @@
 # BNL Broadcast Ballads v1
 
+## Rhyme guidance and prompt revision 3
+
+`broadcast-ballad-3` strengthens the shared songwriting guidance used by both
+Discord and the site. It illustrates multisyllabic and word-spanning rhyme,
+asks for related sounds across nearby lines and internal echoes, and keeps
+natural stresses and meaningful phrasing. Simple rhymes can support a hook or
+contrast without becoming the default pattern throughout the verses. The sound
+examples illustrate technique; they are not stock lyrics to reuse.
+
+The Ballad brief ends with a short writing reminder after show evidence and
+creative history. The actual worker now includes the full shared songwriting
+protocol once, removing the duplicate previously supplied by both the system
+prompt and standalone Ballad brief. This reduces repeated input without removing
+show evidence, creative history or track-story instructions.
+
+These are first-draft prompt changes, following Google's guidance on
+[concrete examples](https://ai.google.dev/gemini-api/docs/prompting-strategies)
+and [placing the request after long context](https://ai.google.dev/gemini-api/docs/long-context).
+There is still one provider attempt per command, with no rhyme scorer, output
+rejection, critic call or automatic rewrite. Tests check delivery of the prompt
+and successful receipt replay without another generation; they do not establish
+the musical quality or rhyme choices of the next live song. Existing songs and
+confirmed selections are not regenerated or replaced by this update.
+
 ## Track stories and prompt revision 2
 
 `broadcast-ballad-2` keeps the existing single-attempt writer and adds optional
