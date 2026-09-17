@@ -1,5 +1,31 @@
 # BNL Broadcast Ballads v1
 
+## Track stories and prompt revision 2
+
+`broadcast-ballad-2` keeps the existing single-attempt writer and adds optional
+`linerNotes` to the same JSON response: `about`, `inspiration`, `mentions`, and
+`inspiredBy`. These are concise public strings, each stored up to 1,500 characters.
+BNL's inspiration is a first-person creative note about the supplied broadcast
+and musical choices. Mentions identify people actually named in the lyrics;
+inspiration can also identify relevant people or moments from the public show.
+Neither field grants a performer, collaborator or endorsement credit. Private
+producer feedback and instructions remain outside public copy.
+
+The small Ballad-specific prompt adjustment favors natural phrasing, purposeful
+hooks and a structure suited to each song while retaining BNL's technical humor,
+swagger and unusual choices. Creative history labels confirmed selections and
+includes bounded feedback from their original saved producer directions. This is
+context for the next draft, not model training or approval of every selected line.
+The shared Discord songwriting protocol, provider limits and budget routing are
+unchanged. Prompt revision 1 and all original drafts remain in repository/history.
+
+Missing or malformed story fields become empty strings; usable lyrics are saved
+without a second call. Older versions restore normally. Producer lyric edits and
+restores carry the original generated story; the site provides a separate Save
+track story action to correct or expand public notes for that exact version.
+Publication/archival freeze the selected recording's story, independently of later
+private notes or draft changes. No generation or publication runs on deployment.
+
 BNL owns the writing. Each finalized public broadcast gets one song slot on the
 site, locked when the producer confirms the selected audio. Site archival clears
 the slot or atomically replaces it, while retaining the previous song and prompts.
