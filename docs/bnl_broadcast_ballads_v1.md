@@ -52,6 +52,10 @@ or timer owner is introduced. Source evidence loading runs off the Discord loop.
 The provider call uses existing tracked/budgeted generation with route
 `broadcast_ballad_background`: one attempt, no provider retry or fallback, a bounded
 wait, and no general chat post-processing loop. It preserves existing budget reserves.
+Ballads retain all optional-background spending checks, including monthly pace and
+daily limits. A local budget refusal is delivered as `budget_restricted:<reason>`
+instead of a generic generation failure. The failed receipt is cached; polling
+cannot retry the model or spend money. No spending limit or route priority is raised.
 
 The site defaults automation off. A saved producer setting enables future finalized
 public shows. Manual Generate/Edit/Restore requests remain separate from Publish.

@@ -143,6 +143,17 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
         self.assertEqual(background, (False, "monthly_target_pace"))
         self.assertEqual(interactive, (True, "interactive_available"))
 
+    def test_ballad_stays_subject_to_monthly_spending_pace(self):
+        self.now = datetime(2026, 9, 16, 20, 30, tzinfo=PACIFIC)
+        with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
+            decision = self.decision(
+                bnl01_bot.BALLAD_ROUTE,
+                request="0.0429675",
+                month="11.4812361",
+                today="1.3762125",
+            )
+        self.assertEqual(decision, (False, "monthly_target_pace"))
+
     def test_relay_uses_bounded_pace_allowance_while_ambient_stays_restricted(self):
         with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
             relay = self.decision(

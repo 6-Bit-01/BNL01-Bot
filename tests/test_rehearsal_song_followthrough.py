@@ -108,6 +108,28 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_receipt["outcome"], "complete")
         self.assertEqual(first_receipt["version"]["title"], "Last Light")
 
+    async def test_ballad_budget_refusal_keeps_reason_and_replays_without_retry(self):
+        command = dict(id="budget-draft-1", showId="show-attendance-1", showDate="2026-08-28",
+                       kind="generate", baseVersion=None, options={})
+        control = {"contractVersion": 1, "commands": [command], "catalogVersions": {}}
+        result = bot.GenerationResult(
+            False, error_category=bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+            provider_error_code="monthly_target_pace",
+            provider_error_message_safe="Provider detail must not enter the receipt",
+        )
+        with mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", self.fixture.guild_id), \
+             mock.patch.object(bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(return_value=result)) as generate, \
+             mock.patch.object(bot, "_ballad_control_request_sync", side_effect=[control, {"ok": True}, control, {"ok": True}]) as transport:
+            await bot._run_ballad_control_cycle()
+            await bot._run_ballad_control_cycle()
+        generate.assert_awaited_once()
+        receipt = transport.call_args_list[1].args[1]
+        self.assertEqual(receipt, transport.call_args_list[3].args[1])
+        self.assertEqual(receipt["outcome"], "failed")
+        self.assertEqual(receipt["error"], "budget_restricted:monthly_target_pace")
+        self.assertNotIn("version", receipt)
+
     async def test_revision_intent_does_not_promote_casual_phrases(self):
         self.assertTrue(bot._detect_request_intent(FEEDBACK)[0])
         self.assertTrue(bot._detect_request_intent(OVERRIDE)[0])

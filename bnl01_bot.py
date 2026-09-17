@@ -35887,6 +35887,9 @@ async def _run_ballad_control_cycle():
                     BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + prompt, BALLAD_ROUTE,
                 ), timeout=120)
                 if not result.success:
+                    if result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET:
+                        reason = result.provider_error_code or GENERATION_ERROR_LOCAL_MODEL_BUDGET
+                        raise ValueError(f"budget_restricted:{reason}")
                     raise ValueError("generation_unavailable_try_manually")
                 return result.text
 
