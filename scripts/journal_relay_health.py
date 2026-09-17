@@ -64,6 +64,14 @@ def inspect(db_path: str, guild_id: int, *, now: datetime = None) -> dict:
         snapshot("showEpisodes", "tiktok_show_evidence_ledgers", "ended_at_ms", "lifecycle_status", millis=True)
         snapshot("memoryLedger", "memory_ledger_entries", "created_at", "lifecycle_status")
 
+        rejected = rows("memory_moment_windows", """SELECT qualification_reason,COUNT(*)
+            FROM memory_moment_windows WHERE guild_id=? AND datetime(last_activity_at)>=datetime(?)
+              AND lifecycle_status='rejected' GROUP BY qualification_reason""", (guild_id, cutoff))
+        result["momentRejectionReasons24h"] = {
+            "available": rejected is not None,
+            "counts": {str(reason or "unknown"): count for reason, count in rejected or []},
+        }
+
         errors = rows("bnl_journal_automation_runs", """SELECT reason,COUNT(*)
             FROM bnl_journal_automation_runs WHERE guild_id=? AND datetime(updated_at)>=datetime(?)
             AND lifecycle_state NOT IN ('published','quiet','superseded') GROUP BY reason""", (guild_id, cutoff))

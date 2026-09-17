@@ -272,6 +272,7 @@ from bnl_journal import (
     approve_draft as approve_journal_draft,
     deliver_approved as deliver_approved_journal,
     generate_and_store_draft as generate_and_store_journal_draft,
+    generate_test_preview as generate_journal_test_preview,
     preview as preview_journal_draft,
     purge_guild_journal_derivatives_on_connection,
     purge_user_journal_derivatives_on_connection,
@@ -9445,7 +9446,7 @@ def _format_rd_entity_context_response(subject: str, context: dict) -> str:
 
 def _parse_journal_command(text: str) -> tuple[bool, dict, str]:
     m = re.match(
-        r"(?is)^\s*!bnl\s+journal\s+(create|preview|regenerate|reject|approve|retry|status|run-daily|run-weekly|rehydrate)\b(.*)$",
+        r"(?is)^\s*!bnl\s+journal\s+(test|create|preview|regenerate|reject|approve|retry|status|run-daily|run-weekly|rehydrate)\b(.*)$",
         text or "",
     )
     if not m:
@@ -9464,6 +9465,7 @@ def _parse_journal_command(text: str) -> tuple[bool, dict, str]:
 
 
 JOURNAL_OPERATOR_READ_ONLY_ACTIONS = frozenset({"preview", "status"})
+_journal_test_locks_by_guild: dict[int, asyncio.Lock] = {}
 
 
 def journal_command_permission_denial(
@@ -10020,6 +10022,59 @@ async def run_journal_automation_control_cycle(
     return results
 
 
+async def _send_private_journal_test(message: discord.Message, options: dict) -> None:
+    """Deliver to the invoking owner's DM without any conversation save hook."""
+    guild_id = int(message.guild.id)
+    lock = _journal_test_locks_by_guild.setdefault(guild_id, asyncio.Lock())
+    if lock.locked():
+        await message.reply("A Journal test is already running. Check your DMs when it finishes.")
+        return
+    async with lock:
+        snapshot, _ = await asyncio.to_thread(_journal_publication_control_snapshot_sync)
+        if snapshot is None:
+            await message.reply("Couldn't load Journal visibility settings. No test generation ran; try again shortly.")
+            return
+        hours = _parse_journal_hours(options.get("hours") or options.get("window"), default=24)
+        mentions = discord.AllowedMentions.none()
+        try:
+            # Check DM delivery before spending any model budget. Never fall
+            # back to posting the article in the invoking channel.
+            await message.author.send(
+                f"Preparing one private Journal test from the last {hours} hours. "
+                "This stays out of publication, saved Journals, and BNL memory. "
+                "Normal model budget applies; there is no automatic rewrite.",
+                allowed_mentions=mentions,
+            )
+        except discord.HTTPException:
+            await message.reply("Enable DMs from this server, then run the test again. No generation ran.")
+            return
+        result = await asyncio.to_thread(
+            generate_journal_test_preview, DB_FILE, guild_id, hours, _generate_journal_json_sync,
+            excluded_history_entry_ids=set(snapshot.public_excluded_entry_ids) | set(snapshot.memory_excluded_entry_ids),
+        )
+        if not result["ok"]:
+            text = f"Journal test stopped: `{result['reason']}`. Nothing was saved or published; no automatic rewrite ran."
+        else:
+            article = result["article"]
+            text = (
+                "**Private Journal test — not saved or published**\n"
+                f"Writing version: `{result['editorialVersion']}`\n"
+                f"Window: {result['sourceWindowStart']} to {result['sourceWindowEnd']}\n\n"
+                f"**{article['title']}**\n{article['excerpt']}\n"
+                + "\n".join(f"\n**{s['heading']}**\n{s['body']}" for s in article["sections"])
+            )
+            if result.get("editorialAdvisory"):
+                text += "\n\nAn editorial suggestion remains; the test kept this version without rewriting it."
+        try:
+            for chunk in discord_safe_chunks(text):
+                await message.author.send(chunk, allowed_mentions=mentions)
+        except discord.HTTPException:
+            await message.reply("Discord couldn't deliver the complete test DM. Nothing was saved or published.")
+            return
+        logging.info("journal_private_test_finished guild=%s ok=%s reason=%s stored=false published=false", guild_id, result["ok"], result["reason"] or "none")
+        await message.reply("Journal test result sent to your DMs. Nothing was saved or published.")
+
+
 async def maybe_handle_journal_command(message: discord.Message, clean_content: str) -> bool:
     matched, options, _ = _parse_journal_command(clean_content)
     if not matched:
@@ -10058,6 +10113,9 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         return True
     guild_id = message.guild.id
     try:
+        if action == "test":
+            await _send_private_journal_test(message, options)
+            return True
         if action == "status":
             flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
             control, control_error = await asyncio.to_thread(_journal_control_request_sync, "GET")
@@ -47164,6 +47222,13 @@ async def on_message(message: discord.Message):
     # enter promptable room/batch/context stores.  The handler owns all scope,
     # authentication, payload validation, and denial/error replies.
     if await maybe_handle_declared_canon_command(message, message.content):
+        return
+
+    # Test commands (including denied requests) must not become room context,
+    # conversation records, Journal sources, or Moment/identity observations.
+    matched_journal, journal_options, _ = _parse_journal_command(message.content)
+    if matched_journal and journal_options.get("action") == "test":
+        await maybe_handle_journal_command(message, message.content)
         return
 
     direct_conversation_ingress = _register_direct_conversation_ingress(message)

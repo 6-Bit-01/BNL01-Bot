@@ -31,6 +31,23 @@ class JournalRelayHealthTests(unittest.TestCase):
             self.assertFalse(report["moments"]["available"])
             self.assertEqual({"journal_publication": 1, "relay_publication": 2}, report["sharedBrainReceipts24h"]["lanesInSentPrompts"])
 
+    def test_moment_rejection_reasons_are_time_and_guild_scoped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "health.db"
+            with sqlite3.connect(path) as conn:
+                conn.execute("CREATE TABLE memory_moment_windows(guild_id INTEGER,last_activity_at TEXT,lifecycle_status TEXT,qualification_reason TEXT)")
+                conn.executemany("INSERT INTO memory_moment_windows VALUES(?,?,?,?)", [
+                    (1, "2026-09-17T01:00:00Z", "rejected", "low_signal_or_insufficient_continuity"),
+                    (1, "2026-09-17T01:00:00Z", "rejected", "low_signal_or_insufficient_continuity"),
+                    (1, "2026-09-17T01:00:00Z", "finalized", "qualified"),
+                    (2, "2026-09-17T01:00:00Z", "rejected", "other_guild"),
+                    (1, "2026-09-15T01:00:00Z", "rejected", "old_window"),
+                ])
+            before = path.read_bytes()
+            report = inspect(str(path), 1, now=datetime(2026, 9, 17, 2, tzinfo=timezone.utc))
+            self.assertEqual({"available": True, "counts": {"low_signal_or_insufficient_continuity": 2}}, report["momentRejectionReasons24h"])
+            self.assertEqual(before, path.read_bytes())
+
     def test_missing_file_does_not_create_a_database(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "missing.db"

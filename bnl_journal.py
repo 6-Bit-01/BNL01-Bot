@@ -8,8 +8,10 @@ import re
 import sqlite3
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 from bnl_canon_source_contract import (
@@ -38,6 +40,7 @@ JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
 JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
 JOURNAL_EDITORIAL_VERSION = "journal-public-voices-1"
+JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-1"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
 JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT = 200
@@ -2142,7 +2145,7 @@ def build_generation_context_lanes(
     safe_sources: list[dict[str, Any]],
     private_sources: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
+    with _read_source_database(db_path) as conn:
         identity_tokens = _journal_identity_tokens(conn, guild_id)
         established, memory_provenance = _approved_journal_broadcast_memory(
             conn, guild_id, safe_sources, source_window_end
@@ -2359,7 +2362,7 @@ def _historical_source_reflection_basis(
     if window_start_ms is None:
         return [], []
     history_start_ms = max(0, window_start_ms - int(timedelta(days=90).total_seconds() * 1000))
-    with sqlite3.connect(db_path) as conn:
+    with _read_source_database(db_path) as conn:
         if not table_exists(conn, "bnl_journal_source_events"):
             return [], []
         rows = conn.execute(
@@ -2559,7 +2562,7 @@ def _broadcast_memory_reflection_basis(
     guild_id: int,
     source_window_end: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    with sqlite3.connect(db_path) as conn:
+    with _read_source_database(db_path) as conn:
         safe_records, provenance = _approved_journal_broadcast_memory(
             conn,
             guild_id,
@@ -3172,7 +3175,7 @@ def _relay_source_health(
     duration_ms = end_ms - start_ms
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        with _read_source_database(db_path) as conn:
             if not table_exists(conn, "bnl_journal_source_events"):
                 health["status"] = "unobserved"
                 health["reason"] = "source_archive_unavailable"
@@ -3306,13 +3309,15 @@ def retrieve_history(
     limit: int = 6,
     *,
     excluded_entry_ids: Optional[set[str]] = None,
+    prepare_schema: bool = True,
 ) -> dict[str, Any]:
-    ensure_schema(db_path)
+    if prepare_schema:
+        ensure_schema(db_path)
     excluded = {str(entry_id) for entry_id in (excluded_entry_ids or set()) if str(entry_id)}
     current_subjects = _subject_refs(current_packet)
     current_topics = set(current_packet.get("candidateTopicTags", []))
     terms = set(_norm(_json(current_packet.get("safeSources", []))).split())
-    with sqlite3.connect(db_path) as conn:
+    with _read_source_database(db_path) as conn:
         conn.row_factory = sqlite3.Row
         prev_rows = conn.execute("""SELECT entry_id,revision,title,excerpt,sections_json,published_at,created_at
             FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published'
@@ -3483,6 +3488,7 @@ def build_packet_from_sources(
     observation_context: Optional[list[dict[str, Any]]] = None,
     coverage_complete: bool = True,
     excluded_history_entry_ids: Optional[set[str]] = None,
+    prepare_schema: bool = True,
 ) -> dict[str, Any]:
     # Scrub with the complete window's identity set before sampling. Otherwise
     # a selected source can mention a community member whose own source was the
@@ -3500,7 +3506,7 @@ def build_packet_from_sources(
         end=end,
         entry_kind=entry_kind,
     )
-    with sqlite3.connect(db_path) as conn:
+    with _read_source_database(db_path) as conn:
         people = _journal_public_people(conn, guild_id, private_sources)
         identity_tokens = _journal_identity_tokens(conn, guild_id)
     public_by_subject = {p["subjectRef"]: p for p in people}
@@ -3640,8 +3646,19 @@ def build_packet_from_sources(
         guild_id,
         packet,
         excluded_entry_ids=excluded_history_entry_ids,
+        prepare_schema=prepare_schema,
     )
     return packet
+
+
+@contextmanager
+def _read_source_database(db_path: str):
+    """Readers cannot initialize, backfill, or mutate the source database."""
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def build_source_packet_between(
@@ -3654,16 +3671,18 @@ def build_source_packet_between(
     observation_context: Optional[list[dict[str, Any]]] = None,
     excluded_history_entry_ids: Optional[set[str]] = None,
     source_period_bounds: Optional[list[dict[str, Any]]] = None,
+    prepare_schema: bool = True,
 ) -> dict[str, Any]:
     try:
         from bnl_journal_source_store import backfill_legacy_sources, query_source_events, timestamp_to_epoch_ms
 
-        backfill_legacy_sources(db_path, guild_id)
+        if prepare_schema:
+            backfill_legacy_sources(db_path, guild_id)
         start_ms = timestamp_to_epoch_ms(start)
         end_ms = timestamp_to_epoch_ms(end)
         if start_ms is None or end_ms is None:
             raise ValueError("invalid_source_window")
-        archived = query_source_events(db_path, guild_id, start_ms, end_ms)
+        archived = query_source_events(db_path, guild_id, start_ms, end_ms, prepare_schema=prepare_schema)
         relays: list[dict[str, Any]] = []
         conversations: list[dict[str, Any]] = []
         for event in archived.events:
@@ -3726,6 +3745,7 @@ def build_source_packet_between(
             },
             observation_context=observation_context,
             excluded_history_entry_ids=excluded_history_entry_ids,
+            prepare_schema=prepare_schema,
             # The archive activation watermark prevents the automatic
             # publisher from claiming a full day that began before durable
             # capture was enabled. Manual previews remain available during
@@ -3753,7 +3773,7 @@ def build_source_packet_between(
         # Safe compatibility path for a partially deployed schema. Automation
         # exposes this in private metadata so operators can see the downgrade.
         pass
-    with sqlite3.connect(db_path) as conn:
+    with _read_source_database(db_path) as conn:
         relay_count, conversation_count = _count_legacy_sources(conn, guild_id, start, end)
         relays = accepted_relays(conn, guild_id, start, end)
         conversations = public_conversations(conn, guild_id, start, end)
@@ -3773,6 +3793,7 @@ def build_source_packet_between(
         },
         observation_context=observation_context,
         excluded_history_entry_ids=excluded_history_entry_ids,
+        prepare_schema=prepare_schema,
         coverage_complete=relay_count <= MAX_RELAY_SOURCES_PER_WINDOW and conversation_count <= MAX_CONVERSATION_SOURCES_PER_WINDOW,
     )
     if source_period_bounds:
@@ -3798,6 +3819,7 @@ def build_source_packet(
     *,
     entry_kind: str = "manual",
     excluded_history_entry_ids: Optional[set[str]] = None,
+    prepare_schema: bool = True,
 ) -> dict[str, Any]:
     bounded_hours = max(1, min(int(hours or 72), 168))
     end = now or utc_now_iso()
@@ -3809,6 +3831,7 @@ def build_source_packet(
         end,
         entry_kind=entry_kind,
         excluded_history_entry_ids=excluded_history_entry_ids,
+        prepare_schema=prepare_schema,
     )
 
 
@@ -4825,6 +4848,8 @@ def _generate_article_with_repairs(
     generator: Callable[[dict[str, Any], str], str],
     prior_titles: list[str],
     attempt_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+    *,
+    max_attempts: Optional[int] = None,
 ) -> tuple[Optional[dict[str, Any]], str, bool]:
     """Return the best blocking-clean article without letting polish cancel publication."""
     def observe(event: dict[str, Any]) -> None:
@@ -4840,7 +4865,8 @@ def _generate_article_with_repairs(
     previous_output = ""
     last_repair_details: list[dict[str, Any]] = []
     retained_publishable: Optional[dict[str, Any]] = None
-    for attempt in range(JOURNAL_GENERATION_ATTEMPTS):
+    attempt_limit = JOURNAL_GENERATION_ATTEMPTS if max_attempts is None else max(1, min(int(max_attempts), JOURNAL_GENERATION_ATTEMPTS))
+    for attempt in range(attempt_limit):
         attempt_number = attempt + 1
         observe({
             "generationAttempt": attempt_number,
@@ -5080,6 +5106,64 @@ def generate_and_store_draft(
         excluded_history_entry_ids=excluded_history_entry_ids,
     )
     return generate_and_store_packet_draft(db_path, guild_id, packet, generator, entry_id=entry_id)
+
+
+def generate_test_preview(
+    db_path: str,
+    guild_id: int,
+    hours: int,
+    generator: Callable[[dict[str, Any], str], str],
+    *,
+    now: Optional[str] = None,
+    excluded_history_entry_ids: Optional[set[str]] = None,
+) -> dict[str, Any]:
+    """One in-memory daily-style preview; never create a draft or a run.
+
+    Source readers skip schema preparation/backfill and open SQLite read-only.
+    The caller's normal provider accounting remains active, but generated prose
+    has no persistence, approval, scheduling, or publication path here.
+    """
+    result: dict[str, Any] = {
+        "ok": False, "reason": "", "previewVersion": JOURNAL_TEST_PREVIEW_VERSION,
+        "editorialVersion": JOURNAL_EDITORIAL_VERSION,
+    }
+    try:
+        with _read_source_database(db_path) as conn:
+            prior_titles = _prior_titles(conn, guild_id)
+        packet = build_source_packet(
+            db_path, guild_id, hours, now,
+            entry_kind="daily", prepare_schema=False,
+            excluded_history_entry_ids=excluded_history_entry_ids,
+        )
+    except (sqlite3.Error, ValueError):
+        result["reason"] = "preview_sources_unavailable"
+        return result
+    result.update({
+        "sourceWindowStart": packet["sourceWindowStart"],
+        "sourceWindowEnd": packet["sourceWindowEnd"],
+        "aggregateCounts": packet.get("aggregateCounts", {}),
+    })
+    if not packet.get("coverageComplete", True):
+        result["reason"] = "incomplete_source_window"
+        return result
+    if not packet.get("safeSources") and not _eligible_reflection_basis(packet):
+        result["reason"] = "insufficient_grounded_material"
+        return result
+    article, reason, advisory = _generate_article_with_repairs(
+        packet, generator, prior_titles, max_attempts=1,
+    )
+    if article is None:
+        result["reason"] = reason
+        return result
+    result.update({
+        "ok": True,
+        "editorialAdvisory": advisory,
+        "article": {
+            "title": article["title"], "excerpt": article["excerpt"],
+            "sections": [{"heading": s["heading"], "body": s["body"]} for s in article["sections"]],
+        },
+    })
+    return result
 
 
 def approve_draft(
