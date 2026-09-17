@@ -22,6 +22,10 @@ SONG = (
 )
 FEEDBACK = "Make the chorus less repetitive and change the genres. Keep the same rehearsal facts."
 OVERRIDE = "Rewrite that as an eight-line hip hop chorus set in 2020. No Style section."
+STANDALONE_SONG = (
+    "Write an end-of-show song about the private BARCODE Radio [09-15-2026] "
+    "rehearsal, using the available records for the whole session."
+)
 
 
 class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
@@ -85,6 +89,56 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Wrong Uploader", prompt)
         self.assertNotIn("Wrong Filename", prompt)
         self.assertNotIn("the green visuals during this song are wild", prompt)
+
+    async def test_ballad_control_delivery_retry_does_not_generate_again(self):
+        command = dict(id="control-draft-1", showId="show-attendance-1", showDate="2026-08-28",
+                       kind="generate", baseVersion=None, options={})
+        control = {"contractVersion": 1, "commands": [command], "catalogVersions": {}}
+        result = bot.GenerationResult(True, '{"title":"Last Light","lyrics":"[Chorus]\\nLeave a light","style":"1977 chamber soul","palette":{}}')
+        with mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", self.fixture.guild_id), \
+             mock.patch.object(bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(return_value=result)) as generate, \
+             mock.patch.object(bot, "_ballad_control_request_sync", side_effect=[control, OSError("delivery unavailable"), control, {"ok": True}]) as transport:
+            await bot._run_ballad_control_cycle()
+            await bot._run_ballad_control_cycle()
+        generate.assert_awaited_once()
+        first_receipt = transport.call_args_list[1].args[1]
+        second_receipt = transport.call_args_list[3].args[1]
+        self.assertEqual(first_receipt, second_receipt)
+        self.assertEqual(first_receipt["outcome"], "complete")
+        self.assertEqual(first_receipt["version"]["title"], "Last Light")
+
+    async def test_revision_intent_does_not_promote_casual_phrases(self):
+        self.assertTrue(bot._detect_request_intent(FEEDBACK)[0])
+        self.assertTrue(bot._detect_request_intent(OVERRIDE)[0])
+        for text in ("keep it real", "make it home safely", "change the subject eventually"):
+            self.assertFalse(bot._detect_request_intent(text)[0])
+
+    async def test_ballad_reader_uses_existing_finalized_public_show_owner(self):
+        text, digest = bot.build_broadcast_ballad_evidence(
+            bot.DB_FILE, self.fixture.guild_id, "show-attendance-1",
+        )
+        self.assertIn("First Signal", text)
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(bot.build_broadcast_ballad_evidence(
+            bot.DB_FILE, self.fixture.guild_id, "private-rehearsal",
+        ), ("", ""))
+
+    async def test_unaddressed_revision_after_standalone_song_reaches_provider(self):
+        previous = []
+        for request in (STANDALONE_SONG, FEEDBACK, OVERRIDE):
+            with self.subTest(request=request):
+                self.seed(previous)
+                prompt, _website = await self.direct(request)
+                self.assert_fresh_facts(prompt)
+                channel, generation, _guard = await self.fixture._batch(
+                    "sealed_test", request=request,
+                    answer="[Chorus]\nA new refrain with room to breathe.",
+                )
+                generation.assert_awaited_once()
+                self.assert_fresh_facts(generation.await_args.args[0])
+                self.assertTrue(channel.sent)
+            previous.append(request)
 
     async def test_lookup_song_feedback_override_reach_direct_and_batch_with_fresh_facts(self):
         previous = [REQUEST]

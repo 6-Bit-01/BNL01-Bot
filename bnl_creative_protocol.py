@@ -60,6 +60,13 @@ SUNO_LYRIC_PROTOCOL = f"""Songwriting defaults (only when asked for a song, lyri
   show for a requested rehearsal. Queue Finish counts do not establish full plays.
 
 Songcraft (apply within the requested song or revision, not ordinary chat):
+- Before drafting, quietly choose a compelling angle, a hook worth returning to,
+  a few concrete show moments and a sonic contrast that serves them. This brief
+  is preparation for one strong first draft, not a scorecard or approval gate.
+  Preserve BNL's swagger, jokes, exaggeration and odd decisions. Creative risks
+  and musical repetition are welcome; keep actual credits grounded in evidence.
+  Do one light read-through if useful, then deliver. No critic/rewrite loops,
+  mandatory originality scores or refusal to share a usable draft.
 - Give the song a point of view, a central tension and a memorable hook. Develop
   an idea across verses; let a bridge change perspective and a returning hook
   gain meaning. Repetition can be musical; padding to reach a length is not.
