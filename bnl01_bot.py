@@ -3064,6 +3064,12 @@ def build_bnl_read_model_context(
     tiktok_context_query = live_reaction_query or show_analysis_query
     operational_query = queue_query or live_reaction_query or show_analysis_query
     queue_focus = _queue_query_focus(queue_lookup_text) if operational_query else {}
+    if prior_queue_request:
+        # The earlier request identifies the source session, not a permanent
+        # track filter or answer format. Context has already selected this
+        # continuation; let the current task use the available session records.
+        queue_focus = _queue_query_focus(user_text)
+        queue_focus["playback_evidence"] = True
     if live_reaction_query:
         queue_focus["show_reaction"] = True
 
@@ -3170,6 +3176,8 @@ def build_bnl_read_model_context(
         if operational_query:
             lines.extend(_queue_request_focus_lines(queue_focus, queue_url))
             lines.append("- Session scope: the queue facts below belong only to this snapshot's session. Match any requested title, session ID or date; do not substitute another session when the requested one is unavailable.")
+        if prior_queue_request:
+            lines.append("- Follow-up source coverage: include the available queued, completed and removed records from this same session, beyond any tracks named in the earlier lookup. These snapshot collections are not proof of the complete show history. The current request determines what to discuss; do not infer total submissions or sole participation from a selection of tracks.")
         session_bits = []
         session_field_specs = (
             ("sessionId", ("sessionId", "id")),
@@ -3267,7 +3275,9 @@ def build_bnl_read_model_context(
             priority_label = _compact_public_text(_first_present_value(session, ("priorityUpgradeLabel",)), 80)
         if priority_signal or priority_enabled is not None or priority_label:
             lines.append(f"- Priority Signal: enabled={priority_enabled if priority_enabled is not None else 'unknown'}" + (f", label={priority_label}" if priority_label else ""))
-        selected_queued_tracks = _queue_tracks_for_request(
+        selected_queued_tracks = [
+            track for track in queued_tracks if isinstance(track, dict)
+        ] if prior_queue_request else _queue_tracks_for_request(
             queued_tracks,
             queue_lookup_text,
             queue_focus,
@@ -3286,7 +3296,7 @@ def build_bnl_read_model_context(
                     lines.append(f"- {label}")
         matched_completed_tracks = [
             track for track in completed_tracks
-            if isinstance(track, dict) and _queue_track_matches_query(track, queue_lookup_text)
+            if isinstance(track, dict) and (prior_queue_request or _queue_track_matches_query(track, queue_lookup_text))
         ]
         if queue_focus.get("completed") and not matched_completed_tracks:
             matched_completed_tracks = [
@@ -3300,7 +3310,7 @@ def build_bnl_read_model_context(
                     lines.append(f"- {label}")
         matched_removed_tracks = [
             track for track in removed_tracks
-            if isinstance(track, dict) and _queue_track_matches_query(track, queue_lookup_text)
+            if isinstance(track, dict) and (prior_queue_request or _queue_track_matches_query(track, queue_lookup_text))
         ]
         if matched_removed_tracks:
             lines.append("\nRelevant removed tracks:")
