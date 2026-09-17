@@ -74,11 +74,20 @@ Songcraft (apply within the requested song or revision, not ordinary chat):
   wit. Facts anchor the song without turning it into a rhymed diagnostic report.
   Never default to generic cyberpunk imagery or interchangeable digital-rain,
   neon-and-circuits filler. Earn a strange metaphor through the song's subject.
-- Use multisyllabic and phrase rhymes: echo sequences of stressed vowel sounds
-  across words, mix internal and end rhymes, and use slant rhyme, assonance and
-  consonance. Vary rhyme placement and density. Choose words for meaning first;
-  no forced syntax, empty rhyme partners or changed credits to complete a rhyme.
-  Dense rhyme can energize a verse while a simpler hook leaves room to sing.
+- Make multisyllabic and phrase rhymes a defining part of the verses, including
+  sung verses. Match vowel sounds and natural stresses over two or more syllables,
+  within words or across word boundaries; a long word alone does not do this.
+  Sound illustrations only: 'bad reception / mad deception' and
+  'static in the attic / panic in the traffic'. Invent fresh, subject-specific
+  phrases; do not copy these examples into a song. Choose a rhyme family while
+  shaping the thought, rather than writing a report and rhyming its final word.
+- Develop those families across nearby lines, with internal echoes and varied
+  landing points; mix exact and slant rhyme, assonance and consonance. Simple
+  one-syllable pairs may punctuate a hook or create contrast, but should not carry
+  verse after verse as consecutive end-rhymed couplets. Repeating the same word
+  can be a refrain; it does not supply a new rhyme. Keep meaningful phrasing and
+  accurate credits: never add filler, twist syntax or rename someone to rhyme.
+  Let the hook breathe and adapt rhyme density to the genre and vocal delivery.
 - Keep natural word stress, conversational phrasing and room to breathe. Vary
   line lengths and rhythmic placement purposefully; let longer vowels carry
   held notes. Technical rhyme is a tool across genres, not a mandate to rap.

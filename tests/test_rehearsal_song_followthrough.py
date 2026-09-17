@@ -106,6 +106,11 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
             await bot._run_ballad_control_cycle()
             await bot._run_ballad_control_cycle()
         generate.assert_awaited_once()
+        prompt = generate.call_args.args[0]
+        self.assertEqual(prompt.count(bot.SUNO_LYRIC_PROTOCOL), 1)
+        self.assertIn("AUTHORIZED SHOW EVIDENCE:", prompt)
+        self.assertIn("linerNotes", prompt)
+        self.assertGreater(prompt.index("WRITING REMINDER:"), prompt.index("EXISTING DRAFT (only revise if requested):"))
         first_receipt = transport.call_args_list[1].args[1]
         second_receipt = transport.call_args_list[3].args[1]
         self.assertEqual(first_receipt, second_receipt)
