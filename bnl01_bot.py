@@ -24,6 +24,7 @@ from bnl_canon_source_contract import (
     build_claim_contract_inventory,
     diagnostics as canon_source_diagnostics,
     env_queue_production_enabled,
+    public_show_evidence_archive,
     queue_usability,
     render_concise_public_schedule,
     render_founders,
@@ -3004,6 +3005,8 @@ def build_bnl_read_model_context(
     """Build a compact prompt block from the channel-authorized read model."""
 
     declared_access_scope = website_queue_access_scope(read_model)
+    independent_history = "publicHistory" in _read_model_sections(read_model)
+    public_archive = public_show_evidence_archive(read_model) if independent_history else {}
     private_queue_allowed = _channel_allows_private_bnl_queue(channel_policy)
     read_model = safe_bnl_read_model_for_consumption(read_model, channel_policy)
     if not read_model:
@@ -3028,19 +3031,25 @@ def build_bnl_read_model_context(
             archive = {**archive, "currentShow": {
                 **current_show, "_evidenceObservedThroughMs": int(_bnl_read_model_cached_at.timestamp() * 1000),
             }}
+            public_current = _first_mapping(public_archive.get("currentShow"))
+            if public_current.get("sessionId") == current_id:
+                public_archive = {**public_archive, "currentShow": {
+                    **public_current, "_evidenceObservedThroughMs": int(_bnl_read_model_cached_at.timestamp() * 1000),
+                }}
     preparation_context = ""
-    if show_preparation_requested(user_text) and declared_access_scope == "public":
-        show, _selected_source = select_show_for_tiktok_analysis(archive, user_text)
+    if show_preparation_requested(user_text) and (public_archive or declared_access_scope == "public"):
+        preparation_archive = public_archive if independent_history else archive
+        show, _selected_source = select_show_for_tiktok_analysis(preparation_archive, user_text)
         if show:
             parent = build_tiktok_show_evidence_ledger(show, [])
             if parent:
-                current = _first_mapping(archive.get("currentShow"))
+                current = _first_mapping(preparation_archive.get("currentShow"))
                 if (show.get("sessionId") == current.get("sessionId")
                         and show.get("status") != "archived" and _bnl_read_model_cached_at is not None):
                     parent["preparationObservedThroughMs"] = int(_bnl_read_model_cached_at.timestamp() * 1000)
                 context = load_show_preparation_context(
                     DB_FILE, guild_id=BNL_PRIMARY_GUILD_ID, ledger=parent,
-                    same_date_show_count=sum(1 for item in tiktok_show_records(archive)
+                    same_date_show_count=sum(1 for item in tiktok_show_records(preparation_archive)
                         if item.get("showDate") == show.get("showDate")),
                 )
                 if context and show_preparation_only_requested(user_text):
@@ -3373,10 +3382,18 @@ def build_bnl_read_model_context(
                 lines.extend(f"- {line}" for line in event_lines)
 
     if live_reaction_query or show_analysis_query:
-        if access_scope in {"public", "private"}:
+        history_archive = public_archive if independent_history else archive
+        if independent_history and access_scope == "private" and archive.get("currentShow"):
+            # Preserve the authorized transient rehearsal candidate. Its
+            # current record stays private; historical public rows retain
+            # their independent authority and never inherit this access.
+            history_archive = {**history_archive, "currentShow": archive["currentShow"]}
+        history_allowed = bool(history_archive) if independent_history else access_scope in {"public", "private"}
+        context_allowed = history_allowed if show_analysis_query else access_scope in {"public", "private"}
+        if context_allowed:
             if show_analysis_query:
                 dates = requested_show_dates(show_analysis_text)
-                scoped_archives = [("", archive)]
+                scoped_archives = [("", history_archive)]
                 if not dates and broad_show_history_requested(show_analysis_text):
                     # Broad history is already maintained by the shared show
                     # ledger. Do not select a latest archive here and turn its
@@ -3388,7 +3405,7 @@ def build_bnl_read_model_context(
                         "attributed TikTok and Discord history."
                     )
                 elif len(dates) > 1:
-                    records = tiktok_show_records(archive)
+                    records = tiktok_show_records(history_archive)
                     scoped_archives = []
                     available_dates = 0
                     for day in dates:
@@ -3451,7 +3468,9 @@ def build_bnl_read_model_context(
             lines.extend(
                 [
                     "\nTikTok show reaction context:",
-                    "- Availability: unavailable because the queue/show session does not authorize live-show context in this channel.",
+                    ("- Availability: the public show-history projection is unavailable for this request."
+                     if show_analysis_query else
+                     "- Availability: unavailable because the queue/show session does not authorize live-show context in this channel."),
                     "- Do not invent current or historical TikTok comments, engagement, audience reactions, or queue state.",
                 ]
             )

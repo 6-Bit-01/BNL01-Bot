@@ -496,6 +496,27 @@ def requested_show_dates(
     return (value,) if value else ()
 
 
+def requested_recent_show_count(user_text: str) -> Optional[int]:
+    """Resolve a relative history window within an already selected show request."""
+    if has_explicit_show_date(user_text) or requested_show_date(user_text):
+        return None
+    words = {word: index for index, word in enumerate(
+        ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"), 1,
+    )}
+    match = re.search(
+        r"\b(?:last|latest|previous|prior|past|most recent)\s+"
+        r"(?:(" + "|".join(words) + r"|[1-9]\d{0,2})\s+)?"
+        r"(?:public\s+)?(?:barcode radio\s+)?(shows?|broadcasts?|episodes?|lives?)\b",
+        str(user_text or ""), re.IGNORECASE,
+    )
+    if not match:
+        return None
+    count = (match.group(1) or "").lower()
+    if count:
+        return words[count] if count in words else int(count)
+    return None if match.group(2).lower().endswith("s") else 1
+
+
 def is_live_show_reaction_query(
     text: str, *, now: Any = None, current_show_date: Optional[str] = None,
     check_show_date: bool = True,
@@ -691,7 +712,6 @@ def select_show_for_tiktok_analysis(
     candidates = _show_candidates(archive)
     if not candidates:
         return {}, "none"
-    normalized = _SPACE_RE.sub(" ", str(user_text or "")).strip().lower()
     # The website owns an ongoing show's date across midnight. A request for
     # "tonight" still refers to that current record, while explicit dates and
     # past calendar days constrain historical selection.
@@ -706,10 +726,18 @@ def select_show_for_tiktok_analysis(
         return {}, "none"
     if has_explicit_show_date(user_text):
         return {}, "none"
-    if re.search(r"\b(?:last|previous|prior|past) show\b", normalized):
-        for source_key, show in candidates:
-            if source_key in {"latestShow", "shows"}:
-                return dict(show), source_key
+    if requested_recent_show_count(user_text) is not None:
+        completed = [(key, show) for key, show in candidates
+                     if show.get("status") == "archived"
+                     or (not show.get("status") and key != "currentShow")]
+        if not completed:
+            return {}, "none"
+        source_key, show = max(completed, key=lambda item: str(item[1].get("showDate") or ""))
+        return dict(show), source_key
+    if re.search(r"\b(?:current|this)\s+(?:(?:private|public)\s+)?"
+                 r"(?:rehearsal|show|broadcast|session)\b", str(user_text or ""), re.I):
+        if not any(key == "currentShow" for key, _show in candidates):
+            return {}, "none"
     for preferred_source in ("currentShow", "latestShow", "shows"):
         for source_key, show in candidates:
             if source_key != preferred_source:

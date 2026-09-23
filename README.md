@@ -138,12 +138,18 @@ become personal memory or canon.
 
 The same one-minute read-model cycle may assemble a durable public show episode
 for a retained show only after the local queue gate, website queue capability,
-top-level public scope, and exact `queue_public_history_projection_v1` archive
-contract all pass. The archive must be available, `public_safe`, explicitly
-public, digest/revision-bearing, browser-personal-history-free, and free of test
-or simulation markers. Private, unavailable, malformed, capability-disabled,
-and local-gate-disabled projections create no show row or Memory Ledger
-projection. Each admitted episode carries a content-free
+and exact public-history contract all pass. Website schema 1.11 supplies
+`sections.publicHistory` (`queue_bnl_public_history_v1`), whose public authority
+is independent of the current queue's public/private/none scope. The section
+must be available, `public_safe`, explicitly public and read-only, have a valid
+content digest and source revision, contain no browser personal history, and
+be free of test or simulation markers. An explicitly unavailable or malformed
+section cannot fall back to the legacy archive. When the new section is absent,
+the existing `queue_public_history_projection_v1` archive still requires
+top-level public scope. Current private queue access and rehearsal playback
+keep their existing channel limits; they never enter public show memory.
+Unavailable, malformed, capability-disabled, and local-gate-disabled history
+projections create no show row or Memory Ledger projection. Each admitted episode carries a content-free
 `show_queue_evidence_authorization_v1` receipt in its source digest. Older rows
 without that receipt are preserved for audit but quarantined from show recall,
 packet selection, recurrence grouping, and source revalidation; an eligible
@@ -158,7 +164,19 @@ Wheel/sponsor/signal-hold events, order, and outcomes therefore remain available
 after the live snapshot expires. Ordinary recall retrieves only the show and
 evidence slices relevant to the current question; the complete ledger is not
 dumped into every prompt. The local queue gate is checked again for direct show
-context, packet selection, and send-time packet revalidation.
+context, packet selection, and send-time packet revalidation. General show
+recall also reads ordinary public Discord messages from the same show window,
+without requiring a BNL response. It retains speaker attribution, the existing
+track clock, and both eligible surfaces in bounded examples. These fresh reads
+do not inflate retained participant or BNL interaction totals. Original edits
+and visibility changes invalidate prepared context through the existing source
+revalidation owner; no transcript backfill or new memory store is required.
+
+For relative history requests, “last show” selects the newest completed record
+before topic relevance, and “last three shows” restricts candidates to that
+recent window within the existing recall limits. Explicit dates and selected
+source roots keep precedence. Undated person/topic recall keeps its existing
+relevance ordering, including older matching episodes.
 
 Participant presence and Relationship proactive consent authorize continuity;
 they do not create show intent. A show/continuity request or an actual evidence

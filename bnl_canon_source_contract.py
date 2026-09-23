@@ -35,6 +35,8 @@ SHOW_QUEUE_EVIDENCE_AUTHORIZATION_VERSION = (
 )
 SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION = "queue_public_history_projection_v1"
 SHOW_QUEUE_ARCHIVE_SOURCE = "queue_bnl_history_projection"
+SHOW_PUBLIC_HISTORY_SCHEMA_VERSION = "queue_bnl_public_history_v1"
+SHOW_PUBLIC_HISTORY_SOURCE = "queue_bnl_public_history_projection"
 
 
 class CanonStatus(str, Enum):
@@ -3253,8 +3255,33 @@ def _show_queue_archive(read_model: dict | None) -> dict[str, Any]:
     sections = read_model.get("sections")
     if not isinstance(sections, dict):
         return {}
-    archive = sections.get("archive")
+    archive = sections.get("publicHistory") if "publicHistory" in sections else sections.get("archive")
     return dict(archive) if isinstance(archive, Mapping) else {}
+
+
+def _independent_show_history_present(read_model: Any) -> bool:
+    return bool(isinstance(read_model, dict)
+                and isinstance(read_model.get("sections"), dict)
+                and "publicHistory" in read_model["sections"])
+
+
+def _public_history_digest_valid(archive: Mapping[str, Any]) -> bool:
+    shows = archive.get("shows")
+    if not isinstance(shows, list) or any(not isinstance(show, dict) for show in shows):
+        return False
+    current_id = archive.get("currentSessionId")
+    if current_id is not None and not any(
+        show.get("sessionId") == current_id and show.get("status") != "archived"
+        for show in shows
+    ):
+        return False
+    try:
+        encoded = json.dumps({key: archive.get(key) for key in (
+            "schemaVersion", "historyCoverageStartedAt", "currentSessionId", "shows",
+        )}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest() == archive.get("sourceDigest")
+    except (TypeError, ValueError, UnicodeError):
+        return False
 
 
 def _show_queue_archive_contains_test_evidence(value: Any) -> bool:
@@ -3293,6 +3320,11 @@ def show_queue_evidence_authorization(
         environ=dict(environ) if environ is not None else None,
         allow_private=False,
     )
+    independent = _independent_show_history_present(read_model)
+    if independent and queue["local"] and queue["website"] is True:
+        # This exact section has its own public authority. Current operational
+        # scope remains unchanged, including rejection of private queue data.
+        queue = {**queue, "usable": True, "reason": "eligible"}
     decision: dict[str, Any] = {
         "usable": False,
         "reason": str(queue.get("reason") or "queue_not_usable"),
@@ -3304,13 +3336,17 @@ def show_queue_evidence_authorization(
         read_model.get("ok") is not True
         or read_model.get("version") != 1
         or read_model.get("source") != "barcode-network-site"
-        or read_model.get("publicOnly") is not True
-        or website_queue_access_scope(read_model) != "public"
+        or (not independent and (
+            read_model.get("publicOnly") is not True
+            or website_queue_access_scope(read_model) != "public"
+        ))
     ):
         decision["reason"] = "read_model_public_contract_invalid"
         return decision
 
     archive = _show_queue_archive(read_model)
+    schema = SHOW_PUBLIC_HISTORY_SCHEMA_VERSION if independent else SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION
+    source = SHOW_PUBLIC_HISTORY_SOURCE if independent else SHOW_QUEUE_ARCHIVE_SOURCE
     source_revision = archive.get("sourceRevision")
     source_digest = str(archive.get("sourceDigest") or "").strip().casefold()
     coverage_started_at = str(
@@ -3319,8 +3355,8 @@ def show_queue_evidence_authorization(
     archive_contract_valid = bool(
         archive.get("available") is True
         and archive.get("reason") in {None, ""}
-        and archive.get("schemaVersion") == SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION
-        and archive.get("source") == SHOW_QUEUE_ARCHIVE_SOURCE
+        and archive.get("schemaVersion") == schema
+        and archive.get("source") == source
         and archive.get("visibility") == "public_safe"
         and archive.get("accessScope") == "public"
         and archive.get("memoryDefault") == "do_not_store"
@@ -3333,6 +3369,11 @@ def show_queue_evidence_authorization(
         and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", coverage_started_at)
         and archive.get("personalHistory") is None
         and not _show_queue_archive_contains_test_evidence(archive)
+        and (not independent or (
+            archive.get("publicOnly") is True
+            and archive.get("mutationAllowed") is False
+            and _public_history_digest_valid(archive)
+        ))
     )
     if not archive_contract_valid:
         decision["reason"] = "archive_public_contract_invalid"
@@ -3345,8 +3386,8 @@ def show_queue_evidence_authorization(
         "localQueueProduction": True,
         "websiteQueueProduction": True,
         "accessScope": "public",
-        "archiveSchemaVersion": SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION,
-        "archiveSource": SHOW_QUEUE_ARCHIVE_SOURCE,
+        "archiveSchemaVersion": schema,
+        "archiveSource": source,
         "archiveVisibility": "public_safe",
         "archiveSourceRevision": source_revision,
         "archiveSourceDigest": source_digest,
@@ -3360,6 +3401,25 @@ def show_queue_evidence_authorization(
         }
     )
     return decision
+
+
+def public_show_evidence_archive(
+    read_model: dict | None, *, environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Adapt authorized public history for the existing show readers only."""
+    if not show_queue_evidence_authorization(read_model, environ=environ)["usable"]:
+        return {}
+    archive = _show_queue_archive(read_model)
+    if not _independent_show_history_present(read_model):
+        return archive
+    shows = archive["shows"]
+    archived = [show for show in shows if show.get("status") == "archived"]
+    archived.sort(key=lambda show: str(show.get("showDate") or ""), reverse=True)
+    current = next((show for show in shows
+                    if show.get("sessionId") == archive.get("currentSessionId")
+                    and show.get("status") != "archived"), None)
+    return {**archive, "shows": archived, "currentShow": current,
+            "latestShow": archived[0] if archived else None}
 
 
 def show_queue_evidence_authorization_receipt_valid(value: Any) -> bool:
@@ -3391,9 +3451,10 @@ def show_queue_evidence_authorization_receipt_valid(value: Any) -> bool:
         and value.get("localQueueProduction") is True
         and value.get("websiteQueueProduction") is True
         and value.get("accessScope") == "public"
-        and value.get("archiveSchemaVersion")
-        == SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION
-        and value.get("archiveSource") == SHOW_QUEUE_ARCHIVE_SOURCE
+        and (value.get("archiveSchemaVersion"), value.get("archiveSource")) in (
+            (SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION, SHOW_QUEUE_ARCHIVE_SOURCE),
+            (SHOW_PUBLIC_HISTORY_SCHEMA_VERSION, SHOW_PUBLIC_HISTORY_SOURCE),
+        )
         and value.get("archiveVisibility") == "public_safe"
         and isinstance(revision, int)
         and not isinstance(revision, bool)
@@ -3500,13 +3561,20 @@ def strip_queue_sections(
 ) -> dict:
     if not isinstance(read_model, dict):
         return {}
-    if queue_usability(
+    usable = queue_usability(
         read_model,
         environ=environ,
         allow_private=allow_private,
-    )["usable"]:
-        return read_model
-    return _strip_queue_recursive(read_model)
+    )["usable"]
+    result = read_model if usable else _strip_queue_recursive(read_model)
+    if _independent_show_history_present(read_model):
+        # Keep a failed envelope present so it cannot fall back to an older
+        # archive after an explicit withdrawal or unavailable current read.
+        history = read_model["sections"]["publicHistory"] if show_queue_evidence_authorization(
+            read_model, environ=environ,
+        )["usable"] else {"available": False, "reason": "public_history_unavailable"}
+        result = {**result, "sections": {**result.get("sections", {}), "publicHistory": history}}
+    return result
 
 def diagnostics(read_model: dict | None = None, *, environ: dict[str, str] | None = None) -> dict[str, Any]:
     q = queue_usability(read_model, environ=environ)
