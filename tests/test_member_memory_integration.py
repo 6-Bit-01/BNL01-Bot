@@ -682,6 +682,11 @@ class MemberMemoryIntegrationTests(unittest.TestCase):
                 ) VALUES (42,1,'user_note','PRIVATE LEGACY CORE',1.0,1,'2026-07-01')
                 """
             )
+            source_id = conn.execute(
+                "INSERT INTO conversations(user_id,user_name,guild_id,channel_policy,role,content) "
+                "VALUES(42,'Test Member',1,'public_home','user',?)",
+                ('We repaired the antenna controller after three retries.',),
+            ).lastrowid
             conn.commit()
         bnl01_bot._add_memory_tier_entry(
             42,
@@ -704,6 +709,7 @@ class MemberMemoryIntegrationTests(unittest.TestCase):
             source_channel_policy="public_home",
             source_origin="conversations",
             source_trust="source_safe_public",
+            source_conversation_row_ids=(source_id,),
         )
         snapshot = bnl01_bot.get_guild_curiosity_snapshot(1, limit_users=3)
         self.assertEqual(len(snapshot), 1)

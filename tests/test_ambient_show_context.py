@@ -232,8 +232,8 @@ class AmbientShowContextTests(unittest.IsolatedAsyncioTestCase):
 
         self.http.side_effect = read
         await self.capture()
-        self.assertEqual(len(read_threads), 1)
-        self.assertNotEqual(read_threads[0], caller_thread)
+        self.assertEqual(len(read_threads), 2)  # Assembly and post-generation validation.
+        self.assertTrue(all(thread != caller_thread for thread in read_threads))
 
 
 if __name__ == "__main__":

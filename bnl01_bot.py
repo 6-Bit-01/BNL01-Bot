@@ -150,6 +150,7 @@ from bnl_moment_engine import (
     MomentSituationReference,
     apply_moment_meaning,
     claim_pending_moment_meaning,
+    expire_stale_moment_meaning_attempts,
     fail_moment_meaning,
     active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
@@ -21850,16 +21851,21 @@ def build_broadcast_memory_context(guild_id: int, user_text: str, channel_policy
     lines = [f"- {d} [{t}] {s}" for d, t, s in selected[:5]]
     return "Broadcast memory context (cleaned summaries only):\n" + "\n".join(lines)
 
-def build_scoped_broadcast_memory_context(guild_id: int, scope: str, public_only: bool = True, limit: int = 3) -> str:
-    rows = get_recent_broadcast_memory(guild_id, public_only=public_only, limit=25)
+def build_scoped_broadcast_memory_context(guild_id: int, scope: str, public_only: bool = True,
+                                          limit: int = 3, *, source_basis: dict | None = None) -> str:
+    with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
+        rows = _ambient_source_rows(conn, "broadcast_memory", guild_id, limit=25)
     selected = []
-    for episode_date, cleaned_summary, entry_type, _importance, _public_safe, _affects_next_show, usage_scope, _target_show_date, _valid_until, _override_span_count, _needs_clarification in rows:
-        scope_txt = (usage_scope or "").lower()
-        if scope and scope not in scope_txt:
+    for row in rows:
+        scopes = {part.strip().lower() for part in re.split(r"[,/;]+|\band\b", row["usage_scope"] or "")}
+        if scope and scope.lower() not in scopes:
             continue
-        if not cleaned_summary:
+        if (row["status"] != "active" or row["superseded_by_id"] or row["needs_clarification"]
+                or (public_only and row["public_safe"] != 1)
+                or not _valid_until_active(row["valid_until"]) or not row["cleaned_summary"]):
             continue
-        selected.append(f"- {episode_date} [{entry_type}] {_safe_truncate_summary(cleaned_summary, 140)}")
+        _remember_ambient_sources(source_basis, "broadcast_memory", [row])
+        selected.append(f"- {row['episode_date']} [{row['entry_type']}] {_safe_truncate_summary(row['cleaned_summary'], 140)}")
         if len(selected) >= limit:
             break
     return "\n".join(selected)
@@ -23000,67 +23006,136 @@ def _complete_delete_member_data_sync(
         )
 
 
-def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_MESSAGES):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT user_name, content
-        FROM conversations
-        WHERE guild_id = ? AND role = 'user'
-          AND channel_policy IN ('public_home', 'public_context')
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (guild_id, limit),
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return list(reversed(rows))
+_AMBIENT_SOURCE_FIELDS = {
+    "conversations": "id,user_id,user_name,content,role,channel_id,channel_policy",
+    "memory_tiers": "id,user_id,tier,summary,source_role,source_channel_policy,source_trust,source_lineage_complete",
+    "broadcast_memory": "id,episode_date,cleaned_summary,entry_type,public_safe,usage_scope,valid_until,needs_clarification,status,superseded_by_id",
+}
+
+
+def _ambient_source_rows(conn, table, guild_id, *, row_ids=None, limit=100):
+    """Bounded reads of existing owners; never include raw operator notes."""
+    fields = _AMBIENT_SOURCE_FIELDS[table]
+    if table == "conversations":
+        columns = {row[1] for row in conn.execute("PRAGMA main.table_info(conversations)")}
+        fields += "," + ("public_usable" if "public_usable" in columns else "1 AS public_usable")
+        fields += "," + ("visibility" if "visibility" in columns else "'public' AS visibility")
+    if row_ids is None:
+        extra = " AND role='user' AND channel_policy IN ('public_home','public_context')" if table == "conversations" else ""
+        cursor = conn.execute(f"SELECT {fields} FROM {table} WHERE guild_id=?{extra} ORDER BY id DESC LIMIT ?",
+                              (guild_id, min(100, max(1, int(limit)))))
+    else:
+        ids = tuple(row_ids)
+        if not ids:
+            return []
+        if len(ids) > 400:
+            return [row for start in range(0, len(ids), 400)
+                    for row in _ambient_source_rows(conn, table, guild_id, row_ids=ids[start:start + 400])]
+        cursor = conn.execute(f"SELECT {fields} FROM {table} WHERE guild_id=? AND id IN ({','.join('?' for _ in ids)})",
+                              (guild_id, *ids))
+    names = [column[0] for column in cursor.description]
+    rows = [dict(zip(names, row)) for row in cursor.fetchall()]
+    if table in {"conversations", "memory_tiers"}:
+        _, blocked = _public_conversation_recall_controls(
+            conn, guild_id=guild_id, source_users={row['id']: row['user_id'] for row in rows}, source_table=table,
+        )
+        rows = [row for row in rows if row['id'] not in blocked]
+    if table == 'conversations':
+        rows = [row for row in rows if row['role'] == 'user'
+                and row['channel_policy'] in {'public_home', 'public_context'}
+                and row['public_usable'] == 1 and row['visibility'] in {'public', 'public_safe'}]
+    return rows
+
+
+def _ambient_source_hash(row):
+    return _prompt_source_digest(json.dumps(row, sort_keys=True, ensure_ascii=False))
+
+
+def _remember_ambient_sources(basis, table, rows):
+    if basis is not None:
+        _merge_ambient_source_hashes(basis, table, {row['id']: _ambient_source_hash(row) for row in rows})
+
+
+def _merge_ambient_source_hashes(basis, table, rows):
+    recorded = basis.setdefault('rows', {}).setdefault(table, {})
+    if any(row_id in recorded and recorded[row_id] != digest for row_id, digest in rows.items()):
+        raise ValueError('ambient_source_changed_during_assembly')
+    recorded.update(rows)
+
+
+def _ambient_tier_sources(conn, guild_id, tier_id):
+    # Oversized or unlinked summaries do not gain authority through Ambient.
+    rows = conn.execute(
+        'SELECT conversation_row_id FROM memory_tier_conversation_sources '
+        'WHERE guild_id=? AND tier_row_id=? ORDER BY conversation_row_id LIMIT 33',
+        (guild_id, tier_id),
+    ).fetchall()
+    return tuple(row[0] for row in rows) if 0 < len(rows) <= 32 else ()
+
+
+def revalidate_ambient_local_sources(guild_id: int, basis: dict) -> bool:
+    if basis.get('guild_id') != guild_id:
+        return False
+    try:
+        with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
+            for table, expected in basis.get('rows', {}).items():
+                rows = _ambient_source_rows(conn, table, guild_id, row_ids=expected)
+                if {row['id']: _ambient_source_hash(row) for row in rows} != expected:
+                    return False
+                if table == 'broadcast_memory' and any(not _valid_until_active(row['valid_until']) for row in rows):
+                    return False
+            for tier_id, expected in basis.get('tier_sources', {}).items():
+                if _ambient_tier_sources(conn, guild_id, tier_id) != expected:
+                    return False
+        return True
+    except (sqlite3.Error, OSError, ValueError, KeyError):
+        return False
+
+
+def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_MESSAGES,
+                                   *, source_basis: dict | None = None):
+    with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
+        rows = _ambient_source_rows(conn, 'conversations', guild_id, limit=limit)
+    _remember_ambient_sources(source_basis, 'conversations', rows)
+    return [(row['user_name'], row['content']) for row in reversed(rows)]
 
 def get_guild_curiosity_snapshot(guild_id: int, limit_users: int = 3):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT user_id, total_messages, last_topic
-        FROM user_habits
-        WHERE guild_id = ?
-        ORDER BY total_messages DESC, updated_at DESC
-        LIMIT ?
-        """,
-        (guild_id, limit_users),
-    )
-    users = cursor.fetchall()
-    conn.close()
-
     snapshot = []
-    for user_id, total_messages, last_topic in users:
-        tiers = get_memory_tiers(user_id, guild_id)
-        pool = [
-            r
-            for r in tiers
-            if len(r) >= 10
-            and r[9] in ("source_safe_public", "source_safe_public_consolidated")
-            and not _conversation_trace_is_questionable_personal_fact(r)
-        ]
-        short = next((r[1] for r in pool if r[0] == "short"), "")
-        medium = next((r[1] for r in pool if r[0] == "medium"), "")
-        long_t = next((r[1] for r in pool if r[0] == "long"), "")
-        snapshot.append({
-            "user_id": user_id,
-            "total_messages": total_messages,
-            "last_topic": last_topic or "general",
-            # Historical Core flags were confidence/repetition artifacts, not
-            # reviewed authority. They cannot influence public Ambient output.
-            "core_fact": "none",
-            "short_trace": short or "none",
-            "medium_trace": medium or "none",
-            "long_trace": long_t or "none",
-        })
+    with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
+        users = conn.execute('SELECT user_id,total_messages,last_topic FROM user_habits WHERE guild_id=? '
+                             'ORDER BY total_messages DESC,updated_at DESC LIMIT ?',
+                             (guild_id, min(6, max(1, limit_users)))).fetchall()
+        for user_id, total_messages, last_topic in users:
+            ids = [row[0] for row in conn.execute(
+                "SELECT id FROM memory_tiers WHERE guild_id=? AND user_id=? "
+                "AND tier IN ('short','medium','long') AND source_lineage_complete=1 "
+                "AND source_trust IN ('source_safe_public','source_safe_public_consolidated') "
+                "ORDER BY id DESC LIMIT 100", (guild_id, user_id))]
+            item = {'user_id': user_id, 'total_messages': total_messages, 'last_topic': last_topic or 'general',
+                    'core_fact': 'none', '_trace_sources': {}}
+            for row in sorted(_ambient_source_rows(conn, 'memory_tiers', guild_id, row_ids=ids),
+                              key=lambda row: row['id'], reverse=True):
+                if (row['tier'] not in {'short', 'medium', 'long'} or row['source_lineage_complete'] != 1
+                        or row['source_trust'] not in {'source_safe_public', 'source_safe_public_consolidated'}):
+                    continue
+                key = row['tier'] + '_trace'
+                if key in item or _conversation_trace_is_questionable_personal_fact((row['tier'], row['summary'])):
+                    continue
+                source_ids = _ambient_tier_sources(conn, guild_id, row['id'])
+                originals = _ambient_source_rows(conn, 'conversations', guild_id, row_ids=source_ids)
+                if not source_ids or len(originals) != len(source_ids) or any(r['user_id'] != user_id for r in originals):
+                    continue
+                item[key] = row['summary']
+                trace_basis = {'tier_sources': {row['id']: source_ids}}
+                _remember_ambient_sources(trace_basis, 'memory_tiers', [row])
+                _remember_ambient_sources(trace_basis, 'conversations', originals)
+                item['_trace_sources'][row['summary']] = trace_basis
+            for tier in ('short', 'medium', 'long'):
+                item.setdefault(tier + '_trace', 'none')
+            snapshot.append(item)
     return snapshot
 
-def build_dynamic_curiosity_payload(guild_id: int):
+def build_dynamic_curiosity_payload(guild_id: int, *, source_basis: dict | None = None):
     snapshot = get_guild_curiosity_snapshot(guild_id, limit_users=6)
     short_pool, medium_pool, long_pool, core_pool = [], [], [], []
 
@@ -23104,6 +23179,14 @@ def build_dynamic_curiosity_payload(guild_id: int):
         cues = short_pool[:1] + medium_pool[:1] + core_pool[:1]
 
     cues = [c for c in cues if c][:4]
+    if source_basis is not None:
+        for item in snapshot:
+            for cue, trace_basis in item.get('_trace_sources', {}).items():
+                if cue not in cues:
+                    continue
+                source_basis.setdefault('tier_sources', {}).update(trace_basis['tier_sources'])
+                for table, rows in trace_basis['rows'].items():
+                    _merge_ambient_source_hashes(source_basis, table, rows)
     cue_block = "\n".join([f"- {c}" for c in cues]) if cues else "- (none)"
     return mode, cue_block
 
@@ -27901,8 +27984,11 @@ class ConversationPromptSourceBasis:
 
 def _public_conversation_recall_controls(
     conn: sqlite3.Connection, *, guild_id: int, source_users: dict[int, int],
+    source_table: str = 'conversations',
 ) -> tuple[str, frozenset[int]]:
-    """Read explicit correction/forget controls without promoting ledger text."""
+    """Read explicit original/tier controls without promoting ledger text."""
+    if source_table not in {'conversations', 'memory_tiers'}:
+        raise ValueError('unsupported_recall_source_table')
     columns = {str(row[1]) for row in conn.execute(
         "PRAGMA main.table_info(memory_ledger_entries)"
     )}
@@ -27923,9 +28009,9 @@ def _public_conversation_recall_controls(
         rows = conn.execute(
             """SELECT entry_id,source_row_id,subject_key,lifecycle_status
             FROM main.memory_ledger_entries
-            WHERE guild_id=? AND source_table='conversations'
+            WHERE guild_id=? AND source_table=?
               AND source_row_id IN (%s)""" % ",".join("?" for _ in chunk),
-            (int(guild_id), *(str(row_id) for row_id in chunk)),
+            (int(guild_id), source_table, *(str(row_id) for row_id in chunk)),
         ).fetchall()
         for entry_id, source_row_id, subject, lifecycle in rows:
             row_id = int(source_row_id)
@@ -33812,22 +33898,56 @@ def build_ambient_current_show_context(guild_id: int) -> str:
     return "\n".join(lines)
 
 
-async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
-    recent_user = get_recent_guild_user_messages(guild_id, limit=AMBIENT_CONTEXT_MESSAGES)
-    recent_ambient = get_recent_ambient(guild_id, channel_id=channel_id, limit=AMBIENT_AVOID_LAST)
-    curiosity_mode, curiosity_cues = build_dynamic_curiosity_payload(guild_id)
+def _ambient_show_basis(context: str) -> str:
+    # A fresh heartbeat with the same state is still the same observation.
+    # Expiry, outage, and changes to any rendered production state are not.
+    return re.sub(r'; observedAt=[^\n]+', '', context)
+
+
+async def revalidate_ambient_sources(guild_id: int, basis: dict, *, stage: str) -> bool:
+    started = time.monotonic()
+    try:
+        current = await asyncio.to_thread(build_ambient_current_show_context, guild_id)
+        valid = (basis.get('show') == _ambient_show_basis(current)
+                 and await asyncio.to_thread(revalidate_ambient_local_sources, guild_id, basis))
+    except Exception as exc:
+        logging.warning('ambient_source_check_unavailable error_type=%s', type(exc).__name__)
+        valid = False
+    logging.info('ambient_source_check guild=%s stage=%s valid=%s elapsed_seconds=%.3f',
+                 guild_id, stage, valid, time.monotonic() - started)
+    return valid
+
+
+async def generate_dynamic_ambient(guild_id: int, channel_id: int,
+                                   *, source_basis_out: dict | None = None) -> str:
+    basis = {'guild_id': guild_id}
+    if source_basis_out is not None:
+        source_basis_out.clear()
+    def read_sources():
+        recent_user = get_recent_guild_user_messages(guild_id, limit=AMBIENT_CONTEXT_MESSAGES, source_basis=basis)
+        recent_ambient = get_recent_ambient(guild_id, channel_id=channel_id, limit=AMBIENT_AVOID_LAST)
+        mode, cues = build_dynamic_curiosity_payload(guild_id, source_basis=basis)
+        broadcast = build_scoped_broadcast_memory_context(guild_id, scope='ambient', public_only=True, limit=3, source_basis=basis)
+        return recent_user, recent_ambient, mode, cues, broadcast
+    started = time.monotonic()
+    try:
+        recent_user, recent_ambient, curiosity_mode, curiosity_cues, ambient_broadcast_context = await asyncio.to_thread(read_sources)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        logging.warning('ambient_source_read_unavailable error_type=%s', type(exc).__name__)
+        return ''
+    logging.info('ambient_source_read guild=%s elapsed_seconds=%.3f', guild_id, time.monotonic() - started)
 
     convo_block = "\n".join([f"- {u}: {m}" for (u, m) in recent_user]) if recent_user else "(no recent messages)"
     avoid_block = "\n".join([f"- {m}" for m in recent_ambient]) if recent_ambient else "- (none)"
 
     temporal = get_temporal_context()
     ambient_mode = _select_ambient_mode(guild_id, temporal["show_phase"])
-    ambient_broadcast_context = build_scoped_broadcast_memory_context(guild_id, scope="ambient", public_only=True, limit=3)
     try:
         current_show_context = await asyncio.to_thread(build_ambient_current_show_context, guild_id)
     except Exception as exc:
         logging.warning("ambient_show_context_unavailable error_type=%s", type(exc).__name__)
         current_show_context = "Current BARCODE show observations: unavailable; current broadcast state is unknown."
+    basis['show'] = _ambient_show_basis(current_show_context)
     mode_guidance = {
         "room_observation": "Anchor in a fresh public-room pattern; stay concrete and understated.",
         "memory_echo": "Let memory tint the line, but keep recent public context as the subject.",
@@ -33892,6 +34012,8 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
             guild_id,
         )
         return ""
+    if not await revalidate_ambient_sources(guild_id, basis, stage='after_generation'):
+        return ''
     result = trim_to_complete_sentence(
         _sanitize_ambient(raw_result),
         AMBIENT_MAX_CHARS,
@@ -33915,6 +34037,8 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
                 guild_id,
             )
             return ""
+        if not await revalidate_ambient_sources(guild_id, basis, stage='after_generation'):
+            return ''
         if not retry_result or is_incomplete_ambient_message(retry_result) or _looks_like_internal_process_report(retry_result):
             logging.warning("Ambient skipped after retry (incomplete or internal-process shape)")
             return ""
@@ -33943,11 +34067,17 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
                 guild_id,
             )
             return ""
-        if result2 and not is_incomplete_ambient_message(result2) and not _too_similar(result2, recent_ambient):
-            return result2
-        logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (duplicate/similar).")
-        return ""
+        if not await revalidate_ambient_sources(guild_id, basis, stage='after_generation'):
+            return ''
+        if (result2 and not is_incomplete_ambient_message(result2)
+                and not _looks_like_internal_process_report(result2) and not _too_similar(result2, recent_ambient)):
+            result = result2
+        else:
+            logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (duplicate/similar).")
+            return ""
 
+    if source_basis_out is not None:
+        source_basis_out.update(basis)
     _set_ambient_runtime_state(guild_id, mode=ambient_mode)
     return result
 
@@ -35192,11 +35322,12 @@ async def ambient_message_task():
                         continue
 
                     logging.info(f"📡 Ambient generation started for guild {guild_id}")
-                    msg = await generate_dynamic_ambient(guild_id, channel_id)
+                    source_basis = {}
+                    msg = await generate_dynamic_ambient(guild_id, channel_id, source_basis_out=source_basis)
 
                     if msg and is_incomplete_ambient_message(msg):
                         logging.info(f"📡 Ambient rejected for guild {guild_id}: incomplete message. Retrying once.")
-                        retry_msg = await generate_dynamic_ambient(guild_id, channel_id)
+                        retry_msg = await generate_dynamic_ambient(guild_id, channel_id, source_basis_out=source_basis)
                         if retry_msg and not is_incomplete_ambient_message(retry_msg):
                             msg = retry_msg
                             logging.info(f"📡 Ambient retry succeeded for guild {guild_id} after incomplete rejection.")
@@ -35213,7 +35344,19 @@ async def ambient_message_task():
                         _reschedule_ambient_soon(guild_id, last_msg or "")
                         continue
 
-                    await channel.send(msg, allowed_mentions=discord.AllowedMentions.none())
+                    if (not await revalidate_ambient_sources(guild_id, source_basis, stage='before_send')
+                            or not allow_passive_memory_for_policy(resolve_channel_policy(channel))):
+                        _set_ambient_runtime_state(guild_id, skip_reason='source_changed_or_unavailable')
+                        _reschedule_ambient_soon(guild_id, last_msg or '')
+                        continue
+                    send_started = time.monotonic()
+                    send_outcome = 'unconfirmed'
+                    try:
+                        await channel.send(msg, allowed_mentions=discord.AllowedMentions.none())
+                        send_outcome = 'confirmed'
+                    finally:
+                        logging.info('ambient_delivery guild=%s outcome=%s elapsed_seconds=%.3f',
+                                     guild_id, send_outcome, time.monotonic() - send_started)
                     log_ambient(guild_id, channel_id, msg, source_type="ambient")
 
                     next_scheduled = schedule_after_ambient_post(
@@ -35721,6 +35864,9 @@ async def moment_engine_sweep_task():
                 if moment_engine_shadow_enabled():
                     moment_results = sweep_expired_moment_windows(conn)
                     episode_results = sweep_expired_episodes(conn)
+                    expired = expire_stale_moment_meaning_attempts(conn)
+                    if expired:
+                        logging.info('moment_meaning_recovery interrupted=%s', expired)
                 try:
                     lifecycle_result = sweep_atomic_knowledge_lifecycle(
                         conn,
