@@ -2574,6 +2574,25 @@ def _sealed_test_queue_response_required(
     )
 
 
+def _current_queue_requested_alongside_history(text: str) -> bool:
+    """Keep an additional current-state question separate from dated history.
+
+    Queue vocabulary inside a recap belongs to that episode. Only a present
+    queue clause adds the current snapshot; this does not gate a response.
+    """
+    for clause in re.split(r"[.!?;\n]|\b(?:and|also|plus)\b", str(text or ""), flags=re.I):
+        if not _queue_read_model_query(clause) or has_explicit_show_date(clause):
+            continue
+        if re.search(r"\b(?:was|were|did|then|that (?:show|night)|at the time)\b", clause, re.I):
+            continue
+        focus = _queue_query_focus(clause)
+        if focus["now_playing"] or focus["up_next"] or re.search(
+            r"\b(?:is|are|can|may|now|currently|current|today|tonight)\b", clause, re.I,
+        ):
+            return True
+    return False
+
+
 def safe_bnl_read_model_for_consumption(
     read_model: dict,
     channel_policy: str = "",
@@ -3083,8 +3102,15 @@ def build_bnl_read_model_context(
         or _first_mapping(queue.get("session"), queue.get("currentSession")).get("showDate")
         or ""
     )
+    available_show_dates = tuple(dict.fromkeys(
+        str(show.get("showDate") or "")
+        for show in tiktok_show_records(public_archive if independent_history else archive)
+    ))
+    if current_show_date and current_show_date not in available_show_dates:
+        available_show_dates += (str(current_show_date),)
     live_reaction_query = is_live_show_reaction_query(
         user_text, current_show_date=str(current_show_date),
+        available_show_dates=available_show_dates,
     )
     show_analysis_text = (
         str(tiktok_show_analysis_request or "").strip()
@@ -3106,6 +3132,7 @@ def build_bnl_read_model_context(
         # when a normalized copy of the same request arrived from context.
         show_analysis_text = ""
     show_analysis_query = bool(show_analysis_text)
+    current_queue_requested = _current_queue_requested_alongside_history(user_text)
     tiktok_context_query = live_reaction_query or show_analysis_query
     operational_query = queue_query or live_reaction_query or show_analysis_query
     queue_focus = _queue_query_focus(queue_lookup_text) if operational_query else {}
@@ -3148,9 +3175,10 @@ def build_bnl_read_model_context(
             "- These records ground follow-ups to that request, including creative revisions. The current user request controls the task and show; a format or style revision does not change its factual subject.",
             "- Do not replace the requested session with another public or private show. Earlier BNL prose is continuity, not proof of credits or playback. Use unrelated source candidates only when the current request calls for them.",
         ])
-        prior_dates = requested_show_dates(prior_queue_request)
+        prior_dates = requested_show_dates(prior_queue_request, available_show_dates=available_show_dates)
         session = _first_mapping(queue.get("session"), queue.get("currentSession"))
-        if prior_dates and str(session.get("showDate") or "") not in prior_dates:
+        if (prior_dates and str(session.get("showDate") or "") not in prior_dates
+                and not current_queue_requested):
             # The source may have advanced between turns. Keep the missing
             # referent explicit instead of silently substituting the new queue.
             queue = {}
@@ -3192,11 +3220,18 @@ def build_bnl_read_model_context(
     # detail, crowds out comment evidence, and biases topic answers toward
     # now-playing/ranking language. Preserve the queue owner for an actual
     # queue or live-reaction request.
+    requested_history_dates = requested_show_dates(
+        show_analysis_text, available_show_dates=available_show_dates,
+    ) if show_analysis_query else ()
     include_queue_context = bool(
         queue
         and (
             not show_analysis_query
-            or queue_query
+            or (queue_query and (
+                (not requested_history_dates and not has_explicit_show_date(show_analysis_text))
+                or str(current_show_date) in requested_history_dates
+                or current_queue_requested
+            ))
             or live_reaction_query
         )
     )
@@ -3405,7 +3440,9 @@ def build_bnl_read_model_context(
         context_allowed = history_allowed if show_analysis_query else access_scope in {"public", "private"}
         if context_allowed:
             if show_analysis_query:
-                dates = requested_show_dates(show_analysis_text)
+                dates = requested_show_dates(show_analysis_text, available_show_dates=tuple(
+                    str(show.get("showDate") or "") for show in tiktok_show_records(history_archive)
+                ))
                 scoped_archives = [("", history_archive)]
                 if not dates and broad_show_history_requested(show_analysis_text):
                     # Broad history is already maintained by the shared show
@@ -3612,7 +3649,9 @@ def build_bnl_read_model_context(
             rendered,
             rendered_lines=tuple(lines),
             historical_sections=tuple(historical_show_analysis_sections),
-            continuation_show_dates=requested_show_dates(prior_queue_request),
+            continuation_show_dates=requested_show_dates(
+                prior_queue_request, available_show_dates=available_show_dates,
+            ),
         )
     return rendered
 

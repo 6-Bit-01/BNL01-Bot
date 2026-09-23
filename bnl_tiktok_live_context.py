@@ -88,12 +88,12 @@ _EXPLICIT_SHOW_DATE_PATTERNS = (
     re.compile(r"\[(?P<month_number>\d{1,2})-(?P<day>\d{1,2})-(?P<year>\d{4})\]"),
     re.compile(
         rf"\b(?P<month_name>{_SHOW_MONTH_PATTERN})\s*(?P<day>\d{{1,2}})"
-        r"(?:st|nd|rd|th)?(?:\s*,\s*|\s+)(?P<year>\d{4})\b",
+        r"(?:st|nd|rd|th)?(?:(?:\s*,\s*|\s+)(?P<year>\d{4})\b|\b(?!\s*,?\s*\d))",
         re.IGNORECASE,
     ),
     re.compile(
         rf"\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s*(?P<month_name>{_SHOW_MONTH_PATTERN})"
-        r"\s*,?\s*(?P<year>\d{4})\b",
+        r"(?:\s*,?\s*(?P<year>\d{4})\b|\b(?!\s*,?\s*\d))",
         re.IGNORECASE,
     ),
 )
@@ -419,33 +419,59 @@ def has_explicit_show_date(user_text: str) -> bool:
     return _explicit_show_date_match(user_text) is not None
 
 
-def explicit_show_date(user_text: str) -> str:
-    """Normalize an explicit ISO or English month date without guessing a year."""
+def explicit_show_date(
+    user_text: str, *, now: Any = None, available_show_dates: Sequence[str] = (),
+) -> str:
+    """Resolve a calendar reference using the source catalog and current year."""
 
     match = _explicit_show_date_match(user_text)
     if match is None:
         return ""
-    return _normalize_show_date_match(match)
+    return _normalize_show_date_match(match, now=now, available_show_dates=available_show_dates)
 
 
-def _normalize_show_date_match(match: re.Match) -> str:
+def _normalize_show_date_match(
+    match: re.Match, *, now: Any = None, available_show_dates: Sequence[str] = (),
+) -> str:
     parts = match.groupdict()
     month = (
         _SHOW_MONTHS[parts["month_name"].casefold().rstrip(".")]
         if parts.get("month_name") else int(parts["month_number"])
     )
     try:
-        return date(int(parts["year"]), month, int(parts["day"])).isoformat()
+        day = int(parts["day"])
+        if parts.get("year"):
+            return date(int(parts["year"]), month, day).isoformat()
+        # A missing year is an ordinary partial cue, not a missing show. The
+        # authorized source catalog can supply a unique older occurrence;
+        # otherwise the current Pacific year is the ordinary default.
+        date(2000, month, day)  # Validate month/day while allowing leap day.
+        candidates = set()
+        for value in available_show_dates:
+            try:
+                candidate = date.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                continue
+            if (candidate.month, candidate.day) == (month, day):
+                candidates.add(candidate.isoformat())
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        current = date(_pacific_show_date(now).year, month, day).isoformat()
+        return current if not candidates or current in candidates else ""
     except ValueError:
         return ""
 
 
-def explicit_show_dates(user_text: str) -> tuple[str, ...]:
+def explicit_show_dates(
+    user_text: str, *, now: Any = None, available_show_dates: Sequence[str] = (),
+) -> tuple[str, ...]:
     """Keep all distinct valid explicit dates in request order."""
 
     return tuple(dict.fromkeys(
         value for match in _explicit_show_date_matches(user_text)
-        if (value := _normalize_show_date_match(match))
+        if (value := _normalize_show_date_match(
+            match, now=now, available_show_dates=available_show_dates,
+        ))
     ))
 
 
@@ -466,11 +492,12 @@ def _pacific_show_date(now: Any = None) -> date:
 
 def requested_show_date(
     user_text: str, *, now: Any = None, include_current_relative: bool = True,
+    available_show_dates: Sequence[str] = (),
 ) -> str:
     """Resolve the requested public show date for all existing show readers."""
 
     if has_explicit_show_date(user_text):
-        return explicit_show_date(user_text)
+        return explicit_show_date(user_text, now=now, available_show_dates=available_show_dates)
     query = str(user_text or "")
     if not _SHOW_DATE_SCOPE_RE.search(query):
         return ""
@@ -485,11 +512,12 @@ def requested_show_date(
 
 def requested_show_dates(
     user_text: str, *, now: Any = None, include_current_relative: bool = True,
+    available_show_dates: Sequence[str] = (),
 ) -> tuple[str, ...]:
     """Resolve calendar dates within an already-selected show source request."""
 
     if has_explicit_show_date(user_text):
-        return explicit_show_dates(user_text)
+        return explicit_show_dates(user_text, now=now, available_show_dates=available_show_dates)
     value = requested_show_date(
         user_text, now=now, include_current_relative=include_current_relative,
     )
@@ -520,6 +548,7 @@ def requested_recent_show_count(user_text: str) -> Optional[int]:
 def is_live_show_reaction_query(
     text: str, *, now: Any = None, current_show_date: Optional[str] = None,
     check_show_date: bool = True,
+    available_show_dates: Optional[Sequence[str]] = None,
 ) -> bool:
     """Use existing reaction intent, then match the authorized show date.
 
@@ -533,13 +562,14 @@ def is_live_show_reaction_query(
     if not check_show_date:
         return any(re.search(pattern, normalized) for pattern in _LIVE_REACTION_PATTERNS)
     if has_explicit_show_date(normalized):
-        dates = requested_show_dates(normalized)
         active_date = (
             _pacific_show_date(now).isoformat()
             if current_show_date is None else str(current_show_date)
         )
+        source_dates = (active_date,) if available_show_dates is None else available_show_dates
+        dates = requested_show_dates(normalized, now=now, available_show_dates=source_dates)
         if dates != (active_date,) or any(
-            not _normalize_show_date_match(match)
+            not _normalize_show_date_match(match, now=now, available_show_dates=source_dates)
             for match in _explicit_show_date_matches(normalized)
         ):
             return False
@@ -717,6 +747,7 @@ def select_show_for_tiktok_analysis(
     # past calendar days constrain historical selection.
     requested_dates = requested_show_dates(
         user_text, now=now, include_current_relative=False,
+        available_show_dates=tuple(str(show.get("showDate") or "") for _key, show in candidates),
     )
     if requested_dates:
         for requested_date in requested_dates:
@@ -3128,10 +3159,15 @@ def build_durable_show_prompt_context(
     intent = classify_tiktok_show_analysis_intent(user_text)
     show, source_key = select_show_for_tiktok_analysis(archive, user_text)
     if not show:
+        available_dates = sorted({str(item.get("showDate") or "")
+                                  for item in tiktok_show_records(archive) if item.get("showDate")})
         return (
             "Durable TikTok show analysis context:\n"
             f"- Analysis intent={intent}.\n"
-            "- Availability: no public show timeline is available for this request.\n"
+            "- Availability: no public show timeline was selected for this request.\n"
+            f"- Available source dates (up to 16 shown): {', '.join(available_dates[-16:]) or 'none supplied'}. "
+            "A selection miss does not establish that retained history is absent. "
+            "Use the requested date and conversation context; clarify a genuinely unresolved year instead of substituting the latest show.\n"
             "- Do not invent track-level TikTok engagement or claim the live buffer is the historical source."
         )
     start_ms, end_ms = show_timeline_bounds_ms(show)

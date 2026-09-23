@@ -46,6 +46,11 @@ COMPARE_ANSWER = (
     "Alex mentioned green visuals on August 28; "
     "Test September mentioned amber lanterns on September 4."
 )
+YEARLESS_REQUEST = (
+    "Give me a recap of the September 4th BARCODE Radio show. Connect the queue "
+    "events, TikTok chat, and public Discord activity, with a few actual comments and who said them."
+)
+DISCORD_COMMENT = "The amber lantern release is out now. It aired here earlier tonight."
 
 
 class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -128,6 +133,139 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         return website, episode, basis
 
+    def _advance_public_feed_to_september_18(self):
+        from test_public_show_history import public_history_model, seal_history
+
+        archive = self.read_model["sections"]["archive"]
+        september = archive["latestShow"]
+        latest = json.loads(json.dumps(september)
+                            .replace("show-attendance-september", "show-attendance-latest")
+                            .replace("2026-09-04", "2026-09-18")
+                            .replace("2026-09-05", "2026-09-19"))
+        archive["shows"] = [latest, september, *archive["shows"]]
+        archive["latestShow"] = latest
+        self.read_model["sections"]["queue"]["session"]["showDate"] = "2026-09-18"
+        self.read_model["sections"]["publicHistory"] = public_history_model()["sections"]["publicHistory"]
+        self.read_model["sections"]["publicHistory"]["shows"] = archive["shows"]
+        self.read_model["schemaRevision"] = "1.11"
+        seal_history(self.read_model)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("""INSERT INTO conversations
+                (user_id,user_name,guild_id,role,content,timestamp,
+                 channel_id,channel_name,channel_policy,route_mode,message_id)
+                VALUES (88,'Test September Member',77,'user',?,
+                        '2026-09-05T00:03:00Z',9001,'public-room','public_context','normal_chat',7008)
+            """, (DISCORD_COMMENT,))
+        result = show_fixture.sync_tiktok_show_evidence_ledgers(
+            bot.DB_FILE, guild_id=77, read_model=self.read_model,
+            environ=show_fixture.ENABLED_QUEUE_ENV,
+        )
+        self.assertEqual(result["showsSeen"], 3)
+
+    async def test_yearless_older_recap_keeps_queue_chat_discord_and_refresh_on_requested_show(self):
+        self._advance_public_feed_to_september_18()
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                website, episode, basis = self._read(YEARLESS_REQUEST, policy)
+                self.assertIn("showDate=2026-09-04", website)
+                self.assertIn(SEPTEMBER_COMMENT, website)
+                self.assertNotIn("TikTok live show scope", website)
+                self.assertNotIn("Present Signal", website)
+                self.assertEqual(basis.show_keys, ("show-attendance-september",))
+                self.assertIn(SEPTEMBER_COMMENT, episode)
+                self.assertIn(DISCORD_COMMENT, episode)
+                self.assertNotIn("on 2026-09-18", episode)
+                refreshed, changed = bot.refresh_prompt_source_basis(basis)
+                self.assertFalse(changed)
+                self.assertEqual(refreshed.show_keys, basis.show_keys)
+                self.assertEqual(refreshed.authored_excerpts, basis.authored_excerpts)
+                self.assertEqual(bot.prompt_source_basis_failure((refreshed,)), "")
+
+    async def test_yearless_original_request_reaches_one_generation_with_older_public_sources(self):
+        self._advance_public_feed_to_september_18()
+        answer = "The September 4 chat discussed amber lanterns, and a member shared their release in Discord."
+
+        def provider_answer(*_args, **kwargs):
+            if kwargs.get("attempt_counter") is not None:
+                kwargs["attempt_counter"].mark_started()
+            return answer
+
+        for packet_enabled in (False, True):
+            channel_id = 8811 + len(self.runtime.channel_ids)
+            with self.subTest(packet_enabled=packet_enabled), mock.patch.dict(os.environ, {
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+                "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": str(packet_enabled).lower(),
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": str(self.runtime.guild_id),
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": str(self.runtime.user_id),
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": str(channel_id),
+            }):
+                channel, generation, guard = await self.runtime._batch(
+                    "sealed_test", request=YEARLESS_REQUEST, answer=provider_answer, privileged=False,
+                )
+                generation.assert_awaited_once()
+                self.assertEqual(channel.sent, [answer])
+                self.assertEqual(generation.await_args.kwargs["route"],
+                                 bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE if packet_enabled else "get_gemini_response")
+                prompt = generation.await_args.args[0]
+                self.assertIn(SEPTEMBER_COMMENT, prompt)
+                self.assertIn(DISCORD_COMMENT, prompt)
+                self.assertNotIn("Present Signal", prompt)
+                bases = [item for item in guard.await_args.kwargs["prompt_source_bases"]
+                         if isinstance(item, bot.FinalizedShowPromptSourceBasis)]
+                self.assertEqual(len(bases), 1)
+                self.assertEqual(bases[0].show_keys, ("show-attendance-september",))
+
+    async def test_historical_recap_and_current_queue_request_keep_both_source_scopes(self):
+        self._advance_public_feed_to_september_18()
+        for extra in ("Also, is the queue open right now?", "And what is playing now?",
+                      "Also, is the queue open?"):
+            with self.subTest(extra=extra):
+                website, episode, basis = self._read(YEARLESS_REQUEST + " " + extra)
+                self.assertIn("showDate=2026-09-04", website)
+                self.assertIn("showDate=2026-09-18", website)
+                self.assertIn("queueOpen=True", website)
+                self.assertEqual(basis.show_keys, ("show-attendance-september",))
+                # Each existing reader chooses bounded excerpts independently;
+                # their combined prompt must preserve both public surfaces.
+                self.assertIn(SEPTEMBER_COMMENT, website)
+                self.assertIn(DISCORD_COMMENT, episode)
+
+    async def test_mixed_historical_and_current_request_reaches_generation_with_both_sources(self):
+        self._advance_public_feed_to_september_18()
+        request = YEARLESS_REQUEST + " Also, is the queue open right now?"
+        answer = "September 4 had amber lantern comments and a Discord release post. The current queue is open."
+        channel, generation, guard = await self.runtime._batch(
+            "sealed_test", request=request, answer=answer, privileged=False,
+        )
+        generation.assert_awaited_once()
+        self.assertEqual(channel.sent, [answer])
+        prompt = generation.await_args.args[0]
+        for source in (SEPTEMBER_COMMENT, DISCORD_COMMENT, "queueOpen=True", "Present Signal"):
+            self.assertIn(source, prompt)
+        bases = [item for item in guard.await_args.kwargs["prompt_source_bases"]
+                 if isinstance(item, bot.FinalizedShowPromptSourceBasis)]
+        self.assertEqual(len(bases), 1)
+        self.assertEqual(bases[0].show_keys, ("show-attendance-september",))
+
+    async def test_historical_queue_state_and_invalid_date_do_not_add_current_queue(self):
+        self._advance_public_feed_to_september_18()
+        for request in (
+            YEARLESS_REQUEST + " Include when the queue was open and who was up next.",
+            "Now, " + YEARLESS_REQUEST,
+            YEARLESS_REQUEST.replace("September 4th", "February 30th"),
+            YEARLESS_REQUEST.replace("September 4th", "August 14th"),
+        ):
+            with self.subTest(request=request):
+                website, _episode, _basis = self._read(request)
+                self.assertNotIn("Present Signal", website)
+                self.assertNotIn("queueOpen=True", website)
+                self.assertNotIn("showDate=2026-09-18", website)
+
     def _assert_august_source(self, episode, basis):
         self.assertIsNotNone(basis)
         self.assertIn("on 2026-08-28;", episode)
@@ -148,7 +286,7 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_natural_and_iso_dates_select_same_authored_show_in_both_surfaces(self):
         expected_refs = None
         for policy in ("public_home", "sealed_test"):
-            for request in (REQUEST, ISO_REQUEST):
+            for request in (REQUEST, ISO_REQUEST, REQUEST.replace("August 28, 2026", "August 28th")):
                 with self.subTest(policy=policy, request=request):
                     website, episode, basis = self._read(request, policy)
                     self.assertIn("showDate=2026-08-28", website)
@@ -169,7 +307,7 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "Durable TikTok show analysis context:\n"
             "- Show=Current Broadcast; showDate=2026-09-04; selectedFrom=latestShow.\n"
         )
-        for request in (REQUEST, ISO_REQUEST):
+        for request in (REQUEST, ISO_REQUEST, REQUEST.replace("August 28, 2026", "August 28th")):
             with self.subTest(request=request):
                 _website, episode, basis = self._read(
                     request, website_override=conflicting_website,
@@ -283,9 +421,9 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         # One room and member retain the real captures between turns. Supplying
         # selection_user_text directly would bypass the handoff being tested.
         requests = (
-            COMPARE_REQUEST,
+            COMPARE_REQUEST.replace("August 28, 2026", "August 28th").replace("September 4, 2026", "September 4th"),
             "Give me some actual quotes from those shows and who said them.",
-            REQUEST.replace("August 28, 2026", "September 4, 2026"),
+            REQUEST.replace("August 28, 2026", "September 4th"),
         )
         answers = (
             "Both shows had comments about their visuals.",
@@ -455,7 +593,7 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed.authored_excerpts, ())
 
     async def test_missing_requested_show_does_not_substitute_latest_evidence(self):
-        for date in ("August 14, 2026", "2026-08-14"):
+        for date in ("August 14, 2026", "2026-08-14", "August 14th"):
             request = REQUEST.replace("August 28, 2026", date)
             for policy in ("public_home", "sealed_test"):
                 with self.subTest(date=date, policy=policy):
