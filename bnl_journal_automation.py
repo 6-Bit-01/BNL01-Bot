@@ -22,6 +22,7 @@ from bnl_journal import (
     generate_and_store_packet_draft,
     journal_broadcast_memory_provenance_is_eligible,
     journal_public_people_are_current,
+    journal_shared_source_provenance_is_current,
     journal_topic_counts,
     utc_now_iso,
 )
@@ -1549,6 +1550,8 @@ def _frozen_packet_invalidation_reason(
 ) -> str:
     if not journal_public_people_are_current(conn, guild_id, packet.get("privatePublicPeople", [])):
         return "privacy_memory_ineligible"
+    if not journal_shared_source_provenance_is_current(conn, guild_id, packet.get("privateSharedSourceProvenance", [])):
+        return "privacy_source_ineligible"
     refs = {
         str(source.get("refId") or "")
         for source in packet.get("privateSources", [])
@@ -2610,6 +2613,8 @@ def _prepared_invalidation_reason(
 ) -> str:
     if not journal_public_people_are_current(conn, guild_id, metadata.get("publicPeople", [])):
         return "privacy_memory_ineligible"
+    if not journal_shared_source_provenance_is_current(conn, guild_id, metadata.get("sharedInputSourceProvenance", [])):
+        return "privacy_source_ineligible"
     related = {
         str(value)
         for value in metadata.get("relatedPriorJournalEntryIds", [])
@@ -3854,7 +3859,7 @@ def _weekly_packet(
     aggregate["dailyPeriodContexts"] = len(daily_contexts)
     aggregate["finalPeriodSources"] = int(
         final_context["counts"].get("eligibleRelays") or 0
-    ) + int(final_context["counts"].get("eligibleConversations") or 0)
+    ) + int(final_context["counts"].get("eligibleConversations") or 0) + int(final_context["counts"].get("finalizedShows") or 0)
     return packet, complete_days, active_days
 
 

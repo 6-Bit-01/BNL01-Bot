@@ -40,6 +40,7 @@ JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
 JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
 JOURNAL_EDITORIAL_VERSION = "journal-public-voices-1"
+JOURNAL_SHARED_INPUT_VERSION = "journal-shared-inputs-1"
 JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-2"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
@@ -73,6 +74,7 @@ JOURNAL_CONTEXT_LANE_TYPES = {
     "bnl_inference",
 }
 JOURNAL_REFLECTION_BASIS_KINDS = {
+    "public_moment",
     "public_source_history",
     "accepted_relay_continuity",
     "established_broadcast_memory",
@@ -1184,6 +1186,10 @@ def purge_user_journal_derivatives_on_connection(
                 for item in [*target_supporting, *target_reflection]
                 if item.get("refId")
             }
+            target_ref_ids.update(
+                str(item.get("refId")) for item in metadata.get("usedSharedSourceProvenance", [])
+                if isinstance(item, dict) and subject_ref in item.get("subjectRefs", [])
+            )
             metadata["supportingConversationRefs"] = [
                 item for item in supporting if str(item.get("subjectRef") or "") != subject_ref
             ]
@@ -1206,6 +1212,7 @@ def purge_user_journal_derivatives_on_connection(
                 "topicTags", "continuityNotes", "unresolvedQuestions", "recurringTopicCounts",
                 "contextUses", "usedGenerationContextLanes", "usedContextLaneProvenance",
                 "usedReflectionBasis", "usedReflectionBasisProvenance",
+                "usedSharedSourceProvenance", "sharedInputSourceProvenance", "publicPeople",
             ):
                 metadata[key_name] = {} if key_name in {
                     "recurringTopicCounts",
@@ -2281,6 +2288,8 @@ def _finalize_context_lanes_for_safe_sources(
 
 def journal_source_packet_has_meaningful_activity(packet: dict[str, Any]) -> bool:
     """Preserve the established threshold used by scheduled Journal automation."""
+    if any(source.get("sourceKind") == "finalized_show" for source in packet.get("safeSources", [])):
+        return True
     counts = packet.get("aggregateCounts") or {}
     total = int(counts.get("eligibleRelays") or 0) + int(
         counts.get("eligibleConversations") or 0
@@ -2913,6 +2922,8 @@ def _source_for_prompt(source: dict[str, Any]) -> dict[str, Any]:
         "participantAlias",
         "conversationSurface",
         "publicSpeakerName",
+        "sourceClass",
+        "showDates",
     }
     return {k: v for k, v in source.items() if k in allowed and v not in (None, "")}
 
@@ -2982,6 +2993,7 @@ def _window_segment_activity(
     end: str,
     relays: list[dict[str, Any]],
     conversations: list[dict[str, Any]],
+    finalized_shows: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Expose non-identifying daily activity across the relay and context streams."""
     labels = ("early", "middle", "late")
@@ -2989,11 +3001,14 @@ def _window_segment_activity(
         f"segment-{index}": {"conversationSources": 0, "relaySources": 0}
         for index in range(1, 4)
     }
-    for source in [*relays, *conversations]:
+    if finalized_shows:
+        for segment in counts.values():
+            segment["finalizedShows"] = 0
+    for source in [*relays, *conversations, *(finalized_shows or [])]:
         segment = _coverage_segment(source.get("observedAt"), start, end, 3)
         if segment not in counts:
             continue
-        key = "conversationSources" if source.get("sourceKind") == "conversation" else "relaySources"
+        key = {"conversation": "conversationSources", "finalized_show": "finalizedShows"}.get(source.get("sourceKind"), "relaySources")
         counts[segment][key] += 1
     return [
         {
@@ -3404,6 +3419,7 @@ def _source_period_partitions(
     conversations: list[dict[str, Any]],
     *,
     eligible_ref_ids: Optional[set[str]] = None,
+    finalized_shows: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Describe ordered source-only periods from one already-loaded raw range.
 
@@ -3430,7 +3446,8 @@ def _source_period_partitions(
 
         period_relays = [source for source in relays if in_period(source)]
         period_conversations = [source for source in conversations if in_period(source)]
-        ordered = sorted(period_relays + period_conversations, key=_source_sort_key)
+        period_shows = [source for source in finalized_shows or [] if in_period(source)]
+        ordered = sorted(period_relays + period_conversations + period_shows, key=_source_sort_key)
         eligible_ordered = [
             source
             for source in ordered
@@ -3460,6 +3477,7 @@ def _source_period_partitions(
                 "aggregateCounts": {
                     "eligibleRelays": len(period_relays),
                     "eligibleConversations": len(period_conversations),
+                    "finalizedShows": len(period_shows),
                     "participants": len(
                         {
                             source.get("subjectRef")
@@ -3473,6 +3491,91 @@ def _source_period_partitions(
             }
         )
     return partitions
+
+
+def _journal_shared_inputs(
+    conn: sqlite3.Connection, guild_id: int, start: str, end: str,
+    sources: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Project bounded existing owners; never create or re-enrich memory here."""
+    from bnl_moment_engine import public_moment_source_basis, select_public_situation_moment_gists
+    from bnl_tiktok_show_ledger import select_finalized_show_operations
+
+    start_ms, end_ms = timestamp_to_epoch_ms(start), timestamp_to_epoch_ms(end)
+    if start_ms is None or end_ms is None or start_ms >= end_ms:
+        return [], [], []
+    operations, continuity, provenance = [], [], []
+    for item in select_finalized_show_operations(conn, guild_id=guild_id, source_window_ms=(start_ms, end_ms)):
+        operations.append({
+            "refId": item.source_ref, "sourceKind": "finalized_show",
+            "summary": item.text, "observedAt": item.observed_at,
+            "sourceClass": item.source_class, "showDates": list(item.show_dates),
+        })
+        provenance.append({
+            "refId": item.source_ref, "sourceKind": "finalized_show",
+            "sourceId": item.show_keys[0], "sourceVersion": item.source_digest,
+            "sourceWindowStart": start, "sourceWindowEnd": end,
+        })
+    topic = " ".join(journal_topic_counts([*sources, *operations], limit=30))
+    selected = select_public_situation_moment_gists(
+        conn, guild_id=guild_id, topic_text=topic, token_budget=600, max_results=4,
+        allowed_channel_policies=("public_home", "public_context"),
+        require_topic_overlap=True, apply_date_scope=False, prepare_schema=False,
+        observed_before=end, now=end,
+    )
+    for item in selected:
+        basis = public_moment_source_basis(conn, guild_id=guild_id, moment_id=item.moment_id)
+        if basis is None:
+            continue
+        ref = "reflection:moment:" + _hash(item.moment_id)[:24]
+        continuity.append({
+            "refId": ref, "basisKind": "public_moment", "scope": JOURNAL_REFLECTION_SCOPE,
+            "publicSafe": True, "reuseEligible": True, "summary": basis["summary"],
+            "sourceObservedAt": basis["observedAt"], "sourceStartedAt": basis["startedAt"],
+            "sourceVersion": basis["sourceVersion"], "contributions": basis["contributions"],
+            "channelPolicy": basis["channelPolicy"],
+        })
+        provenance.append({
+            "refId": ref, "sourceKind": "public_moment", "sourceId": item.moment_id,
+            "sourceVersion": basis["sourceVersion"], "subjectRefs": basis["subjectRefs"],
+            "canonicalLedgerEntryId": basis["canonicalLedgerEntryId"],
+            "originalSourceRefs": basis["originalSourceRefs"],
+        })
+    return operations, continuity, provenance
+
+
+def journal_shared_source_provenance_is_current(
+    conn: sqlite3.Connection, guild_id: int, provenance: Any,
+) -> bool:
+    """Revalidate exact saved bases in the caller's snapshot, without writes."""
+    from bnl_moment_engine import public_moment_source_basis
+    from bnl_tiktok_show_ledger import select_finalized_show_operations
+
+    if not isinstance(provenance, list) or len(provenance) > 12:
+        return False
+    try:
+        for source in provenance:
+            if not isinstance(source, dict) or not source.get("sourceVersion") or not source.get("sourceId"):
+                return False
+            if source.get("sourceKind") == "public_moment":
+                basis = public_moment_source_basis(conn, guild_id=guild_id, moment_id=source["sourceId"])
+                if basis is None or basis["sourceVersion"] != source["sourceVersion"]:
+                    return False
+            elif source.get("sourceKind") == "finalized_show":
+                start = timestamp_to_epoch_ms(source.get("sourceWindowStart"))
+                end = timestamp_to_epoch_ms(source.get("sourceWindowEnd"))
+                if start is None or end is None or start >= end:
+                    return False
+                items = select_finalized_show_operations(
+                    conn, guild_id=guild_id, source_window_ms=(start, end), show_keys=(source["sourceId"],),
+                )
+                if len(items) != 1 or items[0].source_digest != source["sourceVersion"]:
+                    return False
+            else:
+                return False
+    except (sqlite3.Error, TypeError, ValueError, KeyError):
+        return False
+    return True
 
 
 def build_packet_from_sources(
@@ -3507,11 +3610,19 @@ def build_packet_from_sources(
         entry_kind=entry_kind,
     )
     with _read_source_database(db_path) as conn:
-        people = _journal_public_people(conn, guild_id, private_sources)
+        operations, moment_basis, shared_provenance = _journal_shared_inputs(conn, guild_id, start, end, private_sources)
+        private_sources = [*private_sources[:MAX_PROMPT_SOURCES - len(operations)], *operations]
+        historical_authors = [
+            {**contribution, "sourceKind": "conversation", "refId": item["refId"],
+             "channelPolicy": item["channelPolicy"], "observedAt": item["sourceObservedAt"]}
+            for item in moment_basis for contribution in item["contributions"]
+        ]
+        people = _journal_public_people(conn, guild_id, [*historical_authors, *private_sources])
         identity_tokens = _journal_identity_tokens(conn, guild_id)
     public_by_subject = {p["subjectRef"]: p for p in people}
     replacements: dict[str, set[str]] = {}
-    for source in list(relays) + list(conversations):
+    window_display_names = list(dict.fromkeys(window_display_names + [s["displayName"] for s in historical_authors if s["displayName"]]))
+    for source in [*relays, *conversations, *historical_authors]:
         name = str(source.get("displayName") or "").strip()
         if name:
             replacements.setdefault(name.casefold(), set()).add(
@@ -3523,7 +3634,7 @@ def build_packet_from_sources(
     patterns = [_identity_literal_pattern(name) for name in sorted(literal_names, key=len, reverse=True)]
     pattern = re.compile("|".join(p.pattern for p in patterns if p), re.I) if patterns else None
 
-    def project_summary(text: str) -> str:
+    def project_summary(text: str, limit: int = 1000) -> str:
         if pattern:
             def replace_name(match: re.Match[str]) -> str:
                 choices = replacements.get(match.group().casefold(), set())
@@ -3531,7 +3642,15 @@ def build_packet_from_sources(
             text = pattern.sub(replace_name, text)
         text = re.sub(r"<@!?(\d+)>", lambda m: public_by_subject.get(
             "discord_user:" + m.group(1), {}).get("publicName", "someone"), text)
-        return sanitize_source_summary(text, limit=1000)
+        return sanitize_source_summary(text, limit=limit)
+
+    for item in moment_basis:
+        item["summary"] = project_summary(item["summary"])
+        item["contributions"] = [
+            {"participantAlias": "participant-" + _hash("journal-participant", guild_id, c["subjectRef"])[:8],
+             "publicSpeakerName": public_by_subject.get(c["subjectRef"], {}).get("publicName", ""),
+             "summary": project_summary(c["summary"])} for c in item["contributions"]
+        ]
 
     safe_sources = []
     private_sources = [dict(source) for source in private_sources]
@@ -3543,7 +3662,8 @@ def build_packet_from_sources(
         # The private archive retains original evidence. Only this public
         # projection enters a frozen packet; raw text is not a second memory.
         raw = source.pop("rawSummary", None)
-        source["summary"] = project_summary(str(raw if raw is not None else source.get("summary") or ""))
+        source["summary"] = project_summary(str(raw if raw is not None else source.get("summary") or ""),
+                                            limit=4000 if source.get("sourceKind") == "finalized_show" else 1000)
         safe_source = _source_for_prompt(source)
         if safe_source.get("summary"):
             safe_sources.append(safe_source)
@@ -3554,6 +3674,8 @@ def build_packet_from_sources(
     counts.setdefault("channels", len({x.get("channelPolicy") for x in conversations if x.get("channelPolicy")}))
     counts["promptRelays"] = len([s for s in private_sources if s.get("sourceKind") == "relay"])
     counts["promptConversations"] = len([s for s in private_sources if s.get("sourceKind") == "conversation"])
+    counts["promptFinalizedShows"] = len(operations)
+    counts["publicMomentContext"] = len(moment_basis)
     packet = {
         "entryKind": entry_kind if entry_kind in {"daily", "weekly", "manual"} else "manual",
         "sourceWindowStart": start,
@@ -3563,12 +3685,14 @@ def build_packet_from_sources(
         "privateWindowDisplayNames": window_display_names,
         "privatePublicPeople": people,
         "editorialVersion": JOURNAL_EDITORIAL_VERSION,
+        "sharedInputVersion": JOURNAL_SHARED_INPUT_VERSION,
+        "privateSharedSourceProvenance": shared_provenance,
         "candidateTopicTags": list(journal_topic_counts(safe_sources, limit=30)),
         "aggregateCounts": counts,
         "coverageComplete": bool(coverage_complete),
         "observationContext": list(observation_context or []),
         "windowSegmentActivity": (
-            _window_segment_activity(start, end, relays, conversations)
+            _window_segment_activity(start, end, relays, conversations, operations)
             if entry_kind == "daily"
             else []
         ),
@@ -3639,6 +3763,13 @@ def build_packet_from_sources(
             "minimumDistinctWindowSegments": 0,
             "lowActivityReflectionMode": True,
         }
+    if moment_basis:
+        packet["reflectionBasis"] = [*packet.get("reflectionBasis", []), *moment_basis]
+        packet.setdefault("reflectionBasisContract", {
+            "version": 1, "scope": JOURNAL_REFLECTION_SCOPE,
+            "basisKinds": sorted(JOURNAL_REFLECTION_BASIS_KINDS),
+            "basisDoesNotCountAsFresh": True, "currentActivityClaimsRequireFreshSource": True,
+        })
     packet["generationContextLanes"] = context_lanes
     packet["privateContextLaneProvenance"] = private_lane_provenance
     packet["history"] = retrieve_history(
@@ -3656,6 +3787,7 @@ def _read_source_database(db_path: str):
     """Readers cannot initialize, backfill, or mutate the source database."""
     conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
     try:
+        conn.execute("BEGIN")
         yield conn
     finally:
         conn.close()
@@ -3766,6 +3898,7 @@ def build_source_packet_between(
                     for source in packet.get("safeSources", [])
                     if str(source.get("refId") or "")
                 },
+                finalized_shows=[source for source in packet["safeSources"] if source.get("sourceKind") == "finalized_show"],
             )
         packet["sourceArchiveAvailable"] = True
         return packet
@@ -3806,6 +3939,7 @@ def build_source_packet_between(
                 for source in packet.get("safeSources", [])
                 if str(source.get("refId") or "")
             },
+            finalized_shows=[source for source in packet["safeSources"] if source.get("sourceKind") == "finalized_show"],
         )
     packet["sourceArchiveAvailable"] = False
     return packet
@@ -3936,7 +4070,7 @@ def build_generation_prompt(
     }
     if source_recovery:
         safe_packet["sourceRecoveryMode"] = True
-    if historical_basis_mode:
+    if reflection_basis:
         safe_packet["reflectionBasis"] = reflection_basis
         safe_packet["reflectionBasisContract"] = packet.get(
             "reflectionBasisContract",
@@ -4093,6 +4227,8 @@ def build_generation_prompt(
         "\nHistory is continuity evidence, not a prose template. Check its recent titles, openings, section shapes, and endings before writing; choose a different approach when they repeat. Avoid defaulting to a title listing three topics, two equal recap sections, and a warm moral at the end. These are creative directions, not quotas: do not manufacture events or discard good material to appear different."
         f"{people_rule}"
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
+        "\nPublic Moment reflection records preserve earlier exchanges and each original participant's contribution. Use their source dates, preserve banter, uncertainty and unanswered questions, and paraphrase rather than inventing quotations. A matching topic never makes today's speaker a participant in an earlier exchange. Cite the reflection ref when using it; it does not increase fresh-source, current-participant or recurrence counts."
+        "\nFinalized-show sources report recorded public operations in a completed show. Their date and timeline control the tense; they never establish that a show is live now. Chat, a Moment, a Relay and a Journal retelling of the same occurrence are not independent witnesses or additional occurrences. A show record establishes playback only where playback is recorded."
         f"{coverage_rule}"
         f"{section_source_rule}"
         f"{quote_rule}"
@@ -4396,6 +4532,7 @@ def validate_article(
         for source in _eligible_reflection_basis(packet)
         if source.get("refId")
     }
+    historical_basis_mode = historical_basis_mode or bool(reflection_refs)
     valid_refs = fresh_refs | reflection_refs
     if not valid_refs:
         return "no_new_source"
@@ -4414,7 +4551,7 @@ def validate_article(
         ):
             return "current_activity_without_fresh_source"
         if (
-            source_recovery
+            (source_recovery or (reflection_refs and not low_activity))
             and not ({str(ref) for ref in refs} & fresh_refs)
         ):
             return "current_activity_without_fresh_source"
@@ -4786,6 +4923,8 @@ def _draft_records(
     request_hash = canonical_payload_hash(canonical)
     source_ref_ids = article.get("sourceRefIds", {})
     cited_sources = cited_private_sources(packet, article)
+    used_shared_provenance = [source for source in packet.get("privateSharedSourceProvenance", [])
+                              if source.get("refId") in _article_cited_refs(article)]
     meta = dict(article.get("metadata") or {})
     meta.pop("subjectRefs", None)
     context_uses = [item for item in meta.get("contextUses", []) if isinstance(item, dict)]
@@ -4849,6 +4988,11 @@ def _draft_records(
         },
         "usedReflectionBasis": used_reflection_basis,
         "usedReflectionBasisProvenance": used_reflection_provenance,
+        "usedSharedSourceProvenance": used_shared_provenance,
+        # All supplied candidates can influence the prose, including one the
+        # writer did not cite. Preserve that input fence as well as used lineage.
+        "sharedInputSourceProvenance": packet.get("privateSharedSourceProvenance", []),
+        "sharedInputVersion": packet.get("sharedInputVersion", ""),
         "contextUses": context_uses,
         "canonicalPayloadHash": request_hash,
         "canonicalPayloadBytes": len(canonical),
@@ -5044,6 +5188,9 @@ def store_validated_draft(
         if not _attempt_fence_owned(conn, attempt_fence):
             conn.rollback()
             return JournalResult(False, "superseded", "preparation_epoch_lost", entry_id=entry_id, revision=revision)
+        if not journal_shared_source_provenance_is_current(conn, guild_id, packet.get("privateSharedSourceProvenance", [])):
+            conn.rollback()
+            return JournalResult(False, "no_draft", "privacy_source_ineligible", entry_id=entry_id, revision=revision)
         reason = validate_article(
             article,
             packet,
@@ -5267,6 +5414,9 @@ def approve_draft(
         if source_hash and stored_source_hash != source_hash:
             conn.rollback()
             return JournalResult(False, "draft", "source_packet_hash_mismatch", entry_id, rev, stored_hash)
+        if not journal_shared_source_provenance_is_current(conn, guild_id, metadata.get("sharedInputSourceProvenance", [])):
+            conn.rollback()
+            return JournalResult(False, "draft", "privacy_source_ineligible", entry_id, rev, stored_hash)
         metadata["canonicalPayloadHash"] = request_hash
         metadata["canonicalPayloadBytes"] = len(canonical)
         approved_state = (
@@ -5448,6 +5598,8 @@ def deliver_approved(
         identity_meta = json.loads(identity_row[0] or "{}") if identity_row else {}
         if not journal_public_people_are_current(conn, guild_id, identity_meta.get("publicPeople", [])):
             return JournalResult(False, "not_deliverable", "privacy_memory_ineligible", entry_id, int(revision or 0))
+        if not journal_shared_source_provenance_is_current(conn, guild_id, identity_meta.get("sharedInputSourceProvenance", [])):
+            return JournalResult(False, "not_deliverable", "privacy_source_ineligible", entry_id, int(revision or 0))
     if delivery_fence is not None:
         # Privacy/deletion writers share this narrow Journal fence. The main
         # SQLite transaction is deliberately released before the network wait,
