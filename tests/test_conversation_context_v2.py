@@ -45,6 +45,73 @@ def req(**kw):
     return ConversationContextRequest(**base)
 
 class ConversationContextV2Tests(unittest.TestCase):
+    def test_recent_human_request_survives_without_saved_reply_or_word_overlap(self):
+        for policy in ("public_home", "sealed_test"):
+            for batch in (False, True):
+                for prior, followup in (
+                    ("Give me a recap of the September 4th show.",
+                     "What were some actual comments, and who said them?"),
+                    ("Tell me about Test Beacon's lantern project.",
+                     "What happened after that?"),
+                    ("Test Harbor made the copper bird sculpture.",
+                     "Who contributed the idea?"),
+                ):
+                    for punctuation in (".", "?", ""):
+                        with self.subTest(policy=policy, batch=batch, prior=prior,
+                                          punctuation=punctuation):
+                            rows = [
+                                row(1, "user", "What time is it?", policy=policy, minutes=3),
+                                row(2, "user", "Are we live now?", policy=policy, minutes=2),
+                                row(3, "user", prior.rstrip(".") + punctuation,
+                                    policy=policy, minutes=1),
+                                row(4, "user", followup, policy=policy, minutes=0, mid=9004),
+                            ]
+                            result = assemble_conversation_context_v2(rows, req(
+                                channel_policy=policy, current_texts=(followup,),
+                                current_message_ids={9004}, is_batch=batch,
+                            ))
+                            self.assertIn(3, result.selected_row_ids)
+                            self.assertNotIn(4, result.selected_row_ids)
+                            self.assertIn(prior.rstrip("."), result.rendered_context)
+
+    def test_recent_human_continuity_stays_with_requester_and_existing_bounds(self):
+        rows = [
+            row(1, "user", "An unrelated room statement.", user=2),
+            row(2, "user", "My other room statement.", channel=20),
+            row(3, "user", "My sealed statement.", policy="sealed_test"),
+            row(4, "user", "My stale statement.", minutes=46),
+            row(5, "user", "My future statement.", minutes=-1),
+            row(6, "user", "My recent contribution.", minutes=1),
+        ]
+        result = assemble_conversation_context_v2(rows, req(current_texts=("Tell me more.",)))
+        self.assertEqual(result.selected_row_ids, (6,))
+        self.assertIn("recent human turn", result.rendered_context)
+        self.assertNotIn("open loop", result.rendered_context)
+
+    def test_explicit_new_topic_does_not_inherit_previous_human_or_model_turns(self):
+        for saved_reply in (False, True):
+            with self.subTest(saved_reply=saved_reply):
+                rows = [row(1, "user", "What happened in the September 4 show?")]
+                if saved_reply:
+                    rows.append(row(2, "model", "The crowd discussed the wheel."))
+                result = assemble_conversation_context_v2(rows, req(
+                    current_texts=("New topic: explain how a synthesizer works.",),
+                ))
+                self.assertEqual(result.selected_row_ids, ())
+                self.assertEqual(result.thread_focus_mode, "new_thread")
+
+    def test_recent_human_turn_is_not_starved_by_older_pairs(self):
+        rows = []
+        for index in range(4):
+            rows.extend((
+                row(index * 2 + 1, "user", "An old question? " + "detail " * 90, minutes=8),
+                row(index * 2 + 2, "model", "An old answer. " + "detail " * 90, minutes=7),
+            ))
+        rows.append(row(9, "user", "Tell me about Test Harbor's copper sculpture.", minutes=1))
+        result = assemble_conversation_context_v2(rows, req(current_texts=("Who helped?",)))
+        self.assertIn(9, result.selected_row_ids)
+        self.assertLessEqual(result.final_char_count, MAX_RENDERED_CHARS)
+
     def test_numeric_selection_ranges_are_not_named_choice_payloads(self):
         cases = (
             ("Choose a year between 1974 and 2008 and combine two styles.",
@@ -1000,10 +1067,12 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
         self.assertEqual(res.same_room_paired_turn_count, 0)
         self.assertEqual(res.cross_channel_paired_turn_count, 0)
 
-    def test_orphan_model_and_arbitrary_unpaired_user_are_not_open_loop(self):
+    def test_orphan_model_is_excluded_and_own_recent_statement_is_continuity(self):
         res = assemble_conversation_context_v2([row(1,"model","orphan answer"), row(2,"user","arbitrary statement")], req(current_texts=("fresh topic",)))
         self.assertNotIn("User/member (open loop): orphan answer", res.rendered_context)
-        self.assertNotIn("arbitrary statement", res.rendered_context)
+        self.assertNotIn("orphan answer", res.rendered_context)
+        self.assertIn("User/member (recent human turn): arbitrary statement", res.rendered_context)
+        self.assertNotIn("open loop", res.rendered_context)
 
     def test_timestamp_fail_closed_cases(self):
         valid_naive = dict(row(1,"user","valid naive"), timestamp="2026-07-16 11:59:00")

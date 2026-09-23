@@ -54,6 +54,104 @@ DISCORD_COMMENT = "The amber lantern release is out now. It aired here earlier t
 
 
 class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def _capture_human_history(self, policy, channel_id, texts):
+        channel_name = "bnl-testing" if policy == "sealed_test" else "barcode-bot"
+        for index, text in enumerate(texts):
+            bot.save_user_message(
+                self.runtime.user_id, "Test Member", self.runtime.guild_id,
+                text, channel_name=channel_name, channel_policy=policy,
+                channel_id=channel_id, message_id=channel_id * 100 + index,
+                route_mode="normal_chat", directed_to_bnl=True,
+            )
+
+    async def test_short_recap_followup_reloads_original_sources_in_direct_and_batch(self):
+        self._advance_public_feed_to_september_18()
+        history = (
+            "What day, date and time is it in Pacific time?",
+            "Does that mean we're live right now?",
+            "Give me a recap of the September 4th show.",
+        )
+        followup = "What were some actual comments, and who said them?"
+        answer = 'Test September said, "The amber lanterns are bright tonight."'
+
+        async def provider_answer(*_args, **kwargs):
+            if kwargs.get("attempt_counter") is not None:
+                kwargs["attempt_counter"].mark_started()
+            return answer
+
+        for policy in ("public_home", "sealed_test"):
+            for packet_enabled in (False, True):
+                channel_id = 8811 + len(self.runtime.channel_ids)
+                with self.subTest(policy=policy, packet=packet_enabled), mock.patch.dict(os.environ, {
+                    "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                    "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                    "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                    "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+                    "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": str(packet_enabled).lower(),
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED": str(packet_enabled).lower(),
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": str(self.runtime.guild_id),
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": str(self.runtime.user_id),
+                    "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "8810",
+                }):
+                    with sqlite3.connect(bot.DB_FILE) as conn:
+                        conn.execute("DELETE FROM conversations WHERE channel_id=8810")
+                    self._capture_human_history(policy, 8810, history)
+                    prompt, metadata = await self.runtime._direct_prompt_async(
+                        policy, request=followup, privileged=False,
+                    )
+                    self.assertEqual(metadata["ordinary_chat_single_packet_applied"], packet_enabled,
+                                     metadata["ordinary_chat_single_packet_scope"])
+                    self._capture_human_history(policy, channel_id, history)
+                    with mock.patch.dict(os.environ, {
+                        "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": str(channel_id),
+                    }):
+                        channel, generation, guard = await self.runtime._batch(
+                            policy, request=followup, answer=provider_answer, privileged=False,
+                        )
+                    generation.assert_awaited_once()
+                    self.assertEqual(channel.sent, [answer])
+                    for actual_prompt, bases in (
+                        (prompt, metadata["prompt_source_bases"]),
+                        (generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"]),
+                    ):
+                        self.assertIn(history[-1], actual_prompt)
+                        self.assertIn(SEPTEMBER_COMMENT, actual_prompt)
+                        self.assertNotIn(AUGUST_COMMENT, actual_prompt)
+                        show_bases = [basis for basis in bases
+                                      if isinstance(basis, bot.FinalizedShowPromptSourceBasis)]
+                        self.assertEqual(len(show_bases), 1)
+                        self.assertEqual(show_bases[0].show_keys, ("show-attendance-september",))
+                        self.assertTrue(any(
+                            excerpt.source_text == SEPTEMBER_COMMENT
+                            and excerpt.speaker_label == "Test September (@test.september)"
+                            for excerpt in show_bases[0].authored_excerpts
+                        ))
+
+    async def test_new_recent_show_scope_does_not_inherit_prior_single_date(self):
+        self._advance_public_feed_to_september_18()
+        self._capture_human_history("sealed_test", 8810, (
+            "Give me a recap of the September 4th show.",
+        ))
+        request = (
+            "Hey BNL what were some recurring topics from the last 4 shows "
+            "and what were some of the stranger things said?"
+        )
+        prompt, metadata = await self.runtime._direct_prompt_async(
+            "sealed_test", request=request, privileged=False,
+        )
+        show_bases = [basis for basis in metadata["prompt_source_bases"]
+                      if isinstance(basis, bot.FinalizedShowPromptSourceBasis)]
+        self.assertEqual(len(show_bases), 1)
+        # Three eligible shows in this fixture: requesting four retains all
+        # three without substituting an old single-date conversational scope.
+        self.assertEqual(set(show_bases[0].show_keys), {
+            "show-attendance-1", "show-attendance-september", "show-attendance-latest",
+        })
+        self.assertIn(AUGUST_COMMENT, prompt)
+        self.assertIn(SEPTEMBER_COMMENT, prompt)
+
     async def asyncSetUp(self):
         self.runtime = network_fixture.PublicNetworkKnowledgeTests()
         await self.runtime.asyncSetUp()

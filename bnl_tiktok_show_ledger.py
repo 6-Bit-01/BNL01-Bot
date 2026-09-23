@@ -340,6 +340,10 @@ def broad_show_history_requested(
     recent_count = requested_recent_show_count(text)
     if recent_count is not None:
         return recent_count > 1
+    if re.search(r"\b(?:those|these|both)\s+(?:shows|episodes|broadcasts)\b", text, re.I):
+        # A deictic plural keeps the selected comparison. It does not request
+        # a fresh broad history scope; explicit dates/counts above still win.
+        return False
     if re.search(
         r"\b(?:the|last|previous|this|current|latest|yesterday(?:'s)?|tonight(?:'s)?) "
         r"(?:show|live|episode|broadcast)\b",
@@ -4403,12 +4407,17 @@ def build_tiktok_show_evidence_context(
                     )
                     lines.extend(_operational_event_line(event) for event in selected_operations)
                 continue
+        recall_query = (
+            selection_query
+            if candidate_context and _general_participant_recall(selection_query, participant_matches)
+            else user_text
+        )
         general_recall = bool(
             not requested_dates
-            and _general_participant_recall(user_text, participant_matches)
+            and _general_participant_recall(recall_query, participant_matches)
         )
         message_query_terms = (
-            _participant_topic_terms(user_text, participant_matches)
+            _participant_topic_terms(recall_query, participant_matches)
             if general_recall else query_terms
         )
         coverage = ledger.get("coverage") or {}

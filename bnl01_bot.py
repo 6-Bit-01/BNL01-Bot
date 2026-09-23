@@ -4097,9 +4097,25 @@ def build_tiktok_show_evidence_context_for_turn(
             tiktok_show_evidence_query = dated_selection
     selection_query = continuation_selection_query or tiktok_show_evidence_query
     candidate_context = bool(continuation_selection_query)
+    member_selection_query = (
+        _public_member_continuation_query(
+            user_text, conversation_context_result,
+            guild_id=guild_id, current_user_id=subject_user_id,
+        )
+        if conversation_basis is not None
+        and conversation_basis.current_user_id == int(subject_user_id or 0)
+        and conversation_basis.guild_id == int(guild_id)
+        and not image_queries
+        else user_text
+    )
+    if member_selection_query != user_text:
+        selection_query = member_selection_query
+        candidate_context = True
     if (
         conversation_basis is not None
+        and member_selection_query == user_text
         and not continuation_selection_query
+        and not broad_show_history_requested(user_text)
         and not image_queries
         and conversation_context_result is not None
         and conversation_context_result.thread_focus_mode
@@ -4142,6 +4158,13 @@ def build_tiktok_show_evidence_context_for_turn(
             ):
                 selection_query = tiktok_show_evidence_query + "\n" + item.text
                 candidate_context = True
+                break
+            if (
+                item.speaker_user_id == int(subject_user_id)
+                and not is_tiktok_show_analysis_followup(item.text)
+            ):
+                # Do not jump across an intervening human topic to revive a
+                # historical episode. The current request can name it again.
                 break
     context = build_tiktok_show_evidence_context(
         DB_FILE,
@@ -15314,6 +15337,44 @@ def _named_public_member_subjects(
         user_id = next(iter(candidates))
         resolved.setdefault(user_id, member_labels[(key, user_id)])
     return tuple(resolved.items()), tuple(dict.fromkeys(unresolved))
+
+
+def _public_member_continuation_query(
+    text: str, context_result: ConversationContextResult | None,
+    *, guild_id: int, current_user_id: int,
+) -> str:
+    """Carry one selected human person/topic referent to existing readers.
+
+    This only supplies a retrieval query. Identity still comes from the guild
+    resolver, facts from original sources, and the selected human rows remain
+    in the normal revalidatable conversation basis. Never guess among people
+    or inherit scope across an explicit replacement or a different speaker.
+    """
+    if (
+        context_result is None
+        or not current_user_id
+        or context_result.requester_user_id != int(current_user_id)
+        or context_result.thread_focus_mode != "continue_or_answer"
+        or context_result.referent_status not in {"not_requested", "resolved"}
+        or context_result.referent_reason == "discord_reply_source"
+        or not _EXACT_REPLY_PRONOUN_SUBJECT_RE.search(text or "")
+        or has_explicit_show_date(text)
+        or broad_show_history_requested(text)
+        or _current_queue_state_query(text)
+        or _typed_canon_subject_references(text)
+    ):
+        return text
+    guild = client.get_guild(int(guild_id or 0))
+    named, unresolved = _named_public_member_subjects(guild, text)
+    if named or unresolved:
+        return text
+    for _row_id, prior in reversed(context_result.requester_human_turns):
+        named, unresolved = _named_public_member_subjects(guild, prior)
+        if len(named) == 1 and not unresolved:
+            return text + "\nPrior human request: " + prior
+        if named or unresolved or not _EXACT_REPLY_PRONOUN_SUBJECT_RE.search(prior):
+            break
+    return text
 
 
 def resolve_discord_turn_addressing(
@@ -27785,6 +27846,8 @@ def build_named_public_conversation_context(
     *, situation_frame: SituationFrameV1 | None, guild_id: int,
     route_mode: str, channel_policy: str, user_text: str,
     channel_id: int = 0, channel_name: str = "",
+    conversation_basis=None,
+    conversation_context_result: ConversationContextResult | None = None,
 ) -> tuple[str, ConversationPromptSourceBasis | None]:
     """Read topic-relevant original public messages for frozen member targets.
 
@@ -27815,6 +27878,11 @@ def build_named_public_conversation_context(
     subject_ids = tuple(dict.fromkeys(int(s.user_id) for s in subjects))[:8]
     if not subject_ids:
         return "", None
+    if conversation_basis is not None and conversation_basis.guild_id == int(guild_id):
+        user_text = _public_member_continuation_query(
+            user_text, conversation_context_result, guild_id=guild_id,
+            current_user_id=conversation_basis.current_user_id,
+        )
     selected_date = requested_show_date(user_text)
     if has_explicit_show_date(user_text) and not selected_date:
         return "", None
@@ -28813,10 +28881,14 @@ def build_live_conversation_orchestration_decision(
         )
     )
     cached_guild = client.get_guild(int(guild_id or 0))
+    member_selection_query = _public_member_continuation_query(
+        current_text, context_result, guild_id=guild_id,
+        current_user_id=(current_speaker_user_ids[0] if len(current_speaker_user_ids) == 1 else 0),
+    ) if route_allowed and not resolved_subject_user_ids else current_text
     named_member_subjects, unresolved_member_labels = (
         _named_public_member_subjects(
             cached_guild,
-            current_text,
+            member_selection_query,
             typed_subject_user_ids=resolved_subject_user_ids,
             addressee_user_ids=resolved_addressee_user_ids,
         )
@@ -38599,6 +38671,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 user_text=combined_text,
                 channel_id=channel_id,
                 channel_name=getattr(channel, "name", ""),
+                conversation_basis=batch_conversation_basis,
+                conversation_context_result=orchestration_state.get("context_result"),
             )
             if batch_named_conversation_context:
                 prompt += "\n\n" + batch_named_conversation_context + "\n"
@@ -41711,6 +41785,8 @@ def build_user_aware_prompt(
             user_text=clean_content,
             channel_id=channel_id,
             channel_name=channel_name,
+            conversation_basis=conversation_prompt_basis,
+            conversation_context_result=conversation_context_result,
         )
     )
     if named_conversation_basis is not None:
