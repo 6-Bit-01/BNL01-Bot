@@ -37,6 +37,13 @@ episodes retain their selected dates. See
 [`docs/conversation-time-awareness-2026-09-23.md`](docs/conversation-time-awareness-2026-09-23.md)
 for the bounded scope and post-deploy checks.
 
+Recent human turns remain available when a website-backed BNL reply is
+intentionally not stored. Person/topic follow-ups reload eligible original
+Discord and TikTok evidence through the existing readers; explicit new topics,
+people, dates and recent-show scopes take precedence. See
+[`docs/shared-conversation-continuity-2026-09-23.md`](docs/shared-conversation-continuity-2026-09-23.md)
+for the source boundaries and focused acceptance batch.
+
 ## Runtime configuration
 
 Configure secrets in the process environment; do not commit them. Core variables include:

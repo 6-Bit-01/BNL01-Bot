@@ -854,7 +854,9 @@ def _task_subject_indexes(
             for label in labels
         ):
             matches.append(index)
-    if not matches and third_party and len(subjects) == 1:
+    if not matches and len(subjects) == 1 and (
+        third_party or _EXACT_REPLY_DEICTIC_SUBJECT_RE.search(segment or "")
+    ):
         matches.append(0)
     return tuple(dict.fromkeys(matches))
 

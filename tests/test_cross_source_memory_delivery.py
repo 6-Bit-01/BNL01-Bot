@@ -49,6 +49,91 @@ ANSWER = (
 
 
 class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_person_topic_followup_uses_original_memory_with_or_without_saved_bot_reply(self):
+        for policy, enabled, saved in product(("public_home", "sealed_test"), (False, True), (False, True)):
+            channel_id = 8811 + len(self.runtime.channel_ids)
+            with self.subTest(policy=policy, packet=enabled, saved=saved), self._packet_configuration(enabled, 8810):
+                channel_name = "bnl-testing" if policy == "sealed_test" else "barcode-bot"
+                with sqlite3.connect(bot.DB_FILE) as conn:
+                    conn.execute("DELETE FROM conversations WHERE channel_id=8810")
+                for target in (8810, channel_id):
+                    bot.save_user_message(
+                        REQUESTER, "Test Member", GUILD, REQUEST,
+                        channel_name=channel_name, channel_policy=policy,
+                        channel_id=target, message_id=target * 100,
+                        route_mode="normal_chat", directed_to_bnl=True,
+                    )
+                    if saved:
+                        with sqlite3.connect(bot.DB_FILE) as conn:
+                            conn.execute(
+                                "INSERT INTO conversations (user_id,user_name,guild_id,role,content,"
+                                "timestamp,channel_id,channel_name,channel_policy,route_mode) "
+                                "VALUES (?,?,?,'model',?,?,?,?,?,'normal_chat')",
+                                (REQUESTER, "BNL-01", GUILD, "They discussed their stage decorations.",
+                                 bot.datetime.now(bot.timezone.utc).isoformat(), target, channel_name, policy),
+                            )
+                followup = "What were their exact words?"
+                prompt, metadata = await self.runtime._direct_prompt_async(
+                    policy, request=followup, privileged=False,
+                )
+                self._assert_sources(prompt, metadata["prompt_source_bases"])
+                self.assertEqual(metadata["ordinary_chat_single_packet_applied"], enabled,
+                                 metadata["ordinary_chat_single_packet_scope"])
+                with self._packet_configuration(enabled, channel_id):
+                    channel, generation, guard = await self.runtime._batch(
+                        policy, request=followup, answer=self._provider_answer, privileged=False,
+                    )
+                generation.assert_awaited_once()
+                self.assertEqual(channel.sent, [ANSWER])
+                self._assert_sources(generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"])
+
+    def _capture_prior_person_request(self, text=REQUEST):
+        bot.save_user_message(
+            REQUESTER, "Test Member", GUILD, text,
+            channel_name="bnl-testing", channel_policy="sealed_test",
+            channel_id=8810, message_id=881000,
+            route_mode="normal_chat", directed_to_bnl=True,
+        )
+
+    async def test_new_person_and_new_topic_take_precedence_over_prior_memory_request(self):
+        self._capture_prior_person_request()
+        prompt, metadata = await self.runtime._direct_prompt_async(
+            "sealed_test", request="No, what has Test Other said about amber lanterns?", privileged=False,
+        )
+        self.assertIn(OTHER_COMMENT, prompt)
+        self.assertNotIn(DISCORD_COMMENT, prompt)
+        self.assertNotIn(TIKTOK_COMMENT, prompt)
+        prompt, _metadata = await self.runtime._direct_prompt_async(
+            "sealed_test", request="New topic: what are their favorite instruments?", privileged=False,
+        )
+        self.assertNotIn(REQUEST, prompt)
+        self.assertNotIn(DISCORD_COMMENT, prompt)
+        self.assertNotIn(TIKTOK_COMMENT, prompt)
+
+    async def test_intervening_unrelated_human_turn_does_not_revive_old_person(self):
+        self._capture_prior_person_request()
+        self._capture_prior_person_request("Explain the difference between a flute and a trumpet.")
+        prompt, _metadata = await self.runtime._direct_prompt_async(
+            "sealed_test", request="What were their exact words?", privileged=False,
+        )
+        self.assertNotIn(DISCORD_COMMENT, prompt)
+        self.assertNotIn(TIKTOK_COMMENT, prompt)
+
+    async def test_continuation_anchor_and_original_sources_remain_revalidatable(self):
+        self._capture_prior_person_request()
+        prompt, metadata = await self.runtime._direct_prompt_async(
+            "sealed_test", request="What were their exact words?", privileged=False,
+        )
+        bases = tuple(metadata["prompt_source_bases"])
+        self._assert_sources(prompt, bases)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("UPDATE conversations SET channel_policy='internal_controlled' WHERE id=7101")
+        self.assertEqual(bot.prompt_source_basis_failure(bases), "conversation_source_changed")
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("UPDATE conversations SET channel_policy='public_home' WHERE id=7101")
+            conn.execute("DELETE FROM conversations WHERE channel_id=8810")
+        self.assertEqual(bot.prompt_source_basis_failure(bases), "conversation_source_changed")
+
     async def asyncSetUp(self):
         self.runtime = network_fixture.PublicNetworkKnowledgeTests()
         await self.runtime.asyncSetUp()
@@ -153,6 +238,7 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def _packet_configuration(self, enabled, channel_id):
         return mock.patch.dict(os.environ, {
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": str(enabled).lower(),
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED": str(enabled).lower(),
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": str(GUILD),
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": str(REQUESTER),
             "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": str(channel_id),

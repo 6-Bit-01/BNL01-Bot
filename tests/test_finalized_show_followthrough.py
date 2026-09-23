@@ -107,8 +107,11 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
             channel_name="bnl-testing", channel_policy="sealed_test",
             context_result=result,
         )
-        self.assertIsNotNone(basis)
-        self.assertIn(9003 if exact_other_reply else 9001, basis.source_row_ids)
+        if result.thread_focus_mode == "new_thread":
+            self.assertIsNone(basis)
+        else:
+            self.assertIsNotNone(basis)
+            self.assertIn(9003 if exact_other_reply else 9001, basis.source_row_ids)
         return result, basis
 
     def _show_context(self, current, *, subject_user_id=42, guild_id=77,
@@ -150,12 +153,13 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
                 self.assertIn("the green visuals during this song are wild.", rendered)
                 self.assertFalse(self.bot.finalized_show_packet_owner_requested(current, rendered))
 
-    def test_ambiguous_current_referent_does_not_inherit_a_show(self):
+    def test_explicit_new_topic_does_not_inherit_a_show_or_old_referent(self):
         rendered, selection, result = self._show_context(
             "Separate topic: briefly explain why a checksum can detect a "
             "corrupted file but cannot repair it.",
         )
-        self.assertEqual(result.referent_status, "ambiguous")
+        self.assertEqual(result.thread_focus_mode, "new_thread")
+        self.assertEqual(result.referent_status, "not_requested")
         self.assertEqual(rendered, "")
         self.assertEqual(selection, {})
 
