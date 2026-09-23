@@ -798,6 +798,7 @@ def select_published_journal_entries_on_connection(
     now: Any = None,
     limit: int = JOURNAL_PUBLICATION_RESULT_LIMIT,
     include_context: bool = False,
+    context_only: bool = False,
 ) -> JournalPublicationSelection:
     """Select canonical publications under the existing visibility controls.
 
@@ -806,7 +807,7 @@ def select_published_journal_entries_on_connection(
     a valid control snapshot. Context reuse obeys the same memory exclusions as
     topic/latest reads; exact publication lookups retain their separate policy.
     """
-    requested_mode = journal_publication_query_mode(user_text)
+    requested_mode = "context" if context_only else journal_publication_query_mode(user_text)
     if requested_mode == "not_requested":
         if not include_context:
             return JournalPublicationSelection("not_requested", "not_requested")
@@ -822,7 +823,7 @@ def select_published_journal_entries_on_connection(
     if not table_exists(conn, "bnl_journal_entries"):
         return JournalPublicationSelection("source_unavailable", requested_mode)
 
-    identity = _journal_query_identity(user_text)
+    identity = "" if context_only else _journal_query_identity(user_text)
     publication_date_match = _JOURNAL_DATE_RE.search(str(user_text or ""))
     publication_date = (
         publication_date_match.group(1)
@@ -1089,6 +1090,8 @@ def purge_user_journal_derivatives_on_connection(
     subject_ref = f"discord_user:{user}"
     now = utc_now_iso()
     counts: dict[str, int] = {}
+    from bnl_website_relay_state import purge_user_relay_derivatives_on_connection
+    counts.update(purge_user_relay_derivatives_on_connection(conn, guild, user))
 
     if table_exists(conn, "bnl_journal_observations"):
         rows = conn.execute(
@@ -1647,6 +1650,8 @@ def purge_guild_journal_derivatives_on_connection(
         ).fetchall():
             collect(row[0])
     for table, columns in (
+        ("website_relay_pending_v2", ("source_basis_json",)),
+        ("website_relay_history", ("source_basis_json",)),
         ("bnl_journal_private_metadata", ("metadata_json",)),
         ("bnl_journal_automation_runs", ("frozen_packet_json",)),
         (
@@ -3546,6 +3551,7 @@ def _journal_shared_inputs(
 
 def journal_shared_source_provenance_is_current(
     conn: sqlite3.Connection, guild_id: int, provenance: Any,
+    *, propagate_database_errors: bool = False,
 ) -> bool:
     """Revalidate exact saved bases in the caller's snapshot, without writes."""
     from bnl_moment_engine import public_moment_source_basis
@@ -3573,7 +3579,11 @@ def journal_shared_source_provenance_is_current(
                     return False
             else:
                 return False
-    except (sqlite3.Error, TypeError, ValueError, KeyError):
+    except sqlite3.Error:
+        if propagate_database_errors:
+            raise
+        return False
+    except (TypeError, ValueError, KeyError):
         return False
     return True
 

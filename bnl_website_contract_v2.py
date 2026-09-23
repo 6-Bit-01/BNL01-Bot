@@ -26,6 +26,9 @@ SOURCE_CLASS_MAP = {
     "conversation_continuity": "recent_public_continuity",
     "broadcast_memory": "scoped_broadcast_memory",
     "public_safe_memory": "public_safe_memory",
+    "public_moment": "public_safe_memory",
+    "finalized_show": "public_safe_memory",
+    "published_journal": "public_safe_memory",
     "canon": "approved_canon",
     "reflection": "grounded_reflection",
 }
@@ -182,11 +185,15 @@ def validate_relay_response(data: Any, submitted: Dict[str, Any]) -> DeliveryRes
     return DeliveryResult(True, "published", "", relay_id=relay["relayId"], published_at=published_at, idempotent=bool(data.get("idempotent")))
 
 
-def deliver_json(url: str, api_key: str, envelope: Dict[str, Any], *, opener: Optional[Callable[..., Any]] = None, retries: int = 1, timeout: int = 10) -> DeliveryResult:
+def deliver_json(url: str, api_key: str, envelope: Dict[str, Any], *, opener: Optional[Callable[..., Any]] = None, retries: int = 1, timeout: int = 10, preflight: Optional[Callable[[], str]] = None) -> DeliveryResult:
     opener = opener or urllib.request.urlopen
     payload = canonical_payload_bytes(envelope)
     last_reason = "retryable_delivery_failure"
     for attempt in range(max(0, retries) + 1):
+        if preflight:
+            reason = preflight()
+            if reason:
+                return DeliveryResult(False, "source_blocked", reason)
         req = urllib.request.Request(url, data=payload, method="POST", headers={"Content-Type": "application/json", "x-api-key": api_key})
         try:
             with opener(req, timeout=timeout) as response:
