@@ -71,6 +71,17 @@ class MomentMeaningTests(unittest.TestCase):
         moments.ensure_moment_schema(self.conn)
         relationships.ensure_relationship_v2_schema(self.conn)
 
+    def test_interrupted_attempt_recovery_is_bounded_and_does_not_requeue(self):
+        mids = [self.captured_moment(channel=channel)[0] for channel in (10, 11)]
+        for _mid in mids:
+            self.assertIsNotNone(moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,)))
+        self.conn.execute("UPDATE memory_moment_windows SET meaning_attempted_at='2026-09-12T07:00:00+00:00'")
+        at = datetime(2026, 9, 12, 7, 10, tzinfo=timezone.utc)
+        self.assertEqual(moments.expire_stale_moment_meaning_attempts(self.conn, now=at, limit=1), 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory_moment_windows WHERE meaning_status='generating'").fetchone()[0], 1)
+        self.assertEqual(moments.expire_stale_moment_meaning_attempts(self.conn, now=at, limit=1), 1)
+        self.assertIsNone(moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,)))
+
     def captured_moment(self, turns=REPORTERS, *, channel=10, policy="public_home", started_at=None):
         start = started_at or datetime(2026, 9, 12, 7, channel % 60, tzinfo=timezone.utc)
         roots = []

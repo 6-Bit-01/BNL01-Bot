@@ -1,6 +1,7 @@
 """The existing Moment sweep uses one accounted, cancellable background attempt."""
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,53 @@ class MomentMeaningBotTests(unittest.IsolatedAsyncioTestCase):
         with sqlite3.connect(self.path) as conn:
             return conn.execute('SELECT meaning_status FROM memory_moment_windows WHERE moment_id=?',
                                 (self.mid,)).fetchone()[0]
+
+    def claim_and_age(self, *, age=601):
+        with sqlite3.connect(self.path) as conn:
+            request = bot.claim_pending_moment_meaning(conn, guild_ids=(1,))
+            self.assertIsNotNone(request)
+            conn.execute('UPDATE memory_moment_windows SET meaning_attempted_at=? WHERE moment_id=?',
+                         ((datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat(), self.mid))
+            summary = conn.execute('SELECT summary FROM memory_moment_windows WHERE moment_id=?', (self.mid,)).fetchone()[0]
+        return request, summary
+
+    async def test_restart_sweep_expires_committed_claim_without_replaying_provider(self):
+        request, original_summary = self.claim_and_age()
+        # Reopen the persisted database through the real periodic sweep.
+        with mock.patch.object(bot, '_generate_gemini_content_result_async') as generate:
+            await bot.moment_engine_sweep_task.coro()
+            if bot._moment_meaning_task:
+                await bot._moment_meaning_task
+        generate.assert_not_called()
+        self.assertEqual(self.status(), 'interrupted')
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute('SELECT summary FROM memory_moment_windows WHERE moment_id=?', (self.mid,)).fetchone()[0], original_summary)
+            self.assertFalse(bot.apply_moment_meaning(conn, request, json.dumps(fixtures.REPORTER_MEANING)))
+            self.assertIsNone(bot.claim_pending_moment_meaning(conn, guild_ids=(1,)))
+
+    async def test_recent_inflight_claim_is_not_expired_or_duplicated_by_sweep(self):
+        self.claim_and_age(age=30)
+        with mock.patch.object(bot, '_generate_gemini_content_result_async') as generate:
+            await bot.moment_engine_sweep_task.coro()
+            if bot._moment_meaning_task:
+                await bot._moment_meaning_task
+        self.assertEqual(self.status(), 'generating')
+        generate.assert_not_called()
+
+    async def test_recovery_respects_existing_shadow_gates(self):
+        self.claim_and_age()
+        for gate in ('BNL_MEMORY_LEDGER_SHADOW_ENABLED', 'BNL_MOMENT_ENGINE_SHADOW_ENABLED'):
+            with mock.patch.dict(os.environ, {gate: 'false'}), sqlite3.connect(self.path) as conn:
+                self.assertEqual(bot.expire_stale_moment_meaning_attempts(conn), 0)
+        self.assertEqual(self.status(), 'generating')
+
+    async def test_invalid_attempt_timestamp_is_closed_without_provider(self):
+        self.claim_and_age()
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("UPDATE memory_moment_windows SET meaning_attempted_at='invalid' WHERE moment_id=?", (self.mid,))
+            self.assertEqual(bot.expire_stale_moment_meaning_attempts(conn), 1)
+            self.assertEqual(bot.expire_stale_moment_meaning_attempts(conn), 0)
+        self.assertEqual(self.status(), 'interrupted')
 
     async def test_one_metered_call_runs_after_commit_and_saves_a_derived_revision(self):
         async def provider(prompt, route, *, attempt_counter):

@@ -53,6 +53,9 @@ MOMENT_MEANING_VERSION = "moment_meaning_v2"
 MOMENT_MEANING_PREFIX = "Derived moment gist (source-grounded): "
 MOMENT_MEANING_MAX_SOURCE_CHARS = 12000
 MOMENT_MEANING_MAX_SOURCES = 32
+# The existing provider transport is capped at four minutes. Expire abandoned
+# claims after ten, retaining the original Moment and never replaying the call.
+MOMENT_MEANING_ATTEMPT_MAX_SECONDS = 10 * 60
 _PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 SITUATION_EPISODE_READ_VERSION = "situation_episode_read_v1"
 EPISODE_EVENT_TYPES = (
@@ -3061,6 +3064,32 @@ def claim_pending_moment_meaning(
     _diag(conn, basis['guild_id'], 'moment_meaning_claimed', 'single_background_attempt', mid)
     return MomentMeaningRequest(mid, basis['guild_id'], basis['canonical_ledger_entry_id'],
                                 digest, participants, tuple(rows), prompt)
+
+
+def expire_stale_moment_meaning_attempts(
+    conn: sqlite3.Connection, *, now: datetime | None = None, limit: int = 100,
+) -> int:
+    """Close interrupted claims in the existing sweep; never enqueue a retry."""
+    if not shadow_enabled() or not ledger_shadow_enabled():
+        return 0
+    at = now or datetime.now(timezone.utc)
+    cutoff = (at - timedelta(seconds=MOMENT_MEANING_ATTEMPT_MAX_SECONDS)).isoformat()
+    rows = conn.execute(
+        "SELECT moment_id,guild_id FROM memory_moment_windows "
+        "WHERE meaning_status='generating' AND "
+        "(datetime(meaning_attempted_at) IS NULL OR "
+        "datetime(meaning_attempted_at)<=datetime(?)) "
+        "ORDER BY meaning_attempted_at,moment_id LIMIT ?",
+        (cutoff, min(100, max(1, int(limit)))),
+    ).fetchall()
+    for mid, guild_id in rows:
+        conn.execute(
+            "UPDATE memory_moment_windows SET meaning_status='interrupted',updated_at=? "
+            "WHERE moment_id=? AND meaning_status='generating'",
+            (at.isoformat(), mid),
+        )
+        _diag(conn, guild_id, 'moment_meaning_not_applied', 'attempt_expired', mid)
+    return len(rows)
 
 
 def fail_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest,

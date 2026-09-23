@@ -182,6 +182,35 @@ class SourceContextBotIntegrationTests(unittest.TestCase):
         self.assertIn("Prompt operator authority: approved_operator_context", prompt)
         self.assertTrue(prompt_metadata["source_context_available"])
 
+    def test_authorized_lookup_reaches_actual_prompt_with_internal_source_boundary(self):
+        result = {"ok": True, "found": True, "matchKind": "exact", "data": {"sourceFile": {
+            "name": "Test Atlas", "knownFacts": ["A test archive entity."],
+            "publicSafetyNotes": "internal-only until reviewed",
+        }}}
+        query = 'what do we know about Test Atlas?'
+        metadata = {}
+        with (
+            mock.patch.object(bnl01_bot, 'BNL_OWNER_USER_ID', 999),
+            mock.patch.object(bnl01_bot, 'lookup_source_file', return_value=result) as lookup,
+            mock.patch.object(bnl01_bot, 'get_user_profile', return_value=('Test Operator', None)),
+            mock.patch.object(bnl01_bot, 'should_allow_greeting', return_value=False),
+            mock.patch.object(bnl01_bot, 'choose_response_style', return_value=('concise', 'style rule')),
+            mock.patch.object(bnl01_bot, 'build_user_memory_context', return_value=''),
+            mock.patch.object(bnl01_bot, 'build_broadcast_memory_context', return_value=''),
+        ):
+            block = asyncio.run(bnl01_bot.maybe_build_source_context_for_direct_message(
+                self.Message(), query, 'internal_controlled'))
+            prompt, *_ = bnl01_bot.build_user_aware_prompt(
+                999, 123, 'Test Operator', query, channel_name='research-and-development',
+                privileged=True, channel_policy='internal_controlled', is_direct_interaction=True,
+                source_context_block=block, prompt_metadata=metadata,
+            )
+        lookup.assert_called_once()
+        self.assertIn('A test archive entity.', prompt)
+        self.assertIn('internal working case file, not public dossier', prompt)
+        self.assertIn('internal-only until reviewed', prompt)
+        self.assertTrue(metadata['source_context_available'])
+
     def test_diagnostics_include_source_context_safe_metadata(self):
         diag = bnl01_bot.build_dossier_recommendation_diagnostics()
         for key in ("source_context_injection_available", "source_context_injection_enabled", "source_context_last_status", "source_context_last_subjects", "source_context_last_found_count", "source_context_last_match_kinds", "source_context_last_error_status"):

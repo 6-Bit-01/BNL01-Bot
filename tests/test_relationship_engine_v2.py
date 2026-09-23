@@ -228,6 +228,28 @@ def _case_evaluation_report_truthful_and_shadow_no_discord_response():
     assert report['legacy_v2_comparison'] == 'not_collected' and report['policy_eligible_shadow_candidates'] == 1 and report['actual_live_emissions'] == 0
 
 
+def _case_existing_tone_reader_reaches_prompt_only_with_live_authority(monkeypatch):
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, 'tone.db')
+        monkeypatch.setattr(bnl01_bot, 'DB_FILE', path)
+        bnl01_bot.init_db()
+        with sqlite3.connect(path) as c:
+            obs(c, 'Thank you for the helpful rhythm feedback.', 1)
+            state(c)
+        monkeypatch.setattr(bnl01_bot, 'memory_governance_live_enabled', lambda: True)
+        for enabled in ('0', '1'):
+            monkeypatch.setenv(LIVE_ENV, enabled)
+            for single_packet in (False, True):
+                prompt, *_ = bnl01_bot.build_user_aware_prompt(
+                    2, 1, 'Test Member', 'How should we approach the rhythm?',
+                    channel_name='general-chat', channel_policy='public_home', is_direct_interaction=True,
+                    _ordinary_chat_single_packet_enabled_override=single_packet,
+                )
+                assert ('Private relationship calibration' in prompt) == (enabled == '1')
+                assert 'Thank you for the helpful rhythm feedback.' not in prompt
+                assert 'rapport=' not in prompt and 'trust=' not in prompt
+
+
 class RelationshipEngineV2Tests(unittest.TestCase):
     pass
 
