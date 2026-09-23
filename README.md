@@ -27,6 +27,16 @@ python -m unittest discover -s tests -p 'test_*.py'
 
 `make check` first compiles the bot, support modules, and tests, then runs the full suite.
 
+Direct and batched conversation prompts share the existing Pacific clock,
+approved Friday schedule, and maintained occasion calendar. Each new prompt
+includes the current local date/time and the next regular scheduled show start,
+with the correct daylight-saving offset. Calendar timing does not establish
+actual broadcast, intake, playback, or publication state; existing authorized
+source readers still own those facts and any scheduling changes. Historical
+episodes retain their selected dates. See
+[`docs/conversation-time-awareness-2026-09-23.md`](docs/conversation-time-awareness-2026-09-23.md)
+for the bounded scope and post-deploy checks.
+
 ## Runtime configuration
 
 Configure secrets in the process environment; do not commit them. Core variables include:
