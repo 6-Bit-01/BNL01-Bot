@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta
 from unittest import mock
 
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
@@ -98,7 +99,7 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
                 context, basis = self.read(policy=policy)
                 self.assertIn(STATEMENT, context)
                 self.assertIn("TestMarbles in #test-public-stage", context)
-                self.assertIn("2026-08-29T03:00:00+00:00", context)
+                self.assertIn("2026-08-28 20:00:00 PDT", context)
                 self.assertEqual(basis.source_row_ids, (1,))
                 self.assertEqual(basis.participant_user_ids, (222,))
                 self.assertEqual(basis.evidence_items[0].text, STATEMENT)
@@ -204,6 +205,64 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
                 self.assertEqual(basis.source_row_ids, (1,))
                 self.assertIn(STATEMENT, context)
 
+    def test_original_timestamp_is_explicit_pacific_for_naive_utc_z_and_offsets(self):
+        cases = (
+            ("2026-09-19 04:10:08", "2026-09-18 21:10:08 PDT"),
+            ("2026-09-19T04:10:08Z", "2026-09-18 21:10:08 PDT"),
+            ("2026-09-19T06:10:08+02:00", "2026-09-18 21:10:08 PDT"),
+            ("2026-01-16T04:10:08+00:00", "2026-01-15 20:10:08 PST"),
+        )
+        for source_time, expected in cases:
+            with self.subTest(source_time=source_time):
+                with sqlite3.connect(self.path) as conn:
+                    conn.execute("DELETE FROM conversations")
+                self.seed(timestamp=source_time)
+                context, basis = self.read()
+                self.assertIn(expected, context)
+                self.assertEqual(basis.source_row_ids, (1,))
+                self.assertEqual(basis.evidence_items[0].text, STATEMENT)
+                self.assertFalse(bot.refresh_prompt_source_basis(basis)[1])
+
+    def test_requested_day_includes_both_midnight_edges_across_winter_summer_and_dst(self):
+        # Independent UTC boundaries for 24-, 23- and 25-hour Pacific days.
+        cases = (
+            ("2026-01-15", "2026-01-15T08:00:00+00:00", "2026-01-16T08:00:00+00:00"),
+            ("2026-05-08", "2026-05-08T07:00:00+00:00", "2026-05-09T07:00:00+00:00"),
+            ("2026-03-08", "2026-03-08T08:00:00+00:00", "2026-03-09T07:00:00+00:00"),
+            ("2026-11-01", "2026-11-01T07:00:00+00:00", "2026-11-02T08:00:00+00:00"),
+        )
+        for day, start, end in cases:
+            with self.subTest(day=day):
+                with sqlite3.connect(self.path) as conn:
+                    conn.execute("DELETE FROM conversations")
+                start, end = datetime.fromisoformat(start), datetime.fromisoformat(end)
+                stamps = (start - timedelta(seconds=1), start, start + timedelta(minutes=15),
+                          end - timedelta(seconds=1), end)
+                for row_id, stamp in enumerate(stamps, 1):
+                    self.seed(row_id, timestamp=stamp.isoformat(), text="The studio lights are blue.")
+                context, basis = self.read(text="Give me a public Discord comment from TestMarbles on " + day + ".")
+                self.assertIsNotNone(basis)
+                self.assertEqual(basis.source_row_ids, (2, 3, 4))
+                self.assertIn(day + " 00:00:00", context)
+                self.assertIn(day + " 23:59:59", context)
+
+    def test_repeated_fall_hour_preserves_both_occurrences_and_offsets(self):
+        self.seed(1, timestamp="2026-11-01T08:30:00Z", text="The first studio check is complete.")
+        self.seed(2, timestamp="2026-11-01T09:30:00Z", text="The second studio check is complete.")
+        context, basis = self.read(text="Give me public Discord comments from TestMarbles on November 1, 2026.")
+        self.assertEqual(basis.source_row_ids, (1, 2))
+        self.assertIn("2026-11-01 01:30:00 PDT", context)
+        self.assertIn("2026-11-01 01:30:00 PST", context)
+        self.assertLess(context.index("first studio"), context.index("second studio"))
+
+    def test_invalid_stored_timestamp_is_not_presented_as_a_known_date(self):
+        self.seed(timestamp="not-a-date")
+        context, basis = self.read()
+        self.assertIn("date unavailable", context)
+        self.assertNotIn("not-a-date", context)
+        self.assertEqual(basis.evidence_items[0].text, STATEMENT)
+        self.assertEqual(self.read(text=QUERY + " on May 8, 2026"), ("", None))
+
     def test_read_is_snapshot_only_and_does_not_create_missing_database(self):
         self.seed()
         before = hashlib.sha256(Path(self.path).read_bytes()).hexdigest()
@@ -222,6 +281,7 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
             ("user_id", 333),
             ("channel_policy", "internal_controlled"),
             ("role", "model"),
+            ("timestamp", "2026-08-30T03:00:00+00:00"),
         ):
             with self.subTest(column=column):
                 _context, basis = self.read()

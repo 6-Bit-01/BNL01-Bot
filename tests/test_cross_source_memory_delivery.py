@@ -52,6 +52,49 @@ ANSWER = (
 
 
 class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dated_original_keeps_local_time_in_direct_and_delivered_batch_prompts(self):
+        original = "The violet keyboard arrived just after midnight."
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            for row_id, stamp, content in (
+                (7097, "2026-05-08T06:59:59Z", "The previous day's violet keyboard update."),
+                (7098, "2026-05-09T07:00:00Z", "The following day's violet keyboard update."),
+                (7099, "2026-05-08T07:15:00Z", original),
+            ):
+                conn.execute(
+                    "INSERT INTO conversations (id,user_id,user_name,guild_id,role,content,"
+                    "timestamp,channel_id,channel_name,channel_policy,route_mode) "
+                    "VALUES (?,?,?,?,'user',?,?,9920,'public-lounge','public_home','normal_chat')",
+                    (row_id, SUBJECT, "Test Signal", GUILD, content, stamp),
+                )
+        request = "Give me a public Discord comment from Test Signal on May 8, 2026. Quote it."
+        for policy, enabled in product(("public_home", "sealed_test"), (False, True)):
+            with self.subTest(policy=policy, packet=enabled), self._packet_configuration(enabled, 8810):
+                inputs = self.runtime._direct_prompt_inputs(policy, request, privileged=False)
+                direct, *_ = await bot.build_user_aware_prompt_async(**inputs)
+
+                async def provider(*_args, **kwargs):
+                    counter = kwargs.get("attempt_counter")
+                    if counter is not None:
+                        counter.mark_started()
+                    return original
+
+                channel, generation, guard = await self.runtime._batch(
+                    policy, request=request, answer=provider, privileged=False, channel_id=8810,
+                )
+                generation.assert_awaited_once()
+                self.assertEqual(channel.sent, [original])
+                for prompt, bases in (
+                    (direct, inputs["prompt_metadata"]["prompt_source_bases"]),
+                    (generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"]),
+                ):
+                    self.assertIn(original, prompt)
+                    self.assertIn("2026-05-08 00:15:00 PDT", prompt)
+                    self.assertNotIn("previous day's violet", prompt)
+                    self.assertNotIn("following day's violet", prompt)
+                    selected = {row for basis in bases if isinstance(basis, bot.ConversationPromptSourceBasis)
+                                for row in basis.source_row_ids if row in {7097, 7098, 7099}}
+                    self.assertEqual(selected, {7099})
+
     async def test_live_recall_sequence_keeps_layers_through_the_final_provider_prompt(self):
         early = "My violet keyboard arrived in May."
         with sqlite3.connect(bot.DB_FILE) as conn:

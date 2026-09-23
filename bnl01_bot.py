@@ -28190,9 +28190,13 @@ def build_named_public_conversation_context(
             date_clause = ""
             date_params = ()
             if selected_date:
-                start = datetime.fromisoformat(selected_date).replace(tzinfo=PACIFIC_TZ)
+                day = datetime.fromisoformat(selected_date)
+                # Localize each midnight separately: a Pacific calendar day
+                # can be 23 or 25 hours, and pytz.replace uses historical LMT.
+                start = PACIFIC_TZ.localize(day)
+                end = PACIFIC_TZ.localize(day + timedelta(days=1))
                 date_clause = " AND julianday(timestamp)>=julianday(?) AND julianday(timestamp)<julianday(?)"
-                date_params = (start.isoformat(), (start + timedelta(days=1)).isoformat())
+                date_params = (start.isoformat(), end.isoformat())
             for subject in subjects:
                 rows = conn.execute(
                     "SELECT " + ",".join(selections) + """
@@ -28265,7 +28269,15 @@ def build_named_public_conversation_context(
     selected = []
     for source, label, text in ranked:
         place = _safe_prompt_display_label(source["channel_name"], "public Discord")
-        stamp = sanitize_history_text(str(source["timestamp"] or ""), limit=48)
+        try:
+            observed = datetime.fromisoformat(str(source["timestamp"] or "").replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            # Keep the zone explicit without crowding out whole utterances
+            # from the existing bounded original-message allowance.
+            stamp = observed.astimezone(PACIFIC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        except (TypeError, ValueError, OverflowError):
+            stamp = "date unavailable"
         line = f"- {label} in #{place} ({stamp}): {text}"
         if used + len(line) + 1 > budget:
             continue
