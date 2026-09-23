@@ -243,6 +243,12 @@ class ShowIntervalConversationTests(unittest.TestCase):
              mock.patch.dict(bot.os.environ, ENABLED_QUEUE_ENV), \
              mock.patch.object(bot, "_bnl_read_model_cached_at", datetime(2026, 8, 29, 0, 7, tzinfo=timezone.utc)):
             text = bot.build_bnl_read_model_context(model, query, "public_home")
+            from test_public_show_history import public_history_model, seal_history
+            model["sections"]["publicHistory"] = public_history_model()["sections"]["publicHistory"]
+            model["sections"]["publicHistory"].update(shows=[show], currentSessionId=show["sessionId"])
+            seal_history(model)
+            independent = bot.build_bnl_read_model_context(model, query, "public_home")
+        self.assertEqual(text, independent)
         self.assertIn("The green visuals made that moment hit.", text)
         self.assertIn("Transcript coverage: 2/2", text)
         self.assertIn("provisional observation", text)

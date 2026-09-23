@@ -54,6 +54,41 @@ whether the model used an allowed phrase.
   existing response-repair owner reconstructs the prompt and makes a bounded
   corrective generation when necessary.
 
+## Public history and bounded general recall (2026-09-23)
+
+Website PR #444 adds an independently authorized `sections.publicHistory`.
+The existing show owner validates its schema/source pair, public read-only
+policy, production gates, revision, and canonical SHA-256 content digest before
+adapting its compact show list into the existing current/latest/archive views.
+A private or unavailable current queue cannot block that public section or
+contribute its own rehearsal facts to public show memory. Legacy archive
+receipts remain readable; legacy fallback applies only when the new section
+is absent, never after an explicit withdrawal or malformed new envelope.
+
+Relative show counts constrain candidate records by date before topic scoring.
+Explicit dates and already selected roots still own their scope. General show
+recall uses the existing fresh public Discord reader alongside retained TikTok
+evidence, keeps both surfaces represented in bounded examples, and uses the
+existing track-window boundaries for temporal correlation. Ordinary room chat
+does not require a directed message or BNL reply and does not increase the
+retained BNL-interaction totals. Fresh original edits, privacy changes, and
+removal remain source invalidations before delivery.
+
+This extends source availability and scope inside existing owners. It keeps
+preparation, first-party operations, dialogue, community evidence, and normal
+conversation context as separate contributing layers. The #548 bulk source
+reads, one rebuild per validation snapshot, and asynchronous source check
+remain in place. The reverted #547 broad interval parser stays reverted.
+There are no provider, response-wording, deployment, or gate changes.
+
+After merge and a separately authorized bot deployment, verify the production
+read-model receipt reports `queue_bnl_public_history_v1`, public history still
+resolves while the current queue is private/none, and “last show” / “last three
+shows” select the expected retained dates. Confirm a known public unpaired
+Discord message appears with its original speaker and show timing, then check
+existing private rehearsal follow-ups and source-change revalidation. Local
+tests and website read validation do not establish that the VPS runs this code.
+
 ## Response responsibilities
 
 Gemini receives the selected evidence together with the current request and

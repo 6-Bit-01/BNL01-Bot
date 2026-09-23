@@ -91,6 +91,69 @@ class ShowEvidenceThroughputTests(unittest.TestCase):
         # it did not create or rewrite another show record.
         self.assertEqual(f.parent(), parent)
 
+    def test_general_show_recall_reads_unpaired_discord_and_rechecks_originals(self):
+        f = self.fixture
+        f.sync()
+        parent = f.parent()
+        query = "Recap the August 28, 2026 BARCODE Radio show."
+        original = "The courtyard lanterns flickered during the chorus."
+        edited = "The courtyard lanterns stayed steady during the chorus."
+        f.add_discord(2001, original, at="2026-08-29T00:02:00Z")
+        f.add_discord(2002, "Private rehearsal sentinel.", at="2026-08-29T00:02:00Z", policy="sealed_test")
+        f.add_discord(2003, "Outside the show sentinel.", at="2026-08-29T12:00:00Z")
+        with sqlite3.connect(f.db) as conn:
+            request = replace(f.request(), user_text=query)
+            packet = packets.build_packet(conn, request, environ=preparation.PACKET_ENV)
+            rendered = synthesis.render_packet_context(packet)[0]
+            full = shows.build_tiktok_show_evidence_context(f.db, guild_id=77, user_text=query)
+            for view in (full, rendered):
+                self.assertIn(original, view)
+                self.assertNotIn("Private rehearsal sentinel", view)
+                self.assertNotIn("Outside the show sentinel", view)
+            line = next(line for line in full.splitlines() if original in line)
+            self.assertIn('track association="Neon Fox — First Signal"', line)
+            self.assertTrue(packets.revalidate_packet(conn, packet, environ=preparation.PACKET_ENV).valid)
+            conn.execute("UPDATE conversations SET content=? WHERE id=2001", (edited,))
+            conn.commit()
+            self.assertFalse(packets.revalidate_packet(conn, packet, environ=preparation.PACKET_ENV).valid)
+            refreshed = packets.build_packet(conn, request, environ=preparation.PACKET_ENV)
+            self.assertIn(edited, synthesis.render_packet_context(refreshed)[0])
+            self.assertNotIn(original, synthesis.render_packet_context(refreshed)[0])
+            conn.execute("UPDATE conversations SET channel_policy='sealed_test' WHERE id=2001")
+            conn.commit()
+            self.assertFalse(packets.revalidate_packet(conn, refreshed, environ=preparation.PACKET_ENV).valid)
+            for view in (
+                shows.build_tiktok_show_evidence_context(f.db, guild_id=77, user_text=query),
+                synthesis.render_packet_context(packets.build_packet(conn, request, environ=preparation.PACKET_ENV))[0],
+            ):
+                self.assertNotIn(edited, view)
+                self.assertNotIn(original, view)
+        self.assertEqual(f.parent(), parent)
+
+    def test_general_recall_keeps_discord_visible_among_many_tiktok_comments(self):
+        from test_cross_source_show_recall import CrossSourceShowRecallTests
+        f = CrossSourceShowRecallTests()
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        date = f.add_show()
+        for index in range(20):
+            f.message(date, "The show chorus is strong, comment %s." % index)
+        f.sync()
+        text = "The courtyard lanterns flickered during the chorus."
+        with sqlite3.connect(f.db) as conn:
+            conn.execute("""INSERT INTO conversations VALUES
+                (2001,901,'Test Technician',77,'user',?,'2026-08-29T00:02:30Z',
+                 'public_context','show-room',9001,'normal_chat',12001)""", (text,))
+        query = "Recap the last show."
+        full = shows.build_tiktok_show_evidence_context(f.db, guild_id=77, user_text=query)
+        with sqlite3.connect(f.db) as conn:
+            compact = "\n".join(item.text for item in shows.select_tiktok_show_episode_context_items(
+                conn, guild_id=77, user_text=query,
+            ))
+        for view in (full, compact):
+            self.assertIn(text, view)
+            self.assertIn("The show chorus is strong", view)
+
 
 class SourceFenceResponsivenessTests(unittest.IsolatedAsyncioTestCase):
     async def test_final_source_read_yields_to_discord_and_retains_invalidation(self):

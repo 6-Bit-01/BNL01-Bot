@@ -173,6 +173,48 @@ class CrossSourceShowRecallTests(unittest.TestCase):
             self.assertNotIn("I brought amber lanterns for the courtyard.", context)
             self.assertIn("The amber lanterns are beside the doorway.", context)
 
+    def test_last_show_cannot_be_replaced_by_an_older_topic_match(self):
+        older = self.add_show()
+        self.message(older, "The amber lanterns are amber lanterns from the amber lantern festival.")
+        newer = self.add_show("2026-09-04", "2026-09-05")
+        self.message(newer, "Thanks for the welcome tonight.")
+        self.sync()
+        contexts, selection = self.contexts("Recap the last show, including the amber lanterns.")
+        self.assertEqual([item[0] for item in selection["source_refs"]], ["test-show-2026-09-04"])
+        for context in contexts:
+            self.assertIn("2026-09-04", context)
+            self.assertNotIn("2026-08-28", context)
+            self.assertNotIn("amber lantern festival", context)
+
+    def test_last_three_shows_uses_exact_recent_window_before_topic_ranking(self):
+        dates = ("2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28")
+        for index, date in enumerate(dates):
+            next_date = "2026-08-%02d" % (26 + index)
+            self.add_show(date, next_date)
+            self.message(next_date, "amber lantern festival" if index == 0 else "Thanks for the welcome.")
+        self.sync()
+        for count in ("three", "3"):
+            contexts, selection = self.contexts("Recap the last %s shows and the amber lantern festival." % count)
+            self.assertEqual({item[0] for item in selection["source_refs"]}, {
+                "test-show-" + date for date in dates[1:]
+            })
+            for context in contexts:
+                self.assertNotIn("2026-08-25", context)
+                for date in dates[1:]:
+                    self.assertIn(date, context)
+
+    def test_explicit_date_wins_over_relative_show_words(self):
+        older = self.add_show()
+        self.message(older, "The amber lanterns are bright.")
+        newer = self.add_show("2026-09-04", "2026-09-05")
+        self.message(newer, "Thanks for the welcome.")
+        self.sync()
+        contexts, selection = self.contexts("Recap the last show on August 28, 2026.")
+        self.assertEqual([item[0] for item in selection["source_refs"]], ["test-show-2026-08-28"])
+        for context in contexts:
+            self.assertIn("2026-08-28", context)
+            self.assertNotIn("2026-09-04", context)
+
     def test_other_person_topic_does_not_nominate_requested_person(self):
         date = self.add_show()
         self.message(date, "Thanks for the welcome.")

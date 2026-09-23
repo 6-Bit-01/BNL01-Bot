@@ -33,11 +33,20 @@ owner, controller, admin, operator, or infrastructure facts.
 
 When queue production is disabled, the contract strips queue/session/payment/availability/now-playing/up-next/active/completed track/count/Priority/Wheel/queue-derived artist fields, including the complete `artistMemory` section. It also filters `operatorLanes` by provenance: queue-public snapshots and queue/session/track/payment/priority/wheel-derived entries are removed from temporary runtime context, recap candidates, broadcast-memory candidates, dossier seed candidates, and public-safe copy candidates. Non-queue public dossier material and non-queue boundary/do-not-store rules remain available.
 
-Queue production remains disabled unless both gates are explicit: local `BNL_QUEUE_PRODUCTION_ENABLED=true` and website `capabilities.queueProduction=true`. Queue use then follows exactly three website scopes:
+Queue production remains disabled unless both gates are explicit: local `BNL_QUEUE_PRODUCTION_ENABLED=true` and website `capabilities.queueProduction=true`. Current queue and legacy archive use then follows exactly three website scopes:
 
 - `none`: no queue/history data is usable;
 - `private`: queue/history data is usable only in `sealed_test` and `internal_controlled`;
 - `public`: queue/history data is usable in public consumers.
+
+Since website schema 1.11, `sections.publicHistory` has its own public authority
+under `queue_bnl_public_history_v1`. The existing show owner validates that
+section's public, read-only, available policy, source/schema pair, revision,
+canonical content digest, and both production gates. Eligible public shows
+remain usable when the current queue is private or unavailable. That section
+does not authorize current queue access or include private rehearsal records.
+The legacy archive is considered only when `publicHistory` is absent; an
+explicitly unavailable or invalid new section never falls back to it.
 
 Missing, contradictory, or malformed scope/`publicOnly` combinations fail closed. Public and show-day consumers cannot receive private queue data, and Broadcast Memory, dossier, Source File, Relay, Journal, or any other persistence/publication path cannot retain it. Membership in the permission-locked `sealed_test` and `internal_controlled` channels is the requester authorization boundary for this context; access may be granted to explicitly admitted rehearsal testers and operators, while ordinary server members remain excluded. The bot does not impose a second owner-only check after Discord access has already been restricted. An approved private channel may answer an admitted participant from private queue context, including a transient test recap, but the prompt carries an explicit instruction not to use that data in public output and remains non-persistent. In `#bnl-testing`, a queue question creates a response obligation without requiring the participant to be an owner, admin, or mod.
 
