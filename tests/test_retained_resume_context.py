@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
@@ -37,7 +38,7 @@ class RetainedResumeContextTests(unittest.TestCase):
         db_patch = mock.patch.object(self.bot, "DB_FILE", self.db_file)
         db_patch.start()
         self.addCleanup(db_patch.stop)
-        self.now = datetime.now(timezone.utc)
+        self.now = getattr(self, 'now', datetime.now(timezone.utc))
         self.conn = sqlite3.connect(self.db_file)
         self.addCleanup(self.conn.close)
         ledger.ensure_memory_ledger_schema(self.conn)
@@ -126,7 +127,7 @@ class RetainedResumeContextTests(unittest.TestCase):
     def test_explicit_date_selects_the_matching_retained_occurrence(self):
         self.seed(200, self.now - timedelta(minutes=15))
         self.conn.commit()
-        earlier = self.now - timedelta(days=2)
+        earlier = (self.now - timedelta(days=2)).astimezone(ZoneInfo('America/Los_Angeles'))
         for day in (earlier.strftime('%Y-%m-%d'), earlier.strftime('%B %d')):
             with self.subTest(day=day):
                 text, result = self.context(current_texts=(QUERY + ' From ' + day + '.',))

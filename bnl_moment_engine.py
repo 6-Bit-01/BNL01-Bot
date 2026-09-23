@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
 from bnl_conversation_context_v2 import (
@@ -52,6 +53,7 @@ MOMENT_MEANING_VERSION = "moment_meaning_v2"
 MOMENT_MEANING_PREFIX = "Derived moment gist (source-grounded): "
 MOMENT_MEANING_MAX_SOURCE_CHARS = 12000
 MOMENT_MEANING_MAX_SOURCES = 32
+_PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 SITUATION_EPISODE_READ_VERSION = "situation_episode_read_v1"
 EPISODE_EVENT_TYPES = (
     "action",
@@ -5337,23 +5339,40 @@ _RESUME_NAMED_DATE_RE = re.compile(
 
 def resume_date_scope_requested(text: str) -> bool:
     return bool(_RESUME_ISO_DATE_RE.search(text) or _RESUME_NAMED_DATE_RE.search(text)
-                or re.search(r"\byesterday\b", text, flags=re.I))
+                or re.search(r"\b(?:yesterday|last night)\b", text, flags=re.I))
 
 
-def _resume_date_matches(text: str, observed_at: str, now: str) -> bool:
-    """Respect dated transcript requests in the stored UTC conversation clock."""
+def _resume_date_matches(text: str, observed_at: str, now: str, *, started_at: str = "") -> bool:
+    """Match the exchange's calendar interval, never its later derivation time.
 
-    observed = _parse_ts(observed_at).astimezone(timezone.utc).date()
-    dates = [(int(year), int(month), int(day)) for year, month, day in
-             _RESUME_ISO_DATE_RE.findall(text)]
-    for match in _RESUME_NAMED_DATE_RE.finditer(text):
-        month, day, year = match.groups()
-        dates.append((int(year) if year else observed.year, _RESUME_MONTH_NAMES[month.casefold()], int(day)))
-    if dates:
-        return (observed.year, observed.month, observed.day) in dates
-    if re.search(r"\byesterday\b", text, flags=re.I):
-        return observed == (_parse_ts(now).astimezone(timezone.utc) - timedelta(days=1)).date()
-    return True
+    Stored naive timestamps are UTC. Conversational dates use Pacific unless
+    the request explicitly says UTC. Invalid dated sources do not become now.
+    """
+    if not resume_date_scope_requested(text):
+        return True
+    zone = timezone.utc if re.search(r"\bUTC\b", text, re.I) else _PACIFIC_TZ
+    def local_date(value):
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(zone).date()
+    try:
+        end = local_date(observed_at)
+        start = local_date(started_at or observed_at)
+        if start > end:
+            return False
+        dates = [datetime(int(year), int(month), int(day)).date()
+                 for year, month, day in _RESUME_ISO_DATE_RE.findall(text)]
+        for match in _RESUME_NAMED_DATE_RE.finditer(text):
+            month, day, year = match.groups()
+            years = (int(year),) if year else tuple({start.year, end.year})
+            dates.extend(datetime(value, _RESUME_MONTH_NAMES[month.casefold()], int(day)).date()
+                         for value in years)
+        if not dates:
+            reference = local_date(now)
+            dates = [reference - timedelta(days=1)
+                     if re.search(r"\b(?:yesterday|last night)\b", text, re.I) else reference]
+        return any(start <= requested <= end for requested in dates)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def resume_moment_conversation_sources(
@@ -5367,6 +5386,7 @@ def resume_moment_conversation_sources(
     participant_key: str,
     now: str | None = None,
     expected_moment_ids: tuple[str, ...] = (),
+    date_reference_at: str = "",
 ) -> tuple[tuple[str, ...], tuple[int, ...]]:
     """Resolve retained transcript references for Context v2, without writes.
 
@@ -5406,7 +5426,8 @@ def resume_moment_conversation_sources(
         if (basis["guild_id"] != guild_id or basis["channel_id"] != channel_id
                 or basis["channel_policy"] != channel_policy or basis["route_mode"] != route_mode
                 or not 0 <= age <= EPISODE_REOPEN_SECONDS
-                or not _resume_date_matches(topic_text, basis["last_activity_at"], current_time)
+                or not _resume_date_matches(topic_text, basis["last_activity_at"],
+                    date_reference_at or current_time, started_at=basis["window_started_at"])
                 or not _human_participant_present(conn, moment_id, participant_key)
                 or not signature or not _coherent(family, signature,
                     basis["topic_family"], basis["topic_signature"])):
@@ -5772,6 +5793,7 @@ def select_public_participant_moment_gists(
     freshness_days: int = 3650,
     allowed_channel_policies: tuple[str, ...] = (),
     max_results: int = 4,
+    now: str | None = None,
 ) -> tuple[PublicParticipantMomentGist, ...]:
     """Return source-revalidated participant gists for governed recall.
 
@@ -5803,15 +5825,14 @@ def select_public_participant_moment_gists(
     signature = _topic_signature(relevance_text, "conversation")
     if not broad_recall and not signature:
         return ()
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=max(1, freshness_days))
-    ).isoformat()
+    reference_at = now or _now()
+    cutoff = (_parse_ts(reference_at) - timedelta(days=max(1, freshness_days))).isoformat()
     placeholders = ",".join("?" for _ in policies)
     rows = conn.execute(
         f"""
         SELECT moment_id,summary,topic_family,topic_signature,visibility,
                last_activity_at,salience,channel_id,channel_policy,route_mode,
-               canonical_ledger_entry_id
+               canonical_ledger_entry_id,window_started_at
         FROM memory_moment_windows
         WHERE guild_id=? AND channel_policy IN ({placeholders})
           AND route_mode IN (
@@ -5829,6 +5850,9 @@ def select_public_participant_moment_gists(
     used_words = 0
     for row in rows:
         moment_id = str(row[0] or "")
+        if not _resume_date_matches(topic_text, str(row[5] or ""), reference_at,
+                                    started_at=str(row[11] or "")):
+            continue
         visibility = str(row[4] or "unknown")
         window_signature = _recall_signature(str(row[3] or "[]"), str(row[1] or ""))
         if visibility not in {"public", "public_safe"}:
@@ -5920,6 +5944,8 @@ def select_public_situation_moment_gists(
     allowed_channel_policies: tuple[str, ...] = (),
     max_results: int = 6,
     require_topic_overlap: bool = False,
+    now: str | None = None,
+    apply_date_scope: bool = True,
 ) -> tuple[PublicSituationMomentGist, ...]:
     """Return bounded source-revalidated Moment summaries for event queries.
 
@@ -5946,15 +5972,14 @@ def select_public_situation_moment_gists(
     signature = _topic_signature(relevance_text, "conversation")
     if not broad_recall and not signature:
         return ()
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=max(1, freshness_days))
-    ).isoformat()
+    reference_at = now or _now()
+    cutoff = (_parse_ts(reference_at) - timedelta(days=max(1, freshness_days))).isoformat()
     placeholders = ",".join("?" for _ in policies)
     rows = conn.execute(
         f"""
         SELECT moment_id,summary,topic_family,topic_signature,visibility,
                last_activity_at,salience,channel_id,channel_policy,route_mode,
-               canonical_ledger_entry_id
+               canonical_ledger_entry_id,window_started_at
         FROM memory_moment_windows
         WHERE guild_id=? AND channel_policy IN ({placeholders})
           AND route_mode IN (
@@ -5974,6 +5999,9 @@ def select_public_situation_moment_gists(
         if require_topic_overlap and len(selected) >= max(1, int(max_results or 0)):
             break
         moment_id = str(row[0] or "")
+        if apply_date_scope and not _resume_date_matches(topic_text, str(row[5] or ""), reference_at,
+                                    started_at=str(row[11] or "")):
+            continue
         summary = re.sub(r"\s+", " ", str(row[1] or "")).strip()
         visibility = str(row[4] or "unknown")
         window_signature = _recall_signature(str(row[3] or "[]"), summary)
@@ -6137,6 +6165,7 @@ def select_situation_aware_episode_gists(
     allowed_channel_policies: tuple[str, ...] = (),
     max_results: int = 4,
     topic_association: bool = False,
+    now: str | None = None,
 ) -> tuple[SituationAwareEpisodeGist, ...]:
     """Apply one frame to existing Moment/episode projections, read-only."""
 
@@ -6164,6 +6193,7 @@ def select_situation_aware_episode_gists(
             freshness_days=3650,
             allowed_channel_policies=allowed_channel_policies,
             max_results=12,
+            now=now,
         ):
             source_rows.append(
                 {
@@ -6189,6 +6219,8 @@ def select_situation_aware_episode_gists(
             allowed_channel_policies=allowed_channel_policies,
             max_results=max_results if topic_association else 12,
             require_topic_overlap=topic_association,
+            now=now,
+            apply_date_scope=not topic_association,
         ):
             source_rows.append(
                 {
@@ -6349,12 +6381,14 @@ def render_shadow_moment_context(
     allow_cross_channel: bool = False,
     allowed_channel_policies: tuple[str, ...] = (),
     attribution_target_key: str = "",
+    now: str | None = None,
 ) -> str:
     ensure_moment_schema(conn)
     attribution = _parse_attribution_request(topic_text)
     if attribution.exact_authority_requested:
         return ""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=freshness_days)).isoformat()
+    reference_at = now or _now()
+    cutoff = (_parse_ts(reference_at) - timedelta(days=freshness_days)).isoformat()
     relevance_text = (
         attribution.topic_text
         if attribution.requested
@@ -6396,7 +6430,7 @@ def render_shadow_moment_context(
         f"""
         SELECT moment_id,summary,topic_family,topic_signature,visibility,
                last_activity_at,salience,channel_id,channel_policy,route_mode,
-               canonical_ledger_entry_id
+               canonical_ledger_entry_id,window_started_at
         FROM memory_moment_windows
         WHERE {scope_sql} AND lifecycle_status='finalized'
           AND public_usable=1 AND last_activity_at>=?
@@ -6406,6 +6440,9 @@ def render_shadow_moment_context(
     ).fetchall()
     renderable_rows: list[tuple[Any, ...]] = []
     for row in candidate_rows:
+        if not _resume_date_matches(topic_text, str(row[5] or ""), reference_at,
+                                    started_at=str(row[11] or "")):
+            continue
         if VIS_RANK.get(row[4], 5) > VIS_RANK.get(visibility, 0):
             continue
         if (
@@ -6521,6 +6558,13 @@ def render_shadow_moment_context(
                 # member contributed. Only inject a concrete, source-checked
                 # participant gist on the scoped canary path.
                 continue
+        try:
+            stamp = datetime.fromisoformat(str(row[5]).replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            line += " Conversation last activity " + stamp.astimezone(_PACIFIC_TZ).isoformat(timespec="seconds") + " (Pacific)."
+        except (TypeError, ValueError, OverflowError):
+            pass
         words = line.split()
         if used + len(words) > token_budget:
             if attribution.requested:
