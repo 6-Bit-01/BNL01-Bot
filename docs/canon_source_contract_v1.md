@@ -29,6 +29,14 @@ owner, controller, admin, operator, or infrastructure facts.
 
 ## Central sanitized read-model boundary
 
+The feed uses one request with a 15-second socket timeout. The existing 20-second
+snapshot freshness window still starts before that request, including time spent
+waiting and reading; it is never renewed by a failed refresh. Success logs include
+header latency, elapsed time, and response bytes. Transport and decoding errors
+log phase, elapsed time, and exception type, without URLs, keys, or response bodies.
+The September 23 VPS checks received valid schema 1.11 public history in 9.02 and
+9.18 seconds, with headers arriving after the previous eight-second timeout.
+
 `fetch_bnl_read_model()` sends the existing `BNL_API_KEY` when configured and may retain the raw validated payload in its private cache for capability checks, cache metadata, and privacy-safe diagnostics. It accepts either the original/explicit public response (`publicOnly=true`, scope absent/`public`/`none`) or an authenticated private response (`publicOnly=false`, `accessScope=private`). A private response is rejected when the service key is not configured. Normal consumers use the channel-scoped sanitized consumption view before prompt assembly or intent dispatch.
 
 When queue production is disabled, the contract strips queue/session/payment/availability/now-playing/up-next/active/completed track/count/Priority/Wheel/queue-derived artist fields, including the complete `artistMemory` section. It also filters `operatorLanes` by provenance: queue-public snapshots and queue/session/track/payment/priority/wheel-derived entries are removed from temporary runtime context, recap candidates, broadcast-memory candidates, dossier seed candidates, and public-safe copy candidates. Non-queue public dossier material and non-queue boundary/do-not-store rules remain available.
