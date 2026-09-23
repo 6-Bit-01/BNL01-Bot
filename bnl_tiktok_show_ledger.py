@@ -2401,7 +2401,9 @@ def _load_show_related_sources(
     values = sorted(records.values(), key=lambda r: (r["occurredAtMs"], r["eventId"]))
     for record in values:
         text = record["text"]
-        record["explicitShowDates"] = requested_show_dates(text) if has_explicit_show_date(text) else ()
+        record["explicitShowDates"] = requested_show_dates(
+            text, now=datetime.fromtimestamp(record["occurredAtMs"] / 1000, timezone.utc),
+        ) if has_explicit_show_date(text) else ()
     coverage["complete"] = not (coverage["limited"] or coverage["unavailable"] or coverage["invalid"])
     coverage["recordsRead"] = len(values)
     return values, coverage
@@ -2457,8 +2459,9 @@ def _show_preparation_view(
                    AND lineage_type IN ('correction_of','supersedes','retracts')""", (guild_id, entry_id),
             ).fetchone():
                 continue
-        records.append({**stored, "explicitShowDates": requested_show_dates(stored["text"])
-                        if has_explicit_show_date(stored["text"]) else ()})
+        records.append({**stored, "explicitShowDates": requested_show_dates(
+            stored["text"], now=datetime.fromtimestamp(stored["occurredAtMs"] / 1000, timezone.utc),
+        ) if has_explicit_show_date(stored["text"]) else ()})
         retained_count += 1
     show_key = str(ledger.get("showKey") or "")
     session_id = str(ledger.get("sessionId") or (show_key if not show_key.startswith("show:") else ""))
@@ -2970,7 +2973,10 @@ def _ranked_show_ledgers(
                       r"(?<![\w-])" + re.escape(str(row["showKey"])) + r"(?![\w-])", user_text)}
     if exact_keys:
         loaded = [row for row in loaded if row.get("showKey") in exact_keys]
-    requested_dates = requested_show_dates(user_text, now=now)
+    requested_dates = requested_show_dates(
+        user_text, now=now,
+        available_show_dates=tuple(str((row.get("ledger") or {}).get("showDate") or "") for row in loaded),
+    )
     if has_explicit_show_date(user_text) and not requested_dates:
         return []
     recent_count = requested_recent_show_count(user_text) if not exact_keys else None
@@ -4105,6 +4111,11 @@ def build_tiktok_show_evidence_context(
             or str(ledger.get("showKey") or "") in pinned_show_keys
         ):
             ledgers.append(ledger)
+    requested_dates = (
+        requested_show_dates(date_query, available_show_dates=tuple(
+            str(ledger.get("showDate") or "") for ledger in ledgers
+        )) if has_explicit_show_date(date_query) else requested_dates
+    )
     current_named = _named_recall_participants(ledgers, user_text)
     if not image_scopes and _general_participant_recall(user_text, current_named):
         # A new named-person request owns its undated scope. An earlier recap
@@ -4113,8 +4124,8 @@ def build_tiktok_show_evidence_context(
         requested_dates = ()
         date_query = selection_query
         candidate_context = False
-    if has_explicit_show_date(date_query) and not requested_show_dates(date_query):
-        return unavailable_context("the requested show date is invalid")
+    if has_explicit_show_date(date_query) and not requested_dates:
+        return unavailable_context("the requested show date is invalid or unresolved across retained years")
     named_subject_refs = _named_recall_subject_refs(ledgers, selection_query)
     exact_show_keys = {str(ledger["showKey"]) for ledger in ledgers
                       if re.search(r"(?<![\w-])" + re.escape(str(ledger["showKey"]))

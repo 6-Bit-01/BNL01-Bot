@@ -21,7 +21,14 @@ whether the model used an allowed phrase.
 - A public-only basis cannot gain requester-specific scope during refresh.
 - Website archive selection and finalized episode selection share the same
   show-date resolver. ISO dates and named calendar dates identify the same
-  records. Every distinct valid explicit date remains available to the
+  records. Month/day references such as “September 4th”, “Sept. 4”, and
+  “4 September” resolve against the authorized source catalog. A unique
+  retained occurrence supplies its year; otherwise the current Pacific year
+  is the default when available or when there are no matching records.
+  Multiple retained years without a current-year match stay unresolved.
+  Original preparation messages use their own timestamp's year, so reading
+  them later cannot re-date their show references.
+  Every distinct valid explicit date remains available to the
   existing bounded selectors; comparison requests are not reduced to their
   first date. Within the existing bounds, each requested date gets a source
   before additional sessions on the same date. The website adapter reads each
@@ -34,6 +41,13 @@ whether the model used an allowed phrase.
   wording and a website snapshot's date. An unavailable requested show or an
   invalid calendar date cannot silently select the latest show. Source refresh
   preserves that scope.
+- A dated recap's queue events belong to that episode. Mentioning the queue
+  or its historical open/closed state does not add another show's current
+  snapshot. A separate present queue question may include both sources under
+  their own dates and existing permissions. When no timeline is selected, the
+  prompt identifies the available dates and the selection miss; it does not
+  claim that BNL has no retained history. These are retrieval changes, with
+  no new generation call, response gate, or memory owner.
 - Follow-up retrieval reuses the same TikTok intent check as initial source
   admission, before a current-show date is available. All dates selected by
   the website adapter pass to the finalized ledger. When Conversation Context

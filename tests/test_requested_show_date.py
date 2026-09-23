@@ -48,6 +48,52 @@ def two_show_archive():
 
 
 class RequestedShowDateTests(unittest.TestCase):
+    def test_yearless_month_day_uses_available_sources_then_current_pacific_year(self):
+        dates = ("2026-08-28", "2026-09-04", "2026-09-11", "2026-09-18")
+        for text in ("September 4th", "September 4", "Sept. 4", "Sep 4th", "4th September"):
+            with self.subTest(text=text):
+                query = "Recap the " + text + " BARCODE Radio show."
+                self.assertTrue(has_explicit_show_date(query))
+                self.assertEqual(requested_show_dates(query, now="2026-09-23T00:00:00Z"), ("2026-09-04",))
+                self.assertEqual(requested_show_dates(
+                    query, available_show_dates=dates, now="2040-01-01T00:00:00Z",
+                ), ("2026-09-04",))
+                self.assertFalse(is_live_show_reaction_query(
+                    query + " Include TikTok chat.", current_show_date="2026-09-18",
+                ))
+        for dates in ((), ("2026-09-18",), ("2025-09-04", "2026-09-04")):
+            self.assertEqual(requested_show_dates(
+                "September 4th show", available_show_dates=dates, now="2026-09-23T00:00:00Z",
+            ), ("2026-09-04",))
+        self.assertEqual(requested_show_dates(
+            "September 4th show", available_show_dates=("2026-09-04", "2026-09-04"),
+        ), ("2026-09-04",))
+        self.assertEqual(requested_show_dates(
+            "Compare August 28th and September 4th shows.",
+            available_show_dates=("2024-09-04", "2025-09-04", "2026-08-28"),
+            now="2026-09-23T00:00:00Z",
+        ), ("2026-08-28",))  # The ambiguous September reference cannot choose a year.
+
+    def test_yearless_archive_date_cannot_fall_through_to_latest_or_live_show(self):
+        archive = two_show_archive()
+        for text in ("August 28th", "28 August", "Aug. 28"):
+            self.assertEqual(select_show_for_tiktok_analysis(
+                archive, "Recap the " + text + " show with TikTok chat.",
+            )[0]["showDate"], "2026-08-28")
+        for text in ("August 21st", "February 30th"):
+            self.assertEqual(select_show_for_tiktok_analysis(
+                archive, "Recap the " + text + " show with TikTok chat.",
+            ), ({}, "none"))
+        older_year = dict(archive["shows"][-1], sessionId="previous-year", showDate="2025-08-28")
+        archive["shows"].append(older_year)
+        self.assertEqual(select_show_for_tiktok_analysis(
+            archive, "Recap the August 28th show.", now="2026-09-23T00:00:00Z",
+        )[0]["showDate"], "2026-08-28")
+        self.assertEqual(select_show_for_tiktok_analysis(
+            archive, "Recap the August 28th show.", now="2027-09-23T00:00:00Z",
+        ), ({}, "none"))
+        self.assertEqual(select_show_for_tiktok_analysis(archive, "Recap the August 28th, 2026 show.")[0]["showDate"], "2026-08-28")
+
     def test_month_names_ordinals_and_iso_resolve_to_same_calendar_date(self):
         for date_text in (
             "2026-08-28", "2026-8-28", "August 28, 2026", "August 28 2026",
@@ -136,7 +182,8 @@ class RequestedShowDateTests(unittest.TestCase):
 
     def test_archive_selection_matches_named_and_iso_dates_without_latest_substitution(self):
         archive = two_show_archive()
-        for query in (ACCEPTANCE_QUERY, ACCEPTANCE_QUERY.replace("August 28, 2026", "2026-08-28")):
+        for query in (ACCEPTANCE_QUERY, ACCEPTANCE_QUERY.replace("August 28, 2026", "2026-08-28"),
+                      ACCEPTANCE_QUERY.replace("August 28, 2026", "August 28th")):
             show, _ = select_show_for_tiktok_analysis(archive, query)
             self.assertEqual(show["showDate"], "2026-08-28")
         for date_text in ("August 21, 2026", "2026-08-21", "February 30, 2026"):
@@ -204,7 +251,8 @@ class RequestedShowEvidenceTests(unittest.TestCase):
 
     def test_exact_acceptance_wording_gets_same_original_evidence_as_iso_date(self):
         contexts = []
-        for query in (ACCEPTANCE_QUERY, ACCEPTANCE_QUERY.replace("August 28, 2026", "2026-08-28")):
+        for query in (ACCEPTANCE_QUERY, ACCEPTANCE_QUERY.replace("August 28, 2026", "2026-08-28"),
+                      ACCEPTANCE_QUERY.replace("August 28, 2026", "August 28th")):
             selected = {}
             contexts.append(build_tiktok_show_evidence_context(
                 self.db_file, guild_id=77, user_text=query, selection_out=selected,
@@ -216,12 +264,14 @@ class RequestedShowEvidenceTests(unittest.TestCase):
             self.assertTrue(items)
             self.assertTrue(all(item.show_dates == ("2026-08-28",) for item in items))
         self.assertEqual(contexts[0], contexts[1])
+        self.assertEqual(contexts[0], contexts[2])
 
     def test_both_explicit_dates_reach_ledger_and_packet_selection(self):
         for dates in (
             "August 28, 2026 and September 4, 2026",
             "2026-08-28 and 2026-09-04",
             "September 4, 2026 and 2026-08-28",
+            "August 28th and September 4th",
         ):
             with self.subTest(dates=dates):
                 query = "Compare TikTok chat across the " + dates + " shows."

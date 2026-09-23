@@ -113,6 +113,15 @@ class ShowPreparationTests(unittest.TestCase):
             self.assertFalse(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='memory_moment_windows'").fetchone())
 
+    def test_yearless_preparation_uses_the_original_message_year(self):
+        text = "For the August 28th BARCODE Radio show, the audio check passed."
+        self.add_discord(2001, text, at="2025-08-27T10:00:00Z")
+        self.add_discord(2002, text, at="2026-08-27T10:00:00Z")
+        self.sync()
+        messages = self.parent()["preparationMoment"]["messages"]
+        self.assertEqual([row["conversationRowId"] for row in messages], [2002])
+        self.assertEqual(messages[0]["associationReason"], "explicit_show_date")
+
     def test_all_captured_pre_show_chat_is_connected_without_tiktok_moment_admission(self):
         for index in range(26):
             self.add_tiktok(f"prep-{index}", f"Unaddressed room remark {index:02d}: blue curtains again.")
