@@ -346,6 +346,7 @@ from bnl_website_contract_v2 import (
 import os
 import re
 import asyncio
+import bnl_broadcast_ballads as ballad_publications
 import sqlite3
 import logging
 import random
@@ -3216,7 +3217,18 @@ def build_bnl_read_model_context(
                 show = _compact_public_text(song.get("showTitle"), 120)
                 date = _compact_public_text(song.get("showDate"), 30)
                 url = str(song.get("url") or "")
-                if title and url.startswith("https://www.barcode-network.com/radio/ballads?show="):
+                parsed_ballad_url = urllib.parse.urlparse(url)
+                canonical_ballad_link = (
+                    parsed_ballad_url.scheme == "https"
+                    and parsed_ballad_url.netloc == "www.barcode-network.com"
+                    and (
+                        (parsed_ballad_url.path == "/radio/ballads" and parsed_ballad_url.query.startswith("show="))
+                        or (parsed_ballad_url.path == "/radio/archive" and parsed_ballad_url.fragment == "broadcast-ballad"
+                            and urllib.parse.parse_qs(parsed_ballad_url.query).get("view") == ["shows"]
+                            and bool(urllib.parse.parse_qs(parsed_ballad_url.query).get("show")))
+                    )
+                )
+                if title and canonical_ballad_link:
                     lines.append(f"- BNL-01 — {title}; {show} ({date}): {url}")
 
     # Durable post-show analysis is owned by the archive/timeline block below.
@@ -5089,9 +5101,10 @@ def _relay_shared_source_failure(guild_id: int, decision: WebsiteRelayDecision) 
         if snapshot is None:
             return "relay_source_unavailable"
     try:
+        publication_snapshot = ballad_publications.publication_snapshot_for_basis(basis, _journal_website_base_url())
         with sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1) as conn:
             conn.execute("BEGIN")
-            return shared_relay_source_failure(conn, guild_id, basis, control_snapshot=snapshot)
+            return shared_relay_source_failure(conn, guild_id, basis, control_snapshot=snapshot, publication_snapshot=publication_snapshot)
     except (OSError, sqlite3.Error):
         return "relay_source_unavailable"
     except (TypeError, ValueError, KeyError):
@@ -6452,11 +6465,13 @@ def _select_shared_relay_sources(guild_id: int, cursor_value: int, highest: int,
             probe = select_published_journal_entries_on_connection(
                 conn, guild_id=guild_id, user_text=topic_text or "latest Journal",
                 control_snapshot=None, include_context=True, context_only=bool(topic_text.strip()), limit=1)
+            has_ballads = ballad_publications.has_local_versions(conn, guild_id)
         snapshot = _journal_publication_control_snapshot_sync()[0] if probe.candidate_count else None
+        publication_snapshot = ballad_publications.read_publication_catalog(_journal_website_base_url()) if has_ballads else None
         with sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1) as conn:
             conn.execute("BEGIN")
             return select_shared_relay_sources_on_connection(
-                conn, guild_id=guild_id, topic_text=topic_text, control_snapshot=snapshot,
+                conn, guild_id=guild_id, topic_text=topic_text, control_snapshot=snapshot, publication_snapshot=publication_snapshot,
                 source_cursor=cursor_value, highest=highest)
     except (OSError, sqlite3.Error, TypeError, ValueError):
         logging.warning("website_relay_shared_sources_unavailable guild=%s", guild_id)
@@ -6549,6 +6564,7 @@ def _build_source_decision_prompt(decision: RelaySourceDecision, mode: str, guil
         "Forbidden: current queue/read-model state, now-playing, up-next, payment, availability, current queue counts, #bnl-testing, private/admin/mod/research content, prior relay output, runtime inference, generic waiting/monitoring/standby/quiet-signal/bridge-active copy, usernames, channel names, direct quotes, urgency, or pressure.\n"
         "These sources are historical. Do not claim tonight, currently, live, imminent, available, on-air, or other current show state. A regular schedule cannot prove any live operational state. Recorded completed-show operations may be described with their actual date.\n"
         "Keep each original participant attached to their contribution. A person mentioned did not necessarily perform the action. Jokes and roleplay remain banter. A published Journal is BNL's earlier interpretation: identify it as a publication callback, never an independent witness or fresh activity. Repeated retellings of one event cannot establish recurrence.\n"
+        "A published Ballad establishes its release metadata only. Discuss its musical style or creative theme as a song; liner notes never prove participant conduct, show events, or canon. The publication date and linked show's date are distinct.\n"
         f"Mode: {mode}.\n"
         f"{_build_relay_lane_prompt(relay_lane, has_public_residue)}"
         f"{_relay_diversity_prompt_block(guild_id)}"

@@ -29,6 +29,7 @@ SOURCE_CLASS_MAP = {
     "public_moment": "public_safe_memory",
     "finalized_show": "public_safe_memory",
     "published_journal": "public_safe_memory",
+    "published_ballad": "public_safe_memory",
     "canon": "approved_canon",
     "reflection": "grounded_reflection",
 }

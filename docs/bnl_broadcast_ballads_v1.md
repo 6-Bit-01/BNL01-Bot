@@ -276,7 +276,9 @@ The website preserves producer story overrides for the same source version.
 The normal website context can render `sections.ballads` public release metadata:
 title, broadcast/date and the public song link. Creative lyrics never enter this
 block or corroborate show events. Unavailable releases are not inferred from older
-catalog entries. Journal/Relay writer integration is a separate unfinished scope.
+catalog entries. Journal/Relay integration is now implemented in the bounded
+published-metadata reader described in
+[the C7 handoff](published-ballad-editorial-inputs-2026-09-23.md).
 
 Deploy this bot change before the paired workspace. No migration, provider, budget,
 settings, gate or public action is needed. Existing clients work with this version.
