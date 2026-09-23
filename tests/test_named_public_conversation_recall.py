@@ -146,7 +146,12 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
     def test_subject_labels_and_speech_function_words_are_not_topic_evidence(self):
         self.seed(text="TestMarbles said the studio looks lovely.")
         self.assertEqual(self.read(), ("", None))
-        self.assertEqual(self.read(text="What has TestMarbles said?"), ("", None))
+
+    def test_broad_member_recall_does_not_require_an_unrelated_topic_keyword(self):
+        self.seed(text="The studio looks lovely.")
+        context, basis = self.read(text="What has TestMarbles said?")
+        self.assertIn("The studio looks lovely.", context)
+        self.assertEqual(basis.source_row_ids, (1,))
 
     def test_ambiguous_unbound_and_owner_subjects_do_not_read_rows(self):
         self.seed()
@@ -168,6 +173,16 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
             self.assertEqual(basis.source_row_ids, (1,))
             self.assertIn(STATEMENT, context)
         self.assertEqual(self.read(text=QUERY + " February 30, 2026"), ("", None))
+
+    def test_date_only_member_recall_filters_event_time_without_requiring_date_in_message(self):
+        self.seed()
+        self.seed(2, timestamp="2026-09-19T03:00:00+00:00", text="A more recent studio update.")
+        for date in ("August 28, 2026", "2026-08-28"):
+            with self.subTest(date=date):
+                context, basis = self.read(text="Give me a public Discord comment from TestMarbles on " + date + ".")
+                self.assertIsNotNone(basis)
+                self.assertEqual(basis.source_row_ids, (1,))
+                self.assertIn(STATEMENT, context)
 
     def test_read_is_snapshot_only_and_does_not_create_missing_database(self):
         self.seed()

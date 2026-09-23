@@ -42,6 +42,7 @@ from bnl_tiktok_live_context import (
     build_live_prompt_context,
     classify_tiktok_show_analysis_intent,
     has_explicit_show_date,
+    strip_explicit_show_dates,
     is_live_show_reaction_query,
     is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query,
@@ -8871,6 +8872,7 @@ def get_memory_tiers(
     guild_id: int,
     *,
     connection: sqlite3.Connection | None = None,
+    respect_source_controls: bool = False,
 ):
     conn = connection or sqlite3.connect(DB_FILE)
     owns_connection = connection is None
@@ -8881,7 +8883,7 @@ def get_memory_tiers(
         wanted += [c for c in ("topic_key", "subject_key", "project_key", "first_seen", "last_seen", "lifecycle_note") if c in cols]
         cursor.execute(
             f"""
-            SELECT {', '.join(wanted)}
+            SELECT {'id,' if respect_source_controls else ''}{', '.join(wanted)}
             FROM memory_tiers
             WHERE user_id = ? AND guild_id = ?
             ORDER BY
@@ -8890,7 +8892,14 @@ def get_memory_tiers(
             """,
             (user_id, guild_id),
         )
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        if respect_source_controls:
+            _digest, blocked = _public_conversation_recall_controls(
+                conn, guild_id=guild_id, source_table="memory_tiers",
+                source_users={int(row[0]): int(user_id) for row in rows},
+            )
+            return [row[1:] for row in rows if int(row[0]) not in blocked]
+        return rows
     except sqlite3.DatabaseError:
         if owns_connection:
             raise
@@ -27208,6 +27217,7 @@ def build_user_memory_context(
     environ: dict[str, str] | None = None,
     record_operational_diagnostics: bool = True,
     read_only: bool = False,
+    member_recall_query: str | None = None,
 ) -> str:
     env = os.environ if environ is None else environ
 
@@ -27296,6 +27306,7 @@ def build_user_memory_context(
         user_id,
         guild_id,
         connection=connection,
+        respect_source_controls=limits["visibility"] == "public_safe",
     )
     if source_metadata is not None:
         source_metadata.update(
@@ -27453,19 +27464,27 @@ def build_user_memory_context(
             else:
                 diagnostics["skipped"]["visibility_boundary"] += 1
         topic = limits["topic_key"]
-        if user_text and topic == "general" and not any(k in (user_text or "").lower() for k in ("remember", "source file", "dossier", "project", "queue", "memory")):
+        if member_recall_query is None and user_text and topic == "general" and not any(k in (user_text or "").lower() for k in ("remember", "source file", "dossier", "project", "queue", "memory")):
             visible_rows = [r for r in visible_rows if r[0] == "long" and float(r[2] or 0) >= 0.8]
             diagnostics["skipped"]["simple_or_new_topic_relevance"] += max(0, len(tier_rows) - len(visible_rows))
-        query_relevance = _memory_query_relevance((r[1] for r in visible_rows), user_text)
+        memory_query = user_text if member_recall_query is None else member_recall_query
+        query_relevance = _memory_query_relevance((r[1] for r in visible_rows), memory_query)
         ranked = sorted(
             visible_rows,
             key=lambda r: (
                 query_relevance.get(str(r[1] or ""), 0.0),
-                _memory_row_relevance(r, topic, user_text),
+                _memory_row_relevance(r, topic, memory_query),
                 r[0] == "short",
             ),
             reverse=True,
         )
+        if member_recall_query is not None:
+            # A broad member request may need several ages of memory. Rotate
+            # tiers for equal relevance; a matching older topic still wins.
+            buckets = [[r for r in ranked if r[0] == tier] for tier in ("short", "medium", "long")]
+            ranked = [bucket[i] for i in range(max(map(len, buckets), default=0))
+                      for bucket in buckets if i < len(bucket)]
+            ranked.sort(key=lambda r: query_relevance.get(str(r[1] or ""), 0.0), reverse=True)
         tier_limits = {"short": 6 if limits["visibility"] == "public_safe" else 10, "medium": 4 if limits["visibility"] == "public_safe" else 8, "long": 3 if limits["visibility"] == "public_safe" else 6}
         selected = {"short": [], "medium": [], "long": []}
         used = 0
@@ -27948,6 +27967,7 @@ class MemoryPromptSourceBasis:
     source_safe_recall_synthesis: bool = False
     member_budget_chars: int = 0
     member_speaker_label: str = ""
+    member_recall_query: str | None = None
 
 
 @dataclass(frozen=True)
@@ -28050,21 +28070,13 @@ def _public_conversation_recall_controls(
     return digest, frozenset(blocked)
 
 
-def build_named_public_conversation_context(
+def _named_public_recall_scope(
     *, situation_frame: SituationFrameV1 | None, guild_id: int,
     route_mode: str, channel_policy: str, user_text: str,
-    channel_id: int = 0, channel_name: str = "",
     conversation_basis=None,
     conversation_context_result: ConversationContextResult | None = None,
-) -> tuple[str, ConversationPromptSourceBasis | None]:
-    """Read topic-relevant original public messages for frozen member targets.
-
-    This is historical source selection under the existing conversation owner,
-    separate from its immediate-room continuity window. A frame supplies stable
-    subject IDs; stored author labels and original rows supply the evidence.
-    """
-    from bnl_conversation_context_v2 import _unsafe_row
-
+):
+    """Share the frozen person/topic between originals and durable memory."""
     if (
         not isinstance(situation_frame, SituationFrameV1)
         or not situation_frame.route_allowed
@@ -28075,7 +28087,7 @@ def build_named_public_conversation_context(
         or channel_policy not in PUBLIC_CHAT_POLICIES | {"sealed_test"}
         or int(guild_id or 0) <= 0
     ):
-        return "", None
+        return (), user_text, ""
     subjects = tuple(
         subject for subject in situation_frame.subjects
         if int(subject.user_id or 0) > 0
@@ -28083,33 +28095,65 @@ def build_named_public_conversation_context(
         and subject.binding_method == "existing_typed_target"
         and subject.confidence == "high"
     )
-    subject_ids = tuple(dict.fromkeys(int(s.user_id) for s in subjects))[:8]
-    if not subject_ids:
-        return "", None
+    subjects = tuple({int(s.user_id): s for s in subjects}.values())[:8]
+    if not subjects:
+        return (), user_text, ""
     if conversation_basis is not None and conversation_basis.guild_id == int(guild_id):
         user_text = _public_member_continuation_query(
             user_text, conversation_context_result, guild_id=guild_id,
             current_user_id=conversation_basis.current_user_id,
         )
-    selected_date = requested_show_date(user_text)
-    if has_explicit_show_date(user_text) and not selected_date:
-        return "", None
     label_terms = set().union(*(
         memory_relevance_terms(subject.label_hint) for subject in subjects
     ))
     query_terms = (
-        memory_relevance_terms(user_text)
+        memory_relevance_terms(strip_explicit_show_dates(user_text))
         - CONVERSATION_CONTEXT_STOPWORDS - label_terms
         - {"said", "say", "says", "saying", "tell", "told", "spoken",
-           "talk", "talked", "talking", "bnl"}
+           "talk", "talked", "talking", "bnl", "give", "show", "some",
+           "recent", "recently", "latest", "last", "older", "earlier",
+           "public", "discord", "conversation", "conversations", "involving",
+           "example", "examples", "message", "messages", "comment", "comments",
+           "quote", "quotes", "exact", "exactly", "words", "word", "their",
+           "his", "her", "switch", "prior", "human", "request"}
     )
-    if not query_terms:
+    return subjects, user_text, " ".join(sorted(query_terms))
+
+
+def build_named_public_conversation_context(
+    *, situation_frame: SituationFrameV1 | None, guild_id: int,
+    route_mode: str, channel_policy: str, user_text: str,
+    channel_id: int = 0, channel_name: str = "",
+    conversation_basis=None,
+    conversation_context_result: ConversationContextResult | None = None,
+) -> tuple[str, ConversationPromptSourceBasis | None]:
+    """Read original public messages for the resolved member and topic.
+
+    Broad person recall uses recent originals. Topic recall searches the stored
+    public history before bounding candidates, so recent unrelated chat cannot
+    hide an older match. Neither operation invents a cross-platform identity.
+    """
+    from bnl_conversation_context_v2 import _unsafe_row
+
+    subjects, user_text, query = _named_public_recall_scope(
+        situation_frame=situation_frame, guild_id=guild_id,
+        route_mode=route_mode, channel_policy=channel_policy, user_text=user_text,
+        conversation_basis=conversation_basis,
+        conversation_context_result=conversation_context_result,
+    )
+    if not subjects:
         return "", None
-    query = " ".join(sorted(query_terms))
+    selected_date = requested_show_date(user_text)
+    if has_explicit_show_date(user_text) and not selected_date:
+        return "", None
+    query_terms = memory_relevance_terms(query)
     candidates = []
     try:
         with closing(_open_member_memory_read_connection()) as conn:
             conn.execute("BEGIN")
+            conn.create_function("member_recall_match", 1, lambda content: int(
+                not query_terms or bool(query_terms & memory_relevance_terms(str(content or "")))
+            ))
             columns = {str(row[1]) for row in conn.execute(
                 "PRAGMA main.table_info(conversations)"
             )}
@@ -28127,16 +28171,22 @@ def build_named_public_conversation_context(
                 field if field in columns else "NULL AS " + field
                 for field in fields
             )
-            for subject_id in subject_ids:
+            date_clause = ""
+            date_params = ()
+            if selected_date:
+                start = datetime.fromisoformat(selected_date).replace(tzinfo=PACIFIC_TZ)
+                date_clause = " AND julianday(timestamp)>=julianday(?) AND julianday(timestamp)<julianday(?)"
+                date_params = (start.isoformat(), (start + timedelta(days=1)).isoformat())
+            for subject in subjects:
                 rows = conn.execute(
                     "SELECT " + ",".join(selections) + """
                     FROM main.conversations
                     WHERE guild_id=? AND user_id=? AND role='user'
                       AND channel_policy IN
                           ('public_home','public_context','public_selective')
-                    ORDER BY id DESC LIMIT ?
-                    """,
-                    (int(guild_id), subject_id, CONVERSATION_ROWS_PER_USER_MAX),
+                      AND member_recall_match(content)=1
+                    """ + date_clause + " ORDER BY julianday(timestamp) DESC,id DESC LIMIT ?",
+                    (int(guild_id), int(subject.user_id), *date_params, CONVERSATION_ROWS_PER_USER_MAX),
                 ).fetchall()
                 for row in rows:
                     source = dict(zip(fields, row))
@@ -28179,9 +28229,15 @@ def build_named_public_conversation_context(
         return "", None
 
     relevance = _memory_query_relevance((c[2] for c in candidates), query)
+    def observed_order(candidate):
+        try:
+            value = datetime.fromisoformat(str(candidate[0]["timestamp"]).replace("Z", "+00:00"))
+            return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
     ranked = sorted(
-        (candidate for candidate in candidates if relevance.get(candidate[2], 0) > 0),
-        key=lambda candidate: (relevance[candidate[2]], int(candidate[0]["id"])),
+        (candidate for candidate in candidates if not query or relevance.get(candidate[2], 0) > 0),
+        key=lambda candidate: (relevance.get(candidate[2], 0), observed_order(candidate), int(candidate[0]["id"])),
         reverse=True,
     )
     header = "Relevant original public Discord messages:\n"
@@ -28198,7 +28254,7 @@ def build_named_public_conversation_context(
         used += len(line) + 1
     if not selected:
         return "", None
-    selected.sort(key=lambda item: int(item[0]["id"]))
+    selected.sort(key=lambda item: (observed_order(item), int(item[0]["id"])))
     rendered = header + "\n".join(item[3] for item in selected)
     row_ids = tuple(int(item[0]["id"]) for item in selected)
     digest = _prompt_source_digest(json.dumps(
@@ -28220,6 +28276,12 @@ def build_named_public_conversation_context(
             speaker_user_id=int(source["user_id"]), speaker_label=label,
             current_turn=False,
         ) for source, label, text, _line in selected),
+    )
+    logging.info(
+        "named_public_conversation_context_loaded subject_count=%s selection=%s "
+        "query_terms=%s source_row_ids=%s chars=%s",
+        len(basis.participant_user_ids), "topic" if query else "recent",
+        len(query_terms), json.dumps(row_ids), len(rendered),
     )
     return rendered, basis
 
@@ -30155,7 +30217,7 @@ async def record_unified_response_assessment_shadow_after_send(
 
 
 _SOURCE_BEARING_MEMORY_MARKERS = (
-    "Member memory for speaker ",
+    "Member memory for ",
     "Moment-based continuity gist",
     "Approved direct self-reports:",
     "Relationship state:",
@@ -30488,6 +30550,7 @@ def build_memory_prompt_source_basis(
     source_safe_recall_synthesis: bool = False,
     member_budget_chars: int = 0,
     member_speaker_label: str = "",
+    member_recall_query: str | None = None,
 ) -> MemoryPromptSourceBasis | None:
     value = str(rendered_context or "")
     if not any(marker in value for marker in _SOURCE_BEARING_MEMORY_MARKERS):
@@ -30514,6 +30577,7 @@ def build_memory_prompt_source_basis(
         ),
         member_budget_chars=max(0, int(member_budget_chars)),
         member_speaker_label=str(member_speaker_label or ""),
+        member_recall_query=member_recall_query,
     )
 
 
@@ -30536,6 +30600,7 @@ def _batch_member_speaker_labels(items) -> dict[int, str]:
 
 def _bounded_member_memory_context(
     metadata: dict, *, speaker_label: str, budget_chars: int, user_text: str = "",
+    member_recall_query: str | None = None,
 ) -> str:
     """Budget complete reader-selected units together with their attribution."""
     ordinal, _, name = speaker_label.partition(" - ")
@@ -30544,6 +30609,8 @@ def _bounded_member_memory_context(
     # even at the existing eight-message batch limit.
     display_label = f"{ordinal} - {name[:20]}" if name else ordinal
     header = f"Member memory for {display_label}:\n"
+    if member_recall_query is not None:
+        header += "Derived memory summaries (lower-authority hints, not quote authority):\n"
     units = tuple(metadata.get("memory_context_units") or ())
     kinds = ("approved_fact", "short", "medium", "long", "governed", "moment", "relationship", "relationship_v2", "habits")
     buckets = {
@@ -30559,7 +30626,8 @@ def _bounded_member_memory_context(
         if index < len(buckets[kind])
     ]
     query_relevance = _memory_query_relevance(
-        (unit.relevance_text for unit in units if unit.relevance_text), user_text,
+        (unit.relevance_text for unit in units if unit.relevance_text),
+        user_text if member_recall_query is None else member_recall_query,
     )
     ordered.sort(
         key=lambda unit: query_relevance.get(unit.relevance_text, 0.0),
@@ -30609,6 +30677,7 @@ def _read_bounded_member_memory(
     budget_chars: int, route_mode: str, channel_policy: str,
     user_text: str, current_direct: bool, governance_allowed: bool,
     channel_id: int, connection: sqlite3.Connection | None = None,
+    member_recall_query: str | None = None,
 ) -> tuple[str, dict]:
     metadata: dict = {}
     with (nullcontext(connection) if connection is not None else
@@ -30625,10 +30694,12 @@ def _read_bounded_member_memory(
             moment_attribution_target_user_id=0, source_metadata=metadata,
             connection=conn, record_operational_diagnostics=False,
             read_only=True,
+            member_recall_query=member_recall_query,
         )
         rendered = _bounded_member_memory_context(
             metadata, speaker_label=speaker_label, budget_chars=budget_chars,
             user_text=user_text,
+            member_recall_query=member_recall_query,
         )
     return rendered, metadata
 
@@ -30638,6 +30709,69 @@ def _open_member_memory_read_connection() -> sqlite3.Connection:
     return sqlite3.connect(
         Path(DB_FILE).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25,
     )
+
+
+def build_named_public_member_memory_context(
+    *, situation_frame: SituationFrameV1 | None, guild_id: int,
+    route_mode: str, channel_policy: str, user_text: str, channel_id: int,
+    current_speaker_user_ids: tuple[int, ...] = (),
+    conversation_basis=None,
+    conversation_context_result: ConversationContextResult | None = None,
+) -> tuple[str, tuple[MemoryPromptSourceBasis, ...]]:
+    """Compose named subjects through the existing bounded public reader."""
+    subjects, selection_text, query = _named_public_recall_scope(
+        situation_frame=situation_frame, guild_id=guild_id,
+        route_mode=route_mode, channel_policy=channel_policy, user_text=user_text,
+        conversation_basis=conversation_basis,
+        conversation_context_result=conversation_context_result,
+    )
+    # Current speakers already have their own attributed memory block.
+    subjects = tuple(s for s in subjects if int(s.user_id) not in current_speaker_user_ids)
+    if not subjects or has_explicit_show_date(selection_text):
+        return "", ()
+    budget = max(0, MEMORY_PROMPT_BUDGET_PUBLIC - 2 * len(subjects)) // len(subjects)
+    if budget <= 0:
+        return "", ()
+    contexts, bases = [], []
+    selected_kinds = Counter()
+    governance_allowed = bool(memory_governance_live_enabled())
+    try:
+        with closing(_open_member_memory_read_connection()) as conn:
+            conn.execute("BEGIN")
+            for subject in subjects:
+                label = _safe_prompt_display_label(subject.label_hint, "member")
+                context, metadata = _read_bounded_member_memory(
+                    int(subject.user_id), guild_id, speaker_label=label,
+                    budget_chars=budget, route_mode=route_mode,
+                    channel_policy=channel_policy, user_text=selection_text,
+                    current_direct=False, governance_allowed=governance_allowed,
+                    channel_id=channel_id, connection=conn, member_recall_query=query,
+                )
+                basis = build_memory_prompt_source_basis(
+                    context, user_id=int(subject.user_id), guild_id=guild_id,
+                    route_mode=route_mode, channel_policy=channel_policy,
+                    user_text=selection_text, is_owner_or_mod=False,
+                    current_direct=False, governance_allowed=governance_allowed,
+                    channel_id=channel_id, moment_attribution_target_user_id=0,
+                    has_moment_gist=bool(metadata.get("moment_gist_rendered")),
+                    governed_basis_digest=str(metadata.get("governed_basis_digest") or ""),
+                    source_safe_recall_synthesis=bool(metadata.get("source_safe_recall_synthesis")),
+                    member_budget_chars=budget, member_speaker_label=label,
+                    member_recall_query=query,
+                )
+                if basis is not None:
+                    contexts.append(context)
+                    bases.append(basis)
+                    selected_kinds.update(unit.kind for unit in metadata.get("memory_context_units", ()))
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+        logging.warning("named_public_member_memory_read_failed error=%s", type(exc).__name__)
+        return "", ()
+    rendered = "\n\n".join(contexts)
+    logging.info(
+        "named_public_member_memory_context_loaded subject_count=%s source_kinds=%s chars=%s",
+        len(bases), json.dumps(dict(selected_kinds), sort_keys=True), len(rendered),
+    )
+    return rendered, tuple(bases)
 
 
 def build_batch_member_memory_context(
@@ -31180,6 +31314,7 @@ def refresh_prompt_source_basis(
                 user_text=basis.user_text, current_direct=basis.current_direct,
                 governance_allowed=basis.governance_allowed,
                 channel_id=basis.channel_id,
+                member_recall_query=basis.member_recall_query,
             )
         else:
             fresh_context = build_user_memory_context(
@@ -38933,7 +39068,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             (
                 batch_named_conversation_context,
                 batch_named_conversation_basis,
-            ) = build_named_public_conversation_context(
+            ) = await asyncio.to_thread(
+                build_named_public_conversation_context,
                 situation_frame=batch_situation_frame,
                 guild_id=guild_id,
                 route_mode=batch_route_mode,
@@ -38946,6 +39082,18 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             if batch_named_conversation_context:
                 prompt += "\n\n" + batch_named_conversation_context + "\n"
+                batch_source_context_available = True
+            batch_named_memory_context, batch_named_memory_bases = await asyncio.to_thread(
+                build_named_public_member_memory_context,
+                situation_frame=batch_situation_frame, guild_id=guild_id,
+                route_mode=batch_route_mode, channel_policy=channel_policy,
+                user_text=combined_text, channel_id=channel_id,
+                current_speaker_user_ids=tuple(unique_user_ids),
+                conversation_basis=batch_conversation_basis,
+                conversation_context_result=orchestration_state.get("context_result"),
+            )
+            if batch_named_memory_context:
+                prompt += "\n\n" + batch_named_memory_context + "\n"
                 batch_source_context_available = True
             batch_publication_packet_owns_turn = (
                 publication_packet_owns_turn(batch_situation_frame)
@@ -39192,7 +39340,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         + batch_moment_attribution_context
                         + "\n"
                     )
-            batch_prompt_source_bases: list[PromptSourceBasis] = list(batch_member_memory_bases)
+            batch_prompt_source_bases: list[PromptSourceBasis] = [
+                *batch_member_memory_bases, *batch_named_memory_bases,
+            ]
             if batch_named_conversation_basis is not None:
                 batch_prompt_source_bases.append(batch_named_conversation_basis)
             if batch_show_basis is not None:
@@ -39261,6 +39411,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 for part in (
                     recent_room_prompt,
                     batch_memory_context,
+                    batch_named_memory_context,
                     batch_moment_attribution_context,
                 )
                 if (part or "").strip()
@@ -39465,6 +39616,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             recent_room_prompt,
                             batch_named_conversation_context,
                             batch_memory_prompt_block,
+                            batch_named_memory_context,
                             (
                                 batch_unified_moment_canary_basis.rendered_context
                                 if batch_unified_moment_canary_basis is not None
@@ -39537,6 +39689,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         context
                         for context in (
                             batch_memory_context,
+                            batch_named_memory_context,
                             batch_named_conversation_context,
                             batch_tiktok_show_evidence_prompt_block,
                         )
@@ -40092,11 +40245,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_bypass_reason="none",
             deterministic_response=False,
             simple_greeting_detected=is_simple_greeting_to_bnl(combined_text),
-            memory_context_injected=bool(batch_memory_context),
-            memory_context_source_count=(
-                len(batch_member_memory_bases)
-                if batch_member_memory_bases
-                else 1 if batch_memory_context else 0
+            memory_context_injected=bool(batch_memory_context or batch_named_memory_context),
+            memory_context_source_count=sum(
+                isinstance(basis, MemoryPromptSourceBasis) for basis in batch_prompt_source_bases
             ),
             memory_injection_decision=(
                 "single_packet_owner"
@@ -42061,6 +42212,15 @@ def build_user_aware_prompt(
     )
     if named_conversation_basis is not None:
         prompt_source_bases.append(named_conversation_basis)
+    named_memory_context, named_memory_bases = build_named_public_member_memory_context(
+        situation_frame=frozen_situation_frame, guild_id=guild_id,
+        route_mode=route_mode, channel_policy=channel_policy,
+        user_text=clean_content, channel_id=channel_id,
+        current_speaker_user_ids=(int(user_id or 0),),
+        conversation_basis=conversation_prompt_basis,
+        conversation_context_result=conversation_context_result,
+    )
+    prompt_source_bases.extend(named_memory_bases)
     publication_packet_owns_current_turn = publication_packet_owns_turn(
         frozen_situation_frame
     )
@@ -42138,7 +42298,7 @@ def build_user_aware_prompt(
     )
     continuity_source_context = "\n".join(
         part
-        for part in (room_context, memory_context)
+        for part in (room_context, memory_context, named_memory_context)
         if (part or "").strip()
     )
     has_typed_moment_gist = _has_typed_moment_gist_basis(
@@ -42208,7 +42368,7 @@ def build_user_aware_prompt(
                             if source_safe_recall
                             else "legacy_memory"
                         ),
-                        memory_prompt_basis is not None,
+                        bool(memory_prompt_basis or named_memory_bases),
                     ),
                     (
                         "relationship",
@@ -42359,6 +42519,7 @@ def build_user_aware_prompt(
             context
             for context in (
                 memory_context,
+                named_memory_context,
                 named_conversation_context,
                 tiktok_show_evidence_prompt_block,
             )
@@ -42385,6 +42546,7 @@ def build_user_aware_prompt(
                 for block in (
                     room_context,
                     named_conversation_context,
+                    named_memory_context,
                     (
                         unified_moment_canary_basis.rendered_context
                         if unified_moment_canary_basis is not None
@@ -42444,6 +42606,7 @@ def build_user_aware_prompt(
             or queue_artist_memory_context
             or tiktok_show_evidence_context
             or named_conversation_context
+            or named_memory_context
             or source_context_block
         )
         prompt_metadata["queue_artist_memory_context_present"] = bool(
@@ -42632,6 +42795,7 @@ def build_user_aware_prompt(
         f"{recall_synthesis_contract}"
         f"{room_prompt_block}"
         f"{named_conversation_context}\n"
+        f"{named_memory_context}\n"
         f"{continuity_prompt_block}"
         f"{unified_moment_canary_prompt_block}"
         f"{channel_prompt_block}"
