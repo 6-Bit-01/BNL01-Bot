@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bnl_journal_source_store import record_source_event, timestamp_to_epoch_ms
@@ -16,6 +17,8 @@ MAX_SCHEDULE_CLAIMS_PER_GUILD = 4096
 RELAY_PUBLICATION_READ_VERSION = "accepted_relay_publication_read_v1"
 RELAY_PUBLICATION_TOPIC_SCAN_LIMIT = 200
 RELAY_PUBLICATION_RESULT_LIMIT = 4
+RELAY_SHARED_SOURCE_CLASSES = ("public_moment", "finalized_show", "published_journal")
+RELAY_SHARED_LOOKBACK_DAYS = 30
 STOCK_FAMILIES = {
     "waiting_standby": (
         "waiting", "standing by", "standby", "awaiting signal", "awaiting fresh", "remains online",
@@ -59,6 +62,147 @@ class WebsiteRelayDecision:
     mode: str = "OBSERVATION"
     relayLane: str = "current_signal"
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def select_shared_relay_sources_on_connection(
+    conn: sqlite3.Connection, *, guild_id: int, topic_text: str = "",
+    control_snapshot=None, now: str | None = None,
+    source_cursor: int = 0, highest: int = 0,
+) -> tuple[RelaySourceDecision, ...]:
+    """Bounded read adapters for the existing quiet-source rotation, without writes.
+
+    Each category offers one dated candidate. A supplied conversation topic must
+    match continuity; otherwise the recent public window supplies the angle.
+    Publication prose is authority only for what BNL published.
+    """
+    from bnl_journal import journal_topic_counts, render_journal_publication, select_published_journal_entries_on_connection
+    from bnl_moment_engine import public_moment_source_basis, select_public_situation_moment_gists
+    from bnl_tiktok_show_ledger import select_finalized_show_operations
+
+    end = now or utc_now_iso()
+    end_ms = timestamp_to_epoch_ms(end)
+    if end_ms is None:
+        return ()
+    start = (datetime.fromtimestamp(end_ms / 1000, timezone.utc) - timedelta(days=RELAY_SHARED_LOOKBACK_DAYS)).isoformat()
+    start_ms = timestamp_to_epoch_ms(start)
+    selected = []
+
+    def append(kind, context, basis):
+        selected.append(RelaySourceDecision(
+            kind, context, {kind: 1}, source_cursor=source_cursor,
+            highest_eligible_conversation_id=highest,
+            metadata={"source_message_count": 1, "shared_source_provenance": [basis]},
+        ))
+
+    for item in select_public_situation_moment_gists(
+        conn, guild_id=guild_id, topic_text=topic_text, broad_recall=not bool(topic_text.strip()),
+        token_budget=240, max_results=1, freshness_days=RELAY_SHARED_LOOKBACK_DAYS,
+        allowed_channel_policies=("public_home", "public_context"),
+        require_topic_overlap=bool(topic_text.strip()), apply_date_scope=False,
+        prepare_schema=False, observed_before=end, now=end,
+    ):
+        basis = public_moment_source_basis(conn, guild_id=guild_id, moment_id=item.moment_id)
+        if basis is None:
+            continue
+        contributions = basis["contributions"]
+        context = "Earlier public Moment (%s through %s): %s\nOriginal human contributions:\n%s" % (
+            basis["startedAt"], basis["observedAt"], basis["summary"],
+            "\n".join("participant_%s: %s" % (index, row["summary"])
+                      for index, row in enumerate(contributions, 1)),
+        )
+        # Keep roles separate without expanding Relay into a named profile feed.
+        # An ambiguous shared display label is never assigned to one speaker.
+        labels = {str(row.get("displayName") or "") for row in contributions}
+        for label in sorted(labels, key=len, reverse=True):
+            if len(label) >= 2:
+                context = re.sub(re.escape(label), "a participant", context, flags=re.I)
+        append("public_moment", context[:2200], {
+            "sourceKind": "public_moment", "sourceId": item.moment_id,
+            "sourceVersion": basis["sourceVersion"], "subjectRefs": basis["subjectRefs"],
+            "canonicalLedgerEntryId": basis["canonicalLedgerEntryId"],
+            "originalSourceRefs": basis["originalSourceRefs"],
+        })
+
+    terms = set(journal_topic_counts([{"summary": topic_text}], limit=20))
+    operations = select_finalized_show_operations(conn, guild_id=guild_id, source_window_ms=(start_ms, end_ms))
+    for item in operations:
+        if terms and not terms.intersection(journal_topic_counts([{"summary": item.text}], limit=80)):
+            continue
+        append("finalized_show", "Recorded, completed show operations; historical evidence only:\n" + item.text[:2200], {
+            "sourceKind": "finalized_show", "sourceId": item.show_keys[0],
+            "sourceVersion": item.source_digest, "sourceWindowStart": start, "sourceWindowEnd": end,
+        })
+        break
+
+    query = topic_text.strip() or "latest Journal"
+    publications = select_published_journal_entries_on_connection(
+        conn, guild_id=guild_id, user_text=query, control_snapshot=control_snapshot,
+        include_context=True, context_only=bool(topic_text.strip()), now=end, limit=2,
+    )
+    for item in publications.publications:
+        published_ms = timestamp_to_epoch_ms(item.published_at)
+        if published_ms is None or not start_ms <= published_ms < end_ms:
+            continue
+        append("published_journal",
+            "Historical publication callback: this is BNL's published interpretation, not independent testimony.\n"
+            + render_journal_publication(item, limit=1400), {
+                "sourceKind": "published_journal", "sourceId": item.entry_id,
+                "revision": item.revision, "sourceVersion": item.source_digest,
+                "queryMode": item.query_mode, "selectorText": query if item.query_mode == "latest" else "",
+                "sourceWindowStart": item.source_window_start, "sourceWindowEnd": item.source_window_end,
+                "publishedAt": item.published_at,
+            })
+        break
+    return tuple(selected)
+
+
+def shared_relay_source_failure(conn: sqlite3.Connection, guild_id: int, basis: Any, *, control_snapshot=None) -> str:
+    """Recheck exact saved sources, including original Moment contributions."""
+    from bnl_journal import (
+        journal_control_snapshot_status, journal_shared_source_provenance_is_current,
+        revalidate_published_journal_entry_on_connection,
+    )
+    if not isinstance(basis, list) or not basis or len(basis) > 3:
+        return "relay_source_basis_invalid"
+    for source in basis:
+        if not isinstance(source, dict) or not source.get("sourceId") or not source.get("sourceVersion"):
+            return "relay_source_basis_invalid"
+        if source.get("sourceKind") == "published_journal":
+            if journal_control_snapshot_status(control_snapshot) != "valid":
+                return "relay_source_unavailable"
+            digest = revalidate_published_journal_entry_on_connection(
+                conn, guild_id=guild_id, entry_id=source["sourceId"], revision=source.get("revision", 0),
+                query_mode=source.get("queryMode", "context"), user_text=source.get("selectorText", ""),
+                control_snapshot=control_snapshot,
+            )
+            if not digest or digest != source["sourceVersion"]:
+                return "relay_source_changed"
+        elif not journal_shared_source_provenance_is_current(conn, guild_id, [source], propagate_database_errors=True):
+            return "relay_source_changed"
+    return ""
+
+
+def purge_user_relay_derivatives_on_connection(conn: sqlite3.Connection, guild_id: int, user_id: int) -> dict[str, int]:
+    """Retire unsent derivatives; retain accepted public prose without private lineage."""
+    from bnl_journal import _contains_exact_json_scalar
+    counts = {}
+    for table in ("website_relay_pending_v2", "website_relay_history"):
+        if "source_basis_json" not in _relay_table_columns(conn, table):
+            continue
+        for relay_id, raw in conn.execute(
+            f"SELECT relay_id,source_basis_json FROM {table} WHERE guild_id=?", (guild_id,),
+        ).fetchall():
+            try:
+                affected = _contains_exact_json_scalar(json.loads(raw), f"discord_user:{int(user_id)}")
+            except (ValueError, TypeError):
+                affected = True
+            if affected:
+                if table == "website_relay_pending_v2":
+                    conn.execute(f"DELETE FROM {table} WHERE guild_id=? AND relay_id=?", (guild_id, relay_id))
+                else:
+                    conn.execute(f"UPDATE {table} SET source_basis_json='[]' WHERE guild_id=? AND relay_id=?", (guild_id, relay_id))
+                counts[table + "_scrubbed"] = counts.get(table + "_scrubbed", 0) + 1
+    return counts
 
 
 @dataclass(frozen=True)
@@ -174,6 +318,9 @@ def ensure_schema(db_path: str) -> None:
             highest_eligible_conversation_id INTEGER NOT NULL DEFAULT 0
         )
         """)
+        for table in ("website_relay_pending_v2", "website_relay_history"):
+            if "source_basis_json" not in _relay_table_columns(conn, table):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN source_basis_json TEXT NOT NULL DEFAULT '[]'")
 
 
 def get_cursor(db_path: str, guild_id: int) -> int | None:
@@ -834,18 +981,20 @@ def save_pending_v2_publication(
     event_type: str = "",
     aggregate_source_counts: dict[str, int] | None = None,
     highest_eligible_conversation_id: int = 0,
+    source_basis: list[dict[str, Any]] | None = None,
 ) -> None:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.execute("""
         INSERT OR REPLACE INTO website_relay_pending_v2(
             guild_id,relay_id,message,current_directive,source_class,trigger,source_cursor,source_conversation_fingerprint,
-            canonical_json,prepared_at,mode,relay_lane,event_type,aggregate_source_counts,highest_eligible_conversation_id
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            canonical_json,prepared_at,mode,relay_lane,event_type,aggregate_source_counts,highest_eligible_conversation_id,source_basis_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             guild_id, relay_id, message, current_directive, source_class, trigger, int(source_cursor or 0),
             source_conversation_fingerprint or "", canonical_json, utc_now_iso(), mode or "OBSERVATION", relay_lane or "current_signal",
             event_type or "", __import__('json').dumps(aggregate_source_counts or {}, sort_keys=True), int(highest_eligible_conversation_id or 0),
+            json.dumps(source_basis or [], sort_keys=True, separators=(",", ":")),
         ))
 
 
@@ -914,7 +1063,7 @@ def _advance_publication_state(
     )
 
 
-def record_publication(db_path: str, guild_id: int, *, message: str, directive: str, mode: str, relay_lane: str, event_type: str, source_cursor: int, published_timestamp: str | None = None, relay_id: str | None = None) -> str:
+def record_publication(db_path: str, guild_id: int, *, message: str, directive: str, mode: str, relay_lane: str, event_type: str, source_cursor: int, published_timestamp: str | None = None, relay_id: str | None = None, source_basis: list[dict[str, Any]] | None = None) -> str:
     ensure_schema(db_path)
     ts = published_timestamp or utc_now_iso()
     norm = normalize_text(message)
@@ -985,6 +1134,9 @@ def record_publication(db_path: str, guild_id: int, *, message: str, directive: 
                 ts,
             )
             inserted = True
+        if source_basis:
+            conn.execute("UPDATE website_relay_history SET source_basis_json=? WHERE guild_id=? AND relay_id=?",
+                         (json.dumps(source_basis, sort_keys=True, separators=(",", ":")), guild_id, relay_id))
     occurred_at_ms = timestamp_to_epoch_ms(ts)
     if inserted and occurred_at_ms is not None:
         try:

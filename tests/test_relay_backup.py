@@ -86,6 +86,8 @@ class RelayBackupTests(unittest.TestCase):
             canonical_json='{"secret":"PRIVATE-CANONICAL-SENTINEL"}',
         )
         with sqlite3.connect(self.source_db) as connection:
+            connection.execute("UPDATE website_relay_history SET source_basis_json=?",
+                               ('[{"sourceId":"PRIVATE-SOURCE-BASIS-SENTINEL"}]',))
             connection.execute(
                 "CREATE TABLE conversations(content TEXT NOT NULL)"
             )
@@ -185,6 +187,7 @@ class RelayBackupTests(unittest.TestCase):
             b"PRIVATE-CONVERSATION-SENTINEL",
             b"PRIVATE-HEARTBEAT-SENTINEL",
             b"PRIVATE-PROVIDER-TRACE-SENTINEL",
+            b"PRIVATE-SOURCE-BASIS-SENTINEL",
         ):
             self.assertNotIn(sentinel, decompressed)
         payload = json.loads(decompressed.decode("utf-8"))

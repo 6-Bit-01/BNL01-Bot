@@ -268,7 +268,9 @@ def _read_source_snapshot(db_path: Path) -> tuple[list[dict], list[dict]]:
                     "PRAGMA table_info(website_relay_state)"
                 ).fetchall()
             )
-            if history_columns != HISTORY_COLUMNS:
+            # Source lineage is private runtime metadata. Its explicit addition
+            # must not expand the public Relay archive or invalidate old stores.
+            if history_columns not in (HISTORY_COLUMNS, HISTORY_COLUMNS + ("source_basis_json",)):
                 raise RelayBackupValidationError("relay_history_schema_mismatch")
             if state_columns != STATE_COLUMNS:
                 raise RelayBackupValidationError("relay_state_schema_mismatch")

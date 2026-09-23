@@ -60,6 +60,28 @@ def inspect(db_path: str, guild_id: int, *, now: datetime = None) -> dict:
         snapshot("relayPublications", "website_relay_history", "published_timestamp", "event_type")
         snapshot("relayAttempts", "website_relay_attempts", "started_at", "outcome")
         snapshot("relayPending", "website_relay_pending_v2", "prepared_at")
+        shared_inputs = {}
+        for label, table, stamp in (("pending", "website_relay_pending_v2", "prepared_at"),
+                                    ("accepted", "website_relay_history", "published_timestamp")):
+            selected = rows(table, f"SELECT source_basis_json FROM {table} WHERE guild_id=? ORDER BY {stamp} DESC LIMIT 10", (guild_id,))
+            kinds, unreadable = Counter(), 0
+            for (raw,) in selected or []:
+                try:
+                    basis = json.loads(raw)
+                    if not isinstance(basis, list):
+                        raise ValueError("invalid_basis")
+                    kinds.update(item["sourceKind"] for item in basis if isinstance(item, dict)
+                                 and item.get("sourceKind") in {"public_moment", "finalized_show", "published_journal"})
+                except (TypeError, ValueError):
+                    unreadable += 1
+            shared_inputs[label] = {"available": selected is not None, "rowsScanned": len(selected or []),
+                                    "sourceCounts": dict(kinds), "unreadableBases": unreadable}
+        result["relaySharedInputs"] = shared_inputs
+        holds = rows("website_relay_attempts", """SELECT reason,COUNT(*) FROM website_relay_attempts
+            WHERE guild_id=? AND datetime(started_at)>=datetime(?)
+              AND reason IN ('relay_source_changed','relay_source_basis_invalid','relay_source_unavailable')
+            GROUP BY reason""", (guild_id, cutoff))
+        result["relaySourceHolds24h"] = dict(holds or [])
         snapshot("moments", "memory_moment_windows", "last_activity_at", "lifecycle_status")
         snapshot("showEpisodes", "tiktok_show_evidence_ledgers", "ended_at_ms", "lifecycle_status", millis=True)
         snapshot("memoryLedger", "memory_ledger_entries", "created_at", "lifecycle_status")
