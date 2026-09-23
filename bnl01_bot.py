@@ -19,6 +19,7 @@ from bnl_creative_protocol import GLITCH_PROTOCOL, SUNO_LYRIC_PROTOCOL, bound_su
 from typing import Any, Awaitable, Callable, Mapping, Union
 
 from bnl_canon_source_contract import (
+    PUBLIC_RECALL_EVIDENCE_GUIDANCE,
     CANON_ENTITY_IDENTITIES,
     CANON_SOURCE_CONTRACT_VERSION,
     FRIDAY_PUBLIC_SCHEDULE,
@@ -35,6 +36,7 @@ from bnl_canon_source_contract import (
     website_queue_access_scope,
 )
 from bnl_tiktok_live_context import (
+    PUBLIC_MEMBER_RECALL_REQUEST_WORDS,
     DEFAULT_CONTEXT_PATH as DEFAULT_TIKTOK_LIVE_CONTEXT_PATH,
     DEFAULT_MAX_AGE_SECONDS as DEFAULT_TIKTOK_LIVE_CONTEXT_MAX_AGE_SECONDS,
     build_durable_show_prompt_context,
@@ -246,6 +248,7 @@ from bnl_memory_preview import (
     snapshots_equivalent as memory_preview_snapshots_equivalent,
 )
 from bnl_unified_response_assessment import (
+    self_public_activity_requested,
     situation_subject_label_spans,
     ConversationOrchestrationDecision,
     ConversationOrchestrationInput,
@@ -22616,7 +22619,20 @@ def build_conversation_context_v2_for_prompt(
         # A dated, resolved occurrence owns this historical context. Recent
         # messages about a different occurrence cannot replace its sources.
         rows = [row for row in rows if int(row.get("id") or 0) in retained_rows]
+    named_recall_subjects, unresolved_recall_labels = _named_public_member_subjects(
+        client.get_guild(int(guild_id or 0)), resume_query,
+    ) if has_explicit_show_date(resume_query) else ((), ())
+    # A complete current person/date lookup owns "Quote it" in that request.
+    # It does not point to one of the preceding bot replies. Real Discord
+    # reply targets and ambiguous member labels retain their existing owners.
+    current_recall_scope_complete = bool(
+        len(named_recall_subjects) == 1 and not unresolved_recall_labels
+        and requested_show_date(resume_query)
+        and re.search(r"\b(?:comments?|messages?|conversation|quote)\b", resume_query, re.I)
+        and not re.search(r"\b(?:above|previous|prior|that|this)\b", resume_query, re.I)
+    )
     req = ConversationContextRequest(
+        current_recall_scope_complete=current_recall_scope_complete,
         guild_id=int(guild_id or 0), current_user_id=int(current_user_id or 0), channel_id=int(channel_id or 0),
         channel_name=(channel_name or "").strip().lower(), channel_policy=(channel_policy or "unknown").strip().lower(),
         route_mode=route_mode or ROUTE_MODE_NORMAL_CHAT, conversation_surface=conversation_surface or "unknown",
@@ -28091,9 +28107,15 @@ def _named_public_recall_scope(
     subjects = tuple(
         subject for subject in situation_frame.subjects
         if int(subject.user_id or 0) > 0
-        and int(subject.user_id) != int(BNL_OWNER_USER_ID or 0)
-        and subject.binding_method == "existing_typed_target"
-        and subject.confidence == "high"
+        and (
+            (subject.binding_method == "existing_typed_target"
+             and subject.confidence == "high"
+             and int(subject.user_id) != int(BNL_OWNER_USER_ID or 0))
+            or (subject.binding_method == "current_speaker_context"
+                and subject.confidence in {"high", "contextual"}
+                and subject.user_id in situation_frame.current_speaker_user_ids
+                and self_public_activity_requested(user_text))
+        )
     )
     subjects = tuple({int(s.user_id): s for s in subjects}.values())[:8]
     if not subjects:
@@ -28109,13 +28131,7 @@ def _named_public_recall_scope(
     query_terms = (
         memory_relevance_terms(strip_explicit_show_dates(user_text))
         - CONVERSATION_CONTEXT_STOPWORDS - label_terms
-        - {"said", "say", "says", "saying", "tell", "told", "spoken",
-           "talk", "talked", "talking", "bnl", "give", "show", "some",
-           "recent", "recently", "latest", "last", "older", "earlier",
-           "public", "discord", "conversation", "conversations", "involving",
-           "example", "examples", "message", "messages", "comment", "comments",
-           "quote", "quotes", "exact", "exactly", "words", "word", "their",
-           "his", "her", "switch", "prior", "human", "request"}
+        - PUBLIC_MEMBER_RECALL_REQUEST_WORDS
     )
     return subjects, user_text, " ".join(sorted(query_terms))
 
@@ -28207,7 +28223,10 @@ def build_named_public_conversation_context(
                                 continue
                         except (TypeError, ValueError):
                             continue
-                    label = _safe_prompt_display_label(source["user_name"], "")
+                    label = (
+                        "6 Bit" if int(source["user_id"]) == int(BNL_OWNER_USER_ID or 0)
+                        else _safe_prompt_display_label(source["user_name"], "")
+                    )
                     raw = str(source["content"] or "")
                     # Preserve the complete sanitized utterance; never present
                     # a budget-truncated paraphrase as its original wording.
@@ -28280,7 +28299,7 @@ def build_named_public_conversation_context(
     logging.info(
         "named_public_conversation_context_loaded subject_count=%s selection=%s "
         "query_terms=%s source_row_ids=%s chars=%s",
-        len(basis.participant_user_ids), "topic" if query else "recent",
+        len(basis.participant_user_ids), "date" if selected_date else "topic" if query else "recent",
         len(query_terms), json.dumps(row_ids), len(rendered),
     )
     return rendered, basis
@@ -29421,6 +29440,7 @@ def _build_unified_intelligence_packet_shadow(
     operational_context_authorized: bool,
     current_direct: bool,
     show_episode_dates: tuple[str, ...] = (),
+    show_episode_selection_text: str = "",
     situation_frame: SituationFrameV1 | None = None,
 ) -> UnifiedIntelligencePacket | None:
     """Build and persist one packet receipt without exposing it to the prompt."""
@@ -29565,6 +29585,7 @@ def _build_unified_intelligence_packet_shadow(
         visibility_allowance=visibility_allowance,
         user_text=str(current_text or "")[:8000],
         show_episode_dates=show_episode_dates,
+        show_episode_selection_text=show_episode_selection_text,
         participant_user_ids=participants,
         direct_state="direct" if current_direct else "indirect",
         conversation_evidence=evidence,
@@ -29864,6 +29885,10 @@ def build_unified_response_assessment_shadow(
             packet_operational_context_authorized
         ),
         show_episode_dates=show_episode_dates,
+        show_episode_selection_text=next((
+            basis.selection_user_text for basis in prompt_source_bases
+            if isinstance(basis, FinalizedShowPromptSourceBasis)
+        ), ""),
         current_direct=current_direct,
         situation_frame=situation_frame,
     )
@@ -38243,7 +38268,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- BARCODE/archive flavor is welcome, but do not claim records, archives, source files, dossiers, scans, deployments, or broadcast memory prove anything unless real source context is supplied.\n"
         "- Do not say media was merely logged/detected, and do not use a canned utility acknowledgement as the whole normal-chat response.\n"
         "- Address multiple points smoothly (no bullets).\n- Consecutive fragments from the same user are one continuing thought; respond once to their combined meaning.\n- Do not answer each fragment separately or produce one paragraph per fragment.\n- Do not over-analyze simple test fragments.\n"
-        "- Authored excerpts retain their original speaker and event; summaries and prior BNL replies are not audience transcripts. A consequential current-room exact-quote request still requires the typed Exact-quote authority block and its limits.\n"
+        f"- {PUBLIC_RECALL_EVIDENCE_GUIDANCE}\n"
         "- No @mentions.\n"
         "- If asked to handle a list of people/items, respond to every unique payload item unless impossible.\n"
         "- If a message has a request line followed by newline-separated lines, those later lines are payload/list items for that request.\n"
@@ -42789,7 +42814,7 @@ def build_user_aware_prompt(
         "Live media rule: current media is a live room event, not a recent-media recall request; do not expose link-preview/provider/host/storage/metadata labels or say a visual description is stored/missing unless the user explicitly asks what you saw or stored.\n"
         "Current-room media grounding: anchor to the media and nearby conversation; do not assume the poster is the subject of a meme unless text/metadata/context says so; do not turn a random media reaction into an archive/source report, poster biography, or unrelated BARCODE Radio/show/broadcast deployment explanation.\n"
         "Source-authority basis rule: archive/record/source/dossier/scan/deployment/broadcast-memory language may be style or honest supplied-source reporting, but do not claim those sources prove/indicate/confirm something unless source/broadcast/show-state/read-model context is actually supplied.\n"
-        "People-and-memory provenance: authored excerpts retain their original speaker and event; summaries, memory tiers, relationship notes, Moment gists, and prior BNL replies are not audience transcripts. A consequential current-room exact-quote request still requires the typed Exact-quote authority block and its limits.\n"
+        f"People-and-memory provenance: {PUBLIC_RECALL_EVIDENCE_GUIDANCE}\n"
         f"{prompt_contract}"
         f"{recall_interpretation_contract}"
         f"{recall_synthesis_contract}"

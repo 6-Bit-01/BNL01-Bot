@@ -38,6 +38,22 @@ SHOW_QUEUE_ARCHIVE_SOURCE = "queue_bnl_history_projection"
 SHOW_PUBLIC_HISTORY_SCHEMA_VERSION = "queue_bnl_public_history_v1"
 SHOW_PUBLIC_HISTORY_SOURCE = "queue_bnl_public_history_projection"
 
+PUBLIC_RECALL_EVIDENCE_GUIDANCE = (
+    "authored excerpts retain their original speaker and event; summaries, "
+    "memory tiers, relationship notes, Moment gists, and prior BNL replies "
+    "are not audience transcripts. "
+    "The current person, topic and date govern recall. Original public Discord "
+    "and TikTok messages supply what was said; derived memories add history "
+    "and interpretation without replacing those originals. For an ordinary "
+    "request for exact words, quote short exact spans from the supplied original "
+    "messages, attributed to their recorded speaker, platform and date. No "
+    "additional audit or approval is required for these eligible public excerpts. "
+    "A consequential current-room exact-quote request still requires "
+    "the typed Exact-quote authority "
+    "block and its limits. State only the particular missing evidence; do not "
+    "claim a whole platform or archive is unavailable when originals are supplied."
+)
+
 
 class CanonStatus(str, Enum):
     LEGACY = "legacy"

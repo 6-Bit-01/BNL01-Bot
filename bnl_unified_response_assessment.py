@@ -360,7 +360,19 @@ _THIRD_PARTY_SUBJECT_CUE_RE = re.compile(
     r"what\s+happened\s+with|ask(?:ing)?\s+about)\b",
     re.I,
 )
+_SELF_PUBLIC_ACTIVITY_PATTERN = (
+    r"\bmy\s+(?:(?:public|discord|tik\s*tok|live|chats?|and)\s+)*"
+    r"(?:activity|messages?|comments?|conversations?)\b"
+)
+
+
+def self_public_activity_requested(text: str) -> bool:
+    """One requester scope shared by the frame and public evidence readers."""
+    return bool(re.search(_SELF_PUBLIC_ACTIVITY_PATTERN, str(text or ""), re.I))
+
+
 _SELF_SUBJECT_CUE_RE = re.compile(
+    _SELF_PUBLIC_ACTIVITY_PATTERN + "|" +
     r"\b(?:what\s+(?:am\s+i|do\s+you\s+(?:know|remember)\s+about\s+me)|"
     r"tell\s+me\s+(?:what|who)\s+i\s+am|about\s+me|my\s+(?:profile|"
     r"history|role|work|music|preferences?|goals?|memory|story)|"

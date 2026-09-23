@@ -478,6 +478,9 @@ class IntelligencePacketRequest:
     # Date scope already selected by the authorized native show reader.
     # It narrows retained recall; it grants no additional source authority.
     show_episode_dates: tuple[str, ...] = ()
+    # The native reader's resolved human person/topic continuation. A later
+    # packet projection must not select a different episode for the same turn.
+    show_episode_selection_text: str = ""
     participant_user_ids: tuple[int, ...] = ()
     direct_state: str = "direct"
     budget_chars: int = 2400
@@ -3061,6 +3064,8 @@ def _show_episode_query(request: IntelligencePacketRequest) -> str:
     query = str(request.user_text or "")[:8000]
     if has_explicit_show_date(query) or requested_show_dates(query, now=request.now or None):
         return query
+    if request.show_episode_selection_text:
+        query = str(request.show_episode_selection_text)[:8000]
     dates = tuple(day for day in request.show_episode_dates if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", day))
     return query + (" " + " ".join(dates) if dates else "")
 
