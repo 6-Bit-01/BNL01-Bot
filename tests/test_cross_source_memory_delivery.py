@@ -52,6 +52,96 @@ ANSWER = (
 
 
 class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_recall_sequence_keeps_layers_through_the_final_provider_prompt(self):
+        early = "My violet keyboard arrived in May."
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO conversations (id,user_id,user_name,guild_id,role,content,"
+                "timestamp,channel_id,channel_name,channel_policy,route_mode) "
+                "VALUES (7099,?,?,?,'user',?,'2026-05-08T18:00:00+00:00',9920,"
+                "'public-lounge','public_home','normal_chat')",
+                (SUBJECT, "Test Signal", GUILD, early),
+            )
+        self._seed_member_tiers()
+        cases = (
+            ("Tell me about a recent public Discord conversation involving Test Signal.",
+             "Test Signal keeps amber lanterns beside a mixing desk.", (7099, 7101), True),
+            ("What were their exact words?",
+             'Test Signal said on Discord, "' + DISCORD_COMMENT + '"', (7099, 7101), True),
+            ("Switch to Test Other. Give me a recent example from public Discord and quote what Test Other said.",
+             'Test Other said on Discord, "' + OTHER_COMMENT + '"', (7104,), False),
+            ("Give me a public Discord comment from Test Signal on May 8, 2026. Quote it.",
+             'On May 8, Test Signal said on Discord, "' + early + '"', (7099,), False),
+            ("What do you remember about Test Other?",
+             "Test Other mentioned amber lanterns arriving in a blue box.", (7104,), False),
+            ("Look at my TikTok and Discord activity together. What do you see?",
+             "I do not have a supported TikTok example for you here.", (), False),
+            ("What has Test Signal said in the TikTok live chats and the Discord?",
+             ANSWER, (7099, 7101), True),
+        )
+        for enabled in (False, True):
+            with self.subTest(packet=enabled), self._packet_configuration(enabled, 8810):
+                with sqlite3.connect(bot.DB_FILE) as conn:
+                    conn.execute("DELETE FROM conversations WHERE channel_id=8810")
+                for index, (request, answer, expected_rows, has_show) in enumerate(cases):
+                    inputs = self.runtime._direct_prompt_inputs("sealed_test", request, privileged=False)
+                    direct, *_ = await bot.build_user_aware_prompt_async(**inputs)
+                    self.assertEqual(inputs["conversation_orchestration"].situation_frame.status, "resolved")
+                    if index == 3:
+                        self.assertEqual(inputs["conversation_context_result"].referent_status, "not_requested")
+                    async def provider(*_args, **kwargs):
+                        counter = kwargs.get("attempt_counter")
+                        if counter is not None:
+                            counter.mark_started()
+                        return answer
+                    channel, generation, guard = await self.runtime._batch(
+                        "sealed_test", request=request, answer=provider,
+                        privileged=False, channel_id=8810,
+                    )
+                    generation.assert_awaited_once()
+                    self.assertEqual(channel.sent, [answer])
+                    delivered = generation.await_args.args[0]
+                    for prompt, bases in (
+                        (direct, inputs["prompt_metadata"]["prompt_source_bases"]),
+                        (delivered, guard.await_args.kwargs["prompt_source_bases"]),
+                    ):
+                        with self.subTest(turn=index, packet=enabled):
+                            source_rows = tuple(sorted({
+                                row for basis in bases if isinstance(basis, bot.ConversationPromptSourceBasis)
+                                for row in basis.source_row_ids if row in {7099, 7101, 7104}
+                            }))
+                            self.assertEqual(source_rows, expected_rows)
+                            originals = [excerpt.source_text for basis in bases
+                                         if isinstance(basis, bot.FinalizedShowPromptSourceBasis)
+                                         for excerpt in basis.authored_excerpts]
+                            self.assertEqual(TIKTOK_COMMENT in originals, has_show)
+                            self.assertNotIn("Exact-quote authority: unavailable", prompt)
+                            self.assertNotIn("Never quote them", prompt)
+                            self.assertIn("quote short exact spans from the supplied original", prompt)
+                            if index in (0, 1, 6):
+                                self.assertIn("amber lantern project began", prompt)
+                    # Preserve a preceding refusal too: a saved BNL claim must
+                    # not override original quotation authority on later turns.
+                    self._capture_prior_person_request(request)
+                    bot.save_model_message(
+                        REQUESTER, GUILD,
+                        "I cannot give exact words without an audit block." if index == 1 else answer,
+                        channel_name="bnl-testing", channel_policy="sealed_test", channel_id=8810,
+                        route_mode="normal_chat",
+                    )
+
+    async def test_self_public_activity_uses_only_the_requesters_originals_in_both_sources(self):
+        self.runtime.user_id = SUBJECT
+        request = "Look at my TikTok and Discord activity together. What do you see?"
+        prompt, metadata = await self.runtime._direct_prompt_async("sealed_test", request=request, privileged=False)
+        self.assertIn(DISCORD_COMMENT, prompt)
+        self.assertIn(TIKTOK_COMMENT, prompt)
+        source_text = "\n".join(getattr(b, "rendered_context", "") for b in metadata["prompt_source_bases"])
+        self.assertNotIn(OTHER_COMMENT, source_text)
+        self.assertTrue(any(isinstance(b, bot.ConversationPromptSourceBasis)
+                            and b.participant_user_ids == (SUBJECT,) for b in metadata["prompt_source_bases"]))
+        self.assertEqual(bot.prompt_source_basis_failure(metadata["prompt_source_bases"]), "")
+
     async def test_broad_discord_recall_and_quote_followup_keep_the_named_member(self):
         request = "Tell me about a recent public Discord conversation involving Test Signal."
         for enabled in (False, True):

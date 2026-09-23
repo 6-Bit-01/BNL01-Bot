@@ -181,8 +181,8 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         prompt, *_ = await bnl01_bot.build_user_aware_prompt_async(**inputs)
         return prompt, inputs["prompt_metadata"]
 
-    async def _batch(self, policy, request=REQUEST, answer=PUBLIC_MEMORY, privileged=True, participants=()):
-        channel_id = 8811 + len(self.channel_ids)
+    async def _batch(self, policy, request=REQUEST, answer=PUBLIC_MEMORY, privileged=True, participants=(), channel_id=None):
+        channel_id = channel_id or 8811 + len(self.channel_ids)
         self.channel_ids.add(channel_id)
         channel = FakeChannel(
             channel_id,

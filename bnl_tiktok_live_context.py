@@ -37,6 +37,26 @@ METRIC_MEMORY = "current_show_only"
 MEMORY_PLACEMENT = "above_community_canon"
 IDENTITY_DEFAULT = "handle_display_correlated_v1"
 
+# Request and source selectors are not topics an authored message must repeat.
+# Shared by the Discord original/tier readers and the show participant reader.
+PUBLIC_MEMBER_RECALL_REQUEST_WORDS = frozenset({
+    "said", "say", "says", "saying", "tell", "told", "spoken",
+    "talk", "talked", "talking", "bnl", "give", "show", "some",
+    "ask", "asked", "asking", "write", "wrote", "written", "post", "posted",
+    "recent", "recently", "latest", "last", "older", "earlier",
+    "public", "discord", "tiktok", "tik", "tok", "live", "chat", "chats",
+    "conversation", "conversations", "involving", "activity",
+    "example", "examples", "message", "messages", "comment", "comments",
+    "quote", "quotes", "exact", "exactly", "words", "word", "their",
+    "his", "her", "switch", "prior", "human", "request", "remember",
+    "look", "see", "together", "across", "both", "my",
+    "the", "and", "that", "with", "this", "those", "these", "them", "they",
+    "you", "your", "for", "from", "was", "were", "are", "is", "a", "an",
+    "it", "its", "why", "what", "how", "when", "where", "about", "into",
+    "onto", "then", "than", "just", "like", "have", "has", "had", "but",
+    "not", "can", "could", "would", "me",
+})
+
 DEFAULT_CONTEXT_PATH = "/run/bnl-tiktok-chat-shadow/live-context.json"
 DEFAULT_MAX_AGE_SECONDS = 20.0
 DEFAULT_EVENT_WINDOW_SECONDS = 5 * 60.0

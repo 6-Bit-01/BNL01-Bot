@@ -36,6 +36,7 @@ from bnl_memory_ledger import (
     living_canon_v1_formation_enabled,
 )
 from bnl_tiktok_live_context import (
+    PUBLIC_MEMBER_RECALL_REQUEST_WORDS,
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     _comment_timing_evidence,
     _event_subject_key,
@@ -55,7 +56,9 @@ from bnl_tiktok_live_context import (
     tiktok_show_evidence_key,
     tiktok_show_records,
 )
-from bnl_unified_response_assessment import situation_subject_label_spans
+from bnl_unified_response_assessment import (
+    situation_subject_label_spans, self_public_activity_requested,
+)
 
 
 TIKTOK_SHOW_EVIDENCE_TABLE = "tiktok_show_evidence_ledgers"
@@ -321,7 +324,8 @@ def _requested_show_date(user_text: str, *, now: Any = None) -> str:
 
 
 def _subject_continuity_requested(user_text: str) -> bool:
-    return bool(_SUBJECT_CONTINUITY_QUERY_RE.search(str(user_text or "")))
+    return bool(_SUBJECT_CONTINUITY_QUERY_RE.search(str(user_text or ""))
+                or self_public_activity_requested(user_text))
 
 
 def _community_baseline_requested(user_text: str) -> bool:
@@ -2668,7 +2672,7 @@ def _participant_topic_terms(
         topic_parts.append(user_text[offset:start])
         offset = end
     topic_parts.append(user_text[offset:])
-    return _query_terms(" ".join(topic_parts))
+    return _query_terms(" ".join(topic_parts)) - PUBLIC_MEMBER_RECALL_REQUEST_WORDS
 
 
 def _general_participant_recall(
@@ -2676,7 +2680,8 @@ def _general_participant_recall(
 ) -> bool:
     return bool(
         participants
-        and not _subject_continuity_requested(user_text)
+        and (not _subject_continuity_requested(user_text)
+             or self_public_activity_requested(user_text))
         # Naming a source (TikTok, Discord, chat) does not choose an episode.
         # Keep singular episode requests and calendar scope with their owner.
         and not re.search(
@@ -2806,7 +2811,7 @@ def _document_relevance(
         {str(item.get("subjectRef") or "") for item in direct_subject_candidates}
         if not explicit_episode_scope else set()
     )
-    topic_terms = _participant_topic_terms(query, participant_matches)
+    topic_terms = _participant_topic_terms(query, participant_matches or direct_subject_candidates)
     authored_overlap = max((
         len(topic_terms.intersection(_query_terms(str(message.get("text") or ""))))
         for message in _authored_show_messages(ledger)
@@ -2817,7 +2822,7 @@ def _document_relevance(
         score += min(240, 80 * authored_overlap)
     elif (
         not requested_dates
-        and _general_participant_recall(query, participant_matches)
+        and _general_participant_recall(query, participant_matches or direct_subject_candidates)
         and topic_terms
     ):
         # A newer appearance by the same person is not evidence about the
@@ -2825,6 +2830,7 @@ def _document_relevance(
         return 0, []
     if direct_subject_candidates and (
         explicit_episode_scope or evidence_query_overlap
+        or (self_public_activity_requested(query) and not topic_terms)
     ):
         for participant in direct_subject_candidates:
             if participant not in participant_matches:

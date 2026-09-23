@@ -164,6 +164,26 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
             with self.subTest(frame=candidate.status, subjects=candidate.subjects):
                 self.assertEqual(self.read(frame=candidate), ("", None))
 
+    def test_owner_self_activity_projects_only_public_identity_and_revalidates(self):
+        self.seed(user_id=99, label="Test Account Label", text="The public stage lights are blue.")
+        self.seed(2, user_id=99, label="Test Account Label", policy="internal_controlled",
+                  text="The private fixture must remain outside public recall.")
+        text = "Look at my TikTok and Discord activity together."
+        frame = build_situation_frame_v1(
+            route_allowed=True, route_mode="normal_chat", conversation_surface="sealed_test",
+            channel_policy="sealed_test", current_text=text,
+            current_speaker_user_ids=(99,), current_speaker_labels=("6 Bit",), response_act="answer",
+        )
+        context, basis = self.read(text=text, frame=frame)
+        self.assertEqual(basis.source_row_ids, (1,))
+        self.assertIn("6 Bit in #test-public-stage", context)
+        self.assertNotIn("Test Account Label", context)
+        self.assertNotIn("private fixture", context)
+        self.assertEqual(bot.prompt_source_basis_failure((basis,)), "")
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("UPDATE conversations SET channel_policy='internal_controlled' WHERE id=1")
+        self.assertEqual(bot.prompt_source_basis_failure((basis,)), "conversation_source_changed")
+
     def test_shared_explicit_date_filter_uses_pacific_calendar_and_invalid_date_is_empty(self):
         self.seed()
         self.seed(2, timestamp="2026-08-30T03:00:00+00:00")

@@ -255,6 +255,7 @@ class ConversationContextRequest:
     is_reply_to_bnl: bool = False
     is_batch: bool = False
     is_deferred_payload_session: bool = False
+    current_recall_scope_complete: bool = False
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     route_allowed_sources: frozenset[str] = field(default_factory=frozenset)
 
@@ -1939,7 +1940,7 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         now,
     )
     if (
-        EXPLICIT_NEW_TOPIC_RE.search(current_text)
+        (EXPLICIT_NEW_TOPIC_RE.search(current_text) or req.current_recall_scope_complete)
         and referent_resolution.reason != "discord_reply_source"
     ):
         referent_resolution = _ReferentResolution()

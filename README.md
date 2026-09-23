@@ -375,12 +375,16 @@ shadow prerequisites are effective and all global live gates are off. Public
 and other non-allowlisted prompts remain unchanged. Setting the flag to
 `false` and restarting is the response-path kill switch.
 
-When asked what another person said, BNL should give a cautious gist by default.
-Exact wording is a separate, fail-closed evidence mode: it requires a
-consequential verification or dispute request, one typed target, one eligible
-same-room public human message, and a still-matching live Discord source.
-Memory tiers, relationship notes, summaries, Relays, Journals, and Moments never
-authorize a quote.
+Ordinary public recall layers original Discord/TikTok messages with relevant
+durable memory. Requested quotations come from the supplied originals with
+their recorded speaker, platform and date. Derived tiers, relationship notes
+and Moment gists add history and meaning but cannot supply exact wording.
+Published Journal/Relay prose is its own text, not a member's original speech.
+The separate consequential current-room verification/dispute path remains
+fail-closed: one typed target, one eligible same-room public human message,
+and a still-matching live Discord source. See the
+[layered recall repair](docs/layered-public-recall-2026-09-23.md) for the current
+person/date/follow-up contract and its acceptance limits.
 
 `BNL_MOMENT_GIST_CANARY_ENABLED` defaults off. Even when explicitly set, it
 requires both Ledger and Moment shadow gates, non-empty guild and member
