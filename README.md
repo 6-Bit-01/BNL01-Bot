@@ -44,6 +44,13 @@ people, dates and recent-show scopes take precedence. See
 [`docs/shared-conversation-continuity-2026-09-23.md`](docs/shared-conversation-continuity-2026-09-23.md)
 for the source boundaries and focused acceptance batch.
 
+Dated Moment recall uses the original conversation's Pacific date, with an
+explicit UTC request honored. Retained transcript and derived-gist readers
+share that date boundary. A relative request keeps its calendar reference
+during source revalidation; a new turn receives a fresh reference. Prompts
+retain the original exchange time separately from later memory revisions or
+publications. See [`docs/memory-chronology-2026-09-23.md`](docs/memory-chronology-2026-09-23.md).
+
 ## Runtime configuration
 
 Configure secrets in the process environment; do not commit them. Core variables include:

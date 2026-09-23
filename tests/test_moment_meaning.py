@@ -71,8 +71,8 @@ class MomentMeaningTests(unittest.TestCase):
         moments.ensure_moment_schema(self.conn)
         relationships.ensure_relationship_v2_schema(self.conn)
 
-    def captured_moment(self, turns=REPORTERS, *, channel=10, policy="public_home"):
-        start = datetime(2026, 9, 12, 7, channel % 60, tzinfo=timezone.utc)
+    def captured_moment(self, turns=REPORTERS, *, channel=10, policy="public_home", started_at=None):
+        start = started_at or datetime(2026, 9, 12, 7, channel % 60, tzinfo=timezone.utc)
         roots = []
         moment_id = ""
         for index, (person, role, text) in enumerate(turns):

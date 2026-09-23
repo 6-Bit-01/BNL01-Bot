@@ -22422,7 +22422,7 @@ def get_conversation_context_v2_rows(
 
 def _read_resume_conversation_sources(
     *, guild_id, current_user_id, channel_id, channel_policy, route_mode,
-    query, now=None, expected_moment_ids=(),
+    query, now=None, expected_moment_ids=(), date_reference_at="",
 ):
     if not query or not os.path.exists(DB_FILE):
         return (), ()
@@ -22435,6 +22435,7 @@ def _read_resume_conversation_sources(
                 topic_text=query, participant_key=subject_key_for_user(current_user_id),
                 now=(now.isoformat() if now is not None else None),
                 expected_moment_ids=expected_moment_ids,
+                date_reference_at=date_reference_at,
             )
     except (OSError, sqlite3.Error, ValueError, TypeError):
         return (), ()
@@ -22457,12 +22458,13 @@ def build_conversation_context_v2_for_prompt(
         if result_out is not None:
             result_out["result"] = None
         return ""
+    request_now = now or datetime.now(timezone.utc)
     resume_query = " ".join(current_texts or ())
     retained_moments, retained_rows = (
         _read_resume_conversation_sources(
             guild_id=guild_id, current_user_id=current_user_id,
             channel_id=channel_id, channel_policy=channel_policy,
-            route_mode=route_mode, query=resume_query, now=now,
+            route_mode=route_mode, query=resume_query, now=request_now,
         ) if not (referenced_message_ids or referenced_conversation_row_ids or transient_reply_sources)
         else ((), ())
     )
@@ -22499,13 +22501,14 @@ def build_conversation_context_v2_for_prompt(
         ),
         transient_reply_sources=tuple(transient_reply_sources or ()),
         is_direct_target=bool(is_direct_target), is_reply_to_bnl=bool(is_reply_to_bnl), is_batch=bool(is_batch),
-        is_deferred_payload_session=bool(is_deferred_payload_session), now=now or datetime.now(timezone.utc),
+        is_deferred_payload_session=bool(is_deferred_payload_session), now=request_now,
         route_allowed_sources=frozenset(route_allowed_sources or getattr(get_route_mode_contract(route_mode), "allowed_context_sources", frozenset())),
     )
     result = assemble_conversation_context_v2(rows, req)
     if set(result.selected_row_ids).intersection(retained_rows):
         result = replace(result, retained_moment_ids=retained_moments,
                          retained_resume_query=resume_query,
+                         retained_resume_reference_at=request_now.isoformat(),
                          retained_resume_route_mode=route_mode)
     if result_out is not None:
         result_out["result"] = result
@@ -27775,6 +27778,7 @@ class ConversationPromptSourceBasis:
     retained_moment_ids: tuple[str, ...] = ()
     retained_resume_query: str = ""
     retained_resume_route_mode: str = "normal_chat"
+    retained_resume_reference_at: str = ""
 
 
 def _public_conversation_recall_controls(
@@ -30757,6 +30761,7 @@ def build_conversation_prompt_source_basis(
         retained_moment_ids=getattr(context_result, "retained_moment_ids", ()),
         retained_resume_query=getattr(context_result, "retained_resume_query", ""),
         retained_resume_route_mode=getattr(context_result, "retained_resume_route_mode", "normal_chat"),
+        retained_resume_reference_at=getattr(context_result, "retained_resume_reference_at", ""),
         participant_user_ids=participant_user_ids,
         speaker_labels=speaker_labels,
         evidence_items=evidence_items,
@@ -31036,6 +31041,7 @@ def refresh_prompt_source_basis(
             channel_id=basis.channel_id, channel_policy=basis.channel_policy,
             route_mode=basis.retained_resume_route_mode, query=basis.retained_resume_query,
             expected_moment_ids=basis.retained_moment_ids,
+            date_reference_at=basis.retained_resume_reference_at,
         )
         if current_moments != basis.retained_moment_ids:
             return replace(basis, expected_digest="retained_moment_source_unavailable"), True

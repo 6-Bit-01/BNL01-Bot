@@ -640,6 +640,7 @@ def build_governed_context(
                 freshness_days=3650,
                 allowed_channel_policies=("public_home", "public_context"),
                 max_results=4,
+                now=req.now or None,
             ):
                 diag.candidates_by_source["moment_gist"] = (
                     diag.candidates_by_source.get("moment_gist", 0) + 1

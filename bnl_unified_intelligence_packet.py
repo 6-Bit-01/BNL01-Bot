@@ -2941,6 +2941,7 @@ def _episode_items(
         allowed_channel_policies=("public_home", "public_context"),
         max_results=2 if topic_association else 4,
         topic_association=topic_association,
+        now=request.now or None,
     )
     diagnostics.episode_candidate_count = len(rows)
     if topic_association:
@@ -5918,6 +5919,7 @@ def _moment_version(
         freshness_days=3650,
         allowed_channel_policies=("public_home", "public_context"),
         max_results=4,
+        now=packet.request.now or None,
     )
     target = item.revalidation_key
     for moment in moments:
@@ -5967,6 +5969,7 @@ def _episode_version(
         allowed_channel_policies=("public_home", "public_context"),
         max_results=2 if topic_association else 4,
         topic_association=topic_association,
+        now=packet.request.now or None,
     )
     for row in rows:
         source_ref = "episode:%s:moment:%s" % (
