@@ -419,6 +419,14 @@ def has_explicit_show_date(user_text: str) -> bool:
     return _explicit_show_date_match(user_text) is not None
 
 
+def strip_explicit_show_dates(user_text: str) -> str:
+    """Remove the shared calendar selectors before lexical content matching."""
+    value = str(user_text or "")
+    for match in reversed(_explicit_show_date_matches(value)):
+        value = value[:match.start()] + " " + value[match.end():]
+    return value
+
+
 def explicit_show_date(
     user_text: str, *, now: Any = None, available_show_dates: Sequence[str] = (),
 ) -> str:

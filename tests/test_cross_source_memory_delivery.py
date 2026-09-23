@@ -19,7 +19,10 @@ from unittest import mock
 import test_public_network_knowledge as network_fixture
 import test_tiktok_show_evidence_ledger as show_fixture
 from bnl_journal_source_store import record_source_event
-from bnl_memory_ledger import shadow_conversation_row, shadow_tiktok_live_chat_event
+from bnl_memory_ledger import (
+    shadow_conversation_row, shadow_tiktok_live_chat_event, shadow_memory_tier_row,
+    attach_memory_tier_conversation_sources,
+)
 
 
 bot = network_fixture.bnl01_bot
@@ -49,6 +52,178 @@ ANSWER = (
 
 
 class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_broad_discord_recall_and_quote_followup_keep_the_named_member(self):
+        request = "Tell me about a recent public Discord conversation involving Test Signal."
+        for enabled in (False, True):
+            with self.subTest(packet=enabled), self._packet_configuration(enabled, 8810):
+                for text in (request, "What were their exact words?"):
+                    if text != request:
+                        self._capture_prior_person_request(request)
+                    prompt, metadata = await self.runtime._direct_prompt_async(
+                        "sealed_test", request=text, privileged=False,
+                    )
+                    self.assertIn(DISCORD_COMMENT, prompt)
+                    self.assertTrue(any(
+                        isinstance(basis, bot.ConversationPromptSourceBasis)
+                        and 7101 in basis.source_row_ids
+                        for basis in metadata["prompt_source_bases"]
+                    ))
+                    for excluded in (OTHER_COMMENT, PRIVATE_COMMENT, SEALED_COMMENT):
+                        self.assertNotIn(excluded, prompt)
+
+    async def test_topic_search_reaches_older_originals_before_applying_recent_row_limit(self):
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO conversations (id,user_id,user_name,guild_id,role,content,"
+                "timestamp,channel_id,channel_name,channel_policy,route_mode) "
+                "VALUES (7200,?,?,?,'user',?,'2026-09-22T15:00:00+00:00',9920,"
+                "'public-lounge','public_home','normal_chat')",
+                (SUBJECT, "Test Signal", GUILD, "The new silver drum kit arrived today."),
+            )
+        with mock.patch.object(bot, "CONVERSATION_ROWS_PER_USER_MAX", 1):
+            prompt, metadata = await self.runtime._direct_prompt_async(
+                "sealed_test", request=REQUEST, privileged=False,
+            )
+        self.assertIn(DISCORD_COMMENT, prompt)
+        self.assertTrue(any(
+            isinstance(basis, bot.ConversationPromptSourceBasis)
+            and 7101 in basis.source_row_ids for basis in metadata["prompt_source_bases"]
+        ))
+
+    def _seed_member_tiers(self):
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            for uid, tier, text, trust in (
+                (SUBJECT, "short", "A recent discussion covered silver drums.", "source_safe_public"),
+                (SUBJECT, "medium", "An earlier exchange explored amber lantern placement.", "source_safe_public_consolidated"),
+                (SUBJECT, "long", "The amber lantern project began with a stage lighting experiment.", "source_safe_public_consolidated"),
+                (SUBJECT, "long", "The hidden amber lantern access code is turquoise.", "legacy_unknown"),
+                (43, "long", "The other member ordered amber lantern batteries.", "source_safe_public_consolidated"),
+            ):
+                bot._insert_memory_tier(
+                    conn.cursor(), uid, GUILD, tier, text, 0.85,
+                    source_role="user" if tier == "short" else "consolidation",
+                    source_channel_policy="public_home", source_trust=trust,
+                )
+            conn.execute("UPDATE memory_tiers SET updated_at='2026-05-15T12:00:00+00:00' WHERE tier IN ('medium','long')")
+
+    async def test_named_member_tiers_join_originals_and_revalidate_in_both_routes(self):
+        self._seed_member_tiers()
+        for enabled in (False, True):
+            with self.subTest(packet=enabled), self._packet_configuration(enabled, 8810):
+                prompt, metadata = await self.runtime._direct_prompt_async(
+                    "sealed_test", request=REQUEST, privileged=False,
+                )
+                self.assertIn("earlier exchange explored amber lantern placement", prompt)
+                self.assertIn("amber lantern project began", prompt)
+                self.assertIn(DISCORD_COMMENT, prompt)
+                self.assertIn(TIKTOK_COMMENT, prompt)
+                self.assertNotIn("hidden amber lantern access code", prompt)
+                self.assertNotIn("other member ordered amber lantern batteries", prompt)
+                bases = tuple(basis for basis in metadata["prompt_source_bases"]
+                              if isinstance(basis, bot.MemoryPromptSourceBasis)
+                              and basis.user_id == SUBJECT)
+                self.assertEqual(len(bases), 1)
+                self.assertIn("not quote authority", bases[0].rendered_context)
+                self.assertFalse(bot.refresh_prompt_source_basis(bases[0])[1])
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("UPDATE memory_tiers SET source_trust='legacy_unknown' WHERE user_id=? AND tier='medium'", (SUBJECT,))
+        fresh, changed = bot.refresh_prompt_source_basis(bases[0])
+        self.assertTrue(changed)
+        self.assertNotIn("earlier exchange explored amber lantern placement", fresh.rendered_context)
+
+    async def test_broad_batch_delivers_originals_and_all_public_tiers_with_one_send(self):
+        self._seed_member_tiers()
+        request = "Tell me about a recent public Discord conversation involving Test Signal."
+        for policy, enabled in product(("public_home", "sealed_test"), (False, True)):
+            channel_id = 8811 + len(self.runtime.channel_ids)
+            with self.subTest(policy=policy, packet=enabled), self._packet_configuration(enabled, channel_id):
+                channel, generation, guard = await self.runtime._batch(
+                    policy, request=request, answer=self._provider_answer, privileged=False,
+                )
+                generation.assert_awaited_once()
+                self.assertEqual(channel.sent, [ANSWER])
+                prompt = generation.await_args.args[0]
+                for included in (DISCORD_COMMENT, "recent discussion covered silver drums",
+                                 "earlier exchange explored amber lantern placement", "amber lantern project began"):
+                    self.assertIn(included, prompt)
+                self.assertNotIn("hidden amber lantern access code", prompt)
+                self.assertTrue(any(isinstance(basis, bot.MemoryPromptSourceBasis)
+                                    and basis.user_id == SUBJECT
+                                    for basis in guard.await_args.kwargs["prompt_source_bases"]))
+
+    async def test_broad_recall_uses_message_time_not_archive_insertion_order(self):
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            for row_id, stamp, comment in (
+                (7200, "2026-09-22T12:00:00+00:00", "A recent public note about green stage curtains."),
+                (7300, "2026-05-15T12:00:00+00:00", "An older note imported after the recent discussion."),
+            ):
+                conn.execute(
+                    "INSERT INTO conversations (id,user_id,user_name,guild_id,role,content,"
+                    "timestamp,channel_id,channel_name,channel_policy,route_mode) "
+                    "VALUES (?,?,?,?,'user',?,?,9920,'public-lounge','public_home','normal_chat')",
+                    (row_id, SUBJECT, "Test Signal", GUILD, comment, stamp),
+                )
+        with mock.patch.object(bot, "CONVERSATION_ROWS_PER_USER_MAX", 1):
+            _prompt, metadata = await self.runtime._direct_prompt_async(
+                "sealed_test", request="Give me a recent public Discord example from Test Signal.", privileged=False,
+            )
+        historical = [basis for basis in metadata["prompt_source_bases"]
+                      if isinstance(basis, bot.ConversationPromptSourceBasis)
+                      and basis.current_user_id == 0]
+        self.assertEqual(len(historical), 1)
+        self.assertEqual(historical[0].source_row_ids, (7200,))
+
+    async def test_named_tier_controls_and_original_retractions_invalidate_delivery(self):
+        self._seed_member_tiers()
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            for row_id, tier, summary, stamp in conn.execute(
+                "SELECT id,tier,summary,updated_at FROM memory_tiers WHERE user_id=? AND tier IN ('medium','long')",
+                (SUBJECT,),
+            ).fetchall():
+                if tier == "long":
+                    attach_memory_tier_conversation_sources(
+                        conn, guild_id=GUILD, tier_row_id=row_id, source_row_ids=(7101,),
+                    )
+                shadow_memory_tier_row(
+                    conn, row_id=row_id, user_id=SUBJECT, guild_id=GUILD,
+                    tier=tier, summary=summary, updated_at=stamp, channel_policy="public_home",
+                )
+        _prompt, metadata = await self.runtime._direct_prompt_async(
+            "sealed_test", request=REQUEST, privileged=False,
+        )
+        basis = next(basis for basis in metadata["prompt_source_bases"]
+                     if isinstance(basis, bot.MemoryPromptSourceBasis) and basis.user_id == SUBJECT)
+        self.assertIn("earlier exchange explored amber lantern placement", basis.rendered_context)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='retracted' WHERE source_table='memory_tiers' AND normalized_value LIKE 'An earlier exchange%'")
+        fresh, changed = bot.refresh_prompt_source_basis(basis)
+        self.assertTrue(changed)
+        self.assertNotIn("earlier exchange explored amber lantern placement", fresh.rendered_context)
+        self.assertIn("amber lantern project began", fresh.rendered_context)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("UPDATE conversations SET content='A corrected public contribution.' WHERE id=7101")
+        corrected, changed = bot.refresh_prompt_source_basis(fresh)
+        self.assertTrue(changed)
+        self.assertNotIn("amber lantern project began", corrected.rendered_context)
+
+    async def test_person_switch_and_unknown_artist_do_not_inherit_another_members_tiers(self):
+        self._seed_member_tiers()
+        self._capture_prior_person_request()
+        for request, expected in (
+            ("Switch to Test Other. Give me a recent public Discord example and quote what Test Other said.", OTHER_COMMENT),
+            ("Tell me about a recent public Discord conversation involving Test Stage Alias.", None),
+        ):
+            with self.subTest(request=request):
+                prompt, metadata = await self.runtime._direct_prompt_async(
+                    "sealed_test", request=request, privileged=False,
+                )
+                self.assertNotIn("earlier exchange explored amber lantern placement", prompt)
+                self.assertNotIn("amber lantern project began", prompt)
+                self.assertFalse(any(isinstance(basis, bot.MemoryPromptSourceBasis) and basis.user_id == SUBJECT
+                                     for basis in metadata["prompt_source_bases"]))
+                if expected:
+                    self.assertIn(expected, prompt)
+
     async def test_person_topic_followup_uses_original_memory_with_or_without_saved_bot_reply(self):
         for policy, enabled, saved in product(("public_home", "sealed_test"), (False, True), (False, True)):
             channel_id = 8811 + len(self.runtime.channel_ids)
@@ -371,6 +546,8 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         names = (
             "maybe_build_bnl_read_model_context",
             "build_tiktok_show_evidence_context_for_turn",
+            "build_named_public_conversation_context",
+            "build_named_public_member_memory_context",
             "prompt_source_basis_failure",
         )
         originals = {name: getattr(bot, name) for name in names}
