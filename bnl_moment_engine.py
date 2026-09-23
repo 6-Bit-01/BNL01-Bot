@@ -5946,6 +5946,8 @@ def select_public_situation_moment_gists(
     require_topic_overlap: bool = False,
     now: str | None = None,
     apply_date_scope: bool = True,
+    prepare_schema: bool = True,
+    observed_before: str = "",
 ) -> tuple[PublicSituationMomentGist, ...]:
     """Return bounded source-revalidated Moment summaries for event queries.
 
@@ -5953,7 +5955,10 @@ def select_public_situation_moment_gists(
     original owners. The canonical stored summary remains unchanged.
     """
 
-    ensure_moment_schema(conn)
+    if prepare_schema:
+        ensure_moment_schema(conn)
+    elif not _table_exists(conn, "memory_moment_windows"):
+        return ()
     policies = tuple(
         sorted(
             {
@@ -5987,10 +5992,11 @@ def select_public_situation_moment_gists(
           )
           AND lifecycle_status='finalized' AND public_usable=1
           AND last_activity_at>=?
+          AND (?='' OR julianday(last_activity_at)<julianday(?))
         ORDER BY salience DESC,last_activity_at DESC,moment_id
         LIMIT 100
         """,
-        (int(guild_id or 0), *policies, cutoff),
+        (int(guild_id or 0), *policies, cutoff, observed_before, observed_before),
     ).fetchall()
     selected: list[PublicSituationMomentGist] = []
     seen: set[str] = set()
@@ -6089,6 +6095,70 @@ def select_public_situation_moment_gists(
         seen.add(summary.casefold())
         used_words += len(words)
     return tuple(selected)
+
+
+def public_moment_source_basis(
+    conn: sqlite3.Connection, *, guild_id: int, moment_id: str,
+) -> dict[str, Any] | None:
+    """Read one public Moment and its original contributions without writes.
+
+    Publication consumers retain this version and exact source identity, then
+    call this same owner again before use. A later ranking change is irrelevant;
+    source correction, removal, privacy or attribution changes are not.
+    """
+    if not _table_exists(conn, "memory_moment_windows"):
+        return None
+    loaded = _moment_episode_basis(conn, moment_id)
+    if loaded is None:
+        return None
+    basis, sources = loaded
+    if (basis["guild_id"] != guild_id or not basis["public_usable"]
+            or basis["visibility"] not in {"public", "public_safe"}
+            or basis["channel_policy"] not in PUBLIC_CROSS_CHANNEL_POLICIES
+            or basis["route_mode"] not in {"normal_chat", "direct_payload", "direct_payload_task"}):
+        return None
+    row = conn.execute("SELECT summary FROM memory_moment_windows WHERE moment_id=?", (moment_id,)).fetchone()
+    summary = str(row[0] or "") if row else ""
+    if not _moment_is_renderable(
+        conn, moment_id=moment_id, summary=summary, guild_id=guild_id,
+        channel_id=basis["channel_id"], channel_policy=basis["channel_policy"],
+        route_mode=basis["route_mode"], visibility=basis["visibility"],
+        canonical_ledger_entry_id=basis["canonical_ledger_entry_id"],
+    ):
+        return None
+    contributions = []
+    for (subject,) in conn.execute(
+        "SELECT participant_key FROM memory_moment_participants WHERE moment_id=? "
+        "AND participant_role='human_author' AND authored_entry_count>0 "
+        "ORDER BY participation_order,participant_key LIMIT 12", (moment_id,),
+    ):
+        gist, label = _contribution_is_renderable(
+            conn, moment_id=moment_id, participant_key=str(subject), guild_id=guild_id,
+            channel_id=basis["channel_id"], channel_policy=basis["channel_policy"],
+            route_mode=basis["route_mode"], visibility=basis["visibility"],
+        )
+        if gist:
+            contributions.append({"subjectRef": str(subject), "displayName": label, "summary": gist})
+    result = {
+        "momentId": moment_id, "summary": summary,
+        "startedAt": basis["window_started_at"], "observedAt": basis["last_activity_at"],
+        "channelPolicy": basis["channel_policy"], "contributions": contributions,
+        "subjectRefs": sorted({source.subject_key for source in sources if source.is_human}),
+        "canonicalLedgerEntryId": basis["canonical_ledger_entry_id"],
+        "originalSourceRefs": [
+            {"ledgerEntryId": entry, "sourceTable": table, "sourceRowId": row_id, "role": role,
+             "subjectRef": subject, "observedAt": observed, "sourceRevision": revision}
+            for entry, table, row_id, role, subject, observed, revision in conn.execute(
+                "SELECT e.entry_id,e.source_table,e.source_row_id,e.source_role,e.subject_key,e.observed_at,e.source_revision "
+                "FROM memory_moment_members m JOIN memory_ledger_entries e ON e.entry_id=m.ledger_entry_id "
+                "WHERE m.moment_id=? ORDER BY e.source_sequence,e.entry_id", (moment_id,),
+            )
+        ],
+    }
+    result["sourceVersion"] = hashlib.sha256(json.dumps(
+        [result, _source_digest(sources)], sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return result
 
 
 def _episode_projection_for_moment(

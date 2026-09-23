@@ -104,6 +104,12 @@ def inspect(db_path: str, guild_id: int, *, now: datetime = None) -> dict:
                 item = json.loads(raw)
                 summaries.append({
                     "editorialVersion": item.get("editorialVersion", "legacy-anonymous"),
+                    "sharedInputVersion": item.get("sharedInputVersion", "none"),
+                    "sharedInputCandidates": len(item.get("sharedInputSourceProvenance", [])),
+                    "citedPublicMoments": sum(source.get("sourceKind") == "public_moment"
+                                              for source in item.get("usedSharedSourceProvenance", []) if isinstance(source, dict)),
+                    "citedFinalizedShows": sum(source.get("sourceKind") == "finalized_show"
+                                               for source in item.get("usedSharedSourceProvenance", []) if isinstance(source, dict)),
                     "namedParticipants": len(item.get("publicPeople", [])),
                     "citedConversations": len(item.get("supportingConversationRefs", [])),
                     "citedRelays": len(item.get("supportingRelayIds", [])),

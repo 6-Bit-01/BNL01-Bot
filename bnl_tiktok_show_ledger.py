@@ -369,6 +369,8 @@ def _load_finalized_show_ledgers(
     *,
     guild_id: int,
     limit: int = 200,
+    source_window_ms: tuple[int, int] | None = None,
+    show_keys: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -376,15 +378,24 @@ def _load_finalized_show_ledgers(
     ).fetchone()
     if not exists:
         return []
+    scope = ""
+    params: list[Any] = [int(guild_id)]
+    if source_window_ms is not None:
+        scope += " AND ended_at_ms>=? AND ended_at_ms<?"
+        params.extend(source_window_ms)
+    if show_keys:
+        scope += " AND show_key IN (" + ",".join("?" for _ in show_keys) + ")"
+        params.extend(show_keys)
+    params.append(max(1, min(int(limit or 1), 500)))
     rows = conn.execute(
         f"""
         SELECT show_key,source_digest,ended_at_ms,ledger_json
         FROM {TIKTOK_SHOW_EVIDENCE_TABLE}
-        WHERE guild_id=? AND lifecycle_status='finalized'
+        WHERE guild_id=? AND lifecycle_status='finalized' {scope}
         ORDER BY ended_at_ms DESC,show_key DESC
         LIMIT ?
         """,
-        (int(guild_id), max(1, min(int(limit or 1), 500))),
+        params,
     ).fetchall()
     loaded: list[dict[str, Any]] = []
     for show_key, source_digest, ended_at_ms, raw_json in rows:
@@ -398,6 +409,8 @@ def _load_finalized_show_ledgers(
             str(ledger.get("showKey") or "") != str(show_key or "")
             or str(ledger.get("sourceDigest") or "")
             != str(source_digest or "")
+            or ledger.get("lifecycle") != "finalized"
+            or int(ledger.get("endedAtMs") or 0) != int(ended_at_ms or 0)
         ):
             continue
         loaded.append(
@@ -409,6 +422,25 @@ def _load_finalized_show_ledgers(
             }
         )
     return loaded
+
+
+def select_finalized_show_operations(
+    conn: sqlite3.Connection, *, guild_id: int,
+    source_window_ms: tuple[int, int], show_keys: tuple[str, ...] = (),
+) -> tuple[TikTokShowEpisodeContextItem, ...]:
+    """Bounded publication view over the same authorized show/operation owner.
+
+    Completion belongs to the recorded end time, not schedule or sync time.
+    Chat and cached community interpretations never become operation evidence.
+    Exact keys allow saved publications to revalidate without reranking.
+    """
+    rows = _load_finalized_show_ledgers(
+        conn, guild_id=guild_id, limit=8, source_window_ms=source_window_ms,
+        show_keys=show_keys[:8],
+    )
+    return tuple(item for row in rows
+                 for item in [_operational_episode_context_item(row, user_text="show recap")]
+                 if item is not None)
 
 
 def ensure_tiktok_show_evidence_schema(conn: sqlite3.Connection) -> None:
