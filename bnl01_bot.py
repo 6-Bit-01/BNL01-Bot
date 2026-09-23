@@ -2040,9 +2040,9 @@ _bnl_control_flags_has_remote_snapshot = False
 _bnl_control_flags_404_warned = False
 _bnl_control_flags_last_source_url = None
 BNL_READ_MODEL_TTL_SECONDS = 20
-# The authenticated feed can take more than three seconds to send headers.
-# Allow that response to arrive without retries or extending snapshot freshness.
-BNL_READ_MODEL_TIMEOUT_SECONDS = 8
+# Production feed headers can take about nine seconds. Keep one bounded
+# attempt, with its entire wait still counted against snapshot freshness.
+BNL_READ_MODEL_TIMEOUT_SECONDS = 15
 _bnl_read_model_cache = None
 _bnl_read_model_cached_at = None
 _bnl_read_model_cache_scope = None
@@ -2276,18 +2276,27 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
     if api_key:
         headers["x-api-key"] = api_key
     req = urllib.request.Request(source_url, method="GET", headers=headers)
+    request_started = time.monotonic()
+    request_phase = "headers"
     try:
         with urllib.request.urlopen(req, timeout=BNL_READ_MODEL_TIMEOUT_SECONDS) as response:
+            headers_seconds = time.monotonic() - request_started
             code = getattr(response, "status", None) or response.getcode()
             if not (200 <= code < 300):
                 logging.warning("bnl_read_model_fetch_failed reason=http_status")
                 if code in {408, 429} or 500 <= code < 600:
                     return fresh_cached_snapshot(refresh_failed=True)
                 return discard_rejected_snapshot()
-            body = response.read().decode("utf-8", errors="replace")
+            request_phase = "body"
+            response_body = response.read()
+            request_phase = "json"
+            body = response_body.decode("utf-8", errors="replace")
             data = json.loads(body) if body else {}
     except Exception as e:
-        logging.warning(f"bnl_read_model_fetch_failed reason={type(e).__name__}")
+        logging.warning(
+            "bnl_read_model_fetch_failed reason=%s phase=%s elapsed_seconds=%.3f",
+            type(e).__name__, request_phase, time.monotonic() - request_started,
+        )
         transient = (
             (e.code in {408, 429} or 500 <= e.code < 600)
             if isinstance(e, urllib.error.HTTPError)
@@ -2317,9 +2326,13 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
     if superseded:
         return fresh_cached_snapshot()
     logging.info(
-        "bnl_read_model_fetch_success sections=%s access_scope=%s",
+        "bnl_read_model_fetch_success sections=%s access_scope=%s "
+        "headers_seconds=%.3f elapsed_seconds=%.3f bytes=%s",
         len(data.get("sections") or {}),
         website_queue_access_scope(data),
+        headers_seconds,
+        time.monotonic() - request_started,
+        len(response_body),
     )
     return data
 

@@ -132,18 +132,82 @@ class ReadModelRefreshRecoveryTests(unittest.TestCase):
         self.assertEqual(bnl01_bot.fetch_bnl_read_model(force=True), original)
         request = self.http.call_args.args[0]
         self.assertEqual(request.get_header("Cache-control"), "no-cache")
-        self.assertEqual(self.http.call_args.kwargs["timeout"], 8)
+        self.assertEqual(self.http.call_args.kwargs["timeout"], 15)
         self.assertEqual(bnl01_bot._bnl_read_model_cached_at, original_time)
         self.advance(10)
         self.assertEqual(bnl01_bot.fetch_bnl_read_model(force=True), {})
         self.assertEqual(bnl01_bot._bnl_read_model_cached_at, original_time)
 
+    def test_nine_second_public_history_response_reaches_authorized_reader(self):
+        from test_public_show_history import public_history_model
+        from test_tiktok_show_evidence_ledger import ENABLED_QUEUE_ENV
+        from bnl_canon_source_contract import show_queue_evidence_authorization
+
+        payload = public_history_model()
+        payload["schemaRevision"] = "1.11"
+        body = json.dumps(payload).encode("utf-8")
+        received = []
+        advance = self.advance
+
+        class SlowPublicHistory(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append((self.path, self.headers.get("x-api-key")))
+                # Production headers arrived at 8.77 and 8.95 seconds; the
+                # previous eight-second socket budget rejected both feeds.
+                time.sleep(9)
+                advance(9)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), SlowPublicHistory) as server:
+            serving = threading.Thread(target=server.serve_forever, daemon=True)
+            serving.start()
+            self.http.side_effect = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+            ).open
+            try:
+                with mock.patch.object(
+                    bnl01_bot, "BNL_READ_MODEL_URL",
+                    f"http://127.0.0.1:{server.server_port}/api/bnl/read-model",
+                ):
+                    started = self.clock
+                    loaded = bnl01_bot.fetch_bnl_read_model(force=True)
+                    self.assertTrue(loaded, "A nine-second public feed must reach the reader")
+                    authorization = show_queue_evidence_authorization(
+                        loaded, environ=ENABLED_QUEUE_ENV,
+                    )
+                    self.assertTrue(authorization["usable"], authorization)
+                    self.assertEqual(authorization["receipt"]["archiveSchemaVersion"],
+                                     "queue_bnl_public_history_v1")
+                    self.assertEqual(bnl01_bot._bnl_read_model_cached_at, started)
+                    self.advance(10)
+                    self.assertEqual(bnl01_bot.fetch_bnl_read_model(), loaded)
+                    self.http.assert_called_once()
+                    self.assertEqual(received, [("/api/bnl/read-model", "test-service-key")])
+                    # The wait consumes freshness; it never buys a new TTL.
+                    self.advance(1)
+                    self.http.side_effect = TimeoutError("test timeout")
+                    self.assertEqual(bnl01_bot.fetch_bnl_read_model(force=True), {})
+                    self.assertEqual(bnl01_bot._bnl_read_model_cached_at, started)
+            finally:
+                server.shutdown()
+                serving.join(timeout=2)
+
     def test_expiry_during_failed_refresh_cannot_return_current_queue(self):
         self.seed()
         self.advance(19)
 
-        def timeout_after_wait(*_args, **_kwargs):
-            self.advance(8)
+        def timeout_after_wait(*_args, **kwargs):
+            self.advance(kwargs["timeout"])
             raise TimeoutError("test timeout")
 
         self.http.side_effect = timeout_after_wait
