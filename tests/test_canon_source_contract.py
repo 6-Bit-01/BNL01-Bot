@@ -350,6 +350,19 @@ if __name__ == "__main__":
     unittest.main()
 
 class PublishedBalladContextTests(unittest.TestCase):
+    def test_current_archive_link_is_accepted_but_unrelated_hosts_and_views_are_not(self):
+        model = hostile_read_model(queue_production=False)
+        for url, allowed in (
+            ("https://www.barcode-network.com/radio/archive?view=shows&show=show-1#broadcast-ballad", True),
+            ("https://www.barcode-network.com.evil.test/radio/archive?view=shows&show=show-1#broadcast-ballad", False),
+            ("https://www.barcode-network.com/radio/archive?view=private&show=show-1#broadcast-ballad", False),
+            ("https://www.barcode-network.com/radio/archive?view=shows#broadcast-ballad", False),
+        ):
+            with self.subTest(url=url):
+                model["sections"]["ballads"] = {"available": True, "songs": [{"title": "The Last Light", "url": url}]}
+                context = build_bnl_read_model_context(model, "Tell me about BNL's released music", "public")
+                self.assertEqual("The Last Light" in context, allowed)
+
     def test_public_release_metadata_is_available_without_treating_lyrics_as_evidence(self):
         model = hostile_read_model(queue_production=False)
         model["sections"]["ballads"] = {"available": True, "songs": [{"title": "The Last Light", "showTitle": "Friday Radio", "showDate": "2026-09-11", "url": "https://www.barcode-network.com/radio/ballads?show=show-1", "lyrics": "DO_NOT_RENDER_CREATIVE_LYRICS"}]}

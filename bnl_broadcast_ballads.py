@@ -6,12 +6,16 @@ The website owns controls/media/publication; the existing show ledger owns facts
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
+import os
 import re
 import sqlite3
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from bnl_creative_protocol import SUNO_LYRIC_PROTOCOL
@@ -21,6 +25,145 @@ MANUAL_ROUTE = "broadcast_ballad_manual"
 PROMPT_VERSION = "broadcast-ballad-5"
 LINER_NOTE_FIELDS = ("about", "inspiration", "mentions", "inspiredBy")
 PALETTE_FIELDS = ("angle", "hook", "topics", "imagery", "genres", "era", "arrangement")
+PUBLICATION_READ_LIMIT = 2_000_000
+PUBLICATION_LOOKBACK_DAYS = 30
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def has_local_versions(conn, guild_id):
+    """A read adapter must not initialize the creative store."""
+    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bnl_ballad_versions'").fetchone()
+                and conn.execute("SELECT 1 FROM bnl_ballad_versions WHERE guild_id=? LIMIT 1", (guild_id,)).fetchone())
+
+
+def read_publication_catalog(base_url=None, *, opener=None):
+    """One bounded public GET. Never poll the side-effectful Ballad control API.
+
+    This is a transient authority snapshot, not another catalog or memory store.
+    Project only public release metadata; discard lyrics and production fields.
+    """
+    base = urllib.parse.urlparse(base_url if base_url is not None else os.getenv("BNL_STATUS_URL", ""))
+    unavailable = {"available": False, "songs": []}
+    if base.scheme not in {"http", "https"} or not base.netloc or base.username or base.password:
+        return unavailable
+    origin = f"{base.scheme}://{base.netloc}"
+    try:
+        request = urllib.request.Request(origin + "/api/ballads/catalog", headers={"Accept": "application/json"})
+        with (opener or urllib.request.urlopen)(request, timeout=5) as response:
+            if getattr(response, "status", 200) != 200:
+                return unavailable
+            raw = response.read(PUBLICATION_READ_LIMIT + 1)
+        if len(raw) > PUBLICATION_READ_LIMIT:
+            return unavailable
+        payload = json.loads(raw)
+        catalog = payload.get("ballads") if isinstance(payload, dict) else None
+        if not isinstance(catalog, list) or len(catalog) > 200:
+            return unavailable
+        songs, seen = [], set()
+        for item in catalog:
+            show, version = item["show"], item["version"]
+            for value in (show["sessionId"], show["showDate"], version["id"], version["title"], item["audioId"], item["publishedAt"]):
+                if not isinstance(value, str) or not value.strip() or len(value) > 300:
+                    return unavailable
+            if show["sessionId"] in seen or version.get("author") != "BNL-01":
+                return unavailable
+            seen.add(show["sessionId"])
+            published = datetime.fromisoformat(item["publishedAt"].replace("Z", "+00:00"))
+            if published.tzinfo is None:
+                return unavailable
+            datetime.fromisoformat(show["showDate"])
+            song = {
+                "showId": show["sessionId"], "showDate": show["showDate"],
+                "showTitle": str(show.get("title") or "")[:180],
+                "versionId": version["id"], "title": version["title"],
+                "style": str(version.get("style") or "")[:700],
+                "palette": {key: str((version.get("palette") or {}).get(key) or "")[:180] for key in PALETTE_FIELDS},
+                "linerNotes": {key: value[:350] for key, value in liner_notes(item.get("linerNotes")).items()},
+                "publishedAt": item["publishedAt"], "audioId": item["audioId"],
+                "url": origin + "/radio/archive?view=shows&show=" + urllib.parse.quote(show["sessionId"], safe="") + "#broadcast-ballad",
+            }
+            song["publicationHash"] = _digest(song)
+            songs.append(song)
+        return {"available": True, "songs": songs}
+    except (OSError, http.client.HTTPException, ValueError, TypeError, KeyError, AttributeError):
+        # No exception text: transport bodies can contain unrelated/private data.
+        return unavailable
+
+
+def _local_version(conn, guild_id, show_id, version_id):
+    if not has_local_versions(conn, guild_id):
+        return None
+    row = conn.execute("SELECT document FROM bnl_ballad_versions WHERE guild_id=? AND show_id=? AND version_id=?",
+                       (guild_id, show_id, version_id)).fetchone()
+    try:
+        document = json.loads(row[0]) if row else {}
+        digest = document.pop("contentHash", "")
+        if (document.get("id") != version_id or document.get("showId") != show_id
+                or document.get("author") != "BNL-01" or not digest or _digest(document) != digest):
+            return None
+        return document, digest
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def select_editorial_publications(conn, guild_id, snapshot, *, observed_before, topic_text="", limit=2):
+    """Exact released versions, within a bounded historical window; no lyrics."""
+    if not snapshot or snapshot.get("available") is not True:
+        return []
+    end = datetime.fromisoformat(observed_before.replace("Z", "+00:00"))
+    start = end - timedelta(days=PUBLICATION_LOOKBACK_DAYS)
+    terms = set(re.findall(r"\w{4,}", topic_text.casefold()))
+    selected = []
+    for song in sorted(snapshot["songs"], key=lambda s: datetime.fromisoformat(s["publishedAt"].replace("Z", "+00:00")), reverse=True):
+        published = datetime.fromisoformat(song["publishedAt"].replace("Z", "+00:00"))
+        if not start <= published < end:
+            continue
+        local = _local_version(conn, guild_id, song["showId"], song["versionId"])
+        if local is None or local[0].get("title") != song["title"] or str(local[0].get("style") or "")[:700] != song["style"]:
+            continue
+        local_palette = local[0].get("palette") or {}
+        if not isinstance(local_palette, dict) or any(str(local_palette.get(key) or "")[:180] != song["palette"][key] for key in PALETTE_FIELDS):
+            continue
+        metadata = json.dumps({key: value for key, value in song.items() if key != "publicationHash"}, ensure_ascii=False)
+        if terms and not terms.intersection(re.findall(r"\w{4,}", metadata.casefold())):
+            continue
+        text = "Published Broadcast Ballad; creative release metadata only, never proof of show events, participant conduct, or canon. " + metadata
+        basis = {"sourceKind": "published_ballad", "sourceId": song["showId"], "versionId": song["versionId"],
+                 "audioId": song["audioId"], "publishedAt": song["publishedAt"], "versionHash": local[1],
+                 "publicationHash": song["publicationHash"], "sourceVersion": _digest([song["publicationHash"], local[1]])}
+        selected.append({"summary": text, "basis": basis, "showLink": song["url"]})
+        if len(selected) >= max(1, min(limit, 2)):
+            break
+    return selected
+
+
+def local_publication_basis_is_current(conn, guild_id, source):
+    local = _local_version(conn, guild_id, source.get("sourceId"), source.get("versionId"))
+    return bool(local and local[1] == source.get("versionHash")
+                and source.get("sourceVersion") == _digest([source.get("publicationHash"), local[1]]))
+
+
+def publication_snapshot_for_basis(basis, base_url=None):
+    if any(isinstance(row, dict) and row.get("sourceKind") == "published_ballad" for row in basis or []):
+        return read_publication_catalog(base_url)
+    return None
+
+
+def publication_source_failure(basis, snapshot):
+    """Pure snapshot check, safe inside a short SQLite fence; never performs I/O."""
+    sources = [row for row in basis or [] if isinstance(row, dict) and row.get("sourceKind") == "published_ballad"]
+    if not sources:
+        return ""
+    if not snapshot or snapshot.get("available") is not True:
+        return "ballad_publication_unavailable"
+    for source in sources:
+        current = next((song for song in snapshot["songs"] if song["showId"] == source.get("sourceId")), None)
+        if not current or any(current.get(key) != source.get(key) for key in ("versionId", "audioId", "publishedAt", "publicationHash")):
+            return "ballad_publication_changed"
+    return ""
 
 
 @dataclass(frozen=True)

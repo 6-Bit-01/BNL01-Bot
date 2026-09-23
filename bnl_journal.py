@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+import bnl_broadcast_ballads as ballads
 from bnl_canon_source_contract import (
     CANON_FACTS,
     CANON_SOURCE_CONTRACT_VERSION,
@@ -40,7 +41,7 @@ JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
 JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
 JOURNAL_EDITORIAL_VERSION = "journal-public-voices-1"
-JOURNAL_SHARED_INPUT_VERSION = "journal-shared-inputs-1"
+JOURNAL_SHARED_INPUT_VERSION = "journal-shared-inputs-2"
 JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-2"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
@@ -74,6 +75,7 @@ JOURNAL_CONTEXT_LANE_TYPES = {
     "bnl_inference",
 }
 JOURNAL_REFLECTION_BASIS_KINDS = {
+    "published_ballad",
     "public_moment",
     "public_source_history",
     "accepted_relay_continuity",
@@ -3577,6 +3579,9 @@ def journal_shared_source_provenance_is_current(
                 )
                 if len(items) != 1 or items[0].source_digest != source["sourceVersion"]:
                     return False
+            elif source.get("sourceKind") == "published_ballad":
+                if not ballads.local_publication_basis_is_current(conn, guild_id, source):
+                    return False
             else:
                 return False
     except sqlite3.Error:
@@ -3620,7 +3625,17 @@ def build_packet_from_sources(
         entry_kind=entry_kind,
     )
     with _read_source_database(db_path) as conn:
+        has_ballads = ballads.has_local_versions(conn, guild_id)
+    # The site owns publication, SQLite owns immutable creative versions. Keep
+    # this bounded network read outside every database transaction.
+    ballad_snapshot = ballads.read_publication_catalog() if has_ballads else None
+    with _read_source_database(db_path) as conn:
         operations, moment_basis, shared_provenance = _journal_shared_inputs(conn, guild_id, start, end, private_sources)
+        published_ballads = ballads.select_editorial_publications(conn, guild_id, ballad_snapshot, observed_before=end)
+        for item in published_ballads:
+            basis = item["basis"]
+            ref = "reflection:ballad:" + _hash(basis["sourceId"], basis["versionId"])[:24]
+            shared_provenance.append({**basis, "refId": ref})
         private_sources = [*private_sources[:MAX_PROMPT_SOURCES - len(operations)], *operations]
         historical_authors = [
             {**contribution, "sourceKind": "conversation", "refId": item["refId"],
@@ -3662,6 +3677,14 @@ def build_packet_from_sources(
              "summary": project_summary(c["summary"])} for c in item["contributions"]
         ]
 
+    ballad_basis = [{
+        "refId": "reflection:ballad:" + _hash(item["basis"]["sourceId"], item["basis"]["versionId"])[:24],
+        "basisKind": "published_ballad", "scope": JOURNAL_REFLECTION_SCOPE,
+        "publicSafe": True, "reuseEligible": True,
+        "summary": project_summary(item["summary"], limit=6000),
+        "showLink": item["showLink"],
+        "sourceObservedAt": item["basis"]["publishedAt"], "sourceVersion": item["basis"]["sourceVersion"],
+    } for item in published_ballads]
     safe_sources = []
     private_sources = [dict(source) for source in private_sources]
     for source in private_sources:
@@ -3686,6 +3709,7 @@ def build_packet_from_sources(
     counts["promptConversations"] = len([s for s in private_sources if s.get("sourceKind") == "conversation"])
     counts["promptFinalizedShows"] = len(operations)
     counts["publicMomentContext"] = len(moment_basis)
+    counts["publishedBalladContext"] = len(ballad_basis)
     packet = {
         "entryKind": entry_kind if entry_kind in {"daily", "weekly", "manual"} else "manual",
         "sourceWindowStart": start,
@@ -3773,8 +3797,8 @@ def build_packet_from_sources(
             "minimumDistinctWindowSegments": 0,
             "lowActivityReflectionMode": True,
         }
-    if moment_basis:
-        packet["reflectionBasis"] = [*packet.get("reflectionBasis", []), *moment_basis]
+    if moment_basis or ballad_basis:
+        packet["reflectionBasis"] = [*packet.get("reflectionBasis", []), *moment_basis, *ballad_basis]
         packet.setdefault("reflectionBasisContract", {
             "version": 1, "scope": JOURNAL_REFLECTION_SCOPE,
             "basisKinds": sorted(JOURNAL_REFLECTION_BASIS_KINDS),
@@ -4239,6 +4263,7 @@ def build_generation_prompt(
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
         "\nPublic Moment reflection records preserve earlier exchanges and each original participant's contribution. Use their source dates, preserve banter, uncertainty and unanswered questions, and paraphrase rather than inventing quotations. A matching topic never makes today's speaker a participant in an earlier exchange. Cite the reflection ref when using it; it does not increase fresh-source, current-participant or recurrence counts."
         "\nFinalized-show sources report recorded public operations in a completed show. Their date and timeline control the tense; they never establish that a show is live now. Chat, a Moment, a Relay and a Journal retelling of the same occurrence are not independent witnesses or additional occurrences. A show record establishes playback only where playback is recorded."
+        "\nPublished Ballad reflection records establish only the released song and its approved creative metadata. Discuss the song as a song. Liner notes are creative interpretation, never proof that a person acted, a quoted event happened, or new canon was established. Their release date is distinct from the linked show's date. Drafts and lyrics are not supplied as evidence."
         f"{coverage_rule}"
         f"{section_source_rule}"
         f"{quote_rule}"
@@ -5193,6 +5218,10 @@ def store_validated_draft(
     source_hash: str = "",
 ) -> JournalResult:
     ensure_schema(db_path)
+    basis = packet.get("privateSharedSourceProvenance", [])
+    publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis))
+    if publication_failure:
+        return JournalResult(False, "no_draft", publication_failure, entry_id=entry_id, revision=revision)
     with sqlite3.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         if not _attempt_fence_owned(conn, attempt_fence):
@@ -5372,6 +5401,17 @@ def generate_test_preview(
     return result
 
 
+def _ballad_snapshot_for_entry(db_path, guild_id, entry_id, revision):
+    with _read_source_database(db_path) as conn:
+        row = conn.execute(
+            "SELECT metadata_json FROM bnl_journal_private_metadata WHERE guild_id=? AND entry_id=? "
+            + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"),
+            (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id),
+        ).fetchone()
+        basis = _json_object(row[0] if row else None).get("sharedInputSourceProvenance", [])
+    return ballads.publication_snapshot_for_basis(basis)
+
+
 def approve_draft(
     db_path: str,
     guild_id: int,
@@ -5384,6 +5424,7 @@ def approve_draft(
 ) -> JournalResult:
     ensure_schema(db_path)
     now = utc_now_iso()
+    publication_snapshot = _ballad_snapshot_for_entry(db_path, guild_id, entry_id, revision)
     with sqlite3.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         if not _attempt_fence_owned(conn, attempt_fence):
@@ -5416,6 +5457,10 @@ def approve_draft(
             return JournalResult(False, "draft", "request_body_too_large", entry_id, rev, stored_hash)
         request_hash = canonical_payload_hash(canonical)
         metadata = _json_object(row[4])
+        publication_failure = ballads.publication_source_failure(metadata.get("sharedInputSourceProvenance", []), publication_snapshot)
+        if publication_failure:
+            conn.rollback()
+            return JournalResult(False, "draft", publication_failure, entry_id, rev, stored_hash)
         stored_request_hash = str(metadata.get("canonicalPayloadHash") or "")
         if stored_request_hash and stored_request_hash != request_hash:
             conn.rollback()
@@ -5525,7 +5570,13 @@ def regenerate_draft(
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id, old_revision)
+    basis = packet.get("privateSharedSourceProvenance", [])
+    publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis))
+    if publication_failure:
+        return JournalResult(False, "no_draft", publication_failure, entry_id, old_revision)
     with sqlite3.connect(db_path) as conn:
+        if not journal_shared_source_provenance_is_current(conn, guild_id, basis):
+            return JournalResult(False, "no_draft", "privacy_source_ineligible", entry_id, old_revision)
         reason = validate_article(
             article,
             packet,
@@ -5610,6 +5661,7 @@ def deliver_approved(
             return JournalResult(False, "not_deliverable", "privacy_memory_ineligible", entry_id, int(revision or 0))
         if not journal_shared_source_provenance_is_current(conn, guild_id, identity_meta.get("sharedInputSourceProvenance", [])):
             return JournalResult(False, "not_deliverable", "privacy_source_ineligible", entry_id, int(revision or 0))
+    basis = identity_meta.get("sharedInputSourceProvenance", [])
     if delivery_fence is not None:
         # Privacy/deletion writers share this narrow Journal fence. The main
         # SQLite transaction is deliberately released before the network wait,
@@ -5657,6 +5709,9 @@ def deliver_approved(
                         )
                 conn.commit()
 
+            publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis, base_url))
+            if publication_failure:
+                return JournalResult(False, "not_deliverable", publication_failure, entry_id, rev)
             status, reason, http, idem, published = _post_canonical_payload(
                 canonical,
                 base_url,
@@ -5724,6 +5779,9 @@ def deliver_approved(
     if not row:
         return JournalResult(False, "not_deliverable", "not_approved", entry_id)
     rev, canonical, content_hash = int(row[0]), row[1], row[2]
+    publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis, base_url))
+    if publication_failure:
+        return JournalResult(False, "not_deliverable", publication_failure, entry_id, rev)
     status, reason, http, idem, published = _post_canonical_payload(canonical, base_url, api_key, opener, timeout)
     now = utc_now_iso()
     with sqlite3.connect(db_path) as conn:

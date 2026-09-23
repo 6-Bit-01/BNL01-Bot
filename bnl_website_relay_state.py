@@ -17,7 +17,7 @@ MAX_SCHEDULE_CLAIMS_PER_GUILD = 4096
 RELAY_PUBLICATION_READ_VERSION = "accepted_relay_publication_read_v1"
 RELAY_PUBLICATION_TOPIC_SCAN_LIMIT = 200
 RELAY_PUBLICATION_RESULT_LIMIT = 4
-RELAY_SHARED_SOURCE_CLASSES = ("public_moment", "finalized_show", "published_journal")
+RELAY_SHARED_SOURCE_CLASSES = ("public_moment", "finalized_show", "published_journal", "published_ballad")
 RELAY_SHARED_LOOKBACK_DAYS = 30
 STOCK_FAMILIES = {
     "waiting_standby": (
@@ -66,7 +66,7 @@ class WebsiteRelayDecision:
 
 def select_shared_relay_sources_on_connection(
     conn: sqlite3.Connection, *, guild_id: int, topic_text: str = "",
-    control_snapshot=None, now: str | None = None,
+    control_snapshot=None, publication_snapshot=None, now: str | None = None,
     source_cursor: int = 0, highest: int = 0,
 ) -> tuple[RelaySourceDecision, ...]:
     """Bounded read adapters for the existing quiet-source rotation, without writes.
@@ -78,6 +78,7 @@ def select_shared_relay_sources_on_connection(
     from bnl_journal import journal_topic_counts, render_journal_publication, select_published_journal_entries_on_connection
     from bnl_moment_engine import public_moment_source_basis, select_public_situation_moment_gists
     from bnl_tiktok_show_ledger import select_finalized_show_operations
+    from bnl_broadcast_ballads import select_editorial_publications
 
     end = now or utc_now_iso()
     end_ms = timestamp_to_epoch_ms(end)
@@ -153,17 +154,24 @@ def select_shared_relay_sources_on_connection(
                 "publishedAt": item.published_at,
             })
         break
+    for item in select_editorial_publications(conn, guild_id, publication_snapshot,
+                                             observed_before=end, topic_text=topic_text, limit=1):
+        append("published_ballad", item["summary"], item["basis"])
     return tuple(selected)
 
 
-def shared_relay_source_failure(conn: sqlite3.Connection, guild_id: int, basis: Any, *, control_snapshot=None) -> str:
+def shared_relay_source_failure(conn: sqlite3.Connection, guild_id: int, basis: Any, *, control_snapshot=None, publication_snapshot=None) -> str:
     """Recheck exact saved sources, including original Moment contributions."""
     from bnl_journal import (
         journal_control_snapshot_status, journal_shared_source_provenance_is_current,
         revalidate_published_journal_entry_on_connection,
     )
-    if not isinstance(basis, list) or not basis or len(basis) > 3:
+    from bnl_broadcast_ballads import publication_source_failure
+    if not isinstance(basis, list) or not basis or len(basis) > 4:
         return "relay_source_basis_invalid"
+    publication_failure = publication_source_failure(basis, publication_snapshot)
+    if publication_failure:
+        return "relay_source_unavailable" if publication_failure == "ballad_publication_unavailable" else "relay_source_changed"
     for source in basis:
         if not isinstance(source, dict) or not source.get("sourceId") or not source.get("sourceVersion"):
             return "relay_source_basis_invalid"

@@ -11,6 +11,7 @@ from typing import AbstractSet, Any, Callable, Optional
 
 import pytz
 
+import bnl_broadcast_ballads as ballads
 from bnl_journal import (
     JOURNAL_SITE_REQUEST_BODY_MAX_BYTES,
     SCHEDULED_PREPARED_STATE,
@@ -47,6 +48,7 @@ MAX_AUTOMATIC_GENERATION_CYCLES = 4
 GENERATION_CYCLE_WINDOW_HOURS = 24
 TERMINAL_RUN_STATES = {"published", "quiet", "incomplete", "superseded"}
 DELIVERY_PREFLIGHT_INVALIDATION_REASONS = frozenset({
+    "ballad_publication_changed",
     "prepared_revision_missing",
     "prepared_payload_integrity_failed",
     "source_packet_hash_mismatch",
@@ -1633,10 +1635,14 @@ def _freeze_or_load_packet(
         if not isinstance(parsed, dict):
             return None, "", "frozen_packet_invalid"
         stored = dict(parsed)
+        publication_failure = ballads.publication_source_failure(stored.get("privateSharedSourceProvenance", []), publication_snapshot)
+        if publication_failure == "ballad_publication_unavailable":
+            # Preserve exact frozen inputs through temporary authority outages.
+            return None, "", publication_failure
         if not stored.get("sourceArchiveAvailable", False) or not stored.get("coverageComplete", True):
             invalidation = "source_packet_ineligible"
         else:
-            invalidation = _frozen_packet_invalidation_reason(conn, guild_id, stored)
+            invalidation = publication_failure or _frozen_packet_invalidation_reason(conn, guild_id, stored)
         if invalidation:
             conn.execute(
                 "UPDATE bnl_journal_automation_runs SET frozen_packet_json=NULL,frozen_packet_hash=NULL,"
@@ -1646,6 +1652,17 @@ def _freeze_or_load_packet(
             )
             return None, "", invalidation
         return stored, stored_hash, ""
+
+    # Fetch external authority before the write fence, and compare against the
+    # actual packet under the fence. A different concurrent basis fails closed.
+    with sqlite3.connect(db_path) as conn:
+        previous = conn.execute("SELECT frozen_packet_json FROM bnl_journal_automation_runs WHERE run_id=?", (run_id,)).fetchone()
+    try:
+        previous_packet = json.loads(previous[0] or "{}") if previous else {}
+        previous_basis = previous_packet.get("privateSharedSourceProvenance", [])
+    except (ValueError, TypeError, AttributeError):
+        previous_basis = []
+    publication_snapshot = ballads.publication_snapshot_for_basis(previous_basis)
 
     # Fast recovery still takes the write lock: a privacy deletion and a
     # preparation owner can never pass one another between validation/return.
@@ -1669,6 +1686,8 @@ def _freeze_or_load_packet(
     # Packet construction may read several durable owners and therefore cannot
     # run under this table's write transaction. Recheck everything after it.
     packet = builder()
+    publication_snapshot = ballads.publication_snapshot_for_basis(
+        packet.get("privateSharedSourceProvenance", []) if isinstance(packet, dict) else [])
     with sqlite3.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
@@ -1692,7 +1711,8 @@ def _freeze_or_load_packet(
         if not packet.get("sourceArchiveAvailable", False) or not packet.get("coverageComplete", True):
             conn.commit()
             return packet, "", "source_packet_ineligible"
-        invalidation = _frozen_packet_invalidation_reason(conn, guild_id, packet)
+        invalidation = (ballads.publication_source_failure(packet.get("privateSharedSourceProvenance", []), publication_snapshot)
+                        or _frozen_packet_invalidation_reason(conn, guild_id, packet))
         if invalidation:
             conn.commit()
             return None, "", invalidation
@@ -3022,7 +3042,7 @@ def _finish_invalidated_delivery(
             str(row[1] or result.entry_id),
             int(row[2] or result.revision),
             result.reason,
-            retire_packet=result.reason.startswith("privacy_"),
+            retire_packet=result.reason.startswith("privacy_") or result.reason == "ballad_publication_changed",
         )
         conn.commit()
     return AutomationResult(
@@ -3194,6 +3214,10 @@ def _release_occurrence_under_fence(
             counts,
         )
     status = delivered.status if delivered.status in {"published", "delivery_failed"} else "held"
+    if delivered.reason == "ballad_publication_unavailable":
+        # Use the existing exact-payload delivery retry owner. A held occurrence
+        # is preparation work; this outage requires no new draft or model call.
+        status = "delivery_failed"
     result = AutomationResult(
         delivered.ok,
         cadence,
