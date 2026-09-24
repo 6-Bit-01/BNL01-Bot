@@ -229,6 +229,24 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
             conn.execute("UPDATE conversations SET channel_policy='internal_controlled' WHERE id=1")
         self.assertEqual(bot.prompt_source_basis_failure((basis,)), "conversation_source_changed")
 
+    def test_resolved_self_recall_does_not_need_platform_or_activity_words(self):
+        self.seed()
+        self.seed(2, user_id=333, text="The neighbor's public history.")
+        self.seed(3, policy="internal_controlled", text="The private fixture history.")
+        for text in ("What do you remember about me?", "Tell me about my history."):
+            with self.subTest(text=text):
+                frame = build_situation_frame_v1(
+                    route_allowed=True, route_mode="normal_chat", conversation_surface="public_home",
+                    channel_policy="public_home", current_text=text,
+                    current_speaker_user_ids=(222,), current_speaker_labels=("TestMarbles",),
+                    response_act="answer",
+                )
+                context, basis = self.read(text=text, policy="public_home", frame=frame)
+                self.assertIn(STATEMENT, context)
+                self.assertEqual(basis.source_row_ids, (1,))
+                self.assertEqual(basis.participant_user_ids, (222,))
+                self.assertFalse(bot.refresh_prompt_source_basis(basis)[1])
+
     def test_shared_explicit_date_filter_uses_pacific_calendar_and_invalid_date_is_empty(self):
         self.seed()
         self.seed(2, timestamp="2026-08-30T03:00:00+00:00")

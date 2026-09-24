@@ -23,6 +23,8 @@ is added by this change.
   Uncertainty about a task or conversational referent does not revoke an
   independently resolved speaker's attributed background; uncertain identity
   candidates still do not authorize a source read.
+  A resolved speaker can also receive their own public originals without an
+  additional platform/activity-word check.
 - Public show episodes and their authored messages retain subject/source
   bindings and episode/date scope. Topic overlap orders candidates, including
   older matches, without removing the resolved person's remaining evidence.
