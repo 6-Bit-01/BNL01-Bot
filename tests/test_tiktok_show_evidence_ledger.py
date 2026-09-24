@@ -383,6 +383,46 @@ def artist_index():
 
 
 class TikTokShowEvidenceLedgerTests(unittest.TestCase):
+    def test_recorded_clock_preserves_dst_instants_and_missing_time(self):
+        from bnl_tiktok_live_context import _recorded_pacific_time
+
+        for utc, expected in (
+            ("2026-09-19T04:12:21Z", "2026-09-18 21:12:21 PDT"),
+            ("2026-01-16T04:12:21Z", "2026-01-15 20:12:21 PST"),
+            ("2026-03-08T09:59:59Z", "2026-03-08 01:59:59 PST"),
+            ("2026-03-08T10:00:00Z", "2026-03-08 03:00:00 PDT"),
+            ("2026-11-01T08:30:00Z", "2026-11-01 01:30:00 PDT"),
+            ("2026-11-01T09:30:00Z", "2026-11-01 01:30:00 PST"),
+        ):
+            with self.subTest(utc=utc):
+                self.assertEqual(_recorded_pacific_time(stamp(utc)), expected)
+        for missing in (None, "", "broken", 0, -1, True, float("nan"), float("inf"), 10**50):
+            with self.subTest(missing=missing):
+                self.assertEqual(_recorded_pacific_time(missing), "clock time unavailable")
+
+    def test_episode_clock_times_are_source_instants_not_schedule_estimates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_file = str(Path(directory) / "bnl.db")
+            self.seed_source_and_memory(db_file)
+            sync_tiktok_show_evidence_ledgers(
+                db_file, guild_id=77,
+                read_model=authorized_read_model({
+                    "currentShow": None, "latestShow": archived_show(), "shows": [],
+                }),
+                artist_identity_index=artist_index(), environ=ENABLED_QUEUE_ENV,
+            )
+            context = build_tiktok_show_evidence_context(
+                db_file, guild_id=77, subject_user_id=42,
+                user_text="What did I ask BNL during the live?",
+            )
+            for text, expected in (
+                ("Did the Wheel put Queue Light up next, BNL?", "2026-08-28 17:05:10 PDT"),
+                ("Yes—the Wheel confirmed Queue Light, and it is playing now.", "2026-08-28 17:05:20 PDT"),
+            ):
+                lines = [line for line in context.splitlines() if text in line]
+                self.assertTrue(lines)
+                self.assertTrue(all(expected in line for line in lines), lines)
+
     def test_builder_accounts_for_people_messages_topics_and_show_moments(self):
         ledger = build_tiktok_show_evidence_ledger(
             archived_show(),
@@ -1581,7 +1621,7 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 allow_subject_continuity=True,
                 now="2026-08-28T12:00:00-07:00",
             )
-            self.assertEqual(same_day_unrelated, ())
+            self.assertTrue(same_day_unrelated)
             prior_day_unrelated = select_tiktok_show_episode_context_items(
                 conn,
                 guild_id=77,
@@ -1590,7 +1630,7 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 allow_subject_continuity=True,
                 now="2026-08-29T12:00:00-07:00",
             )
-            self.assertEqual(prior_day_unrelated, ())
+            self.assertTrue(prior_day_unrelated)
             proactive_unrelated = select_tiktok_show_episode_context_items(
                 conn,
                 guild_id=77,
@@ -1599,7 +1639,15 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                 allow_subject_continuity=True,
                 now="2026-08-29T12:00:00-07:00",
             )
-            self.assertEqual(proactive_unrelated, ())
+            self.assertTrue(proactive_unrelated)
+            # The caller's continuity permission, not question vocabulary,
+            # admits the speaker's bounded background. This is not proof of
+            # the request's topic or implied day.
+            for selected in (same_day_unrelated, prior_day_unrelated, proactive_unrelated):
+                dialogue = next(item for item in selected if item.kind == "dialogue")
+                self.assertEqual(dialogue.subject_key, "discord_user:42")
+                self.assertEqual(dialogue.show_dates, ("2026-08-28",))
+                self.assertIn("Did the Wheel put Queue Light", dialogue.text)
             explicit_self = select_tiktok_show_episode_context_items(
                 conn,
                 guild_id=77,

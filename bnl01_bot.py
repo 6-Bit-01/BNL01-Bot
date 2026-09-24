@@ -27480,9 +27480,8 @@ def build_user_memory_context(
             else:
                 diagnostics["skipped"]["visibility_boundary"] += 1
         topic = limits["topic_key"]
-        if member_recall_query is None and user_text and topic == "general" and not any(k in (user_text or "").lower() for k in ("remember", "source file", "dossier", "project", "queue", "memory")):
-            visible_rows = [r for r in visible_rows if r[0] == "long" and float(r[2] or 0) >= 0.8]
-            diagnostics["skipped"]["simple_or_new_topic_relevance"] += max(0, len(tier_rows) - len(visible_rows))
+        # Eligible history does not depend on special request words.
+        # Relevance orders the bounded prompt; it does not grant source access.
         memory_query = user_text if member_recall_query is None else member_recall_query
         query_relevance = _memory_query_relevance((r[1] for r in visible_rows), memory_query)
         ranked = sorted(
@@ -28096,7 +28095,6 @@ def _named_public_recall_scope(
     if (
         not isinstance(situation_frame, SituationFrameV1)
         or not situation_frame.route_allowed
-        or situation_frame.status == "ambiguous"
         or situation_frame.route_mode != route_mode
         or situation_frame.channel_policy != channel_policy
         or route_mode != ROUTE_MODE_NORMAL_CHAT
@@ -28104,6 +28102,9 @@ def _named_public_recall_scope(
         or int(guild_id or 0) <= 0
     ):
         return (), user_text, ""
+    # A task/referent can remain uncertain while a named speaker is already
+    # bound. Read only the independently resolved identities below; global
+    # frame ambiguity must not erase their attributed public background.
     subjects = tuple(
         subject for subject in situation_frame.subjects
         if int(subject.user_id or 0) > 0
@@ -28145,9 +28146,9 @@ def build_named_public_conversation_context(
 ) -> tuple[str, ConversationPromptSourceBasis | None]:
     """Read original public messages for the resolved member and topic.
 
-    Broad person recall uses recent originals. Topic recall searches the stored
-    public history before bounding candidates, so recent unrelated chat cannot
-    hide an older match. Neither operation invents a cross-platform identity.
+    Person, date and source controls define eligibility. Query overlap ranks
+    the stored history before bounding candidates, but a zero score cannot
+    hide otherwise eligible originals. Neither operation invents identity.
     """
     from bnl_conversation_context_v2 import _unsafe_row
 
@@ -28167,8 +28168,8 @@ def build_named_public_conversation_context(
     try:
         with closing(_open_member_memory_read_connection()) as conn:
             conn.execute("BEGIN")
-            conn.create_function("member_recall_match", 1, lambda content: int(
-                not query_terms or bool(query_terms & memory_relevance_terms(str(content or "")))
+            conn.create_function("member_recall_rank", 1, lambda content: len(
+                query_terms & memory_relevance_terms(str(content or ""))
             ))
             columns = {str(row[1]) for row in conn.execute(
                 "PRAGMA main.table_info(conversations)"
@@ -28204,8 +28205,8 @@ def build_named_public_conversation_context(
                     WHERE guild_id=? AND user_id=? AND role='user'
                       AND channel_policy IN
                           ('public_home','public_context','public_selective')
-                      AND member_recall_match(content)=1
-                    """ + date_clause + " ORDER BY julianday(timestamp) DESC,id DESC LIMIT ?",
+                    """ + date_clause + """
+                    ORDER BY member_recall_rank(content) DESC,julianday(timestamp) DESC,id DESC LIMIT ?""",
                     (int(guild_id), int(subject.user_id), *date_params, CONVERSATION_ROWS_PER_USER_MAX),
                 ).fetchall()
                 for row in rows:
@@ -28259,7 +28260,7 @@ def build_named_public_conversation_context(
         except (TypeError, ValueError):
             return 0.0
     ranked = sorted(
-        (candidate for candidate in candidates if not query or relevance.get(candidate[2], 0) > 0),
+        candidates,
         key=lambda candidate: (relevance.get(candidate[2], 0), observed_order(candidate), int(candidate[0]["id"])),
         reverse=True,
     )
@@ -30764,7 +30765,7 @@ def build_named_public_member_memory_context(
     )
     # Current speakers already have their own attributed memory block.
     subjects = tuple(s for s in subjects if int(s.user_id) not in current_speaker_user_ids)
-    if not subjects or has_explicit_show_date(selection_text):
+    if not subjects:
         return "", ()
     budget = max(0, MEMORY_PROMPT_BUDGET_PUBLIC - 2 * len(subjects)) // len(subjects)
     if budget <= 0:

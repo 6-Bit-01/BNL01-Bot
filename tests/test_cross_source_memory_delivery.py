@@ -52,6 +52,67 @@ ANSWER = (
 
 
 class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clock_request_keeps_original_and_episode_times_through_delivery(self):
+        original = "The copper keyboard arrived safely."
+        local_stamp = "2026-08-28 17:02:21 PDT"
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO conversations (id,user_id,user_name,guild_id,role,content,"
+                "timestamp,channel_id,channel_name,channel_policy,route_mode) "
+                "VALUES (7096,?,?,?,'user',?,'2026-08-29T00:02:21Z',9920,"
+                "'public-lounge','public_home','normal_chat')",
+                (SUBJECT, "Test Signal", GUILD, original),
+            )
+            # The live failure quoted a retained directed exchange. Seed its
+            # linked reply so both existing readers own this same original.
+            conn.execute(
+                "INSERT INTO conversations (id,user_id,user_name,guild_id,role,content,"
+                "timestamp,channel_id,channel_name,channel_policy,route_mode) "
+                "VALUES (7095,?,'BNL-01',?,'model','The keyboard receipt is acknowledged.',"
+                "'2026-08-29T00:02:25Z',9920,'public-lounge','public_home','normal_chat')",
+                (SUBJECT, GUILD),
+            )
+        show_fixture.sync_tiktok_show_evidence_ledgers(
+            bot.DB_FILE, guild_id=GUILD, read_model=self.read_model,
+            artist_identity_index={}, environ=show_fixture.ENABLED_QUEUE_ENV,
+        )
+        request = (
+            "Give me a public Discord comment from Test Signal on August 28, 2026. "
+            "Quote it and include the Pacific time."
+        )
+        for policy, enabled in product(("public_home", "sealed_test"), (False, True)):
+            with self.subTest(policy=policy, packet=enabled), self._packet_configuration(enabled, 8810):
+                inputs = self.runtime._direct_prompt_inputs(policy, request, privileged=False)
+                direct, *_ = await bot.build_user_aware_prompt_async(**inputs)
+
+                async def provider(*_args, **kwargs):
+                    counter = kwargs.get("attempt_counter")
+                    if counter is not None:
+                        counter.mark_started()
+                    return original
+
+                channel, generation, guard = await self.runtime._batch(
+                    policy, request=request, answer=provider, privileged=False, channel_id=8810,
+                )
+                generation.assert_awaited_once()
+                self.assertEqual(channel.sent, [original])
+                for prompt, bases in (
+                    (direct, inputs["prompt_metadata"]["prompt_source_bases"]),
+                    (generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"]),
+                ):
+                    originals = [basis for basis in bases
+                                 if isinstance(basis, bot.ConversationPromptSourceBasis)
+                                 and 7096 in basis.source_row_ids]
+                    self.assertTrue(originals, "Clock-format request removed the original reader")
+                    episodes = [basis for basis in bases
+                                if isinstance(basis, bot.FinalizedShowPromptSourceBasis)
+                                and original in basis.rendered_context]
+                    self.assertTrue(episodes, "Existing-source episode evidence is missing")
+                    for context in (prompt, *(basis.rendered_context for basis in originals + episodes)):
+                        self.assertTrue(any(original in line and local_stamp in line
+                                            for line in context.splitlines()), context)
+                    self.assertIn("recurring show schedule is not a recorded start", prompt)
+
     async def test_dated_original_keeps_local_time_in_direct_and_delivered_batch_prompts(self):
         original = "The violet keyboard arrived just after midnight."
         with sqlite3.connect(bot.DB_FILE) as conn:
@@ -263,6 +324,62 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         fresh, changed = bot.refresh_prompt_source_basis(bases[0])
         self.assertTrue(changed)
         self.assertNotIn("earlier exchange explored amber lantern placement", fresh.rendered_context)
+
+    async def test_unmatched_wording_keeps_scoped_evidence_through_both_delivery_routes(self):
+        self._seed_member_tiers()
+        # No content word here overlaps the authored lantern/drum evidence.
+        # The model needs that evidence to judge meaning, including whether a
+        # question is unsupported; the selector must not decide by vocabulary.
+        requests = (
+            "How does Test Signal set the mood? Keep your answer concise.",
+            "Describe Test Signal's outlook. Use a couple of sentences.",
+            "What has Test Signal said about submarines?",
+        )
+        for policy, enabled, request in product(
+            ("public_home", "sealed_test"), (False, True), requests,
+        ):
+            with self.subTest(policy=policy, packet=enabled, request=request), self._packet_configuration(enabled, 8810):
+                inputs = self.runtime._direct_prompt_inputs(policy, request, privileged=False)
+                direct, *_ = await bot.build_user_aware_prompt_async(**inputs)
+                channel, generation, guard = await self.runtime._batch(
+                    policy, request=request, answer=self._provider_answer,
+                    privileged=False, channel_id=8810,
+                )
+                generation.assert_awaited_once()
+                self.assertEqual(channel.sent, [ANSWER])
+                for prompt, bases in (
+                    (direct, inputs["prompt_metadata"]["prompt_source_bases"]),
+                    (generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"]),
+                ):
+                    self._assert_sources(prompt, bases)
+                    for summary in ("recent discussion covered silver drums",
+                                    "earlier exchange explored amber lantern placement",
+                                    "amber lantern project began"):
+                        self.assertIn(summary, prompt)
+                    self.assertNotIn("hidden amber lantern access code", prompt)
+                    self.assertIn("background context does not prove a requested topic or date", prompt)
+                    self.assertIn("bounded selection does not establish absence", prompt)
+                    self.assertTrue(any(isinstance(b, bot.MemoryPromptSourceBasis)
+                                        and b.user_id == SUBJECT for b in bases))
+
+    async def test_dated_recall_keeps_memory_as_background_and_originals_in_date_scope(self):
+        self._seed_member_tiers()
+        for enabled in (False, True):
+            with self.subTest(packet=enabled), self._packet_configuration(enabled, 8810):
+                prompt, metadata = await self.runtime._direct_prompt_async(
+                    "sealed_test", privileged=False,
+                    request="Give me a public Discord comment from Test Signal on May 8, 2026.",
+                )
+                self.assertIn("amber lantern project began", prompt)
+                self.assertNotIn(DISCORD_COMMENT, prompt)
+                self.assertNotIn(TIKTOK_COMMENT, prompt)
+                self.assertIn("background context does not prove a requested topic or date", prompt)
+                bases = metadata["prompt_source_bases"]
+                self.assertTrue(any(isinstance(b, bot.MemoryPromptSourceBasis)
+                                    and b.user_id == SUBJECT and "not quote authority" in b.rendered_context
+                                    for b in bases))
+                self.assertFalse(any(isinstance(b, bot.ConversationPromptSourceBasis)
+                                     and 7101 in b.source_row_ids for b in bases))
 
     async def test_broad_batch_delivers_originals_and_all_public_tiers_with_one_send(self):
         self._seed_member_tiers()
@@ -555,7 +672,9 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def _assert_sources(self, prompt, bases):
         self.assertTrue(DISCORD_COMMENT in prompt, "Public Discord authored statement missing from provider prompt")
         self.assertTrue(TIKTOK_COMMENT in prompt, "Public TikTok authored statement missing from provider prompt")
-        for excluded in (NEWER_COMMENT, OTHER_COMMENT, PRIVATE_COMMENT, SEALED_COMMENT):
+        # Same-person background can remain beside a stronger topic match.
+        # Another person's words or private sources must never fill that role.
+        for excluded in (OTHER_COMMENT, PRIVATE_COMMENT, SEALED_COMMENT):
             self.assertNotIn(excluded, prompt)
         self.assertIn("Test Signal", prompt)
         self.assertIn("discord", prompt.casefold())

@@ -39,6 +39,7 @@ from bnl_tiktok_live_context import (
     PUBLIC_MEMBER_RECALL_REQUEST_WORDS,
     SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
     _comment_timing_evidence,
+    _recorded_pacific_time,
     _event_subject_key,
     _safe_durable_event,
     _track_windows_from_timeline,
@@ -2716,7 +2717,6 @@ def _document_relevance(
     query = str(user_text or "")
     query_terms = _query_terms(query)
     explicit_episode_scope = _show_episode_scope_requested(query)
-    evidence_query_overlap = False
     score = max(0, 20 - recency_rank)
     if requested_dates:
         if str(ledger.get("showDate") or "") not in requested_dates:
@@ -2747,7 +2747,6 @@ def _document_relevance(
             direct_subject_candidates.append(participant)
         if named:
             participant_matches.append(participant)
-            evidence_query_overlap = True
             score += 90
     if named_subject_refs and not any(
         str(item.get("subjectRef") or "") in named_subject_refs
@@ -2766,7 +2765,6 @@ def _document_relevance(
             query,
             track.get("trackLabel"),
         ):
-            evidence_query_overlap = True
             score += 80
     for track in ledger.get("trackRoster") or ():
         if isinstance(track, Mapping) and any(
@@ -2778,11 +2776,9 @@ def _document_relevance(
                 track.get("submittedByTikTokHandle"),
             )
         ):
-            evidence_query_overlap = True
             score += 85
     for topic in ledger.get("showTopics") or ledger.get("topics") or ():
         if isinstance(topic, Mapping) and _phrase_in_query(query, topic.get("term")):
-            evidence_query_overlap = True
             score += 60
     for event in ledger.get("operationalEvents") or ():
         if not isinstance(event, Mapping):
@@ -2801,7 +2797,6 @@ def _document_relevance(
         ).replace("_", " ")
         overlap = query_terms.intersection(_query_terms(searchable))
         if overlap:
-            evidence_query_overlap = True
             score += min(60, 12 * len(overlap))
     participant_refs = {
         str(item.get("subjectRef") or "") for item in participant_matches
@@ -2818,20 +2813,10 @@ def _document_relevance(
         if not authored_subject_refs or str(message.get("subjectRef") or "") in authored_subject_refs
     ), default=0)
     if authored_overlap:
-        evidence_query_overlap = True
         score += min(240, 80 * authored_overlap)
-    elif (
-        not requested_dates
-        and _general_participant_recall(query, participant_matches or direct_subject_candidates)
-        and topic_terms
-    ):
-        # A newer appearance by the same person is not evidence about the
-        # requested topic. Nor are another speaker's or BNL's statements.
-        return 0, []
-    if direct_subject_candidates and (
-        explicit_episode_scope or evidence_query_overlap
-        or (self_public_activity_requested(query) and not topic_terms)
-    ):
+    # The resolved subject remains a source scope without lexical overlap.
+    # Topic scores rank their episodes; they do not decide source eligibility.
+    if direct_subject_candidates:
         for participant in direct_subject_candidates:
             if participant not in participant_matches:
                 participant_matches.append(participant)
@@ -2980,6 +2965,7 @@ def _operational_event_line(event: Mapping[str, Any]) -> str:
         suffix = "; ".join(value for value in (suffix, detail) if value)
     return (
         f"- t+{float(event.get('minuteOffset') or 0.0):.1f}m "
+        f"({_recorded_pacific_time(event.get('occurredAtMs'))}) "
         f"[{event_type}] {label}"
         + (f" — {suffix}" if suffix else "")
     )
@@ -3379,8 +3365,8 @@ def _operational_episode_context_item(
     ]
     text = (
         "Recorded BARCODE Radio chronology for %s on %s, using the website's "
-        "first-party queue/broadcast record: %s. Times are offsets from the "
-        "recorded show start; this proves public operations, not unobserved "
+        "first-party queue/broadcast record: %s. Clock labels use recorded event "
+        "timestamps; t+ offsets use the recorded show start. This proves public operations, not unobserved "
         "studio-floor incidents."
         % (
             str(ledger.get("showTitle") or "BARCODE Radio"),
@@ -3434,9 +3420,6 @@ def _dialogue_episode_context_item(
             candidates = [
                 item for item in candidates
                 if str(item.get("subjectRef") or "") in participant_refs
-                and (not query_terms or query_terms.intersection(
-                    _query_terms(str(item.get("text") or ""))
-                ))
             ]
         ranked = sorted(
             candidates,
@@ -3453,16 +3436,6 @@ def _dialogue_episode_context_item(
                 for item in ranked
                 if str(item.get("subjectRef") or "") in participant_refs
             ]
-        if query_terms:
-            matches = [
-                item
-                for item in ranked
-                if query_terms.intersection(
-                    _query_terms(str(item.get("text") or ""))
-                )
-            ]
-            if matches:
-                return matches
         return ranked
 
     for row in rows:
@@ -3530,11 +3503,12 @@ def _dialogue_episode_context_item(
         track_label = _safe_label(message.get("trackLabel"), 180)
         moment = f" during {track_label}" if track_label else " in the recorded show window"
         examples.append(
-            "%s %s t+%.1fm %s%s: %s"
+            "%s %s t+%.1fm (%s) %s%s: %s"
             % (
                 str(message.get("showDate") or "unknown date"),
                 str(message.get("surface") or "show chat"),
                 float(message.get("minuteOffset") or 0.0),
+                _recorded_pacific_time(message.get("occurredAtMs")),
                 _public_show_speaker_label(
                     message.get("subjectRef"),
                     message.get("speakerLabel"),
@@ -3608,9 +3582,9 @@ def select_tiktok_show_episode_context_items(
     """Select compact show evidence for the existing intelligence packet.
 
     Full ledgers stay in their current source owner.  This selector emits
-    separate authority views and only when the request names show/community
-    scope, explicitly asks for self continuity, or names a retained
-    participant.  Merely being the current speaker never injects an episode.
+    separate authority views for show/community scope, retained participants,
+    or caller-authorized subject continuity. With continuity allowed, the
+    speaker's bounded background does not require matching request words.
     """
 
     if int(guild_id or 0) <= 0 or not str(user_text or "").strip():
@@ -4410,8 +4384,9 @@ def build_tiktok_show_evidence_context(
                     )
                     remember_authored_excerpt(ledger, message, surface=surface,
                                               speaker_label=speaker)
-                    lines.append("- %s t+%.1fm %s: %s" % (
+                    lines.append("- %s t+%.1fm (%s) %s: %s" % (
                         surface, float(message.get("minuteOffset") or 0),
+                        _recorded_pacific_time(message.get("occurredAtMs")),
                         json.dumps(speaker, ensure_ascii=False),
                         json.dumps(_safe_label(message.get("text"), 360), ensure_ascii=False),
                     ))
@@ -4679,9 +4654,6 @@ def build_tiktok_show_evidence_context(
             messages = [
                 item for item in messages
                 if str(item.get("subjectRef") or "") in participant_refs
-                and (not message_query_terms or message_query_terms.intersection(
-                    _query_terms(str(item.get("text") or ""))
-                ))
             ]
         relevant_messages = sorted(
             messages,
@@ -4698,14 +4670,6 @@ def build_tiktok_show_evidence_context(
                 for item in relevant_messages
                 if str(item.get("subjectRef") or "") in participant_refs
             ]
-        elif query_terms:
-            query_matches = [
-                item
-                for item in relevant_messages
-                if query_terms.intersection(_query_terms(str(item.get("text") or "")))
-            ]
-            if query_matches:
-                relevant_messages = query_matches
         if not relevant_messages:
             relevant_messages = messages
         if str(ledger["showKey"]) in recall_messages:
@@ -4733,6 +4697,7 @@ def build_tiktok_show_evidence_context(
                 lines.append(
                     f"- [{str(message.get('surface') or 'tiktok')}] "
                     f"t+{float(message.get('minuteOffset') or 0.0):.1f}m "
+                    f"({_recorded_pacific_time(message.get('occurredAtMs'))}) "
                     f"{json.dumps(public_speaker_label, ensure_ascii=False)}"
                     f": {json.dumps(str(message.get('text') or ''), ensure_ascii=False)} | {timing}"
                 )
@@ -4759,16 +4724,7 @@ def build_tiktok_show_evidence_context(
                 query_terms.intersection(_query_terms(exchange_text))
             )
             if general_recall:
-                exchange_relevant = bool(
-                    exchange_subject in participant_refs
-                    and (not message_query_terms or any(
-                        message_query_terms.intersection(
-                            _query_terms(str(message.get("text") or ""))
-                        )
-                        for message in exchange.get("userMessages") or ()
-                        if isinstance(message, Mapping)
-                    ))
-                )
+                exchange_relevant = exchange_subject in participant_refs
             elif participant_refs and _subject_continuity_requested(user_text):
                 exchange_relevant = exchange_subject in participant_refs
             else:
@@ -4811,13 +4767,15 @@ def build_tiktok_show_evidence_context(
                     )
                     lines.append(
                         f"- t+{float(message.get('minuteOffset') or 0.0):.1f}m "
+                        f"({_recorded_pacific_time(message.get('occurredAtMs'))}) "
                         f"{json.dumps(public_speaker_label, ensure_ascii=False)}: "
                         f"{json.dumps(_safe_label(message.get('text'), 1200), ensure_ascii=False)}"
                     )
                 response = exchange.get("bnlResponse")
                 if isinstance(response, Mapping):
                     lines.append(
-                        f"  BNL replied at t+{float(response.get('minuteOffset') or 0.0):.1f}m: "
+                        f"  BNL replied at t+{float(response.get('minuteOffset') or 0.0):.1f}m "
+                        f"({_recorded_pacific_time(response.get('occurredAtMs'))}): "
                         f"{json.dumps(_safe_label(response.get('text'), 1600), ensure_ascii=False)}"
                     )
                 else:
