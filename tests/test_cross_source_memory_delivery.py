@@ -53,6 +53,60 @@ ANSWER = (
 
 
 class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_artist_history_keeps_music_submitted_by_someone_else(self):
+        self.runtime.user_id = SUBJECT
+        self.stack.enter_context(mock.patch("bnl_tiktok_live_context._pacific_show_date", return_value=date(2026, 9, 23)))
+        show = self.read_model["sections"]["archive"]["shows"][0]
+        # Late roster entries must remain discoverable without a matching
+        # submitter handle or a track-linked chat moment naming the song.
+        show["trackRoster"] = [{
+            "trackId": "history-%s" % index, "projectLabel": "Other Artist %s" % index,
+            "title": "Other Tune %s" % index, "submittedByTikTokHandle": "other.%s" % index,
+            "outcome": "finished", "lane": "regular", "submissionEventSequence": index + 1,
+        } for index in range(48)] + [{
+            "trackId": "history-artist", "projectLabel": "Test Signal", "title": "Lantern Parade",
+            "submittedByTikTokHandle": "test.other", "outcome": "finished",
+            "lane": "regular", "submissionEventSequence": 49,
+        }, {
+            "trackId": "history-submitter", "projectLabel": "Another Musician", "title": "Borrowed Signal",
+            "submittedByTikTokHandle": "test.signal", "outcome": "removed",
+            "lane": "regular", "submissionEventSequence": 50,
+        }]
+        show_fixture.sync_tiktok_show_evidence_ledgers(
+            bot.DB_FILE, guild_id=GUILD, read_model=self.read_model,
+            artist_identity_index={}, environ=show_fixture.ENABLED_QUEUE_ENV,
+        )
+        requests = (
+            "What have I talked about in Discord and TikTok over the past month, and have any of my songs been in the queue?",
+            "What did Test Signal discuss lately, and which of their songs reached the queue?",
+            "Did my music appear in the August 28, 2026 show queue?",
+        )
+        for request, enabled in product(requests, (False, True)):
+            with self.subTest(request=request, packet=enabled), self._packet_configuration(enabled, 8810), mock.patch.dict(
+                os.environ, {"BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": str(SUBJECT)}
+            ):
+                prompt, metadata = await self.runtime._direct_prompt_async("sealed_test", request, privileged=False)
+                channel, generation, guard = await self.runtime._batch(
+                    "sealed_test", request=request, answer=self._provider_answer,
+                    privileged=False, channel_id=8810,
+                )
+                self.assertEqual(channel.sent, [ANSWER])
+                for text, bases in ((prompt, metadata["prompt_source_bases"]),
+                                    (generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"])):
+                    self.assertIn("Test Signal — Lantern Parade", text)
+                    self.assertIn("submitted as @test.other", text)
+                    self.assertIn("Another Musician — Borrowed Signal", text)
+                    self.assertIn("submitted as @test.signal", text)
+                    self.assertEqual(bot.prompt_source_basis_failure(bases), "")
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            items = show_fixture.select_tiktok_show_episode_context_items(
+                conn, guild_id=GUILD, user_text=requests[0], subject_user_id=SUBJECT,
+                allow_subject_continuity=True,
+            )
+        operations = "\n".join(item.text for item in items if item.kind == "operations")
+        self.assertIn("Test Signal — Lantern Parade", operations)
+        self.assertIn("submitted as @test.other", operations)
+
     async def test_member_history_and_queue_keep_independent_source_scopes(self):
         self.runtime.user_id = SUBJECT
         self.stack.enter_context(mock.patch("bnl_tiktok_live_context._pacific_show_date", return_value=date(2026, 9, 23)))

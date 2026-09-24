@@ -2946,26 +2946,61 @@ def _selected_operational_events(
     return [events[index] for index in sorted(selected_indexes)[:safe_limit]]
 
 
-def _show_roster_lines(ledger: Mapping[str, Any], participants: Sequence[Mapping[str, Any]]) -> list[str]:
-    """Keep source-owned submission attribution in a compact history read."""
+def _ranked_show_roster(
+    ledger: Mapping[str, Any], participants: Sequence[Mapping[str, Any]], user_text: str,
+) -> list[Mapping[str, Any]]:
+    """Rank artist credits and submitters independently before the display bound.
+
+    Public label matches select source records for this read. They do not
+    create identity links or turn a submitter into the credited artist.
+    """
     handles = {str(p.get("handle") or "").casefold().lstrip("@") for p in participants
                if p.get("handle")}
+    labels = {
+        _public_show_speaker_label(p.get("subjectRef"), p.get(field), "").casefold()
+        for p in participants for field in ("displayName", "speakerLabel")
+    } - {""}
     roster = [track for track in ledger.get("trackRoster") or () if isinstance(track, Mapping)]
+
+    def relevance(track: Mapping[str, Any]) -> int:
+        return (
+            30 * any(_participant_name_in_query(user_text, track.get(field))
+                     for field in ("trackLabel", "title", "projectLabel"))
+            + 20 * (_safe_label(track.get("projectLabel"), 160).casefold() in labels)
+            + 10 * (str(track.get("submittedByTikTokHandle") or "").casefold().lstrip("@") in handles)
+        )
+
+    return sorted(roster, key=lambda track: -relevance(track))
+
+
+def _show_roster_lines(
+    ledger: Mapping[str, Any], participants: Sequence[Mapping[str, Any]], *,
+    user_text: str = "", include_source_attribution: bool = True,
+) -> list[str]:
+    """Keep the credited music separate from who entered it into the queue."""
+    roster = _ranked_show_roster(ledger, participants, user_text)
     if not roster:
         return []
-    roster.sort(key=lambda track: str(track.get("submittedByTikTokHandle") or "").casefold().lstrip("@") not in handles)
-    lines = ["Authoritative show roster and lifecycle (bounded selection):"]
-    for participant in participants:
+    lines = [
+        "Authoritative show roster and lifecycle (bounded selection):",
+        "- Showing %s of %s retained roster records for this show. Omitted records do not establish zero participation."
+        % (min(len(roster), 12), len(roster)),
+        "- Artist/project credit and submitter are separate source fields: someone else can submit an artist's music. A public credit-name match selects a record for this reply, not a verified identity link. Submission and outcome do not alone prove playback.",
+    ]
+    for participant in participants if include_source_attribution else ():
         if participant.get("handle") and participant.get("identityBindingBasis"):
             label = _public_show_speaker_label(participant.get("subjectRef"), participant.get("speakerLabel"))
             lines.append("- Existing chat-source attribution: %s; handle=@%s. This is the retained source association, not a new identity verification; a similar display name is not an identity link." % (
                 json.dumps(label, ensure_ascii=False), _safe_label(participant["handle"], 80),
             ))
     for track in roster[:12]:
-        lines.append("- %s; outcome=%s; submitted as @%s; playedOrder=%s. Submission and outcome do not alone prove playback." % (
+        lines.append("- %s; artist/project credit=%s; outcome=%s; submitted as @%s; lane=%s; submissionOrder=%s; playedOrder=%s." % (
             json.dumps(str(track.get("trackLabel") or "Unknown track"), ensure_ascii=False),
+            json.dumps(str(track.get("projectLabel") or "unavailable"), ensure_ascii=False),
             _safe_label(track.get("outcome") or "unknown", 40),
-            _safe_label(track.get("submittedByTikTokHandle") or "unavailable", 80),
+            _safe_label(track.get("submittedByTikTokHandle") or "unavailable", 80).lstrip("@"),
+            _safe_label(track.get("lane") or "unknown", 40),
+            track.get("submissionOrder", "unavailable"),
             track.get("playedOrder", "unavailable"),
         ))
     return lines
@@ -3380,6 +3415,7 @@ def _operational_episode_context_item(
     row: Mapping[str, Any],
     *,
     user_text: str,
+    participant_matches: Sequence[Mapping[str, Any]] = (),
 ) -> Optional[TikTokShowEpisodeContextItem]:
     ledger = row.get("ledger") or {}
     events = [
@@ -3392,7 +3428,10 @@ def _operational_episode_context_item(
         user_text=user_text,
         limit=14,
     )
-    if not selected:
+    roster_lines = _show_roster_lines(
+        ledger, participant_matches, user_text=user_text, include_source_attribution=False,
+    ) if _TRACK_QUERY_RE.search(user_text or "") else []
+    if not selected and not roster_lines:
         return None
     event_lines = [
         _operational_event_line(event).removeprefix("- ")
@@ -3409,6 +3448,8 @@ def _operational_episode_context_item(
             " | ".join(event_lines),
         )
     )
+    if roster_lines:
+        text += "\n" + "\n".join(roster_lines)
     participants = [
         str(item.get("subjectRef") or "")
         for item in _episode_participants(ledger)
@@ -3747,10 +3788,11 @@ def select_tiktok_show_episode_context_items(
         )
     )):
         operation_limit = 2 if multi_show else 1
-        for row in selected_rows[:operation_limit]:
+        for _score, _rank, row, matches in selected_ranked[:operation_limit]:
             operation_item = _operational_episode_context_item(
                 row,
                 user_text=user_text,
+                participant_matches=matches,
             )
             if operation_item is not None:
                 items.append(operation_item)
@@ -4407,7 +4449,7 @@ def build_tiktok_show_evidence_context(
                 str(match.get("subjectRef") or "") for match in participant_matches
             }
             if wants_tracks:
-                lines.extend(_show_roster_lines(ledger, participant_matches))
+                lines.extend(_show_roster_lines(ledger, participant_matches, user_text=user_text))
             messages = recall_messages.get(str(ledger["showKey"]), _authored_show_messages(ledger))
             if _general_participant_recall(user_text, participant_matches):
                 messages = [message for message in messages
@@ -4610,32 +4652,7 @@ def build_tiktok_show_evidence_context(
                     for event_id in event_ids
                 })
         if wants_tracks:
-            roster_rows = [
-                item
-                for item in ledger.get("trackRoster") or ()
-                if isinstance(item, Mapping)
-            ]
-            if roster_rows:
-                lines.append("Authoritative show roster and lifecycle:")
-                for track in roster_rows[:12]:
-                    order_bits = []
-                    if track.get("submissionOrder") is not None:
-                        order_bits.append(
-                            f"submitted #{int(track.get('submissionOrder') or 0)}"
-                        )
-                    if track.get("playedOrder") is not None:
-                        order_bits.append(
-                            f"played #{int(track.get('playedOrder') or 0)}"
-                        )
-                    order_text = ", ".join(order_bits) or "order unavailable"
-                    handle = str(track.get("submittedByTikTokHandle") or "")
-                    lines.append(
-                        f"- {json.dumps(str(track.get('trackLabel') or 'Unknown track'), ensure_ascii=False)}: "
-                        f"{str(track.get('outcome') or 'unknown')} outcome, "
-                        f"{str(track.get('lane') or 'unknown')} lane, {order_text}"
-                        + (f", submitted as @{handle}" if handle else "")
-                        + "."
-                    )
+            lines.extend(_show_roster_lines(ledger, participant_matches, user_text=user_text))
             track_rows = [
                 item
                 for item in track_rows
