@@ -12,6 +12,7 @@ import os
 import sqlite3
 import threading
 import unittest
+from datetime import date
 from itertools import product
 from types import SimpleNamespace
 from unittest import mock
@@ -52,6 +53,111 @@ ANSWER = (
 
 
 class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_member_history_and_queue_keep_independent_source_scopes(self):
+        self.runtime.user_id = SUBJECT
+        self.stack.enter_context(mock.patch("bnl_tiktok_live_context._pacific_show_date", return_value=date(2026, 9, 23)))
+        archive = self.read_model["sections"]["archive"]
+        archive["shows"] = json.loads(json.dumps(archive["shows"]).replace("Neon Fox", "Test Signal")
+                                     .replace("neon.fox", "test.signal").replace("First Signal", "Amber Loop"))
+        show_fixture.sync_tiktok_show_evidence_ledgers(
+            bot.DB_FILE, guild_id=GUILD, read_model=self.read_model,
+            artist_identity_index={}, environ=show_fixture.ENABLED_QUEUE_ENV,
+        )
+        self.read_model["sections"]["queue"] = {
+            "available": True, "accessScope": "public", "visibility": "public_safe",
+            "session": {"id": "current-empty", "showDate": "2026-09-23",
+                        "queueOpen": False, "broadcastPhase": "ended"},
+            "status": {"activeCount": 0, "completedCount": 0},
+            "queuedTracks": [], "completedTracks": [],
+        }
+        requests = (
+            "Hey BNL what are some things i've talked about in the Discord and the TikTok chat the last month and have I had any songs in the queue?",
+            "Summarize my Discord and TikTok activity over the past month, including my queue submissions.",
+            "What have I said in Discord and TikTok lately, and is the queue open now?",
+            "Across Discord, TikTok and the queue over the past month, what have I been talking about and submitting?",
+        )
+        for request, enabled in product(requests, (False, True)):
+            with self.subTest(request=request, packet=enabled), self._packet_configuration(enabled, 8810), mock.patch.dict(
+                os.environ, {"BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": str(SUBJECT)}
+            ):
+                website = bot.maybe_build_bnl_read_model_context(request, "sealed_test", guild_id=GUILD)
+                inputs = self.runtime._direct_prompt_inputs("sealed_test", request, website, privileged=False)
+                direct, *_ = await bot.build_user_aware_prompt_async(**inputs)
+                channel, generation, guard = await self.runtime._batch(
+                    "sealed_test", request=request, answer=self._provider_answer,
+                    privileged=False, channel_id=8810,
+                )
+                generation.assert_awaited_once()
+                self.assertEqual(channel.sent, [ANSWER])
+                for prompt, bases in (
+                    (direct, inputs["prompt_metadata"]["prompt_source_bases"]),
+                    (generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"]),
+                ):
+                    self.assertIn(DISCORD_COMMENT, prompt)
+                    self.assertIn(TIKTOK_COMMENT, prompt)
+                    self.assertIn(NEWER_COMMENT, prompt)
+                    if "month" in request:
+                        self.assertIn("Amber Loop", prompt)
+                        self.assertIn("submitted as @test.signal", prompt)
+                        self.assertIn("Existing chat-source attribution:", prompt)
+                        self.assertNotIn("showDate=2026-09-23", prompt)
+                        self.assertNotIn("activeCount=0", prompt)
+                    self.assertTrue(any(isinstance(b, bot.FinalizedShowPromptSourceBasis) for b in bases))
+                    self.assertEqual(bot.prompt_source_basis_failure(bases), "")
+                    if "open now" in request:
+                        self.assertIn("queueOpen=False", prompt)
+
+    async def test_history_window_excludes_older_originals_and_episode_evidence(self):
+        self.runtime.user_id = SUBJECT
+        self.stack.enter_context(mock.patch("bnl_tiktok_live_context._pacific_show_date", return_value=date(2026, 9, 23)))
+        old_text = "My old Discord TikTok queue submissions were violet lanterns."
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("UPDATE conversations SET timestamp='2026-07-04T00:02:00Z' WHERE id=7104")
+            conn.execute("INSERT INTO conversations (id,user_id,user_name,guild_id,role,content,timestamp,channel_id,channel_name,channel_policy,route_mode) VALUES (7200,?,'Test Signal',?,'user',?,'2026-07-04T00:02:00Z',9930,'public-lounge','public_home','normal_chat')", (SUBJECT, GUILD, old_text))
+        record_source_event(
+            bot.DB_FILE, guild_id=GUILD, source_kind="tiktok_live_chat", source_key="old-month-source",
+            occurred_at_ms=show_fixture.stamp("2026-07-04T00:02:00Z"), raw_text=old_text,
+            sanitized_summary=old_text, channel_policy="public_context", subject_ref="discord_user:42",
+            private_display_name="Test Signal", public_usable=True,
+            metadata={"eventType": "comment", "handle": "test.signal", "identityBindingBasis": "exact_source_owned_subject_reference"},
+        )
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            shadow_tiktok_live_chat_event(conn, guild_id=GUILD, event_id="old-month-source", subject_key="discord_user:42",
+                subject_display_name="Test Signal", content=old_text, observed_at="2026-07-04T00:02:00Z",
+                source_sequence=show_fixture.stamp("2026-07-04T00:02:00Z"))
+        self.read_model["sections"]["archive"]["shows"].append(json.loads(json.dumps(show_fixture.archived_show())
+            .replace("show-attendance-1", "old-show").replace("2026-08-28", "2026-07-03").replace("2026-08-29", "2026-07-04")))
+        show_fixture.sync_tiktok_show_evidence_ledgers(bot.DB_FILE, guild_id=GUILD, read_model=self.read_model,
+            artist_identity_index={}, environ=show_fixture.ENABLED_QUEUE_ENV)
+        request = "Summarize my Discord and TikTok activity over the past month, including my queue submissions."
+        prompt, metadata = await self.runtime._direct_prompt_async("sealed_test", request, privileged=False)
+        self.assertIn(TIKTOK_COMMENT, prompt)
+        self.assertIn(DISCORD_COMMENT, prompt)
+        self.assertNotIn(old_text, prompt)
+        show_bases = [b for b in metadata["prompt_source_bases"] if isinstance(b, bot.FinalizedShowPromptSourceBasis)]
+        self.assertTrue(show_bases)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            items = show_fixture.select_tiktok_show_episode_context_items(
+                conn, guild_id=GUILD, user_text=request, subject_user_id=SUBJECT, allow_subject_continuity=True,
+            )
+        self.assertTrue(items)
+        self.assertNotIn(old_text, "\n".join(item.text for item in items))
+
+    async def test_first_person_request_does_not_change_a_named_history_subject(self):
+        self.runtime.user_id = SUBJECT
+        for request in (
+            "I want you to summarize Test Other's Discord and TikTok comments.",
+            "I'd like to hear about Test Other's Discord and TikTok comments.",
+            "Can I ask what Test Other said in Discord and TikTok?",
+        ):
+            with self.subTest(request=request):
+                prompt, metadata = await self.runtime._direct_prompt_async("sealed_test", request, privileged=False)
+                originals = "\n".join(b.rendered_context for b in metadata["prompt_source_bases"]
+                                      if isinstance(b, (bot.ConversationPromptSourceBasis, bot.FinalizedShowPromptSourceBasis)))
+                self.assertIn(OTHER_COMMENT, originals)
+                self.assertNotIn(DISCORD_COMMENT, originals)
+                self.assertNotIn(TIKTOK_COMMENT, originals)
+
     async def test_clock_request_keeps_original_and_episode_times_through_delivery(self):
         original = "The copper keyboard arrived safely."
         local_stamp = "2026-08-28 17:02:21 PDT"

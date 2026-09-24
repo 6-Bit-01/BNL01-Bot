@@ -23,6 +23,7 @@ from bnl_tiktok_live_context import (
     load_live_context_snapshot,
     select_show_for_tiktok_analysis,
     show_timeline_bounds_ms,
+    requested_history_window,
 )
 from bnl_tiktok_live_memory import (
     TikTokPublicConversationSpoolWriter,
@@ -66,6 +67,18 @@ def observation_payload(event_type, event_id, clock, **changes):
 
 
 class TikTokLiveContextBridgeTests(unittest.TestCase):
+    def test_shared_history_window_uses_pacific_dates_and_calendar_months(self):
+        for text, now, expected in (
+            ("the last month", "2026-09-24T03:20:00Z", ("2026-08-23", "2026-09-24")),
+            ("over the past month", "2026-03-31T20:00:00Z", ("2026-02-28", "2026-04-01")),
+            ("past two weeks", "2026-03-09T03:00:00Z", ("2026-02-22", "2026-03-09")),
+            ("last 30 days", "2026-09-24T03:20:00Z", ("2026-08-24", "2026-09-24")),
+            ("August 28, 2026", "2026-09-24T03:20:00Z", ()),
+        ):
+            with self.subTest(text=text, now=now):
+                self.assertEqual(requested_history_window(text, now=now), expected)
+        self.assertFalse(is_live_show_reaction_query("What have I talked about in TikTok chat the last month?"))
+
     def make_adapter(self, clock):
         adapter = LiveChatAdapter(
             LiveChatBuffer(100, 600, clock),

@@ -52,6 +52,7 @@ from bnl_tiktok_live_context import (
     load_live_context_snapshot,
     requested_show_date,
     requested_show_dates,
+    requested_history_window,
     select_show_for_tiktok_analysis,
     show_conversation_interval_requested,
     tiktok_show_evidence_key,
@@ -3011,12 +3012,14 @@ class WebsiteReadModelContext(str):
         historical_sections: tuple[tuple[str, tuple[int, ...]], ...] = (),
         show_awareness_only: bool = False,
         continuation_show_dates: tuple[str, ...] = (),
+        show_selection_dates: tuple[str, ...] = (),
     ):
         context = super().__new__(cls, text)
         context.rendered_lines = rendered_lines
         context.historical_sections = historical_sections
         context.show_awareness_only = show_awareness_only
         context.continuation_show_dates = continuation_show_dates
+        context.show_selection_dates = show_selection_dates
         return context
 
     def for_original_quote_lookup(self, show_keys, *, current_images: bool = False) -> str:
@@ -3172,6 +3175,7 @@ def build_bnl_read_model_context(
         ),
     ]
     historical_show_analysis_sections: list[tuple[str, tuple[int, ...]]] = []
+    show_selection_dates: list[str] = []
     schema_revision = _compact_public_text(read_model.get("schemaRevision"), 40)
     if schema_revision:
         lines[-1] += f" / schemaRevision={schema_revision}"
@@ -3243,8 +3247,10 @@ def build_bnl_read_model_context(
     requested_history_dates = requested_show_dates(
         show_analysis_text, available_show_dates=available_show_dates,
     ) if show_analysis_query else ()
+    history_window = requested_history_window(user_text)
     include_queue_context = bool(
         queue
+        and (not history_window or current_queue_requested)
         and (
             not show_analysis_query
             or (queue_query and (
@@ -3291,6 +3297,7 @@ def build_bnl_read_model_context(
         if operational_query:
             lines.extend(_queue_request_focus_lines(queue_focus, queue_url))
             lines.append("- Session scope: the queue facts below belong only to this snapshot's session. Match any requested title, session ID or date; do not substitute another session when the requested one is unavailable.")
+            lines.append("- This snapshot does not establish past queue participation or the availability of historical TikTok/Discord messages. Use the independent public history sources for those parts of a combined request.")
         if prior_queue_request:
             lines.append("- Follow-up source coverage: include the available queued, completed and removed records from this same session, beyond any tracks named in the earlier lookup. These snapshot collections are not proof of the complete show history. The current request determines what to discuss; do not infer total submissions or sole participation from a selection of tracks.")
         session_bits = []
@@ -3492,6 +3499,8 @@ def build_bnl_read_model_context(
                     selected_show, _ = select_show_for_tiktok_analysis(
                         scoped_archive, show_analysis_text,
                     )
+                    if selected_show.get("showDate"):
+                        show_selection_dates.append(str(selected_show["showDate"]))
                     durable_events = _load_durable_tiktok_show_events(
                         scoped_archive, show_analysis_text,
                     )
@@ -3518,6 +3527,7 @@ def build_bnl_read_model_context(
                         ))
             else:
                 if current_show_date:
+                    show_selection_dates.append(str(current_show_date))
                     # Carry the authorized live scope with this rendered
                     # source; persistence must not re-date it from the clock
                     # or from a different queue session after midnight.
@@ -3664,16 +3674,15 @@ def build_bnl_read_model_context(
         content_limit = max(0, 80 - len(guardrail_lines))
         lines = [*lines[:content_limit], *guardrail_lines]
     rendered = "\n".join(lines)
-    if historical_show_analysis_sections or prior_queue_request:
-        return WebsiteReadModelContext(
-            rendered,
-            rendered_lines=tuple(lines),
-            historical_sections=tuple(historical_show_analysis_sections),
-            continuation_show_dates=requested_show_dates(
-                prior_queue_request, available_show_dates=available_show_dates,
-            ),
-        )
-    return rendered
+    return WebsiteReadModelContext(
+        rendered,
+        rendered_lines=tuple(lines),
+        historical_sections=tuple(historical_show_analysis_sections),
+        continuation_show_dates=requested_show_dates(
+            prior_queue_request, available_show_dates=available_show_dates,
+        ),
+        show_selection_dates=tuple(dict.fromkeys(show_selection_dates)),
+    )
 
 
 def build_light_show_awareness(read_model: dict, channel_policy: str) -> str:
@@ -4089,10 +4098,11 @@ def build_tiktok_show_evidence_context_for_turn(
         )
     )
     continuation_dates = getattr(website_read_model_context, "continuation_show_dates", ())
-    selected_show_dates = continuation_dates or tuple(dict.fromkeys(re.findall(
-        r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b",
-        website_read_model_context or "",
-    )))
+    # A queue snapshot's date belongs to its operational readout, not the
+    # member's independent history. Only the show owner supplies candidates.
+    selected_show_dates = continuation_dates or getattr(
+        website_read_model_context, "show_selection_dates", (),
+    )
     continuation_selection_query = ""
     if (
         selected_show_dates
@@ -28159,6 +28169,7 @@ def build_named_public_conversation_context(
     if not subjects:
         return "", None
     selected_date = requested_show_date(user_text)
+    history_window = requested_history_window(user_text)
     if has_explicit_show_date(user_text) and not selected_date:
         return "", None
     query_terms = memory_relevance_terms(query)
@@ -28194,6 +28205,10 @@ def build_named_public_conversation_context(
                 # can be 23 or 25 hours, and pytz.replace uses historical LMT.
                 start = PACIFIC_TZ.localize(day)
                 end = PACIFIC_TZ.localize(day + timedelta(days=1))
+                date_clause = " AND julianday(timestamp)>=julianday(?) AND julianday(timestamp)<julianday(?)"
+                date_params = (start.isoformat(), end.isoformat())
+            elif history_window:
+                start, end = (PACIFIC_TZ.localize(datetime.fromisoformat(day)) for day in history_window)
                 date_clause = " AND julianday(timestamp)>=julianday(?) AND julianday(timestamp)<julianday(?)"
                 date_params = (start.isoformat(), end.isoformat())
             for subject in subjects:

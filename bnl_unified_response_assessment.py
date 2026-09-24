@@ -364,11 +364,15 @@ _SELF_PUBLIC_ACTIVITY_PATTERN = (
     r"\bmy\s+(?:(?:public|discord|tik\s*tok|live|chats?|and)\s+)*"
     r"(?:activity|messages?|comments?|conversations?)\b"
 )
+_FIRST_PERSON_REFERENCE_RE = re.compile(r"\b(?:i(?:['’](?:ve|m|d|ll))?|my|mine)\b", re.I)
+_PUBLIC_ACTIVITY_SOURCE_RE = re.compile(r"\b(?:discord|tik\s*tok|chat|queue|submissions?)\b", re.I)
 
 
 def self_public_activity_requested(text: str) -> bool:
     """One requester scope shared by the frame and public evidence readers."""
-    return bool(re.search(_SELF_PUBLIC_ACTIVITY_PATTERN, str(text or ""), re.I))
+    return bool(re.search(_SELF_PUBLIC_ACTIVITY_PATTERN, str(text or ""), re.I)
+                or (_FIRST_PERSON_REFERENCE_RE.search(str(text or ""))
+                    and _PUBLIC_ACTIVITY_SOURCE_RE.search(str(text or ""))))
 
 
 _SELF_SUBJECT_CUE_RE = re.compile(
@@ -818,7 +822,8 @@ def _task_subject_indexes(
     subjects: Sequence[SituationSubjectReference],
 ) -> Tuple[int, ...]:
     bnl_self = bool(_BNL_SELF_SUBJECT_CUE_RE.search(segment or ""))
-    self_subject = bool(_SELF_SUBJECT_CUE_RE.search(segment or ""))
+    self_subject = bool(_SELF_SUBJECT_CUE_RE.search(segment or "")
+                        or self_public_activity_requested(segment))
     third_party = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(segment or ""))
     matches = []
     for index, subject in enumerate(subjects):
@@ -931,6 +936,7 @@ def _situation_tasks(
         subject_cue = bool(
             _BNL_SELF_SUBJECT_CUE_RE.search(segment)
             or _SELF_SUBJECT_CUE_RE.search(segment)
+            or self_public_activity_requested(segment)
             or (
                 _THIRD_PARTY_SUBJECT_CUE_RE.search(segment)
                 and not external_role_query
@@ -1137,7 +1143,8 @@ def build_situation_frame_v1(
         evidence_items=(evidence,),
     )
     third_party_cue = bool(_THIRD_PARTY_SUBJECT_CUE_RE.search(text))
-    self_subject_cue = bool(_SELF_SUBJECT_CUE_RE.search(text))
+    self_subject_cue = bool(_SELF_SUBJECT_CUE_RE.search(text)
+                            or self_public_activity_requested(text))
     bnl_self_subject_cue = bool(_BNL_SELF_SUBJECT_CUE_RE.search(text))
     external_role_query = bool(_EXTERNAL_ROLE_QUERY_RE.search(text))
 
@@ -1221,6 +1228,10 @@ def build_situation_frame_v1(
     if (
         len(speakers) == 1
         and self_subject_cue
+        # Resolved named subjects take precedence over an implicit speaker
+        # lookup. Possessive activity can explicitly request both members.
+        and (not subject_ids or _SELF_SUBJECT_CUE_RE.search(text)
+             or re.search(r"\b(?:my|mine)\b", text, re.I))
         and not any(subject.user_id == speakers[0] for subject in subjects)
     ):
         subjects.append(

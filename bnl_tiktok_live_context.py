@@ -573,6 +573,39 @@ def requested_recent_show_count(user_text: str) -> Optional[int]:
     return None if match.group(2).lower().endswith("s") else 1
 
 
+def requested_history_window(user_text: str, *, now: Any = None) -> tuple[str, str]:
+    """Resolve a rolling public-history window as Pacific dates, end exclusive.
+
+    This constrains the existing readers; it is not permission to read another
+    source. Explicit calendar dates retain their existing owner. A month means
+    the same date in the preceding calendar month, clamped at month end.
+    """
+    if has_explicit_show_date(user_text):
+        return ()
+    match = re.search(
+        r"\b(?:last|past|previous)\s+(?:(\d{1,3}|one|two|three|four|a)\s+)?"
+        r"(days?|weeks?|months?)\b", str(user_text or ""), re.I,
+    )
+    if not match:
+        return ()
+    amount = (match.group(1) or "one").lower()
+    count = {"a": 1, "one": 1, "two": 2, "three": 3, "four": 4}.get(amount)
+    if count is None:
+        count = int(amount)
+    if not 1 <= count <= 366:
+        return ()
+    end = _pacific_show_date(now)
+    unit = match.group(2).lower()
+    if unit.startswith("month"):
+        import calendar
+        year, month = divmod(end.year * 12 + end.month - 1 - count, 12)
+        month += 1
+        start = date(year, month, min(end.day, calendar.monthrange(year, month)[1]))
+    else:
+        start = end - timedelta(days=count * (7 if unit.startswith("week") else 1))
+    return start.isoformat(), (end + timedelta(days=1)).isoformat()
+
+
 def is_live_show_reaction_query(
     text: str, *, now: Any = None, current_show_date: Optional[str] = None,
     check_show_date: bool = True,
@@ -589,6 +622,8 @@ def is_live_show_reaction_query(
         return False
     if not check_show_date:
         return any(re.search(pattern, normalized) for pattern in _LIVE_REACTION_PATTERNS)
+    if requested_history_window(normalized, now=now):
+        return False
     if has_explicit_show_date(normalized):
         active_date = (
             _pacific_show_date(now).isoformat()
