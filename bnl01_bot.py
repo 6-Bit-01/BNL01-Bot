@@ -31469,7 +31469,12 @@ def refresh_prompt_source_bases(
     replacement_failed = False
     updated_prompt = prompt
     for basis in bases or ():
+        source_check_started = time.monotonic()
         fresh, changed = refresh_prompt_source_basis(basis)
+        logging.info(
+            "prompt_source_revalidation phase=refresh kind=%s elapsed_seconds=%.3f changed=%s",
+            type(basis).__name__, time.monotonic() - source_check_started, int(changed),
+        )
         refreshed.append(fresh)
         if not changed:
             continue
@@ -31545,6 +31550,7 @@ def prompt_source_basis_failure(
     bases = tuple(bases or ())
     try:
         for basis in bases:
+            source_check_started = time.monotonic()
             _fresh, changed = (
                 refresh_prompt_source_basis(
                     basis,
@@ -31554,6 +31560,10 @@ def prompt_source_basis_failure(
                 if journal_control_snapshot_provided
                 and isinstance(basis, PublicationPromptSourceBasis)
                 else refresh_prompt_source_basis(basis)
+            )
+            logging.info(
+                "prompt_source_revalidation phase=check kind=%s elapsed_seconds=%.3f changed=%s",
+                type(basis).__name__, time.monotonic() - source_check_started, int(changed),
             )
             if changed:
                 return (
@@ -40546,6 +40556,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     batch_attribution_contract.third_party_attribution_requested
                 ),
                 prompt_source_bases=tuple(batch_prompt_source_bases),
+                sender_revalidates_sources=True,
                 regeneration_allowed=bool(
                     batch_single_packet_cutover
                     or not batch_synthesis_candidate_active
@@ -40723,6 +40734,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         prompt_source_bases=tuple(
                             batch_prompt_source_bases
                         ),
+                        sender_revalidates_sources=True,
                         regeneration_allowed=True,
                         situation_frame=(
                             orchestration_state["decision"].situation_frame
@@ -41181,6 +41193,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     prompt_source_bases=tuple(
                         batch_prompt_source_bases
                     ),
+                    sender_revalidates_sources=True,
                     regeneration_allowed=True,
                     situation_frame=(
                         orchestration_state["decision"].situation_frame
@@ -43907,6 +43920,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         prompt_source_bases=tuple(
             prompt_metadata.get("prompt_source_bases") or ()
         ),
+        sender_revalidates_sources=True,
         situation_frame=session_orchestration.situation_frame,
         situation_frame_current_text=direct_content,
         situation_frame_route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
@@ -44458,11 +44472,19 @@ async def apply_guarded_response_regeneration(
     exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
     third_party_attribution_requested: bool = False,
     prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
+    sender_revalidates_sources: bool = False,
     situation_frame: SituationFrameV1 | None = None,
     situation_frame_current_text: str = "",
     situation_frame_route_mode: str = "",
     image_inputs: tuple[ConversationImageInput, ...] = (),
 ) -> tuple[str, dict]:
+    """Check the response and refresh its selected sources.
+
+    Delivery owners with a fresh source fence after their last route-specific
+    await set sender_revalidates_sources. That fence owns the final check;
+    standalone guard callers retain the check here.
+    """
+
     diagnostics = {
         "scripted_mode_leak_guard_triggered": False,
         "regenerated_for_mode_leak": False,
@@ -45564,22 +45586,23 @@ async def apply_guarded_response_regeneration(
             }
         )
         return "", diagnostics
-    final_source_failure = await asyncio.to_thread(
-        prompt_source_basis_failure,
-        prompt_source_bases
-    )
-    if final_source_failure:
-        diagnostics.update(
-            {
-                "prompt_source_basis_changed": True,
-                "suppressed": True,
-                "suppression_reason": (
-                    final_source_failure + "_before_send"
-                ),
-                "guard_fallback_or_generic_non_answer": True,
-            }
+    if not sender_revalidates_sources:
+        final_source_failure = await asyncio.to_thread(
+            prompt_source_basis_failure,
+            prompt_source_bases
         )
-        return "", diagnostics
+        if final_source_failure:
+            diagnostics.update(
+                {
+                    "prompt_source_basis_changed": True,
+                    "suppressed": True,
+                    "suppression_reason": (
+                        final_source_failure + "_before_send"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
     if source_safe_recall:
         conversation_source_count = sum(
             len(basis.evidence_items)
@@ -45591,7 +45614,7 @@ async def apply_guarded_response_regeneration(
             guild_id=guild_id,
             conversation_source_count=conversation_source_count,
         )
-    # Callers perform one more synchronous check immediately after their last
+    # Delivery owners perform a fresh off-loop check after their last
     # route-specific await (typing stop, quote fetch, or pacing grace). If this
     # guard rebuilt changed memory/Moment context and regenerated successfully,
     # that final check must use the refreshed basis rather than the stale
@@ -46974,6 +46997,7 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested
             ),
             prompt_source_bases=selected_bases,
+            sender_revalidates_sources=True,
             regeneration_allowed=regeneration_allowed,
             situation_frame=situation_frame,
             situation_frame_current_text=situation_frame_current_text,

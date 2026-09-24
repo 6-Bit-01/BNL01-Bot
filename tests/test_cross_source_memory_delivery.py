@@ -862,6 +862,144 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
             conn.execute("UPDATE conversations SET user_name='Test Renamed' WHERE id=7101")
         self.assertEqual(bot.prompt_source_basis_failure(bases), "conversation_source_changed")
 
+    async def test_batch_uses_two_fresh_show_reads_after_generation(self):
+        for enabled in (False, True):
+            channel_id = 8811 + len(self.runtime.channel_ids)
+            with self.subTest(packet=enabled), self._packet_configuration(enabled, channel_id), mock.patch.object(
+                bot, "refresh_prompt_source_basis", wraps=bot.refresh_prompt_source_basis,
+            ) as refresh:
+                channel, generation, _guard = await self.runtime._batch(
+                    "sealed_test", request=REQUEST, answer=self._provider_answer,
+                    privileged=False, channel_id=channel_id,
+                )
+            self.assertEqual(channel.sent, [ANSWER])
+            generation.assert_awaited_once()
+            show_reads = [call for call in refresh.call_args_list
+                          if isinstance(call.args[0], bot.FinalizedShowPromptSourceBasis)]
+            # One post-generation refresh and one fresh send check. The
+            # response guard must not add a third full evidence reconstruction.
+            self.assertEqual(len(show_reads), 2)
+
+    async def _send_direct_source_reply(self):
+        from test_conversation_batching import FakeChannel, FakeGuild, FakeMessage
+
+        prompt, metadata = await self.runtime._direct_prompt_async(
+            "sealed_test", request=REQUEST, privileged=False,
+        )
+        channel = FakeChannel(8810, name="bnl-testing", guild=FakeGuild(GUILD))
+        message = FakeMessage(channel, REQUEST)
+        plan = bot.plan_conversation_response(
+            REQUEST, "sealed_test", route_mode=bot.ROUTE_MODE_NORMAL_CHAT,
+            real_direct_target=True, batching_enabled=False,
+            conversation_surface=bot.CONVERSATION_SURFACE_MENTION_OR_REPLY,
+        )
+        with mock.patch.object(bot, "_apply_direct_response_pacing", new=mock.AsyncMock()):
+            await bot.send_planned_conversation_response(
+                message, ANSWER, plan, prompt=prompt,
+                source_context_available=metadata["source_context_available"],
+                prompt_source_bases=metadata["prompt_source_bases"],
+                mark_recent_direct=False,
+            )
+        return message
+
+    async def test_direct_uses_two_fresh_show_reads_before_delivery(self):
+        with mock.patch.object(
+            bot, "refresh_prompt_source_basis", wraps=bot.refresh_prompt_source_basis,
+        ) as refresh:
+            message = await self._send_direct_source_reply()
+        self.assertEqual(message.replies, [ANSWER])
+        show_reads = [call for call in refresh.call_args_list
+                      if isinstance(call.args[0], bot.FinalizedShowPromptSourceBasis)]
+        self.assertEqual(len(show_reads), 2)
+
+    async def test_batch_source_changes_after_guard_never_deliver_the_old_quote(self):
+        real_stop = bot._stop_batch_typing
+        corrected = "That earlier Discord quotation is no longer available."
+        for column, value in (
+            ("channel_policy", "internal_controlled"),
+            ("content", "The corrected comment concerns blue drums."),
+            ("user_id", 43),
+        ):
+            channel_id = 8811 + len(self.runtime.channel_ids)
+            changed = False
+
+            async def stop_typing(*args, **kwargs):
+                nonlocal changed
+                if kwargs.get("reason") == "response_ready" and not changed:
+                    with sqlite3.connect(bot.DB_FILE) as conn:
+                        conn.execute(f"UPDATE conversations SET {column}=? WHERE id=7101", (value,))
+                    changed = True
+                return await real_stop(*args, **kwargs)
+
+            async def provider(*args, **kwargs):
+                await self._provider_answer(*args, **kwargs)
+                return corrected if changed else ANSWER
+
+            with self.subTest(mutation=column), self._packet_configuration(True, channel_id), mock.patch.object(
+                bot, "_stop_batch_typing", side_effect=stop_typing,
+            ):
+                channel, generation, _guard = await self.runtime._batch(
+                    "sealed_test", request=REQUEST, answer=provider,
+                    privileged=False, channel_id=channel_id,
+                )
+            self.assertTrue(changed)
+            self.assertEqual(channel.sent, [corrected])
+            self.assertEqual(generation.await_count, 2)
+            with sqlite3.connect(bot.DB_FILE) as conn:
+                saved = conn.execute(
+                    "SELECT content FROM conversations WHERE role='model' AND channel_id=?",
+                    (channel_id,),
+                ).fetchall()
+                conn.execute(
+                    "UPDATE conversations SET channel_policy='public_home',content=?,user_id=? WHERE id=7101",
+                    (DISCORD_COMMENT, SUBJECT),
+                )
+            self.assertEqual(saved, [(corrected,)])
+
+    async def test_direct_source_privacy_change_after_guard_is_still_checked(self):
+        changed = False
+        real_quote_check = bot.exact_quote_presend_failure
+
+        async def change_after_guard(*args, **kwargs):
+            nonlocal changed
+            with sqlite3.connect(bot.DB_FILE) as conn:
+                conn.execute("UPDATE conversations SET channel_policy='internal_controlled' WHERE id=7101")
+            changed = True
+            return await real_quote_check(*args, **kwargs)
+
+        corrected = "That earlier Discord quotation is no longer available."
+        provider = mock.AsyncMock(return_value=bot.TrackedGenerationResponse(corrected, 1))
+        with (
+            mock.patch.object(bot, "get_tracked_gemini_response_with_optional_typing", new=provider),
+            mock.patch.object(bot, "exact_quote_presend_failure", side_effect=change_after_guard),
+        ):
+            message = await self._send_direct_source_reply()
+        self.assertTrue(changed)
+        self.assertEqual(message.replies, [corrected])
+        provider.assert_awaited_once()
+
+    async def test_standalone_guard_keeps_its_final_source_check_after_repair(self):
+        prompt, metadata = await self.runtime._direct_prompt_async(
+            "sealed_test", request=REQUEST, privileged=False,
+        )
+
+        async def repair(*_args, **_kwargs):
+            with sqlite3.connect(bot.DB_FILE) as conn:
+                conn.execute("UPDATE conversations SET channel_policy='internal_controlled' WHERE id=7101")
+            return ANSWER
+
+        with mock.patch.object(bot, "get_gemini_response_with_optional_typing", side_effect=repair) as provider:
+            response, diagnostics = await bot.apply_guarded_response_regeneration(
+                "What do you need?", prompt=prompt, user_id=REQUESTER, guild_id=GUILD,
+                route_mode=bot.ROUTE_MODE_NORMAL_CHAT, channel_policy="sealed_test",
+                current_user_text=REQUEST, source_context_available=True,
+                prompt_source_bases=metadata["prompt_source_bases"],
+            )
+        provider.assert_awaited_once()
+        self.assertEqual(response, "")
+        self.assertTrue(diagnostics["suppressed"])
+        self.assertEqual(diagnostics["suppression_reason"], "conversation_source_changed_before_send")
+
 
 if __name__ == "__main__":
     unittest.main()
