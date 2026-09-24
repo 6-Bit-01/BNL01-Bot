@@ -248,7 +248,6 @@ from bnl_memory_preview import (
     snapshots_equivalent as memory_preview_snapshots_equivalent,
 )
 from bnl_unified_response_assessment import (
-    self_public_activity_requested,
     situation_subject_label_spans,
     ConversationOrchestrationDecision,
     ConversationOrchestrationInput,
@@ -28114,8 +28113,7 @@ def _named_public_recall_scope(
              and int(subject.user_id) != int(BNL_OWNER_USER_ID or 0))
             or (subject.binding_method == "current_speaker_context"
                 and subject.confidence in {"high", "contextual"}
-                and subject.user_id in situation_frame.current_speaker_user_ids
-                and self_public_activity_requested(user_text))
+                and subject.user_id in situation_frame.current_speaker_user_ids)
         )
     )
     subjects = tuple({int(s.user_id): s for s in subjects}.values())[:8]
