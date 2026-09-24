@@ -107,6 +107,33 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
                 self.assertFalse(basis.evidence_items[0].current_turn)
                 self.assertFalse(bot.refresh_prompt_source_basis(basis)[1])
 
+    def test_clock_output_request_does_not_filter_originals(self):
+        self.seed(timestamp="2026-09-19 04:12:21")
+        for suffix in (
+            "Quote it and include the Pacific time.",
+            "Quote it. Include the exact timestamp.",
+            "Quote it with the local time.",
+        ):
+            query = "Give me a public Discord comment from TestMarbles on September 18, 2026. " + suffix
+            with self.subTest(suffix=suffix):
+                context, basis = self.read(text=query)
+                self.assertIn(STATEMENT, context)
+                self.assertIn("2026-09-18 21:12:21 PDT", context)
+                self.assertEqual(basis.source_row_ids, (1,))
+
+    def test_time_words_remain_available_as_an_actual_topic(self):
+        clock_comment = "Pacific time works well for rehearsals."
+        self.seed(text=clock_comment)
+        self.seed(2, text="The violet keyboard arrived safely.")
+        with mock.patch.object(bot, "MEMORY_PROMPT_BUDGET_PUBLIC", 220):
+            context, basis = self.read(text=(
+                "What has TestMarbles said about Pacific time? "
+                "Quote it and include the timestamp."
+            ))
+        self.assertIn(clock_comment, context)
+        self.assertNotIn("violet keyboard", context)
+        self.assertEqual(basis.source_row_ids, (1,))
+
     def test_private_sealed_wrong_author_and_wrong_guild_rows_are_excluded(self):
         self.seed()
         self.seed(2, user_id=111, text="Requester pants statement.")
@@ -144,9 +171,17 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
         self.assertLessEqual(len(context), 220)
         self.assertNotIn("…", context)
 
-    def test_subject_labels_and_speech_function_words_are_not_topic_evidence(self):
+    def test_unmatched_terms_do_not_remove_the_resolved_members_originals(self):
         self.seed(text="TestMarbles said the studio looks lovely.")
-        self.assertEqual(self.read(), ("", None))
+        self.seed(2, user_id=333, text="I have been stealing pants.")
+        for query in (QUERY, "Explain TestMarbles's outlook in concise prose.",
+                      "TestMarbles — how welcoming has the space felt?"):
+            with self.subTest(query=query):
+                context, basis = self.read(text=query)
+                self.assertIn("studio looks lovely", context)
+                self.assertNotIn("stealing pants", context)
+                self.assertEqual(basis.source_row_ids, (1,))
+                self.assertFalse(bot.refresh_prompt_source_basis(basis)[1])
 
     def test_broad_member_recall_does_not_require_an_unrelated_topic_keyword(self):
         self.seed(text="The studio looks lovely.")
@@ -154,16 +189,25 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
         self.assertIn("The studio looks lovely.", context)
         self.assertEqual(basis.source_row_ids, (1,))
 
-    def test_ambiguous_unbound_and_owner_subjects_do_not_read_rows(self):
+    def test_unbound_and_owner_subjects_do_not_read_rows(self):
         self.seed()
         frame = self.frame()
         for candidate in (
-            replace(frame, status="ambiguous"),
             replace(frame, subjects=(replace(frame.subjects[0], confidence="low"),)),
             self.frame(ids=(99,), labels=("6 Bit",)),
         ):
             with self.subTest(frame=candidate.status, subjects=candidate.subjects):
                 self.assertEqual(self.read(frame=candidate), ("", None))
+
+    def test_task_ambiguity_does_not_erase_an_independently_bound_person(self):
+        self.seed()
+        frame = replace(self.frame(), status="ambiguous",
+                        ambiguity_reasons=("referent_unresolved",))
+        context, basis = self.read(frame=frame)
+        self.assertIn(STATEMENT, context)
+        self.assertEqual(basis.participant_user_ids, (222,))
+        unbound = replace(frame, subjects=(replace(frame.subjects[0], confidence="low"),))
+        self.assertEqual(self.read(frame=unbound), ("", None))
 
     def test_owner_self_activity_projects_only_public_identity_and_revalidates(self):
         self.seed(user_id=99, label="Test Account Label", text="The public stage lights are blue.")

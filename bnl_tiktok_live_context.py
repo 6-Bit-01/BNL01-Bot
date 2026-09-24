@@ -702,6 +702,19 @@ def _iso_epoch_ms(value: Any) -> Optional[int]:
         return None
 
 
+def _recorded_pacific_time(occurred_at_ms: Any) -> str:
+    """Project the recorded instant; never infer a clock from a schedule."""
+    try:
+        value = float(occurred_at_ms)
+        if isinstance(occurred_at_ms, bool) or not math.isfinite(value) or value <= 0:
+            return "clock time unavailable"
+        return datetime.fromtimestamp(value / 1000, timezone.utc).astimezone(
+            _PACIFIC_TZ
+        ).strftime("%Y-%m-%d %H:%M:%S %Z")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "clock time unavailable"
+
+
 def _history_track_identity(value: Any) -> Tuple[str, str, str]:
     if not isinstance(value, Mapping):
         return "", "", ""
@@ -2136,7 +2149,8 @@ def _durable_comment_evidence_line(
         operational_events,
     )
     return (
-        f"- t+{minute_offset:.1f}m | {label} | {speaker}: "
+        f"- t+{minute_offset:.1f}m ({_recorded_pacific_time(event.get('occurred_at_ms'))}) "
+        f"| {label} | {speaker}: "
         f"{json.dumps(text, ensure_ascii=False)} | {timing}"
     )
 
@@ -2452,7 +2466,10 @@ def build_show_interval_conversation(
     )]
     transcript = []
     for item in timeline:
-        prefix = f"t+{(int(item.get('occurredAtMs') or 0)-start_ms)/60000:.3f}m "
+        prefix = (
+            f"t+{(int(item.get('occurredAtMs') or 0)-start_ms)/60000:.3f}m "
+            f"({_recorded_pacific_time(item.get('occurredAtMs'))}) "
+        )
         if item.get("role") == "operation":
             transcript.append(prefix + "[recorded operation] " + str(item.get("eventType") or "")
                               + ": " + str(item.get("trackLabel") or item.get("headline") or "")
@@ -3149,6 +3166,7 @@ def _direct_operational_evidence_lines(
         suffix = "; ".join(value for value in facts if value)
         lines.append(
             f"- t+{float(event.get('minuteOffset') or 0.0):.1f}m "
+            f"({_recorded_pacific_time(event.get('occurredAtMs'))}) "
             f"[{event_type}] {headline}"
             + (f" — {suffix}" if suffix else "")
         )

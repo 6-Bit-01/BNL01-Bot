@@ -603,6 +603,34 @@ class MemberMemoryIntegrationTests(unittest.TestCase):
         # follow-through guard on its own.
         self.assertNotIn("[CONVERSATION_CONTINUITY_REQUIRED]", prompt)
 
+    def test_ordinary_wording_can_receive_all_eligible_memory_tiers(self):
+        summaries = {
+            "short": "The copper lamp flickered beside the mixer.",
+            "medium": "An earlier exchange covered amber lantern placement.",
+            "long": "The stage lighting experiment began in May.",
+        }
+        for tier, summary in summaries.items():
+            bnl01_bot._add_memory_tier_entry(
+                42, 1, tier, summary, 0.85, source_role="user",
+                source_channel_policy="public_home", source_trust="source_safe_public",
+            )
+        bnl01_bot._add_memory_tier_entry(
+            42, 1, "short", "The hidden fixture access code is turquoise.", 0.95,
+            source_role="user", source_channel_policy="internal_controlled",
+            source_trust="internal_only",
+        )
+        for query in ("How did we set the mood?", "What was that all about?",
+                      "Explain the atmosphere in two sentences."):
+            with self.subTest(query=query):
+                context = bnl01_bot.build_user_memory_context(
+                    42, 1, channel_policy="public_home", user_text=query,
+                    current_direct=True,
+                )
+                for summary in summaries.values():
+                    self.assertIn(summary, context)
+                self.assertNotIn("hidden fixture access code", context)
+                self.assertIn("neither exact prior messages nor verified personal facts", context)
+
     def test_governance_rejects_arbitrary_first_party_preferences(self):
         with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
             ensure_governance_schema(conn)

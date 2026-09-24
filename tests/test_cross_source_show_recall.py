@@ -88,14 +88,15 @@ class CrossSourceShowRecallTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "completed")
 
-    def contexts(self, query=QUERY):
+    def contexts(self, query=QUERY, *, show_limit=None):
         selection = {}
         full = build_tiktok_show_evidence_context(
             self.db, guild_id=77, user_text=query, selection_out=selection,
+            show_limit=show_limit,
         )
         with sqlite3.connect(self.db) as conn:
             compact = "\n".join(item.text for item in select_tiktok_show_episode_context_items(
-                conn, guild_id=77, user_text=query,
+                conn, guild_id=77, user_text=query, max_shows=show_limit or 8,
             ))
         return (full, compact), selection
 
@@ -105,12 +106,31 @@ class CrossSourceShowRecallTests(unittest.TestCase):
         newer = self.add_show("2026-09-04", "2026-09-05")
         self.message(newer, "Thanks for the welcome tonight.")
         self.sync()
-        contexts, selection = self.contexts()
+        contexts, selection = self.contexts(show_limit=1)
         for context in contexts:
             self.assertIn("I brought amber lanterns for the courtyard.", context)
             self.assertNotIn("Thanks for the welcome tonight.", context)
         self.assertEqual(len(selection["source_refs"]), 1)
         self.assertEqual(selection["source_refs"][0][0], "test-show-2026-08-28")
+
+    def test_unmatched_terms_keep_the_named_person_available_in_both_views(self):
+        date = self.add_show()
+        self.message(date, "I brought amber lanterns for the courtyard.")
+        self.message(date, "I repaired the brass lamps today.", surface="discord")
+        self.message(date, "My submarine is blue.", subject="discord_user:43",
+                     name="Test Neighbor", handle="test.neighbor")
+        self.sync()
+        for query in ("How does Test Signal set the mood?",
+                      "Describe Test Signal's outlook in two sentences.",
+                      "What has Test Signal said about submarines?"):
+            with self.subTest(query=query):
+                contexts, selection = self.contexts(query)
+                for context in contexts:
+                    self.assertIn("I brought amber lanterns for the courtyard.", context)
+                    self.assertIn("I repaired the brass lamps today.", context)
+                    self.assertNotIn("My submarine is blue.", context)
+                self.assertEqual({item[3] for item in selection["authored_excerpts"]},
+                                 {"discord_user:42"})
 
     def test_general_query_combines_matching_episodes_and_both_sources(self):
         older = self.add_show()
@@ -215,15 +235,18 @@ class CrossSourceShowRecallTests(unittest.TestCase):
             self.assertIn("2026-08-28", context)
             self.assertNotIn("2026-09-04", context)
 
-    def test_other_person_topic_does_not_nominate_requested_person(self):
+    def test_other_person_topic_does_not_replace_requested_persons_evidence(self):
         date = self.add_show()
         self.message(date, "Thanks for the welcome.")
         self.message(date, "My amber lanterns are made of paper.",
                      subject="discord_user:43", name="Test Neighbor", handle="test.neighbor")
         self.sync()
         contexts, selection = self.contexts()
-        self.assertEqual(contexts, ("", ""))
-        self.assertEqual(selection, {})
+        for context in contexts:
+            self.assertIn("Thanks for the welcome.", context)
+            self.assertNotIn("My amber lanterns are made of paper.", context)
+        self.assertEqual({item[3] for item in selection["authored_excerpts"]},
+                         {"discord_user:42"})
 
     def test_platform_words_cannot_add_another_speakers_episode(self):
         older = self.add_show()
@@ -253,8 +276,15 @@ class CrossSourceShowRecallTests(unittest.TestCase):
         date = self.add_show()
         self.exchange(date, "Thanks for the welcome.", "Your amber lanterns look bright.")
         self.sync()
-        contexts, _ = self.contexts()
-        self.assertEqual(contexts, ("", ""))
+        contexts, selection = self.contexts()
+        for context in contexts:
+            self.assertIn("Thanks for the welcome.", context)
+        # The native exchange may include the separately attributed BNL reply,
+        # but it must never become a member-authored excerpt or quote root.
+        self.assertTrue(selection["authored_excerpts"])
+        self.assertTrue(all(item[5] == "Thanks for the welcome."
+                            for item in selection["authored_excerpts"]))
+        self.assertNotIn("Your amber lanterns look bright.", contexts[1])
 
     def test_mentioned_topic_person_does_not_become_an_author(self):
         date = self.add_show()
