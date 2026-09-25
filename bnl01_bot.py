@@ -13179,7 +13179,11 @@ def _record_additional_channel_observation(message) -> bool:
         ).fetchone()
     if seen:
         return True
-    name = str(getattr(author, "display_name", "") or getattr(author, "name", "member"))
+    # Resolve authority by ID before touching account display fields.
+    if int(BNL_OWNER_USER_ID or 0) and int(getattr(author, "id", 0) or 0) == int(BNL_OWNER_USER_ID):
+        name = "6 Bit"
+    else:
+        name = str(getattr(author, "display_name", "") or getattr(author, "name", "member"))
     if memory_policy:
         save_user_message(
             author.id, name, guild.id, bounded,
@@ -19652,23 +19656,25 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
                     )
         except Exception as exc:
             logging.debug("relationship_v2_shadow_observe_user_failed error=%s", exc)
-    try:
-        mark_subject_dirty_for_evidence(
-            DB_FILE,
-            guild_id=guild_id,
-            subject_name=user_name,
-            evidence_source="conversations",
-            content=content,
-            channel_policy=channel_policy,
-            source_scope="subject_authored",
-            authority="local_observed",
-            visibility="public_safe" if channel_policy in {"public_home", "public_context", "public_selective", "broadcast_memory"} else "review_only",
-            evidence_type="subject_authored_message",
-            relation_to_subject="authored",
-            created_by="save_user_message",
-        )
-    except Exception as exc:
-        logging.debug("source_refresh_dirty_hook_failed source=conversations error=%s", exc)
+    # Reading additional rooms must not produce automatic Source File work.
+    if route_mode != "channel_observation":
+        try:
+            mark_subject_dirty_for_evidence(
+                DB_FILE,
+                guild_id=guild_id,
+                subject_name=user_name,
+                evidence_source="conversations",
+                content=content,
+                channel_policy=channel_policy,
+                source_scope="subject_authored",
+                authority="local_observed",
+                visibility="public_safe" if channel_policy in {"public_home", "public_context", "public_selective", "broadcast_memory"} else "review_only",
+                evidence_type="subject_authored_message",
+                relation_to_subject="authored",
+                created_by="save_user_message",
+            )
+        except Exception as exc:
+            logging.debug("source_refresh_dirty_hook_failed source=conversations error=%s", exc)
     if decision.update_relationship:
         update_relationship_state(user_id, guild_id, content, delta_affinity=0.06)
     if decision.update_habits:

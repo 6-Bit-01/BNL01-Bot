@@ -60,6 +60,38 @@ class AllChannelObservationTests(unittest.TestCase):
         with sqlite3.connect(self.tmp.name) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 1)
 
+    def test_owner_observation_never_reads_or_persists_account_display_fields(self):
+        class OwnerAuthor:
+            id = 42
+            bot = False
+
+            @property
+            def display_name(self):
+                raise AssertionError("Account display fields must not be read")
+
+            @property
+            def name(self):
+                raise AssertionError("Account display fields must not be read")
+
+        with mock.patch.object(bot, "BNL_OWNER_USER_ID", 42):
+            for public in (True, False):
+                guild, channel = self.room(public=public)
+                self.assertTrue(bot.record_additional_channel_observation(
+                    FakeMessage("A new observation.", channel, author=OwnerAuthor())))
+        self.assertEqual([event["private_display_name"] for event in self.events()], ["6 Bit", "6 Bit"])
+        with sqlite3.connect(self.tmp.name) as conn:
+            self.assertEqual(conn.execute("SELECT user_name FROM conversations").fetchall(), [("6 Bit",)])
+
+    def test_observation_does_not_enqueue_source_refresh_but_normal_capture_still_can(self):
+        guild, channel = self.room()
+        with mock.patch.object(bot, "mark_subject_dirty_for_evidence") as dirty:
+            self.assertTrue(bot.record_additional_channel_observation(
+                FakeMessage("I released my first complete album today.", channel)))
+            dirty.assert_not_called()
+            bot.save_user_message(43, "Test Member", guild.id, "I released an album today.",
+                                  channel_policy="public_selective")
+            dirty.assert_called_once()
+
     def test_private_named_and_new_rooms_never_become_public_activity(self):
         for name in ("new-private-room", "research-and-development", "rules", "welcome"):
             with self.subTest(name=name):

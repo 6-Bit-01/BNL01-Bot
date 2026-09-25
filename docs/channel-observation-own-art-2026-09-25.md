@@ -22,6 +22,9 @@ Private and external-bot observations keep their author/source attribution in
 the existing archive with public reuse disabled. They do not become evidence
 that a person spoke, public activity counts, or public Journal/Relay material.
 Existing scoped forget operations also cover these new observations.
+Observation-only capture bypasses automatic Source File refresh queue hooks.
+The configured owner's label is normalized to `6 Bit` without reading account
+display fields, before writing either conversation or private source records.
 
 Each additional observation retains the original message time and ID and at
 most 1,000 characters with a truncation marker. Attachment metadata is observed;
