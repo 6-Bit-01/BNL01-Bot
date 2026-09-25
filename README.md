@@ -63,9 +63,10 @@ BNL keeps its existing 1,350,000-token daily API safety budget as a secondary
 guard, independent of consumer Gemini subscriptions and Google project limits.
 Production defaults to `gemini-3.6-flash`; interactive conversation may use the
 same-project `gemini-3.5-flash` fallback after bounded transient-error retry.
-Each optional-background provider invocation uses one SDK attempt with no
-fallback; a provider outage or local budget refusal stops validator-guided
-follow-up calls for that job.
+Optional-background generation uses one SDK attempt, except that the website
+Relay may make one same-project backup call after a primary HTTP 503. Other
+background work has no fallback; a provider outage or local budget refusal stops
+validator-guided follow-up calls for that job.
 Governed memory, Source File/dossier, the accepted ordinary-chat single-packet
 route, and Journal do not automatically downgrade. Route-specific output
 allowances preserve quality, and `BNL_GEMINI_JOURNAL_PROTECTED_TOKENS` (default
@@ -108,8 +109,9 @@ remain immediate and retain the same quiet-source cascade, validator, history,
 and cursor rules. Website presence heartbeat remains independent at five
 minutes.
 
-Relay keeps its background one-attempt/no-fallback provider policy, but may use
-the small configured pace allowance when generic background work is restricted.
+Relay has no per-model retry and at most one backup call after HTTP 503. Both
+attempts are reserved up front. It may use the small configured pace allowance
+when generic background work is restricted.
 The allowance never bypasses the effective hard limit or the Journal and
 interactive dollar reserves. Show-day generation remains background-shaped but
 time-sensitive, so the generic monthly/daily pace gate cannot suppress a

@@ -180,6 +180,40 @@ class RelaySharedInputsTests(unittest.TestCase):
         saved = json.loads(relay.recent_history(self.db, 1)[0]["source_basis_json"])
         self.assertEqual(saved[0]["sourceId"], self.mid)
 
+    def test_publication_rotation_cannot_promote_journal_over_original_evidence(self):
+        self.add_journal()
+        self.add_show()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("INSERT INTO conversations VALUES (21, 7, 'Test Member', 1, 'public', 'public_home', 'user', ?, ?)",
+                         ("The reporters compared how journalists verify their original sources.",
+                          (self.now - timedelta(hours=3)).isoformat()))
+        # All original categories have already appeared. Before the repair the
+        # unseen Journal won the diversity rotation despite these real sources.
+        for index, kind in enumerate(("conversation_continuity", "public_moment", "finalized_show", "canon")):
+            relay.record_publication(self.db, 1, message="Previously accepted example %s." % index,
+                directive="Consider the earlier supported question.", mode="OBSERVATION",
+                relay_lane="residual_echo", event_type=kind, source_cursor=20,
+                published_timestamp=(self.now - timedelta(minutes=4-index)).isoformat(),
+                relay_id="original-priority-%s" % index)
+        self.reset_process()
+        selected = bot._select_approved_quiet_relay_source(1, 20, 21)
+        self.assertEqual(selected.source_class, "conversation_continuity")
+        self.assertIn("published_journal", selected.metadata["available_source_classes"])
+        self.assertNotIn("published_journal", selected.metadata["primary_source_classes"])
+        self.assertIn("original sources", selected.context)
+        self.assertNotIn("published interpretation", selected.context)
+        self.assertEqual(relay.get_cursor(self.db, 1), 20)
+
+    def test_journal_remains_available_when_no_original_source_is_eligible(self):
+        self.add_journal()
+        publication = next(item for item in self.sources() if item.source_class == "published_journal")
+        with mock.patch.object(bot, "_select_shared_relay_sources", return_value=(publication,)):
+            selected = bot._select_approved_quiet_relay_source(1, 20, 20)
+        self.assertEqual(selected.source_class, "published_journal")
+        self.assertIn("not independent testimony", selected.context)
+        self.assertEqual(selected.metadata["shared_source_provenance"], publication.metadata["shared_source_provenance"])
+        self.assertEqual(relay.get_cursor(self.db, 1), 20)
+
     def test_journal_callback_without_lane_keywords_reaches_accepted_publication(self):
         self.add_journal()
         copy = ("The published Journal framed that playful reporters debate as a question about verification.\n"
