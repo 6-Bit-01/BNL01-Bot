@@ -23288,6 +23288,15 @@ def revalidate_ambient_local_sources(guild_id: int, basis: dict) -> bool:
                     return False
                 if table == 'broadcast_memory' and any(not _valid_until_active(row['valid_until']) for row in rows):
                     return False
+            recent_ids = tuple(basis.get('recent_conversation_ids', ()))
+            if recent_ids:
+                now = _pacific_now().astimezone(timezone.utc)
+                current_ids = {row[0] for row in conn.execute(
+                    "SELECT id FROM conversations WHERE guild_id=? AND id IN (" + ','.join('?' for _ in recent_ids) + ") "
+                    "AND datetime(timestamp)>=datetime(?) AND datetime(timestamp)<=datetime(?)",
+                    (guild_id, *recent_ids, (now - timedelta(hours=24)).isoformat(), now.isoformat()))}
+                if current_ids != set(recent_ids):
+                    return False
             for tier_id, expected in basis.get('tier_sources', {}).items():
                 if _ambient_tier_sources(conn, guild_id, tier_id) != expected:
                     return False
@@ -23301,6 +23310,8 @@ def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_M
     with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
         rows = _ambient_source_rows(conn, 'conversations', guild_id, limit=limit)
     _remember_ambient_sources(source_basis, 'conversations', rows)
+    if source_basis is not None:
+        source_basis['recent_conversation_ids'] = tuple(row['id'] for row in rows)
     return [((str(row['timestamp']) + '; ' if dated else '') + row['user_name'], row['content']) for row in reversed(rows)]
 
 def get_guild_curiosity_snapshot(guild_id: int, limit_users: int = 3):
@@ -35671,9 +35682,13 @@ async def ambient_message_task():
                         continue
 
                     art = await ambient_art.prepare(sys.modules[__name__], guild_id, source_basis)
+                    if art:
+                        await asyncio.to_thread(ambient_art.record, sys.modules[__name__], art['metadata']['artId'], 'discord_delivery_reserved')
                     if (not await revalidate_ambient_sources(guild_id, source_basis, stage='before_send')
                             or not allow_passive_memory_for_policy(resolve_channel_policy(channel))
                             or is_community_image_channel(channel)):
+                        if art:
+                            await asyncio.to_thread(ambient_art.record, sys.modules[__name__], art['metadata']['artId'], 'withdrawn_before_delivery')
                         _set_ambient_runtime_state(guild_id, skip_reason='source_changed_or_unavailable')
                         _reschedule_ambient_soon(guild_id, last_msg or '')
                         continue
@@ -35681,8 +35696,6 @@ async def ambient_message_task():
                         art = None  # Midnight must not charge yesterday's claim to today's send.
                     send_started = time.monotonic()
                     send_outcome = 'unconfirmed'
-                    if art:
-                        await asyncio.to_thread(ambient_art.record, sys.modules[__name__], art['metadata']['artId'], 'discord_send_started')
                     try:
                         kwargs = {'allowed_mentions': discord.AllowedMentions.none()}
                         if art:

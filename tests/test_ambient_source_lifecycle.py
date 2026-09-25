@@ -264,5 +264,22 @@ class AmbientSourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         logged.assert_not_called()
 
 
+    async def test_recent_source_aging_out_during_generation_discards_draft(self):
+        self.execute('UPDATE conversations SET timestamp=?', ((self.fixture.now - timedelta(hours=24) + timedelta(seconds=1)).isoformat(),))
+        def advance():
+            self.fixture.now += timedelta(seconds=2)
+        self.assertEqual(await self.generate(advance), '')
+        self.provider.assert_awaited_once()
+
+    async def test_older_linked_memory_remains_eligible_as_historical_context(self):
+        self.execute('UPDATE conversations SET timestamp=?', ((self.fixture.now - timedelta(days=3)).isoformat(),))
+        self.tier()
+        self.assertEqual(await self.generate(), ANSWER)
+        prompt = self.provider.call_args.args[0]
+        self.assertIn('asymmetric percussion', prompt)
+        self.assertNotIn('A new rhythm is forming', prompt)
+
+
 if __name__ == '__main__':
     unittest.main()
+

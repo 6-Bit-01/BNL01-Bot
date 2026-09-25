@@ -119,7 +119,7 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
         raw = json.dumps({'action': 'post', 'text': TEXT, 'art': {**CONCEPT, 'inspirationRefs': ['private:99']}})
         self.assertEqual(art.parse_response(raw), (TEXT, None, False))
 
-    async def test_scheduler_attaches_one_image_and_distinguishes_delivery(self):
+    async def _run_art_scheduler_case(self, withdraw=False):
         self.execute("INSERT INTO guild_configs(guild_id,active_channel_id,next_ambient_message_at) VALUES(42,100,?)", ((self.fixture.now - timedelta(minutes=1)).isoformat(),))
         channel = mock.Mock(id=100, name='public-room')
         channel.send = mock.AsyncMock(return_value=mock.Mock(id=123456))
@@ -137,7 +137,18 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(mock.patch.object(bot, 'get_last_ambient_posted_at', return_value=None))
             stack.enter_context(mock.patch.object(bot, 'ambient_capacity_decision', return_value={'allowed': True, 'capacityUsed': 0, 'cap': 1}))
             website = stack.enter_context(mock.patch.object(art, 'publish_website'))
+            record = art.record
+            def save(*args, **kwargs):
+                if withdraw and args[2] == 'discord_delivery_reserved':
+                    self.execute("UPDATE conversations SET channel_policy='sealed_test'")
+                return record(*args, **kwargs)
+            stack.enter_context(mock.patch.object(art, 'record', side_effect=save))
             await bot.ambient_message_task.coro()
+            if withdraw:
+                channel.send.assert_not_awaited()
+                website.assert_not_called()
+                self.assertEqual(self.execute('SELECT status FROM bnl_own_art_delivery')[0][0], 'withdrawn_before_delivery')
+                return
             channel.send.assert_awaited_once()
             self.assertEqual(channel.send.call_args.args[0], TEXT)
             self.assertIsInstance(channel.send.call_args.kwargs['file'], bot.discord.File)
@@ -164,3 +175,9 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, raw)
         provider.assert_awaited_once()
         rewrite.assert_not_awaited()
+
+    async def test_scheduler_attaches_one_image_and_distinguishes_delivery(self):
+        await self._run_art_scheduler_case()
+
+    async def test_withdrawal_during_delivery_reservation_is_checked_before_send(self):
+        await self._run_art_scheduler_case(withdraw=True)
