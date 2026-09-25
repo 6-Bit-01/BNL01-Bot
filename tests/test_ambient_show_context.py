@@ -64,8 +64,8 @@ class AmbientShowContextTests(unittest.IsolatedAsyncioTestCase):
         bot.init_db()
         with sqlite3.connect(bot.DB_FILE) as conn:
             conn.execute(
-                "INSERT INTO conversations(user_id,user_name,guild_id,channel_id,channel_name,channel_policy,role,content) "
-                "VALUES(7,'Test Member',42,100,'barcode-bot','public_home','user','A new rhythm is forming in the room.')"
+                "INSERT INTO conversations(user_id,user_name,guild_id,channel_id,channel_name,channel_policy,role,content,timestamp) "
+                "VALUES(7,'Test Member',42,100,'barcode-bot','public_home','user','A new rhythm is forming in the room.',?)", (self.now.isoformat(),)
             )
         clock = mock.Mock(wraps=datetime)
         clock.now.side_effect = lambda _tz: self.now
