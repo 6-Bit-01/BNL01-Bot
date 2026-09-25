@@ -27,6 +27,9 @@
   gates off unless a newer explicit owner decision authorizes the exact gate.
 - Preserve unrelated work and make the smallest coherent change that satisfies
   the requested scope.
+- Relay style/lane guidance must not become mandatory output vocabulary.
+  Validate source authority through the existing source owners; do not require
+  particular words as proof of grounding. Keep privacy and factual/time checks.
 
 ## Verification
 

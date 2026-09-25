@@ -180,6 +180,41 @@ class RelaySharedInputsTests(unittest.TestCase):
         saved = json.loads(relay.recent_history(self.db, 1)[0]["source_basis_json"])
         self.assertEqual(saved[0]["sourceId"], self.mid)
 
+    def test_journal_callback_without_lane_keywords_reaches_accepted_publication(self):
+        self.add_journal()
+        copy = ("The published Journal framed that playful reporters debate as a question about verification.\n"
+                "Which part of that interpretation deserves a closer look against the original conversation?")
+        generator = mock.AsyncMock(return_value=copy)
+        opener = mock.Mock(side_effect=self.accept)
+        with self.only_source("published_journal"), \
+             mock.patch.object(bot, "_select_quiet_relay_lane", return_value="residual_echo"):
+            result = self.transaction(generator, opener)
+        self.assertTrue(result.publish, result)
+        self.assertEqual(result.message, copy.splitlines()[0])
+        self.assertEqual(result.relayLane, "residual_echo")
+        generator.assert_awaited_once()
+        opener.assert_called_once()
+        self.assertTrue(result.metadata["accepted_relay_id"])
+        self.assertTrue(result.metadata["website_published_at"])
+        history = relay.recent_history(self.db, 1)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(json.loads(history[0]["source_basis_json"])[0]["sourceId"], "journal-relay-001")
+
+    def test_residual_journal_callback_still_rechecks_visibility_before_send(self):
+        self.add_journal()
+        hidden = control_snapshot(memory_excluded=("journal-relay-001",),
+            observed_at=self.now.isoformat(), fresh_until=(self.now + timedelta(seconds=120)).isoformat())
+        copy = ("The published Journal framed that playful reporters debate as a question about verification.\n"
+                "Which part of that interpretation deserves a closer look against the original conversation?")
+        with self.only_source("published_journal"), \
+             mock.patch.object(bot, "_select_quiet_relay_lane", return_value="residual_echo"), \
+             mock.patch.object(bot, "_journal_publication_control_snapshot_sync", return_value=(hidden, "valid")):
+            opener = mock.Mock(side_effect=AssertionError("withdrawn source must not post"))
+            result = self.transaction(lambda *a, **k: copy, opener)
+        self.assertEqual(result.skipReason, "relay_source_changed")
+        opener.assert_not_called()
+        self.assertEqual(relay.get_pending_v2_publication(self.db, 1), {})
+
     def test_correction_during_generation_blocks_publication_and_pending_save(self):
         async def generator(*args, **kwargs):
             with sqlite3.connect(self.db) as conn:

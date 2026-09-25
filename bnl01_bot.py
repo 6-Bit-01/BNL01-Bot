@@ -5874,7 +5874,10 @@ def _sanitize_relay_temporal_claims(
     return sanitized
 
 
-def _validate_relay_lane_adherence(message: str, lane: str, context_is_strong: bool, guild_id: int) -> tuple[bool, str]:
+def _validate_relay_lane_adherence(
+    message: str, lane: str, context_is_strong: bool, guild_id: int,
+    *, has_public_residue: bool = False,
+) -> tuple[bool, str]:
     safe_lane = lane if lane in RELAY_LANES else "carrier_trace"
     normalized = re.sub(
         r"\s+",
@@ -5915,9 +5918,11 @@ def _validate_relay_lane_adherence(message: str, lane: str, context_is_strong: b
         if has_thin_signal_text:
             logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=thin_signal_text")
             return False, "thin_signal_text"
-    if safe_lane == "residual_echo" and not any(marker in normalized for marker in ("residue", "echo", "afterimage", "archive", "still on", "recent")):
-        logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=missing_residual_anchor")
-        return False, "missing_residual_anchor"
+    # Ground the historical lane in the selected source, never in mandatory
+    # vocabulary. A word in generated prose cannot establish source authority.
+    if safe_lane == "residual_echo" and not has_public_residue:
+        logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=missing_residual_source")
+        return False, "missing_residual_source"
     return True, ""
 
 
@@ -6033,7 +6038,10 @@ async def build_low_signal_relay_message(guild_id: int, reason: str, recent_rela
             generated, _tokens = _extract_text_and_tokens(response)
             candidate = _sanitize_low_signal_candidate(generated, guild_id, recent_relay_messages)
             if candidate:
-                lane_ok, _lane_reason = _validate_relay_lane_adherence(candidate, relay_lane or "carrier_trace", False, guild_id)
+                lane_ok, _lane_reason = _validate_relay_lane_adherence(
+                    candidate, relay_lane or "carrier_trace", False, guild_id,
+                    has_public_residue=has_public_residue,
+                )
                 if lane_ok:
                     logging.info(f"website_low_signal_relay_generated guild={guild_id} reason={safe_reason} relay_lane={relay_lane or 'carrier_trace'}")
                     return candidate
@@ -6569,8 +6577,17 @@ def _select_quiet_relay_lane(guild_id: int, source_class: str) -> str:
     return ranked[0][1] if ranked else "network_posture"
 
 
+def _relay_source_has_public_residue(decision: RelaySourceDecision) -> bool:
+    """Use the approved selector's context; publication revalidates its basis."""
+    return bool(
+        not decision.skip_reason
+        and decision.context.strip()
+        and decision.source_class in {"conversation_continuity", "broadcast_memory", *RELAY_SHARED_SOURCE_CLASSES}
+    )
+
+
 def _build_source_decision_prompt(decision: RelaySourceDecision, mode: str, guild_id: int, relay_lane: str) -> str:
-    has_public_residue = decision.source_class in {"conversation_continuity", "broadcast_memory", *RELAY_SHARED_SOURCE_CLASSES}
+    has_public_residue = _relay_source_has_public_residue(decision)
     return (
         f"Write a BNL website relay from the selected approved source class: {decision.source_class}.\n"
         "Return exactly two lines: public relay message, then current directive.\n"
@@ -6650,7 +6667,10 @@ async def _generate_quiet_website_relay(guild_id: int, *, source_cursor: int, hi
     directive_reason = relay_stock_directive_reason(directive)
     if directive_reason:
         return WebsiteRelayDecision(False, skipReason=directive_reason, sourceCursor=source_cursor, metadata={"reason": directive_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
-    lane_ok, lane_reason = _validate_relay_lane_adherence(relay_message, relay_lane, False, guild_id)
+    lane_ok, lane_reason = _validate_relay_lane_adherence(
+        relay_message, relay_lane, False, guild_id,
+        has_public_residue=_relay_source_has_public_residue(quiet_source),
+    )
     if not lane_ok:
         return WebsiteRelayDecision(
             False,
