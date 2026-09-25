@@ -67,7 +67,7 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             clear=False,
         ):
             for route in (
-                "website_relay_event",
+                "website_relay_generation",
                 "ambient_generation",
                 "occasion_generation",
                 "community_scouting",
@@ -86,6 +86,15 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
                     self.assertEqual(policy.max_output_tokens, 1_024)
                     self.assertEqual(policy.provider_retries, 0)
                     self.assertFalse(policy.allow_fallback)
+
+    def test_relay_reserves_two_attempts_with_only_503_fallback(self):
+        with mock.patch.dict("os.environ", {"BNL_GEMINI_PROVIDER_RETRIES": "2"}):
+            policy = routing.policy_for_route("website_relay_event")
+        self.assertTrue(policy.allow_fallback)
+        self.assertEqual(policy.provider_retries, 0)
+        self.assertEqual(policy.fallback_status_codes, (503,))
+        self.assertEqual(routing.estimated_generation_reservation("abc", policy),
+                         2 * routing.single_attempt_reservation("abc", policy))
 
     def test_background_default_preserves_observed_thinking_headroom(self):
         with mock.patch.dict("os.environ", {}, clear=True):
