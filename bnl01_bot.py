@@ -502,6 +502,7 @@ from bnl_gemini_routing import (
     journal_protected_tokens,
     policy_for_route,
     provider_failure_kind,
+    provider_server_diagnostics,
     provider_status_code,
     relay_protected_tokens,
     retry_delay_seconds,
@@ -32248,6 +32249,24 @@ def _generate_model_with_retry(
         except Exception as error:
             last_error = error
             kind = provider_failure_kind(error)
+            if (route in {"website_relay_event", "bnl_journal_generation"}
+                    and not isinstance(contents, GeminiImageRequest)
+                    and 500 <= provider_status_code(error) < 600):
+                try:
+                    logging.warning(
+                        "gemini_provider_server_error reservation_id=%s route=%s model=%s "
+                        "attempt=%s status=%s input_chars=%s max_output_tokens=%s detail=%s",
+                        str(budget_reservation_id or "none"), route, model_name,
+                        attempt_index + 1, provider_status_code(error),
+                        len(contents) if isinstance(contents, str) else 0,
+                        policy.max_output_tokens,
+                        json.dumps(provider_server_diagnostics(
+                            error, secrets=(GEMINI_API_KEY,)), sort_keys=True),
+                    )
+                except Exception:
+                    # Diagnostics must not mask the original error, bypass
+                    # accounting, or introduce a retry/provider request.
+                    logging.warning("gemini_provider_diagnostics_unavailable route=%s", route)
             try:
                 record_failed_generation_attempt(
                     error,
