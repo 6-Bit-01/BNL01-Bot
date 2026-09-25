@@ -42,6 +42,7 @@ JOURNAL_GENERATION_ATTEMPTS = 4
 JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
 JOURNAL_EDITORIAL_VERSION = "journal-public-voices-1"
 JOURNAL_SHARED_INPUT_VERSION = "journal-shared-inputs-2"
+JOURNAL_REFLECTION_VERSION = "journal-dated-reflection-1"
 JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-2"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
@@ -83,6 +84,14 @@ JOURNAL_REFLECTION_BASIS_KINDS = {
     "approved_canon",
 }
 JOURNAL_REFLECTION_SCOPE = "historical_or_canon"
+# These are the Relay owner's quiet-source classes. A new publication of one
+# is not a new occurrence of the event it recalls. Actual completed shows enter
+# separately through the governed show reader, using their completion time.
+RETROSPECTIVE_RELAY_TYPES = frozenset({
+    "conversation_continuity", "broadcast_memory", "canon", "reflection",
+    "public_moment", "finalized_show", "published_journal", "published_ballad",
+    "quiet", "quiet_source", "non_event_stock", "heartbeat", "hydrated",
+})
 JOURNAL_TOPIC_STOPWORDS = {
     "about", "after", "again", "being", "could", "from", "have", "into", "just", "more", "other", "their",
     "there", "these", "they", "this", "through", "under", "where", "which", "while", "with", "would", "someone",
@@ -185,10 +194,11 @@ _REPAIR_GUIDANCE = {
     ),
     "current_activity_without_fresh_source": (
         "Remove every implication that historical or canon material happened in the current Journal window. "
-        "A reflective section may discuss only the supplied historical/canon basis unless it cites a fresh current-window source."
+        "Real activity needs current-window evidence. Keep personal reflection and explicitly imagined scenes "
+        "clearly in BNL's own thoughts; an imagined scene must never become a report of real community activity."
     ),
     "reflection_scope_not_explicit": (
-        "Frame the reflection explicitly as approved canon, an earlier public record, archive history, or established continuity. "
+        "Frame the passage naturally as a memory, earlier record, personal reflection, or explicitly imagined scene. "
         "Do not leave historical material sounding like an event in the current Journal window."
     ),
 }
@@ -244,7 +254,8 @@ _SENSITIVE_PERSONAL_PATTERNS = (
 
 _CURRENT_WINDOW_CLAIM_RE = re.compile(
     r"\b(?:today|tonight|yesterday|last\s+night|right\s+now|currently|this\s+(?:day|week|window)|"
-    r"during\s+(?:this|the\s+current)\s+(?:day|week|window)|in\s+the\s+current\s+window)\b",
+    r"during\s+(?:this|the\s+current)\s+(?:day|week|window)|in\s+the\s+current\s+window|"
+    r"(?:fresh|new)\s+(?:public\s+|community\s+)?(?:inquiries|arrivals|releases|submissions|announcements|conversations))\b",
     re.IGNORECASE,
 )
 _REFLECTION_SCOPE_CUE_RE = re.compile(
@@ -253,6 +264,51 @@ _REFLECTION_SCOPE_CUE_RE = re.compile(
     r"remembered|preserved|has\s+long)\b",
     re.IGNORECASE,
 )
+_IMAGINED_SCENE_RE = re.compile(
+    r"\b(?:I\s+(?:imagine|imagined|picture|pictured|daydream|daydreamed|am\s+imagining)|"
+    r"what\s+if|in\s+my\s+(?:head|imagination|daydream)|(?:an?|my|this)\s+imaginary|"
+    r"(?:an?|this)\s+imagined\s+scene)\b", re.I,
+)
+_PERSONAL_REFLECTION_RE = re.compile(
+    r"\b(?:I\s+(?:think|wonder|feel|felt|keep\s+thinking|kept\s+thinking|"
+    r"am\s+thinking|found\s+myself\s+thinking)|my\s+(?:thought|daydream|imagination))\b", re.I,
+)
+_EXTERNAL_ACTIVITY_VERB_RE = re.compile(
+    r"\b(?:announc(?:e[ds]?|ing)|releas(?:e[ds]?|ing)|submi(?:t(?:s|ted)?|tting)|"
+    r"post(?:s|ed|ing)?|arriv(?:e[ds]?|ing)|join(?:s|ed|ing)?|ask(?:s|ed|ing)?|"
+    r"said|says?|saying|told|tells?|chat(?:s|ted|ting)?|discuss(?:es|ed|ing)?|"
+    r"play(?:s|ed|ing)?|perform(?:s|ed|ing)?|finish(?:es|ed|ing)?|drop(?:s|ped|ping)?|"
+    r"upload(?:s|ed|ing)?|start(?:s|ed|ing)?|end(?:s|ed|ing)?|skip(?:s|ped|ping)?(?!\s+wheel)|"
+    r"won|wins?|paid|pay(?:s|ing)?|purchas(?:e[ds]?|ing)|vot(?:e[ds]?|ing)|request(?:s|ed|ing)?)\b", re.I,
+)
+
+
+def _creative_reflection_sentence(sentence: str, packet: dict[str, Any]) -> bool:
+    """Allow framed imagination/opinion, never a new factual activity report."""
+    if not packet.get("creativeReflectionAllowed"):
+        return False
+    if _IMAGINED_SCENE_RE.search(sentence):
+        return not re.search(r"\b(?:actually|in\s+reality|in\s+fact|but\s+today)\b", sentence, re.I)
+    return bool(
+        _PERSONAL_REFLECTION_RE.search(sentence)
+        and not _EXTERNAL_ACTIVITY_VERB_RE.search(sentence)
+    )
+
+
+def _has_current_activity_claim(text: str, packet: dict[str, Any]) -> bool:
+    return any(
+        _CURRENT_WINDOW_CLAIM_RE.search(sentence)
+        and not _creative_reflection_sentence(sentence, packet)
+        for sentence in _context_sentences(text)
+    )
+
+
+def _has_external_inference_claim(text: str, packet: dict[str, Any]) -> bool:
+    return any(
+        _EXPLICIT_BNL_INFERENCE_RE.search(sentence)
+        and not _creative_reflection_sentence(sentence, packet)
+        for sentence in _context_sentences(text)
+    )
 
 
 @dataclass
@@ -2293,12 +2349,108 @@ def _finalize_context_lanes_for_safe_sources(
     return finalized, finalized_provenance
 
 
+def _is_retrospective_relay(source: dict[str, Any]) -> bool:
+    return (
+        source.get("sourceKind") == "relay"
+        and str(source.get("eventType") or "").lower() in RETROSPECTIVE_RELAY_TYPES
+    )
+
+
+def journal_packet_needs_reflection_refresh(packet: dict[str, Any]) -> bool:
+    """Rebuild unsent old packets that gave callbacks fresh-source authority."""
+    return (
+        packet.get("reflectionVersion") != JOURNAL_REFLECTION_VERSION
+        and any(_is_retrospective_relay(source) for source in packet.get("safeSources", []))
+    )
+
+
+def journal_metadata_needs_reflection_refresh(
+    conn: sqlite3.Connection, guild_id: int, metadata: dict[str, Any],
+) -> bool:
+    if metadata.get("reflectionVersion") == JOURNAL_REFLECTION_VERSION:
+        return False
+    relay_ids = [str(value) for value in metadata.get("supportingRelayIds", []) if value]
+    if not relay_ids or not {"guild_id", "relay_id", "event_type"} <= _cols(conn, "website_relay_history"):
+        return False
+    for offset in range(0, len(relay_ids), 400):
+        selected = relay_ids[offset:offset + 400]
+        rows = conn.execute(
+            "SELECT event_type FROM website_relay_history WHERE guild_id=? AND relay_id IN ("
+            + ",".join("?" for _ in selected) + ")", (guild_id, *selected),
+        ).fetchall()
+        if any(str(row[0] or "").lower() in RETROSPECTIVE_RELAY_TYPES for row in rows):
+            return True
+    return False
+
+
+def _relay_reflection_basis(
+    conn: sqlite3.Connection, guild_id: int, source: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Retain accepted Relay prose as interpretation, with publication/origin dates apart."""
+    origin_basis: list[dict[str, Any]] = []
+    if {"guild_id", "relay_id", "source_basis_json"} <= _cols(conn, "website_relay_history"):
+        row = conn.execute(
+            "SELECT source_basis_json FROM website_relay_history WHERE guild_id=? AND relay_id=?",
+            (guild_id, source.get("relayId")),
+        ).fetchone()
+        try:
+            stored = json.loads(row[0] or "[]") if row else []
+        except (ValueError, TypeError):
+            stored = []
+        if isinstance(stored, list):
+            origin_basis = [item for item in stored[:4] if isinstance(item, dict)]
+    origin_dates = []
+    for item in origin_basis:
+        kind = str(item.get("sourceKind") or "")
+        dates = {"sourceKind": kind}
+        # For shows, sourceWindowStart/End is a selector lookback, not the
+        # show's actual date. Only the source owner's recorded event dates count.
+        keys = ["publishedAt", "startedAt", "observedAt"]
+        if kind == "published_journal":
+            keys += ["sourceWindowStart", "sourceWindowEnd"]
+        for key in keys:
+            if _parse_context_datetime(item.get(key)):
+                dates[key] = str(item[key])
+        if isinstance(item.get("showDates"), list):
+            dates["showDates"] = [str(day) for day in item["showDates"][:8] if _parse_context_datetime(day)]
+        origin_dates.append(dates)
+    original_ref = str(source.get("refId") or "")
+    match = re.fullmatch(r"fresh:(\d+)", original_ref)
+    ref = f"reflection:event:{match.group(1)}" if match else "reflection:relay:" + _hash(original_ref)[:24]
+    basis = {
+        "refId": ref, "basisKind": "accepted_relay_continuity",
+        "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True, "reuseEligible": True,
+        "summary": source["summary"], "sourceType": "website_relay",
+        "sourceVersion": _hash(source["summary"], _json(origin_dates)),
+        "sourceObservedAt": source.get("observedAt", ""),
+        "relayPublishedAt": source.get("observedAt", ""),
+        "relayTopicKind": source.get("eventType", ""),
+        "originalSourceDates": origin_dates,
+        "authority": "BNL retrospective interpretation; publication time is not event time",
+    }
+    provenance = {
+        "refId": ref, "originalRefId": original_ref,
+        "sourceKind": "website_relay", "sourceKey": source.get("relayId", ""),
+        "relayPublishedAt": source.get("observedAt", ""),
+        "originalSources": [
+            {key: value for key, value in item.items() if key in {
+                "sourceKind", "sourceId", "sourceVersion", "revision", "subjectRefs",
+                "originalSourceRefs", "canonicalLedgerEntryId", "publishedAt",
+                "startedAt", "observedAt", "sourceWindowStart", "sourceWindowEnd", "showDates",
+            }} for item in origin_basis
+        ],
+    }
+    if match:
+        provenance["eventSeq"] = int(match.group(1))
+    return basis, provenance
+
+
 def journal_source_packet_has_meaningful_activity(packet: dict[str, Any]) -> bool:
     """Preserve the established threshold used by scheduled Journal automation."""
     if any(source.get("sourceKind") == "finalized_show" for source in packet.get("safeSources", [])):
         return True
     counts = packet.get("aggregateCounts") or {}
-    total = int(counts.get("eligibleRelays") or 0) + int(
+    total = int(counts.get("currentActivityRelays", counts.get("eligibleRelays")) or 0) + int(
         counts.get("eligibleConversations") or 0
     )
     if total < 5:
@@ -2314,6 +2466,7 @@ def journal_source_packet_has_meaningful_activity(packet: dict[str, Any]) -> boo
     }
     return any(
         str(source.get("eventType") or "").lower() not in quiet_markers
+        and not _is_retrospective_relay(source)
         for source in packet.get("privateSources", [])
     )
 
@@ -3617,8 +3770,15 @@ def build_packet_from_sources(
         if str(source.get("displayName") or "").strip()
     ]
     window_display_names = list(dict.fromkeys(window_display_names))
+    activity_relays = [source for source in relays if not _is_retrospective_relay(source)]
+    retrospective_relays = [source for source in relays if _is_retrospective_relay(source)]
+    reflection_relays = _stable_reflection_sample(
+        [{**source, "_diversityKey": source.get("eventType", "")} for source in retrospective_relays],
+        MAX_REFLECTION_SOURCE_CONTEXT, _hash("relay-reflection", guild_id, end),
+        diversity_key="_diversityKey",
+    )
     private_sources = _sample_source_kinds(
-        relays,
+        activity_relays,
         conversations,
         start=start,
         end=end,
@@ -3636,7 +3796,7 @@ def build_packet_from_sources(
             basis = item["basis"]
             ref = "reflection:ballad:" + _hash(basis["sourceId"], basis["versionId"])[:24]
             shared_provenance.append({**basis, "refId": ref})
-        private_sources = [*private_sources[:MAX_PROMPT_SOURCES - len(operations)], *operations]
+        private_sources = [*private_sources[:MAX_PROMPT_SOURCES - len(operations)], *operations, *reflection_relays]
         historical_authors = [
             {**contribution, "sourceKind": "conversation", "refId": item["refId"],
              "channelPolicy": item["channelPolicy"], "observedAt": item["sourceObservedAt"]}
@@ -3686,6 +3846,7 @@ def build_packet_from_sources(
         "sourceObservedAt": item["basis"]["publishedAt"], "sourceVersion": item["basis"]["sourceVersion"],
     } for item in published_ballads]
     safe_sources = []
+    relay_basis, relay_provenance, pending_reflection_relays = [], [], []
     private_sources = [dict(source) for source in private_sources]
     for source in private_sources:
         person = public_by_subject.get(source.get("subjectRef"))
@@ -3697,15 +3858,29 @@ def build_packet_from_sources(
         raw = source.pop("rawSummary", None)
         source["summary"] = project_summary(str(raw if raw is not None else source.get("summary") or ""),
                                             limit=4000 if source.get("sourceKind") == "finalized_show" else 1000)
+        if _is_retrospective_relay(source):
+            pending_reflection_relays.append(source)
+            continue
         safe_source = _source_for_prompt(source)
         if safe_source.get("summary"):
             safe_sources.append(safe_source)
+    if pending_reflection_relays:
+        with _read_source_database(db_path) as conn:
+            for source in pending_reflection_relays:
+                basis, provenance = _relay_reflection_basis(conn, guild_id, source)
+                source["refId"] = basis["refId"]
+                source["relayOriginalSources"] = provenance["originalSources"]
+                relay_basis.append(basis)
+                relay_provenance.append(provenance)
     counts = dict(aggregate_counts or {})
     counts.setdefault("eligibleRelays", len(relays))
     counts.setdefault("eligibleConversations", len(conversations))
     counts.setdefault("participants", len({x.get("subjectRef") for x in conversations if x.get("subjectRef")}))
     counts.setdefault("channels", len({x.get("channelPolicy") for x in conversations if x.get("channelPolicy")}))
-    counts["promptRelays"] = len([s for s in private_sources if s.get("sourceKind") == "relay"])
+    counts["currentActivityRelays"] = len(activity_relays)
+    counts["retrospectiveRelays"] = len(retrospective_relays)
+    counts["promptRelays"] = len([s for s in private_sources if s.get("sourceKind") == "relay" and not _is_retrospective_relay(s)])
+    counts["reflectionRelays"] = len(relay_basis)
     counts["promptConversations"] = len([s for s in private_sources if s.get("sourceKind") == "conversation"])
     counts["promptFinalizedShows"] = len(operations)
     counts["publicMomentContext"] = len(moment_basis)
@@ -3720,13 +3895,14 @@ def build_packet_from_sources(
         "privatePublicPeople": people,
         "editorialVersion": JOURNAL_EDITORIAL_VERSION,
         "sharedInputVersion": JOURNAL_SHARED_INPUT_VERSION,
+        "reflectionVersion": JOURNAL_REFLECTION_VERSION,
         "privateSharedSourceProvenance": shared_provenance,
         "candidateTopicTags": list(journal_topic_counts(safe_sources, limit=30)),
         "aggregateCounts": counts,
         "coverageComplete": bool(coverage_complete),
         "observationContext": list(observation_context or []),
         "windowSegmentActivity": (
-            _window_segment_activity(start, end, relays, conversations, operations)
+            _window_segment_activity(start, end, activity_relays, conversations, operations)
             if entry_kind == "daily"
             else []
         ),
@@ -3789,6 +3965,7 @@ def build_packet_from_sources(
         )
     if low_activity:
         packet["lowActivityMode"] = True
+        packet["creativeReflectionAllowed"] = True
         packet["evidenceCoverageContract"] = {
             **packet["evidenceCoverageContract"],
             "minimumDistinctFreshSources": 0,
@@ -3797,13 +3974,15 @@ def build_packet_from_sources(
             "minimumDistinctWindowSegments": 0,
             "lowActivityReflectionMode": True,
         }
-    if moment_basis or ballad_basis:
-        packet["reflectionBasis"] = [*packet.get("reflectionBasis", []), *moment_basis, *ballad_basis]
+    if moment_basis or ballad_basis or relay_basis:
+        packet["reflectionBasis"] = [*packet.get("reflectionBasis", []), *moment_basis, *ballad_basis, *relay_basis]
         packet.setdefault("reflectionBasisContract", {
             "version": 1, "scope": JOURNAL_REFLECTION_SCOPE,
             "basisKinds": sorted(JOURNAL_REFLECTION_BASIS_KINDS),
             "basisDoesNotCountAsFresh": True, "currentActivityClaimsRequireFreshSource": True,
         })
+    if relay_provenance:
+        packet.setdefault("privateReflectionBasisProvenance", {}).setdefault("historicalSourceEvents", []).extend(relay_provenance)
     packet["generationContextLanes"] = context_lanes
     packet["privateContextLaneProvenance"] = private_lane_provenance
     packet["history"] = retrieve_history(
@@ -4083,6 +4262,7 @@ def build_generation_prompt(
         "entryKind": entry_kind,
         "sourceWindowStart": packet.get("sourceWindowStart"),
         "sourceWindowEnd": packet.get("sourceWindowEnd"),
+        "creativeReflectionAllowed": bool(packet.get("creativeReflectionAllowed")),
         "freshSources": safe_sources,
         "evidenceCoverageContract": coverage_contract,
         "editorialContract": {
@@ -4175,10 +4355,14 @@ def build_generation_prompt(
         "\nFor every context lane actually used, add one metadata.contextUses object with laneType, laneRefId, sectionHeading, claim, and basisRefIds. claim must be the exact complete public sentence from that named section. Include both the laneRefId and at least one fresh sourceRefId in basisRefIds, and put every fresh basisRefId in that same section's sourceRefIds. If basisRefIds references another memory or rumor lane, give that secondary lane its own contextUse for the same section."
         "\nWhen established memory, public rumor, and BNL interpretation form a substantive story, a dedicated third section is welcome. Omit it on thin or quiet windows; never pad beyond three sections."
         if context_lanes
-        else "\nNo optional context lane qualified for this window. Do not invent broadcast memory, rumors, or BNL theories. Return metadata.contextUses as an empty list."
+        else (
+            "\nNo optional context lane qualified for factual inference. Personal reflection and clearly imagined scenes are welcome; do not invent confirmed history, community rumors, or actual activity. Return metadata.contextUses as an empty list."
+            if packet.get("creativeReflectionAllowed")
+            else "\nNo optional context lane qualified for this window. Do not invent broadcast memory, rumors, or BNL theories. Return metadata.contextUses as an empty list."
+        )
     )
     beats_rule = (
-        "\nBuild a grounded reflection around a verified historical, continuity, or canon detail. Let the material determine its shape. Do not invent a current-window moment or imply that a reflection-basis subject happened during this period."
+        "\nBuild a personal reflection inspired by verified history, continuity, or canon. Let the material determine its shape. Clearly imagined moments may enrich it; never report them as real activity or imply that an older event happened again during this period."
         if low_activity
         else "\nChoose an editorial angle from the strongest concrete current-window evidence. A developing project, a funny exchange, a change in someone's work, or a contrast between moments can carry the entry. Let the evidence determine its shape; there is no required sequence of scene, community lesson, and BNL reaction. A pattern needs distinct supporting observations, not several retellings of one event."
     )
@@ -4235,13 +4419,19 @@ def build_generation_prompt(
         else "\nParaphrase source summaries by default. Use a direct quote only rarely, when one brief public-safe line is unusually worth preserving. Put quoted wording inside clear double quotation marks and cite its fresh source in that section. A publicPeople name is required to name its speaker."
     )
     reflection_rule = (
-        "\nLOW-ACTIVITY EVIDENCE RULE: This is the same Journal voice, prose standard, validator, and four-attempt generation path—not a fallback persona or a stock nothing-happened template. Use only supplied reflectionBasis records. Their stable reflection: refs are valid citations but never fresh evidence. Keep historical and canon tense explicit, preserve corrected canon, and never describe 6 Bit as BARCODE's music producer; the supplied corrected canon identifies GALAKNOISE as the producer."
+        "\nLOW-ACTIVITY EVIDENCE RULE — QUIET-DAY CREATIVE FREEDOM: Use the same Journal voice with real creative freedom. Personal thoughts, opinions, playful speculation, metaphors, daydreams, and explicitly imagined scenes are welcome. Combine dated memories, recorded shows, songs, canon, or thoughts about the queue when they give the piece an interesting direction. The cited record can inspire imagination without being evidence that the imagined scene occurred. Naturally signal the boundary with wording such as I imagine, what if, in my head, or I wonder; do not add a boilerplate disclaimer. I think and I wonder about BNL's own tastes or imaginings need no factual inference lane."
+        "\nQUIET-DAY REALITY BOUNDARY: Actual people speaking, arriving, releasing or submitting music, payments, queue changes, playback, show status and dates require the supplied evidence. Never invent those as real activity, invent a quotation, or announce imagined lore as established canon. Keep each memory's original date and each imagined scene clearly imagined. A new Relay or Journal discussing an older event does not make that event happen again. Low input counts do not prove nobody was active. Use the same Journal quality and four-attempt generation path, with no stock nothing-happened entry. Reflection refs remain valid inspiration/continuity citations and never count as fresh activity. Preserve corrected canon: GALAKNOISE is the music producer; 6 Bit is the artist, MC and host."
         if low_activity
         else (
             "\nSOURCE-RECOVERY EVIDENCE RULE: This is the normal Journal voice, validator, and four-attempt generation path. The recovery flag changes evidence handling, not quality. Use reflectionBasis only as explicitly historical continuity; never use it to fill a missing current chronology, and never disclose the recovery condition publicly."
             if source_recovery
             else ""
         )
+    )
+    reality_rule = (
+        "Claims about real events, people, times, places, actions, motives, outcomes, relationships, dialogue and emotional states must follow the cited evidence. Clearly imagined scene details and BNL's personal reflections are creative expression, not claims of real events."
+        if packet.get("creativeReflectionAllowed")
+        else "Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
     )
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
@@ -4254,7 +4444,8 @@ def build_generation_prompt(
         "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
         "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
         "\nBNL's personality can live in the selection, phrasing, dry humor, and point of view. A first-person reaction is welcome when it adds something, but is not required. Avoid repeating a stock confession or affectionate closing. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
-        "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
+        "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. "
+        f"{reality_rule}"
         f"{daily_spine_rule}"
         f"{window_rule}"
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
@@ -4264,6 +4455,7 @@ def build_generation_prompt(
         "\nPublic Moment reflection records preserve earlier exchanges and each original participant's contribution. Use their source dates, preserve banter, uncertainty and unanswered questions, and paraphrase rather than inventing quotations. A matching topic never makes today's speaker a participant in an earlier exchange. Cite the reflection ref when using it; it does not increase fresh-source, current-participant or recurrence counts."
         "\nFinalized-show sources report recorded public operations in a completed show. Their date and timeline control the tense; they never establish that a show is live now. Chat, a Moment, a Relay and a Journal retelling of the same occurrence are not independent witnesses or additional occurrences. A show record establishes playback only where playback is recorded."
         "\nPublished Ballad reflection records establish only the released song and its approved creative metadata. Discuss the song as a song. Liner notes are creative interpretation, never proof that a person acted, a quoted event happened, or new canon was established. Their release date is distinct from the linked show's date. Drafts and lyrics are not supplied as evidence."
+        "\nRetrospective Relay reflection records are BNL's accepted interpretations, not additional witnesses. relayPublishedAt/sourceObservedAt dates the Relay publication only. originalSourceDates preserves known origin dates; absent origin dates are unknown, not today. A prior Journal's source window dates its underlying activity; its publication date does not re-date that activity. Never interpret a show's selector lookback as the show's date."
         f"{coverage_rule}"
         f"{section_source_rule}"
         f"{quote_rule}"
@@ -4581,7 +4773,7 @@ def validate_article(
             return "invalid_section_source_refs"
         if (
             historical_basis_mode
-            and _CURRENT_WINDOW_CLAIM_RE.search(str(section.get("body") or ""))
+            and _has_current_activity_claim(str(section.get("body") or ""), packet)
             and not ({str(ref) for ref in refs} & fresh_refs)
         ):
             return "current_activity_without_fresh_source"
@@ -4596,17 +4788,19 @@ def validate_article(
             and not _REFLECTION_SCOPE_CUE_RE.search(
                 str(section.get("body") or "")
             )
+            and not any(_creative_reflection_sentence(sentence, packet)
+                        for sentence in _context_sentences(str(section.get("body") or "")))
         ):
             return "reflection_scope_not_explicit"
     if (
         historical_basis_mode
-        and _CURRENT_WINDOW_CLAIM_RE.search(
+        and _has_current_activity_claim(
             "\n".join(
                 [
                     str(article.get("title") or ""),
                     str(article.get("excerpt") or ""),
                 ]
-            )
+            ), packet
         )
         and not (_article_cited_refs(article) & fresh_refs)
     ):
@@ -4721,7 +4915,7 @@ def validate_article(
     }
     for field in ("title", "excerpt"):
         text = str(article.get(field) or "")
-        if _EXPLICIT_RUMOR_RE.search(text) or _EXPLICIT_BNL_INFERENCE_RE.search(text):
+        if _EXPLICIT_RUMOR_RE.search(text) or _has_external_inference_claim(text, packet):
             undeclared = True
             report(field, "context_claim_outside_body")
     for heading, text in section_text.items():
@@ -4729,7 +4923,7 @@ def validate_article(
         if _EXPLICIT_RUMOR_RE.search(text) and "community_rumor" not in declared_types:
             undeclared = True
             report(body_fields[heading], "missing_context_declaration", laneType="community_rumor")
-        if _EXPLICIT_BNL_INFERENCE_RE.search(text) and "bnl_inference" not in declared_types:
+        if _has_external_inference_claim(text, packet) and "bnl_inference" not in declared_types:
             undeclared = True
             report(body_fields[heading], "missing_context_declaration", laneType="bnl_inference")
     public_locations: list[tuple[Optional[str], str, str]] = [
@@ -5028,6 +5222,8 @@ def _draft_records(
         # writer did not cite. Preserve that input fence as well as used lineage.
         "sharedInputSourceProvenance": packet.get("privateSharedSourceProvenance", []),
         "sharedInputVersion": packet.get("sharedInputVersion", ""),
+        "reflectionVersion": packet.get("reflectionVersion", ""),
+        "creativeReflectionAllowed": bool(packet.get("creativeReflectionAllowed")),
         "contextUses": context_uses,
         "canonicalPayloadHash": request_hash,
         "canonicalPayloadBytes": len(canonical),

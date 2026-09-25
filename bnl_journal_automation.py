@@ -23,6 +23,8 @@ from bnl_journal import (
     generate_and_store_packet_draft,
     journal_broadcast_memory_provenance_is_eligible,
     journal_public_people_are_current,
+    journal_packet_needs_reflection_refresh,
+    journal_metadata_needs_reflection_refresh,
     journal_shared_source_provenance_is_current,
     journal_topic_counts,
     utc_now_iso,
@@ -48,6 +50,7 @@ MAX_AUTOMATIC_GENERATION_CYCLES = 4
 GENERATION_CYCLE_WINDOW_HOURS = 24
 TERMINAL_RUN_STATES = {"published", "quiet", "incomplete", "superseded"}
 DELIVERY_PREFLIGHT_INVALIDATION_REASONS = frozenset({
+    "journal_reflection_contract_changed",
     "ballad_publication_changed",
     "prepared_revision_missing",
     "prepared_payload_integrity_failed",
@@ -1550,6 +1553,8 @@ def _frozen_packet_invalidation_reason(
     guild_id: int,
     packet: dict[str, Any],
 ) -> str:
+    if journal_packet_needs_reflection_refresh(packet):
+        return "journal_reflection_contract_changed"
     if not journal_public_people_are_current(conn, guild_id, packet.get("privatePublicPeople", [])):
         return "privacy_memory_ineligible"
     if not journal_shared_source_provenance_is_current(conn, guild_id, packet.get("privateSharedSourceProvenance", [])):
@@ -2631,6 +2636,8 @@ def _prepared_invalidation_reason(
     metadata: dict[str, Any],
     memory_excluded_entry_ids: set[str],
 ) -> str:
+    if journal_metadata_needs_reflection_refresh(conn, guild_id, metadata):
+        return "journal_reflection_contract_changed"
     if not journal_public_people_are_current(conn, guild_id, metadata.get("publicPeople", [])):
         return "privacy_memory_ineligible"
     if not journal_shared_source_provenance_is_current(conn, guild_id, metadata.get("sharedInputSourceProvenance", [])):

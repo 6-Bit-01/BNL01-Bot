@@ -127,6 +127,10 @@ def inspect(db_path: str, guild_id: int, *, now: datetime = None) -> dict:
                 summaries.append({
                     "editorialVersion": item.get("editorialVersion", "legacy-anonymous"),
                     "sharedInputVersion": item.get("sharedInputVersion", "none"),
+                    "reflectionVersion": item.get("reflectionVersion", "none"),
+                    "creativeReflectionAllowed": bool(item.get("creativeReflectionAllowed")),
+                    "currentActivityRelays": (item.get("aggregateCounts") or {}).get("currentActivityRelays"),
+                    "retrospectiveRelays": (item.get("aggregateCounts") or {}).get("retrospectiveRelays"),
                     "sharedInputCandidates": len(item.get("sharedInputSourceProvenance", [])),
                     "citedPublicMoments": sum(source.get("sourceKind") == "public_moment"
                                               for source in item.get("usedSharedSourceProvenance", []) if isinstance(source, dict)),

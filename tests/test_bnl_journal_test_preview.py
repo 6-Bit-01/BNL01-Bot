@@ -131,7 +131,9 @@ class JournalTestPreviewTests(unittest.TestCase):
                 def flagged_article(packet, prompt):
                     article = json.loads(article_for(packet))
                     if finding == "undeclared_context_use":
-                        article["excerpt"] = "I think the rhythm deserves a second listen."
+                        # Personal taste is allowed in quiet-day reflection;
+                        # a claim about somebody else's action still needs its lane.
+                        article["excerpt"] = "I think Test Composer released another recording."
                     else:
                         article["sections"][0]["sourceRefIds"] = []
                     raw = json.dumps(article)
