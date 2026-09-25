@@ -4052,9 +4052,16 @@ def build_source_packet_between(
         archived = query_source_events(db_path, guild_id, start_ms, end_ms, prepare_schema=prepare_schema)
         relays: list[dict[str, Any]] = []
         conversations: list[dict[str, Any]] = []
+        eligible_channels: set[int] = set()
+        eligible_event_count = 0
         for event in archived.events:
             if not event.get("public_usable") or not str(event.get("sanitized_summary") or "").strip():
                 continue
+            if event.get("source_kind") not in {"discord_message", "tiktok_live_chat", "website_relay"}:
+                continue
+            eligible_event_count += 1
+            if event.get("channel_id"):
+                eligible_channels.add(int(event["channel_id"]))
             observed_at = datetime.fromtimestamp(int(event["occurred_at_ms"]) / 1000.0, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
             base = {
@@ -4107,8 +4114,8 @@ def build_source_packet_between(
                 "eligibleRelays": len(relays),
                 "eligibleConversations": len(conversations),
                 "participants": len({x.get("subjectRef") for x in conversations if x.get("subjectRef")}),
-                "channels": int(archived.counts.get("uniqueChannels") or 0),
-                "archivedSourceEvents": int(archived.counts.get("total") or 0),
+                "channels": len(eligible_channels),
+                "archivedSourceEvents": eligible_event_count,
             },
             observation_context=observation_context,
             excluded_history_entry_ids=excluded_history_entry_ids,

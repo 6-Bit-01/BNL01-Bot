@@ -14,6 +14,9 @@ import re
 
 DEFAULT_PRIMARY_MODEL = "gemini-3.6-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash"
+OWN_ART_IMAGE_MODEL = "gemini-3.1-flash-image"
+OWN_ART_CONCEPT_ROUTE = "bnl_own_art_concept"
+OWN_ART_IMAGE_ROUTE = "bnl_own_art_image"
 
 
 @dataclass(frozen=True)
@@ -186,6 +189,11 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
         "_",
         str(route or "").lower(),
     )
+    if normalized_route in {OWN_ART_CONCEPT_ROUTE, OWN_ART_IMAGE_ROUTE}:
+        return GeminiRoutePolicy(
+            lane="background", max_output_tokens=4096, legacy_thinking_budget=1024,
+            provider_retries=0, allow_fallback=False,
+        )
     retries = _bounded_env_int(
         "BNL_GEMINI_PROVIDER_RETRIES",
         1,
