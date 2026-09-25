@@ -46,7 +46,10 @@ witnesses. Low input counts do not establish that nobody was active.
 
 The existing validator checks explicit current-time/activity language against
 fresh citations, including titles and excerpts. It allows framed imagination
-and personal reflection while retaining the factual inference rules. These
+and personal reflection while retaining the factual inference rules. Framing
+is checked per clause: an imagined scene cannot lend authority to an adjacent
+factual assertion. Ambiguous compound scenes require renewed explicit framing.
+These
 checks and the prompt are guardrails, not a semantic proof of every generated
 sentence. Live prose remains a separate observation.
 

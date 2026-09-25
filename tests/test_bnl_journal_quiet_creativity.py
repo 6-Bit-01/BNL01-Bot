@@ -136,6 +136,31 @@ class QuietJournalTests(unittest.TestCase):
         article = self.article(packet, "Today a community member submitted a new track.", refs=[source["refId"]])
         self.assertEqual(journal.validate_article(article, packet), "")
 
+    def test_imagination_does_not_authorize_separate_factual_clauses(self):
+        packet = self.packet()
+        for body in [
+            "I imagine a silent stage, and today a producer performed there.",
+            "Today a producer performed there, and I imagine a silent stage.",
+            "I imagine a stage and today a producer performed there.",
+            "In my head the queue glows; tonight Test Member submitted a song.",
+            "I picture an archive because fresh public inquiries arrived.",
+            "I imagine a stage, and I think Test Member released another recording.",
+        ]:
+            with self.subTest(body=body):
+                result = journal.validate_article(self.article(packet, body), packet)
+                self.assertIn(result, {"current_activity_without_fresh_source", "undeclared_context_use"})
+                article = self.article(packet, "I imagine a hallway of humming doors.")
+                article["excerpt"] = body
+                self.assertIn(journal.validate_article(article, packet),
+                              {"current_activity_without_fresh_source", "undeclared_context_use"})
+        for body in [
+            "Tonight I imagine a producer performing on a silent stage.",
+            "I imagine a stage, and in my head tonight a paper bird performs there.",
+            "I think anticipation is an instrument, and I feel fond of the space between songs tonight.",
+        ]:
+            with self.subTest(creative_body=body):
+                self.assertEqual(journal.validate_article(self.article(packet, body), packet), "")
+
     def test_legacy_callback_packet_is_retired_but_current_packet_and_real_activity_are_retained(self):
         old = {"safeSources":[{"refId":"fresh:1","sourceKind":"relay","eventType":"published_journal"}]}
         self.assertTrue(journal.journal_packet_needs_reflection_refresh(old))

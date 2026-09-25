@@ -283,31 +283,53 @@ _EXTERNAL_ACTIVITY_VERB_RE = re.compile(
 )
 
 
-def _creative_reflection_sentence(sentence: str, packet: dict[str, Any]) -> bool:
-    """Allow framed imagination/opinion, never a new factual activity report."""
+def _context_claim_clauses(text: str) -> list[str]:
+    """Do not lend one clause's imagined framing to a separate assertion.
+
+    This intentionally requires renewed framing after coordination or a clause
+    boundary. Ambiguous compound scenes can be rewritten with an explicit frame
+    in each clause rather than weakening the factual-activity check.
+    """
+    return [
+        clause.strip()
+        for sentence in _context_sentences(text)
+        for clause in re.split(
+            r"\s*(?:[;,:—]|\b(?:and|but|yet|however|whereas|while|although|"
+            r"though|because|since|when|then|meanwhile)\b)\s*", sentence, flags=re.I,
+        )
+        if clause.strip()
+    ]
+
+
+def _creative_reflection_clause(clause: str, packet: dict[str, Any]) -> bool:
+    """Allow this clause's framed imagination/opinion, not adjacent assertions."""
     if not packet.get("creativeReflectionAllowed"):
         return False
-    if _IMAGINED_SCENE_RE.search(sentence):
-        return not re.search(r"\b(?:actually|in\s+reality|in\s+fact|but\s+today)\b", sentence, re.I)
+    frame = _IMAGINED_SCENE_RE.search(clause)
+    if frame:
+        return not (
+            _EXTERNAL_ACTIVITY_VERB_RE.search(clause[:frame.start()])
+            or re.search(r"\b(?:actually|in\s+reality|in\s+fact)\b", clause, re.I)
+        )
     return bool(
-        _PERSONAL_REFLECTION_RE.search(sentence)
-        and not _EXTERNAL_ACTIVITY_VERB_RE.search(sentence)
+        _PERSONAL_REFLECTION_RE.search(clause)
+        and not _EXTERNAL_ACTIVITY_VERB_RE.search(clause)
     )
 
 
 def _has_current_activity_claim(text: str, packet: dict[str, Any]) -> bool:
     return any(
-        _CURRENT_WINDOW_CLAIM_RE.search(sentence)
-        and not _creative_reflection_sentence(sentence, packet)
-        for sentence in _context_sentences(text)
+        _CURRENT_WINDOW_CLAIM_RE.search(clause)
+        and not _creative_reflection_clause(clause, packet)
+        for clause in _context_claim_clauses(text)
     )
 
 
 def _has_external_inference_claim(text: str, packet: dict[str, Any]) -> bool:
     return any(
-        _EXPLICIT_BNL_INFERENCE_RE.search(sentence)
-        and not _creative_reflection_sentence(sentence, packet)
-        for sentence in _context_sentences(text)
+        _EXPLICIT_BNL_INFERENCE_RE.search(clause)
+        and not _creative_reflection_clause(clause, packet)
+        for clause in _context_claim_clauses(text)
     )
 
 
@@ -4788,8 +4810,8 @@ def validate_article(
             and not _REFLECTION_SCOPE_CUE_RE.search(
                 str(section.get("body") or "")
             )
-            and not any(_creative_reflection_sentence(sentence, packet)
-                        for sentence in _context_sentences(str(section.get("body") or "")))
+            and not any(_creative_reflection_clause(clause, packet)
+                        for clause in _context_claim_clauses(str(section.get("body") or "")))
         ):
             return "reflection_scope_not_explicit"
     if (
