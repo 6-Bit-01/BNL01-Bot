@@ -6557,12 +6557,21 @@ def _select_approved_quiet_relay_source(guild_id: int, cursor_value: int, highes
         )
     )
     recent_sources = list(_recent_relay_sources_by_guild.get(guild_id, []))
+    # A published Journal is BNL's interpretation of earlier evidence. Keep it
+    # available for a genuinely quiet callback, but never let publication
+    # diversity promote that retelling over eligible original community/show
+    # evidence. This changes source selection, not the words a Relay must use.
+    original_classes = {"conversation_continuity", "public_moment", "finalized_show", "broadcast_memory"}
+    has_original = any(item.source_class in original_classes for item in available)
+    primary_candidates = [item for item in available
+                          if not (has_original and item.source_class == "published_journal")]
     ranked = sorted(
-        enumerate(available),
+        enumerate(primary_candidates),
         key=lambda pair: _rotation_rank(recent_sources, pair[1].source_class, pair[0]),
     )
     selected = ranked[0][1]
     selected.metadata["available_source_classes"] = [item.source_class for item in available]
+    selected.metadata["primary_source_classes"] = [item.source_class for item in primary_candidates]
     selected.metadata["recent_source_classes"] = recent_sources[-6:]
     return selected
 
