@@ -128,7 +128,7 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
         with ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}))
             stack.enter_context(mock.patch.object(art, 'journal_context', return_value=None))
-            stack.enter_context(mock.patch.object(art, 'generate_private_image', return_value=(png, {'sha256': hashlib.sha256(png).hexdigest()})))
+            stack.enter_context(mock.patch.object(art, 'generate_private_image', return_value=(png, {'sha256': hashlib.sha256(png).hexdigest(), 'mimeType': 'image/jpeg'})))
             stack.enter_context(mock.patch.object(bot.client, 'get_channel', return_value=channel))
             stack.enter_context(mock.patch.object(bot, 'resolve_channel_policy', return_value='public_home'))
             stack.enter_context(mock.patch.object(bot, 'is_community_image_channel', return_value=False))
@@ -152,6 +152,7 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
             channel.send.assert_awaited_once()
             self.assertEqual(channel.send.call_args.args[0], TEXT)
             self.assertIsInstance(channel.send.call_args.kwargs['file'], bot.discord.File)
+            self.assertTrue(channel.send.call_args.kwargs['file'].filename.endswith('.jpg'))
             self.assertEqual(website.call_count, 1)
             self.assertFalse(art.available(bot, 42))
         row = self.execute('SELECT status,discord_message_id,website_status FROM bnl_own_art_delivery')[0]
@@ -166,6 +167,23 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
                 art.publish_website(bot, {'image': b'png', 'metadata': {'artId': art_id}})
                 opener.return_value.open.assert_called_once()
             self.assertEqual(self.execute('SELECT website_status FROM bnl_own_art_delivery')[0][0], 'unconfirmed')
+
+    def test_website_upload_uses_actual_image_type_and_generic_payload(self):
+        data = b'provider-jpeg-fixture'
+        digest = hashlib.sha256(data).hexdigest()
+        with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}):
+            art_id = art.claim(bot, 42)
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({'ok': True, 'artId': art_id, 'sha256': digest}).encode()
+            with mock.patch.object(bot, '_journal_website_base_url', return_value='https://example.test'), mock.patch.object(art.urllib.request, 'build_opener') as opener:
+                opener.return_value.open.return_value = response
+                art.publish_website(bot, {'image': data, 'metadata': {'artId': art_id, 'sha256': digest, 'mimeType': 'image/jpeg'}})
+                packet = json.loads(opener.return_value.open.call_args.args[0].data)
+            self.assertEqual(packet['contractVersion'], 2)
+            self.assertIn('imageBase64', packet)
+            self.assertNotIn('pngBase64', packet)
+            self.assertEqual(packet['art']['mimeType'], 'image/jpeg')
+            self.assertEqual(self.execute('SELECT website_status FROM bnl_own_art_delivery')[0][0], 'confirmed')
 
     async def test_structured_ambient_uses_one_provider_call_and_preserves_json(self):
         from types import SimpleNamespace

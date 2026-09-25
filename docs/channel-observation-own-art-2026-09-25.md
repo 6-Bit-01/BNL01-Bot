@@ -57,12 +57,13 @@ to make nothing. Imagination needs no fabricated evidence or mandatory wording.
 Source refs must resolve to the supplied public projection. Raw/private source
 fields are excluded from the creative prompt.
 
-If BNL chooses a concept, one Gemini image request creates a private PNG and
+If BNL chooses a concept, one Gemini image request creates a private image and
 receipt. It uses the Google Interactions REST endpoint directly so the pinned
 conversation SDK and working conversation/Relay/Journal model calls do not need
 to change. No Pollinate command or community bot is invoked. No retry, fallback,
 background task, recurring quota, Discord sender or website publisher is added.
-Generation, stored draft and public delivery are distinct states; `published`
+PNG and JPEG keep their original bytes and correct extension; no format is
+forced in the provider request. Generation, stored draft and public delivery are distinct states; `published`
 is always false in this tool.
 
 The new destination directory must not already exist; it is created with mode
@@ -79,7 +80,7 @@ locally at the higher image rate: an explicit conservative upper estimate,
 not an invoice or exact charge. Existing budget ceilings and protected lanes
 are unchanged. Unknown transport or accounting outcomes retain their cost
 reservation; they are not automatically retried. Stateless image requests set
-`store=false`, request one 1K PNG, and enable no search/tools.
+`store=false`, request one 1K image, and enable no search/tools.
 
 ## Acceptance and remaining choices
 

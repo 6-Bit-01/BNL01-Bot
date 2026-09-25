@@ -1,0 +1,104 @@
+{
+  "source": "https://ai.google.dev/static/api/interactions-v1.openapi.json",
+  "retrievedAt": "2026-09-25",
+  "schema": {
+    "description": "Configuration for image output format.",
+    "type": "object",
+    "properties": {
+      "aspect_ratio": {
+        "description": "The aspect ratio for the image output.",
+        "type": "string",
+        "enum": [
+          "1:1",
+          "2:3",
+          "3:2",
+          "3:4",
+          "4:3",
+          "4:5",
+          "5:4",
+          "9:16",
+          "16:9",
+          "21:9",
+          "1:8",
+          "8:1",
+          "1:4",
+          "4:1"
+        ],
+        "x-google-enum-descriptions": [
+          "1:1 aspect ratio.",
+          "2:3 aspect ratio.",
+          "3:2 aspect ratio.",
+          "3:4 aspect ratio.",
+          "4:3 aspect ratio.",
+          "4:5 aspect ratio.",
+          "5:4 aspect ratio.",
+          "9:16 aspect ratio.",
+          "16:9 aspect ratio.",
+          "21:9 aspect ratio.",
+          "1:8 aspect ratio.",
+          "8:1 aspect ratio.",
+          "1:4 aspect ratio.",
+          "4:1 aspect ratio."
+        ]
+      },
+      "delivery": {
+        "description": "The delivery mode for the image output.",
+        "type": "string",
+        "enum": [
+          "inline",
+          "uri"
+        ],
+        "x-google-enum-descriptions": [
+          "Image data is returned inline in the response.",
+          "Image data is returned as a URI."
+        ]
+      },
+      "image_size": {
+        "description": "The size of the image output.",
+        "type": "string",
+        "enum": [
+          "512",
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "x-google-enum-descriptions": [
+          "512px image size.",
+          "1K image size.",
+          "2K image size.",
+          "4K image size."
+        ]
+      },
+      "mime_type": {
+        "description": "The MIME type of the image output.",
+        "type": "string",
+        "enum": [
+          "image/jpeg"
+        ],
+        "x-google-enum-descriptions": [
+          "JPEG image format."
+        ]
+      },
+      "type": {
+        "const": "image"
+      }
+    },
+    "required": [
+      "type"
+    ],
+    "examples": [
+      {
+        "image_response_format": {
+          "summary": "Image Output",
+          "value": {
+            "type": "image",
+            "aspect_ratio": "16:9",
+            "image_size": "1K",
+            "mime_type": "image/jpeg"
+          }
+        }
+      }
+    ],
+    "x-speakeasy-model-namespace": "interactions"
+  }
+}

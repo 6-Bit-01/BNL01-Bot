@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -16,13 +17,16 @@ from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
-from bnl_gemini_routing import OWN_ART_CONCEPT_ROUTE, OWN_ART_IMAGE_MODEL, OWN_ART_IMAGE_ROUTE, policy_for_route
+from bnl_gemini_routing import (OWN_ART_CONCEPT_ROUTE, OWN_ART_IMAGE_MODEL, OWN_ART_IMAGE_ROUTE,
+                                policy_for_route, provider_server_diagnostics)
 from bnl_journal import build_source_packet, _eligible_reflection_basis
 
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 12 * 1024 * 1024
+MAX_ERROR_BYTES = 8192
 IMAGE_ENDPOINT = "https://generativelanguage.googleapis.com/v1/interactions"
+IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg"}
 
 
 def build_own_art_brief(packet: dict) -> tuple[str, set[str]]:
@@ -90,7 +94,9 @@ def own_art_image_request(prompt: str) -> dict:
         "input": prompt,
         "store": False,
         "generation_config": {"max_output_tokens": policy_for_route(OWN_ART_IMAGE_ROUTE).max_output_tokens},
-        "response_format": {"type": "image", "mime_type": "image/png", "aspect_ratio": "1:1", "image_size": "1K"},
+        # Let Gemini choose its supported output format. Preserve its original
+        # bytes and MIME through private storage, Discord and website delivery.
+        "response_format": {"type": "image", "delivery": "inline", "aspect_ratio": "1:1", "image_size": "1K"},
     }
 
 
@@ -103,7 +109,7 @@ def image_usage_response(payload: dict):
     }
     values = {}
     for name, key in fields.items():
-        value = usage.get(key)
+        value = usage.get(key, 0) if key in {"total_thought_tokens", "total_cached_tokens"} else usage.get(key)
         if type(value) is not int or value < 0:
             raise ValueError("art_image_usage_unavailable")
         values[name] = value
@@ -114,13 +120,51 @@ def image_usage_response(payload: dict):
     return SimpleNamespace(usage_metadata=SimpleNamespace(**values))
 
 
-def extract_generated_png(payload: dict) -> bytes:
+def image_info(data: bytes) -> dict:
+    """Bounded raster headers; no conversion or forced output format."""
+    width = height = 0
+    mime = ""
+    if len(data) >= 32 and data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR":
+        mime = "image/png"
+        width, height = struct.unpack(">II", data[16:24])
+    elif data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"):
+        mime = "image/jpeg"
+        offset = 2
+        while offset + 4 <= len(data):
+            if data[offset] != 0xff:
+                break
+            while offset < len(data) and data[offset] == 0xff:
+                offset += 1
+            if offset >= len(data):
+                break
+            marker = data[offset]
+            offset += 1
+            if marker in {0xd9, 0xda}:
+                break
+            if marker == 0x01 or 0xd0 <= marker <= 0xd7:
+                continue
+            if offset + 2 > len(data):
+                break
+            length = int.from_bytes(data[offset:offset + 2], "big")
+            if length < 2 or offset + length > len(data):
+                break
+            if marker in {0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf}:
+                if length >= 8:
+                    height, width = struct.unpack(">HH", data[offset + 3:offset + 7])
+                break
+            offset += length
+    if mime not in IMAGE_EXTENSIONS or not (0 < width <= 4096 and 0 < height <= 4096):
+        raise ValueError("art_image_data_invalid")
+    return {"mimeType": mime, "width": width, "height": height}
+
+
+def extract_generated_image(payload: dict) -> tuple[bytes, dict]:
     if payload.get("status") != "completed":
         raise ValueError("art_image_not_completed")
     images = [part for step in payload.get("steps", []) if isinstance(step, dict) and step.get("type") == "model_output"
               for part in step.get("content", []) if isinstance(part, dict) and part.get("type") == "image"]
-    if len(images) != 1 or images[0].get("mime_type") != "image/png":
-        raise ValueError("art_image_expected_one_png")
+    if len(images) != 1 or images[0].get("mime_type") not in IMAGE_EXTENSIONS:
+        raise ValueError("art_image_expected_one_raster")
     encoded = images[0].get("data")
     if not isinstance(encoded, str) or len(encoded) > (MAX_IMAGE_BYTES * 4 // 3 + 4):
         raise ValueError("art_image_inline_data_invalid")
@@ -128,17 +172,36 @@ def extract_generated_png(payload: dict) -> bytes:
         data = base64.b64decode(encoded, validate=True)
     except (ValueError, TypeError):
         raise ValueError("art_image_base64_invalid") from None
-    if not 32 <= len(data) <= MAX_IMAGE_BYTES or not data.startswith(b"\x89PNG\r\n\x1a\n") or data[12:16] != b"IHDR":
-        raise ValueError("art_image_png_invalid")
-    width, height = struct.unpack(">II", data[16:24])
-    if not (0 < width <= 4096 and 0 < height <= 4096):
-        raise ValueError("art_image_dimensions_invalid")
-    return data
+    if not 32 <= len(data) <= MAX_IMAGE_BYTES:
+        raise ValueError("art_image_size_invalid")
+    info = image_info(data)
+    if info["mimeType"] != images[0]["mime_type"]:
+        raise ValueError("art_image_mime_mismatch")
+    return data, info
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _image_provider_error(exc: Exception, *, secrets: tuple[str, ...]) -> RuntimeError:
+    """Keep bounded, redacted Google error fields, never raw bodies or URLs."""
+    error = RuntimeError("art_image_provider_request_failed")
+    error.status_code = int(exc.code) if isinstance(exc, urllib.error.HTTPError) else 0
+    fields = {}
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            raw = exc.read(MAX_ERROR_BYTES + 1)
+            payload = json.loads(raw) if len(raw) <= MAX_ERROR_BYTES else {}
+            fields = payload.get("error", {}) if isinstance(payload, dict) else {}
+            if not isinstance(fields, dict):
+                fields = {}
+        except Exception:
+            fields = {}
+    carrier = SimpleNamespace(message=fields.get("message"), status=fields.get("status"), details=fields)
+    error.provider_diagnostics = provider_server_diagnostics(carrier, secrets=secrets)
+    return error
 
 
 def generate_private_image(bot, prompt: str, *, attempt_counter=None) -> tuple[bytes, dict]:
@@ -161,17 +224,27 @@ def generate_private_image(bot, prompt: str, *, attempt_counter=None) -> tuple[b
             if not isinstance(payload, dict):
                 raise ValueError("art_image_response_invalid")
         except Exception as exc:
-            safe_error = RuntimeError("art_image_provider_request_failed")
-            safe_error.status_code = int(getattr(exc, "code", 0) or 0) if isinstance(exc, urllib.error.HTTPError) else 0
+            safe_error = _image_provider_error(exc, secrets=(bot.GEMINI_API_KEY, prompt))
             bot.record_failed_generation_attempt(safe_error, route=OWN_ART_IMAGE_ROUTE, model=OWN_ART_IMAGE_MODEL,
                                                  reservation_id=reservation_id)
+            # Only an explicit pre-generation rejection releases the estimate.
+            # Unknown responses, timeouts, and server errors retain it.
+            rejection = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED",
+                         403: "PERMISSION_DENIED", 404: "NOT_FOUND"}
+            if (safe_error.status_code in rejection
+                    and safe_error.provider_diagnostics.get("status") == rejection[safe_error.status_code]):
+                retain = False
+            logging.warning("gemini_image_provider_error reservation_id=%s model=%s status=%s detail=%s",
+                            reservation_id, OWN_ART_IMAGE_MODEL, safe_error.status_code,
+                            json.dumps(safe_error.provider_diagnostics, sort_keys=True))
             raise safe_error from None
         usage = image_usage_response(payload)
         bot.record_generation_token_usage(usage, route=OWN_ART_IMAGE_ROUTE, model=OWN_ART_IMAGE_MODEL,
                                           reservation_id=reservation_id)
         retain = False
-        image = extract_generated_png(payload)
+        image, info = extract_generated_image(payload)
         return image, {"model": OWN_ART_IMAGE_MODEL, "providerCalls": 1,
+                       **info,
                        "usage": vars(usage.usage_metadata), "costBasis": "image_output_upper_bound_2026-09-25",
                        "sha256": hashlib.sha256(image).hexdigest(), "bytes": len(image)}
     finally:
@@ -217,7 +290,8 @@ def prepare_private_preview(bot, output_dir: str, *, generate: bool = False) -> 
             return receipt
         receipt["status"] = "image_generation_started"
         image, image_receipt = generate_private_image(bot, concept["imagePrompt"], attempt_counter=image_counter)
-        _private_write(target / "bnl-own-art.png", image)
+        image_receipt["fileName"] = "bnl-own-art" + IMAGE_EXTENSIONS[image_receipt["mimeType"]]
+        _private_write(target / image_receipt["fileName"], image)
         receipt["image"] = image_receipt
         receipt["status"] = "private_draft_ready"
         return receipt
@@ -227,6 +301,9 @@ def prepare_private_preview(bot, output_dir: str, *, generate: bool = False) -> 
         receipt["errorType"] = type(exc).__name__
         reason = str(exc)
         receipt["reason"] = reason if re.fullmatch(r"art_[a-z_]{1,100}", reason) else "art_preview_failed"
+        if hasattr(exc, "provider_diagnostics"):
+            receipt["providerStatus"] = exc.status_code
+            receipt["providerDiagnostics"] = exc.provider_diagnostics
         raise
     finally:
         receipt["conceptCalls"] = concept_counter.count
