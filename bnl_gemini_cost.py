@@ -156,6 +156,19 @@ class MonthlyBudgetPace:
 # published price transition on 2027-01-01; retaining both periods prevents a
 # silent stale-price estimate when a record crosses that boundary.
 BUILT_IN_STANDARD_PRICING = {
+    # Image previews conservatively reserve/account every output token at the
+    # image rate. This upper estimate is explicit, not Google's invoice. Text
+    # and thinking actually cost less. No caching or search tools are requested.
+    "gemini-3.1-flash-image": (
+        GeminiModelPrice(
+            model="gemini-3.1-flash-image",
+            input_usd_per_million=Decimal("0.50"),
+            output_usd_per_million=Decimal("60.00"),
+            cached_input_usd_per_million=Decimal("0.50"),
+            effective_from=date(2026, 9, 25),
+            source="image_output_upper_bound_2026-09-25",
+        ),
+    ),
     "gemini-3.6-flash": (
         GeminiModelPrice(
             model="gemini-3.6-flash",

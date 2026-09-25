@@ -496,13 +496,13 @@ def _purge_discord_source_events_on_connection(
         if subject_ref:
             cursor = conn.execute(
                 "DELETE FROM bnl_journal_source_events "
-                "WHERE guild_id=? AND source_kind='discord_message' AND subject_ref=?",
+                "WHERE guild_id=? AND source_kind IN ('discord_message','discord_channel_observation') AND subject_ref=?",
                 (guild, subject_ref),
             )
         else:
             cursor = conn.execute(
                 "DELETE FROM bnl_journal_source_events "
-                "WHERE guild_id=? AND source_kind='discord_message'",
+                "WHERE guild_id=? AND source_kind IN ('discord_message','discord_channel_observation')",
                 (guild,),
             )
         return int(cursor.rowcount or 0)
@@ -546,7 +546,7 @@ def purge_user_bound_conversation_sources_on_connection(
             """
             DELETE FROM bnl_journal_source_events
             WHERE guild_id=? AND subject_ref=?
-              AND source_kind IN ('discord_message','tiktok_live_chat')
+              AND source_kind IN ('discord_message','tiktok_live_chat','discord_channel_observation')
             """,
             (guild, "discord_user:%s" % user),
         )

@@ -352,6 +352,10 @@ import os
 import re
 import asyncio
 import bnl_broadcast_ballads as ballad_publications
+from bnl_channel_observation import (
+    is_community_image_channel,
+    public_observation_policy,
+)
 import sqlite3
 import logging
 import random
@@ -492,6 +496,8 @@ from bnl_tiktok_show_ledger import build_broadcast_ballad_evidence
 from bnl_gemini_routing import (
     DEFAULT_FALLBACK_MODEL,
     DEFAULT_PRIMARY_MODEL,
+    OWN_ART_IMAGE_MODEL,
+    OWN_ART_IMAGE_ROUTE,
     GeminiImagePart,
     GeminiImageRequest,
     ProviderFailureKind,
@@ -2009,6 +2015,7 @@ _passive_capture_last_channel = "none"
 _passive_capture_last_user = "none"
 _passive_capture_last_status = "never"
 _passive_capture_last_skip_reason = "none"
+_additional_channel_observation_lock = threading.Lock()
 _backfill_last_channel = "none"
 _backfill_last_status = "never"
 _backfill_last_scanned_count = 0
@@ -10891,6 +10898,8 @@ async def maybe_handle_dossier_recommendation_command(message: discord.Message, 
 def _resolve_channel_policy_without_parent(channel) -> str:
     if not channel:
         return "unknown"
+    if is_community_image_channel(channel):
+        return "ai_image_tool"
     cid = getattr(channel, "id", 0) or 0
     guild_id = getattr(getattr(channel, "guild", None), "id", 0) or 0
 
@@ -11149,7 +11158,7 @@ def context_visibility_for_policy(policy: str) -> str:
         "internal_controlled": "internal_no_passive_public_memory",
         "protected_system": "protected_existing_behavior",
         "reference_canon": "reference_only",
-        "ai_image_tool": "owner_approval_required",
+        "ai_image_tool": "observe_only_no_output",
         "broadcast_memory": "trusted_show_memory_inbox",
         "public_home": "public_context_allowed",
         "public_context": "public_context_allowed",
@@ -13115,6 +13124,96 @@ def _channel_permissions_snapshot(channel) -> dict:
     }
 
 
+def channel_observation_expected(channel, permissions: dict | None = None) -> bool:
+    """Incoming text only, including text attached to voice/stage channels."""
+    permissions = permissions or _channel_permissions_snapshot(channel)
+    kind = str(getattr(channel, "type", "") or "").lower()
+    carries_text = _is_text_like_channel(channel) or kind in {"voice", "stage_voice"}
+    return bool(carries_text and permissions.get("view") and permissions.get("read_history"))
+
+
+def record_additional_channel_observation(message) -> bool:
+    # Gateway replays can arrive concurrently; serialize the archive receipt
+    # check with the existing conversation writer to avoid duplicate rows.
+    with _additional_channel_observation_lock:
+        return _record_additional_channel_observation(message)
+
+
+def _record_additional_channel_observation(message) -> bool:
+    """Use existing stores for channels/bot events outside passive chat capture.
+
+    This function has no model, download, reply, reaction, or command dispatch.
+    Bot output remains explicitly bot output; seeing an attachment is not seeing
+    its pixels. Private sources never enter the public conversation projection.
+    """
+    channel = getattr(message, "channel", None)
+    guild = getattr(message, "guild", None)
+    author = getattr(message, "author", None)
+    if not guild or author == client.user or not channel_observation_expected(channel):
+        return False
+    raw = str(getattr(message, "content", "") or "")
+    # Control payloads and slash commands are not ordinary observations.
+    if raw.lstrip().startswith("/") or re.match(r"^\s*!bnl\b", raw, re.I):
+        return False
+    policy = resolve_channel_policy(channel)
+    bot_author = bool(getattr(author, "bot", False) or getattr(message, "webhook_id", None))
+    if not bot_author and allow_passive_memory_for_policy(policy):
+        return False  # Existing conversational/passive owner captures this.
+    message_id = int(getattr(message, "id", 0) or 0)
+    occurred = journal_timestamp_to_epoch_ms(getattr(message, "created_at", None))
+    if not message_id or occurred is None:
+        return False
+    media = build_message_media_context(message)
+    content = append_media_context_to_text(raw, media).strip()
+    if not content:
+        return False
+    bounded = content[:1000]
+    memory_policy = "" if bot_author else public_observation_policy(channel, policy)
+    kind = "discord_message" if memory_policy else "discord_channel_observation"
+    ensure_journal_source_schema(DB_FILE)
+    with sqlite3.connect(DB_FILE) as conn:
+        seen = conn.execute(
+            "SELECT 1 FROM bnl_journal_source_events "
+            "WHERE guild_id=? AND source_kind=? AND source_key=?",
+            (guild.id, kind, str(message_id)),
+        ).fetchone()
+    if seen:
+        return True
+    # Resolve authority by ID before touching account display fields.
+    if int(BNL_OWNER_USER_ID or 0) and int(getattr(author, "id", 0) or 0) == int(BNL_OWNER_USER_ID):
+        name = "6 Bit"
+    else:
+        name = str(getattr(author, "display_name", "") or getattr(author, "name", "member"))
+    if memory_policy:
+        save_user_message(
+            author.id, name, guild.id, bounded,
+            channel_name=getattr(channel, "name", ""),
+            channel_policy=memory_policy, channel_id=channel.id,
+            message_id=message_id, route_mode="channel_observation",
+            source_observed_at=datetime.fromtimestamp(occurred / 1000, timezone.utc).isoformat(),
+            observation_metadata={"participationPolicy": policy, "mediaPixelsRead": False,
+                                  "truncated": len(content) > len(bounded)},
+        )
+    else:
+        recorded = record_journal_source_event(
+            DB_FILE, guild_id=guild.id, source_kind=kind, source_key=str(message_id),
+            occurred_at_ms=occurred, raw_text=bounded,
+            sanitized_summary=sanitize_journal_source_summary(bounded, [name]),
+            channel_id=channel.id, channel_policy=policy,
+            subject_ref=f"discord_user:{author.id}", private_display_name=name,
+            public_usable=False,
+            metadata={"messageId": message_id, "authorKind": "bot" if bot_author else "human",
+                      "participationPolicy": policy, "mediaPixelsRead": False,
+                      "truncated": len(content) > len(bounded)},
+        )
+        if not recorded.ok:
+            raise RuntimeError("channel_observation_archive_conflict")
+    logging.info("channel_observation_stored guild_id=%s channel_id=%s message_id=%s "
+                 "public_memory=%s author_kind=%s media_pixels_read=false",
+                 guild.id, channel.id, message_id, bool(memory_policy), "bot" if bot_author else "human")
+    return True
+
+
 def passive_capture_expected_for_channel(channel, policy: str | None = None, permissions: dict | None = None) -> bool:
     policy = (policy or resolve_channel_policy(channel) or "unknown").strip().lower()
     permissions = permissions or _channel_permissions_snapshot(channel)
@@ -13174,7 +13273,21 @@ def build_channel_audit_rows(guild) -> list[dict]:
     rows = []
     if not guild:
         return rows
-    channels = list(getattr(guild, "channels", []) or [])
+    ensure_journal_source_schema(DB_FILE)
+    with sqlite3.connect(DB_FILE) as conn:
+        observations = {
+            int(channel_id or 0): (int(count), latest)
+            for channel_id, count, latest in conn.execute(
+                "SELECT channel_id,COUNT(*),MAX(occurred_at_ms) "
+                "FROM bnl_journal_source_events WHERE guild_id=? AND source_kind IN "
+                "('discord_message','discord_channel_observation') GROUP BY channel_id",
+                (guild.id,),
+            )
+        }
+    channels_by_id = {getattr(ch, "id", id(ch)): ch for ch in [
+        *(getattr(guild, "channels", []) or []), *(getattr(guild, "threads", []) or [])
+    ]}
+    channels = list(channels_by_id.values())
     channels.sort(key=lambda ch: (getattr(getattr(ch, "category", None), "position", 9999), getattr(ch, "position", 9999), str(getattr(ch, "name", ""))))
     for channel in channels:
         channel_type = str(getattr(channel, "type", type(channel).__name__))
@@ -13186,7 +13299,9 @@ def build_channel_audit_rows(guild) -> list[dict]:
         perms = _channel_permissions_snapshot(channel)
         text_like = _is_text_like_channel(channel)
         expected = passive_capture_expected_for_channel(channel, policy, perms)
+        observation_expected = channel_observation_expected(channel, perms)
         stats = get_channel_capture_stats(getattr(guild, "id", 0), getattr(channel, "id", 0), getattr(channel, "name", ""))
+        observed = observations.get(int(getattr(channel, "id", 0)), (0, None))
         flags = []
         if not perms.get("view"):
             flags.append("cannot_view")
@@ -13208,6 +13323,10 @@ def build_channel_audit_rows(guild) -> list[dict]:
             "permissions": perms,
             "channel_policy": policy,
             "passive_capture_expected": expected,
+            "observation_expected": observation_expected,
+            "observation_rows": int(observed[0] or 0),
+            "last_observed_at_ms": observed[1],
+            "posting_surface": conversation_surface_for_channel_policy(policy),
             **stats,
             "flags": flags,
         })
@@ -13244,6 +13363,7 @@ def format_channel_audit_pages(guild, rows: list[dict] | None = None, *, max_cha
             f"id={row.get('channel_id')} type={row.get('channel_type')} "
             f"perms(v={int(perms.get('view', False))},hist={int(perms.get('read_history', False))},send={int(perms.get('send', False))},react={int(perms.get('react', False))}) "
             f"policy={row.get('channel_policy')} capture={'yes' if row.get('passive_capture_expected') else 'no'} "
+            f"observe={'yes' if row.get('observation_expected') else 'no'} observed={row.get('observation_rows', 0)} "
             f"rows={row.get('captured_rows', 0)} latest={row.get('latest_captured_at') or 'none'} "
             f"flags={','.join(row.get('flags') or ['ok'])}"
         )
@@ -19418,7 +19538,7 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     conn.close()
     return int(row[0] if row else 0) == 0
 
-def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, directed_to_bnl: bool = False, reply_to_conversation_row_id: int = 0):
+def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, directed_to_bnl: bool = False, reply_to_conversation_row_id: int = 0, source_observed_at: str = "", observation_metadata: dict | None = None):
     decision = decide_memory_write_policy(route_mode, channel_policy, "user", content, False)
     if not decision.save_conversation:
         logging.info("memory_write_policy_skip_conversation role=user route_mode=%s reason=%s", route_mode, decision.reason)
@@ -19448,6 +19568,13 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     if "route_mode" in conversation_columns:
         insert_columns.append("route_mode")
         insert_values.append(str(route_mode or "unknown")[:80])
+    if source_observed_at:
+        occurred = journal_timestamp_to_epoch_ms(source_observed_at)
+        if occurred is None:
+            conn.close()
+            raise ValueError("invalid_observation_timestamp")
+        insert_columns.append("timestamp")
+        insert_values.append(datetime.fromtimestamp(occurred / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
     insert_columns.extend(("role", "content"))
     insert_values.extend(("user", content))
     cursor.execute(
@@ -19497,6 +19624,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
                         "routeMode": route_mode,
                         "directedToBnl": bool(directed_to_bnl),
                         "channelName": (channel_name or "").lower()[:80],
+                        **({"observation": observation_metadata} if observation_metadata else {}),
                     },
                 )
         except Exception as exc:
@@ -19528,23 +19656,25 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
                     )
         except Exception as exc:
             logging.debug("relationship_v2_shadow_observe_user_failed error=%s", exc)
-    try:
-        mark_subject_dirty_for_evidence(
-            DB_FILE,
-            guild_id=guild_id,
-            subject_name=user_name,
-            evidence_source="conversations",
-            content=content,
-            channel_policy=channel_policy,
-            source_scope="subject_authored",
-            authority="local_observed",
-            visibility="public_safe" if channel_policy in {"public_home", "public_context", "public_selective", "broadcast_memory"} else "review_only",
-            evidence_type="subject_authored_message",
-            relation_to_subject="authored",
-            created_by="save_user_message",
-        )
-    except Exception as exc:
-        logging.debug("source_refresh_dirty_hook_failed source=conversations error=%s", exc)
+    # Reading additional rooms must not produce automatic Source File work.
+    if route_mode != "channel_observation":
+        try:
+            mark_subject_dirty_for_evidence(
+                DB_FILE,
+                guild_id=guild_id,
+                subject_name=user_name,
+                evidence_source="conversations",
+                content=content,
+                channel_policy=channel_policy,
+                source_scope="subject_authored",
+                authority="local_observed",
+                visibility="public_safe" if channel_policy in {"public_home", "public_context", "public_selective", "broadcast_memory"} else "review_only",
+                evidence_type="subject_authored_message",
+                relation_to_subject="authored",
+                created_by="save_user_message",
+            )
+        except Exception as exc:
+            logging.debug("source_refresh_dirty_hook_failed source=conversations error=%s", exc)
     if decision.update_relationship:
         update_relationship_state(user_id, guild_id, content, delta_affinity=0.06)
     if decision.update_habits:
@@ -24053,7 +24183,7 @@ def _estimated_request_cost_nanos(
         conservative_utf8=True,
     )
     attempts = 1 + max(0, int(policy.provider_retries))
-    models = [GEMINI_MODEL]
+    models = [OWN_ART_IMAGE_MODEL if route == OWN_ART_IMAGE_ROUTE else GEMINI_MODEL]
     if (
         policy.allow_fallback
         and GEMINI_FALLBACK_MODEL
@@ -35374,7 +35504,12 @@ intents.members = True
 intents.typing = True
 
 client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+class BnlCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction):
+        return not is_community_image_channel(getattr(interaction, "channel", None))
+
+
+tree = BnlCommandTree(client)
 _ambient_post_locks = {}
 
 
@@ -36408,6 +36543,8 @@ async def barcode_radio_queue_task():
                 continue
             channel_id = get_guild_config(guild.id)
             channel = guild.get_channel(channel_id) if channel_id else None
+            if is_community_image_channel(channel):
+                channel = None
             last_ambient = (get_recent_ambient(guild.id, channel_id=channel_id, limit=1) or [""])[0]
             discord_post_count = get_showday_discord_post_count(guild.id, show_date)
             recently_posted = had_recent_showday_discord_post(guild.id, minutes=SHOWDAY_RECENT_POST_BLOCK_MINUTES)
@@ -45792,6 +45929,8 @@ async def send_reply_then_save_model(
     reply_text: str | None = None,
 ) -> MemoryWriteDecision:
     model_decision = MemoryWriteDecision(False, False, False, False, False, False, "model_save_skipped", context_visibility_for_policy(channel_policy))
+    if is_community_image_channel(getattr(message, "channel", None)):
+        return model_decision
     sent_text = (
         str(reply_text)
         if reply_text is not None
@@ -45836,6 +45975,8 @@ async def send_channel_then_save_model(
     allowed_mentions=None,
 ) -> MemoryWriteDecision:
     model_decision = MemoryWriteDecision(False, False, False, False, False, False, "model_save_skipped", context_visibility_for_policy(channel_policy))
+    if is_community_image_channel(channel):
+        return model_decision
     safe_mentions = allowed_mentions if allowed_mentions is not None else discord.AllowedMentions.none()
     kwargs = {"allowed_mentions": safe_mentions}
     sent_message_ids = []
@@ -48021,6 +48162,20 @@ def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: 
 async def on_message(message: discord.Message):
     print("BNL DEBUG: on_message triggered")
     if message.author == client.user or not message.guild:
+        return
+    # Observation is not participation. In particular even mentions, commands,
+    # bot output, and an accidentally selected active channel cannot elicit a
+    # response or reaction in the community's image-generation workspace.
+    if channel_observation_expected(message.channel) and (
+        getattr(message.author, "bot", False) or getattr(message, "webhook_id", None)
+        or not allow_passive_memory_for_policy(resolve_channel_policy(message.channel))
+    ):
+        try:
+            await asyncio.to_thread(record_additional_channel_observation, message)
+        except Exception as exc:
+            logging.warning("channel_observation_failed channel_id=%s error_type=%s",
+                            getattr(message.channel, "id", 0), type(exc).__name__)
+    if is_community_image_channel(message.channel):
         return
     if getattr(message.author, "bot", False):
         return
@@ -50414,6 +50569,11 @@ async def setup(interaction: discord.Interaction):
 @app_commands.describe(channel="The channel where BNL-01 will be fully active")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if is_community_image_channel(channel):
+        await interaction.response.send_message(
+            "The community image generator is observe-only for BNL.", ephemeral=True,
+        )
+        return
     set_guild_config(interaction.guild.id, channel.id)
     ensure_next_ambient_scheduled(interaction.guild.id)
     logging.info(f"📍 Active channel set to #{channel.name} in {interaction.guild.name}")

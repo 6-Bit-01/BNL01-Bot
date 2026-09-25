@@ -2,6 +2,12 @@
 
 The production Discord runtime for BNL-01, including governed conversation memory, Presence/Relay v2, the BNL Journal, Source File and dossier assistance, relationship/moment systems, and owner-operated internal controls.
 
+BNL observes new messages in readable guild text surfaces independently of his
+permission to speak. The community image-generator channel and its threads are
+strictly observe-only. His own art is self-directed, never a member commission;
+the private preview has no public sender or automatic schedule. See
+[`docs/channel-observation-own-art-2026-09-25.md`](docs/channel-observation-own-art-2026-09-25.md).
+
 ## Supported Python
 
 - Python 3.9 is the current deployment compatibility floor.
