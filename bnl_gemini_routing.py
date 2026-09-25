@@ -98,6 +98,7 @@ class GeminiRoutePolicy:
     journal_protected: bool = False
     relay_protected: bool = False
     showday_protected: bool = False
+    fallback_status_codes: tuple[int, ...] = ()
 
 
 def _bounded_env_int(
@@ -288,12 +289,12 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
                 minimum=0,
                 maximum=8_192,
             ),
-            # Optional scheduled work skips cleanly when the provider is
-            # unavailable. It must not amplify one background job into retry
-            # or fallback-model spend, regardless of the interactive retry
-            # policy.
+            # Relay may recover from provider overload with one backup call.
+            # No per-model retries: both attempts are reserved up front by
+            # the existing token/dollar guards. Other background work skips.
             provider_retries=0,
-            allow_fallback=False,
+            allow_fallback=normalized_route == "website_relay_event",
+            fallback_status_codes=(503,) if normalized_route == "website_relay_event" else (),
             relay_protected="relay" in normalized_route,
             # A single automatic draft for a finalized show is scheduled show
             # work. It retains the hard ceiling and both dollar reserves.

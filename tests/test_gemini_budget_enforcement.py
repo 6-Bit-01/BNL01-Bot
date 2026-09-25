@@ -335,6 +335,13 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
                 return ""
 
         with mock.patch.dict(os.environ, env, clear=False):
+            # Allow one complete two-model reservation, but not two concurrent
+            # logical Relay jobs. Keep this independent of model price changes.
+            request_cost = bnl01_bot._estimated_request_cost_nanos("x", "website_relay_event")
+            cap = str(Decimal(request_cost * 3 // 2) / Decimal(1_000_000_000))
+            for key in ("BNL_GEMINI_MONTHLY_TARGET_USD", "BNL_GEMINI_MONTHLY_HARD_LIMIT_USD",
+                        "BNL_GEMINI_DAILY_SOFT_LIMIT_USD"):
+                os.environ[key] = cap
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 reservations = list(pool.map(lambda _index: reserve(), range(2)))
 
@@ -614,6 +621,56 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
         self.assertEqual(lease_count, 0)
         self.assertEqual(usage_count, 1)
 
+    def test_relay_reserves_cost_for_both_models_and_hard_cap_blocks_before_call(self):
+        with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
+            policy = bnl01_bot.policy_for_route("website_relay_event")
+            estimates = [bnl01_bot.estimate_gemini_cost(
+                model, prompt_tokens=5, candidate_tokens=policy.max_output_tokens,
+                total_tokens=5 + policy.max_output_tokens, at=self.now,
+            ).estimated_cost_nanos for model in (bnl01_bot.GEMINI_MODEL, bnl01_bot.GEMINI_FALLBACK_MODEL)]
+            self.assertEqual(bnl01_bot._estimated_request_cost_nanos("hello", "website_relay_event"),
+                             sum(estimates))
+        # Enough headroom for the primary alone must not admit an unreserved
+        # backup. Hard limits are never expanded by provider recovery.
+        ceiling = str(Decimal(estimates[0] + estimates[1] // 2) / Decimal(1_000_000_000))
+        env = self.default_budget_env(
+            BNL_GEMINI_MONTHLY_TARGET_USD=ceiling,
+            BNL_GEMINI_MONTHLY_HARD_LIMIT_USD=ceiling,
+            BNL_GEMINI_BILLING_LAG_BUFFER_USD="0",
+            BNL_GEMINI_INTERACTIVE_RESERVE_USD="0",
+            BNL_GEMINI_JOURNAL_RESERVE_USD="0",
+        )
+        with (mock.patch.dict(os.environ, env, clear=False),
+              mock.patch.object(bnl01_bot, "get_gemini_client") as client):
+            with self.assertRaises(bnl01_bot.LocalModelBudgetExhausted):
+                bnl01_bot._generate_gemini_content_with_fallback("hello", "website_relay_event")
+        client.assert_not_called()
+        self.assertEqual(bnl01_bot._token_budget_reserved_tokens, 0)
+
+    def test_relay_recovery_records_two_attempts_under_one_reservation(self):
+        response = provider_response()
+        generate = mock.Mock(side_effect=[RuntimeError("503 service unavailable"), response])
+        fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        with (mock.patch.dict(os.environ, self.default_budget_env(), clear=False),
+              mock.patch.object(bnl01_bot, "gemini_client", fake_client),
+              mock.patch.object(bnl01_bot, "record_failed_generation_attempt", wraps=bnl01_bot.record_failed_generation_attempt) as failed,
+              mock.patch.object(bnl01_bot, "record_generation_token_usage", wraps=bnl01_bot.record_generation_token_usage) as succeeded,
+              mock.patch.object(bnl01_bot.time, "sleep")):
+            result = bnl01_bot._generate_gemini_content_with_fallback("hello", "website_relay_event")
+        self.assertTrue(result.fallback_used)
+        with sqlite3.connect(self.db_path) as conn:
+            attempts = conn.execute("SELECT model, outcome, is_fallback FROM model_generation_attempts ORDER BY id").fetchall()
+            leases = conn.execute("SELECT COUNT(*) FROM gemini_budget_reservations").fetchone()[0]
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(failed.call_args.kwargs["reservation_id"], succeeded.call_args.kwargs["reservation_id"])
+        self.assertTrue(failed.call_args.kwargs["reservation_id"])
+        self.assertEqual(attempts, [
+            (bnl01_bot.GEMINI_MODEL, "failure", 0),
+            (bnl01_bot.GEMINI_FALLBACK_MODEL, "success", 1),
+        ])
+        self.assertEqual(leases, 0)
+        self.assertEqual(bnl01_bot._token_budget_reserved_tokens, 0)
+
     def test_background_provider_failure_has_no_retry_or_fallback(self):
         generate = mock.Mock(side_effect=RuntimeError("503 service unavailable"))
         fake_client = SimpleNamespace(
@@ -633,7 +690,7 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "503"):
                 bnl01_bot._generate_gemini_content_with_fallback(
                     "optional",
-                    "website_relay_event",
+                    "ambient_generation",
                 )
         self.assertEqual(generate.call_count, 1)
         self.assertEqual(

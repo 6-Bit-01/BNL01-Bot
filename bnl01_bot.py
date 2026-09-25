@@ -32075,8 +32075,19 @@ async def _generate_gemini_content_with_fallback_async(
     attempt_counter: ProviderAttemptCounter | None = None,
 ):
     started = time.monotonic()
+    # Cancelling to_thread does not stop an in-flight SDK call. Carry the
+    # Relay timeout into that worker so a late 503 cannot start a backup.
+    cancel_event = threading.Event() if route == "website_relay_event" else None
     logging.info(f"gemini_generation_offloaded route={route}")
     try:
+        if cancel_event is not None:
+            return await asyncio.to_thread(
+                _generate_gemini_content_with_fallback,
+                contents,
+                route,
+                attempt_counter=attempt_counter,
+                cancel_event=cancel_event,
+            )
         if attempt_counter is None:
             return await asyncio.to_thread(
                 _generate_gemini_content_with_fallback,
@@ -32089,6 +32100,10 @@ async def _generate_gemini_content_with_fallback_async(
             route,
             attempt_counter=attempt_counter,
         )
+    except asyncio.CancelledError:
+        if cancel_event is not None:
+            cancel_event.set()
+        raise
     finally:
         elapsed = time.monotonic() - started
         logging.info(f"gemini_generation_completed route={route} elapsed_seconds={elapsed:.3f}")
@@ -32338,6 +32353,7 @@ def _generate_gemini_content_with_fallback(
     route: str,
     *,
     attempt_counter: ProviderAttemptCounter | None = None,
+    cancel_event: threading.Event | None = None,
 ):
     policy = policy_for_route(route)
     reservation = reserve_local_model_budget(contents, route)
@@ -32346,6 +32362,8 @@ def _generate_gemini_content_with_fallback(
     )
     accounting_state = GenerationAccountingState()
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("relay_generation_cancelled")
         client = get_gemini_client()
         try:
             response = _generate_model_with_retry(
@@ -32370,9 +32388,20 @@ def _generate_gemini_content_with_fallback(
                 and GEMINI_FALLBACK_MODEL
                 and GEMINI_FALLBACK_MODEL != GEMINI_MODEL
                 and fallback_eligible_failure(kind)
+                and (not policy.fallback_status_codes
+                     or provider_status_code(primary_error) in policy.fallback_status_codes)
             )
             if not fallback_allowed:
                 raise
+            if route == "website_relay_event":
+                # One short jittered pause; no retry loop or new schedule.
+                delay = retry_delay_seconds(0) + random.uniform(0.0, 0.5)
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        logging.info("gemini_fallback_skipped route=%s reason=cancelled", route)
+                        raise
+                else:
+                    time.sleep(delay)
             logging.warning(
                 "gemini_primary_failed_trying_fallback reservation_id=%s primary=%s "
                 "fallback=%s route=%s category=%s same_project=true",
