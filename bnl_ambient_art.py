@@ -18,7 +18,7 @@ from pathlib import Path
 import sqlite3
 import urllib.request
 
-from bnl_own_art import _NoRedirect, _private_write, generate_private_image, parse_own_art_concept
+from bnl_own_art import IMAGE_EXTENSIONS, _NoRedirect, _private_write, generate_private_image, parse_own_art_concept
 
 PUBLIC_MAX_IMAGE_BYTES = 2 * 1024 * 1024
 
@@ -127,12 +127,12 @@ async def prepare(bot, guild_id, basis):
             raise ValueError("art_sources_changed")
         now = bot._pacific_now().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         metadata = {"artId": art_id, "title": concept["title"], "meaning": concept["meaning"],
-                    "createdAt": now, "sha256": receipt["sha256"], "journal": concept.get("journal"),
+                    "createdAt": now, "sha256": receipt["sha256"], "mimeType": receipt["mimeType"], "journal": concept.get("journal"),
                     "sourceJournals": [{"entryId": p.entry_id, "revision": p.revision, "contentHash": p.content_hash}
                                        for p in getattr(basis.get("art_journal_basis"), "publications", ())]}
         folder = Path(bot.DB_FILE).resolve().parent / "bnl-own-art" / art_id
         folder.mkdir(mode=0o700, parents=True, exist_ok=False)
-        _private_write(folder / "image.png", image)
+        _private_write(folder / ("image" + IMAGE_EXTENSIONS[receipt["mimeType"]]), image)
         _private_write(folder / "receipt.json", json.dumps({"metadata": metadata, "image": receipt}).encode())
         await asyncio.to_thread(record, bot, art_id, "draft_ready", metadata=metadata)
         return {"image": image, "metadata": metadata}
@@ -147,7 +147,8 @@ async def prepare(bot, guild_id, basis):
 
 
 def discord_file(bot, art):
-    return bot.discord.File(io.BytesIO(art["image"]), filename=art["metadata"]["artId"] + ".png",
+    extension = IMAGE_EXTENSIONS[art["metadata"].get("mimeType", "image/png")]
+    return bot.discord.File(io.BytesIO(art["image"]), filename=art["metadata"]["artId"] + extension,
                             description=art["metadata"]["meaning"][:1000])
 
 
@@ -160,8 +161,8 @@ def publish_website(bot, art):
         if not base.startswith("https://") or not bot.BNL_API_KEY:
             status = "configuration_missing"
             return
-        payload = {"contractVersion": 1, "kind": "bnl_own_art", "art": art["metadata"],
-                   "pngBase64": base64.b64encode(art["image"]).decode("ascii")}
+        payload = {"contractVersion": 2, "kind": "bnl_own_art", "art": art["metadata"],
+                   "imageBase64": base64.b64encode(art["image"]).decode("ascii")}
         request = urllib.request.Request(base + "/api/bnl/art", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "x-api-key": bot.BNL_API_KEY}, method="POST")
         with urllib.request.build_opener(_NoRedirect).open(request, timeout=20) as response:

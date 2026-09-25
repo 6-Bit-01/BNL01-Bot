@@ -38,6 +38,11 @@ after generation and again before sending. The image is attached to the same
 message; it is never a second post. Claims, private draft, confirmed Discord
 message ID, and website receipt are separate states. Private files use mode 600.
 
+There is no PNG requirement. The image client preserves Gemini's PNG or JPEG
+bytes with the actual MIME and extension, including Discord attachments and
+website contract v2 (`imageBase64`, `art.mimeType`). See the
+[private-preview correction](own-art-image-provider-fix-2026-09-25.md).
+
 After confirmed Discord delivery, the same image can be published at
 `POST /api/bnl/art` using the existing website service credential. A failed or
 uncertain website upload is recorded, not reported as a published gallery item.
