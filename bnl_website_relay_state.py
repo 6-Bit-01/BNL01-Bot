@@ -119,6 +119,7 @@ def select_shared_relay_sources_on_connection(
                 context = re.sub(re.escape(label), "a participant", context, flags=re.I)
         append("public_moment", context[:2200], {
             "sourceKind": "public_moment", "sourceId": item.moment_id,
+            "startedAt": basis["startedAt"], "observedAt": basis["observedAt"],
             "sourceVersion": basis["sourceVersion"], "subjectRefs": basis["subjectRefs"],
             "canonicalLedgerEntryId": basis["canonicalLedgerEntryId"],
             "originalSourceRefs": basis["originalSourceRefs"],
@@ -131,6 +132,7 @@ def select_shared_relay_sources_on_connection(
             continue
         append("finalized_show", "Recorded, completed show operations; historical evidence only:\n" + item.text[:2200], {
             "sourceKind": "finalized_show", "sourceId": item.show_keys[0],
+            "observedAt": item.observed_at, "showDates": list(item.show_dates),
             "sourceVersion": item.source_digest, "sourceWindowStart": start, "sourceWindowEnd": end,
         })
         break
