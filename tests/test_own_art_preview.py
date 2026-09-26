@@ -74,7 +74,7 @@ class OwnArtPreviewTests(unittest.TestCase):
                 self.assertIn(value, field["enum"], key)
             if "const" in field:
                 self.assertEqual(value, field["const"], key)
-        self.assertEqual(output["delivery"], "inline")
+        self.assertNotIn("delivery", output)
         self.assertNotIn("image/png", schema["properties"]["mime_type"]["enum"])
 
     def test_usage_allows_omitted_zero_counters_but_requires_accounting_totals(self):
@@ -191,7 +191,16 @@ class OwnArtPreviewTests(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps(provider_payload()).encode()
         opener = mock.Mock()
-        opener.open.return_value = response
+
+        def provider_response(request, **kwargs):
+            # Reproduce the live 400: schema-valid delivery overrides fail.
+            body = json.loads(request.data)
+            if "delivery" in body.get("response_format", {}):
+                raw = b'{"error":{"message":"Image delivery mode is not supported.","code":"invalid_request"}}'
+                raise art.urllib.error.HTTPError(art.IMAGE_ENDPOINT, 400, "bad", {}, io.BytesIO(raw))
+            return response
+
+        opener.open.side_effect = provider_response
         with mock.patch.object(art.urllib.request, "build_opener", return_value=opener):
             data, receipt = art.generate_private_image(fake, "A quiet orange room.")
         self.assertEqual(data, PNG)
