@@ -100,7 +100,8 @@ TEMPORAL_REFERENT_MODIFIER_RE = re.compile(
     r"(?:(?:in\s+the|this|that|past)\s+)?"
     r"(?:(?:few|several|\d+)\s+)?"
     r"(?:seconds?|minutes?|hours?|days?|mornings?|afternoons?|evenings?|"
-    r"nights?|weeks?|weekends?|months?|years?|seasons?|today|yesterday|"
+    r"nights?|weeks?|weekends?|months?|years?|seasons?|shows?|broadcasts?|"
+    r"streams?|performances?|sessions?|today|yesterday|"
     r"tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
     re.I,
 )
@@ -1258,7 +1259,7 @@ def nearby_contribution_referent_requested(text: str) -> bool:
     """Recognize a structural reference without keying on one exact phrase."""
 
     value = str(text or "")
-    # A time modifier such as "this evening" or "last week" scopes the
+    # A time/event modifier such as "this evening" or "those shows" scopes the
     # request; it does not point at a previous room contribution. Keep the
     # original text for source/date selection and inspect only this local
     # view for structural pointers.
