@@ -1586,6 +1586,71 @@ class GovernedSelfNameTests(unittest.TestCase):
 
 
 class StructuralReferentTests(unittest.TestCase):
+    def test_temporal_scope_does_not_invent_a_contribution_or_person_subject(self):
+        rows = [
+            _context_row(1, "How is the show going?", user_name="Test Member"),
+            _context_row(
+                2, "A public track is receiving cheers.", role="model",
+                user_name="BNL-01",
+            ),
+        ]
+        for text in (
+            "What is your read on the chat this evening?",
+            "What do you think of the audience last night?",
+            "Review the queue activity earlier today.",
+            "Summarize our community activity these past few weeks.",
+            "What is your impression of the broadcast this Friday?",
+        ):
+            for batch in (False, True):
+                for history in (rows[:1], rows):
+                    with self.subTest(text=text, batch=batch, rows=len(history)):
+                        result = assemble_conversation_context_v2(
+                            history, _context_request(text, is_batch=batch),
+                        )
+                        self.assertEqual(result.referent_status, "not_requested")
+                        self.assertEqual(result.referent_candidate_labels, ())
+                        decision = bnl01_bot.build_live_conversation_orchestration_decision(
+                            engagement_decision="answer",
+                            engagement_reason="direct_request",
+                            channel_policy="public_home",
+                            addressings=(_addressing(bnl=True),),
+                            context_result=result,
+                            moment_situation=None,
+                            current_text=text,
+                            current_speaker_user_ids=(999,),
+                            current_speaker_labels=("Test Member",),
+                            influence_mode="live",
+                        )
+                        self.assertEqual(decision.situation_frame.status, "resolved")
+                        self.assertEqual(decision.situation_frame.subjects, ())
+
+    def test_time_scope_keeps_real_message_references_and_exact_reply_identity(self):
+        rows = [
+            _context_row(1, "Copper rain fell over the orchard.",
+                         user_name="Test Member", message_id=4001),
+            _context_row(2, "A paper satellite crossed the harbor.",
+                         user_name="Test Member", message_id=4002),
+        ]
+        for text, expected, selected in (
+            ("Read that message from this evening.", "ambiguous", ()),
+            ("Read this.", "ambiguous", ()),
+            ("Read the previous message from this evening.", "resolved", (2,)),
+            ("Review Test Member's message from last night.", "ambiguous", ()),
+            ("Review Test Member's previous message from last night.", "resolved", (2,)),
+        ):
+            with self.subTest(text=text):
+                result = assemble_conversation_context_v2(rows, _context_request(text))
+                self.assertEqual(result.referent_status, expected)
+                self.assertEqual(result.referent_selected_row_ids, selected)
+        exact = assemble_conversation_context_v2(
+            rows, _context_request(
+                "What is your read on the chat this evening?",
+                referenced_message_ids=frozenset({4001}),
+            ),
+        )
+        self.assertEqual(exact.referent_reason, "discord_reply_source")
+        self.assertEqual(exact.referent_selected_row_ids, (1,))
+
     def test_above_passage_resolves_recent_long_form_across_speakers(self):
         passage = (
             "A signal crossed the empty city and found every window awake. "
