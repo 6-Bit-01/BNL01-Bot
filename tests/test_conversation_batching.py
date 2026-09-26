@@ -2330,6 +2330,23 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(channel.sent, ["Still receiving."])
                 self.assertEqual(channel.typing_active, 0)
 
+    async def test_typing_starts_before_source_preparation_and_cleans_up(self):
+        channel = self._channel(8125)
+        self._prime_flush(channel, "BNL, what stood out at the show?")
+
+        def read_sources(*_args, **_kwargs):
+            self.assertEqual(channel.typing_active, 1)
+            return ""
+
+        with self._flush_runtime(channel.id, mock.AsyncMock(return_value="The room was lively.")), mock.patch.object(
+            bnl01_bot, "maybe_build_bnl_read_model_context", side_effect=read_sources,
+        ) as reader:
+            await bnl01_bot._flush_channel_buffer(channel)
+        reader.assert_called()
+        self.assertEqual(channel.sent, ["The room was lively."])
+        self.assertEqual(channel.typing_events, ["start", "stop"])
+        self.assertEqual(channel.typing_active, 0)
+
     async def test_second_late_fragment_survives_slow_regeneration_and_keeps_full_context(self):
         channel = self._channel(8112)
         first_generation_started = asyncio.Event()

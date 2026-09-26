@@ -1651,6 +1651,34 @@ class StructuralReferentTests(unittest.TestCase):
         self.assertEqual(exact.referent_reason, "discord_reply_source")
         self.assertEqual(exact.referent_selected_row_ids, (1,))
 
+    def test_separate_statements_do_not_create_a_cross_clause_referent(self):
+        rows = [
+            _context_row(1, "How did people get along at the show?"),
+            _context_row(2, "The crowd supported one another.", role="model", user_name="BNL-01"),
+        ]
+        for text in (
+            "Test Member is a guy. He told you that. Explain the room dynamics.",
+            "That date is wrong. Review the queue activity on September 25, 2026.",
+            "Use he/him for me. That matters. What is your read on the audience?",
+        ):
+            with self.subTest(text=text):
+                result = assemble_conversation_context_v2(rows, _context_request(text))
+                self.assertEqual(result.referent_status, "not_requested")
+                self.assertEqual(result.referent_candidate_labels, ())
+
+    def test_reasoning_followup_refers_to_bnl_answer_not_human_question(self):
+        rows = [
+            _context_row(1, "How did people get along at the show?", user_id=999),
+            _context_row(2, "The crowd supported one another.", role="model", user_name="BNL-01", user_id=999),
+        ]
+        for text in ("What made you think that?", "Why did you say that?", "What led you to conclude that?"):
+            with self.subTest(text=text):
+                result = assemble_conversation_context_v2(rows, _context_request(text))
+                self.assertEqual(result.referent_status, "resolved")
+                self.assertEqual(result.referent_selected_row_ids, (2,))
+                self.assertEqual(result.referent_request_row_ids, (1,))
+                self.assertIn(rows[0]["content"], result.rendered_context)
+
     def test_above_passage_resolves_recent_long_form_across_speakers(self):
         passage = (
             "A signal crossed the empty city and found every window awake. "

@@ -395,6 +395,30 @@ class MemberMemoryIntegrationTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_independent_question_does_not_erase_direct_self_report(self):
+        for index, (text, expected) in enumerate((
+            ("My pronouns are he/him. What did you think of the show?", ("pronouns", "he/him")),
+            ("Call me Nova. Can you explain the queue?", ("preferred_name", "Nova")),
+            ("How was the show? My favorite color is teal.", ("favorite_color", "teal")),
+            ("My favorite movie is Hackers. What about you?", ("favorite_movie", "Hackers")),
+        ), start=910):
+            with self.subTest(text=text):
+                self.assertEqual([(key, value) for key, value, _ in bnl01_bot.extract_user_facts(text)], [expected])
+                self.save_direct(text, message_id=index)
+                evidence = bnl01_bot.get_approved_member_fact_evidence(42, 1)
+                self.assertIn(expected, [(item.key, item.value) for item in evidence])
+
+    def test_question_clause_cannot_be_promoted_by_adjacent_declaration(self):
+        for text in (
+            "Could you call me Nova? The show was fun.",
+            "What if my pronouns are he/him? Tell me about the show.",
+            "Did I say my favorite color is teal? That was a good song.",
+            'He wrote "My pronouns are he/him. What about you?"',
+            "In this scene, my favorite movie is Hackers. How was the show?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(bnl01_bot.extract_user_facts(text), [])
+
     def test_source_linked_fact_survives_transcript_pruning_while_legacy_row_stays_hidden(self):
         self.save_direct("My favorite movie is Hackers.", message_id=77)
         bnl01_bot.upsert_user_fact(43, 1, "favorite_color", "orange", 0.99)

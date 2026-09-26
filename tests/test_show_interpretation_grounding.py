@@ -143,6 +143,37 @@ class ShowInterpretationGroundingTests(unittest.IsolatedAsyncioTestCase):
         self._assert_original_show_evidence(prompt)
         self.fetch.assert_called()
 
+    async def test_source_content_and_date_do_not_require_system_vocabulary(self):
+        for question in (
+            "Tell me about the green visuals.",
+            "How was the crowd responding on August 28, 2026?",
+            "What were people saying about the green visuals?",
+        ):
+            with self.subTest(question=question), self._packet_flags(8810):
+                prompt, metadata = await self._direct_prompt(question)
+                basis = metadata["ordinary_chat_single_packet_basis"]
+                self.assertNotEqual(basis.packet.subject_resolution.status, "ambiguous")
+                assembled = bot.build_packet_owned_prompt(prompt, basis)
+                self.assertTrue(assembled.ready, assembled.reason)
+                self._assert_original_show_evidence(assembled.prompt)
+        for question in ("Explain guitar string tension.", "Tell me a joke about ferns."):
+            with self.subTest(question=question), self._packet_flags(8810):
+                prompt, _ = await self._direct_prompt(question)
+                self.assertNotIn(COMMENT, prompt)
+
+    async def test_why_followup_reopens_sources_behind_the_paired_answer(self):
+        self._seed_recent_exchange(8810, "Recap the August 28, 2026 BARCODE Radio show.")
+        for question in ("What made you think that?", "Why did you say that?",
+                         "What led you to conclude that?"):
+            with self.subTest(question=question), self._packet_flags(8810):
+                prompt, _ = await self._direct_prompt(question)
+                self._assert_original_show_evidence(prompt)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("DELETE FROM conversations WHERE channel_id=8810 AND role='user'")
+        # BNL's orphaned claim supplies neither a date nor factual authority.
+        prompt, _ = await self._direct_prompt("What made you think that?")
+        self.assertNotIn(COMMENT, prompt)
+
     def test_followup_cannot_open_history_from_bnl_prose_or_jump_topics(self):
         for context in (
             "",

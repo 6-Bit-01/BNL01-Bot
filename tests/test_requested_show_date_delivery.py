@@ -20,6 +20,7 @@ from unittest import mock
 
 import test_public_network_knowledge as network_fixture
 import test_tiktok_show_evidence_ledger as show_fixture
+import bnl_tiktok_show_ledger as show_owner
 from bnl_journal_source_store import record_source_event
 from bnl_tiktok_live_context import LiveContextSnapshotWriter
 from tests import test_tiktok_live_context_bridge as live_fixture
@@ -437,6 +438,59 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(changed)
                 self.assertEqual(refreshed.authored_excerpts, basis.authored_excerpts)
                 self.assertEqual(bot.prompt_source_basis_failure((refreshed,)), "")
+
+    async def test_relative_comparison_uses_dated_show_and_preceding_retained_show(self):
+        request = "Compare the September 4, 2026 show with the one before it."
+        prompt, metadata = await self.runtime._direct_prompt_async(
+            "public_home", request=request, privileged=False,
+        )
+        for comment in (AUGUST_COMMENT, SEPTEMBER_COMMENT):
+            self.assertIn(comment, prompt)
+        bases = [b for b in metadata["prompt_source_bases"]
+                 if isinstance(b, bot.FinalizedShowPromptSourceBasis)]
+        self.assertEqual(len(bases), 1)
+        self.assertEqual(set(bases[0].show_keys), {"show-attendance-1", "show-attendance-september"})
+        refreshed, changed = bot.refresh_prompt_source_basis(bases[0])
+        self.assertFalse(changed)
+        self.assertEqual(refreshed.authored_excerpts, bases[0].authored_excerpts)
+
+    async def test_pinned_refresh_decodes_only_selected_episodes_and_checks_changes(self):
+        _website, _episode, basis = self._read(REQUEST)
+        decoded = []
+        safe_document = show_owner._safe_document
+
+        def observe(document):
+            decoded.append(document.get("showKey"))
+            return safe_document(document)
+
+        with mock.patch.object(show_owner, "_safe_document", side_effect=observe):
+            refreshed, changed = bot.refresh_prompt_source_basis(basis)
+        self.assertFalse(changed)
+        self.assertTrue(decoded)
+        self.assertEqual(set(decoded), set(basis.show_keys))
+        self.assertEqual(refreshed.authored_excerpts, basis.authored_excerpts)
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("DELETE FROM tiktok_show_evidence_ledgers WHERE guild_id=77 AND show_key=?",
+                         (basis.show_keys[0],))
+        refreshed, changed = bot.refresh_prompt_source_basis(basis)
+        self.assertTrue(changed)
+        self.assertFalse(refreshed.authored_excerpts)
+        self.assertNotIn(SEPTEMBER_COMMENT, refreshed.rendered_context)
+
+    async def test_incidental_person_correction_preserves_show_followup_scope(self):
+        self._capture_human_history("public_home", 8810, (
+            "Recap the September 4, 2026 show chat.",
+        ))
+        prompt, metadata = await self.runtime._direct_prompt_async(
+            "public_home", privileged=False,
+            request="Neon Fox is a guy. He told you that. Also, did you notice any tension or chemistry between people?",
+        )
+        bases = [b for b in metadata["prompt_source_bases"]
+                 if isinstance(b, bot.FinalizedShowPromptSourceBasis)]
+        self.assertEqual(len(bases), 1)
+        self.assertEqual(bases[0].show_keys, ("show-attendance-september",))
+        self.assertIn(SEPTEMBER_COMMENT, prompt)
+        self.assertNotIn(AUGUST_COMMENT, prompt)
 
     async def test_removed_second_show_refresh_retains_only_the_valid_source(self):
         _website, _episode, basis = self._read(COMPARE_REQUEST)

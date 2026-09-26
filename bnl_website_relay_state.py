@@ -423,7 +423,7 @@ _RELAY_QUERY_CUE_RE = re.compile(
 )
 _RELAY_QUERY_ACTION_RE = re.compile(
     r"\b(?:accepted|archive|find|history|latest|message|published|recent|"
-    r"said|show|signal|status|what)\b",
+    r"said|show|signal|status|what|recap|summari[sz]e|tell|explain|describe|remember|remind)\b",
     re.IGNORECASE,
 )
 _RELAY_LATEST_RE = re.compile(

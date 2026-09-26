@@ -356,8 +356,9 @@ _SITUATION_ROLE_DOMAIN_PATTERNS = (
     ("system_subject", "technical", re.compile(r"\b(?:bot|code|database|api|memory|website|server|deploy|pr)\b", re.I)),
 )
 _THIRD_PARTY_SUBJECT_CUE_RE = re.compile(
-    r"\b(?:who\s+is|tell\s+me\s+about|what\s+do\s+you\s+(?:know|remember)\s+about|"
-    r"what\s+happened\s+with|ask(?:ing)?\s+about)\b",
+    r"\bwho\s+is\b|\b(?:tell\s+me\s+about|what\s+do\s+you\s+(?:know|remember)\s+about|"
+    r"what\s+happened\s+with|ask(?:ing)?\s+about)\b"
+    r"(?!\s+(?:the|a|an|our|these|those)\b)",
     re.I,
 )
 _SELF_PUBLIC_ACTIVITY_PATTERN = (
@@ -394,7 +395,7 @@ _BNL_SELF_SUBJECT_CUE_RE = re.compile(
 )
 _TASK_LEAD_RE = re.compile(
     r"(?:what|which|who|where|when|why|how|tell|explain|summari[sz]e|"
-    r"restate|repeat|recap|paraphrase|recommend|suggest|list|"
+    r"restate|repeat|recap|remind|paraphrase|recommend|suggest|list|"
     r"compare(?:s|d)?|describe|give|show|help|check|find|choose|try|test|"
     r"is|are|do|does|did|can|could|would|should)\b",
     re.I,
@@ -674,6 +675,7 @@ def _situation_object(text: str) -> str:
         object_kind
         for object_kind, pattern in _SITUATION_OBJECT_PATTERNS
         if pattern.search(text or "")
+        and (object_kind != "person" or _THIRD_PARTY_SUBJECT_CUE_RE.search(text or ""))
     )
     if len(matches) == 1:
         return matches[0]

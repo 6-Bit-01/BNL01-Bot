@@ -1508,7 +1508,7 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         self.assertEqual("source_changed", changed.status)
         self.assertGreaterEqual(changed.changed_source_count, 1)
 
-    def test_missing_hidden_and_unapproved_publications_fail_packet_closed(self):
+    def test_missing_and_unapproved_publications_close_only_their_source_lane(self):
         missing = build_packet(
             self.conn,
             self.request(
@@ -1519,10 +1519,9 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             persist=False,
             environ=self.flags,
         )
-        self.assertIn(
-            "journal_publication_query_failed_closed",
-            missing.diagnostics.invalid_invariants,
-        )
+        self.assertFalse(missing.diagnostics.invalid_invariants)
+        self.assertFalse(any(item.lane == "journal_publication" for item in missing.items))
+        self.assertEqual(missing.diagnostics.journal_query_status, "not_found")
         manual_id = "bnl-packet-manual-001"
         self.add_relay(
             manual_id,
@@ -1535,10 +1534,9 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             persist=False,
             environ=self.flags,
         )
-        self.assertIn(
-            "relay_publication_query_failed_closed",
-            unapproved.diagnostics.invalid_invariants,
-        )
+        self.assertFalse(unapproved.diagnostics.invalid_invariants)
+        self.assertFalse(any(item.lane == "relay_publication" for item in unapproved.items))
+        self.assertNotEqual(unapproved.diagnostics.relay_query_status, "eligible")
 
 
 if __name__ == "__main__":
