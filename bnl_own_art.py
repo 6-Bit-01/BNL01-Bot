@@ -94,9 +94,9 @@ def own_art_image_request(prompt: str) -> dict:
         "input": prompt,
         "store": False,
         "generation_config": {"max_output_tokens": policy_for_route(OWN_ART_IMAGE_ROUTE).max_output_tokens},
-        # Let Gemini choose its supported output format. Preserve its original
-        # bytes and MIME through private storage, Discord and website delivery.
-        "response_format": {"type": "image", "delivery": "inline", "aspect_ratio": "1:1", "image_size": "1K"},
+        # Gemini returns image data inline by default. Explicit delivery modes
+        # are rejected by the live API even though its schema lists them.
+        "response_format": {"type": "image", "aspect_ratio": "1:1", "image_size": "1K"},
     }
 
 
