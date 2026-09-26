@@ -27588,6 +27588,7 @@ def build_user_memory_context(
                     "public_home",
                     "public_context",
                 ),
+                prepare_schema=not read_only,
             )
         except Exception as exc:
             logging.warning(
@@ -28003,7 +28004,7 @@ def build_batch_moment_attribution_context(
     ):
         return ""
     try:
-        with sqlite3.connect(DB_FILE) as moment_conn:
+        with closing(_open_member_memory_read_connection()) as moment_conn:
             gist = render_shadow_moment_context(
                 moment_conn,
                 guild_id=int(guild_id),
@@ -28023,6 +28024,7 @@ def build_batch_moment_attribution_context(
                     "public_home",
                     "public_context",
                 ),
+                prepare_schema=False,
             )
     except Exception as exc:
         logging.warning(
@@ -30990,6 +30992,40 @@ def _open_member_memory_read_connection() -> sqlite3.Connection:
     return sqlite3.connect(
         Path(DB_FILE).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25,
     )
+
+
+async def build_user_memory_context_async(
+    user_id: int, guild_id: int, *, source_metadata: dict | None = None,
+    **kwargs,
+) -> str:
+    """Use the existing memory owner in one off-loop, read-only snapshot."""
+    def read():
+        metadata: dict = {}
+        with closing(_open_member_memory_read_connection()) as conn:
+            conn.execute("BEGIN")
+            # Acquire the snapshot once, before readers that handle individual
+            # source failures. A busy database is unavailable, not empty memory.
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            context = build_user_memory_context(
+                user_id, guild_id, source_metadata=metadata,
+                connection=conn, read_only=True, **kwargs,
+            )
+        return context, metadata
+
+    started = time.monotonic()
+    try:
+        context, metadata = await asyncio.to_thread(read)
+        # A cancelled caller must never receive late worker metadata.
+        if source_metadata is not None:
+            source_metadata.update(metadata)
+        return context
+    finally:
+        logging.info(
+            "response_stage_timing stage=member_memory_read guild_id=%s "
+            "channel_id=%s elapsed_ms=%s",
+            guild_id, int(kwargs.get("channel_id") or 0),
+            round((time.monotonic() - started) * 1000),
+        )
 
 
 def build_named_public_member_memory_context(
@@ -38818,6 +38854,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     channel_id = channel.id
     guild_id = channel.guild.id
     channel_policy = resolve_channel_policy(channel)
+    batch_surface = conversation_surface_for_channel_policy(channel_policy)
     sealed_test_channel = channel_policy == "sealed_test"
     now = datetime.now(PACIFIC_TZ)
     handoff_items = _channel_interrupt_handoff.pop(channel_id, None)
@@ -38933,6 +38970,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         )
         in {"live", "sealed_canary"}
     )
+    response_stage = "orchestration"
     try:
         _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
         if (
@@ -39180,9 +39218,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 engagement_reason=reason,
                 pending_state=pending_state,
                 pending_anchor=pending_anchor,
-                is_active_channel=(
-                    channel_id == get_guild_config(guild_id)
-                ),
             )
             orchestration_decision = orchestration_state["decision"]
             batch_route_mode = str(
@@ -39268,6 +39303,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             # The response obligation is settled. Show progress while source
             # readers prepare the answer, retaining the existing generation
             # token, interrupt handling, cooldown and finally cleanup.
+            response_stage = "source_preparation"
             await _ensure_batch_typing(channel, local_generation_id)
             style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
@@ -39586,21 +39622,35 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         current_direct=batch_current_direct,
                     )
                 )
-                batch_memory_context = build_user_memory_context(
-                    first_uid,
-                    guild_id,
-                    route_mode=batch_route_mode,
-                    channel_policy=channel_policy,
-                    user_text=combined_text,
-                    is_owner_or_mod=batch_member_is_privileged,
-                    current_direct=batch_current_direct,
-                    governance_allowed=bool(memory_governance_live_enabled()),
-                    channel_id=channel_id,
-                    moment_attribution_target_user_id=(
-                        batch_memory_target_user_id
-                    ),
-                    source_metadata=batch_memory_source_metadata,
-                )
+                response_stage = "member_memory_read"
+                try:
+                    batch_memory_context = await build_user_memory_context_async(
+                        first_uid,
+                        guild_id,
+                        route_mode=batch_route_mode,
+                        channel_policy=channel_policy,
+                        user_text=combined_text,
+                        is_owner_or_mod=batch_member_is_privileged,
+                        current_direct=batch_current_direct,
+                        governance_allowed=bool(memory_governance_live_enabled()),
+                        channel_id=channel_id,
+                        moment_attribution_target_user_id=(
+                            batch_memory_target_user_id
+                        ),
+                        source_metadata=batch_memory_source_metadata,
+                    )
+                except (OSError, sqlite3.DatabaseError) as exc:
+                    logging.warning(
+                        "batch_member_memory_read_failed error=%s",
+                        type(exc).__name__,
+                    )
+                    prompt += (
+                        "\n\nDurable member memory could not be read for this turn. "
+                        "This is not evidence that no memories exist. Use the other "
+                        "available sources; state the retrieval limitation if the "
+                        "requested answer depends on the unavailable memory.\n"
+                    )
+                response_stage = "packet_assembly"
                 if batch_memory_context:
                     batch_memory_prompt_block = (
                         "\n\nDurable memory context for the sole current speaker:\n"
@@ -39631,7 +39681,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_moment_attribution_context = ""
             if len(unique_user_ids) > 1:
                 batch_moment_attribution_context = (
-                    build_batch_moment_attribution_context(
+                    await asyncio.to_thread(
+                        build_batch_moment_attribution_context,
                         batch_attribution_contract,
                         guild_id=guild_id,
                         channel_id=channel_id,
@@ -40094,6 +40145,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 post_generation_regeneration_pending = None
 
             generation_route = "free_speak_media_generation" if reason == "free_speak_media_generation" else "get_gemini_response"
+            response_stage = "generation"
             _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
             generation_elapsed = max(0.0, (datetime.now(PACIFIC_TZ) - batch_start).total_seconds())
             _log_batch_event(logging.INFO, "generation_started_after_wait", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
@@ -40122,12 +40174,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     situation_frame_current_text=combined_text,
                     route_mode=batch_route_mode,
                     channel_policy=channel_policy,
-                    conversation_surface=(
-                        conversation_surface_for_channel_policy(
-                            channel_policy,
-                            channel_id == get_guild_config(guild_id),
-                        )
-                    ),
+                    conversation_surface=batch_surface,
                     user_id=first_uid,
                     guild_id=guild_id,
                     user_display_name=(
@@ -40205,7 +40252,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     route=generation_route,
                     channel=channel,
                     channel_policy=channel_policy,
-                    conversation_surface=conversation_surface_for_channel_policy(channel_policy, channel_id == get_guild_config(guild_id)),
+                    conversation_surface=batch_surface,
                     directness="request_intent" if reason.startswith("request_intent:") else ("plain_name_call" if active_packet.get("addressed_to_bot") else "batch_answer"),
                     result=latest_result,
                 )
@@ -40522,7 +40569,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 if not pending_task or pending_task.done():
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
             return
-        batch_surface = conversation_surface_for_channel_policy(channel_policy, channel_id == get_guild_config(guild_id))
+        response_stage = "response_guards"
         batch_plain_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", (combined_text or "").lower()))
         batch_directness = "plain_name_call" if batch_plain_name_seen and conversation_surface_allows_free_speak(batch_surface) else "free_speak_passive"
         update_last_route_debug(
@@ -41141,7 +41188,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         )
         if guard_diagnostics.get("source_neutral_recovery"):
             batch_presend_source_bases = ()
-        await _stop_batch_typing(channel_id, local_generation_id, reason="response_ready")
+        response_stage = "presend_checks"
         if (
             batch_attribution_contract.exact_quote_authority is not None
             and not guard_diagnostics.get("source_neutral_recovery")
@@ -41624,12 +41671,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_frame,
                 current_text=combined_text,
                 route_mode=ROUTE_MODE_NORMAL_CHAT,
-                conversation_surface=(
-                    conversation_surface_for_channel_policy(
-                        channel_policy,
-                        channel_id == get_guild_config(guild_id),
-                    )
-                ),
+                conversation_surface=batch_surface,
                 channel_policy=channel_policy,
                 packet_source_snapshot_digest=(
                     batch_packet_snapshot_digest
@@ -41798,6 +41840,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             len(items),
             f"generation_id={local_generation_id}",
         )
+        response_stage = "discord_send"
         sent_message_ids = []
         try:
             if len(response) <= 2000:
@@ -41844,6 +41887,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_status="batch_discord_send_failed",
             )
             return
+        await _stop_batch_typing(channel_id, local_generation_id, reason="response_sent")
+        response_stage = "after_send"
         await safely_finalize_shared_brain_synthesis(
             batch_synthesis_decision,
             final_response=response,
@@ -41948,6 +41993,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             guard_diagnostics=guard_diagnostics,
             response_sent=True,
         )
+    except Exception as exc:
+        # Report the stage and code location without logging prompt/source text
+        # or arbitrary exception messages. The scheduler still receives failure.
+        frame = exc.__traceback__
+        while frame is not None and frame.tb_next is not None:
+            frame = frame.tb_next
+        logging.error(
+            "batch_response_failed guild_id=%s channel_id=%s generation_id=%s "
+            "stage=%s error_type=%s function=%s line=%s",
+            guild_id, channel_id, local_generation_id, response_stage,
+            type(exc).__name__,
+            frame.tb_frame.f_code.co_name if frame is not None else "unknown",
+            frame.tb_lineno if frame is not None else 0,
+        )
+        raise
     finally:
         _channel_payload_wait_extended[channel_id] = False
         await _clear_generation_state(channel_id, local_generation_id)

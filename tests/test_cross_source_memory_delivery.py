@@ -1073,7 +1073,7 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(show_reads), 2)
 
     async def test_batch_source_changes_after_guard_never_deliver_the_old_quote(self):
-        real_stop = bot._stop_batch_typing
+        real_snapshot = bot.journal_control_snapshot_for_source_fence
         corrected = "That earlier Discord quotation is no longer available."
         for column, value in (
             ("channel_policy", "internal_controlled"),
@@ -1083,20 +1083,22 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
             channel_id = 8811 + len(self.runtime.channel_ids)
             changed = False
 
-            async def stop_typing(*args, **kwargs):
+            async def change_before_source_fence(*args, **kwargs):
                 nonlocal changed
-                if kwargs.get("reason") == "response_ready" and not changed:
+                # Typing now lasts through delivery. Mutate at the actual
+                # pre-send source boundary, after the response guard, instead.
+                if not changed:
                     with sqlite3.connect(bot.DB_FILE) as conn:
                         conn.execute(f"UPDATE conversations SET {column}=? WHERE id=7101", (value,))
                     changed = True
-                return await real_stop(*args, **kwargs)
+                return await real_snapshot(*args, **kwargs)
 
             async def provider(*args, **kwargs):
                 await self._provider_answer(*args, **kwargs)
                 return corrected if changed else ANSWER
 
             with self.subTest(mutation=column), self._packet_configuration(True, channel_id), mock.patch.object(
-                bot, "_stop_batch_typing", side_effect=stop_typing,
+                bot, "journal_control_snapshot_for_source_fence", side_effect=change_before_source_fence,
             ):
                 channel, generation, _guard = await self.runtime._batch(
                     "sealed_test", request=REQUEST, answer=provider,
