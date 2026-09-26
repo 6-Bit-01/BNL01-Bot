@@ -5823,6 +5823,7 @@ def select_public_participant_moment_gists(
     allowed_channel_policies: tuple[str, ...] = (),
     max_results: int = 4,
     now: str | None = None,
+    prepare_schema: bool = True,
 ) -> tuple[PublicParticipantMomentGist, ...]:
     """Return source-revalidated participant gists for governed recall.
 
@@ -5832,7 +5833,10 @@ def select_public_participant_moment_gists(
     Exact-quote and third-party attribution requests remain owned by their
     separate live-source paths.
     """
-    ensure_moment_schema(conn)
+    if prepare_schema:
+        ensure_moment_schema(conn)
+    elif not _table_exists(conn, "memory_moment_windows"):
+        return ()
     if not re.fullmatch(r"discord_user:[1-9]\d*", participant_key or ""):
         return ()
     attribution = _parse_attribution_request(topic_text)
@@ -6481,8 +6485,12 @@ def render_shadow_moment_context(
     allowed_channel_policies: tuple[str, ...] = (),
     attribution_target_key: str = "",
     now: str | None = None,
+    prepare_schema: bool = True,
 ) -> str:
-    ensure_moment_schema(conn)
+    if prepare_schema:
+        ensure_moment_schema(conn)
+    elif not _table_exists(conn, "memory_moment_windows"):
+        return ""
     attribution = _parse_attribution_request(topic_text)
     if attribution.exact_authority_requested:
         return ""

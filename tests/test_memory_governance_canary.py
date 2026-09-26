@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sqlite3
@@ -277,6 +278,94 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
                 ),
             )
             conn.commit()
+
+    def test_async_member_read_preserves_governed_evidence_under_writer_reservation(self):
+        self.enable_canary()
+        self.insert_ledger(
+            "Test Member's favorite color is teal.", entry_id="public-preference",
+            predicate="favorite_color",
+        )
+        self.insert_ledger(
+            "A private fixture preference.", entry_id="private-preference",
+            predicate="favorite_movie", visibility="private", public_usable=0,
+        )
+        request = dict(
+            channel_policy="public_home", current_direct=True,
+            user_text="What do you remember about me?", channel_id=700,
+        )
+        expected_metadata = {}
+        expected = bnl01_bot.build_user_memory_context(
+            42, 1, **request, source_metadata=expected_metadata,
+            record_operational_diagnostics=False,
+        )
+        self.assertIn("Test Member's favorite color is teal.", expected)
+        self.assertNotIn("private fixture", expected)
+        statements = []
+        opened = []
+
+        def read_connection():
+            conn = sqlite3.connect(
+                Path(bnl01_bot.DB_FILE).resolve().as_uri() + "?mode=ro",
+                uri=True, timeout=0.02, check_same_thread=False,
+            )
+            conn.set_trace_callback(statements.append)
+            opened.append(conn)
+            return conn
+
+        writer = sqlite3.connect(bnl01_bot.DB_FILE)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            actual_metadata = {}
+            with mock.patch.object(
+                bnl01_bot, "_open_member_memory_read_connection", side_effect=read_connection,
+            ), mock.patch.object(bnl01_bot, "persist_shadow_diagnostics") as persist:
+                actual = asyncio.run(bnl01_bot.build_user_memory_context_async(
+                    42, 1, **request, source_metadata=actual_metadata,
+                ))
+            persist.assert_not_called()
+            self.assertEqual(actual, expected)
+            self.assertEqual(actual_metadata, expected_metadata)
+            self.assertTrue(statements)
+            self.assertEqual([
+                sql for sql in statements
+                if sql.strip().split()[0].upper() in {"INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "REPLACE"}
+            ], [])
+            for conn in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    conn.execute("SELECT 1")
+        finally:
+            writer.rollback()
+            writer.close()
+
+    def test_async_member_read_closes_failed_snapshot_with_retained_exception(self):
+        writer = sqlite3.connect(bnl01_bot.DB_FILE)
+        opened = []
+        metadata = {"previous": "unchanged"}
+
+        def read_connection():
+            conn = sqlite3.connect(
+                Path(bnl01_bot.DB_FILE).resolve().as_uri() + "?mode=ro",
+                uri=True, timeout=0.02, check_same_thread=False,
+            )
+            opened.append(conn)
+            return conn
+
+        try:
+            writer.execute("BEGIN EXCLUSIVE")
+            with mock.patch.object(
+                bnl01_bot, "_open_member_memory_read_connection", side_effect=read_connection,
+            ), self.assertRaises(sqlite3.OperationalError) as retained:
+                asyncio.run(bnl01_bot.build_user_memory_context_async(
+                    42, 1, channel_policy="sealed_test", source_metadata=metadata,
+                ))
+            self.assertIsNotNone(retained.exception)
+            self.assertEqual(metadata, {"previous": "unchanged"})
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                opened[0].execute("SELECT 1")
+        finally:
+            writer.rollback()
+            writer.close()
 
     def govern(
         self,

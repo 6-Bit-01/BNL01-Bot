@@ -1,8 +1,10 @@
 import asyncio
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import ExitStack
@@ -2346,6 +2348,176 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.sent, ["The room was lively."])
         self.assertEqual(channel.typing_events, ["start", "stop"])
         self.assertEqual(channel.typing_active, 0)
+
+    async def test_batch_surface_does_not_depend_on_unused_guild_config_read(self):
+        channel = self._channel(8160)
+        self._prime_flush(channel, "BNL, what stood out at the show?")
+        generate = mock.AsyncMock(return_value="The room was lively.")
+        with self._flush_runtime(channel.id, generate), mock.patch.object(
+            bnl01_bot, "get_guild_config",
+            side_effect=[channel.id, sqlite3.OperationalError("database is locked")],
+        ) as config:
+            await bnl01_bot._flush_channel_buffer(channel)
+        config.assert_not_called()
+        self.assertEqual(channel.sent, ["The room was lively."])
+
+    async def test_single_speaker_memory_read_keeps_event_loop_available(self):
+        channel = self._channel(8161)
+        self._prime_flush(channel, "BNL, what stood out at the show?")
+        loop = asyncio.get_running_loop()
+        loop_responded = threading.Event()
+        observations = []
+
+        def read_memory(*_args, **kwargs):
+            loop.call_soon_threadsafe(loop_responded.set)
+            observations.append(loop_responded.wait(timeout=0.5))
+            kwargs["source_metadata"]["approved_fact_count"] = 1
+            return "Approved direct self-reports:\n- Test Member plays synths."
+
+        generate = mock.AsyncMock(return_value="The room was lively.")
+        with self._flush_runtime(channel.id, generate), mock.patch.object(
+            bnl01_bot, "build_user_memory_context", side_effect=read_memory,
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+        self.assertTrue(observations)
+        self.assertTrue(all(observations))
+        self.assertIn("Test Member plays synths.", generate.await_args.args[0])
+        self.assertEqual(channel.sent, ["The room was lively."])
+
+    async def test_typing_remains_active_through_final_source_check_and_send(self):
+        channel = self._channel(8162)
+        self._prime_flush(channel, "BNL, what stood out at the show?")
+        source_checked = []
+        delivered = []
+
+        async def check_sources(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            source_checked.append(channel.typing_active)
+            return ""
+
+        async def send(text, **_kwargs):
+            await asyncio.sleep(0)
+            delivered.append(channel.typing_active)
+            channel.sent.append(text)
+
+        with (
+            self._flush_runtime(channel.id, mock.AsyncMock(return_value="The room was lively.")),
+            mock.patch.object(bnl01_bot, "prompt_source_basis_failure_async", side_effect=check_sources),
+            mock.patch.object(channel, "send", side_effect=send),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+        self.assertTrue(source_checked)
+        self.assertTrue(all(value == 1 for value in source_checked))
+        self.assertEqual(delivered, [1])
+        self.assertEqual(channel.sent, ["The room was lively."])
+        self.assertEqual(channel.typing_events, ["start", "stop"])
+        self.assertEqual(channel.typing_active, 0)
+
+    async def test_busy_member_memory_is_reported_without_abandoning_other_sources(self):
+        channel = self._channel(8163)
+        self._prime_flush(channel, "BNL, what stood out at the show?")
+        generate = mock.AsyncMock(return_value="The room was lively.")
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(bnl01_bot, "build_user_memory_context_async",
+                              side_effect=sqlite3.OperationalError("database is locked")),
+            mock.patch.object(bnl01_bot, "maybe_build_bnl_read_model_context",
+                              return_value="Public show evidence: Test Member welcomed another artist."),
+            self.assertLogs(level="WARNING") as logs,
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+        self.assertIn("batch_member_memory_read_failed error=OperationalError", "\n".join(logs.output))
+        prompt = generate.await_args.args[0]
+        self.assertIn("Test Member welcomed another artist.", prompt)
+        self.assertIn("This is not evidence that no memories exist.", prompt)
+        self.assertEqual(channel.sent, ["The room was lively."])
+        self.assertEqual(channel.typing_active, 0)
+
+    async def test_generation_failure_records_stage_and_cleans_up_typing(self):
+        channel = self._channel(8164)
+        self._prime_flush(channel, "BNL, what stood out at the show?")
+        with (
+            self._flush_runtime(channel.id, mock.AsyncMock(side_effect=RuntimeError("sensitive fixture message"))),
+            self.assertLogs(level="ERROR") as logs,
+            self.assertRaises(RuntimeError),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+        logged = "\n".join(logs.output)
+        self.assertIn("batch_response_failed", logged)
+        self.assertIn("stage=generation error_type=RuntimeError", logged)
+        self.assertNotIn("sensitive fixture message", logged)
+        self.assertEqual(channel.sent, [])
+        self.assertEqual(channel.typing_events, ["start", "stop"])
+        self.assertFalse(bnl01_bot._channel_generating[channel.id])
+
+    async def test_failed_send_stops_typing_without_persisting_reply(self):
+        channel = self._channel(8165)
+        self._prime_flush(channel, "BNL, what stood out at the show?")
+        with (
+            self._flush_runtime(channel.id, mock.AsyncMock(return_value="The room was lively.")),
+            mock.patch.object(channel, "send", side_effect=RuntimeError("send failed")),
+            mock.patch.object(bnl01_bot, "save_model_message") as save,
+            self.assertLogs(level="ERROR") as logs,
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+        self.assertIn("response_send_failed", "\n".join(logs.output))
+        self.assertEqual(channel.typing_events, ["start", "stop"])
+        self.assertEqual(channel.typing_active, 0)
+        save.assert_not_called()
+
+    async def test_cancelled_memory_read_cannot_publish_late_metadata(self):
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        metadata = {"previous": "unchanged"}
+        worker_finished = asyncio.Event()
+
+        def read(*_args, **kwargs):
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=2)
+            kwargs["source_metadata"]["late"] = "must not escape"
+            loop.call_soon_threadsafe(worker_finished.set)
+            return "Late memory context."
+
+        with mock.patch.object(bnl01_bot, "build_user_memory_context", side_effect=read):
+            task = asyncio.create_task(bnl01_bot.build_user_memory_context_async(
+                100, 7700, source_metadata=metadata, channel_policy="sealed_test",
+            ))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+                await asyncio.wait_for(worker_finished.wait(), timeout=1)
+        self.assertEqual(metadata, {"previous": "unchanged"})
+
+    async def test_cancellation_during_presend_check_stops_typing(self):
+        channel = self._channel(8166)
+        self._prime_flush(channel, "BNL, what stood out at the show?")
+        entered = asyncio.Event()
+
+        async def check(*_args, **_kwargs):
+            entered.set()
+            await asyncio.Future()
+
+        with (
+            self._flush_runtime(channel.id, mock.AsyncMock(return_value="The room was lively.")),
+            mock.patch.object(bnl01_bot, "prompt_source_basis_failure_async", side_effect=check),
+            mock.patch.object(bnl01_bot, "save_model_message") as save,
+        ):
+            task = asyncio.create_task(bnl01_bot._flush_channel_buffer(channel))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                self.assertEqual(channel.typing_active, 1)
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        self.assertEqual(channel.typing_active, 0)
+        self.assertEqual(channel.sent, [])
+        save.assert_not_called()
 
     async def test_second_late_fragment_survives_slow_regeneration_and_keeps_full_context(self):
         channel = self._channel(8112)

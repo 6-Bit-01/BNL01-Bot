@@ -300,6 +300,7 @@ class MomentGistCanaryPromptIntegrationTests(unittest.TestCase):
                 "public_home",
                 "public_context",
             ),
+            prepare_schema=True,
         )
         self.assertIn("Moment-based continuity gist", context)
         self.assertIn("paraphrase only, never exact wording", context)
