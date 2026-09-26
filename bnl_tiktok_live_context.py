@@ -567,6 +567,21 @@ def requested_show_date(
     return ""
 
 
+def relative_prior_show_requested(user_text: str) -> bool:
+    """A dated episode is the anchor for an adjacent-episode comparison."""
+    query = str(user_text or "")
+    return bool(
+        has_explicit_show_date(query)
+        and re.search(r"\b(?:show|episode|broadcast|stream)\b", query, re.I)
+        and re.search(r"\b(?:compar\w*|versus|vs\.?|differ\w*)\b", query, re.I)
+        and re.search(
+            r"\b(?:the (?:one|show|episode|broadcast|stream) before (?:it|that)|"
+            r"the (?:previous|preceding|prior) (?:one|show|episode|broadcast|stream))\b",
+            query, re.I,
+        )
+    )
+
+
 def requested_show_dates(
     user_text: str, *, now: Any = None, include_current_relative: bool = True,
     available_show_dates: Sequence[str] = (),
@@ -574,7 +589,14 @@ def requested_show_dates(
     """Resolve calendar dates within an already-selected show source request."""
 
     if has_explicit_show_date(user_text):
-        return explicit_show_dates(user_text, now=now, available_show_dates=available_show_dates)
+        dates = explicit_show_dates(user_text, now=now, available_show_dates=available_show_dates)
+        if len(dates) == 1 and relative_prior_show_requested(user_text):
+            prior = sorted({value for value in available_show_dates
+                            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value))
+                            and value < dates[0]})
+            if prior:
+                return dates + (prior[-1],)
+        return dates
     value = requested_show_date(
         user_text, now=now, include_current_relative=include_current_relative,
     )

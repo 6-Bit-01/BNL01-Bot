@@ -514,6 +514,7 @@ class IntelligencePacketRequest:
     frame_currentness: str = "unknown"
     journal_control_snapshot: JournalControlSnapshot | None = None
     journal_control_status: str = "not_requested"
+    publication_context_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -4949,6 +4950,7 @@ def _journal_publication_items(
         user_text=request.user_text,
         control_snapshot=request.journal_control_snapshot,
         now=request.now or None,
+        include_context=request.publication_context_enabled,
     )
     diagnostics.journal_query_status = selection.status
     diagnostics.journal_candidate_count = int(selection.candidate_count or 0)
@@ -5051,6 +5053,7 @@ def _relay_publication_items(
         conn,
         guild_id=int(request.guild_id or 0),
         user_text=request.user_text,
+        include_context=request.publication_context_enabled,
     )
     diagnostics.relay_query_status = selection.status
     diagnostics.relay_candidate_count = int(selection.candidate_count or 0)
@@ -6466,9 +6469,8 @@ def _revalidate_packet_in_snapshot(
         if journal_control_snapshot_provided
         else packet.request.journal_control_snapshot
     )
-    journal_query_requested = (
-        str(packet.diagnostics.journal_query_status or "not_requested")
-        != "not_requested"
+    journal_query_requested = any(
+        item.lane == "journal_publication" for item in revalidation_items
     )
     if journal_control_snapshot_provided and journal_query_requested:
         original_control = packet.request.journal_control_snapshot
@@ -6776,7 +6778,10 @@ def _packet_invariants(
             packet.diagnostics.relay_query_status,
         ),
     ):
-        if status not in {"not_requested", "eligible"}:
+        if status != "eligible" and any(item.lane == lane for item in packet.items):
+            # An unavailable publication must contribute no evidence. Its
+            # absence is not corruption of independent eligible sources.
+            # Task support will hold only the request lacking that evidence.
             invalid.append("%s_query_failed_closed" % lane)
         elif status == "eligible" and not any(
             item.lane == lane for item in packet.items

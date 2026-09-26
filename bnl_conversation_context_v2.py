@@ -85,6 +85,12 @@ MODEL_REFERENT_NOUN_RE = re.compile(
     r"\b(?:response|answer|reply)\b",
     re.I,
 )
+MODEL_REASONING_REFERENT_RE = re.compile(
+    r"\b(?:why\s+(?:do|did|would)\s+you\s+|"
+    r"what\s+(?:made|makes|led)\s+you\s+(?:to\s+)?)"
+    r"(?:think|say|conclude|interpret|believe|feel|read)\b",
+    re.I,
+)
 POSITIONAL_REFERENT_RE = re.compile(
     r"\b(?:above|previous|prior|earlier|last|latest|recent)\b",
     re.I,
@@ -301,6 +307,7 @@ class ConversationContextResult:
     retained_resume_reference_at: str = ""
     requester_user_id: int = 0
     requester_human_turns: tuple[tuple[int, str], ...] = ()
+    referent_request_row_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1256,13 +1263,7 @@ def nearby_contribution_referent_requested(text: str) -> bool:
     # original text for source/date selection and inspect only this local
     # view for structural pointers.
     structural_text = TEMPORAL_REFERENT_MODIFIER_RE.sub(" ", value)
-    pointer = bool(NEARBY_REFERENT_POINTER_RE.search(structural_text))
-    noun = bool(NEARBY_REFERENT_NOUN_RE.search(value))
-    act = bool(NEARBY_REFERENT_ACT_RE.search(value))
     attribution = bool(SPEAKER_ATTRIBUTION_REFERENT_RE.search(value))
-    current_correction_resolved = bool(
-        CURRENT_CORRECTION_REPLACEMENT_RE.search(value)
-    )
     current_payload_complete = bool(
         CURRENT_TURN_NAMED_PAYLOAD_RE.search(value)
     )
@@ -1275,12 +1276,21 @@ def nearby_contribution_referent_requested(text: str) -> bool:
         and not explicit_historical_position
     ):
         return False
-    return bool(
-        attribution
-        or (pointer and noun)
-        or (noun and act)
-        or (pointer and act and not current_correction_resolved)
-    )
+    # Do not combine a pointer from one statement with a request in another:
+    # a correction followed by an independent question is still two acts.
+    for clause in re.split(r"[.!?;\n]+", structural_text):
+        pointer = bool(NEARBY_REFERENT_POINTER_RE.search(clause))
+        noun = bool(NEARBY_REFERENT_NOUN_RE.search(clause))
+        act = bool(NEARBY_REFERENT_ACT_RE.search(clause))
+        if (
+            SPEAKER_ATTRIBUTION_REFERENT_RE.search(clause)
+            or (pointer and MODEL_REASONING_REFERENT_RE.search(clause))
+            or (pointer and noun)
+            or (noun and act)
+            or (pointer and act and not CURRENT_CORRECTION_REPLACEMENT_RE.search(clause))
+        ):
+            return True
+    return False
 
 
 def _speaker_label_referenced(text: str, label: str) -> bool:
@@ -1334,7 +1344,8 @@ def _narrow_referent_contribution_type(
             ),
             True,
         )
-    if MODEL_REFERENT_NOUN_RE.search(current_text or ""):
+    if (MODEL_REFERENT_NOUN_RE.search(current_text or "")
+            or MODEL_REASONING_REFERENT_RE.search(current_text or "")):
         return (
             tuple(
                 row
@@ -2126,6 +2137,13 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     candidates = []
     candidate_row_ids: set[int] = set()
     for _score, pair, why in selected_pairs:
+        if any(
+            int(row.get("id") or 0) == int(pair["model"].get("id") or 0)
+            for row in referent_resolution.selected
+        ):
+            # The exact model referent renders first. Keeping the whole pair
+            # would later deduplicate away its human half as well.
+            continue
         if pair.get("_room_group"):
             users = tuple(pair.get("users") or ())
             candidate_row_ids.update(
@@ -2159,6 +2177,28 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     for row in referent_resolution.selected:
         row_id = int(row.get("id") or 0)
         role = str(row.get("role") or "").lower()
+        if role in {"model", "assistant", "bnl"}:
+            for pair in pairs:
+                if int(pair["model"].get("id") or 0) != row_id:
+                    continue
+                users = (
+                    tuple(pair.get("users") or ()) if pair.get("_room_group")
+                    else tuple(pair["user"].get("_cluster_rows") or (pair["user"],))
+                )
+                for user in users:
+                    user_row_id = int(user.get("id") or 0)
+                    if (
+                        user_row_id in candidate_row_ids
+                        or int(user.get("user_id") or 0) != int(req.current_user_id)
+                        or not _row_is_same_room(user, req)
+                    ):
+                        continue
+                    candidates.append((
+                        user_row_id, "unpaired_user",
+                        dict(user, _unpaired_reason="referent_request"),
+                        ("referent_request",),
+                    ))
+                    candidate_row_ids.add(user_row_id)
         candidates.append(
             (
                 row_id,
@@ -2264,6 +2304,7 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             "immediate_room_recap": "immediate room recap",
             "current_payload_fragment": "current payload fragment",
             "immediate_referent_unpaired": "immediate room event",
+            "referent_request": "request behind the referenced BNL reply",
             "recent_human_turn": "recent human turn",
         }
         qualifier = qualifiers.get(item.get("_unpaired_reason"), "open loop")
@@ -2499,6 +2540,21 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         ),
         transient_referent_texts=tuple(rendered_transient_texts),
         requester_user_id=int(req.current_user_id),
+        # A request about BNL's answer may need that answer's original human
+        # question to reopen its sources. Use the existing participant-aware
+        # pairing, never a nearest-row guess or the model's prose as evidence.
+        referent_request_row_ids=tuple(sorted({
+            int(user.get("id") or 0)
+            for pair in pairs
+            if int(pair["model"].get("id") or 0) in resolved_referent_ids
+            for user in (
+                tuple(pair.get("users") or ()) if pair.get("_room_group")
+                else tuple(pair["user"].get("_cluster_rows") or (pair["user"],))
+            )
+            if int(user.get("id") or 0) in rendered_row_ids
+            and int(user.get("user_id") or 0) == int(req.current_user_id)
+            and _row_is_same_room(user, req)
+        })) if final_referent_status == "resolved" else (),
         requester_human_turns=tuple(
             (int(row["id"]), _render_history_excerpt(row.get("content") or "", current_text))
             for row in sorted(source_rows, key=lambda item: int(item.get("id") or 0))

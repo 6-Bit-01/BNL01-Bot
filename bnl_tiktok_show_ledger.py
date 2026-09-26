@@ -52,6 +52,7 @@ from bnl_tiktok_live_context import (
     has_explicit_show_date,
     requested_show_date,
     requested_show_dates,
+    relative_prior_show_requested,
     requested_history_window,
     requested_recent_show_count,
     show_timeline_bounds_ms,
@@ -2682,8 +2683,18 @@ def _participant_topic_terms(
 def _general_participant_recall(
     user_text: str, participants: Sequence[Mapping[str, Any]]
 ) -> bool:
+    # Incidental names in a correction/declaration do not retarget a separate
+    # question to that person's whole history. Inspect the actual request
+    # clauses, using the same task segmentation as the Situation Frame.
+    from bnl_unified_response_assessment import _situation_task_segments
+
+    request_text = "\n".join(_situation_task_segments(str(user_text or "")))
+    requested_participants = tuple(
+        participant for participant in participants
+        if _participant_named(request_text, participant)
+    )
     return bool(
-        participants
+        (requested_participants or (participants and self_public_activity_requested(user_text)))
         and (not _subject_continuity_requested(user_text)
              or self_public_activity_requested(user_text))
         # Naming a source (TikTok, Discord, chat) does not choose an episode.
@@ -2820,6 +2831,18 @@ def _document_relevance(
     ), default=0)
     if authored_overlap:
         score += min(240, 80 * authored_overlap)
+    authored_subject = re.search(
+        r"\b(?:what|which)\s+(?:did|does|has|had)\s+(.+?)\s+"
+        r"(?:say|said|write|wrote|written|post|posted|share|shared|think|thought)\b",
+        query, re.I,
+    )
+    unresolved_authored_subject = bool(
+        authored_subject and not participant_matches and not direct_subject_candidates
+        and not re.fullmatch(
+            r"(?:the\s+)?(?:people|viewers?|audience|crowd|chat|room|everyone|anyone|they)",
+            authored_subject.group(1).strip(), re.I,
+        )
+    )
     # The resolved subject remains a source scope without lexical overlap.
     # Topic scores rank their episodes; they do not decide source eligibility.
     if direct_subject_candidates:
@@ -2831,7 +2854,13 @@ def _document_relevance(
         score += 30
     elif _COMMUNITY_BASELINE_QUERY_RE.search(query):
         score += 24
-    elif not participant_matches:
+    elif not participant_matches and not requested_dates and (
+        authored_overlap < 2 or unresolved_authored_subject
+    ):
+        # Dates and concrete matches in original evidence are also retrieval
+        # cues. Do not erase a useful score merely because the user omitted
+        # the name of the system that owns the information. Two content terms
+        # keep a lone incidental word from pulling unrelated show history.
         score = 0
     return score, participant_matches
 
@@ -4179,14 +4208,19 @@ def build_tiktok_show_evidence_context(
         ).fetchone()
         if not exists:
             return unavailable_context("the retained episode table is unavailable")
+        scope_sql = ""
+        scope_params = []
+        if pinned_show_keys:
+            scope_sql = " AND show_key IN (" + ",".join("?" for _ in pinned_show_keys) + ")"
+            scope_params.extend(pinned_show_keys)
         rows = conn.execute(
             f"""
             SELECT ledger_json FROM {TIKTOK_SHOW_EVIDENCE_TABLE}
-            WHERE guild_id=? AND lifecycle_status='finalized'
+            WHERE guild_id=? AND lifecycle_status='finalized' {scope_sql}
             ORDER BY ended_at_ms DESC,show_key DESC
             LIMIT 200
             """,
-            (int(guild_id),),
+            (int(guild_id), *scope_params),
         ).fetchall()
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
         return unavailable_context("the retained episode read is unavailable")
@@ -4400,6 +4434,8 @@ def build_tiktok_show_evidence_context(
     lines = [
         *image_query_lines,
         "Durable BARCODE Radio show episode memory:",
+        *(["- Relative comparison uses the closest preceding retained eligible show, not a presumed weekly interval. This does not establish complete archive coverage."]
+          if relative_prior_show_requested(selection_query) else []),
         *preparation_contexts,
         "- Retrieval scope: aggregate totals and selected records from retained eligible show evidence. The participant lists and authored examples below are partial selections, not a complete transcript or attendee list.",
         (

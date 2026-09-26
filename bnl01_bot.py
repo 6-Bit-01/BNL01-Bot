@@ -54,6 +54,7 @@ from bnl_tiktok_live_context import (
     load_live_context_snapshot,
     requested_show_date,
     requested_show_dates,
+    relative_prior_show_requested,
     requested_history_window,
     select_show_for_tiktok_analysis,
     show_conversation_interval_requested,
@@ -4159,7 +4160,7 @@ def build_tiktok_show_evidence_context_for_turn(
         conversation_basis is not None
         and member_selection_query == user_text
         and not continuation_selection_query
-        and not broad_show_history_requested(user_text)
+        and not broad_show_history_requested(user_text, include_community_baseline=False)
         and not image_queries
         and conversation_context_result is not None
         and conversation_context_result.thread_focus_mode
@@ -4176,11 +4177,15 @@ def build_tiktok_show_evidence_context_for_turn(
     ):
         # Reuse Context's selected human referent when one is resolved. With
         # no referent request, retain the existing labeled background source.
-        # Intersect with human evidence so model replies cannot select shows.
+        # A resolved BNL answer can lead back through Context's authoritative
+        # pairing to the original human request. Its prose is not show data.
         source_items = conversation_basis.evidence_items
         if conversation_context_result.referent_status == "resolved":
             selected_row_ids = set(
                 conversation_context_result.referent_selected_row_ids
+            )
+            selected_row_ids.update(
+                conversation_context_result.referent_request_row_ids
             )
             source_items = tuple(
                 item for item in source_items
@@ -4210,6 +4215,7 @@ def build_tiktok_show_evidence_context_for_turn(
                 # Do not jump across an intervening human topic to revive a
                 # historical episode. The current request can name it again.
                 break
+    show_read_started = time.perf_counter()
     context = build_tiktok_show_evidence_context(
         DB_FILE,
         guild_id=guild_id,
@@ -4223,6 +4229,10 @@ def build_tiktok_show_evidence_context_for_turn(
     if selection_out is not None and context:
         selection_out["subject_user_id"] = selected_subject_user_id
         selection_out["user_text"] = tiktok_show_evidence_query
+    logging.info(
+        "response_stage_timing stage=show_source_read elapsed_ms=%s context_chars=%s",
+        round((time.perf_counter() - show_read_started) * 1000), len(context),
+    )
     return context
 
 
@@ -13084,6 +13094,9 @@ def normal_chat_prompt_contract(route_mode: str) -> str:
         "Ordinary preference and opinion questions permit a bounded conversational answer. "
         f"{NORMAL_CHAT_JUDGMENT_RULE} "
         "Use the named current speaker, tag recipients, reply target, and immediate room exchange to resolve pronouns and corrections before asking for clarification. "
+        "Respect explicit self-identification and corrections in eligible context; use a person's name when their pronouns are not established. "
+        "Acknowledging a correction is not proof of a durable write: do not claim a profile or memory was updated without a successful write result. "
+        "Combine relevant original records, memories, and reflections while preserving their different authority and dates. An unavailable source does not erase independently usable evidence. "
         "When the user says an earlier reply missed the point, use the visible prior exchange and make the corrected attempt now instead of asking them to repeat the request. "
         "For teasing or banter, match the scale and usually stay within 1–3 sentences. "
         f"{NORMAL_CHAT_TECHNICAL_VOICE_RULE} "
@@ -19546,6 +19559,7 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     return int(row[0] if row else 0) == 0
 
 def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, directed_to_bnl: bool = False, reply_to_conversation_row_id: int = 0, source_observed_at: str = "", observation_metadata: dict | None = None):
+    capture_started = time.perf_counter()
     decision = decide_memory_write_policy(route_mode, channel_policy, "user", content, False)
     if not decision.save_conversation:
         logging.info("memory_write_policy_skip_conversation role=user route_mode=%s reason=%s", route_mode, decision.reason)
@@ -19608,6 +19622,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         raise
     finally:
         conn.close()
+    original_saved_at = time.perf_counter()
     if (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES:
         try:
             occurred_at_ms = journal_timestamp_to_epoch_ms(observed_at)
@@ -19636,6 +19651,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
                 )
         except Exception as exc:
             logging.warning("journal_source_capture_failed source=discord_message row_id=%s error_type=%s", row_id, type(exc).__name__)
+    journal_saved_at = time.perf_counter()
     _shadow_memory_ledger_write(
         "conversations_user",
         lambda ledger_conn: shadow_conversation_row(
@@ -19646,6 +19662,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         ),
         guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id),
     )
+    ledger_saved_at = time.perf_counter()
     if relationship_v2_shadow_enabled():
         try:
             with sqlite3.connect(DB_FILE) as rel_conn:
@@ -19730,6 +19747,15 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
             )
     if decision.update_relationship and any(k in (content or "").lower() for k in ("help", "issue", "stuck", "fix", "error", "problem")):
         add_relationship_journal(user_id, guild_id, "help_signal", f"User asked for help: {(content or '')[:160]}")
+    logging.info(
+        "response_stage_timing stage=message_capture source_row_id=%s "
+        "original_ms=%s journal_ms=%s ledger_moment_ms=%s maintenance_ms=%s total_ms=%s",
+        row_id, round((original_saved_at - capture_started) * 1000),
+        round((journal_saved_at - original_saved_at) * 1000),
+        round((ledger_saved_at - journal_saved_at) * 1000),
+        round((time.perf_counter() - ledger_saved_at) * 1000),
+        round((time.perf_counter() - capture_started) * 1000),
+    )
     return decision
 
 def save_model_message(
@@ -22807,6 +22833,11 @@ def build_conversation_context_v2_for_prompt(
         and re.search(r"\b(?:comments?|messages?|conversation|quote)\b", resume_query, re.I)
         and not re.search(r"\b(?:above|previous|prior|that|this)\b", resume_query, re.I)
     )
+    current_recall_scope_complete |= bool(
+        relative_prior_show_requested(resume_query)
+        and requested_show_date(resume_query)
+        and not unresolved_recall_labels
+    )
     req = ConversationContextRequest(
         current_recall_scope_complete=current_recall_scope_complete,
         guild_id=int(guild_id or 0), current_user_id=int(current_user_id or 0), channel_id=int(channel_id or 0),
@@ -25485,7 +25516,13 @@ _MEMBER_FACT_ACTION_TAIL_RE = re.compile(
 def _split_member_fact_clauses(text: str) -> tuple[str, ...]:
     """Split only at boundaries that cannot be part of a scalar fact value."""
     clauses = []
-    for sentence in re.split(r"[.!?;]+", str(text or "")):
+    # A question is not a self-report, but an independent question must not
+    # cancel a declaration elsewhere in the same turn. Keep the terminator
+    # until after that distinction has been made.
+    for sentence in re.findall(r"[^.!?;]+(?:[.!?;]+|$)", str(text or "")):
+        if "?" in sentence:
+            continue
+        sentence = sentence.rstrip(".!;")
         for clause in _MEMBER_FACT_ACTION_TAIL_RE.split(sentence):
             cleaned = re.sub(r"\s+", " ", clause).strip(" \t\r\n,")
             cleaned = re.sub(r",\s*please$", " please", cleaned, flags=re.I)
@@ -25504,7 +25541,6 @@ def extract_user_facts(text: str):
     content = (text or "").strip()
     if (
         not content
-        or "?" in content
         or _MEMORY_ROLEPLAY_CUES_RE.search(content)
         or re.search(r"[\"“”]", content)
         or re.search(r"\b(?:he|she|they|someone|another person)\s+(?:said|says|wrote)\b", content, flags=re.I)
@@ -29747,7 +29783,24 @@ def _build_unified_intelligence_packet_shadow(
     )
     journal_control_snapshot: JournalControlSnapshot | None = None
     journal_control_status = "not_requested"
-    if journal_publication_query_mode(current_text) != "not_requested":
+    publication_context_enabled = channel_policy in PUBLIC_CHAT_POLICIES | {"sealed_test"}
+    journal_requested = journal_publication_query_mode(current_text) != "not_requested"
+    if publication_context_enabled and not journal_requested:
+        # Match the ordinary prompt's existing relevance-aware reader. Probe
+        # locally before fetching website controls; no text is eligible from
+        # this probe without those controls. Packet ownership must not make
+        # already-supported public context depend on a system-name keyword.
+        try:
+            with closing(sqlite3.connect(
+                Path(DB_FILE).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.1,
+            )) as publication_conn:
+                journal_requested = bool(select_published_journal_entries_on_connection(
+                    publication_conn, guild_id=guild_id, user_text=current_text,
+                    control_snapshot=None, include_context=True, limit=2,
+                ).candidate_count)
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            pass
+    if journal_requested:
         (
             journal_control_snapshot,
             journal_control_status,
@@ -29872,6 +29925,7 @@ def _build_unified_intelligence_packet_shadow(
         ),
         journal_control_snapshot=journal_control_snapshot,
         journal_control_status=journal_control_status,
+        publication_context_enabled=publication_context_enabled,
     )
     try:
         with sqlite3.connect(DB_FILE, timeout=0.25) as packet_conn:
@@ -31356,16 +31410,9 @@ def build_batch_moment_prompt_source_basis(
 def _shared_brain_journal_revalidation_snapshot(
     basis: SharedBrainSynthesisBasis,
 ) -> tuple[JournalControlSnapshot | None, bool]:
-    requested = bool(
-        str(
-            getattr(
-                basis.packet.diagnostics,
-                "journal_query_status",
-                "not_requested",
-            )
-            or "not_requested"
-        )
-        != "not_requested"
+    requested = any(
+        item.lane == "journal_publication"
+        for item in (*basis.packet.items, *basis.packet.validation_items)
     )
     if not requested:
         return None, False
@@ -39196,6 +39243,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 for uid in unique_user_ids:
                     _mark_conversation_continuation_state(guild_id, channel_id, uid)
                 return
+            # The response obligation is settled. Show progress while source
+            # readers prepare the answer, retaining the existing generation
+            # token, interrupt handling, cooldown and finally cleanup.
+            await _ensure_batch_typing(channel, local_generation_id)
             style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(collapsed_items, style_key, style_rule)
