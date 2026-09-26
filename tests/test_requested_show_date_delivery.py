@@ -847,13 +847,11 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     state = bot._get_conversation_continuation_state(
                         self.runtime.guild_id, channel.id, self.runtime.user_id,
                     )
-                    if policy == "public_home":
-                        self.assertEqual(saved, [(answer,)])
-                        self.assertIsNotNone(state)
-                        self.assertIn("last_bnl_reply_at", state)
-                    else:
-                        self.assertEqual(saved, [])
-                        self.assertFalse(state and state.get("last_bnl_reply_at"))
+                    # Public show replies retain ordinary local continuity in
+                    # both rooms; sealed storage keeps its original policy.
+                    self.assertEqual(saved, [(answer,)])
+                    self.assertIsNotNone(state)
+                    self.assertIn("last_bnl_reply_at", state)
 
     async def test_real_batch_delivers_one_supported_answer_from_requested_date(self):
         for policy in ("public_home", "sealed_test"):

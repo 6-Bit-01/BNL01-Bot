@@ -143,6 +143,90 @@ class ShowInterpretationGroundingTests(unittest.IsolatedAsyncioTestCase):
         self._assert_original_show_evidence(prompt)
         self.fetch.assert_called()
 
+    async def test_sealed_two_turn_show_exchange_keeps_local_continuity(self):
+        channel_id = 8890
+        questions = (
+            "BNL, what stood out about how people interacted at the August 28, 2026 BARCODE Radio show?",
+            "What made you think that? Quote a few actual comments and identify the speakers.",
+        )
+        reply = "The recorded comments include praise for the green visuals."
+
+        async def answer(*_args, **kwargs):
+            if kwargs.get("attempt_counter") is not None:
+                kwargs["attempt_counter"].mark_started()
+            return reply
+
+        with self._packet_flags(channel_id):
+            for question in questions:
+                bot.save_user_message(
+                    self.runtime.user_id, "Test Member", self.runtime.guild_id,
+                    question, channel_id=channel_id, channel_name="bnl-testing",
+                    channel_policy="sealed_test", route_mode=bot.ROUTE_MODE_NORMAL_CHAT,
+                )
+                channel, generation, _guard = await self.runtime._batch(
+                    "sealed_test", question, answer, privileged=False,
+                    channel_id=channel_id,
+                )
+                generation.assert_awaited_once()
+                self._assert_original_show_evidence(generation.await_args.args[0])
+                self.assertEqual(channel.sent, [reply])
+            with sqlite3.connect(bot.DB_FILE) as conn:
+                saved = conn.execute(
+                    "SELECT role,content,channel_policy FROM conversations "
+                    "WHERE channel_id=? ORDER BY id", (channel_id,),
+                ).fetchall()
+            self.assertEqual([row[0] for row in saved], ["user", "model", "user", "model"])
+            self.assertEqual([row[1] for row in saved if row[0] == "model"], [reply, reply])
+            self.assertTrue(all(row[2] == "sealed_test" for row in saved))
+            with sqlite3.connect(bot.DB_FILE) as conn:
+                projections = conn.execute(
+                    "SELECT public_usable FROM memory_ledger_entries "
+                    "WHERE source_table='conversations' AND channel_id=?",
+                    (channel_id,),
+                ).fetchall()
+            self.assertTrue(projections)
+            self.assertTrue(all(row[0] == 0 for row in projections))
+            # Same-room continuity does not become public or cross-room memory.
+            for policy, other_channel in (("public_home", 8891), ("sealed_test", 8892)):
+                context = bot.build_conversation_context_v2_for_prompt(
+                    guild_id=self.runtime.guild_id, current_user_id=self.runtime.user_id,
+                    channel_id=other_channel, channel_policy=policy,
+                    route_mode=bot.ROUTE_MODE_NORMAL_CHAT, current_texts=(questions[1],),
+                    current_participants={self.runtime.user_id}, is_direct_target=True,
+                )
+                self.assertNotIn(reply, context)
+
+    async def test_style_commit_contention_does_not_cancel_a_show_answer(self):
+        connect = sqlite3.connect
+        log_style = bot.log_response_style
+        write_results = []
+
+        def contended_style(*args):
+            reader = connect(bot.DB_FILE)
+            try:
+                reader.execute("BEGIN")
+                reader.execute("SELECT * FROM response_style_log").fetchall()
+                write_results.append(log_style(*args))
+            finally:
+                reader.close()
+
+        async def answer(*_args, **kwargs):
+            if kwargs.get("attempt_counter") is not None:
+                kwargs["attempt_counter"].mark_started()
+            return "The recorded comments include praise for the green visuals."
+
+        with self._packet_flags(8893), mock.patch.object(
+            bot, "log_response_style", side_effect=contended_style,
+        ):
+            channel, generation, _guard = await self.runtime._batch(
+                "sealed_test", "Recap the August 28, 2026 BARCODE Radio show.",
+                answer, privileged=False, channel_id=8893,
+            )
+        self.assertEqual(write_results, [False])
+        generation.assert_awaited_once()
+        self._assert_original_show_evidence(generation.await_args.args[0])
+        self.assertEqual(len(channel.sent), 1)
+
     async def test_source_content_and_date_do_not_require_system_vocabulary(self):
         for question in (
             "Tell me about the green visuals.",

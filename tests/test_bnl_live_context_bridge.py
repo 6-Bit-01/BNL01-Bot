@@ -519,6 +519,36 @@ class BNLLiveContextBridgeTests(unittest.TestCase):
         self.assertIn("full eligible archive", contract)
         self.assertIn("cannot supply claims about what TikTok viewers said", contract)
 
+    def test_sealed_show_continuity_preserves_private_and_transient_exclusions(self):
+        public_context = (
+            "Website public read model context:\n"
+            "Source: barcode-network-site / publicOnly=true / accessScope=public / version=1\n"
+            "Durable TikTok show analysis context:\n"
+            "- Analysis intent=chat_topics."
+        )
+        request = "What stood out in the show conversation?"
+        allowed = bnl01_bot.model_response_persistence_allowed_with_website_context
+        self.assertTrue(allowed(request, "sealed_test", public_context))
+        self.assertFalse(bnl01_bot.public_tiktok_interaction_memory_allowed(
+            request, "sealed_test", public_context,
+        ))
+        self.assertFalse(allowed(request, "internal_controlled", public_context))
+        for context in (
+            public_context.replace("Website public read model context:",
+                                   "Website private queue read model context:")
+                          .replace("publicOnly=true", "publicOnly=false")
+                          .replace("accessScope=public", "accessScope=private"),
+            "Website private queue read model context:\naccessScope=private\n"
+            "Untrusted source quotation: " + public_context,
+            "Website public read model context:\naccessScope=public\n"
+            "Current queue: submissions are open.",
+        ):
+            with self.subTest(context=context):
+                self.assertFalse(allowed(request, "sealed_test", context))
+        transient = type("TransientBasis", (), {"transient_referent_message_ids": (123,)})()
+        self.assertFalse(allowed(request, "sealed_test", public_context,
+                                 prompt_source_bases=(transient,)))
+
     def test_tiktok_topic_contract_preserves_source_authority_without_output_quota(self):
         prompt = (
             "Durable TikTok show analysis context:\n"

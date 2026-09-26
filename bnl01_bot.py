@@ -3889,19 +3889,34 @@ def public_tiktok_interaction_memory_allowed(
 ) -> bool:
     """Allow the public BNL exchange to persist, never the injected snapshot."""
 
+    return bool(
+        (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES
+        and _tiktok_conversation_context_allows_continuity(
+            user_text, website_read_model_context,
+        )
+    )
+
+
+def _tiktok_conversation_context_allows_continuity(
+    user_text: str,
+    website_read_model_context: str,
+) -> bool:
+    """Recognize the existing public conversation evidence exception."""
+
     if (isinstance(website_read_model_context, WebsiteReadModelContext)
             and website_read_model_context.show_awareness_only):
         # Only the delivered public conversation persists, never this snapshot.
-        return channel_policy in PUBLIC_CHAT_POLICIES
+        return True
     context = str(website_read_model_context or "")
+    if context.startswith("Website private queue read model context:"):
+        return False
     durable_show_context = "Durable TikTok show analysis context:" in context
     live_show_date = re.search(
         r"(?m)^TikTok live show scope: showDate=(20\d{2}-\d{2}-\d{2})$",
         context,
     )
     return bool(
-        (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES
-        and (
+        (
             is_live_show_reaction_query(
                 user_text,
                 current_show_date=live_show_date.group(1) if live_show_date else None,
@@ -3958,9 +3973,10 @@ def model_response_persistence_allowed_with_website_context(
 
     Website-backed operational answers normally remain no-store. Public
     TikTok conversation is different: the member's request and BNL's delivered
-    natural-language reply are ordinary public conversation evidence, while
-    the injected archive/read-model block itself is never passed to the memory
-    writer.
+    natural-language reply are ordinary conversation evidence. The same
+    exception keeps a sealed test reply in its existing same-channel history;
+    the writer still receives sealed_test and cannot promote it to public
+    memory. The injected archive/read-model block is never saved.
     """
 
     if turn_local_discord_reply_requires_no_store(prompt_source_bases):
@@ -3968,10 +3984,12 @@ def model_response_persistence_allowed_with_website_context(
     context = str(website_read_model_context or "")
     return bool(
         not context
-        or public_tiktok_interaction_memory_allowed(
-            user_text,
-            channel_policy,
-            website_read_model_context,
+        or (
+            (channel_policy or "").strip().lower()
+            in PUBLIC_CHAT_POLICIES | {"sealed_test"}
+            and _tiktok_conversation_context_allows_continuity(
+                user_text, website_read_model_context,
+            )
         )
     )
 
@@ -19804,87 +19822,86 @@ def save_model_message(
     primary_message_id = (
         delivered_message_ids[0] if delivered_message_ids else None
     )
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    conversation_columns = {
-        str(row[1] or "")
-        for row in cursor.execute(
-            "PRAGMA table_info(conversations)"
-        ).fetchall()
-    }
-    insert_columns = [
-        "user_id",
-        "user_name",
-        "guild_id",
-        "channel_name",
-        "channel_policy",
-        "channel_id",
-    ]
-    insert_values = [
-        storage_user_id,
-        "BNL-01",
-        guild_id,
-        (channel_name or "").lower()[:80],
-        (channel_policy or "unknown")[:40],
-        int(channel_id or 0),
-    ]
-    if "message_id" in conversation_columns:
-        insert_columns.append("message_id")
-        insert_values.append(primary_message_id)
-    if "route_mode" in conversation_columns:
-        insert_columns.append("route_mode")
-        insert_values.append(str(route_mode or "unknown")[:80])
-    insert_columns.extend(("role", "content"))
-    insert_values.extend(("model", content))
-    cursor.execute(
-        "INSERT INTO conversations (%s) VALUES (%s)"
-        % (
-            ",".join(insert_columns),
-            ",".join("?" for _ in insert_columns),
-        ),
-        tuple(insert_values),
-    )
-    row_id = int(cursor.lastrowid or 0)
-    link_table_exists = cursor.execute(
-        """
-        SELECT 1
-        FROM sqlite_master
-        WHERE type='table' AND name='conversation_discord_message_links'
-        """
-    ).fetchone()
-    if link_table_exists and delivered_message_ids:
-        cursor.executemany(
-            """
-            INSERT OR REPLACE INTO conversation_discord_message_links (
-                conversation_row_id,guild_id,channel_id,message_id
-            ) VALUES (?,?,?,?)
-            """,
-            [
-                (
-                    row_id,
-                    int(guild_id or 0),
-                    int(channel_id or 0),
-                    message_id,
-                )
-                for message_id in delivered_message_ids
-            ],
+    # Roll back and close even when COMMIT fails and a task retains its traceback.
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+        cursor = conn.cursor()
+        conversation_columns = {
+            str(row[1] or "")
+            for row in cursor.execute(
+                "PRAGMA table_info(conversations)"
+            ).fetchall()
+        }
+        insert_columns = [
+            "user_id",
+            "user_name",
+            "guild_id",
+            "channel_name",
+            "channel_policy",
+            "channel_id",
+        ]
+        insert_values = [
+            storage_user_id,
+            "BNL-01",
+            guild_id,
+            (channel_name or "").lower()[:80],
+            (channel_policy or "unknown")[:40],
+            int(channel_id or 0),
+        ]
+        if "message_id" in conversation_columns:
+            insert_columns.append("message_id")
+            insert_values.append(primary_message_id)
+        if "route_mode" in conversation_columns:
+            insert_columns.append("route_mode")
+            insert_values.append(str(route_mode or "unknown")[:80])
+        insert_columns.extend(("role", "content"))
+        insert_values.extend(("model", content))
+        cursor.execute(
+            "INSERT INTO conversations (%s) VALUES (%s)"
+            % (
+                ",".join(insert_columns),
+                ",".join("?" for _ in insert_columns),
+            ),
+            tuple(insert_values),
         )
-    if is_room_group_response:
-        cursor.executemany(
+        row_id = int(cursor.lastrowid or 0)
+        link_table_exists = cursor.execute(
             """
-            INSERT OR IGNORE INTO conversation_response_participants (
-                conversation_row_id, guild_id, user_id
-            ) VALUES (?, ?, ?)
-            """,
-            [
-                (row_id, guild_id, target_user_id)
-                for target_user_id in target_user_ids
-            ],
-        )
-    observed_at = cursor.execute("SELECT timestamp FROM conversations WHERE id=?", (row_id,)).fetchone()
-    observed_at = observed_at[0] if observed_at else ""
-    conn.commit()
-    conn.close()
+            SELECT 1
+            FROM sqlite_master
+            WHERE type='table' AND name='conversation_discord_message_links'
+            """
+        ).fetchone()
+        if link_table_exists and delivered_message_ids:
+            cursor.executemany(
+                """
+                INSERT OR REPLACE INTO conversation_discord_message_links (
+                    conversation_row_id,guild_id,channel_id,message_id
+                ) VALUES (?,?,?,?)
+                """,
+                [
+                    (
+                        row_id,
+                        int(guild_id or 0),
+                        int(channel_id or 0),
+                        message_id,
+                    )
+                    for message_id in delivered_message_ids
+                ],
+            )
+        if is_room_group_response:
+            cursor.executemany(
+                """
+                INSERT OR IGNORE INTO conversation_response_participants (
+                    conversation_row_id, guild_id, user_id
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (row_id, guild_id, target_user_id)
+                    for target_user_id in target_user_ids
+                ],
+            )
+        observed_at = cursor.execute("SELECT timestamp FROM conversations WHERE id=?", (row_id,)).fetchone()
+        observed_at = observed_at[0] if observed_at else ""
     _shadow_memory_ledger_write(
         "conversations_model",
         lambda ledger_conn: shadow_conversation_row(
@@ -31912,43 +31929,48 @@ def build_memory_diagnostic_snapshot(user_id: int, guild_id: int, route_mode: st
 
 
 def log_response_style(guild_id: int, user_id: int, style_key: str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO response_style_log (guild_id, user_id, style_key, timestamp) VALUES (?, ?, ?, ?)",
-        (guild_id, user_id, style_key, datetime.now(PACIFIC_TZ).isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    """Tone variation is optional; a failed commit must release its locks."""
+    try:
+        with closing(sqlite3.connect(DB_FILE, timeout=0.1)) as conn, conn:
+            conn.execute(
+                "INSERT INTO response_style_log (guild_id, user_id, style_key, timestamp) VALUES (?, ?, ?, ?)",
+                (guild_id, user_id, style_key, datetime.now(PACIFIC_TZ).isoformat()),
+            )
+        return True
+    except sqlite3.Error as exc:
+        logging.warning(
+            "response_style_history_unavailable operation=write error_type=%s",
+            type(exc).__name__,
+        )
+        return False
 
 def get_recent_response_styles(guild_id: int, user_id: int = 0, limit: int = RECENT_STYLE_WINDOW):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    if user_id:
-        cursor.execute(
-            """
-            SELECT style_key
-            FROM response_style_log
-            WHERE guild_id = ? AND (user_id = ? OR user_id = 0)
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (guild_id, user_id, limit),
+    try:
+        with closing(sqlite3.connect(DB_FILE, timeout=0.1)) as conn:
+            if user_id:
+                rows = conn.execute(
+                    """
+                    SELECT style_key FROM response_style_log
+                    WHERE guild_id = ? AND (user_id = ? OR user_id = 0)
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (guild_id, user_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT style_key FROM response_style_log
+                    WHERE guild_id = ? ORDER BY id DESC LIMIT ?
+                    """,
+                    (guild_id, limit),
+                ).fetchall()
+        return [r[0] for r in rows]
+    except sqlite3.Error as exc:
+        logging.warning(
+            "response_style_history_unavailable operation=read error_type=%s",
+            type(exc).__name__,
         )
-    else:
-        cursor.execute(
-            """
-            SELECT style_key
-            FROM response_style_log
-            WHERE guild_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (guild_id, limit),
-        )
-    rows = cursor.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+        return []
 
 def choose_response_style(guild_id: int, user_id: int, message_count: int, combined_text: str):
     c = (combined_text or "").lower()

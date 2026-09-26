@@ -1679,6 +1679,22 @@ class StructuralReferentTests(unittest.TestCase):
                 self.assertEqual(result.referent_request_row_ids, (1,))
                 self.assertIn(rows[0]["content"], result.rendered_context)
 
+    def test_event_scoped_quotes_do_not_invent_competing_room_contributions(self):
+        rows = [
+            _context_row(1, "Compare the August 28 and September 4 shows.", user_id=999),
+            _context_row(2, "Both shows had comments about their visuals.",
+                         role="model", user_name="BNL-01", user_id=999),
+        ]
+        for text in (
+            "Give me some actual quotes from those shows and who said them.",
+            "What did people say during that broadcast?",
+            "Who said what in those streams?",
+        ):
+            with self.subTest(text=text):
+                result = assemble_conversation_context_v2(rows, _context_request(text))
+                self.assertEqual(result.referent_status, "not_requested")
+                self.assertIn(rows[0]["content"], result.rendered_context)
+
     def test_above_passage_resolves_recent_long_form_across_speakers(self):
         passage = (
             "A signal crossed the empty city and found every window awake. "
