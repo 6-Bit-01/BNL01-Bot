@@ -139,6 +139,18 @@ _LIVE_REACTION_PATTERNS = (
     r"\bwhat(?:['’]s| is|s) (?:the )?(?:live|show) reaction\b",
 )
 
+# Interpretation is an evidence request too. Share these cues with comment
+# selection so a request for the room's mood does not become an engagement
+# ranking or a reply based only on BNL's previous prose.
+_AUDIENCE_INTERPRETATION_RE = re.compile(
+    r"\b(?:mood|tone|atmosphere|vibes?|tension|chemistry|sentiment)\b"
+    r"|\b(?:your|a|the)\s+(?:read|take|impression)\s+(?:on|of)\b",
+    re.I,
+)
+_AUDIENCE_SCOPE_RE = re.compile(
+    r"\b(?:chat|audience|viewers?|the room)\b", re.I,
+)
+
 _SHOW_ANALYSIS_PATTERNS = (
     r"\b(?:verify|correct|check|confirm|retract|audit)\b.*"
     r"\b(?:broadcast|tiktok|show|chat)\b.*"
@@ -185,6 +197,9 @@ _SHOW_ANALYSIS_PATTERNS = (
 )
 
 _SHOW_ANALYSIS_FOLLOWUP_PATTERNS = (
+    r"\b(?:mood|tone|atmosphere|vibes?|sentiment)\b",
+    r"\b(?:you|anyone|people|they)\b.{0,35}\b(?:feel|felt|notice|noticed|sense|sensed)\b"
+    r".{0,60}\b(?:tension|chemistry)\b",
     r"\brecurring (?:topics?|themes?|patterns?)\b",
     r"\b(?:topics?|themes?|patterns?)\b",
     r"\banything (?:else )?(?:of note|notable)\b",
@@ -518,6 +533,17 @@ def _pacific_show_date(now: Any = None) -> date:
     return current.astimezone(_PACIFIC_TZ).date()
 
 
+def _audience_interpretation_requested(text: str) -> bool:
+    return bool(
+        _AUDIENCE_INTERPRETATION_RE.search(text)
+        and _AUDIENCE_SCOPE_RE.search(text)
+        and not (
+            re.search(r"\bdiscord\b", text, re.I)
+            and not re.search(r"\b(?:tiktok|show|live|stream|broadcast)\b", text, re.I)
+        )
+    )
+
+
 def requested_show_date(
     user_text: str, *, now: Any = None, include_current_relative: bool = True,
     available_show_dates: Sequence[str] = (),
@@ -527,7 +553,10 @@ def requested_show_date(
     if has_explicit_show_date(user_text):
         return explicit_show_date(user_text, now=now, available_show_dates=available_show_dates)
     query = str(user_text or "")
-    if not _SHOW_DATE_SCOPE_RE.search(query):
+    if not (
+        _SHOW_DATE_SCOPE_RE.search(query)
+        or _audience_interpretation_requested(query)
+    ):
         return ""
     if _PAST_SHOW_DATE_RE.search(query):
         return (_pacific_show_date(now) - timedelta(days=1)).isoformat()
@@ -649,6 +678,7 @@ def is_tiktok_show_analysis_query(text: str) -> bool:
         return False
     return bool(
         show_conversation_interval_requested(normalized)
+        or _audience_interpretation_requested(normalized)
         or any(re.search(pattern, normalized) for pattern in _SHOW_ANALYSIS_PATTERNS)
     )
 
@@ -676,9 +706,12 @@ def tiktok_show_analysis_needs_comment_evidence(text: str) -> bool:
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
         return False
-    return any(
-        re.search(pattern, normalized)
-        for pattern in _SHOW_COMMENT_EVIDENCE_PATTERNS
+    return bool(
+        _AUDIENCE_INTERPRETATION_RE.search(normalized)
+        or any(
+            re.search(pattern, normalized)
+            for pattern in _SHOW_COMMENT_EVIDENCE_PATTERNS
+        )
     )
 
 
@@ -718,6 +751,8 @@ def classify_tiktok_show_analysis_intent(text: str) -> str:
         normalized,
     ):
         return SHOW_ANALYSIS_INTENT_TRACK_REACTION
+    if _AUDIENCE_INTERPRETATION_RE.search(normalized):
+        return SHOW_ANALYSIS_INTENT_CHAT_TOPICS
     return SHOW_ANALYSIS_INTENT_SHOW_RECAP
 
 

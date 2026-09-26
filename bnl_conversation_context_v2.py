@@ -89,6 +89,15 @@ POSITIONAL_REFERENT_RE = re.compile(
     r"\b(?:above|previous|prior|earlier|last|latest|recent)\b",
     re.I,
 )
+TEMPORAL_REFERENT_MODIFIER_RE = re.compile(
+    r"\b(?:this|that|these|those|last|previous|prior|recent|earlier)\s+"
+    r"(?:(?:in\s+the|this|that|past)\s+)?"
+    r"(?:(?:few|several|\d+)\s+)?"
+    r"(?:seconds?|minutes?|hours?|days?|mornings?|afternoons?|evenings?|"
+    r"nights?|weeks?|weekends?|months?|years?|seasons?|today|yesterday|"
+    r"tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.I,
+)
 CURRENT_CORRECTION_REPLACEMENT_RE = re.compile(
     r"\bi\s+meant\s+(?!(?:that|this|it|those|these)\b)\S"
     r"|\binstead\s+of\s+\S",
@@ -1242,7 +1251,12 @@ def nearby_contribution_referent_requested(text: str) -> bool:
     """Recognize a structural reference without keying on one exact phrase."""
 
     value = str(text or "")
-    pointer = bool(NEARBY_REFERENT_POINTER_RE.search(value))
+    # A time modifier such as "this evening" or "last week" scopes the
+    # request; it does not point at a previous room contribution. Keep the
+    # original text for source/date selection and inspect only this local
+    # view for structural pointers.
+    structural_text = TEMPORAL_REFERENT_MODIFIER_RE.sub(" ", value)
+    pointer = bool(NEARBY_REFERENT_POINTER_RE.search(structural_text))
     noun = bool(NEARBY_REFERENT_NOUN_RE.search(value))
     act = bool(NEARBY_REFERENT_ACT_RE.search(value))
     attribution = bool(SPEAKER_ATTRIBUTION_REFERENT_RE.search(value))
@@ -1253,7 +1267,7 @@ def nearby_contribution_referent_requested(text: str) -> bool:
         CURRENT_TURN_NAMED_PAYLOAD_RE.search(value)
     )
     explicit_historical_position = bool(
-        POSITIONAL_REFERENT_RE.search(value)
+        POSITIONAL_REFERENT_RE.search(structural_text)
     )
     if (
         current_payload_complete
@@ -1476,6 +1490,8 @@ def _resolve_nearby_contribution_referent(
             reason="no_bounded_same_room_candidates",
         )
 
+    structural_text = TEMPORAL_REFERENT_MODIFIER_RE.sub(" ", current_text)
+
     speaker_matches = tuple(
         row
         for row in candidates
@@ -1508,7 +1524,7 @@ def _resolve_nearby_contribution_referent(
                 labels=labels,
                 reason="speaker_attribution",
             )
-        if POSITIONAL_REFERENT_RE.search(current_text or ""):
+        if POSITIONAL_REFERENT_RE.search(structural_text):
             return _ReferentResolution(
                 status="resolved",
                 candidates=narrowed_speakers,
@@ -1550,7 +1566,7 @@ def _resolve_nearby_contribution_referent(
             reason="no_matching_contribution_type",
         )
     labels = _referent_candidate_labels(narrowed)
-    positional = bool(POSITIONAL_REFERENT_RE.search(current_text or ""))
+    positional = bool(POSITIONAL_REFERENT_RE.search(structural_text))
     if narrowed and positional:
         return _ReferentResolution(
             status="resolved",

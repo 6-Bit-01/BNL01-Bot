@@ -2696,7 +2696,10 @@ def resolve_tiktok_show_analysis_request(
         return ""
     if is_tiktok_show_analysis_query(current):
         return current
-    if not is_tiktok_show_analysis_followup(current):
+    if (
+        _CONTEXTUAL_NEW_TOPIC_RE.search(current)
+        or not is_tiktok_show_analysis_followup(current)
+    ):
         return ""
 
     prior_human_requests = [
@@ -2721,6 +2724,8 @@ def resolve_tiktok_show_analysis_request(
                 f"{prior}\nCurrent follow-up: {current}"
             )
             return _safe_truncate_summary(request, 2000)
+        if _CONTEXTUAL_NEW_TOPIC_RE.search(prior):
+            break
         if is_tiktok_show_analysis_followup(prior):
             followup_chain.append(f"Prior follow-up: {prior}")
             continue

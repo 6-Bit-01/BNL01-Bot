@@ -23,6 +23,7 @@ from bnl_tiktok_live_context import (
     load_live_context_snapshot,
     select_show_for_tiktok_analysis,
     show_timeline_bounds_ms,
+    tiktok_show_analysis_needs_comment_evidence,
     requested_history_window,
 )
 from bnl_tiktok_live_memory import (
@@ -67,6 +68,48 @@ def observation_payload(event_type, event_id, clock, **changes):
 
 
 class TikTokLiveContextBridgeTests(unittest.TestCase):
+    def test_audience_interpretation_requests_select_durable_comment_evidence(self):
+        for text in (
+            "What is your read on the chat this evening?",
+            "What was the mood in the audience last night?",
+            "Give me your impression of the room during the broadcast.",
+            "How would you describe the atmosphere in TikTok chat?",
+            "Was there tension between people in the show chat?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_tiktok_show_analysis_query(text))
+                self.assertEqual(classify_tiktok_show_analysis_intent(text), "chat_topics")
+                self.assertTrue(tiktok_show_analysis_needs_comment_evidence(text))
+        for text in (
+            "What is your read on this poem?",
+            "Describe the atmosphere on Venus.",
+            "How do I read a chat log file in Python?",
+            "There is tension in the guitar strings.",
+            "What was the mood in Discord chat last night?",
+        ):
+            with self.subTest(unrelated=text):
+                self.assertFalse(is_tiktok_show_analysis_query(text))
+
+    def test_interpretive_followups_require_an_existing_show_thread(self):
+        for text in (
+            "I feel you're skipping over some things. You didn't feel a..... Tension?",
+            "What about the mood?",
+            "Did you notice the chemistry?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_tiktok_show_analysis_followup(text))
+                self.assertFalse(is_tiktok_show_analysis_query(text))
+                self.assertEqual(classify_tiktok_show_analysis_intent(text), "chat_topics")
+                self.assertTrue(tiktok_show_analysis_needs_comment_evidence(text))
+        self.assertEqual(
+            classify_tiktok_show_analysis_intent("What did TikTok chat think about Test Tension?"),
+            "track_reaction",
+        )
+        self.assertEqual(
+            classify_tiktok_show_analysis_intent("Which tracks had the most chat engagement during Test Tension?"),
+            "track_ranking",
+        )
+
     def test_shared_history_window_uses_pacific_dates_and_calendar_months(self):
         for text, now, expected in (
             ("the last month", "2026-09-24T03:20:00Z", ("2026-08-23", "2026-09-24")),
@@ -254,6 +297,7 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
         for query in (
             "What happened during yesterday's BARCODE Radio show?",
             "Give me the show timeline from last night.",
+            "What was the mood in the audience last night?",
             "Summarize the past show.",
         ):
             with self.subTest(query=query):
@@ -271,6 +315,12 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
         )
         self.assertEqual(missing, {})
         self.assertEqual(source, "none")
+
+        missing, source = select_show_for_tiktok_analysis(
+            archive, "What is your read on the chat last night?",
+            now="2026-08-31T12:00:00-07:00",
+        )
+        self.assertEqual((missing, source), ({}, "none"))
 
     def test_whole_show_topics_receive_actual_chat_evidence_and_lexical_support(self):
         show = {
