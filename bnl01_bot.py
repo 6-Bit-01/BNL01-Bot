@@ -8759,7 +8759,7 @@ def _add_memory_tier_entry(user_id: int, guild_id: int, tier: str, summary: str,
 
 def _fetch_tier_rows(cursor, user_id: int, guild_id: int, tier: str) -> list[dict]:
     cols = _memory_tiers_columns(cursor)
-    wanted = ["id", "summary", "salience", "mentions", "updated_at"] + [c for c in ("source_role", "source_channel_policy", "source_channel_name", "source_origin", "source_trust", "topic_key", "subject_key", "project_key", "first_seen", "last_seen") if c in cols]
+    wanted = ["id", "summary", "salience", "mentions", "updated_at"] + [c for c in ("source_role", "source_channel_policy", "source_channel_name", "source_origin", "source_trust", "topic_key", "subject_key", "project_key", "first_seen", "last_seen", "source_lineage_complete") if c in cols]
     cursor.execute(f"SELECT {', '.join(wanted)} FROM memory_tiers WHERE user_id=? AND guild_id=? AND tier=? ORDER BY id DESC", (user_id, guild_id, tier))
     return [dict(zip(wanted, row)) for row in cursor.fetchall()]
 
@@ -8768,9 +8768,14 @@ def _merge_or_insert_cluster(cursor, user_id: int, guild_id: int, tier: str, row
     if not rows:
         return
     group = _memory_visibility_group(source_trust, rows[0].get("source_channel_policy", ""))
+    lineage_complete = all(bool(r.get("source_lineage_complete")) for r in rows)
     compatible = []
     for r in _fetch_tier_rows(cursor, user_id, guild_id, tier):
-        if (r.get("topic_key") or _memory_topic_key(r.get("summary", ""))) == topic_key and _memory_visibility_group(r.get("source_trust", ""), r.get("source_channel_policy", "")) == group:
+        if (
+            (r.get("topic_key") or _memory_topic_key(r.get("summary", ""))) == topic_key
+            and _memory_visibility_group(r.get("source_trust", ""), r.get("source_channel_policy", "")) == group
+            and bool(r.get("source_lineage_complete")) == lineage_complete
+        ):
             compatible.append(r)
     summary = _compress_memory_fragments([r.get("summary", "") for r in rows] + [r.get("summary", "") for r in compatible[:1]], tier, topic_key)
     sal = min(1.0, (sum(float(r.get("salience") or 0.5) for r in rows) / max(1, len(rows))) + (0.08 if len(rows) >= 2 else 0.03))
@@ -8818,8 +8823,10 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
                 for r in overflow:
                     topic = (r.get("topic_key") or _memory_topic_key(r.get("summary", "")))
                     group = _memory_visibility_group(r.get("source_trust", ""), r.get("source_channel_policy", ""))
-                    buckets[(topic, group)].append(r)
-                for (topic, _group), rows in buckets.items():
+                    # Preserve complete original-source chains independently
+                    # of older hints whose provenance cannot be recovered.
+                    buckets[(topic, group, bool(r.get("source_lineage_complete")))].append(r)
+                for (topic, _group, _complete), rows in buckets.items():
                     trust = _consolidated_trust_for(rows)
                     shadow_event = _merge_or_insert_cluster(cursor, user_id, guild_id, "medium", rows, topic, trust, "consolidated_short_to_medium")
                     if shadow_event:
@@ -8834,10 +8841,10 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
                 for r in overflow:
                     topic = (r.get("topic_key") or _memory_topic_key(r.get("summary", "")))
                     group = _memory_visibility_group(r.get("source_trust", ""), r.get("source_channel_policy", ""))
-                    buckets[(topic, group)].append(r)
+                    buckets[(topic, group, bool(r.get("source_lineage_complete")))].append(r)
                 promoted_ids = set()
                 stale_ids = set()
-                for (topic, _group), rows in buckets.items():
+                for (topic, _group, _complete), rows in buckets.items():
                     repeated = sum(int(r.get("mentions") or 1) for r in rows) >= 3 or len(rows) >= 2
                     high_salience = max(float(r.get("salience") or 0.0) for r in rows) >= 0.78
                     confirmed = any(any(k in (r.get("summary") or "").lower() for k in ("remember", "confirmed", "owner-confirmed", "this matters", "keep this")) for r in rows)

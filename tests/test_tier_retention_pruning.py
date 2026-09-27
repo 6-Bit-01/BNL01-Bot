@@ -265,7 +265,7 @@ class TierRetentionPruningTests(unittest.TestCase):
         bot.prune_conversation_history(42, 1, max_rows=0)
         self.assertEqual(self.rows("SELECT id FROM conversations"), [])
 
-    def test_merging_legacy_and_linked_memory_does_not_claim_complete_lineage(self):
+    def test_legacy_target_cannot_absorb_a_new_source_linked_memory(self):
         legacy_text = "Remember this bean recipe uses smoked paprika."
         with sqlite3.connect(self.db_path) as conn:
             legacy_source_id = conn.execute(
@@ -283,19 +283,95 @@ class TierRetentionPruningTests(unittest.TestCase):
         new_source_id = self.save("Remember this bean recipe uses lemon zest.")
         self.advance("medium")
         self.assertEqual(self.rows(
-            "SELECT id,source_lineage_complete FROM memory_tiers"
-        ), [(legacy_tier_id, 0)])
+            "SELECT source_lineage_complete FROM memory_tiers ORDER BY id"
+        ), [(0,), (1,)])
+        self.assertEqual(self.rows(
+            "SELECT summary FROM memory_tiers WHERE id=?", (legacy_tier_id,),
+        ), [(legacy_text,)])
         self.assertEqual(self.source_ids(), {new_source_id})
         bot.prune_conversation_history(42, 1, max_rows=0)
         self.assert_source_present(legacy_source_id)
         self.assert_source_present(new_source_id)
         self.advance("long")
         self.assertEqual(self.rows(
-            "SELECT source_lineage_complete FROM memory_tiers"
-        ), [(0,)])
+            "SELECT source_lineage_complete FROM memory_tiers ORDER BY source_lineage_complete"
+        ), [(0,), (1,)])
         self.assertEqual(self.source_ids(tier="long"), {new_source_id})
         bot.prune_conversation_history(42, 1, max_rows=0)
         self.assert_source_present(legacy_source_id)
+        # Correcting the new original retires only its dependent memory. The
+        # unrelated older hint must not acquire or depend on that source.
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE conversations SET content=? WHERE id=?", (
+                "Correction: this recipe uses lime zest.", new_source_id,
+            ))
+        self.assertEqual(self.rows(
+            "SELECT source_lineage_complete FROM memory_tiers"
+        ), [(0,)])
+        self.assertIn("smoked paprika", bot.get_memory_tiers(42, 1)[0][1])
+
+    def test_legacy_overflow_cannot_downgrade_existing_linked_mid_or_long(self):
+        for guild, tier in ((1, "medium"), (2, "long")):
+            with self.subTest(tier=tier):
+                source_id = self.save(
+                    "Remember this artist project uses layered percussion.",
+                    guild=guild,
+                )
+                self.advance(tier, guild=guild)
+                target = self.rows(
+                    "SELECT id,summary FROM memory_tiers WHERE guild_id=? AND tier=?",
+                    (guild, tier),
+                )[0]
+                with sqlite3.connect(self.db_path) as conn:
+                    bot._insert_memory_tier(
+                        conn.cursor(), 42, guild, "short",
+                        "Remember this older artist project used only piano.", 0.9,
+                        source_role="user", source_channel_policy="public_home",
+                        source_trust="source_safe_public", topic_key="memory",
+                    )
+                self.advance(tier, guild=guild)
+                self.assertEqual(self.rows(
+                    "SELECT id,summary,source_lineage_complete FROM memory_tiers WHERE id=?",
+                    (target[0],),
+                ), [(target[0], target[1], 1)])
+                self.assertEqual(self.source_ids(guild=guild, tier=tier), {source_id})
+                self.assertEqual(self.rows(
+                    "SELECT source_lineage_complete FROM memory_tiers "
+                    "WHERE guild_id=? AND tier=? ORDER BY source_lineage_complete",
+                    (guild, tier),
+                ), [(0,), (1,)])
+
+    def test_mixed_short_overflow_keeps_source_linked_artist_history_separate(self):
+        with sqlite3.connect(self.db_path) as conn:
+            bot._insert_memory_tier(
+                conn.cursor(), 42, 1, "short",
+                "This matters: the artist arrangement contained only piano.", 0.9,
+                source_role="user", source_channel_policy="public_home",
+                source_trust="source_safe_public", topic_key="memory",
+            )
+        first = self.save("This matters: the artist arrangement combines layered percussion.")
+        second = self.save("This matters: the artist arrangement now includes bowed bass.")
+        self.advance("long")
+        linked = self.rows(
+            "SELECT id,summary FROM memory_tiers "
+            "WHERE tier='long' AND source_lineage_complete=1"
+        )
+        self.assertEqual(len(linked), 1)
+        self.assertIn("layered percussion", linked[0][1])
+        self.assertIn("bowed bass", linked[0][1])
+        self.assertNotIn("only piano", linked[0][1])
+        self.assertEqual(self.source_ids(tier="long"), {first, second})
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM user_memory_facts"), [(0,)])
+        context = bot.build_user_memory_context(
+            42, 1, channel_policy="public_home", user_text="artist project bowed bass",
+        )
+        self.assertIn("bowed bass", context)
+        self.assertIn("derived memory summary", context)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE conversations SET channel_policy='sealed_test' WHERE id=?", (first,))
+        self.assertNotIn("bowed bass", bot.build_user_memory_context(
+            42, 1, channel_policy="public_home", user_text="artist project bowed bass",
+        ))
 
     def test_real_capture_keeps_raw_ledger_lineage_after_each_tier_promotion(self):
         with mock.patch.dict(os.environ, {
