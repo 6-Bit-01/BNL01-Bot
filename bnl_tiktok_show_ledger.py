@@ -1097,7 +1097,7 @@ def _raw_ledger_entry_ids(
         rows = conn.execute(
             f"""
             SELECT source_row_id,entry_id
-            FROM memory_ledger_entries
+            FROM memory_ledger_entries INDEXED BY idx_mle_source
             WHERE guild_id=? AND source_table='tiktok_live_chat'
               AND source_role='user' AND lifecycle_status='active'
               AND source_row_id IN ({placeholders})
@@ -1130,7 +1130,7 @@ def _conversation_ledger_entry_ids(
         rows = conn.execute(
             f"""
             SELECT source_row_id,entry_id
-            FROM memory_ledger_entries
+            FROM memory_ledger_entries INDEXED BY idx_mle_source
             WHERE guild_id=? AND source_table='conversations'
               AND lifecycle_status='active'
               AND source_row_id IN ({placeholders})

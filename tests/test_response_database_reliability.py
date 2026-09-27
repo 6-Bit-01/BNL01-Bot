@@ -13,6 +13,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
 
 import bnl01_bot as bot
 import bnl_moment_engine as moments
+import bnl_tiktok_show_ledger as show_owner
 
 
 class CaptureLineageLookupTests(unittest.TestCase):
@@ -54,6 +55,45 @@ class CaptureLineageLookupTests(unittest.TestCase):
                                  {"corrected-root", "superseded-root", "retracted-root"})
                 self.assertTrue(all(c.kwargs == {"guild_id": 1} for c in correct.call_args_list))
             self.assertEqual(moments._reply_target_moment(conn, source), "")
+            conn.set_progress_handler(None, 0)
+
+
+class ShowSourceLookupTests(unittest.TestCase):
+    def test_exact_sources_keep_scope_and_order_without_scanning_guild_history(self):
+        with closing(sqlite3.connect(":memory:")) as conn:
+            conn.executescript("""
+                CREATE TABLE memory_ledger_entries (
+                    entry_id TEXT PRIMARY KEY, guild_id INTEGER, source_table TEXT,
+                    source_row_id TEXT, source_revision TEXT, source_role TEXT,
+                    lifecycle_status TEXT, observed_at TEXT, source_sequence INTEGER);
+                CREATE INDEX idx_mle_observed ON memory_ledger_entries(guild_id,observed_at);
+                CREATE INDEX idx_mle_source ON memory_ledger_entries
+                    (guild_id,source_table,source_row_id,source_revision);
+            """)
+            conn.executemany("INSERT INTO memory_ledger_entries VALUES(?,1,?,?, '', 'user','active','2026-01-01',0)", (
+                ("unrelated-%s-%s" % (table, i), table, str(i))
+                for i in range(20000) for table in ("tiktok_live_chat", "conversations")
+            ))
+            conn.executemany("INSERT INTO memory_ledger_entries VALUES(?,?,?,?, '',?,?,?,?)", (
+                ("valid-chat", 1, "tiktok_live_chat", "event-a", "user", "active", "2026-01-02", 1),
+                ("later-chat", 1, "tiktok_live_chat", "event-a", "user", "active", "2026-01-03", 2),
+                ("wrong-guild", 2, "tiktok_live_chat", "event-a", "user", "active", "2026-01-01", 0),
+                ("retracted", 1, "tiktok_live_chat", "event-a", "user", "retracted", "2026-01-01", 0),
+                ("model-chat", 1, "tiktok_live_chat", "event-a", "model", "active", "2026-01-01", 0),
+                ("valid-conversation", 1, "conversations", "50001", "user", "active", "2026-01-02", 1),
+                ("other-source", 1, "other", "50001", "user", "active", "2026-01-01", 0),
+            ))
+            steps = [0]
+            def bound_work():
+                steps[0] += 1
+                return steps[0] > 30
+            conn.set_progress_handler(bound_work, 100)
+            self.assertEqual(show_owner._raw_ledger_entry_ids(
+                conn, guild_id=1, event_ids=("event-a", "missing")),
+                {"event-a": "valid-chat"})
+            self.assertEqual(show_owner._conversation_ledger_entry_ids(
+                conn, guild_id=1, conversation_row_ids=(50001, 50002)),
+                {"50001": "valid-conversation"})
             conn.set_progress_handler(None, 0)
 
 

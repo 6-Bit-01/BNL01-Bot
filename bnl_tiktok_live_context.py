@@ -197,6 +197,7 @@ _SHOW_ANALYSIS_PATTERNS = (
 )
 
 _SHOW_ANALYSIS_FOLLOWUP_PATTERNS = (
+    r"\b(?:quote|cite)\b.{0,80}\b(?:comments?|words?|messages?)\b",
     r"\b(?:mood|tone|atmosphere|vibes?|sentiment)\b",
     r"\b(?:you|anyone|people|they)\b.{0,35}\b(?:feel|felt|notice|noticed|sense|sensed)\b"
     r".{0,60}\b(?:tension|chemistry)\b",
@@ -217,6 +218,7 @@ _SHOW_ANALYSIS_FOLLOWUP_PATTERNS = (
 )
 
 _SHOW_COMMENT_EVIDENCE_PATTERNS = (
+    r"\b(?:quote|cite)\b.{0,80}\b(?:comments?|words?|messages?)\b",
     r"\b(?:topics?|themes?|patterns?)\b",
     r"\b(?:recap|summari[sz]e|summary)\b",
     r"\b(?:talk(?:ed|ing)? about|discuss(?:ed|ing)?|mention(?:ed|ing)?)\b",
@@ -698,10 +700,24 @@ def is_tiktok_show_analysis_query(text: str) -> bool:
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
         return False
+    if is_tiktok_show_analysis_continuation(normalized):
+        return False
     return bool(
         show_conversation_interval_requested(normalized)
         or _audience_interpretation_requested(normalized)
         or any(re.search(pattern, normalized) for pattern in _SHOW_ANALYSIS_PATTERNS)
+    )
+
+
+def is_tiktok_show_analysis_continuation(text: str) -> bool:
+    """An explicit backward reference needs a human-owned episode scope."""
+    value = str(text or "")
+    return bool(
+        re.search(r"\b(?:that(?: same)?|the same)\s+"
+                  r"(?:chat|conversation|show|broadcast|episode|stream)\b", value, re.I)
+        and not has_explicit_show_date(value)
+        and not requested_history_window(value)
+        and not re.search(r"\b(?:across|compare|other|different|latest|previous)\b", value, re.I)
     )
 
 
@@ -716,7 +732,7 @@ def is_tiktok_show_analysis_followup(text: str) -> bool:
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
         return False
-    return any(
+    return is_tiktok_show_analysis_continuation(normalized) or any(
         re.search(pattern, normalized)
         for pattern in _SHOW_ANALYSIS_FOLLOWUP_PATTERNS
     )

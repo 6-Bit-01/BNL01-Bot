@@ -6783,10 +6783,11 @@ def _packet_invariants(
             # absence is not corruption of independent eligible sources.
             # Task support will hold only the request lacking that evidence.
             invalid.append("%s_query_failed_closed" % lane)
-        elif status == "eligible" and not any(
-            item.lane == lane for item in packet.items
-        ):
-            invalid.append("%s_selection_missing" % lane)
+        # Eligible query results are candidates, not mandatory selections.
+        # Budget, frame applicability, and deduplication may omit a lane.
+        # Those exclusions remain in diagnostics and task-support accounting;
+        # they must not invalidate independent selected evidence. Selected
+        # publications still require the authority and source checks below.
     broad = _request_is_broad_profile(packet.request)
     for item in packet.items:
         if not _route_allows_item(packet.request, item):
