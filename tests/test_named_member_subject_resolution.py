@@ -41,11 +41,11 @@ class NamedMemberSubjectResolutionTests(unittest.TestCase):
             name=username or label, bot=bot_member,
         )
 
-    def frame(self, text, *, addressings=(), policy="sealed_test", speakers=(111,)):
+    def frame(self, text, *, addressings=(), policy="sealed_test", speakers=(111,), context=None):
         decision = bot.build_live_conversation_orchestration_decision(
             engagement_decision="answer", engagement_reason="question",
             channel_policy=policy, addressings=addressings,
-            context_result=None, moment_situation=None, guild_id=1,
+            context_result=context, moment_situation=None, guild_id=1,
             channel_id=10, route_mode="normal_chat",
             conversation_surface=bot.conversation_surface_for_channel_policy(policy),
             current_text=text, current_speaker_user_ids=speakers,
@@ -327,6 +327,104 @@ class NamedMemberSubjectResolutionTests(unittest.TestCase):
             self.guild, "What has TestMarbles said about the costumes?",
         )
         self.assertEqual((references, unresolved), ((), ()))
+
+    def person_context(self, prior):
+        from datetime import datetime, timezone
+        from bnl_conversation_context_v2 import (
+            ConversationContextRequest, assemble_conversation_context_v2,
+        )
+        return assemble_conversation_context_v2([
+            dict(id=50, role="user", content=prior, user_id=111,
+                 user_name="Test Requester", channel_id=10, channel_name="bnl-testing",
+                 channel_policy="sealed_test", timestamp="2026-09-09T17:59:00+00:00"),
+        ], ConversationContextRequest(
+            guild_id=1, current_user_id=111, channel_id=10, channel_name="bnl-testing",
+            channel_policy="sealed_test", route_mode="normal_chat", conversation_surface="test",
+            current_texts=("What were his exact words?",), current_participants=frozenset({111}),
+            is_direct_target=True, now=datetime(2026, 9, 9, 18, tzinfo=timezone.utc),
+            route_allowed_sources=frozenset({"conversation_continuity"}),
+        ))
+
+    def test_identity_separation_keeps_only_the_requested_history_subject(self):
+        self.members[:] = [self.member(222, "Cedar Vale"), self.member(333, "Cedar Glass", username="glass_alias")]
+        for text in (
+            "What do Cedar Vale's comments reveal about his creative process? Keep his history separate from Cedar Glass / glass_alias.",
+            "Cedar Vale is not Cedar Glass. Tell me about Cedar Vale's own public history.",
+        ):
+            with self.subTest(text=text):
+                frame = self.frame(text)
+                self.assertEqual(tuple(s.user_id for s in frame.subjects), (222,))
+                context = self.person_context(text)
+                self.assertEqual(context.thread_focus_mode, "continue_or_answer")
+                followup = self.frame("What were his exact words?", context=context)
+                self.assertEqual(tuple(s.user_id for s in followup.subjects), (222,))
+
+    def test_identity_question_and_later_explicit_task_retain_other_subject(self):
+        self.members[:] = [self.member(222, "Cedar Vale"), self.member(333, "Cedar Glass")]
+        for text in (
+            "Why is Cedar Vale distinct from Cedar Glass?",
+            "Is Cedar Vale not Cedar Glass?",
+            "Compare Cedar Vale and Cedar Glass.",
+            "Cedar Vale is not Cedar Glass. What has Cedar Glass said?",
+            "Keep Cedar Vale separate from Cedar Glass, then tell me about Cedar Glass.",
+        ):
+            with self.subTest(text=text):
+                subjects = {s.user_id for s in self.frame(text).subjects}
+                self.assertIn(333, subjects)
+
+    def test_followup_carries_person_without_inheriting_prior_show_date(self):
+        self.members[:] = [self.member(222, "Cedar Vale"), self.member(333, "Cedar Glass")]
+        context = self.person_context("What did Cedar Vale say during the September 8, 2026 show?")
+        for text in (
+            "What do you remember about him beyond that one show?",
+            "What did he say on September 7, 2026?",
+        ):
+            with self.subTest(text=text):
+                query = bot._public_member_continuation_query(text, context, guild_id=1, current_user_id=111)
+                self.assertIn("Cedar Vale", query)
+                self.assertNotIn("September 8", query)
+                self.assertEqual(tuple(s.user_id for s in self.frame(text, context=context).subjects), (222,))
+
+    def test_followup_does_not_guess_a_person_or_cross_a_topic_or_requester(self):
+        self.members[:] = [self.member(222, "Cedar Vale"), self.member(333, "Cedar Glass")]
+        context = self.person_context("Compare Cedar Vale and Cedar Glass.")
+        text = "What were his exact words?"
+        self.assertEqual(bot._public_member_continuation_query(text, context, guild_id=1, current_user_id=111), text)
+        context = self.person_context("Tell me about Cedar Vale.")
+        for changed in (
+            replace(context, requester_user_id=444),
+            replace(context, thread_focus_mode="new_topic"),
+            replace(context, referent_status="ambiguous"),
+            replace(context, requester_human_turns=(*context.requester_human_turns, (51, "Tell me about the weather."))),
+        ):
+            self.assertEqual(bot._public_member_continuation_query(text, changed, guild_id=1, current_user_id=111), text)
+        explicit = "What did Cedar Glass say?"
+        self.assertEqual(bot._public_member_continuation_query(explicit, context, guild_id=1, current_user_id=111), explicit)
+        for unknown in ("Tell me about Cedar Branch.", "What do you remember about Cedar?"):
+            self.assertEqual(bot._public_member_continuation_query(unknown, context, guild_id=1, current_user_id=111), unknown)
+
+    def test_followup_reopens_only_the_same_persons_public_originals(self):
+        self.members[:] = [self.member(222, "Cedar Vale"), self.member(333, "Cedar Glass")]
+        self.seed(920, 222, "I paused writing music to recharge my creative energy.")
+        self.seed(921, 333, "I paused music for an unrelated reason.")
+        self.seed(922, 222, "My private music note.", policy="internal_controlled")
+        context = self.person_context("Tell me about Cedar Vale. Keep his history separate from Cedar Glass.")
+        text = "What were his exact words about writing music?"
+        frame = self.frame(text, context=context)
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = os.path.join(directory, "sources.db")
+            with sqlite3.connect(source_path) as disk_source:
+                self.conn.backup(disk_source)
+            with mock.patch.object(bot, "DB_FILE", source_path):
+                rendered, basis = bot.build_named_public_conversation_context(
+                    situation_frame=frame, guild_id=1, route_mode="normal_chat",
+                    channel_policy="sealed_test", user_text=text, channel_id=10,
+                )
+        self.assertIn("recharge my creative energy", rendered)
+        self.assertNotIn("unrelated reason", rendered)
+        self.assertNotIn("private music", rendered)
+        self.assertEqual({item.speaker_user_id for item in basis.evidence_items}, {222})
 
     def test_topical_recall_delivers_authored_target_discord_evidence(self):
         text = "What has testmarbles said about stealing pants?"

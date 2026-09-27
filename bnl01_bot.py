@@ -15694,8 +15694,6 @@ def _public_member_continuation_query(
         or context_result.referent_status not in {"not_requested", "resolved"}
         or context_result.referent_reason == "discord_reply_source"
         or not _EXACT_REPLY_PRONOUN_SUBJECT_RE.search(text or "")
-        or has_explicit_show_date(text)
-        or broad_show_history_requested(text)
         or _current_queue_state_query(text)
         or _typed_canon_subject_references(text)
     ):
@@ -15707,7 +15705,9 @@ def _public_member_continuation_query(
     for _row_id, prior in reversed(context_result.requester_human_turns):
         named, unresolved = _named_public_member_subjects(guild, prior)
         if len(named) == 1 and not unresolved:
-            return text + "\nPrior human request: " + prior
+            # Carry identity, not an old date/topic constraint. A request for
+            # earlier history or a new date still concerns this person.
+            return text + "\nPrior human subject: " + named[0][1]
         if named or unresolved or not _EXACT_REPLY_PRONOUN_SUBJECT_RE.search(prior):
             break
     return text

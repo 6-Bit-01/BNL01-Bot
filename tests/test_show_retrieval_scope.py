@@ -12,6 +12,29 @@ from bnl_tiktok_show_ledger import build_tiktok_show_evidence_context
 
 
 class ShowRetrievalScopeTests(unittest.TestCase):
+    def test_separation_constraint_does_not_combine_show_participant_history(self):
+        from bnl_tiktok_show_ledger import _document_relevance
+
+        people = [
+            dict(speakerLabel="Cedar Vale", handle="cedar_vale", subjectRef="tiktok_user:cedar_vale"),
+            dict(speakerLabel="Cedar Glass", handle="glass_alias", subjectRef="tiktok_user:glass_alias"),
+        ]
+        ledger = dict(showDate="2026-09-08", participants=people)
+        for request in (
+            "What did Cedar Vale say during the show? Keep his history separate from Cedar Glass / glass_alias.",
+            "Cedar Vale is not Cedar Glass. Tell me about Cedar Vale's public show comments.",
+        ):
+            with self.subTest(request=request):
+                _score, selected = _document_relevance(
+                    ledger, user_text=request, subject_ref="", recency_rank=0,
+                )
+                self.assertEqual([p["subjectRef"] for p in selected], ["tiktok_user:cedar_vale"])
+        _score, selected = _document_relevance(
+            ledger, user_text="Compare Cedar Vale and Cedar Glass during the show.",
+            subject_ref="", recency_rank=0,
+        )
+        self.assertEqual({p["subjectRef"] for p in selected}, {p["subjectRef"] for p in people})
+
     def test_retained_people_and_comments_can_be_absent_from_selected_view(self):
         with tempfile.TemporaryDirectory() as directory:
             db_file = str(Path(directory) / "scope.db")
