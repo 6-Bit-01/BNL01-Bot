@@ -403,6 +403,37 @@ class NamedMemberSubjectResolutionTests(unittest.TestCase):
         for unknown in ("Tell me about Cedar Branch.", "What do you remember about Cedar?"):
             self.assertEqual(bot._public_member_continuation_query(unknown, context, guild_id=1, current_user_id=111), unknown)
 
+    def test_multiple_nearby_contributions_do_not_make_one_selected_person_ambiguous(self):
+        from datetime import datetime, timezone
+        from bnl_conversation_context_v2 import ConversationContextRequest, assemble_conversation_context_v2
+        self.members[:] = [self.member(222, "Cedar Vale"), self.member(333, "Cedar Glass")]
+        text = "When he said it was his first time trying to make his own, what was he making? Check his surrounding original messages."
+        def context(prior):
+            return assemble_conversation_context_v2([
+                dict(id=50, role="user", content=prior, user_id=111,
+                     user_name="Test Requester", channel_id=10, channel_name="bnl-testing",
+                     channel_policy="sealed_test", timestamp="2026-09-09T17:58:00+00:00"),
+                dict(id=51, role="model", content="Cedar Vale said he stepped back from creative work to recharge.",
+                     user_id=111, user_name="BNL-01", channel_id=10, channel_name="bnl-testing",
+                     channel_policy="sealed_test", timestamp="2026-09-09T17:58:23+00:00"),
+            ], ConversationContextRequest(
+                guild_id=1, current_user_id=111, channel_id=10, channel_name="bnl-testing",
+                channel_policy="sealed_test", route_mode="normal_chat", conversation_surface="test",
+                current_texts=(text,), current_participants=frozenset({111}), is_direct_target=True,
+                now=datetime(2026, 9, 9, 18, tzinfo=timezone.utc),
+                route_allowed_sources=frozenset({"conversation_continuity"}),
+            ))
+        selected = context("What do Cedar Vale's comments reveal about his creative process? Keep Cedar Vale separate from Cedar Glass.")
+        self.assertEqual(selected.referent_reason, "multiple_bounded_contributions")
+        query = bot._public_member_continuation_query(text, selected, guild_id=1, current_user_id=111)
+        self.assertIn("Prior human subject: Cedar Vale", query)
+        self.assertNotIn("Cedar Glass", query)
+        frame = self.frame(text, context=selected)
+        self.assertEqual(tuple(s.user_id for s in frame.subjects), (222,))
+        self.assertEqual(frame.status, "resolved")
+        ambiguous = context("Compare Cedar Vale and Cedar Glass.")
+        self.assertEqual(bot._public_member_continuation_query(text, ambiguous, guild_id=1, current_user_id=111), text)
+
     def test_followup_reopens_only_the_same_persons_public_originals(self):
         self.members[:] = [self.member(222, "Cedar Vale"), self.member(333, "Cedar Glass")]
         self.seed(920, 222, "I paused writing music to recharge my creative energy.")

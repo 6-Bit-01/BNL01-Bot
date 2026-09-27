@@ -15691,7 +15691,10 @@ def _public_member_continuation_query(
         or not current_user_id
         or context_result.requester_user_id != int(current_user_id)
         or context_result.thread_focus_mode != "continue_or_answer"
-        or context_result.referent_status not in {"not_requested", "resolved"}
+        or (
+            context_result.referent_status not in {"not_requested", "resolved"}
+            and context_result.referent_reason != "multiple_bounded_contributions"
+        )
         or context_result.referent_reason == "discord_reply_source"
         or not _EXACT_REPLY_PRONOUN_SUBJECT_RE.search(text or "")
         or _current_queue_state_query(text)
@@ -15705,6 +15708,9 @@ def _public_member_continuation_query(
     for _row_id, prior in reversed(context_result.requester_human_turns):
         named, unresolved = _named_public_member_subjects(guild, prior)
         if len(named) == 1 and not unresolved:
+            # Several nearby message contributions can concern one person.
+            # Resolve that person from the requester's selected human turns;
+            # contribution ambiguity must not veto an unambiguous identity.
             # Carry identity, not an old date/topic constraint. A request for
             # earlier history or a new date still concerns this person.
             return text + "\nPrior human subject: " + named[0][1]
@@ -29517,6 +29523,18 @@ def build_live_conversation_orchestration_decision(
         if route_allowed else ((), ())
     )
     named_member_labels = dict(named_member_subjects)
+    if (
+        member_selection_query != current_text
+        and len(named_member_subjects) == 1 and not unresolved_member_labels
+        and context_result is not None
+        and context_result.referent_reason == "multiple_bounded_contributions"
+    ):
+        # The existing human-subject reader resolved the person. This does not
+        # select any nearby message as quote authority; original-source readers
+        # still have to supply and revalidate the requested evidence.
+        referent_status = "resolved"
+        referent_candidate_count = 1
+        referent_candidate_labels = (named_member_subjects[0][1],)
     resolved_subject_user_ids = tuple(dict.fromkeys((
         *resolved_subject_user_ids,
         *(user_id for user_id, _label in named_member_subjects),
