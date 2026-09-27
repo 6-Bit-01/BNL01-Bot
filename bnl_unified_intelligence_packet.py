@@ -5306,6 +5306,16 @@ def _filter_frame_applicable_candidates(
     return kept
 
 
+def is_incidental_publication(item: IntelligencePacketItem) -> bool:
+    """Published background must not outrank the evidence being recalled."""
+    if item.lane not in {"journal_publication", "relay_publication"}:
+        return False
+    try:
+        return json.loads(item.revalidation_key).get("queryMode") == "context"
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def _select_items(
     request: IntelligencePacketRequest,
     subject_resolution: PacketSubjectResolution,
@@ -5447,6 +5457,7 @@ def _select_items(
     ordered = sorted(
         candidates,
         key=lambda item: (
+            is_incidental_publication(item),
             (
                 governed_subject_priority.get(item.lane, 9)
                 if frame_subject_required
@@ -6948,7 +6959,7 @@ def _packet_invariants(
                 item.source_type
                 in {"participant_episode_gist", "situation_episode_summary"}
                 and item.uncertainty_status
-                in {"source_backed_episode", "standalone_moment_only"}
+                in {"source_backed_episode", "standalone_moment_only", "descriptive_moment_only"}
                 and item.usage == "episode_paraphrase"
                 or _historical_topic_item(item)
                 and _topic_association_requested(packet.request)
