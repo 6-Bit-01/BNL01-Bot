@@ -492,6 +492,73 @@ class RequestedShowDateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(SEPTEMBER_COMMENT, prompt)
         self.assertNotIn(AUGUST_COMMENT, prompt)
 
+    async def test_same_chat_correction_after_quote_followup_keeps_one_show(self):
+        history = (
+            "Recap the September 4, 2026 show chat.",
+            "What made you think that? Quote a few actual comments and identify the speakers.",
+        )
+        request = (
+            "Neon Fox is a guy. He told you that earlier. Also, what else did you "
+            "notice about the chemistry between people in that same chat?"
+        )
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                with sqlite3.connect(bot.DB_FILE) as conn:
+                    conn.execute("DELETE FROM conversations WHERE channel_id=8810")
+                self._capture_human_history(policy, 8810, history)
+                prompt, metadata = await self.runtime._direct_prompt_async(
+                    policy, request=request, privileged=False,
+                )
+                bases = [b for b in metadata["prompt_source_bases"]
+                         if isinstance(b, bot.FinalizedShowPromptSourceBasis)]
+                self.assertEqual(len(bases), 1)
+                self.assertEqual(bases[0].show_keys, ("show-attendance-september",))
+                self.assertIn(SEPTEMBER_COMMENT, prompt)
+                self.assertNotIn(AUGUST_COMMENT, prompt)
+
+    async def test_same_chat_correction_keeps_scope_in_batch_packet_delivery(self):
+        history = (
+            "Recap the September 4, 2026 show chat.",
+            "Quote a few actual comments and identify the speakers.",
+        )
+        request = (
+            "Neon Fox is a guy. He told you that earlier. Also, what else did you "
+            "notice about the chemistry between people in that same chat?"
+        )
+        answer = 'Test September said, "The amber lanterns are bright tonight."'
+        async def provider_answer(*_args, **kwargs):
+            if kwargs.get("attempt_counter") is not None:
+                kwargs["attempt_counter"].mark_started()
+            return answer
+        for policy in ("public_home", "sealed_test"):
+            channel_id = 8811 + len(self.runtime.channel_ids)
+            self._capture_human_history(policy, channel_id, history)
+            with self.subTest(policy=policy), mock.patch.dict(os.environ, {
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+                "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED": "true",
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": str(self.runtime.guild_id),
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": str(self.runtime.user_id),
+                "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": str(channel_id),
+            }):
+                channel, generation, guard = await self.runtime._batch(
+                    policy, request=request, answer=provider_answer, privileged=False,
+                )
+            generation.assert_awaited_once()
+            self.assertEqual(channel.sent, [answer])
+            prompt = generation.await_args.args[0]
+            bases = [b for b in guard.await_args.kwargs["prompt_source_bases"]
+                     if isinstance(b, bot.FinalizedShowPromptSourceBasis)]
+            self.assertEqual(len(bases), 1)
+            self.assertEqual(bases[0].show_keys, ("show-attendance-september",))
+            self.assertIn(SEPTEMBER_COMMENT, prompt)
+            self.assertNotIn(AUGUST_COMMENT, prompt)
+
     async def test_removed_second_show_refresh_retains_only_the_valid_source(self):
         _website, _episode, basis = self._read(COMPARE_REQUEST)
         self.assertEqual(len(basis.show_keys), 2)

@@ -95,6 +95,7 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
             "I feel you're skipping over some things. You didn't feel a..... Tension?",
             "What about the mood?",
             "Did you notice the chemistry?",
+            "What else did you notice about the chemistry in that same chat?",
         ):
             with self.subTest(text=text):
                 self.assertTrue(is_tiktok_show_analysis_followup(text))
@@ -109,6 +110,12 @@ class TikTokLiveContextBridgeTests(unittest.TestCase):
             classify_tiktok_show_analysis_intent("Which tracks had the most chat engagement during Test Tension?"),
             "track_ranking",
         )
+
+    def test_quotation_followup_requests_evidence_without_opening_a_new_show_scope(self):
+        text = "Quote a few actual comments and identify the speakers."
+        self.assertTrue(is_tiktok_show_analysis_followup(text))
+        self.assertFalse(is_tiktok_show_analysis_query(text))
+        self.assertTrue(tiktok_show_analysis_needs_comment_evidence(text))
 
     def test_shared_history_window_uses_pacific_dates_and_calendar_months(self):
         for text, now, expected in (

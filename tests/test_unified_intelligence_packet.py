@@ -16,7 +16,7 @@ from bnl_shadow_acceptance import (
     build_v2_shadow_acceptance_snapshot,
     render_v2_shadow_acceptance_lines,
 )
-from bnl_shared_brain_synthesis import render_packet_context
+from bnl_shared_brain_synthesis import _ordinary_packet_context, render_packet_context
 from bnl_unified_intelligence_packet import (
     IntelligencePacketItem,
     IntelligencePacketRequest,
@@ -2952,6 +2952,93 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         selected_lanes = {candidate.lane for candidate in selected}
         self.assertIn("journal_publication", selected_lanes)
         self.assertIn("website_read_model", selected_lanes)
+
+    def test_budget_excluded_publication_preserves_other_rendered_evidence(self):
+        # Exercise both publication owners through the real selector, packet
+        # validation, receipt, and ordinary-prompt renderer. Eligibility is
+        # permission to compete for context, not a promise to win a slot.
+        for selected_lane in ("journal_publication", "relay_publication"):
+            with self.subTest(selected_lane=selected_lane):
+                publications = {}
+                for index, lane in enumerate(
+                    ("journal_publication", "relay_publication"), start=1
+                ):
+                    journal = lane == "journal_publication"
+                    publications[lane] = IntelligencePacketItem(
+                        lane=lane,
+                        source_class=(
+                            packet_module.JOURNAL_PUBLICATION_SOURCE_CLASS
+                            if journal else packet_module.RELAY_PUBLICATION_SOURCE_CLASS
+                        ),
+                        source_type=(
+                            "canonical_published_journal" if journal
+                            else "accepted_relay_publication"
+                        ),
+                        source_ref="%s:budget-example" % lane,
+                        source_digest=str(index) * 64,
+                        subject_key="bnl_01",
+                        predicate_key="published_journal_entry" if journal else "accepted_relay_publication",
+                        text=("%s described the community's playful show conversation. " % lane) * 4,
+                        visibility="public",
+                        confidence=Confidence.APPROVED.value,
+                        lifecycle="published",
+                        authority=0,
+                        usage="publication_projection",
+                        score=160.0 if lane == selected_lane else 135.0,
+                        revalidation_kind=lane,
+                        revalidation_key=(
+                            '{"entryId":"budget-example","revision":1,"queryMode":"topic"}'
+                            if journal else '{"relayId":"budget-example","queryMode":"topic"}'
+                        ),
+                        attribution_mode="publication_only",
+                        uncertainty_status="derived_publication_zero_fact_weight",
+                    )
+
+                def candidates(lane):
+                    def read(_conn, _request, diagnostics, _exclusions):
+                        setattr(diagnostics, lane.split("_")[0] + "_query_status", "eligible")
+                        diagnostics.candidates_by_lane[lane] = 1
+                        diagnostics.publication_projection_count += 1
+                        return [publications[lane]]
+                    return read
+
+                request = replace(
+                    self.public_request(text="Connect your published writing with the community conversation."),
+                    subject_user_id=0,
+                    budget_chars=400,
+                    conversation_evidence=(),
+                )
+                with (
+                    mock.patch.object(packet_module, "_journal_publication_items", side_effect=candidates("journal_publication")),
+                    mock.patch.object(packet_module, "_relay_publication_items", side_effect=candidates("relay_publication")),
+                    mock.patch.object(packet_module, "revalidate_published_journal_entry_on_connection", return_value="1" * 64) as journal_check,
+                    mock.patch.object(packet_module, "revalidate_accepted_relay_publication_on_connection", return_value="2" * 64) as relay_check,
+                ):
+                    packet = build_packet(self.conn, request, environ=self.flags)
+                    omitted_lane = next(lane for lane in publications if lane != selected_lane)
+                    self.assertEqual([item.lane for item in packet.items], [selected_lane])
+                    self.assertTrue(any(
+                        exclusion.lane == omitted_lane and exclusion.reason == "packet_budget"
+                        for exclusion in packet.exclusions
+                    ))
+                    self.assertIn(omitted_lane, packet.diagnostics.missing_lanes)
+                    self.assertEqual(packet.diagnostics.revalidation_status, "passed")
+                    self.assertFalse(packet.diagnostics.invalid_invariants)
+                    rendered, counts, count, _digests = _ordinary_packet_context(packet)
+                    self.assertEqual(count, 1)
+                    self.assertEqual(dict(counts), {selected_lane: 1})
+                    self.assertIn("playful show conversation", rendered)
+
+                    # A real source invalidation still prevents its use; an
+                    # unrelated budget exclusion grants no validation waiver.
+                    check = journal_check if selected_lane == "journal_publication" else relay_check
+                    check.return_value = ""
+                    self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+
+                setattr(packet.diagnostics, selected_lane.split("_")[0] + "_query_status", "source_invalid")
+                self.assertIn(selected_lane + "_query_failed_closed", packet_module._packet_invariants(packet))
+                private_packet = replace(packet, items=(replace(packet.items[0], visibility="private"),))
+                self.assertIn("selected_visibility_violation", packet_module._packet_invariants(private_packet))
 
     def test_unresolved_episode_keeps_valid_conversation_without_guessing_a_subject(self):
         self.add_conversation_context_row()

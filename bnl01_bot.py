@@ -46768,8 +46768,16 @@ async def maybe_generate_ordinary_chat_single_packet(
         )
     except Exception as exc:
         logging.warning(
-            "ordinary_chat_single_packet_evaluation_failed error=%s",
+            "ordinary_chat_single_packet_evaluation_failed error=%s "
+            "sqlite_code=%s sqlite_busy=%s sqlite_readonly=%s",
             type(exc).__name__,
+            getattr(exc, "sqlite_errorcode", "unavailable"),
+            int(isinstance(exc, sqlite3.OperationalError) and str(exc).lower() in {
+                "database is locked", "database table is locked",
+                "database schema is locked",
+            }),
+            int(isinstance(exc, sqlite3.OperationalError)
+                and "readonly database" in str(exc).lower()),
         )
         decision = SynthesisCanaryDecision(
             run=run,
