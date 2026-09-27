@@ -304,6 +304,11 @@ class RelationshipPromptCoordinationTests(unittest.TestCase):
             channel_policy="sealed_test", channel_name="bnl-testing", channel_id=99,
             route_mode="normal_chat", directed_to_bnl=True,
         )
+        bot.save_model_message(
+            42, 1, "We can move forward with the arrangement.",
+            channel_policy="sealed_test", channel_name="bnl-testing", channel_id=99,
+            route_mode="normal_chat",
+        )
         with mock.patch.dict(bot.LAST_MEMORY_PROMPT_DIAGNOSTICS):
             text, metadata = self.read(channel_policy="sealed_test", channel_id=99, governance_allowed=False, record_operational_diagnostics=True)
             self.assert_tone_once(text, metadata)

@@ -185,6 +185,8 @@ class RelationshipEventV2:
 
 def classify_message(text: str, *, actor_role: str, directed: bool, channel_policy: str, route_mode: str) -> tuple[str, str, float, float]:
     t = _canon(text)
+    if channel_policy == "sealed_test":
+        return "unclassified", "sealed exchange excluded from relationship history", .0, .0
     if actor_role != "user":
         return "model_audit", "model output recorded for audit with zero positive relationship weight", .3, 0.0
     if not directed or channel_policy not in ELIGIBLE_RELATIONSHIP_POLICIES or route_mode in DISALLOWED_RELATIONSHIP_ROUTES:
@@ -239,7 +241,7 @@ def record_observation_diagnostic(conn: sqlite3.Connection, *, guild_id: int, us
 
 def observe_message(conn: sqlite3.Connection, *, guild_id: int, user_id: int, role: str, content: str, source_row_id: int | str, user_name: str = "", channel_policy: str = "unknown", channel_name: str = "", channel_id: int = 0, message_id: int | None = None, route_mode: str = "unknown", directed: bool = False, observed_at: str = "") -> str:
     et, summary, conf, sal = classify_message(content, actor_role=role, directed=directed, channel_policy=channel_policy, route_mode=route_mode)
-    if et == "unclassified" and role == "user":
+    if et == "unclassified":
         reason = "sealed_test" if channel_policy == "sealed_test" else ("passive" if not directed else "policy_or_route_or_ambiguous")
         record_observation_diagnostic(conn, guild_id=guild_id, user_id=user_id, role=role, reason=reason, source_row_id=source_row_id, route_mode=route_mode, channel_policy=channel_policy, observed_at=observed_at)
         return ""
