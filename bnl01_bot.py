@@ -28442,6 +28442,63 @@ def build_named_public_conversation_context(
         return "", None
     query_terms = memory_relevance_terms(query)
     candidates = []
+    def recall_candidate(source):
+        source["channel_name"] = source.get("channel_name") or ""
+        source["prompt_history_excluded"] = should_exclude_from_prompt_history("user", source["content"])
+        if _unsafe_row(source):
+            return None
+        if selected_date:
+            try:
+                observed = datetime.fromisoformat(str(source["timestamp"] or "").replace("Z", "+00:00"))
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                if observed.astimezone(PACIFIC_TZ).date().isoformat() != selected_date:
+                    return None
+            except (TypeError, ValueError):
+                return None
+        label = (
+            "6 Bit" if int(source["user_id"]) == int(BNL_OWNER_USER_ID or 0)
+            else _safe_prompt_display_label(source["user_name"], "")
+        )
+        raw = str(source["content"] or "")
+        # Preserve complete sanitized utterances, including surrounding rows.
+        text = sanitize_history_text(raw, limit=max(1, len(raw)))
+        return (source, label, text) if label and text else None
+
+    def observed_order(candidate):
+        try:
+            value = datetime.fromisoformat(str(candidate[0]["timestamp"]).replace("Z", "+00:00"))
+            return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    header = "Relevant original public Discord messages:\n"
+    budget = max(0, MEMORY_PROMPT_BUDGET_PUBLIC)
+    used = len(header)
+    selected = []
+    selected_ids = set()
+
+    def add_candidate(candidate):
+        nonlocal used
+        source, label, text = candidate
+        if int(source["id"]) in selected_ids:
+            return False
+        place = _safe_prompt_display_label(source["channel_name"], "public Discord")
+        try:
+            observed = datetime.fromisoformat(str(source["timestamp"] or "").replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            stamp = observed.astimezone(PACIFIC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        except (TypeError, ValueError, OverflowError):
+            stamp = "date unavailable"
+        line = f"- {label} in #{place} ({stamp}): {text}"
+        if used + len(line) + 1 > budget:
+            return False
+        selected.append((source, label, text, line))
+        selected_ids.add(int(source["id"]))
+        used += len(line) + 1
+        return True
+
     try:
         with closing(_open_member_memory_read_connection()) as conn:
             conn.execute("BEGIN")
@@ -28491,35 +28548,9 @@ def build_named_public_conversation_context(
                     (int(guild_id), int(subject.user_id), *date_params, CONVERSATION_ROWS_PER_USER_MAX),
                 ).fetchall()
                 for row in rows:
-                    source = dict(zip(fields, row))
-                    source["channel_name"] = source.get("channel_name") or ""
-                    source["prompt_history_excluded"] = (
-                        should_exclude_from_prompt_history("user", source["content"])
-                    )
-                    if _unsafe_row(source):
-                        continue
-                    if selected_date:
-                        try:
-                            observed = datetime.fromisoformat(
-                                str(source["timestamp"] or "").replace("Z", "+00:00")
-                            )
-                            if observed.tzinfo is None:
-                                observed = observed.replace(tzinfo=timezone.utc)
-                            if observed.astimezone(PACIFIC_TZ).date().isoformat() != selected_date:
-                                continue
-                        except (TypeError, ValueError):
-                            continue
-                    label = (
-                        "6 Bit" if int(source["user_id"]) == int(BNL_OWNER_USER_ID or 0)
-                        else _safe_prompt_display_label(source["user_name"], "")
-                    )
-                    raw = str(source["content"] or "")
-                    # Preserve the complete sanitized utterance; never present
-                    # a budget-truncated paraphrase as its original wording.
-                    text = sanitize_history_text(raw, limit=max(1, len(raw)))
-                    if not label or not text:
-                        continue
-                    candidates.append((source, label, text))
+                    candidate = recall_candidate(dict(zip(fields, row)))
+                    if candidate:
+                        candidates.append(candidate)
             _control_digest, blocked_rows = _public_conversation_recall_controls(
                 conn, guild_id=int(guild_id), source_users={
                     int(source["id"]): int(source["user_id"])
@@ -28530,41 +28561,49 @@ def build_named_public_conversation_context(
                 candidate for candidate in candidates
                 if int(candidate[0]["id"]) not in blocked_rows
             ]
+            relevance = _memory_query_relevance((c[2] for c in candidates), query)
+            ranked = sorted(
+                candidates,
+                key=lambda c: (relevance.get(c[2], 0), observed_order(c), int(c[0]["id"])),
+                reverse=True,
+            )
+            for candidate in ranked:
+                if not add_candidate(candidate):
+                    continue
+                source = candidate[0]
+                if not int(source.get("channel_id") or 0):
+                    continue
+                # Context is retrieved around a selected original, never by
+                # guessed topic words. Bound it to this author, room, three
+                # minutes, and the requested dates. Do not recursively expand.
+                neighbors = []
+                for operator, direction, limit in (("<", "DESC", 2), (">", "ASC", 1)):
+                    rows = conn.execute(
+                        "SELECT " + ",".join(selections) + """
+                        FROM main.conversations
+                        WHERE guild_id=? AND user_id=? AND channel_id=? AND role='user'
+                          AND channel_policy IN ('public_home','public_context','public_selective')
+                          AND ABS(julianday(timestamp)-julianday(?)) <= 3.0/1440
+                          AND (julianday(timestamp),id) """ + operator + " (julianday(?),?)"
+                        + date_clause + " ORDER BY julianday(timestamp) " + direction
+                        + ",id " + direction + " LIMIT ?",
+                        (int(guild_id), int(source["user_id"]), int(source["channel_id"]),
+                         source["timestamp"], source["timestamp"], int(source["id"]), *date_params, limit),
+                    ).fetchall()
+                    for row in rows:
+                        neighbor = recall_candidate(dict(zip(fields, row)))
+                        if neighbor:
+                            neighbors.append(neighbor)
+                _digest, blocked_neighbors = _public_conversation_recall_controls(
+                    conn, guild_id=int(guild_id), source_users={
+                        int(item[0]["id"]): int(item[0]["user_id"]) for item in neighbors
+                    },
+                )
+                for neighbor in neighbors:
+                    if int(neighbor[0]["id"]) not in blocked_neighbors:
+                        add_candidate(neighbor)
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
         return "", None
-
-    relevance = _memory_query_relevance((c[2] for c in candidates), query)
-    def observed_order(candidate):
-        try:
-            value = datetime.fromisoformat(str(candidate[0]["timestamp"]).replace("Z", "+00:00"))
-            return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
-        except (TypeError, ValueError):
-            return 0.0
-    ranked = sorted(
-        candidates,
-        key=lambda candidate: (relevance.get(candidate[2], 0), observed_order(candidate), int(candidate[0]["id"])),
-        reverse=True,
-    )
-    header = "Relevant original public Discord messages:\n"
-    budget = max(0, MEMORY_PROMPT_BUDGET_PUBLIC)
-    used = len(header)
-    selected = []
-    for source, label, text in ranked:
-        place = _safe_prompt_display_label(source["channel_name"], "public Discord")
-        try:
-            observed = datetime.fromisoformat(str(source["timestamp"] or "").replace("Z", "+00:00"))
-            if observed.tzinfo is None:
-                observed = observed.replace(tzinfo=timezone.utc)
-            # Keep the zone explicit without crowding out whole utterances
-            # from the existing bounded original-message allowance.
-            stamp = observed.astimezone(PACIFIC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-        except (TypeError, ValueError, OverflowError):
-            stamp = "date unavailable"
-        line = f"- {label} in #{place} ({stamp}): {text}"
-        if used + len(line) + 1 > budget:
-            continue
-        selected.append((source, label, text, line))
-        used += len(line) + 1
     if not selected:
         return "", None
     selected.sort(key=lambda item: (observed_order(item), int(item[0]["id"])))

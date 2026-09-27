@@ -444,6 +444,48 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
             and 7101 in basis.source_row_ids for basis in metadata["prompt_source_bases"]
         ))
 
+    async def test_original_neighborhood_reaches_direct_and_batch_generation_with_revalidation(self):
+        context_text = "I baked eight cookies and still have dough left."
+        short_text = "It is my first time trying to make my own."
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            for row_id, stamp, content in (
+                (7250, "2026-08-30T03:00:00Z", context_text),
+                (7251, "2026-08-30T03:01:00Z", short_text),
+            ):
+                conn.execute(
+                    "INSERT INTO conversations (id,user_id,user_name,guild_id,role,content,"
+                    "timestamp,channel_id,channel_name,channel_policy,route_mode) "
+                    "VALUES (?,?,?,?,'user',?,?,9920,'public-lounge','public_home','normal_chat')",
+                    (row_id, SUBJECT, "Test Signal", GUILD, content, stamp),
+                )
+        request = "What did Test Signal say about their first time trying to make their own?"
+        for policy, enabled in product(("public_home", "sealed_test"), (False, True)):
+            with self.subTest(policy=policy, packet=enabled), self._packet_configuration(enabled, 8810), mock.patch.object(
+                bot, "CONVERSATION_ROWS_PER_USER_MAX", 1,
+            ):
+                prompt, metadata = await self.runtime._direct_prompt_async(policy, request, privileged=False)
+                channel, generation, guard = await self.runtime._batch(
+                    policy, request=request, answer=self._provider_answer, privileged=False, channel_id=8810,
+                )
+                self.assertEqual(channel.sent, [ANSWER])
+                for generated_prompt, bases in (
+                    (prompt, metadata["prompt_source_bases"]),
+                    (generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"]),
+                ):
+                    self.assertIn(context_text, generated_prompt)
+                    self.assertIn(short_text, generated_prompt)
+                    self.assertIn("proximity alone does not prove a shared topic", generated_prompt)
+                    originals = [basis for basis in bases if isinstance(basis, bot.ConversationPromptSourceBasis)
+                                 and 7251 in basis.source_row_ids]
+                    self.assertTrue(originals)
+                    self.assertTrue(all(7250 in basis.source_row_ids for basis in originals))
+                    # Batch delivery updates unrelated requester memory after
+                    # the direct prompt was captured; validate these originals.
+                    self.assertEqual(bot.prompt_source_basis_failure(tuple(originals)), "")
+        with sqlite3.connect(bot.DB_FILE) as conn:
+            conn.execute("UPDATE conversations SET channel_policy='internal_controlled' WHERE id=7250")
+        self.assertEqual(bot.prompt_source_basis_failure(tuple(originals)), "conversation_source_changed")
+
     def _seed_member_tiers(self):
         with sqlite3.connect(bot.DB_FILE) as conn:
             for uid, tier, text, trust in (
