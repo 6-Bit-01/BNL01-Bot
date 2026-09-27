@@ -174,6 +174,63 @@ class MomentTopicAssociationTests(unittest.TestCase):
         self.assertEqual(len(self.historical(self.packet(self.request("BNL, beans!")))), 1)
         self.assertEqual(self.historical(self.packet(self.request("BNL!"))), ())
 
+    def test_new_question_moment_does_not_trap_historical_recall(self):
+        old_id, roots = self.add_moment()
+        question = 'BNL, recall the beans recipe conversation. What was corrected about roasted tomatoes?'
+        entry = ledger.shadow_conversation_row(
+            self.conn, row_id=9001, user_id=10, user_name='Test Member Four',
+            guild_id=1, role='user', content=question, channel_policy='sealed_test',
+            channel_id=99, channel_name='bnl-testing', route_mode='normal_chat',
+            observed_at='2026-09-11T09:59:58+00:00',
+        )
+        current_id = moments.observe_ledger_entry(self.conn, entry.entry_id).moment_id
+        self.assertTrue(current_id)
+        frame = build_situation_frame_v1(
+            route_allowed=True, route_mode='normal_chat', conversation_surface='mention_or_reply',
+            channel_policy='sealed_test', current_text=question,
+            current_speaker_user_ids=(10,), current_speaker_labels=('Test Member Four',),
+            moment_id=current_id, moment_situation_state='recent_open',
+            moment_topic_coherent=True, moment_participant_overlap=True,
+            response_act='answer', packet_revision='new_question',
+        )
+        self.assertEqual(frame.event_relation, 'same_event')
+        request = self.request(question, channel_id=99, channel_policy='sealed_test',
+            frame_revision=frame.frame_revision, frame_input_evidence_digest=frame.input_evidence_digest,
+            frame_subject_requirement=frame.subject_requirement, frame_status=frame.status,
+            frame_event_ref=frame.event_ref, frame_event_relation=frame.event_relation,
+            frame_object_kind=frame.object_kind, frame_task_kind=frame.task_kind,
+            frame_phase=frame.phase, budget_chars=1000)
+        packet = self.packet(request)
+        items = self.historical(packet)
+        self.assertEqual([item.event_ref for item in items], [old_id])
+        self.assertNotEqual(items[0].event_ref, current_id)
+        self.assertEqual(items[0].attribution_mode, 'historical_other_participants')
+        rendered = render_packet_context(packet)[0]
+        self.assertIn('NOT a recorded participant', rendered)
+        self.assertIn('roasted', rendered)
+        self.assertTrue(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+        self.conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten' WHERE entry_id=?", (roots[0],))
+        self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+
+    def test_other_member_attribution_is_revalidated_without_binding_the_requester(self):
+        mid, _ = self.add_moment()
+        packet = self.packet()
+        item = self.historical(packet)[0]
+        self.assertEqual(item.attribution_mode, 'historical_other_participants')
+        # A changed requester cannot inherit the frozen attribution statement.
+        changed = replace(packet, request=replace(packet.request, participant_user_ids=(7,)))
+        self.assertFalse(revalidate_packet(self.conn, changed, environ=self.flags).valid)
+        own_packet = self.packet(self.request(participant_user_ids=(7,)))
+        self.assertEqual(self.historical(own_packet)[0].attribution_mode, 'historical_participants_only')
+
+    def test_related_episode_history_fallback_keeps_requested_date(self):
+        mid, _ = self.add_moment(day=1)
+        request = self.request('What was corrected about beans and roasted tomatoes on June 2?',
+            frame_event_ref='current_question', frame_event_relation='same_event')
+        self.assertFalse(self.historical(self.packet(request)))
+        matching = replace(request, user_text='What was corrected about beans and roasted tomatoes on June 1?')
+        self.assertEqual([item.event_ref for item in self.historical(self.packet(matching))], [mid])
+
     def test_topic_association_uses_at_most_two_old_moments(self):
         for day, ingredient in enumerate(("paprika", "cumin", "rosemary"), 1):
             self.add_moment((
