@@ -4,6 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import bnl_journal as journal
@@ -899,6 +900,40 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             journal_control_snapshot=snapshot,
             journal_control_status=control_status,
         )
+
+    def test_incidental_publications_do_not_crowd_out_recalled_moment(self):
+        import test_moment_topic_association as topic_tests
+        mid, roots = topic_tests.MomentTopicAssociationTests.add_moment(self)
+        for index in range(4):
+            self.add_journal(f'context_{index}', title=f'Beans reflection {index}',
+                             body=('I reflected on beans and community discussion. ' * 25))
+            self.add_relay(f'context_relay_{index}',
+                           message=('Beans brought the community together. ' * 20))
+        question = 'BNL, what did we discuss about beans, smoked paprika and roasted tomatoes?'
+        request = replace(
+            topic_tests.MomentTopicAssociationTests.request(self, question),
+            now=NOW, budget_chars=1600, publication_context_enabled=True,
+            journal_control_snapshot=control_snapshot(), journal_control_status='valid',
+        )
+        packet = build_packet(self.conn, request, environ=self.flags)
+        self.assertFalse(packet.diagnostics.invalid_invariants)
+        self.assertGreater(packet.diagnostics.journal_candidate_count, 0)
+        self.assertGreater(packet.diagnostics.relay_candidate_count, 0)
+        self.assertTrue(any(item.event_ref == mid for item in packet.items))
+        rendered, _lanes, _count, digests = render_packet_context(packet, max_chars=1600)
+        moment = next(item for item in packet.items if item.event_ref == mid)
+        self.assertIn(moment.source_digest, digests)
+        self.assertIn('roasted, tomatoes', rendered)
+        self.assertTrue(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+        # Explicit publication requests retain priority in the same small budget.
+        explicit = build_packet(self.conn, replace(request,
+            user_text='Show Journal entry context_0',
+            frame_object_kind='journal', frame_task_kind='retrieve_publication'),
+            environ=self.flags)
+        self.assertTrue(any(item.source_ref.startswith('journal:context_0:')
+                            for item in explicit.items))
+        self.conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten' WHERE entry_id=?", (roots[0],))
+        self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
 
     def test_packet_adapters_are_publication_only_and_revalidate_mutation(self):
         journal_id = "journal_packet_001"

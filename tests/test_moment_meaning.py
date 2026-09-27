@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -189,6 +190,55 @@ class MomentMeaningTests(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) FROM memory_moment_contributions WHERE moment_id=?", (mid,),
         ).fetchone()[0], 1)
+
+    def test_descriptive_recall_does_not_require_lifecycle_correction_tag(self):
+        turns = (
+            (1, 'user', 'Test Reporters told a story about Test Guest eating a shoe.'),
+            (1, 'model', 'That sounds like a story about consuming a soul.'),
+            (1, 'user', 'The sole of a shoe, not a soul. That is the correction.'),
+            (1, 'model', 'The shoe sole belongs to the joke, not a spiritual claim.'),
+            (1, 'user', 'The reporters are our ultimate source of truth, of course.'),
+            (1, 'model', 'Their flexible verification makes that banter rather than policy.'),
+        )
+        mid, roots = self.captured_moment(turns)
+        self.enrich({
+            'summary': 'A member corrected BNL: Test Guest consumed a shoe sole rather than a soul. The exchange playfully treated Test Reporters as the ultimate source of truth; BNL questioned their verification.',
+            'contributions': {'participant_1': 'The participant corrected the shoe-sole misunderstanding and joked about the reliability of Test Reporters.'},
+        })
+        # Reproduce the observed older episode metadata: meaning is valid,
+        # while lifecycle construction did not register a correction event.
+        self.conn.execute("UPDATE memory_moment_episodes SET semantic_types_json='[]'")
+        question = "BNL, recall the conversation about Test Reporters and the shoe. What was corrected?"
+        request = replace(self.packet().request, user_text=question,
+                          frame_object_kind='memory', frame_phase='request')
+        packet = build_packet(self.conn, request, environ=self.flags)
+        self.assertFalse(packet.diagnostics.invalid_invariants)
+        item = next((item for item in packet.items if item.event_ref == mid), None)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.uncertainty_status, 'descriptive_moment_only')
+        rendered = render_packet_context(packet)[0]
+        self.assertIn('shoe sole rather than a soul', rendered)
+        self.assertIn('paraphrase only', rendered)
+        self.assertTrue(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+        # Explicitly resuming a typed episode still requires its phase evidence.
+        anchored = replace(request, frame_event_ref=mid, frame_event_relation='resume')
+        self.assertFalse(any(item.lane == 'episode' for item in
+                             build_packet(self.conn, anchored, environ=self.flags).items))
+        self.conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten' WHERE entry_id=?", (roots[0],))
+        self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+
+    def test_descriptive_open_question_preserves_dates_and_uncertainty(self):
+        mid, _ = self.captured_moment(CONTAINMENT)
+        self.enrich(CONTAINMENT_MEANING)
+        def select(text):
+            return moments.select_situation_aware_episode_gists(
+                self.conn, guild_id=1, topic_text=text,
+                allowed_channel_policies=('public_home',),
+                now='2026-09-27T12:00:00+00:00')
+        rows = select('What remains open about containment on 2026-09-12?')
+        self.assertTrue(any(row.moment_id == mid for row in rows))
+        self.assertIn('unanswered', rows[0].gist)
+        self.assertFalse(select('What remains open about containment on 2026-09-13?'))
 
     def test_real_provider_paraphrase_survives_common_phrase_overlap(self):
         mid, _roots = self.captured_moment()

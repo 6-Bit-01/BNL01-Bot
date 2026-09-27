@@ -42,6 +42,7 @@ from bnl_profile_points import material_profile_point_map
 from bnl_unified_intelligence_packet import (
     SCHEMA_VERSION as PACKET_SCHEMA_VERSION,
     UnifiedIntelligencePacket,
+    is_incidental_publication,
     mark_packet_application,
     packet_subject_keys,
     packet_subject_resolutions,
@@ -2894,6 +2895,7 @@ def render_packet_context(
         for _index, item in sorted(
             enumerate(packet.items),
             key=lambda pair: (
+                is_incidental_publication(pair[1]),
                 render_priority.get(pair[1].lane, 99),
                 pair[0],
             ),

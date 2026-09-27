@@ -6424,6 +6424,16 @@ def select_situation_aware_episode_gists(
     for source in source_rows:
         moment_id = str(source["moment_id"])
         episode = _episode_projection_for_moment(conn, moment_id)
+        # A source-revalidated meaning can describe a correction or an open
+        # question that the older lifecycle classifier never tagged. Those
+        # tags constrain anchored episode operations, not descriptive recall.
+        meaning = conn.execute(
+            "SELECT meaning_status FROM memory_moment_windows WHERE moment_id=?",
+            (moment_id,),
+        ).fetchone()
+        descriptive_recall = bool(
+            not frame_event_ref and meaning and meaning[0] == "ready"
+        )
         if str(frame_event_ref or "") and anchor is None:
             if moment_id != str(frame_event_ref):
                 continue
@@ -6446,7 +6456,7 @@ def select_situation_aware_episode_gists(
             )
         ):
             continue
-        if not topic_association and (
+        if not topic_association and not descriptive_recall and (
             _EPISODE_OPEN_QUERY_RE.search(str(topic_text or ""))
             and (episode is None or episode["open_loop_count"] <= 0)
         ):
@@ -6456,7 +6466,7 @@ def select_situation_aware_episode_gists(
         )
         frame_type = str(source["frame_type"] or "")
         phase = str(frame_phase or "").strip().lower()
-        if not topic_association and (
+        if not topic_association and not descriptive_recall and (
             (_EPISODE_CHANGE_QUERY_RE.search(str(topic_text or "")) or phase == "correction")
             and "correction" not in semantic_types
             and frame_type
@@ -6465,12 +6475,14 @@ def select_situation_aware_episode_gists(
             continue
         if (
             not topic_association
+            and not descriptive_recall
             and phase == "retest"
             and "retest" not in semantic_types
         ):
             continue
         if (
             not topic_association
+            and not descriptive_recall
             and phase == "completion"
             and "outcome" not in semantic_types
         ):
@@ -6512,6 +6524,8 @@ def select_situation_aware_episode_gists(
                 uncertainty_status=(
                     "topic_association_only"
                     if topic_association
+                    else "descriptive_moment_only"
+                    if descriptive_recall
                     else "source_backed_episode"
                     if episode is not None
                     else "standalone_moment_only"
