@@ -144,6 +144,23 @@ class GeminiBudgetEnforcementTests(unittest.TestCase):
         self.assertEqual(background, (False, "monthly_target_pace"))
         self.assertEqual(interactive, (True, "interactive_available"))
 
+    def test_memory_is_not_optional_publication_but_preserves_spending_safeguards(self):
+        self.now = datetime(2026, 9, 27, 12, 0, tzinfo=PACIFIC)
+        with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):
+            # Reproduce September's recorded spend and held image estimates.
+            self.assertEqual(self.decision('moment_meaning_background', request='0.01',
+                month='17.633475', today='1.10', active='0.492170'), (True, 'memory_protected'))
+            self.assertEqual(self.decision('ambient_generation', request='0.01',
+                month='17.633475', today='1.10', active='0.492170'), (False, 'monthly_target_pace'))
+            self.assertEqual(self.decision('moment_meaning_background', request='0.01',
+                month='20.50', today='0.10'), (False, 'interactive_and_journal_reserve'))
+            self.assertEqual(self.decision('moment_meaning_background', request='0.01',
+                month='23.50', today='0.10'), (False, 'monthly_hard_limit'))
+            # Month rollover must not introduce a tiny day-one memory allowance.
+            self.now = datetime(2026, 10, 1, 12, 0, tzinfo=PACIFIC)
+            self.assertEqual(self.decision('moment_meaning_background', request='0.01',
+                month='1.10', today='1.10'), (True, 'memory_protected'))
+
     def test_ballad_priority_uses_existing_budget_without_raising_limits(self):
         self.now = datetime(2026, 9, 16, 20, 30, tzinfo=PACIFIC)
         with mock.patch.dict(os.environ, self.default_budget_env(), clear=False):

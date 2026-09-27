@@ -130,6 +130,23 @@ class MomentMeaningTests(unittest.TestCase):
         self.conn.commit()
         return request
 
+    def test_deferred_claim_is_idempotent_and_does_not_block_newer_work(self):
+        first, _ = self.captured_moment(channel=10)
+        second, _ = self.captured_moment(channel=11)
+        at = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+        request = moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,), now=at)
+        self.assertEqual(request.moment_id, first)
+        original = self.state(first)[1:]
+        self.assertTrue(moments.defer_moment_meaning(self.conn, request, reason='monthly_hard_limit', now=at))
+        self.assertFalse(moments.defer_moment_meaning(self.conn, request, reason='monthly_hard_limit', now=at))
+        self.assertEqual(self.state(first)[1:], original)
+        next_request = moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,), now=at)
+        self.assertEqual(next_request.moment_id, second)
+        self.assertIsNone(moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,), now=at))
+        resumed = moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,), now=at + timedelta(minutes=30))
+        self.assertEqual(resumed.moment_id, first)
+        self.assertIsNone(moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,), now=at + timedelta(minutes=30)))
+
     def state(self, mid):
         return self.conn.execute('SELECT meaning_status,summary,canonical_ledger_entry_id '
                                  'FROM memory_moment_windows WHERE moment_id=?', (mid,)).fetchone()

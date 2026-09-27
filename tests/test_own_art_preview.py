@@ -269,6 +269,19 @@ class OwnArtPreviewTests(unittest.TestCase):
                 self.assertLessEqual(stream.tell(), art.MAX_ERROR_BYTES + 1)
                 fake.release_local_model_budget.assert_called_once_with(fake.reserve_local_model_budget.return_value, retain_cost_reservation=True)
 
+    def test_interactions_invalid_request_code_releases_rejected_call_estimate(self):
+        fake = self.fake_bot('unused')
+        raw = b'{"error":{"message":"Image delivery mode is not supported.","code":"invalid_request"}}'
+        opener = mock.Mock()
+        opener.open.side_effect = art.urllib.error.HTTPError(art.IMAGE_ENDPOINT, 400, 'bad', {}, io.BytesIO(raw))
+        with mock.patch.object(art.urllib.request, 'build_opener', return_value=opener):
+            with self.assertRaises(RuntimeError) as caught:
+                art.generate_private_image(fake, 'A quiet room.')
+        self.assertEqual(caught.exception.provider_diagnostics['status'], 'INVALID_ARGUMENT')
+        fake.release_local_model_budget.assert_called_once_with(
+            fake.reserve_local_model_budget.return_value, retain_cost_reservation=False)
+        fake.record_failed_generation_attempt.assert_called_once()
+
     def test_request_payload_in_provider_error_is_omitted(self):
         raw = b'{"error":{"status":"INVALID_ARGUMENT","message":"Invalid prompt: PRIVATE_FIXTURE"}}'
         error = art.urllib.error.HTTPError(art.IMAGE_ENDPOINT, 400, "bad", {}, io.BytesIO(raw))

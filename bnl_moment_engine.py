@@ -1500,6 +1500,8 @@ def ensure_moment_schema(conn: sqlite3.Connection) -> None:
         "ALTER TABLE memory_moment_windows ADD COLUMN meaning_source_digest TEXT DEFAULT ''",
         "ALTER TABLE memory_moment_windows ADD COLUMN meaning_projection_digest TEXT DEFAULT ''",
         "ALTER TABLE memory_moment_windows ADD COLUMN meaning_attempted_at TEXT DEFAULT ''",
+        "ALTER TABLE memory_moment_windows ADD COLUMN meaning_retry_after TEXT DEFAULT ''",
+        "ALTER TABLE memory_moment_windows ADD COLUMN meaning_deferred_reason TEXT DEFAULT ''",
     ):
         try:
             cur.execute(sql)
@@ -3014,12 +3016,13 @@ def _meaning_record_matches(conn: sqlite3.Connection, moment_id: str,
 
 
 def claim_pending_moment_meaning(
-    conn: sqlite3.Connection, *, guild_ids: tuple[int, ...],
+    conn: sqlite3.Connection, *, guild_ids: tuple[int, ...], now: datetime | None = None,
 ) -> MomentMeaningRequest | None:
     """Claim one newly finalized public Moment; legacy records are never queued.
 
     The caller commits the claim before invoking the existing metered provider.
-    Incomplete/interrupted attempts remain explicit instead of being replayed.
+    Incomplete/interrupted provider attempts are never replayed. Local denials
+    with zero provider attempts can be reclaimed after their durable cooldown.
     """
     if not guild_ids or not shadow_enabled() or not ledger_shadow_enabled():
         return None
@@ -3027,14 +3030,20 @@ def claim_pending_moment_meaning(
     params = tuple(sorted({int(gid) for gid in guild_ids if int(gid) > 0}))
     if not params:
         return None
+    at = now or datetime.now(timezone.utc)
     pending = conn.execute(
-        "SELECT moment_id FROM memory_moment_windows WHERE meaning_status='pending' "
+        "SELECT moment_id,meaning_status FROM memory_moment_windows "
+        "WHERE (meaning_status='pending' OR (meaning_status='budget_deferred' "
+        "AND datetime(meaning_retry_after)<=datetime(?))) "
         f"AND guild_id IN ({','.join('?' for _ in params)}) "
-        "ORDER BY last_activity_at,moment_id LIMIT 1", params,
+        "ORDER BY last_activity_at,moment_id LIMIT 1", (at.isoformat(), *params),
     ).fetchone()
     if not pending:
         return None
     mid = str(pending[0])
+    if pending[1] == 'budget_deferred':
+        conn.execute("UPDATE memory_moment_windows SET meaning_status='pending' "
+                     "WHERE moment_id=? AND meaning_status='budget_deferred'", (mid,))
     loaded = _moment_episode_basis(conn, mid)
     if loaded is None:
         conn.execute("UPDATE memory_moment_windows SET meaning_status='source_unavailable' "
@@ -3092,8 +3101,9 @@ def claim_pending_moment_meaning(
     digest = _meaning_source_digest(rows)
     updated = conn.execute(
         "UPDATE memory_moment_windows SET meaning_status='generating',meaning_source_digest=?, "
-        "meaning_attempted_at=? WHERE moment_id=? AND meaning_status='pending'",
-        (digest, _now(), mid),
+        "meaning_attempted_at=?,meaning_retry_after='',meaning_deferred_reason='' "
+        "WHERE moment_id=? AND meaning_status='pending'",
+        (digest, at.isoformat(), mid),
     )
     if not updated.rowcount:
         return None
@@ -3126,6 +3136,29 @@ def expire_stale_moment_meaning_attempts(
         )
         _diag(conn, guild_id, 'moment_meaning_not_applied', 'attempt_expired', mid)
     return len(rows)
+
+
+def defer_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest,
+                         *, reason: str, now: datetime | None = None) -> bool:
+    """Defer a proven local, unattempted denial without changing its source gist.
+
+    The existing sweep owns recovery. A durable 30-minute cooldown survives
+    restarts and prevents repeated local checks from spinning on exhausted funds.
+    Every reclaim runs the same current source/privacy/gate checks as a new claim.
+    """
+    at = now or datetime.now(timezone.utc)
+    safe_reason = re.sub(r'[^a-z0-9_]', '_', str(reason).lower())[:80]
+    changed = conn.execute(
+        "UPDATE memory_moment_windows SET meaning_status='budget_deferred',"
+        "meaning_retry_after=?,meaning_deferred_reason=?,updated_at=? "
+        "WHERE moment_id=? AND guild_id=? AND meaning_status='generating' "
+        "AND meaning_source_digest=?",
+        ((at + timedelta(minutes=30)).isoformat(), safe_reason, at.isoformat(),
+         request.moment_id, request.guild_id, request.source_digest),
+    )
+    if changed.rowcount:
+        _diag(conn, request.guild_id, 'moment_meaning_budget_deferred', safe_reason, request.moment_id)
+    return bool(changed.rowcount)
 
 
 def fail_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest,

@@ -101,6 +101,7 @@ class GeminiRoutePolicy:
     journal_protected: bool = False
     relay_protected: bool = False
     showday_protected: bool = False
+    memory_protected: bool = False
     fallback_status_codes: tuple[int, ...] = ()
 
 
@@ -203,7 +204,7 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
     if normalized_route == 'moment_meaning_background':
         return GeminiRoutePolicy(
             lane='background', max_output_tokens=2048, legacy_thinking_budget=512,
-            provider_retries=0, allow_fallback=False,
+            provider_retries=0, allow_fallback=False, memory_protected=True,
         )
     if normalized_route in {"broadcast_ballad_manual", "broadcast_ballad_background"}:
         # A full song plus metadata and model thinking needs its own allowance.
