@@ -55,11 +55,11 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
 
     def seed(self, row_id=1, *, text=STATEMENT, user_id=222, label="TestMarbles",
              role="user", policy="public_home", guild_id=77,
-             timestamp="2026-08-29T03:00:00+00:00"):
+             timestamp="2026-08-29T03:00:00+00:00", channel_id=20):
         with sqlite3.connect(self.path) as conn:
             conn.execute(
                 "INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (row_id, guild_id, user_id, label, role, text, 20,
+                (row_id, guild_id, user_id, label, role, text, channel_id,
                  "test-public-stage", policy, timestamp, row_id + 1000),
             )
 
@@ -80,11 +80,11 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
             user_text=text, channel_id=10, channel_name="test-target-room",
         )
 
-    def control(self, *, state="active", lineage=""):
+    def control(self, *, state="active", lineage="", row_id=1):
         with sqlite3.connect(self.path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO memory_ledger_entries VALUES (?,?,?,?,?,?)",
-                ("root-one", 77, "conversations", "1", bot.subject_key_for_user(222), state),
+                ("root-one", 77, "conversations", str(row_id), bot.subject_key_for_user(222), state),
             )
             if lineage:
                 conn.execute(
@@ -376,6 +376,103 @@ class NamedPublicConversationRecallTests(unittest.TestCase):
                 self.control(state=state, lineage=lineage)
                 self.assertEqual(bot.prompt_source_basis_failure((basis,)), "conversation_source_changed")
                 self.assertEqual(self.read(), ("", None))
+
+    def seed_neighborhood(self):
+        self.seed(1, timestamp="2026-08-29T03:00:00Z",
+                  text="I baked eight cookies and still have dough left.")
+        self.seed(2, timestamp="2026-08-29T03:00:20Z",
+                  text="I think the oven was too hot.")
+        self.seed(3, timestamp="2026-08-29T03:01:00Z",
+                  text="It is my first time trying to make my own.")
+        self.seed(4, timestamp="2026-08-29T03:01:20Z",
+                  text="I will lower the temperature for the next batch.")
+
+    def read_neighborhood(self, **kwargs):
+        # Only the ambiguous line fits the ranked anchor limit. Its context
+        # must be recovered from the original source, not lexical overlap.
+        with mock.patch.object(bot, "CONVERSATION_ROWS_PER_USER_MAX", 1):
+            return self.read(text="What did TestMarbles say about their first time trying to make their own?", **kwargs)
+
+    def test_recalled_statement_brings_bounded_same_author_context_with_lineage(self):
+        self.seed_neighborhood()
+        context, basis = self.read_neighborhood()
+        self.assertEqual(basis.source_row_ids, (1, 2, 3, 4))
+        self.assertEqual(basis.revalidation_row_ids, basis.source_row_ids)
+        self.assertIn("eight cookies", context)
+        self.assertIn("first time", context)
+        self.assertIn("next batch", context)
+        self.assertEqual(tuple(item.source_id for item in basis.evidence_items), (1, 2, 3, 4))
+        self.assertEqual(basis.participant_user_ids, (222,))
+        self.assertEqual(bot.prompt_source_basis_failure((basis,)), "")
+        self.assertLessEqual(len(context), bot.MEMORY_PROMPT_BUDGET_PUBLIC)
+
+    def test_neighbors_do_not_expand_author_room_time_or_visibility_scope(self):
+        self.seed_neighborhood()
+        for row_id, kwargs in enumerate((
+            {"user_id": 333}, {"guild_id": 88}, {"channel_id": 21},
+            {"policy": "sealed_test"}, {"policy": "internal_controlled"},
+            {"role": "model"},
+            {"timestamp": "2026-08-29T02:50:00Z"},
+        ), 10):
+            self.seed(row_id, text="Excluded surrounding detail.",
+                      **({"timestamp": "2026-08-29T03:00:59Z"} | kwargs))
+        context, basis = self.read_neighborhood()
+        self.assertEqual(basis.source_row_ids, (1, 2, 3, 4))
+        self.assertNotIn("Excluded", context)
+
+    def test_context_cannot_cross_requested_pacific_day(self):
+        self.seed(1, text="The prior day detail.", timestamp="2026-08-29T06:59:50Z")
+        self.seed(2, text="My first time trying this.", timestamp="2026-08-29T07:00:10Z")
+        with mock.patch.object(bot, "CONVERSATION_ROWS_PER_USER_MAX", 1):
+            context, basis = self.read(text="What did TestMarbles say about their first time on August 29, 2026?")
+        self.assertEqual(basis.source_row_ids, (2,))
+        self.assertNotIn("prior day", context)
+
+    def test_neighbor_correction_and_forget_controls_apply_before_read(self):
+        self.seed_neighborhood()
+        for state, lineage in (("forgotten", ""), ("active", "correction_of")):
+            with self.subTest(state=state, lineage=lineage):
+                self.control(state=state, lineage=lineage, row_id=1)
+                context, basis = self.read_neighborhood()
+                self.assertNotIn(1, basis.source_row_ids)
+                self.assertNotIn("eight cookies", context)
+
+    def test_neighbor_changes_invalidate_the_whole_generated_source_basis(self):
+        self.seed_neighborhood()
+        for change in ("delete", "private", "forget", "correct"):
+            with self.subTest(change=change):
+                with sqlite3.connect(self.path) as conn:
+                    conn.execute("DELETE FROM conversations")
+                    conn.execute("DELETE FROM memory_ledger_entries")
+                    conn.execute("DELETE FROM memory_ledger_lineage")
+                self.seed_neighborhood()
+                context, basis = self.read_neighborhood()
+                self.assertIn("eight cookies", context)
+                if change in {"forget", "correct"}:
+                    self.control(row_id=1, state="forgotten" if change == "forget" else "active",
+                                 lineage="correction_of" if change == "correct" else "")
+                else:
+                    with sqlite3.connect(self.path) as conn:
+                        conn.execute("DELETE FROM conversations WHERE id=1" if change == "delete" else
+                                     "UPDATE conversations SET channel_policy='internal_controlled' WHERE id=1")
+                self.assertEqual(bot.prompt_source_basis_failure((basis,)), "conversation_source_changed")
+
+    def test_neighborhoods_are_not_recursively_expanded_or_duplicated(self):
+        self.seed_neighborhood()
+        self.seed(5, text="An earlier unrelated detail.", timestamp="2026-08-29T02:58:01Z")
+        self.seed(6, text="A later unrelated detail.", timestamp="2026-08-29T03:02:00Z")
+        context, basis = self.read_neighborhood()
+        self.assertEqual(basis.source_row_ids, (1, 2, 3, 4))
+        self.assertEqual(context.count("eight cookies"), 1)
+
+    def test_small_budget_preserves_whole_anchor_without_partial_neighbors(self):
+        self.seed_neighborhood()
+        with mock.patch.object(bot, "MEMORY_PROMPT_BUDGET_PUBLIC", 220):
+            context, basis = self.read_neighborhood()
+        self.assertEqual(basis.source_row_ids, (3,))
+        self.assertIn("It is my first time trying to make my own.", context)
+        self.assertLessEqual(len(context), 220)
+        self.assertNotIn("…", context)
 
 
 if __name__ == "__main__":
