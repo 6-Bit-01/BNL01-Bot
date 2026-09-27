@@ -1586,6 +1586,46 @@ class GovernedSelfNameTests(unittest.TestCase):
 
 
 class StructuralReferentTests(unittest.TestCase):
+    def test_requested_examples_do_not_bind_unrelated_recent_contributions(self):
+        rows = [
+            _context_row(1, "Recall the correction about the missing shoes.", user_id=999),
+            _context_row(2, "The correction was about footwear.", role="model", user_id=999),
+            _context_row(3, "What practical question did the dream discussion leave open?", user_id=999),
+            _context_row(4, "The practical question was calibration.", role="model", user_id=999),
+        ]
+        for text in (
+            "Give one specific reflection and one original audience comment, keeping your interpretation separate from what the audience said.",
+            "Summarize an audience comment from the September 25 show.",
+            "Explain one idea discussed during the September 25 broadcast.",
+            "Give an example of a message someone posted during the show.",
+        ):
+            for batch in (False, True):
+                with self.subTest(text=text, batch=batch):
+                    result = assemble_conversation_context_v2(
+                        rows, _context_request(text, is_batch=batch),
+                    )
+                    self.assertEqual(result.referent_status, "not_requested")
+                    self.assertEqual(result.referent_candidate_labels, ())
+                    decision = bnl01_bot.build_live_conversation_orchestration_decision(
+                        engagement_decision="answer", engagement_reason="direct_request",
+                        channel_policy="public_home", addressings=(_addressing(bnl=True),),
+                        context_result=result, moment_situation=None, current_text=text,
+                        current_speaker_user_ids=(999,), current_speaker_labels=("Test Member",),
+                        influence_mode="live",
+                    )
+                    self.assertEqual(decision.situation_frame.status, "resolved")
+
+    def test_definite_contribution_requests_still_require_disambiguation(self):
+        rows = [
+            _context_row(1, "A copper satellite drifted through the rain."),
+            _context_row(2, "A paper lantern crossed the silent harbor."),
+        ]
+        for text in ("Read the message.", "Explain my comment.", "Interpret the original post.", "Who said that?"):
+            with self.subTest(text=text):
+                result = assemble_conversation_context_v2(rows, _context_request(text))
+                self.assertEqual(result.referent_status, "ambiguous")
+                self.assertEqual(result.referent_selected_row_ids, ())
+
     def test_temporal_scope_does_not_invent_a_contribution_or_person_subject(self):
         rows = [
             _context_row(1, "How is the show going?", user_name="Test Member"),

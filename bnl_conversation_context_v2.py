@@ -66,6 +66,11 @@ NEARBY_REFERENT_NOUN_RE = re.compile(
     r"response|answer|reply|contribution|idea|point|part|thing|one)\b",
     re.I,
 )
+DEFINITE_CONTRIBUTION_REFERENT_RE = re.compile(
+    r"\b(?:the|my|your|his|her|their|our|[\w]+['’]s)\s+"
+    r"(?:[\w-]+\s+){0,2}" + NEARBY_REFERENT_NOUN_RE.pattern,
+    re.I,
+)
 NEARBY_REFERENT_ACT_RE = re.compile(
     r"\b(?:analy[sz](?:e|is)|explain|review|read|respond|answer|"
     r"summari[sz]e|interpret|discuss|continue|mean|think|said|wrote|"
@@ -1283,11 +1288,17 @@ def nearby_contribution_referent_requested(text: str) -> bool:
         pointer = bool(NEARBY_REFERENT_POINTER_RE.search(clause))
         noun = bool(NEARBY_REFERENT_NOUN_RE.search(clause))
         act = bool(NEARBY_REFERENT_ACT_RE.search(clause))
+        # Requesting an example ("explain one idea", "an audience comment")
+        # does not identify any nearby message. An implicit reference needs
+        # a definite/possessive contribution, as in "read the poem"; explicit
+        # pointers, speaker attribution and exact Discord replies keep their
+        # existing resolution paths.
+        definite_contribution = bool(DEFINITE_CONTRIBUTION_REFERENT_RE.search(clause))
         if (
             SPEAKER_ATTRIBUTION_REFERENT_RE.search(clause)
             or (pointer and MODEL_REASONING_REFERENT_RE.search(clause))
             or (pointer and noun)
-            or (noun and act)
+            or (definite_contribution and act)
             or (pointer and act and not CURRENT_CORRECTION_REPLACEMENT_RE.search(clause))
         ):
             return True
