@@ -477,7 +477,9 @@ _PROMPT_CONTROL_RE = re.compile(
     r"\b(?:prompt|instructions?|rules?|commands?)\b"
     r"|\b(?:respond|reply|output|print)\b.{0,24}"
     r"\b(?:with|only|exactly)\b"
-    r"|\b(?:you are now|act as)\b"
+    r"|\byou are now\b"
+    r"|(?:^|[.!?;:,\n]\s*|\bplease\s+|\b(?:can|could|would|will)\s+you\s+|"
+    r"\byou\s+(?:must|should|need to)\s+)act as\b"
     r"|\b(?:system|developer|assistant)\s+(?:message|prompt|instructions?)\b"
     r"|\b(?:jailbreak|prompt injection|hidden prompt|chain of thought)\b",
     re.I,
@@ -2941,6 +2943,30 @@ def _meaning_text_is_safe(value: Any, limit: int) -> bool:
     )
 
 
+def _meaning_contains_source_excerpt(value: str, sources: list[str]) -> bool:
+    """Reject copied passages, not incidental phrases in a paraphrase.
+
+    Four shared words (for example, 'a source of truth') do not establish
+    extraction. Keep the stricter legacy-gist rule separate. Generated meaning
+    rejects eight-word passages, complete short utterances and marked quotes;
+    source eligibility and privacy are independently checked before and after
+    generation.
+    """
+    if _contains_meaningful_source_ngram(value, sources, size=8):
+        return True
+    words = _normalized_words(value)
+    for source in sources:
+        original = _normalized_words(source)
+        if 4 <= len(original) < 8 and any(
+            words[index:index + len(original)] == original
+            for index in range(len(words) - len(original) + 1)
+        ):
+            return True
+    quotes = re.findall(r'["“]([^"”\n]+)["”]|(?<!\w)[\'‘]([^\'’\n]+)[\'’](?!\w)', value)
+    return any(_contains_meaningful_source_ngram(left or right, sources)
+               for left, right in quotes)
+
+
 def _meaning_source_digest(rows: Iterable[SourceEntry]) -> str:
     # Unlike the legacy gist digest, include roles and subject identity too.
     data = [asdict(row) for row in sorted(rows, key=lambda row: row.entry_id)]
@@ -2956,8 +2982,13 @@ def _recall_signature(stored_signature: str, summary: str) -> tuple[str, ...]:
     """Index the new paraphrase at read time without changing episode grouping."""
     signature = _load_sig(stored_signature)
     if summary.startswith(MOMENT_MEANING_PREFIX):
-        signature = tuple(sorted(set(signature) | set(_topic_signature(
-            summary[len(MOMENT_MEANING_PREFIX):], 'conversation'))))
+        # Meaning is already bounded to 360 characters. Index all its terms;
+        # truncating sorted hashes can arbitrarily discard the actual subject.
+        signature = tuple(sorted(set(signature) | {
+            _topic_token_digest(token)
+            for token in re.findall(r"[a-z0-9]{2,}", _canon(summary[len(MOMENT_MEANING_PREFIX):]))
+            if token.isalpha() and token not in STOP
+        }))
     return signature
 
 
@@ -3158,7 +3189,7 @@ def apply_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest
                     or not all(_meaning_text_is_safe(text, 240) for text in contributions.values())):
                 raise ValueError('representation')
             # Preserve the established non-extractive memory representation.
-            if any(_contains_meaningful_source_ngram(text, [r.normalized_value for r in rows])
+            if any(_meaning_contains_source_excerpt(text, [r.normalized_value for r in rows])
                    for text in [summary_text, *contributions.values()]):
                 raise ValueError('source_excerpt')
         except (ValueError, TypeError, KeyError):
