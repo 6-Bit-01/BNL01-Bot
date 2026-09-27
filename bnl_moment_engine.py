@@ -2565,8 +2565,13 @@ def _entries(conn: sqlite3.Connection, moment_id: str) -> list[SourceEntry]:
 
 
 def _mark_targets_for_correction(conn: sqlite3.Connection, source: SourceEntry) -> int:
+    # The guild/type index can scan millions of unrelated supersession edges
+    # before testing entry_id. Anchor this exact-source lookup on the existing
+    # primary key; retain every guild and correction predicate.
     targets = [r[0] for r in conn.execute(
-        "SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=? AND entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')",
+        "SELECT target_entry_id FROM memory_ledger_lineage "
+        "INDEXED BY sqlite_autoindex_memory_ledger_lineage_1 "
+        "WHERE guild_id=? AND entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')",
         (source.guild_id, source.entry_id),
     ).fetchall()]
     count = 0
@@ -2581,7 +2586,7 @@ def _reply_target_moment(conn: sqlite3.Connection, source: SourceEntry) -> str:
         return ""
     targets = conn.execute(
         """SELECT l.target_entry_id,e.source_row_id
-           FROM memory_ledger_lineage l
+           FROM memory_ledger_lineage l INDEXED BY sqlite_autoindex_memory_ledger_lineage_1
            LEFT JOIN memory_ledger_entries e ON e.entry_id=l.target_entry_id
            WHERE l.entry_id=? AND l.guild_id=? AND l.lineage_type='reply_to'""",
         (source.entry_id, source.guild_id),

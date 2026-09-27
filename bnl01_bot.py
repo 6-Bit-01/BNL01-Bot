@@ -29947,7 +29947,7 @@ def _build_unified_intelligence_packet_shadow(
         publication_context_enabled=publication_context_enabled,
     )
     try:
-        with sqlite3.connect(DB_FILE, timeout=0.25) as packet_conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as packet_conn, packet_conn:
             packet = build_unified_intelligence_packet(
                 packet_conn,
                 request,
@@ -30443,7 +30443,7 @@ def record_unified_response_assessment_shadow(
     if assessment is None:
         return ""
     try:
-        with sqlite3.connect(DB_FILE, timeout=0.25) as assessment_conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as assessment_conn, assessment_conn:
             run_id = persist_unified_response_assessment_shadow_run(
                 assessment_conn,
                 assessment,
@@ -30999,22 +30999,11 @@ async def build_user_memory_context_async(
     **kwargs,
 ) -> str:
     """Use the existing memory owner in one off-loop, read-only snapshot."""
-    def read():
-        metadata: dict = {}
-        with closing(_open_member_memory_read_connection()) as conn:
-            conn.execute("BEGIN")
-            # Acquire the snapshot once, before readers that handle individual
-            # source failures. A busy database is unavailable, not empty memory.
-            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-            context = build_user_memory_context(
-                user_id, guild_id, source_metadata=metadata,
-                connection=conn, read_only=True, **kwargs,
-            )
-        return context, metadata
-
     started = time.monotonic()
     try:
-        context, metadata = await asyncio.to_thread(read)
+        context, metadata = await asyncio.to_thread(
+            _read_user_memory_snapshot, user_id, guild_id, **kwargs,
+        )
         # A cancelled caller must never receive late worker metadata.
         if source_metadata is not None:
             source_metadata.update(metadata)
@@ -31026,6 +31015,21 @@ async def build_user_memory_context_async(
             guild_id, int(kwargs.get("channel_id") or 0),
             round((time.monotonic() - started) * 1000),
         )
+
+
+def _read_user_memory_snapshot(user_id: int, guild_id: int, **kwargs) -> tuple[str, dict]:
+    """Use the same bounded, read-only snapshot for selection and revalidation."""
+    metadata: dict = {}
+    with closing(_open_member_memory_read_connection()) as conn:
+        conn.execute("BEGIN")
+        # A busy database is unavailable, not empty memory. Close the snapshot
+        # before returning so a later writer never waits for garbage collection.
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        context = build_user_memory_context(
+            user_id, guild_id, source_metadata=metadata,
+            connection=conn, read_only=True, **kwargs,
+        )
+    return context, metadata
 
 
 def build_named_public_member_memory_context(
@@ -31557,8 +31561,8 @@ def refresh_prompt_source_basis(
             operational_snapshot, operational_provided = (
                 _shared_brain_operational_revalidation_snapshot(basis)
             )
-            with sqlite3.connect(DB_FILE, timeout=0.25) as synthesis_conn:
-                valid, _status = revalidate_shared_brain_synthesis_basis(
+            with closing(_open_member_memory_read_connection()) as synthesis_conn:
+                valid, status = revalidate_shared_brain_synthesis_basis(
                     synthesis_conn,
                     basis,
                     journal_control_snapshot=snapshot,
@@ -31568,8 +31572,14 @@ def refresh_prompt_source_basis(
                         operational_provided
                     ),
                 )
+            if not valid:
+                logging.warning("shared_brain_source_revalidation_failed status=%s", status)
             return basis, not valid
-        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            logging.warning(
+                "shared_brain_source_revalidation_failed status=processing_error error_type=%s",
+                type(exc).__name__,
+            )
             return basis, True
     if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
         reference_out: dict[str, ActiveEpisodeReference] = {}
@@ -31627,7 +31637,7 @@ def refresh_prompt_source_basis(
                 member_recall_query=basis.member_recall_query,
             )
         else:
-            fresh_context = build_user_memory_context(
+            fresh_context, source_metadata = _read_user_memory_snapshot(
                 basis.user_id,
                 basis.guild_id,
                 route_mode=basis.route_mode,
@@ -31640,7 +31650,6 @@ def refresh_prompt_source_basis(
                 moment_attribution_target_user_id=(
                     basis.moment_attribution_target_user_id
                 ),
-                source_metadata=source_metadata,
             )
         fresh = replace(
             basis,
@@ -46132,7 +46141,7 @@ def _begin_ordinary_chat_single_packet_receipt(
     operational_snapshot, operational_provided = (
         _shared_brain_operational_revalidation_snapshot(basis)
     )
-    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
         run = begin_single_packet_run(
             conn,
             basis,
@@ -46173,7 +46182,7 @@ def _evaluate_ordinary_chat_single_packet_receipt(
     operational_snapshot, operational_provided = (
         _shared_brain_operational_revalidation_snapshot(run.basis)
     )
-    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
         decision = evaluate_single_packet_response(
             conn,
             run,
@@ -46211,7 +46220,7 @@ def _record_ordinary_chat_single_packet_review(
     source_revalidation_status: str = "",
     processing_error: bool = False,
 ) -> SynthesisCanaryDecision:
-    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
         reviewed = record_single_packet_review(
             conn,
             decision,
@@ -46237,7 +46246,7 @@ def _begin_shared_brain_synthesis_receipt(
     journal_snapshot, journal_snapshot_provided = (
         _shared_brain_journal_revalidation_snapshot(basis)
     )
-    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
         run = begin_shared_brain_synthesis_run(
             conn,
             basis,
@@ -46267,7 +46276,7 @@ def _evaluate_shared_brain_synthesis_receipt(
     journal_snapshot, journal_snapshot_provided = (
         _shared_brain_journal_revalidation_snapshot(run.basis)
     )
-    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
         decision = evaluate_shared_brain_synthesis_candidate(
             conn,
             run,
@@ -46289,7 +46298,7 @@ def _fallback_shared_brain_synthesis_receipt(
     decision: SynthesisCanaryDecision,
     reason: str,
 ) -> SynthesisCanaryDecision:
-    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
         fallback = record_shared_brain_synthesis_fallback(
             conn,
             decision,
@@ -46307,7 +46316,7 @@ def _finalize_shared_brain_synthesis_receipt(
     candidate_live: bool,
     guard_status: str,
 ) -> bool:
-    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
         finalized = finalize_shared_brain_synthesis_run(
             conn,
             decision,
