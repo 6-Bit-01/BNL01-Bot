@@ -19,6 +19,7 @@ SCHEMA_VERSION = "relationship_v2.1"
 SHADOW_ENV = "BNL_RELATIONSHIP_V2_SHADOW_ENABLED"
 LIVE_ENV = "BNL_RELATIONSHIP_V2_LIVE_ENABLED"
 ACTIVE_ENGAGEMENT_LIVE_ENV = "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED"
+SEALED_CANARY_ENV = "BNL_RELATIONSHIP_V2_SEALED_CANARY_ENABLED"
 ACTIVE_LIFECYCLES = {"active"}
 BLOCKED_LIFECYCLES = {"deleted", "forgotten", "retracted", "corrected", "superseded", "review_only", "needs_review"}
 DIMENSIONS = ("rapport", "trust", "familiarity", "playfulness", "friction", "support", "boundary_alignment", "repair", "mutuality")
@@ -57,6 +58,40 @@ def flag_enabled(name: str, environ: Mapping[str, str] | None = None) -> bool:
 def shadow_enabled(environ: Mapping[str, str] | None = None) -> bool: return flag_enabled(SHADOW_ENV, environ)
 def live_enabled(environ: Mapping[str, str] | None = None) -> bool: return flag_enabled(LIVE_ENV, environ)
 def active_engagement_live_enabled(environ: Mapping[str, str] | None = None) -> bool: return flag_enabled(ACTIVE_ENGAGEMENT_LIVE_ENV, environ)
+
+
+def sealed_canary_enabled(*, guild_id: int, user_id: int, channel_id: int,
+                         route_mode: str, channel_policy: str, direct: bool,
+                         environ: Mapping[str, str] | None = None) -> bool:
+    """Authorize only a sealed, same-member tone read; never evidence writes."""
+    env = os.environ if environ is None else environ
+
+    def ids(key: str) -> set[int]:
+        values = str(env.get(key, "")).split(",")
+        if not all(value.strip().isdigit() and int(value.strip()) > 0 for value in values):
+            return set()
+        return {int(value.strip()) for value in values}
+
+    guilds = ids("BNL_RELATIONSHIP_V2_SEALED_CANARY_GUILD_IDS")
+    channels = ids("BNL_RELATIONSHIP_V2_SEALED_CANARY_CHANNEL_IDS")
+    users = ids("BNL_RELATIONSHIP_V2_SEALED_CANARY_USER_IDS")
+    return bool(
+        flag_enabled(SEALED_CANARY_ENV, env)
+        and len(guilds) == 1 and guild_id in guilds
+        and len(channels) == 1 and channel_id in channels
+        and user_id in users and direct
+        and route_mode == "normal_chat" and channel_policy == "sealed_test"
+        and shadow_enabled(env)
+        and all(flag_enabled(key, env) for key in (
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED", "BNL_MOMENT_ENGINE_SHADOW_ENABLED",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED",
+        ))
+        and not any(flag_enabled(key, env) for key in (
+            LIVE_ENV, ACTIVE_ENGAGEMENT_LIVE_ENV, "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED",
+        ))
+    )
+
+
 def _now() -> str: return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 def _canon(v: Any) -> str: return re.sub(r"\s+", " ", str(v or "").strip().lower())
 def _clamp(x: float) -> float: return max(-1.0, min(1.0, round(float(x or 0.0), 6)))
@@ -150,6 +185,8 @@ class RelationshipEventV2:
 
 def classify_message(text: str, *, actor_role: str, directed: bool, channel_policy: str, route_mode: str) -> tuple[str, str, float, float]:
     t = _canon(text)
+    if channel_policy == "sealed_test":
+        return "unclassified", "sealed exchange excluded from relationship history", .0, .0
     if actor_role != "user":
         return "model_audit", "model output recorded for audit with zero positive relationship weight", .3, 0.0
     if not directed or channel_policy not in ELIGIBLE_RELATIONSHIP_POLICIES or route_mode in DISALLOWED_RELATIONSHIP_ROUTES:
@@ -204,7 +241,7 @@ def record_observation_diagnostic(conn: sqlite3.Connection, *, guild_id: int, us
 
 def observe_message(conn: sqlite3.Connection, *, guild_id: int, user_id: int, role: str, content: str, source_row_id: int | str, user_name: str = "", channel_policy: str = "unknown", channel_name: str = "", channel_id: int = 0, message_id: int | None = None, route_mode: str = "unknown", directed: bool = False, observed_at: str = "") -> str:
     et, summary, conf, sal = classify_message(content, actor_role=role, directed=directed, channel_policy=channel_policy, route_mode=route_mode)
-    if et == "unclassified" and role == "user":
+    if et == "unclassified":
         reason = "sealed_test" if channel_policy == "sealed_test" else ("passive" if not directed else "policy_or_route_or_ambiguous")
         record_observation_diagnostic(conn, guild_id=guild_id, user_id=user_id, role=role, reason=reason, source_row_id=source_row_id, route_mode=route_mode, channel_policy=channel_policy, observed_at=observed_at)
         return ""
@@ -321,21 +358,37 @@ def settings_summary(conn: sqlite3.Connection, *, guild_id: int, user_id: int) -
     pref = _latest_pref(conn, guild_id=guild_id, user_id=user_id, key="proactive") or ("enabled" if s["proactive_enabled"] else "disabled")
     return f"Relationship v2 settings: proactive={'enabled' if pref == 'enabled' and s['proactive_enabled'] else 'disabled'}; playful_rivalry={'enabled' if s['playful_rivalry_enabled'] else 'disabled'}."
 
-def governed_summary(conn: sqlite3.Connection, *, guild_id: int, user_id: int, route_mode: str, channel_policy: str, simple_greeting: bool = False, direct: bool = True, target_user_id: int | None = None, governance_allowed: bool = True) -> str:
-    if not live_enabled() or not governance_allowed or simple_greeting or not direct: return ""
+def governed_summary(conn: sqlite3.Connection, *, guild_id: int, user_id: int, route_mode: str, channel_policy: str, simple_greeting: bool = False, direct: bool = True, target_user_id: int | None = None, governance_allowed: bool = True, environ: Mapping[str, str] | None = None, channel_id: int = 0) -> str:
+    if simple_greeting or not direct: return ""
     if target_user_id is not None and int(target_user_id or 0) != int(user_id or 0): return ""
-    if channel_policy not in PUBLIC_POLICIES or route_mode not in RELATIONSHIP_LIVE_ROUTES: return ""
+    scoped = sealed_canary_enabled(
+        guild_id=guild_id, user_id=user_id, channel_id=channel_id,
+        route_mode=route_mode, channel_policy=channel_policy, direct=direct,
+        environ=environ,
+    )
+    if not scoped and not (
+        live_enabled(environ) and governance_allowed
+        and channel_policy in PUBLIC_POLICIES and route_mode in RELATIONSHIP_LIVE_ROUTES
+    ): return ""
     ensure_relationship_v2_schema(conn); settings = get_member_settings(conn, guild_id=guild_id, user_id=user_id)
     row=conn.execute("SELECT rapport,trust,familiarity,friction,support,repair,relationship_stage,rivalry_state,engagement_opt_out FROM relationship_state_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).fetchone()
     if not row: return ""
     rapport, trust, fam, fric, support, repair, stage, rivalry, opt = row
     tone = "familiar" if fam >= .15 else "lightly familiar" if fam > .05 else "new/low-history"
     warmth = "warm" if rapport >= .15 else "neutral-warm" if rapport > .03 else "neutral"
-    safe = [f"Private relationship calibration for current member only: use a {warmth}, {tone} tone.", "Do not mention internal relationship state, labels, scores, or evidence."]
-    if opt or not settings["proactive_enabled"]: safe.append("Do not proactively recognize or follow up with this member.")
-    if rivalry == "mutual_rivalry" and settings["playful_rivalry_enabled"] and not opt: safe.append("Playful rivalry is allowed only if the member continues it in the current turn.")
-    if fric > .05 or repair > .05: safe.append("Prefer careful repair-aware wording; do not relitigate the old friction.")
-    return " ".join(safe)[:500]
+    safe = [
+        f"Private relationship calibration for current member only: {warmth}, {tone}.",
+        "Tentative tone hint: interpret banter, correction and repair from the current exchange and eligible history.",
+        "Current context outranks old impressions. Keep factual recall and helpfulness independent of rapport.",
+        "Never reveal labels, scores or private evidence.",
+    ]
+    proactive_allowed = not opt and settings["proactive_enabled"]
+    if not proactive_allowed: safe.append("No proactive recognition or follow-up.")
+    if rivalry == "mutual_rivalry" and settings["playful_rivalry_enabled"] and proactive_allowed: safe.append("Rivalry only if the member continues it now.")
+    if fric > .05 or repair > .05: safe.append("Allow repair; do not replay old friction.")
+    # The fixed clauses fit the existing 500-character allowance together.
+    # Never truncate away a member boundary or the current-context precedence.
+    return " ".join(safe)
 
 
 def shadow_packet_posture(

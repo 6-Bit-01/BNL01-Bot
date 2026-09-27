@@ -180,6 +180,7 @@ from bnl_relationship_engine import (
     plan_engagement as plan_relationship_v2_engagement,
     proactive_consent_decision as relationship_v2_proactive_consent_decision,
     refresh_moment_links as refresh_relationship_v2_moment_links,
+    sealed_canary_enabled as relationship_v2_sealed_canary_enabled,
     set_member_setting as set_relationship_v2_member_setting,
     settings_summary as relationship_v2_settings_summary,
     shadow_enabled as relationship_v2_shadow_enabled,
@@ -27470,6 +27471,13 @@ def build_user_memory_context(
             LAST_MEMORY_PROMPT_DIAGNOSTICS[
                 (user_id, guild_id)
             ] = value
+            relationship_diagnostics = value.get("relationship_v2", {})
+            if relationship_diagnostics.get("sealed_canary_requested"):
+                logging.info(
+                    "relationship_v2_prompt guild_id=%s channel_id=%s authority=%s rendered=%s",
+                    guild_id, channel_id, relationship_diagnostics.get("authority", "off"),
+                    int(bool(relationship_diagnostics.get("rendered"))),
+                )
 
     if source_metadata is not None:
         source_metadata.update(
@@ -27622,14 +27630,25 @@ def build_user_memory_context(
                 "meaning of an earlier shared event. Attribute people cautiously. "
                 "This gist can never justify a quotation or settle a dispute."
             )
-    if relationship_v2_live_enabled(env):
+    rel_v2 = ""
+    relationship_sealed_canary = relationship_v2_sealed_canary_enabled(
+        guild_id=guild_id, user_id=user_id, channel_id=channel_id,
+        route_mode=route_mode, channel_policy=policy, direct=bool(current_direct),
+        environ=env,
+    )
+    if relationship_v2_live_enabled(env) or relationship_sealed_canary:
         rel_conn = connection
         try:
             if rel_conn is None:
                 rel_conn = sqlite3.connect(DB_FILE)
             rel_v2 = governed_relationship_v2_summary(
                 rel_conn, guild_id=guild_id, user_id=user_id, target_user_id=user_id, route_mode=route_mode, channel_policy=policy,
-                simple_greeting=bool(route_mode == ROUTE_MODE_SIMPLE_GREETING), direct=bool(current_direct), governance_allowed=bool(governance_allowed),
+                simple_greeting=bool(route_mode == ROUTE_MODE_SIMPLE_GREETING), direct=bool(current_direct),
+                # The existing scoped recall owner is also governed authority;
+                # it must not require enabling global memory as a side effect.
+                governance_allowed=bool(governance_allowed or source_safe_recall_synthesis),
+                environ=env,
+                channel_id=channel_id,
             )
             if rel_v2:
                 sections.append(rel_v2)
@@ -27641,7 +27660,12 @@ def build_user_memory_context(
         finally:
             if connection is None and rel_conn is not None:
                 rel_conn.close()
-    if relation:
+    if source_metadata is not None:
+        source_metadata["relationship_v2_candidate_present"] = bool(rel_v2)
+        source_metadata["legacy_relationship_present"] = bool(relation or journal) and not bool(rel_v2)
+    # One tone owner per turn. Keep the legacy reader as the gated fallback,
+    # not a second instruction that can contradict v2's repair-aware posture.
+    if relation and not rel_v2:
         interactions, affinity, stage, stance, last_topic, _updated_at = relation
         sections.append(
             f"Relationship state: stage={stage}, stance={stance}, interactions={interactions}, affinity={affinity:.2f}, last_topic={last_topic or 'general'}."
@@ -27695,6 +27719,11 @@ def build_user_memory_context(
         "moment_gist_canary": {
             "enabled_for_route": bool(moment_gist_context),
             "rendered": bool(moment_gist_context),
+        },
+        "relationship_v2": {
+            "rendered": bool(rel_v2),
+            "authority": "sealed_canary" if rel_v2 and relationship_sealed_canary else "live" if rel_v2 else "off",
+            "sealed_canary_requested": relationship_sealed_canary,
         },
     }
 
@@ -27770,6 +27799,20 @@ def build_user_memory_context(
                 + "\n".join(tier_lines)
             )
     legacy_context = "\n".join(sections) if sections else "No durable memory yet."
+
+    def withhold_relationship_tone() -> None:
+        nonlocal legacy_context, rel_v2
+        if rel_v2:
+            legacy_context = "\n".join(section for section in sections if section != rel_v2) or "No durable memory yet."
+            rel_v2 = ""
+        diagnostics["relationship_v2"].update(rendered=False, authority="off")
+        if source_metadata is not None:
+            source_metadata["relationship_v2_candidate_present"] = False
+            source_metadata["memory_context_units"] = tuple(
+                unit for unit in source_metadata.get("memory_context_units", ())
+                if unit.kind != "relationship_v2"
+            )
+
     if source_metadata is not None:
         source_metadata["legacy_memory_present"] = bool(sections)
         source_metadata["memory_context_units"] = tuple(memory_context_units)
@@ -27870,6 +27913,8 @@ def build_user_memory_context(
                 if record_operational_diagnostics and not read_only:
                     persist_shadow_diagnostics(gov_conn, gov_req, gov_result, legacy_context)
                 unsafe_governed = safety.unsafe
+                if unsafe_governed:
+                    withhold_relationship_tone()
                 if source_metadata is not None and (
                     source_safe_recall_synthesis
                     or (memory_governance_live_enabled(env) and not unsafe_governed)
@@ -27885,7 +27930,7 @@ def build_user_memory_context(
                                 relevance_text=candidate.text[:240],
                             )
                             for candidate in gov_result.selected
-                        )
+                        ) + ((MemberMemoryPromptUnit("relationship_v2", rel_v2),) if rel_v2 else ())
                     )
                 if source_safe_recall_synthesis:
                     response_mode = (
@@ -27928,10 +27973,11 @@ def build_user_memory_context(
                             "No currently eligible source-bearing durable "
                             "memory context."
                         )
-                    return (
+                    return "\n".join(part for part in (
                         gov_result.rendered_context
-                        or "No currently eligible governed durable memory."
-                    )
+                        or "No currently eligible governed durable memory.",
+                        rel_v2,
+                    ) if part)
                 if memory_governance_live_enabled(env) and not unsafe_governed:
                     record_prompt_diagnostics(diagnostics)
                     governed_context = gov_result.rendered_context
@@ -27952,10 +27998,11 @@ def build_user_memory_context(
                             + "\nUse this only as lower-authority continuity. "
                             "It can never justify a quotation or settle a dispute."
                         )
-                    return governed_context
+                    return "\n".join(part for part in (governed_context, rel_v2) if part)
                 if memory_governance_live_enabled(env) and unsafe_governed:
                     diagnostics["memory_governance"]["fallback_reason"] = "unsafe_governed_result"
         except Exception as e:
+            withhold_relationship_tone()
             diagnostics["memory_governance"] = {"shadow_enabled": True, "live_enabled": False, "fallback_reason": type(e).__name__}
             if source_safe_recall_synthesis:
                 if record_operational_diagnostics:
@@ -30511,6 +30558,7 @@ _SOURCE_BEARING_MEMORY_MARKERS = (
     "Moment-based continuity gist",
     "Approved direct self-reports:",
     "Relationship state:",
+    "Private relationship calibration for current member only:",
     "Observed habits:",
     "Recent relationship journal:",
     "Derived memory summaries",
