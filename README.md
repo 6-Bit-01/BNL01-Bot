@@ -127,6 +127,24 @@ post-show draft. Manual Generate/Polish requests use direct-conversation dollar
 priority. Both remain one provider attempt, without fallback; neither raises any
 spending cap or consumes the Journal's reserved budget.
 
+Moment meaning is core memory maintenance, not optional publication. Its bounded
+single provider attempt bypasses the optional monthly/daily pace gates while
+retaining the monthly hard ceiling, conservative unknown-cost checks, daily
+emergency token ceiling, and Journal/interactive reserves. A local refusal with
+zero physical provider calls becomes `budget_deferred`, with its reason and a
+durable 30-minute cooldown. The existing Moment sweep rechecks current sources,
+privacy, scope, and gates before resuming it. Actual provider failures and
+interrupted calls are not automatically replayed. Historical terminal failures
+require explicit, evidence-backed recovery; they are not blindly requeued.
+
+These are BNL spending safeguards, not Google quotas. Optional Ambient/occasion
+and image work retains pacing to avoid consuming funds needed for core work.
+The daily token ceiling bounds a one-day runaway even when monthly funds remain.
+Google's project/model rate limits and actual billing are separate; `/usage`
+remains a local estimate. Image validation rejections from Interactions' string
+`error.code` release their unused reservation just like `error.status` rejections;
+ambiguous transport failures retain a conservative hold.
+
 Native queue context has two independent production gates plus one website-owned access scope. The local bot variable `BNL_QUEUE_PRODUCTION_ENABLED` defaults off and accepts only `true` (case-insensitive); the website read model must also report `capabilities.queueProduction=true`. The website then declares `accessScope=none`, `private`, or `public`. `none` is always stripped. `private` is accepted only from an authenticated response obtained with the existing `BNL_API_KEY`, and only `sealed_test` and `internal_controlled` channel policies may retain its queue/history fields. Those Discord channels are permission-locked for explicitly admitted rehearsal testers and operators; ordinary server members remain excluded. Discord channel access is the authorization boundary, so the bot deliberately does not add a second owner-only requester check inside those already restricted channels. In `#bnl-testing`, read-only queue questions create a response obligation regardless of the participant's owner/admin/mod status. `public` may support public queue context. Merging queue-aware code does not enable either production gate or change a site's session access choice.
 
 Explicit rehearsal/session credit and playback questions use that same read model even without the word "queue". Playback readouts combine the matching current session's existing timeline with its recent operational events. A play-start/resume event or natural-end evidence establishes actual playback; loading, the legacy `playedAt` field and Finish outcomes alone do not. Missing confirmation is reported as missing evidence, never proof that a track was not played. This read remains temporary context and adds no background polling or persistence. The route diagnostic's `source context allowed` field describes scouting/classification context, not website queue access.

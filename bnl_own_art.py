@@ -199,7 +199,14 @@ def _image_provider_error(exc: Exception, *, secrets: tuple[str, ...]) -> Runtim
                 fields = {}
         except Exception:
             fields = {}
-    carrier = SimpleNamespace(message=fields.get("message"), status=fields.get("status"), details=fields)
+    # Interactions uses a string error.code where generateContent uses status.
+    # Normalize only known validation/auth rejections; never infer from prose.
+    interaction_status = {
+        "invalid_request": "INVALID_ARGUMENT", "unauthenticated": "UNAUTHENTICATED",
+        "permission_denied": "PERMISSION_DENIED", "not_found": "NOT_FOUND",
+    }.get(fields.get("code") if isinstance(fields.get("code"), str) else "")
+    carrier = SimpleNamespace(message=fields.get("message"),
+                              status=fields.get("status") or interaction_status, details=fields)
     error.provider_diagnostics = provider_server_diagnostics(carrier, secrets=secrets)
     return error
 

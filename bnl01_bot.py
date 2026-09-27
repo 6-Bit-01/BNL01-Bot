@@ -159,6 +159,7 @@ from bnl_moment_engine import (
     claim_pending_moment_meaning,
     expire_stale_moment_meaning_attempts,
     fail_moment_meaning,
+    defer_moment_meaning,
     active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
     render_active_episode_canary_context,
@@ -24348,6 +24349,12 @@ def _dollar_budget_decision(
     if policy.showday_protected:
         return True, "showday_protected"
 
+    # Memory formation serves every consumer, even on a busy conversation day.
+    # Keep the hard ceiling, unknown-cost guard and both essential reserves;
+    # the optional-publication pace gate must not suppress this bounded work.
+    if policy.memory_protected:
+        return True, "memory_protected"
+
     pace = calculate_monthly_budget_pace(
         _nanos_to_usd(guarded_month_nanos),
         _nanos_to_usd(guarded_today_nanos),
@@ -36393,13 +36400,16 @@ async def _process_one_moment_meaning() -> None:
             conn.execute('BEGIN IMMEDIATE')
             return claim_pending_moment_meaning(conn, guild_ids=_moment_meaning_public_guilds())
 
-    def finish(*, text='', reason=''):
+    def finish(*, text='', reason='', budget_reason=''):
         with closing(sqlite3.connect(DB_FILE, timeout=3)) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
             if request.guild_id not in _moment_meaning_public_guilds():
                 reason = 'scope_disabled'
             if reason:
                 fail_moment_meaning(conn, request, reason=reason)
+                return False
+            if budget_reason:
+                defer_moment_meaning(conn, request, reason=budget_reason)
                 return False
             return apply_moment_meaning(conn, request, text)
 
@@ -36414,8 +36424,18 @@ async def _process_one_moment_meaning() -> None:
         result = await _generate_gemini_content_result_async(
             request.prompt, 'moment_meaning_background', attempt_counter=attempts,
         )
-        applied = await asyncio.to_thread(finish, text=result.text if result.success else '',
-                                         reason='' if result.success else 'provider_unavailable')
+        budget_deferred = (not result.success and attempts.count == 0
+                           and result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET)
+        outcome = '' if result.success else ('budget_deferred' if budget_deferred else 'provider_unavailable')
+        applied = await asyncio.to_thread(
+            finish, text=result.text if result.success else '',
+            reason='' if result.success or budget_deferred else outcome,
+            budget_reason=(result.provider_error_code or GENERATION_ERROR_LOCAL_MODEL_BUDGET)
+                          if budget_deferred else '',
+        )
+        logging.info('moment_meaning_outcome moment_id=%s outcome=%s budget_reason=%s',
+                     request.moment_id, outcome or ('ready' if applied else 'not_applied'),
+                     result.provider_error_code if budget_deferred else 'none')
         logging.info('moment_meaning_result moment_id=%s applied=%s provider_ok=%s '
                      'physical_attempts=%s elapsed_seconds=%.3f estimated_cost_nanos=%s cost_priced=%s',
                      request.moment_id, applied, result.success, attempts.count,

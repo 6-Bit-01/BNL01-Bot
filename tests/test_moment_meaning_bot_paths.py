@@ -115,6 +115,58 @@ class MomentMeaningBotTests(unittest.IsolatedAsyncioTestCase):
         generate.assert_awaited_once()
         self.assertEqual(self.status(), 'provider_unavailable')
 
+    async def test_local_denial_survives_restart_and_recovers_once_after_cooldown(self):
+        denied = bot.GenerationResult(False, error_category=bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+                                      provider_error_code='monthly_hard_limit')
+        with mock.patch.object(bot, '_generate_gemini_content_result_async', return_value=denied) as generate:
+            await bot._process_one_moment_meaning()
+            self.assertEqual(self.status(), 'budget_deferred')
+            # Reopened connections and a restarted sweep must honor the saved cooldown.
+            await bot._process_one_moment_meaning()
+            generate.assert_awaited_once()
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute('SELECT meaning_deferred_reason,meaning_retry_after FROM memory_moment_windows '
+                               'WHERE moment_id=?', (self.mid,)).fetchone()
+            self.assertEqual(row[0], 'monthly_hard_limit')
+            self.assertGreater(datetime.fromisoformat(row[1]), datetime.now(timezone.utc))
+            conn.execute("UPDATE memory_moment_windows SET meaning_retry_after='2000-01-01' WHERE moment_id=?", (self.mid,))
+        with mock.patch.object(bot, '_generate_gemini_content_result_async',
+                               return_value=bot.GenerationResult(True, json.dumps(fixtures.REPORTER_MEANING))) as generate:
+            await bot._process_one_moment_meaning()
+            await bot._process_one_moment_meaning()
+            generate.assert_awaited_once()
+        self.assertEqual(self.status(), 'ready')
+
+    async def test_deferred_work_revalidates_privacy_before_any_provider_call(self):
+        denied = bot.GenerationResult(False, error_category=bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET)
+        with mock.patch.object(bot, '_generate_gemini_content_result_async', return_value=denied):
+            await bot._process_one_moment_meaning()
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("UPDATE memory_moment_windows SET meaning_retry_after='2000-01-01' WHERE moment_id=?", (self.mid,))
+            conn.execute("UPDATE memory_ledger_entries SET visibility='private' WHERE entry_id=?", (self.roots[0],))
+        with mock.patch.object(bot, '_generate_gemini_content_result_async') as generate:
+            await bot._process_one_moment_meaning()
+            generate.assert_not_called()
+        self.assertNotIn(self.status(), ('generating', 'ready', 'pending', 'budget_deferred'))
+
+    async def test_local_category_after_physical_call_never_authorizes_replay(self):
+        async def provider(*args, attempt_counter, **kwargs):
+            attempt_counter.mark_started()
+            return bot.GenerationResult(False, error_category=bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET)
+        with mock.patch.object(bot, '_generate_gemini_content_result_async', side_effect=provider) as generate:
+            await bot._process_one_moment_meaning()
+            await bot._process_one_moment_meaning()
+            generate.assert_awaited_once()
+        self.assertEqual(self.status(), 'provider_unavailable')
+
+    async def test_disabled_scope_cannot_be_requeued_by_a_local_denial(self):
+        async def provider(*args, **kwargs):
+            bot._moment_meaning_public_guilds.return_value = ()
+            return bot.GenerationResult(False, error_category=bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET)
+        with mock.patch.object(bot, '_generate_gemini_content_result_async', side_effect=provider):
+            await bot._process_one_moment_meaning()
+        self.assertEqual(self.status(), 'scope_disabled')
+
     async def test_scope_disabled_during_provider_wait_discards_result(self):
         async def provider(*args, **kwargs):
             bot._moment_meaning_public_guilds.return_value = ()
@@ -157,7 +209,7 @@ class MomentMeaningBotTests(unittest.IsolatedAsyncioTestCase):
             await first
         process.assert_awaited_once()
 
-    def test_generation_uses_json_and_bounded_nonprotected_background_policy(self):
+    def test_generation_uses_json_and_bounded_memory_policy(self):
         with mock.patch.dict(os.environ, {'BNL_GEMINI_PROVIDER_RETRIES': '2'}):
             policy = policy_for_route('moment_meaning_background')
         self.assertEqual(policy.lane, 'background')
@@ -166,6 +218,7 @@ class MomentMeaningBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(policy.allow_fallback)
         self.assertFalse(policy.journal_protected)
         self.assertFalse(policy.relay_protected)
+        self.assertTrue(policy.memory_protected)
         config = bot._generation_config_for_model(bot.GEMINI_MODEL, 'moment_meaning_background')
         self.assertEqual(config.response_mime_type, 'application/json')
         self.assertEqual(config.max_output_tokens, 2048)
