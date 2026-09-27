@@ -6337,6 +6337,7 @@ def select_situation_aware_episode_gists(
     allowed_channel_policies: tuple[str, ...] = (),
     max_results: int = 4,
     topic_association: bool = False,
+    association_date_scope: bool = False,
     now: str | None = None,
 ) -> tuple[SituationAwareEpisodeGist, ...]:
     """Apply one frame to existing Moment/episode projections, read-only."""
@@ -6392,7 +6393,7 @@ def select_situation_aware_episode_gists(
             max_results=max_results if topic_association else 12,
             require_topic_overlap=topic_association,
             now=now,
-            apply_date_scope=not topic_association,
+            apply_date_scope=not topic_association or association_date_scope,
         ):
             source_rows.append(
                 {

@@ -2997,6 +2997,10 @@ def render_packet_context(
                 qualifier = "; topic association only; paraphrase only"
             else:
                 qualifier = "; frame-bound; paraphrase only"
+            if item.attribution_mode == "historical_other_participants":
+                qualifier += "; the current speaker was NOT a recorded participant; do not recast an unnamed historical participant as 'you'"
+            elif item.attribution_mode == "historical_participants_only":
+                qualifier += "; preserve the original participants; do not guess which historical speaker is the requester"
         elif item.lane == "show_episode":
             qualifier = (
                 "; first-party public chronology; no unseen studio events"
