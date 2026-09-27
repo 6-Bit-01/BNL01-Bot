@@ -518,6 +518,47 @@ enforcement, and zero unauthorized live emissions. Active Engagement v2 is
 last; it requires separate frequency, relevance, cooldown, no-ping, opt-out,
 and rollback evidence.
 
+### Relationship prompt coordination and sealed comparison
+
+The Relationship owner supplies one tentative, private tone hint. When that
+hint is authorized, the prompt omits the competing legacy relationship label.
+Governed factual selection retains the hint as a separate, non-factual unit;
+empty factual results do not erase eligible tone. Unsafe or failed governance
+withholds the hint. Current conversation and eligible history take precedence
+over old relationship impressions, and rapport must not limit factual recall
+or helpfulness. Tone-only prompts participate in the existing source refresh
+before send, including member-boundary and kill-switch changes.
+
+A separately approved sealed comparison can exercise this integration without
+global Relationship, Memory Governance, or Active Engagement activation. It is
+disabled by default and requires all of the following:
+
+- `BNL_RELATIONSHIP_V2_SEALED_CANARY_ENABLED=true`;
+- `BNL_RELATIONSHIP_V2_SEALED_CANARY_GUILD_IDS=<one approved guild>`;
+- `BNL_RELATIONSHIP_V2_SEALED_CANARY_CHANNEL_IDS=<one approved sealed channel>`;
+- `BNL_RELATIONSHIP_V2_SEALED_CANARY_USER_IDS=<approved member IDs>`;
+- the existing Ledger, Moment, Governance, and Relationship shadow switches;
+- all three global live switches off; and
+- a direct `normal_chat` request in `sealed_test`, for the requesting member.
+
+This reads existing member posture through the Relationship owner. It does not
+admit sealed messages as relationship evidence, change channel policy, grant
+another member's posture, or authorize proactive messages. Aggregate
+`relationship_v2_prompt` logs identify whether the sealed authority supplied
+tone, without logging scores, relationship labels, or private evidence.
+
+After an explicit deployment and sealed-canary decision, compare a correction,
+a differently worded reconciliation, a request to stop teasing, and a grounded
+memory question in the approved channel. Check the selected path and send-time
+source refresh as well as the replies. Disable the sealed switch and confirm
+ordinary routing returns. No public activation follows automatically.
+
+This integration does not replace the phrase-based event classifier or prove
+semantic relationship formation. Contextual classification, source withdrawal,
+repair over time, and representative comparisons remain prerequisites for
+broader Relationship activation. Artist assessments, factual memory tiers,
+Core promotion, and autonomous engagement retain their existing owners.
+
 Durable knowledge calcification is also later work. Atomic knowledge
 candidates, independent reinforcement, contradiction/supersession,
 consolidation, governed long-range retrieval, and rare reviewed Core promotion
