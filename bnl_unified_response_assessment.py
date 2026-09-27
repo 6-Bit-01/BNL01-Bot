@@ -773,6 +773,24 @@ def situation_subject_label_spans(
         ):
             subject_seen = False
             topic_only = False
+        clause_prefix = re.split(r"[?!;\n]|\.(?=\s|$)", value[:start])[-1]
+        clause_start = start - len(clause_prefix)
+        clause_start = max((task_start for task_start in task_starts
+                            if clause_start < task_start <= start), default=clause_start)
+        clause_prefix = value[clause_start:start]
+        # A separation constraint names the identity to exclude, not another
+        # subject whose history should be combined with the requested person.
+        # Keep the original request intact; this only scopes source lookup.
+        excluded_identity = bool(
+            re.search(r"^\s*(?:keep|treat)\b.*\b(?:separate|distinct)\s+from\b", clause_prefix, re.I)
+            or (
+                re.search(r"\b(?:is|are)\s+not\s*$", clause_prefix, re.I)
+                and not re.search(r"\b(?:who|what|why|how|whether|if)\b", clause_prefix, re.I)
+            )
+        )
+        if excluded_identity:
+            previous_end = end
+            continue
         if subject_seen and not topic_only:
             for boundary in re.finditer(r"\b(?:about|regarding|concerning|on)\b", between, re.I):
                 coordinated = re.search(

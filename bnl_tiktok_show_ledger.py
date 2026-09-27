@@ -2746,6 +2746,14 @@ def _document_relevance(
     ]
     participant_matches = []
     direct_subject_candidates = []
+    occurrences = _participant_label_occurrences(participants, query)
+    request_subject_spans = set(situation_subject_label_spans(query, [
+        (start, end) for start, end, _participant in occurrences
+    ]))
+    named_here = {
+        id(participant) for start, end, participant in occurrences
+        if (start, end) in request_subject_spans
+    }
     for participant in participants:
         participant_subject_ref = str(participant.get("subjectRef") or "")
         direct_subject = bool(
@@ -2757,7 +2765,7 @@ def _document_relevance(
         )
         named = (
             participant_subject_ref in named_subject_refs
-            if named_subject_refs else _participant_named(query, participant)
+            if named_subject_refs else id(participant) in named_here
         )
         if direct_subject:
             direct_subject_candidates.append(participant)
