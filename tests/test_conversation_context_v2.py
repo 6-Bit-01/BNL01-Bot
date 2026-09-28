@@ -45,6 +45,58 @@ def req(**kw):
     return ConversationContextRequest(**base)
 
 class ConversationContextV2Tests(unittest.TestCase):
+    def test_attribution_followup_uses_latest_answer_to_same_requester(self):
+        rows = [
+            row(1, "user", "Recall the June 1 recipe discussion.", minutes=4),
+            row(2, "model", "There was a correction about the recipe.", minutes=3),
+            row(3, "user", "What exactly did they correct?", minutes=2),
+            row(4, "model", "Test Member Two corrected the ingredient.", minutes=1),
+        ]
+        for text in ("Who said that, and when was that exchange?",
+                     "Who wrote that?", "Who posted this?", "Who shared it?"):
+            for policy in ("public_home", "sealed_test"):
+                with self.subTest(text=text, policy=policy):
+                    result = assemble_conversation_context_v2(
+                        [dict(item, channel_policy=policy) for item in rows],
+                        req(current_texts=(text,), channel_policy=policy),
+                    )
+                    self.assertEqual(result.referent_status, "resolved")
+                    self.assertEqual(result.referent_selected_row_ids, (4,))
+                    self.assertIn(1, result.selected_row_ids)
+                    self.assertIn(3, result.selected_row_ids)
+                    self.assertIn("not canon/current-state evidence", result.rendered_context)
+
+    def test_attribution_followup_cannot_skip_intervening_or_unowned_turn(self):
+        base = [row(1, "user", "Recall the old recipe conversation.", minutes=2),
+                row(2, "model", "Test Member Two corrected the ingredient.")]
+        variants = (
+            [base[1]],  # An orphan answer cannot establish a thread.
+            [dict(item, user_id=2) for item in base],
+            [dict(item, timestamp=(NOW-timedelta(minutes=11)).isoformat()) for item in base],
+            [dict(item, channel_id=20) for item in base],
+            [dict(item, channel_policy="internal_controlled") for item in base],
+            [*base, row(3, "user", "A new contribution.", user=2)],
+            [*base, row(3, "user", "An unrelated message.")],
+            [base[0], dict(base[1], response_participant_ids=(1, 2))],
+        )
+        for rows in variants:
+            with self.subTest(rows=rows):
+                result = assemble_conversation_context_v2(
+                    rows, req(current_texts=("Who said that?",)),
+                )
+                self.assertNotEqual(result.referent_reason, "latest_answer_continuation")
+
+    def test_attribution_continuation_preserves_exact_reply_precedence(self):
+        rows = [row(1, "user", "First contribution.", mid=101),
+                row(2, "model", "First answer.", mid=102),
+                row(3, "user", "Second contribution.", mid=103),
+                row(4, "model", "Second answer.", mid=104)]
+        result = assemble_conversation_context_v2(rows, req(
+            current_texts=("Who said that?",), referenced_message_ids=(101,),
+        ))
+        self.assertEqual(result.referent_reason, "discord_reply_source")
+        self.assertEqual(result.referent_selected_row_ids, (1,))
+
     def test_recent_human_request_survives_without_saved_reply_or_word_overlap(self):
         for policy in ("public_home", "sealed_test"):
             for batch in (False, True):
