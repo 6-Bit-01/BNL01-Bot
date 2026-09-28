@@ -7,7 +7,7 @@ allowlisted prompt canary may render only revalidated public-safe Moment gist.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 import calendar
 import hashlib
@@ -329,6 +329,7 @@ class MomentMeaningRequest:
     participants: tuple[str, ...]
     sources: tuple[SourceEntry, ...]
     prompt: str
+    admission_required: bool = False
 
 
 def shadow_enabled(environ: dict[str, str] | None = None) -> bool:
@@ -2650,6 +2651,40 @@ def _reply_target_moment(conn: sqlite3.Connection, source: SourceEntry) -> str:
     return "" if failure else mid
 
 
+def _semantic_admission_eligible(rows: list[SourceEntry], *, channel_policy: str,
+                                 visibility: str, public_usable: bool) -> bool:
+    humans = [row for row in rows if row.is_human
+              and _meaningful(row.normalized_value, row.source_role, row.predicate_key)]
+    return bool(
+        public_usable and channel_policy in PUBLIC_CROSS_CHANNEL_POLICIES
+        and visibility in {"public", "public_safe"} and humans
+        and len({row.subject_key for row in humans}) <= 6
+        and len(rows) <= MOMENT_MEANING_MAX_SOURCES
+        and sum(len(row.normalized_value) for row in rows) <= MOMENT_MEANING_MAX_SOURCE_CHARS
+        and not any(_contains_sensitive_moment_source(row.normalized_value, row.predicate_key)
+                    for row in rows)
+    )
+
+
+def _same_speaker_meaning_candidate(conn: sqlite3.Connection, moment_id: str,
+                                    source: SourceEntry) -> bool:
+    """Keep a bounded human/BNL follow-up for semantic assessment, not publication."""
+    if not source.is_human or not source.public_usable:
+        return False
+    # An explicit reply has its own source authority and must never be replaced
+    # by a guessed continuation when that target is unavailable or different.
+    if conn.execute("SELECT 1 FROM memory_ledger_lineage WHERE entry_id=? "
+                    "AND guild_id=? AND lineage_type='reply_to' LIMIT 1",
+                    (source.entry_id, source.guild_id)).fetchone():
+        return False
+    rows = _entries(conn, moment_id)
+    return bool(rows and rows[-1].is_model
+        and 0 <= (_parse_ts(source.observed_at) - _parse_ts(rows[-1].observed_at)).total_seconds() <= INACTIVITY_SECONDS
+        and {row.subject_key for row in rows if row.is_human} == {source.subject_key}
+        and _semantic_admission_eligible([*rows, source], channel_policy=source.channel_policy,
+                                        visibility=source.visibility, public_usable=True))
+
+
 def observe_ledger_entry(conn: sqlite3.Connection, ledger_entry_id: str) -> MomentObservationResult:
     if not shadow_enabled():
         return MomentObservationResult(reason_code="moment_gate_disabled", ledger_entry_id=ledger_entry_id)
@@ -2743,6 +2778,12 @@ def observe_ledger_entry(conn: sqlite3.Connection, ledger_entry_id: str) -> Mome
                 continue
             if _coherent(family, signature, win_family or "", _load_sig(win_sig_raw)):
                 chosen = mid
+                break
+            if _same_speaker_meaning_candidate(conn, mid, source):
+                chosen = mid
+                conn.execute("UPDATE memory_moment_windows SET qualification_reason=? WHERE moment_id=?",
+                             ("semantic_continuity_pending", mid))
+                _diag(conn, source.guild_id, "window_continuity_candidate", "semantic_assessment_required", mid, source.entry_id)
                 break
             finalize_moment(conn, mid)
             _diag(conn, source.guild_id, "window_split", "topic_coherence_mismatch", mid, source.entry_id)
@@ -3018,7 +3059,7 @@ def _meaning_record_matches(conn: sqlite3.Connection, moment_id: str,
 def claim_pending_moment_meaning(
     conn: sqlite3.Connection, *, guild_ids: tuple[int, ...], now: datetime | None = None,
 ) -> MomentMeaningRequest | None:
-    """Claim one newly finalized public Moment; legacy records are never queued.
+    """Claim one new public Moment or pending admission; legacy records are never queued.
 
     The caller commits the claim before invoking the existing metered provider.
     Incomplete/interrupted provider attempts are never replayed. Local denials
@@ -3044,12 +3085,13 @@ def claim_pending_moment_meaning(
     if pending[1] == 'budget_deferred':
         conn.execute("UPDATE memory_moment_windows SET meaning_status='pending' "
                      "WHERE moment_id=? AND meaning_status='budget_deferred'", (mid,))
-    loaded = _moment_episode_basis(conn, mid)
+    loaded = _moment_episode_basis(conn, mid, allow_pending_meaning=True)
     if loaded is None:
         conn.execute("UPDATE memory_moment_windows SET meaning_status='source_unavailable' "
                      "WHERE moment_id=? AND meaning_status='pending'", (mid,))
         return None
     basis, rows = loaded
+    admission_required = basis['lifecycle_status'] == 'awaiting_meaning'
     window_summary = conn.execute('SELECT summary FROM memory_moment_windows WHERE moment_id=?',
                                   (mid,)).fetchone()[0]
     eligible = (
@@ -3059,11 +3101,11 @@ def claim_pending_moment_meaning(
         and sum(len(row.normalized_value) for row in rows) <= MOMENT_MEANING_MAX_SOURCE_CHARS
         and not any(_contains_sensitive_moment_source(row.normalized_value, row.predicate_key)
                     for row in rows)
-        and _moment_is_renderable(
+        and (admission_required or _moment_is_renderable(
             conn, moment_id=mid, summary=str(window_summary or ''), guild_id=basis['guild_id'],
             channel_id=basis['channel_id'], channel_policy=basis['channel_policy'],
             route_mode=basis['route_mode'], visibility=basis['visibility'],
-            canonical_ledger_entry_id=basis['canonical_ledger_entry_id'])
+            canonical_ledger_entry_id=basis['canonical_ledger_entry_id']))
     )
     if not eligible:
         conn.execute("UPDATE memory_moment_windows SET meaning_status='ineligible_or_over_budget' "
@@ -3091,13 +3133,29 @@ def claim_pending_moment_meaning(
         "A clarification, different focus or farewell must not erase an earlier substantive turn. "
         "Use participant_1 etc only as contribution object keys; in prose use 'one member', "
         "'another member' or 'the participant' for human authors, and keep BNL separate. "
-        "Return only JSON with keys summary (nonempty string, maximum 360 characters) and "
+        f"Return only JSON with keys {'retain (boolean), ' if admission_required else ''}"
+        "summary (nonempty string, maximum 360 characters) and "
         "contributions (object with exactly the participant keys listed below; each value is a "
         "nonempty paraphrase, maximum 240 characters, describing that human's contribution). "
         "No generic topic labels or empty contributions. This is a derived recollection, "
         "not approved canon or an exact quotation.\n"
         + json.dumps({"participants": list(aliases.values()), "turns": turns}, ensure_ascii=False)
     )
+    if admission_required:
+        prompt = (
+            "First assess whether this bounded exchange contains a worthwhile memory. "
+            "Message count and word overlap are not judgments of significance. A specific "
+            "creative milestone, substantive idea, meaningful question, correction, social "
+            "interaction or distinctive shared joke may matter even in one human turn. "
+            "Routine logistics, generic greetings, filler or unrelated fragments need not be retained. "
+            "An inferred follow-up is only a candidate: decide from the actual turns whether "
+            "they form a meaningful interaction; do not invent a connection. "
+            "Add a boolean retain to the JSON contract below. If retaining, return retain=true "
+            "with the grounded summary and contributions. If declining, return exactly "
+            "{\"retain\":false,\"summary\":\"\",\"contributions\":{}}. "
+            "This judgment creates only a derived recollection, never canon, a trait, "
+            "recurrence, a relationship score or an operational command.\n" + prompt
+        )
     digest = _meaning_source_digest(rows)
     updated = conn.execute(
         "UPDATE memory_moment_windows SET meaning_status='generating',meaning_source_digest=?, "
@@ -3109,7 +3167,7 @@ def claim_pending_moment_meaning(
         return None
     _diag(conn, basis['guild_id'], 'moment_meaning_claimed', 'single_background_attempt', mid)
     return MomentMeaningRequest(mid, basis['guild_id'], basis['canonical_ledger_entry_id'],
-                                digest, participants, tuple(rows), prompt)
+                                digest, participants, tuple(rows), prompt, admission_required)
 
 
 def expire_stale_moment_meaning_attempts(
@@ -3172,6 +3230,10 @@ def fail_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest,
         (safe_reason, _now(), request.moment_id, request.guild_id, request.source_digest),
     )
     if changed.rowcount:
+        if request.admission_required:
+            conn.execute("UPDATE memory_moment_windows SET lifecycle_status='needs_review' "
+                         "WHERE moment_id=? AND guild_id=? AND lifecycle_status='awaiting_meaning'",
+                         (request.moment_id, request.guild_id))
         _diag(conn, request.guild_id, 'moment_meaning_not_applied', safe_reason, request.moment_id)
 
 
@@ -3187,8 +3249,9 @@ def apply_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest
         if not status or tuple(status) != ('generating', request.source_digest):
             conn.execute('RELEASE moment_meaning_apply')
             return False
-        loaded = _moment_episode_basis(conn, request.moment_id)
+        loaded = _moment_episode_basis(conn, request.moment_id, allow_pending_meaning=request.admission_required)
         if (not loaded or loaded[0]['canonical_ledger_entry_id'] != request.canonical_ledger_entry_id
+                or (loaded[0]['lifecycle_status'] == 'awaiting_meaning') != request.admission_required
                 or _meaning_source_digest(loaded[1]) != request.source_digest):
             fail_moment_meaning(conn, request, reason='source_changed')
             conn.execute('RELEASE moment_meaning_apply')
@@ -3196,11 +3259,16 @@ def apply_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest
         basis, rows = loaded
         current_summary = conn.execute('SELECT summary FROM memory_moment_windows WHERE moment_id=?',
                                        (request.moment_id,)).fetchone()[0]
-        if not _moment_is_renderable(
+        if request.admission_required:
+            renderable = _semantic_admission_eligible(rows, channel_policy=basis['channel_policy'],
+                visibility=basis['visibility'], public_usable=basis['public_usable'])
+        else:
+            renderable = _moment_is_renderable(
                 conn, moment_id=request.moment_id, summary=str(current_summary or ''),
                 guild_id=request.guild_id, channel_id=basis['channel_id'],
                 channel_policy=basis['channel_policy'], route_mode=basis['route_mode'],
-                visibility=basis['visibility'], canonical_ledger_entry_id=request.canonical_ledger_entry_id):
+                visibility=basis['visibility'], canonical_ledger_entry_id=request.canonical_ledger_entry_id)
+        if not renderable:
             fail_moment_meaning(conn, request, reason='source_changed')
             conn.execute('RELEASE moment_meaning_apply')
             return False
@@ -3213,8 +3281,21 @@ def apply_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest
                 raise ValueError('response_bound')
             value = json.loads(response_text)
             aliases = {f'participant_{i + 1}': key for i, key in enumerate(request.participants)}
-            if not isinstance(value, dict) or set(value) != {'summary', 'contributions'}:
+            required_keys = {'summary', 'contributions'} | ({'retain'} if request.admission_required else set())
+            if not isinstance(value, dict) or set(value) != required_keys:
                 raise ValueError('shape')
+            if request.admission_required:
+                if not isinstance(value['retain'], bool):
+                    raise ValueError('retention_type')
+                if not value['retain']:
+                    if value['summary'] != '' or value['contributions'] != {}:
+                        raise ValueError('declined_projection')
+                    conn.execute("UPDATE memory_moment_windows SET lifecycle_status='rejected', "
+                                 "meaning_status='not_retained',qualification_reason='semantic_not_retained', "
+                                 "updated_at=? WHERE moment_id=?", (_now(), request.moment_id))
+                    _diag(conn, request.guild_id, 'moment_meaning_declined', 'semantic_not_retained', request.moment_id)
+                    conn.execute('RELEASE moment_meaning_apply')
+                    return False
             summary_text = value['summary']
             contributions = value['contributions']
             if (not _meaning_text_is_safe(summary_text, 360)
@@ -3229,6 +3310,12 @@ def apply_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest
             fail_moment_meaning(conn, request, reason='invalid_projection')
             conn.execute('RELEASE moment_meaning_apply')
             return False
+        if request.admission_required:
+            finalized = finalize_moment(conn, request.moment_id, ensure_schema=False,
+                                        semantic_source_digest=request.source_digest)
+            if not finalized.ledger_entry_id:
+                raise ValueError('semantic_admission_not_finalized')
+            request = replace(request, canonical_ledger_entry_id=finalized.ledger_entry_id)
         summary = MOMENT_MEANING_PREFIX + summary_text
         mapped = {aliases[key]: text for key, text in contributions.items()}
         projection_digest = _meaning_projection_digest(summary, mapped)
@@ -3482,6 +3569,8 @@ def _episode_source_closed(value: str) -> bool:
 def _moment_episode_basis(
     conn: sqlite3.Connection,
     moment_id: str,
+    *,
+    allow_pending_meaning: bool = False,
 ) -> tuple[dict[str, Any], list[SourceEntry]] | None:
     row = conn.execute(
         """
@@ -3493,7 +3582,8 @@ def _moment_episode_basis(
         """,
         (moment_id,),
     ).fetchone()
-    if not row or str(row[12] or "") != "finalized":
+    if not row or (str(row[12] or "") != "finalized"
+                   and not (allow_pending_meaning and row[12] == "awaiting_meaning" and not row[13])):
         return None
     basis = {
         "moment_id": str(moment_id),
@@ -3510,6 +3600,7 @@ def _moment_episode_basis(
         "window_started_at": str(row[10] or _now()),
         "last_activity_at": str(row[11] or _now()),
         "canonical_ledger_entry_id": str(row[13] or ""),
+        "lifecycle_status": str(row[12] or ""),
     }
     rows = _entries(conn, moment_id)
     failure, _failure_lifecycle = _moment_source_failure(
@@ -5193,11 +5284,12 @@ def finalize_moment(
     moment_id: str,
     *,
     ensure_schema: bool = True,
+    semantic_source_digest: str = "",
 ) -> MomentObservationResult:
     if ensure_schema:
         ensure_moment_schema(conn)
     win = conn.execute(
-        "SELECT guild_id,channel_id,channel_name,channel_policy,route_mode,topic_key,window_started_at,last_activity_at,visibility,public_usable,lifecycle_status,canonical_ledger_entry_id FROM memory_moment_windows WHERE moment_id=?",
+        "SELECT guild_id,channel_id,channel_name,channel_policy,route_mode,topic_key,window_started_at,last_activity_at,visibility,public_usable,lifecycle_status,canonical_ledger_entry_id,qualification_reason,meaning_status,meaning_source_digest FROM memory_moment_windows WHERE moment_id=?",
         (moment_id,),
     ).fetchone()
     if not win:
@@ -5208,9 +5300,13 @@ def finalize_moment(
         return MomentObservationResult("deduplicated", "already_finalized", moment_id, existing)
     if lifecycle in {"needs_review", "rejected", "superseded", "retracted", "expired"}:
         return MomentObservationResult("deduplicated", f"terminal_{lifecycle}", moment_id, existing)
-    if lifecycle != "open":
+    semantic_admission = bool(semantic_source_digest and lifecycle == "awaiting_meaning"
+                              and win[13] == 'generating' and win[14] == semantic_source_digest and not win[11])
+    if lifecycle != "open" and not semantic_admission:
         return MomentObservationResult("skipped", f"not_open_{lifecycle or 'unknown'}", moment_id, existing)
     rows = _entries(conn, moment_id)
+    if semantic_source_digest and (not semantic_admission or _meaning_source_digest(rows) != semantic_source_digest):
+        return MomentObservationResult("skipped", "semantic_source_changed", moment_id)
     source_failure, failure_lifecycle = _moment_source_failure(
         conn,
         moment_id=moment_id,
@@ -5245,6 +5341,23 @@ def finalize_moment(
             moment_id,
         )
     qtype, reason, humans, _models = _qualify(rows)
+    if semantic_admission:
+        if not _semantic_admission_eligible(rows, channel_policy=win[3], visibility=win[8], public_usable=bool(win[9])):
+            return MomentObservationResult("skipped", "semantic_source_ineligible", moment_id)
+        qtype = ("shared_activity" if len({row.subject_key for row in humans}) >= 2
+                 else "conversational" if _models else "noteworthy_contribution")
+        reason = "semantic_source_assessment"
+    elif (not qtype or win[12] == "semantic_continuity_pending") and _semantic_admission_eligible(
+            rows, channel_policy=win[3], visibility=win[8], public_usable=bool(win[9])):
+        conn.execute("UPDATE memory_moment_windows SET lifecycle_status='awaiting_meaning', "
+                     "qualification_reason='semantic_assessment_pending',meaning_status='pending', "
+                     "finalized_at=?,updated_at=? WHERE moment_id=?", (_now(), _now(), moment_id))
+        _diag(conn, int(win[0] or 0), "moment_admission_pending", "semantic_assessment_required", moment_id)
+        return MomentObservationResult("pending", "semantic_assessment_required", moment_id)
+    elif win[12] == "semantic_continuity_pending":
+        # An uncertain connection must never fall back to a lexical template
+        # when its complete source packet exceeds the semantic worker's bounds.
+        qtype, reason = "", "semantic_source_ineligible_or_over_budget"
     if not qtype:
         conn.execute("UPDATE memory_moment_windows SET lifecycle_status='rejected', qualification_reason=?, finalized_at=?, updated_at=? WHERE moment_id=?", (reason, _now(), _now(), moment_id))
         _diag(conn, int(win[0] or 0), "window_rejected", reason, moment_id)
@@ -5350,7 +5463,7 @@ def handle_source_correction(conn: sqlite3.Connection, source_entry_id: str, *, 
         params.append(guild_id)
     rows = conn.execute(sql, params).fetchall()
     for moment_id, gid in rows:
-        conn.execute("UPDATE memory_moment_windows SET lifecycle_status='needs_review', updated_at=? WHERE moment_id=? AND lifecycle_status IN ('open','finalized')", (_now(), moment_id))
+        conn.execute("UPDATE memory_moment_windows SET lifecycle_status='needs_review', updated_at=? WHERE moment_id=? AND lifecycle_status IN ('open','finalized','awaiting_meaning')", (_now(), moment_id))
         _diag(conn, int(gid or 0), "moment_awaiting_review", "source_corrected", moment_id, source_entry_id)
     return len(rows)
 
