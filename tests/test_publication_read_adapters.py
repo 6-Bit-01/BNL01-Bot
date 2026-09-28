@@ -936,7 +936,10 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
 
     def test_explicit_journal_survives_recent_questions_and_requested_audience_comment(self):
-        import bnl01_bot as bot
+        with mock.patch.dict(os.environ, {
+            "GEMINI_API_KEY": "test-gemini-key", "DISCORD_BOT_TOKEN": "test-discord-token",
+        }):
+            import bnl01_bot as bot
         from datetime import datetime, timedelta, timezone
         from bnl_conversation_context_v2 import ConversationContextRequest, assemble_conversation_context_v2
 
