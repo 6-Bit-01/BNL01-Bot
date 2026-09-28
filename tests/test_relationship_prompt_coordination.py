@@ -292,12 +292,14 @@ class RelationshipPromptCoordinationTests(unittest.TestCase):
                 ambiguous = dict(env, **{"BNL_RELATIONSHIP_V2_SEALED_CANARY_" + key: "1,99"})
                 self.assertFalse(relationships.sealed_canary_enabled(**request, environ=ambiguous))
 
-    def test_sealed_canary_reads_existing_posture_without_learning_test_messages(self):
+    def test_sealed_canary_learns_privately_without_changing_public_posture(self):
         os.environ.update(self.sealed_env())
         tables = ("relationship_state", "relationship_state_v2", "relationship_events_v2", "relationship_member_preferences_v2")
         def snapshot():
             with closing(sqlite3.connect(self.db)) as conn:
-                return [conn.execute("SELECT * FROM " + table).fetchall() for table in tables]
+                return [conn.execute("SELECT * FROM " + table +
+                    (" WHERE channel_policy<>'sealed_test'" if table == 'relationship_events_v2' else "")).fetchall()
+                    for table in tables]
         before = snapshot()
         bot.save_user_message(
             42, "Test Member", 1, "Thanks for fixing that. We are good.",
@@ -314,6 +316,11 @@ class RelationshipPromptCoordinationTests(unittest.TestCase):
             self.assert_tone_once(text, metadata)
             self.assertEqual(bot.LAST_MEMORY_PROMPT_DIAGNOSTICS[(42, 1)]["relationship_v2"]["authority"], "sealed_canary")
         self.assertEqual(snapshot(), before)
+        with closing(sqlite3.connect(self.db)) as conn:
+            private_events = conn.execute("SELECT channel_id,lifecycle FROM relationship_events_v2 "
+                                          "WHERE channel_policy='sealed_test'").fetchall()
+        self.assertTrue(private_events)
+        self.assertTrue(all(row == (99, 'review_only') for row in private_events))
 
     def test_sealed_canary_reaches_normal_prompt_without_global_activation(self):
         os.environ.update(self.sealed_env())

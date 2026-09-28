@@ -204,7 +204,7 @@ class MomentReplyContinuityTests(unittest.TestCase):
                     "FROM memory_moment_windows WHERE moment_id=?",
                     (self.moment_id(source),),
                 ).fetchone()[:],
-                ("rejected", "low_signal_or_insufficient_continuity"),
+                ("awaiting_meaning", "semantic_assessment_pending"),
             )
         self.assertEqual(
             self.conn.execute(
@@ -332,7 +332,7 @@ class MomentReplyContinuityTests(unittest.TestCase):
                         "SELECT lifecycle_status FROM memory_moment_windows "
                         "WHERE moment_id=?", (self.moment_id(first),)
                     ).fetchone()[0],
-                    "rejected",
+                    "awaiting_meaning",
                 )
 
     def test_reply_does_not_extend_the_five_minute_window_limit(self):
@@ -349,7 +349,7 @@ class MomentReplyContinuityTests(unittest.TestCase):
                 "SELECT lifecycle_status FROM memory_moment_windows "
                 "WHERE moment_id=?", (self.moment_id(first),)
             ).fetchone()[0],
-            "rejected",
+            "awaiting_meaning",
         )
 
     def test_target_withdrawn_after_edge_write_is_revalidated_at_observation(self):

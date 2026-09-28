@@ -137,10 +137,18 @@ class MomentSemanticAdmissionTests(unittest.TestCase):
             self.assertFalse(moments.apply_moment_meaning(self.conn, request, json.dumps(self.ACCEPTED)))
         self.assertEqual(self.conn.execute("SELECT meaning_status FROM memory_moment_windows").fetchone()[0], "disabled")
 
-    def test_sealed_sources_never_enter_public_semantic_admission(self):
+    def test_sealed_sources_receive_private_semantic_admission_only(self):
         self.observe(self.ANNOUNCEMENT, policy="sealed_test")
-        self.assertIsNone(moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,)))
-        self.assertEqual(self.conn.execute("SELECT lifecycle_status FROM memory_moment_windows").fetchone()[0], "rejected")
+        request = moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,))
+        self.assertIsNotNone(request)
+        self.assertTrue(request.admission_required)
+        self.assertTrue(moments.apply_moment_meaning(self.conn, request, json.dumps(self.ACCEPTED)))
+        self.assertEqual(self.conn.execute(
+            "SELECT lifecycle_status,public_usable FROM memory_moment_windows",
+        ).fetchone(), ("finalized", 0))
+        self.assertFalse(moments.select_public_participant_moment_gists(
+            self.conn, guild_id=1, participant_key="discord_user:1", broad_recall=True,
+        ))
 
     def test_explicit_topic_change_keeps_separate_windows(self):
         _roots, windows = self.observe((

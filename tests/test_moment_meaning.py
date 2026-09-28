@@ -443,9 +443,12 @@ class MomentMeaningTests(unittest.TestCase):
         moments.ensure_moment_schema(self.conn)
         self.assertIsNone(moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,)))
 
-    def test_private_sources_and_disabled_owner_do_not_generate(self):
-        self.captured_moment(policy='sealed_test')
-        self.assertIsNone(moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,)))
+    def test_sealed_sources_keep_scope_and_disabled_owner_does_not_generate(self):
+        private_id, _ = self.captured_moment(policy='sealed_test')
+        request = moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,))
+        self.assertEqual(request.moment_id, private_id)
+        self.assertTrue(all(not source.public_usable and source.channel_policy == 'sealed_test'
+                            for source in request.sources))
         self.captured_moment(channel=20)
         with mock.patch.dict(os.environ, {'BNL_MOMENT_ENGINE_SHADOW_ENABLED': 'false'}):
             self.assertIsNone(moments.claim_pending_moment_meaning(self.conn, guild_ids=(1,)))

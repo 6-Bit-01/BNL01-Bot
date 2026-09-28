@@ -58,6 +58,7 @@ from bnl_canon_entity_binding import (
     read_current_guild_entity_account_bindings,
 )
 from bnl_memory_governance import (
+    sealed_tier_candidates,
     APPROVED_MEMBER_SCALAR_PREDICATES,
     GovernanceRequest,
     assess_governance_result_safety,
@@ -1993,12 +1994,16 @@ def _route_allows_item(
     request: IntelligencePacketRequest,
     item: IntelligencePacketItem,
 ) -> bool:
+    if item.source_type in {'sealed_memory_tier', 'sealed_member_fact', 'sealed_moment'}:
+        return bool(request.channel_policy == 'sealed_test' and request.channel_id > 0
+                    and item.visibility == 'sealed_test')
     if item.lane == "relationship_posture":
         return bool(
             item.visibility == "private"
             and item.usage == "tone_only"
             and request.direct_state == "direct"
-            and request.channel_policy in _PUBLIC_POLICIES
+            and (request.channel_policy in _PUBLIC_POLICIES
+                 or (request.channel_policy == 'sealed_test' and request.channel_id > 0))
         )
     if _public_route(request):
         return item.visibility in _PUBLIC_VISIBILITIES
@@ -2797,6 +2802,14 @@ def _governed_items(
                 moment_id=moment_id,
                 subject_key=candidate.subject_key,
             )
+        elif candidate.source_type in {'sealed_memory_tier', 'sealed_member_fact'}:
+            source_digest = _sealed_memory_candidate_digest(candidate)
+            revalidation_kind = 'sealed_memory'
+            revalidation_key = candidate.source_ref
+            root_sets = [_entry_root_metadata(conn, root) for kind, root in candidate.lineage
+                         if kind == 'derived_from']
+            roots = tuple(sorted({value for group in root_sets for value in group[0]}))
+            occurrences = tuple(sorted({value for group in root_sets for value in group[1]}))
         else:
             source_digest = _ledger_entry_digest(conn, candidate.entry_id)
             revalidation_kind = "ledger"
@@ -4836,6 +4849,7 @@ def _relationship_items(
         direct=True,
         target_user_id=request.subject_user_id,
         environ=environ,
+        channel_id=request.channel_id,
     )
     if not posture:
         return []
@@ -6045,6 +6059,25 @@ def _profile_sufficiency(
     )
 
 
+def _sealed_memory_candidate_digest(candidate) -> str:
+    return _digest('sealed_memory', candidate.source_ref, candidate.entry_id,
+                   candidate.predicate_key, candidate.text, candidate.visibility,
+                   candidate.observed_at, candidate.lineage)
+
+
+def _sealed_memory_version(conn, packet, item) -> str:
+    request = packet.request
+    if request.channel_policy != 'sealed_test' or request.channel_id <= 0:
+        return ''
+    req = GovernanceRequest(request.guild_id, request.subject_user_id, request.route_mode,
+                            'unified_intelligence_packet_shadow', channel_id=request.channel_id,
+                            channel_policy=request.channel_policy)
+    for candidate in sealed_tier_candidates(conn, req):
+        if candidate.source_ref == item.revalidation_key and candidate.text == item.text:
+            return _sealed_memory_candidate_digest(candidate)
+    return ''
+
+
 def _moment_version(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
@@ -6063,6 +6096,7 @@ def _moment_version(
         allowed_channel_policies=("public_home", "public_context"),
         max_results=4,
         now=packet.request.now or None,
+        private_channel_id=packet.request.channel_id if packet.request.channel_policy == 'sealed_test' else 0,
     )
     target = item.revalidation_key
     for moment in moments:
@@ -6409,6 +6443,7 @@ def _relationship_version(
         direct=packet.request.direct_state == "direct",
         target_user_id=packet.request.subject_user_id,
         environ=environ,
+        channel_id=packet.request.channel_id,
     )
     return str(posture.get("source_digest") or "")
 
@@ -6653,6 +6688,8 @@ def _revalidate_packet_in_snapshot(
                 current = state.source_digest if state_matches else ""
             elif item.revalidation_kind == "ledger":
                 current = _ledger_entry_digest(conn, item.revalidation_key)
+            elif item.revalidation_kind == "sealed_memory":
+                current = _sealed_memory_version(conn, packet, item)
             elif item.revalidation_kind == "moment":
                 current = _moment_version(conn, packet, item)
             elif item.revalidation_kind == "episode":

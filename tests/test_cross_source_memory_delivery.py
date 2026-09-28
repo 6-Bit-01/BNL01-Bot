@@ -759,7 +759,9 @@ class CrossSourceMemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with sqlite3.connect(bot.DB_FILE) as conn:
             conn.execute("UPDATE conversations SET channel_policy='public_home' WHERE id=7101")
             conn.execute("DELETE FROM conversations WHERE channel_id=8810")
-        self.assertEqual(bot.prompt_source_basis_failure(bases), "conversation_source_changed")
+        # The private continuation now also contributes scoped memory; its
+        # earlier fence must withdraw that derived context along with history.
+        self.assertEqual(bot.prompt_source_basis_failure(bases), "memory_source_changed")
 
     async def asyncSetUp(self):
         self.runtime = network_fixture.PublicNetworkKnowledgeTests()

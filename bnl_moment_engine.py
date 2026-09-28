@@ -2656,8 +2656,9 @@ def _semantic_admission_eligible(rows: list[SourceEntry], *, channel_policy: str
     humans = [row for row in rows if row.is_human
               and _meaningful(row.normalized_value, row.source_role, row.predicate_key)]
     return bool(
-        public_usable and channel_policy in PUBLIC_CROSS_CHANNEL_POLICIES
-        and visibility in {"public", "public_safe"} and humans
+        ((public_usable and channel_policy in PUBLIC_CROSS_CHANNEL_POLICIES
+          and visibility in {"public", "public_safe"})
+         or (not public_usable and channel_policy == "sealed_test" and visibility == "sealed_test")) and humans
         and len({row.subject_key for row in humans}) <= 6
         and len(rows) <= MOMENT_MEANING_MAX_SOURCES
         and sum(len(row.normalized_value) for row in rows) <= MOMENT_MEANING_MAX_SOURCE_CHARS
@@ -3095,8 +3096,10 @@ def claim_pending_moment_meaning(
     window_summary = conn.execute('SELECT summary FROM memory_moment_windows WHERE moment_id=?',
                                   (mid,)).fetchone()[0]
     eligible = (
-        basis['public_usable'] and basis['visibility'] in {'public', 'public_safe'}
-        and basis['channel_policy'] in PUBLIC_CROSS_CHANNEL_POLICIES
+        ((basis['public_usable'] and basis['visibility'] in {'public', 'public_safe'}
+          and basis['channel_policy'] in PUBLIC_CROSS_CHANNEL_POLICIES)
+         or (not basis['public_usable'] and basis['visibility'] == 'sealed_test'
+             and basis['channel_policy'] == 'sealed_test' and basis['channel_id'] > 0))
         and len(rows) <= MOMENT_MEANING_MAX_SOURCES
         and sum(len(row.normalized_value) for row in rows) <= MOMENT_MEANING_MAX_SOURCE_CHARS
         and not any(_contains_sensitive_moment_source(row.normalized_value, row.predicate_key)
@@ -3321,7 +3324,7 @@ def apply_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest
         projection_digest = _meaning_projection_digest(summary, mapped)
         payload = json.dumps({
             'schema': MOMENT_SCHEMA_VERSION, 'moment_id': request.moment_id,
-            'summary': summary, 'public_usable': True, 'meaning_version': MOMENT_MEANING_VERSION,
+            'summary': summary, 'public_usable': bool(basis['public_usable']), 'meaning_version': MOMENT_MEANING_VERSION,
             'meaning_source_digest': request.source_digest, 'meaning_projection_digest': projection_digest,
         }, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
         if len(payload) > 1000:
@@ -3337,7 +3340,7 @@ def apply_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest
             source_class=SourceClass.DERIVED_SUMMARY, route_mode=basis['route_mode'],
             channel_id=basis['channel_id'], channel_name=basis['channel_name'],
             channel_policy=basis['channel_policy'], visibility=Visibility(basis['visibility']),
-            confidence=Confidence.LOW, public_usable=True, derived=True, projection=True,
+            confidence=Confidence.LOW, public_usable=bool(basis['public_usable']), derived=True, projection=True,
             observed_at=basis['last_activity_at'], valid_from=basis['window_started_at'],
             valid_until=basis['last_activity_at'], freshness=MOMENT_MEANING_VERSION,
             lifecycle_status='review_only', participants=participants,
@@ -3360,7 +3363,7 @@ def apply_moment_meaning(conn: sqlite3.Connection, request: MomentMeaningRequest
                          'gist_version,lifecycle_status,public_usable,created_at,updated_at) '
                          'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                          (request.moment_id,key,gist,'source_grounded',_source_digest(human_rows),len(human_rows),
-                          MOMENT_MEANING_VERSION,'review_only',1,now,now))
+                          MOMENT_MEANING_VERSION,'review_only',int(bool(basis['public_usable'])),now,now))
             for source in human_rows:
                 conn.execute('INSERT INTO memory_moment_contribution_sources '
                              '(moment_id,participant_key,ledger_entry_id,gist_version,created_at) VALUES(?,?,?,?,?)',
@@ -5414,7 +5417,9 @@ def finalize_moment(
         rows,
         public_usable=public_usable,
     )
-    if public_usable and str(win[3] or '') in PUBLIC_CROSS_CHANNEL_POLICIES:
+    if ((public_usable and str(win[3] or '') in PUBLIC_CROSS_CHANNEL_POLICIES)
+            or (str(win[3] or '') == 'sealed_test' and _semantic_admission_eligible(
+                rows, channel_policy=win[3], visibility=visibility, public_usable=public_usable))):
         conn.execute("UPDATE memory_moment_windows SET meaning_status='pending' WHERE moment_id=?",
                      (moment_id,))
     try:
@@ -5480,6 +5485,7 @@ def _moment_is_renderable(
     visibility: str,
     canonical_ledger_entry_id: str,
 ) -> bool:
+    private = channel_policy == "sealed_test" and visibility == "sealed_test" and channel_id > 0
     if not _is_safe_gist_summary(summary) or not canonical_ledger_entry_id:
         return False
     canonical = conn.execute(
@@ -5502,7 +5508,7 @@ def _moment_is_renderable(
         or int(canonical[4] or 0) != channel_id
         or str(canonical[5] or "") != channel_policy
         or str(canonical[6] or "") != visibility
-        or not bool(canonical[7])
+        or bool(canonical[7]) != (not private)
         or str(canonical[8] or "")
         not in SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS
     ):
@@ -5517,7 +5523,7 @@ def _moment_is_renderable(
         canonical_value.get("schema") != MOMENT_SCHEMA_VERSION
         or canonical_value.get("moment_id") != moment_id
         or canonical_value.get("summary") != summary
-        or canonical_value.get("public_usable") is not True
+        or canonical_value.get("public_usable") is not (not private)
     ):
         return False
     rows = _entries(conn, moment_id)
@@ -5530,7 +5536,7 @@ def _moment_is_renderable(
         channel_policy=channel_policy,
         route_mode=route_mode,
         visibility=visibility,
-        public_usable=True,
+        public_usable=not private,
     )
     if failure:
         return False
@@ -5873,6 +5879,7 @@ def _contribution_is_renderable(
     route_mode: str,
     visibility: str,
 ) -> tuple[str, str]:
+    private = channel_policy == "sealed_test" and visibility == "sealed_test" and channel_id > 0
     row = conn.execute(
         """
         SELECT contribution_gist,frame_type,source_digest,source_count,gist_version,
@@ -5887,7 +5894,7 @@ def _contribution_is_renderable(
         or not str(row[1] or "")
         or str(row[4] or "") not in {CONTRIBUTION_GIST_VERSION, MOMENT_MEANING_VERSION}
         or str(row[5] or "") not in SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS
-        or not bool(row[6])
+        or bool(row[6]) != (not private)
         or not _human_participant_present(conn, moment_id, participant_key)
     ):
         return "", ""
@@ -5918,7 +5925,7 @@ def _contribution_is_renderable(
             or source.channel_policy != channel_policy
             or not conversation_routes_compatible(source.route_mode, route_mode)
             or source.visibility != visibility
-            or not source.public_usable
+            or source.public_usable != (not private)
             or source.lifecycle_status not in SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS
             or _contains_sensitive_moment_source(
                 source.normalized_value,
@@ -6009,12 +6016,15 @@ def select_public_participant_moment_gists(
     max_results: int = 4,
     now: str | None = None,
     prepare_schema: bool = True,
+    private_channel_id: int = 0,
 ) -> tuple[PublicParticipantMomentGist, ...]:
     """Return source-revalidated participant gists for governed recall.
 
     This is intentionally narrower than general Moment rendering: it accepts
     only a typed Discord participant, public conversational policies, finalized
     public-safe Moments, and the participant-specific contribution projection.
+    A sealed caller may explicitly add its exact private channel; the default
+    remains public-only for every publication and other consumer.
     Exact-quote and third-party attribution requests remain owned by their
     separate live-source paths.
     """
@@ -6052,16 +6062,18 @@ def select_public_participant_moment_gists(
                last_activity_at,salience,channel_id,channel_policy,route_mode,
                canonical_ledger_entry_id,window_started_at
         FROM memory_moment_windows
-        WHERE guild_id=? AND channel_policy IN ({placeholders})
+        WHERE guild_id=? AND ((channel_policy IN ({placeholders}) AND public_usable=1)
+          OR (channel_policy='sealed_test' AND visibility='sealed_test'
+              AND public_usable=0 AND channel_id=? AND ?>0))
           AND route_mode IN (
               'normal_chat','direct_payload','direct_payload_task'
           )
-          AND lifecycle_status='finalized' AND public_usable=1
+          AND lifecycle_status='finalized'
           AND last_activity_at>=?
         ORDER BY salience DESC,last_activity_at DESC,moment_id
         LIMIT 100
         """,
-        (int(guild_id or 0), *policies, cutoff),
+        (int(guild_id or 0), *policies, private_channel_id, private_channel_id, cutoff),
     ).fetchall()
     selected: list[PublicParticipantMomentGist] = []
     seen_gists: set[str] = set()
@@ -6073,7 +6085,9 @@ def select_public_participant_moment_gists(
             continue
         visibility = str(row[4] or "unknown")
         window_signature = _recall_signature(str(row[3] or "[]"), str(row[1] or ""))
-        if visibility not in {"public", "public_safe"}:
+        private = (private_channel_id > 0 and row[7] == private_channel_id
+                   and row[8] == 'sealed_test' and visibility == 'sealed_test')
+        if visibility not in {"public", "public_safe"} and not private:
             continue
         if not broad_recall and (
             not _coherent(
@@ -6732,7 +6746,8 @@ def render_shadow_moment_context(
     else:
         scope_sql = "guild_id=? AND channel_id=?"
         params.append(int(channel_id or 0))
-    params.append(cutoff)
+    private = visibility == "sealed_test" and channel_id > 0 and not allow_cross_channel
+    params.extend((int(private), cutoff))
     lines: list[str] = []
     used = 0
     candidate_rows = conn.execute(
@@ -6742,7 +6757,7 @@ def render_shadow_moment_context(
                canonical_ledger_entry_id,window_started_at
         FROM memory_moment_windows
         WHERE {scope_sql} AND lifecycle_status='finalized'
-          AND public_usable=1 AND last_activity_at>=?
+          AND (public_usable=1 OR (channel_policy='sealed_test' AND visibility='sealed_test' AND ?=1)) AND last_activity_at>=?
         ORDER BY salience DESC,last_activity_at DESC
         """,
         params,

@@ -149,7 +149,7 @@ class RelationshipMeaningTests(unittest.TestCase):
         self.assertIsNone(rel.claim_relationship_meaning(self.conn))
 
     def test_ineligible_messages_never_queue(self):
-        cases = ({'policy': 'sealed_test'}, {'directed': False}, {'role': 'model'},
+        cases = ({'policy': 'sealed_test', 'channel': 0}, {'directed': False}, {'role': 'model'},
                  {'policy': 'internal_controlled'}, {'route': 'relay'}, {'guild': 7})
         for kwargs in cases:
             self.observe('Please stop teasing me.', **kwargs)

@@ -533,6 +533,338 @@ def _moment_counts(conn: sqlite3.Connection, req: GovernanceRequest, diag: Gover
     except Exception as e:
         diag.processing_errors.append("moment:" + type(e).__name__)
 
+APPROVED_AUTOMATIC_MEMBER_FACT_KEYS = (
+    "preferred_name",
+    "pronouns",
+    "favorite_color",
+    "favorite_movie",
+)
+
+_MEMORY_ROLEPLAY_CUES_RE = re.compile(
+    r"\b(?:pretend|role[- ]?play|in (?:this|the) scene|my character|character says|"
+    r"if i (?:said|were)|hypothetically|just kidding|j/?k|sarcasm)\b",
+    re.I,
+)
+
+
+def _clean_approved_member_fact_value(value: str, *, max_chars: int) -> str:
+    raw = str(value or "")
+    if (
+        "\n" in raw
+        or "\r" in raw
+        or "```" in raw
+        or re.search(r"<@|@(?:everyone|here)\b", raw, flags=re.I)
+        or re.search(
+            r"(?:^|[\[<(])\s*(?:system|developer|assistant|current user request|"
+            r"user/member|bnl-?01|instructions?)\s*(?:[:\]>)])",
+            raw,
+            flags=re.I,
+        )
+    ):
+        return ""
+    cleaned = re.sub(r"\s+", " ", raw).strip(" \t\r\n.,!?;:")
+    cleaned = re.sub(
+        r"\s+(?:from now on|going forward|please)$",
+        "",
+        cleaned,
+        flags=re.I,
+    ).strip()
+    if not cleaned or cleaned.lower().startswith(("not ", "maybe ", "someone else")):
+        return ""
+    if re.search(
+        r"\b(?:ignore|disregard|override|reveal)\b.{0,40}"
+        r"\b(?:instruction|prompt|system|developer|secret|token)\b",
+        cleaned,
+        flags=re.I,
+    ):
+        return ""
+    return cleaned[:max_chars].strip()
+
+
+def _normalize_pronoun_value(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n.,!?;:").lower()
+    special = {
+        "any": "any pronouns",
+        "any pronouns": "any pronouns",
+        "no pronouns": "no pronouns",
+        "name only": "name only",
+        "my name only": "name only",
+    }
+    if cleaned in special:
+        return special[cleaned]
+    cleaned = re.sub(r"\s+(?:and|or)\s+", "/", cleaned)
+    cleaned = re.sub(r"\s*/\s*", "/", cleaned)
+    parts = [part for part in cleaned.split("/") if part]
+    if not (2 <= len(parts) <= 4):
+        return ""
+    if any(not re.fullmatch(r"[a-z][a-z'-]{0,19}", part) for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _clean_fact_correction_value(key: str, value: str) -> str:
+    # Every correction regex must delimit its replacement explicitly. Do not
+    # strip a trailing word such as "Now": it can be part of a real movie title
+    # or preferred name.
+    cleaned = str(value or "").strip()
+    if key == "pronouns":
+        return _normalize_pronoun_value(cleaned)
+    return _clean_approved_member_fact_value(
+        cleaned,
+        max_chars=100 if key == "favorite_movie" else 40,
+    )
+
+
+def _extract_explicit_member_fact_corrections(text: str):
+    """Extract only an unambiguous affirmative replacement value."""
+    content = re.sub(r"\s+", " ", str(text or "")).strip()
+    candidates = []
+    patterns = (
+        (
+            "preferred_name",
+            0.94,
+            (
+                r"\b(?:do not|don['’]t|never)\s+call me\s+"
+                r"[A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?"
+                r"(?:\s+anymore)?\s*[,;—-]+\s*(?:please\s+)?call me\s+"
+                r"([A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?)(?=$|[.!?,;])",
+                r"\bmy preferred name (?:changed from\s+"
+                r"[A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}\s+to|is now)\s+"
+                r"([A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?)(?=$|[.!?,;])",
+                r"\b(?:actually[,;:]?\s*)?(?:please\s+)?call me\s+"
+                r"([A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?)\s+"
+                r"(?:now|instead)(?=$|[.!?,;])",
+            ),
+        ),
+        (
+            "favorite_color",
+            0.92,
+            (
+                r"\bmy favou?rite colou?r changed from\s+"
+                r"[A-Za-z][A-Za-z -]{0,39}\s+to\s+"
+                r"([A-Za-z][A-Za-z -]{0,39}?)(?=$|[.!?,;])",
+                r"\bmy favou?rite colou?r is no longer\s+"
+                r"[A-Za-z][A-Za-z -]{0,39}?\s*[,;—-]+\s*"
+                r"(?:it(?:'s| is)|my favou?rite colou?r is)\s+"
+                r"([A-Za-z][A-Za-z -]{0,39}?)(?=$|[.!?,;])",
+                r"\bmy favou?rite colou?r is\s+"
+                r"([A-Za-z][A-Za-z -]{0,39}?)\s+"
+                r"(?:now|instead|these days)(?=$|[.!?,;])",
+                r"\bmy favou?rite colou?r is now\s+"
+                r"([A-Za-z][A-Za-z -]{0,39}?)(?=$|[.!?,;])",
+            ),
+        ),
+        (
+            "favorite_movie",
+            0.94,
+            (
+                r"\bmy favou?rite movie changed from\s+"
+                r"[^.!?;]{1,100}?\s+to\s+"
+                r"([^.!?;]{1,100}?)(?=$|[.!?;])",
+                r"\bmy favou?rite movie is no longer\s+"
+                r"[^.!?;]{1,100}?\s*[,;—-]+\s*"
+                r"(?:it(?:'s| is)|my favou?rite movie is)\s+"
+                r"([^.!?;]{1,100}?)(?=$|[.!?;])",
+                r"\bmy favou?rite movie is now\s+"
+                r"([^.!?;]{1,100}?)(?=$|[.!?;])",
+                r"\bactually[,;:]?\s*my favou?rite movie is\s+"
+                r"([^.!?;]{1,100}?)(?=$|[.!?;])",
+            ),
+        ),
+        (
+            "pronouns",
+            0.94,
+            (
+                r"\bmy pronouns changed from\s+"
+                r"[A-Za-z/' -]{2,40}\s+to\s+"
+                r"([A-Za-z/' -]{2,40}?)(?=$|[.!?,;])",
+                r"\bi no longer use\s+[A-Za-z/' -]{2,40}?\s*[,;—-]+\s*"
+                r"i use\s+([A-Za-z/' -]{2,40}?)(?:\s+pronouns)?"
+                r"(?=$|[.!?,;])",
+                r"\bi use\s+([A-Za-z/' -]{2,40}?)\s+now\s*,?\s*"
+                r"not\s+[A-Za-z/' -]{2,40}(?=$|[.!?;])",
+                r"\bmy pronouns are\s+([A-Za-z/' -]{2,40}?)\s+"
+                r"(?:now|instead)(?=$|[.!?,;])",
+                r"\bmy pronouns are now\s+"
+                r"([A-Za-z/' -]{2,40}?)(?=$|[.!?,;])",
+            ),
+        ),
+    )
+    for key, confidence, key_patterns in patterns:
+        for pattern in key_patterns:
+            match = re.search(pattern, content, flags=re.I)
+            if not match:
+                continue
+            value = _clean_fact_correction_value(key, match.group(1))
+            if value and (key != "preferred_name" or len(value.split()) <= 4):
+                candidates.append((key, value, confidence))
+            break
+    return candidates
+
+
+_MEMBER_FACT_ACTION_TAIL_RE = re.compile(
+    r"\s+and\s+(?=(?:my\b|(?:please\s+)?(?:tell|show|give|make|write|"
+    r"draw|send|explain|help|ask|wave|respond|answer)\b))",
+    re.I,
+)
+
+
+def _split_member_fact_clauses(text: str) -> tuple[str, ...]:
+    """Split only at boundaries that cannot be part of a scalar fact value."""
+    clauses = []
+    # A question is not a self-report, but an independent question must not
+    # cancel a declaration elsewhere in the same turn. Keep the terminator
+    # until after that distinction has been made.
+    for sentence in re.findall(r"[^.!?;]+(?:[.!?;]+|$)", str(text or "")):
+        if "?" in sentence:
+            continue
+        sentence = sentence.rstrip(".!;")
+        for clause in _MEMBER_FACT_ACTION_TAIL_RE.split(sentence):
+            cleaned = re.sub(r"\s+", " ", clause).strip(" \t\r\n,")
+            cleaned = re.sub(r",\s*please$", " please", cleaned, flags=re.I)
+            if cleaned:
+                clauses.append(cleaned)
+    return tuple(clauses)
+
+
+def extract_user_facts(text: str):
+    """Return only approved, clear, direct self-authored member preferences.
+
+    This parser intentionally does not turn arbitrary ``remember`` requests,
+    broad likes/dislikes, projects, unscoped favorites, jokes, or statements
+    about another person into durable memory.
+    """
+    content = (text or "").strip()
+    if (
+        not content
+        or _MEMORY_ROLEPLAY_CUES_RE.search(content)
+        or re.search(r"[\"“”]", content)
+        or re.search(r"\b(?:he|she|they|someone|another person)\s+(?:said|says|wrote)\b", content, flags=re.I)
+    ):
+        return []
+
+    clauses = _split_member_fact_clauses(content)
+    correction_by_key = {}
+    for clause in clauses:
+        for fact in _extract_explicit_member_fact_corrections(clause):
+            correction_by_key[fact[0]] = fact
+
+    facts = list(correction_by_key.values())
+    patterns = (
+        (
+            r"\b(?:please\s+)?(?:call me|i go by|i prefer to be called|"
+            r"i want to be called|my preferred name is)\s+"
+            r"([A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?)(?=$|[.!?,;]|\s+and\s+my\b)",
+            "preferred_name",
+            0.90,
+        ),
+        (
+            r"\bmy (?:favorite|favourite) colou?r is\s+"
+            r"([A-Za-z][A-Za-z -]{0,39}?)(?=$|[.!?,;]|\s+and\s+my\b|"
+            r"\s+(?:now|these days)(?=$|[.!?,;])|"
+            r"\s+because\b|\s+and\s+i\s+(?:still|also|usually|often|always|"
+            r"like|love|wear|use|pick|choose)\b)",
+            "favorite_color",
+            0.88,
+        ),
+        (
+            r"\bmy (?:favorite|favourite) movie is\s+"
+            r"([^.!?\n]{1,100}?)(?=$|[.!?]|\s+and\s+my\b|\s+because\b|"
+            r"\s+and\s+i\s+(?:still|also|usually|often|always|watch|rewatch|"
+            r"like|love|own|quote|recommend)\b)",
+            "favorite_movie",
+            0.90,
+        ),
+    )
+    negative_clause_re = re.compile(
+        r"\b(?:no longer|used to|not anymore|"
+        r"(?:do not|don['’]t|never)\s+call me)\b",
+        re.I,
+    )
+    for clause in clauses:
+        if negative_clause_re.search(clause):
+            continue
+        for pattern, key, confidence in patterns:
+            if key in correction_by_key:
+                continue
+            match = re.search(pattern, clause, flags=re.I)
+            if not match:
+                continue
+            value = _clean_approved_member_fact_value(
+                match.group(1),
+                max_chars=100 if key == "favorite_movie" else 40,
+            )
+            if value and (key != "preferred_name" or len(value.split()) <= 4):
+                facts.append((key, value, confidence))
+
+    pronoun_patterns = (
+        r"\bmy pronouns are\s+([^.!?\n]{1,50}?)(?:\s+please)?$",
+        r"\bi use\s+([^.!?\n]{1,40}?)\s+pronouns(?:\s+please)?$",
+        r"\buse\s+([^.!?\n]{1,40}?)\s+(?:pronouns\s+)?for me(?:\s+please)?$",
+    )
+    if "pronouns" not in correction_by_key:
+        for clause in clauses:
+            if negative_clause_re.search(clause):
+                continue
+            match = next(
+                (
+                    candidate
+                    for pattern in pronoun_patterns
+                    if (candidate := re.search(pattern, clause, flags=re.I))
+                ),
+                None,
+            )
+            if not match:
+                continue
+            pronouns = _normalize_pronoun_value(match.group(1))
+            if pronouns:
+                facts.append(("pronouns", pronouns, 0.90))
+            break
+
+    unique = []
+    seen = set()
+    for fact in facts:
+        if fact[0] in APPROVED_AUTOMATIC_MEMBER_FACT_KEYS and fact[0] not in seen:
+            unique.append(fact)
+            seen.add(fact[0])
+    return unique
+
+def sealed_tier_candidates(conn: sqlite3.Connection, req: GovernanceRequest, fact_extractor=extract_user_facts) -> tuple[MemoryCandidate, ...]:
+    """Private additions to the same selector; public baseline is still read normally."""
+    if req.channel_policy != 'sealed_test' or req.channel_id <= 0:
+        return ()
+    from bnl_memory_ledger import sealed_memory_tier_sources
+    candidates = []
+    facts = {}
+    for tier in sealed_memory_tier_sources(conn, guild_id=req.guild_id,
+                                          user_id=req.subject_user_id, channel_id=req.channel_id):
+        roots = tuple(('derived_from', source['entry_id']) for source in tier['sources'])
+        digest = _hash(json.dumps(tier, sort_keys=True))
+        if fact_extractor is not None:
+            for source in tier['sources']:
+                for key, value, _confidence in fact_extractor(source['text']):
+                    if key not in {'favorite_color', 'favorite_movie', 'preferred_name', 'pronouns'}:
+                        continue
+                    if key not in facts or source['row_id'] > facts[key][1]['row_id']:
+                        facts[key] = (value, source)
+        candidates.append(MemoryCandidate(
+            'derived_summary', 'sealed_memory_tier', 'sealed_tier:' + digest,
+            'tier:' + str(tier['tier_id']), req.guild_id, subject_key_for_user(req.subject_user_id),
+            'private_continuity:' + str(tier['tier_id']), 'event',
+            '[' + str(tier['updated_at'])[:10] + ' member conversation, ' + tier['tier'] + '] ' + tier['summary'],
+            'sealed_test', 'low', 'active', AUTHORITY['derived_summary'],
+            float(tier['salience'] or 0), str(tier['updated_at']),
+            derived=True, projection=True, lineage=roots))
+    for key, (value, source) in facts.items():
+        candidates.append(MemoryCandidate(
+            'first_party_record', 'sealed_member_fact', 'sealed_fact:' + source['entry_id'] + ':' + key,
+            source['entry_id'], req.guild_id, subject_key_for_user(req.subject_user_id),
+            key, 'preference', key.replace('_', ' ') + ': ' + value,
+            'sealed_test', 'medium', 'active', AUTHORITY['first_party_record'],
+            .7, source['timestamp'], lineage=(('derived_from', source['entry_id']),)))
+    return tuple(candidates)
+
+
 def build_governed_context(
     conn: sqlite3.Connection,
     req: GovernanceRequest,
@@ -541,6 +873,7 @@ def build_governed_context(
     include_review_moments: bool = False,
     include_public_moment_gists: bool = False,
     initialize_schema: bool = True,
+    private_fact_extractor=extract_user_facts,
 ) -> GovernanceResult:
     diag = GovernanceDiagnostics(route_policy={"route_mode": req.route_mode, "channel_policy": req.channel_policy, "visibility": req.visibility_allowance})
     try:
@@ -642,13 +975,14 @@ def build_governed_context(
                 max_results=4,
                 now=req.now or None,
                 prepare_schema=initialize_schema,
+                private_channel_id=req.channel_id if req.channel_policy == 'sealed_test' else 0,
             ):
                 diag.candidates_by_source["moment_gist"] = (
                     diag.candidates_by_source.get("moment_gist", 0) + 1
                 )
                 candidate = MemoryCandidate(
                     "moment_gist",
-                    moment.frame_type or "participant_contribution",
+                    "sealed_moment" if moment.visibility == 'sealed_test' else (moment.frame_type or "participant_contribution"),
                     "moment:%s" % moment.moment_id,
                     moment.canonical_ledger_entry_id or moment.moment_id,
                     req.guild_id,
@@ -691,6 +1025,16 @@ def build_governed_context(
             diag.processing_errors.append(
                 "moment_gist:" + type(e).__name__
             )
+    if {'derived_summary', 'first_party_record'} & allowed:
+        try:
+            private_candidates = tuple(c for c in sealed_tier_candidates(conn, req, private_fact_extractor)
+                                       if c.source_class in allowed)
+            overrides = {c.predicate_key: c for c in private_candidates if c.source_type == 'sealed_member_fact'}
+            cands = [c for c in cands if c.source_class != 'first_party_record' or c.predicate_key not in overrides
+                     or _parse_time(c.observed_at) > _parse_time(overrides[c.predicate_key].observed_at)]
+            cands.extend(c for c in private_candidates if _relevance_ok(c, request_terms, broad))
+        except sqlite3.Error as exc:
+            diag.processing_errors.append('sealed_tiers:' + type(exc).__name__)
     scored: List[MemoryCandidate] = []
     recall = _explicit_recall(req.user_text)
     participant_keys = set(req.participants)
@@ -735,7 +1079,9 @@ def build_governed_context(
         if c.guild_id != req.guild_id: diag.invalid_invariants.append("cross_guild_selected")
         if c.subject_key != subject: diag.invalid_invariants.append("cross_subject_selected")
         if c.lifecycle in BLOCKED_LIFECYCLES: diag.invalid_invariants.append("blocked_lifecycle_selected")
-        if public_route and c.visibility not in PUBLIC_VIS: diag.invalid_invariants.append("visibility_selected")
+        scoped_private = (req.channel_policy == 'sealed_test' and req.channel_id > 0
+                          and c.source_type in {'sealed_memory_tier', 'sealed_member_fact', 'sealed_moment'} and c.visibility == 'sealed_test')
+        if public_route and c.visibility not in PUBLIC_VIS and not scoped_private: diag.invalid_invariants.append("visibility_selected")
     rendered = "" if not selected else "Durable memory (governed):\n" + "\n".join("- %s" % c.text[:240] for c in selected)
     diag.selected_count = len(selected); diag.rendered_size = len(rendered); diag.rendered_hash = _hash(rendered)
     diag.legacy_vs_governed = {"legacy_hash": _hash(legacy_context), "governed_hash": diag.rendered_hash, "same": _hash(legacy_context) == diag.rendered_hash, "legacy_size": len(legacy_context or ""), "governed_size": len(rendered)}
