@@ -29673,7 +29673,9 @@ def build_live_conversation_orchestration_decision(
                             and str(
                                 context_result.referent_reason or ""
                             ).lower()
-                            == "discord_reply_source"
+                            # These labels identify a conversational target,
+                            # not the person the current question is about.
+                            in {"discord_reply_source", "latest_answer_continuation"}
                         )
                     )
                     else ()
