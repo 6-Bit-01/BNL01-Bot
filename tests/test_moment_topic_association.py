@@ -244,6 +244,10 @@ class MomentTopicAssociationTests(unittest.TestCase):
         self.assertFalse(self.historical(self.packet(request)))
 
     def test_short_attribution_followup_reaches_moment_through_real_context_and_frame(self):
+        os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
+        os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
+        import bnl01_bot
+
         first, _ = self.add_moment()
         self.add_moment(row_start=200, day=2)
         text = "Who said that, and when was that exchange?"
@@ -268,15 +272,31 @@ class MomentTopicAssociationTests(unittest.TestCase):
             now=datetime.fromisoformat(request.now),
             route_allowed_sources=frozenset({"conversation_continuity"}),
         ))
-        frame = build_situation_frame_v1(
-            route_allowed=True, route_mode="normal_chat", conversation_surface="mention_or_reply",
-            channel_policy="sealed_test", current_text=text,
-            current_speaker_user_ids=(10,), current_speaker_labels=("Test Member Four",),
-            referent_status=context.referent_status, response_act="answer",
-            packet_revision="short_attribution",
-        )
+        with mock.patch.object(bnl01_bot.client, "get_guild", return_value=None):
+            frame = bnl01_bot.build_live_conversation_orchestration_decision(
+                engagement_decision="answer", engagement_reason="request",
+                route_mode="normal_chat", conversation_surface="mention_or_reply",
+                channel_policy="sealed_test", current_text=text,
+                guild_id=1, channel_id=99, addressings=(),
+                current_speaker_user_ids=(10,), current_speaker_labels=("Test Member Four",),
+                context_result=context, moment_situation=None, influence_mode="live",
+                packet_revision="short_attribution",
+            ).situation_frame
         self.assertEqual(context.referent_selected_row_ids, (9003,))
         self.assertEqual(frame.status, "resolved")
+        self.assertEqual(frame.subjects, ())
+        self.assertEqual(frame.subject_requirement, "not_applicable")
+        with mock.patch.object(bnl01_bot.client, "get_guild", return_value=None):
+            named_frame = bnl01_bot.build_live_conversation_orchestration_decision(
+                engagement_decision="answer", engagement_reason="request",
+                channel_policy="sealed_test", current_text=text,
+                guild_id=1, channel_id=99, addressings=(),
+                current_speaker_user_ids=(10,), context_result=context,
+                moment_situation=None, influence_mode="live",
+                subject_user_ids=(7,), subject_label_hints=("Test Member 1",),
+            ).situation_frame
+        self.assertEqual(tuple(subject.user_id for subject in named_frame.subjects), (7,))
+        self.assertEqual(named_frame.subject_requirement, "required")
         evidence = tuple(PacketConversationEvidence(
             text=row["content"], source_id=row["id"], speaker_user_id=row["user_id"],
             speaker_label=row["user_name"],
