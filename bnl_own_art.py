@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 import struct
 from types import SimpleNamespace
@@ -19,7 +21,8 @@ import urllib.request
 
 from bnl_gemini_routing import (OWN_ART_CONCEPT_ROUTE, OWN_ART_IMAGE_MODEL, OWN_ART_IMAGE_ROUTE,
                                 policy_for_route, provider_server_diagnostics)
-from bnl_journal import build_source_packet, _eligible_reflection_basis
+from bnl_journal import (build_source_packet, _eligible_reflection_basis,
+                         journal_shared_source_provenance_is_current)
 
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -38,8 +41,19 @@ def build_own_art_brief(packet: dict) -> tuple[str, set[str]]:
         sources.append({"ref": str(item["refId"]), "summary": str(item["summary"])[:1000],
                         "observedAt": str(item.get("observedAt") or ""), "kind": str(item.get("sourceKind") or "")})
     for item in _eligible_reflection_basis(packet)[:8]:
-        sources.append({"ref": item["refId"], "summary": str(item["summary"])[:1000],
-                        "observedAt": item.get("sourceObservedAt", ""), "kind": "historical_reflection"})
+        source = {"ref": item["refId"], "summary": str(item["summary"])[:1000],
+                  "observedAt": item.get("sourceObservedAt", ""),
+                  "kind": item["basisKind"], "scope": "historical_reflection"}
+        if item["basisKind"] == "public_moment":
+            # Consume only the Journal owner's public projection, never its
+            # private participant keys or original-source archive.
+            source["contributions"] = [
+                {"speaker": str(c.get("publicSpeakerName") or "")[:72],
+                 "summary": str(c["summary"])[:600]}
+                for c in item.get("contributions", [])[:3]
+                if isinstance(c, dict) and str(c.get("summary") or "").strip()
+            ]
+        sources.append(source)
     prompt = (
         "Choose whether YOU, BNL-01, have an image you want to make for yourself. "
         "This is your own artistic expression: thoughts, imagination, memories, experiences. "
@@ -57,6 +71,26 @@ def build_own_art_brief(packet: dict) -> tuple[str, set[str]]:
         "Observed/remembered context:\n" + json.dumps(sources, ensure_ascii=False)
     )
     return prompt, {item["ref"] for item in sources}
+
+
+def _preview_moment_sources(packet: dict, refs: set[str]) -> list[dict]:
+    required = {item["refId"] for item in _eligible_reflection_basis(packet)
+                if item["refId"] in refs and item["basisKind"] == "public_moment"}
+    sources = [item for item in packet.get("privateSharedSourceProvenance", [])
+               if isinstance(item, dict) and item.get("sourceKind") == "public_moment"
+               and item.get("refId") in required]
+    if {item.get("refId") for item in sources} != required:
+        raise ValueError("art_moment_sources_missing")
+    return sources
+
+
+def _revalidate_preview_moments(bot, sources: list[dict]) -> None:
+    if not sources:
+        return
+    with closing(sqlite3.connect(Path(bot.DB_FILE).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.execute("BEGIN")
+        if not journal_shared_source_provenance_is_current(conn, bot.BNL_PRIMARY_GUILD_ID, sources):
+            raise ValueError("art_moment_sources_changed")
 
 
 def parse_own_art_concept(raw: str, allowed_refs: set[str]) -> dict:
@@ -278,12 +312,15 @@ def prepare_private_preview(bot, output_dir: str, *, generate: bool = False) -> 
     try:
         packet = build_source_packet(bot.DB_FILE, bot.BNL_PRIMARY_GUILD_ID, hours=72, entry_kind="manual", prepare_schema=False)
         prompt, refs = build_own_art_brief(packet)
+        moment_sources = _preview_moment_sources(packet, refs)
+        receipt["momentSourceVersions"] = {s["sourceId"]: s["sourceVersion"] for s in moment_sources}
         receipt["sourcePacketHash"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         receipt["sourceCount"] = len(refs)
         receipt["sourceWindowStart"] = packet.get("sourceWindowStart", "")
         receipt["sourceWindowEnd"] = packet.get("sourceWindowEnd", "")
         if not generate:
             return receipt
+        _revalidate_preview_moments(bot, moment_sources)
         receipt["status"] = "concept_generation_started"
         response = bot._generate_gemini_content_with_fallback(
             bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n\n" + prompt, OWN_ART_CONCEPT_ROUTE,
@@ -295,8 +332,10 @@ def prepare_private_preview(bot, output_dir: str, *, generate: bool = False) -> 
         if concept["action"] == "skip":
             receipt["status"] = "bnl_chose_not_to_create"
             return receipt
+        _revalidate_preview_moments(bot, moment_sources)
         receipt["status"] = "image_generation_started"
         image, image_receipt = generate_private_image(bot, concept["imagePrompt"], attempt_counter=image_counter)
+        _revalidate_preview_moments(bot, moment_sources)
         image_receipt["fileName"] = "bnl-own-art" + IMAGE_EXTENSIONS[image_receipt["mimeType"]]
         _private_write(target / image_receipt["fileName"], image)
         receipt["image"] = image_receipt

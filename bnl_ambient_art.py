@@ -78,6 +78,30 @@ def journal_context(bot, guild_id):
         guild_id=guild_id, user_text="latest journal", source_kind="journal")
 
 
+def moment_context(bot, guild_id, topic_text, *, source_basis):
+    """Reuse the public Moment selector and retain its exact original lineage."""
+    from bnl_moment_engine import public_moment_source_basis, select_public_situation_moment_gists
+
+    now = bot._pacific_now().astimezone(timezone.utc).isoformat()
+    records = []
+    with closing(sqlite3.connect(Path(bot.DB_FILE).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.1)) as conn:
+        conn.execute("BEGIN")
+        selected = select_public_situation_moment_gists(
+            conn, guild_id=guild_id, topic_text=topic_text, token_budget=400, max_results=2,
+            allowed_channel_policies=("public_home", "public_context"),
+            require_topic_overlap=True, apply_date_scope=False, prepare_schema=False,
+            observed_before=now, now=now,
+        )
+        for item in selected:
+            basis = public_moment_source_basis(conn, guild_id=guild_id, moment_id=item.moment_id)
+            if basis is None:
+                continue
+            source_basis.setdefault("moments", {})[item.moment_id] = basis["sourceVersion"]
+            records.append({"ref": "moment:" + item.moment_id, "kind": "public_moment",
+                            "observedAt": item.last_activity_at, "summary": item.summary})
+    return records
+
+
 def parse_response(raw, *, allowed_refs=(), journals=()):
     """Legacy plain text remains valid; malformed structured output never leaks."""
     raw = str(raw or "").strip()
