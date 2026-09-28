@@ -1993,6 +1993,73 @@ def carry_memory_tier_conversation_sources(conn: sqlite3.Connection, *, guild_id
     conn.execute("UPDATE memory_tiers SET source_lineage_complete=? WHERE guild_id=? AND id=?", (int(complete), guild_id, target_tier_row_id))
 
 
+def memory_tier_private_channel(conn: sqlite3.Connection, *, guild_id: int, tier_row_id: int) -> int:
+    """Resolve a tier's private scope from its original leaves, never its label.
+
+    Zero is the existing non-playground scope. A negative result means sealed
+    provenance is incomplete or mixed and must not be read or consolidated.
+    """
+    row = conn.execute("SELECT user_id,source_channel_policy,source_lineage_complete "
+                       "FROM memory_tiers WHERE guild_id=? AND id=?",
+                       (guild_id, tier_row_id)).fetchone()
+    if not row or row[1] != 'sealed_test':
+        return 0
+    if not row[2] or 'channel_id' not in _tier_source_columns(conn, 'conversations'):
+        return -1
+    sources = conn.execute("""SELECT c.user_id,c.channel_policy,c.channel_id,c.role
+        FROM memory_tier_conversation_sources s
+        LEFT JOIN conversations c ON c.id=s.conversation_row_id AND c.guild_id=s.guild_id
+        WHERE s.guild_id=? AND s.tier_row_id=?""", (guild_id, tier_row_id)).fetchall()
+    if (not sources or any(s[0] != row[0] or s[1] != 'sealed_test'
+                          or not int(s[2] or 0) > 0 or s[3] != 'user' for s in sources)
+            or len({s[2] for s in sources}) != 1):
+        return -1
+    return int(sources[0][2])
+
+
+def sealed_memory_tier_sources(conn: sqlite3.Connection, *, guild_id: int,
+                               user_id: int, channel_id: int) -> list[dict]:
+    """Reopen this playground's retained human sources with current controls.
+
+    The existing tier links pin the original conversation across consolidation.
+    No copy of public memory or independent private memory store is needed.
+    """
+    if channel_id <= 0 or not _tier_source_columns(conn, 'memory_tier_conversation_sources'):
+        return []
+    rows = conn.execute("""SELECT DISTINCT t.id FROM memory_tiers t
+        WHERE t.guild_id=? AND t.user_id=? AND t.source_channel_policy='sealed_test'
+          AND t.source_lineage_complete=1 ORDER BY t.id DESC""", (guild_id, user_id)).fetchall()
+    result = []
+    for (tier_id,) in rows:
+        if memory_tier_private_channel(conn, guild_id=guild_id, tier_row_id=tier_id) != channel_id:
+            continue
+        sources = conn.execute("""SELECT c.id,c.content,c.timestamp,e.entry_id,e.normalized_value,
+                e.lifecycle_status,e.channel_id,e.channel_policy,e.visibility,e.source_role,e.subject_key
+            FROM memory_tier_conversation_sources s
+            JOIN conversations c ON c.id=s.conversation_row_id AND c.guild_id=s.guild_id
+            JOIN memory_ledger_entries e ON e.guild_id=c.guild_id AND e.source_table='conversations'
+              AND e.source_row_id=CAST(c.id AS TEXT) AND e.predicate_key='conversation'
+            WHERE s.guild_id=? AND s.tier_row_id=? ORDER BY c.id""", (guild_id, tier_id)).fetchall()
+        expected = conn.execute('SELECT COUNT(*) FROM memory_tier_conversation_sources '
+                                'WHERE guild_id=? AND tier_row_id=?', (guild_id, tier_id)).fetchone()[0]
+        if len(sources) != expected:
+            continue
+        if any(s[5] != 'active' or s[6] != channel_id or s[7] != 'sealed_test'
+               or s[8] != 'sealed_test' or s[9] != 'user'
+               or s[10] != subject_key_for_user(user_id) or str(s[1])[:500] != s[4]
+               or conn.execute("SELECT 1 FROM memory_ledger_lineage WHERE guild_id=? "
+                               "AND target_entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')",
+                               (guild_id, s[3])).fetchone() for s in sources):
+            continue
+        tier = conn.execute('SELECT tier,summary,salience,updated_at FROM memory_tiers WHERE id=?',
+                            (tier_id,)).fetchone()
+        result.append({'tier_id': tier_id, 'tier': tier[0], 'summary': tier[1],
+                       'salience': tier[2], 'updated_at': tier[3],
+                       'sources': tuple({'row_id': s[0], 'text': s[1], 'timestamp': s[2],
+                                         'entry_id': s[3]} for s in sources)})
+    return result
+
+
 def retained_tier_conversation_sources(conn: sqlite3.Connection, *, guild_id: int, source_row_ids: Iterable[int | str]) -> set[int]:
     """Read indexed retention references without schema changes or commits."""
     source_ids = _tier_source_ids(source_row_ids)

@@ -106,6 +106,7 @@ from bnl_memory_ledger import (
     attach_memory_tier_conversation_sources,
     carry_memory_tier_conversation_sources,
     ensure_memory_tier_source_schema,
+    memory_tier_private_channel,
     retained_tier_conversation_sources,
     unresolved_memory_tier_sources_count,
     backfill_atomic_knowledge_candidates,
@@ -136,7 +137,18 @@ from bnl_memory_ledger import (
     sweep_atomic_knowledge_lifecycle,
 )
 from bnl_memory_governance import (
+    APPROVED_AUTOMATIC_MEMBER_FACT_KEYS,
+    _MEMORY_ROLEPLAY_CUES_RE,
+    _clean_approved_member_fact_value,
+    _normalize_pronoun_value,
+    _clean_fact_correction_value,
+    _extract_explicit_member_fact_corrections,
+    _MEMBER_FACT_ACTION_TAIL_RE,
+    _split_member_fact_clauses,
+    extract_user_facts,
+
     GovernanceRequest,
+    sealed_tier_candidates,
     assess_governance_result_safety,
     build_governed_context,
     classify_personal_recall_intent,
@@ -173,6 +185,7 @@ from bnl_moment_engine import (
     sweep_expired_windows as sweep_expired_moment_windows,
 )
 from bnl_relationship_engine import (
+    private_conversation_sources,
     claim_relationship_meaning,
     finish_relationship_meaning,
     meaning_guild_ids as relationship_meaning_guild_ids,
@@ -1170,7 +1183,9 @@ CHANNEL_POLICY_CONTRACTS = {
     "public_home": {"reply_without_direct": True, "reply_when_mentioned": True, "passive_save": True, "profile": True, "habits": True, "relationship": True, "memory_tiers": True, "presence": True, "subject_signals": False, "public_context": True, "internal_context": True},
     "public_context": {"reply_without_direct": False, "reply_when_mentioned": True, "passive_save": True, "profile": True, "habits": True, "relationship": True, "memory_tiers": True, "presence": True, "subject_signals": False, "public_context": True, "internal_context": True},
     "public_selective": {"reply_without_direct": False, "reply_when_mentioned": True, "passive_save": True, "profile": True, "habits": True, "relationship": True, "memory_tiers": False, "presence": True, "subject_signals": False, "public_context": "selective", "internal_context": True},
-    "sealed_test": {"reply_without_direct": True, "reply_when_mentioned": True, "passive_save": True, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": True},
+    # Aggregate flags control public stores; private tone is reconstructed from
+    # scoped evidence. Tier writes retain their original sealed channel roots.
+    "sealed_test": {"reply_without_direct": True, "reply_when_mentioned": True, "passive_save": True, "profile": False, "habits": False, "relationship": False, "memory_tiers": True, "presence": False, "subject_signals": False, "public_context": False, "internal_context": True},
     "internal_controlled": {"reply_without_direct": False, "reply_when_mentioned": True, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": True, "public_context": False, "internal_context": True},
     "reference_canon": {"reply_without_direct": False, "reply_when_mentioned": False, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": True},
     "protected_system": {"reply_without_direct": False, "reply_when_mentioned": False, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": False},
@@ -8303,60 +8318,40 @@ def get_latest_user_fact(user_id: int, guild_id: int, fact_key: str):
     conn.close()
     return row
 
-def update_relationship_state(user_id: int, guild_id: int, signal_text: str = "", delta_affinity: float = 0.08):
-    now = datetime.now(PACIFIC_TZ).isoformat()
-    topic = infer_topic(signal_text)
+def _advance_relationship_state(prior, signal_text: str, delta_affinity: float, observed_at: str):
+    """One legacy tone calculation for public writes and scoped private reads."""
     signal = (signal_text or "").lower()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO relationship_state (user_id, guild_id, interaction_count, affinity_score, trust_stage, social_stance, last_topic, updated_at)
-        VALUES (?, ?, 1, ?, 'new', 'neutral', ?, ?)
-        ON CONFLICT(user_id, guild_id)
-        DO UPDATE SET
-            interaction_count = interaction_count + 1,
-            affinity_score = MIN(5.0, affinity_score + ?),
-            last_topic = excluded.last_topic,
-            updated_at = excluded.updated_at
-        """,
-        (user_id, guild_id, max(0.02, delta_affinity), topic, now, max(0.02, delta_affinity)),
-    )
-    cursor.execute(
-        "SELECT interaction_count, affinity_score, social_stance FROM relationship_state WHERE user_id = ? AND guild_id = ?",
-        (user_id, guild_id),
-    )
-    row = cursor.fetchone()
-    if row:
-        interactions, affinity, stance = row
-        if interactions >= 80 or affinity >= 3.5:
-            stage = "trusted"
-        elif interactions >= 20 or affinity >= 1.5:
-            stage = "familiar"
-        else:
-            stage = "new"
+    interactions = (prior[0] if prior else 0) + 1
+    affinity = min(5.0, prior[1] + max(.02, delta_affinity)) if prior else max(.02, delta_affinity)
+    stance = prior[3] if prior else 'neutral'
+    stage = 'trusted' if interactions >= 80 or affinity >= 3.5 else 'familiar' if interactions >= 20 or affinity >= 1.5 else 'new'
+    if any(k in signal for k in ('shut up', 'hate you', 'you suck', 'stupid bot', 'annoying')):
+        stance = 'rival'
+    elif any(k in signal for k in ('thanks', 'thank you', 'good bot', 'love you', 'appreciate')) and stance != 'rival':
+        stance = 'friend'
+    elif stance not in ('friend', 'rival'):
+        stance = 'neutral'
+    return (interactions, affinity, stage, stance, infer_topic(signal_text), observed_at)
 
-        hostile = any(k in signal for k in ("shut up", "hate you", "you suck", "stupid bot", "annoying"))
-        warm = any(k in signal for k in ("thanks", "thank you", "good bot", "love you", "appreciate"))
-        if hostile:
-            stance = "rival"
-        elif warm and stance != "rival":
-            stance = "friend"
-        elif stance not in ("friend", "rival"):
-            stance = "neutral"
 
-        cursor.execute(
-            "UPDATE relationship_state SET trust_stage = ?, social_stance = ? WHERE user_id = ? AND guild_id = ?",
-            (stage, stance, user_id, guild_id),
-        )
-    conn.commit()
-    conn.close()
+def update_relationship_state(user_id: int, guild_id: int, signal_text: str = "", delta_affinity: float = 0.08):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        prior = get_relationship_state(user_id, guild_id, connection=conn)
+        state = _advance_relationship_state(prior, signal_text, delta_affinity, datetime.now(PACIFIC_TZ).isoformat())
+        conn.execute('''INSERT INTO relationship_state
+            (user_id,guild_id,interaction_count,affinity_score,trust_stage,social_stance,last_topic,updated_at)
+            VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(user_id,guild_id) DO UPDATE SET
+            interaction_count=excluded.interaction_count, affinity_score=excluded.affinity_score,
+            trust_stage=excluded.trust_stage, social_stance=excluded.social_stance,
+            last_topic=excluded.last_topic, updated_at=excluded.updated_at''', (user_id, guild_id, *state))
 
 def get_relationship_state(
     user_id: int,
     guild_id: int,
     *,
     connection: sqlite3.Connection | None = None,
+    private_channel_id: int = 0,
 ):
     conn = connection or sqlite3.connect(DB_FILE)
     owns_connection = connection is None
@@ -8371,7 +8366,13 @@ def get_relationship_state(
             """,
             (user_id, guild_id),
         )
-        return cursor.fetchone()
+        state = cursor.fetchone()
+        for source in private_conversation_sources(conn, guild_id=guild_id, user_id=user_id, channel_id=private_channel_id):
+            if source['ledger']['route_mode'] not in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS}:
+                continue
+            state = _advance_relationship_state(state, source['text'],
+                .06 if source['role'] == 'user' else .04, source['timestamp'])
+        return state
     except sqlite3.DatabaseError:
         if owns_connection:
             raise
@@ -8430,49 +8431,45 @@ def get_relationship_journal(
         if owns_connection:
             conn.close()
 
+def _advance_user_habits(prior, content: str, observed_at: str):
+    """Same habit reducer for both surfaces; only public writes persist globally."""
+    text = (content or '').strip()
+    if not text:
+        return prior
+    stamp = datetime.fromisoformat(observed_at.replace('Z', '+00:00'))
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    hour = stamp.astimezone(PACIFIC_TZ).hour
+    total, questions, humor, late, average = prior[:5] if prior else (0, 0, 0, 0, 0.)
+    return (total + 1, questions + int('?' in text),
+            humor + int(any(k in text.lower() for k in ('lol', 'lmao', 'haha', 'joke', 'meme'))),
+            late + int(hour >= 23 or hour <= 4), (average * total + len(text)) / (total + 1),
+            infer_topic(text), observed_at)
+
+
 def update_user_habits(user_id: int, guild_id: int, content: str):
     text = (content or "").strip()
     if not text:
         return
 
-    t = text.lower()
-    now = datetime.now(PACIFIC_TZ)
-    hour = now.hour
-    msg_len = len(text)
-    topic = infer_topic(text)
-    q = 1 if "?" in text else 0
-    humor = 1 if any(k in t for k in ("lol", "lmao", "haha", "joke", "meme")) else 0
-    late_night = 1 if (hour >= 23 or hour <= 4) else 0
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO user_habits (
-            user_id, guild_id, total_messages, question_messages, humor_messages,
-            late_night_messages, avg_length, last_topic, updated_at
-        )
-        VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, guild_id)
-        DO UPDATE SET
-            total_messages = total_messages + 1,
-            question_messages = question_messages + excluded.question_messages,
-            humor_messages = humor_messages + excluded.humor_messages,
-            late_night_messages = late_night_messages + excluded.late_night_messages,
-            avg_length = ((avg_length * total_messages) + excluded.avg_length) / (total_messages + 1),
-            last_topic = excluded.last_topic,
-            updated_at = excluded.updated_at
-        """,
-        (user_id, guild_id, q, humor, late_night, float(msg_len), topic, now.isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        prior = get_user_habits(user_id, guild_id, connection=conn)
+        state = _advance_user_habits(prior, text, datetime.now(PACIFIC_TZ).isoformat())
+        conn.execute('''INSERT INTO user_habits
+            (user_id,guild_id,total_messages,question_messages,humor_messages,late_night_messages,avg_length,last_topic,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,guild_id) DO UPDATE SET
+            total_messages=excluded.total_messages, question_messages=excluded.question_messages,
+            humor_messages=excluded.humor_messages, late_night_messages=excluded.late_night_messages,
+            avg_length=excluded.avg_length, last_topic=excluded.last_topic, updated_at=excluded.updated_at''',
+            (user_id, guild_id, *state))
 
 def get_user_habits(
     user_id: int,
     guild_id: int,
     *,
     connection: sqlite3.Connection | None = None,
+    private_channel_id: int = 0,
 ):
     conn = connection or sqlite3.connect(DB_FILE)
     owns_connection = connection is None
@@ -8487,7 +8484,11 @@ def get_user_habits(
             """,
             (user_id, guild_id),
         )
-        return cursor.fetchone()
+        state = cursor.fetchone()
+        for source in private_conversation_sources(conn, guild_id=guild_id, user_id=user_id, channel_id=private_channel_id):
+            if source['role'] == 'user' and source['ledger']['route_mode'] in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS}:
+                state = _advance_user_habits(state, source['text'], source['timestamp'])
+        return state
     except sqlite3.DatabaseError:
         if owns_connection:
             raise
@@ -8762,20 +8763,24 @@ def _add_memory_tier_entry(user_id: int, guild_id: int, tier: str, summary: str,
     return row_id
 
 
-def _fetch_tier_rows(cursor, user_id: int, guild_id: int, tier: str) -> list[dict]:
+def _fetch_tier_rows(cursor, user_id: int, guild_id: int, tier: str, private_channel_id: int | None = None) -> list[dict]:
     cols = _memory_tiers_columns(cursor)
     wanted = ["id", "summary", "salience", "mentions", "updated_at"] + [c for c in ("source_role", "source_channel_policy", "source_channel_name", "source_origin", "source_trust", "topic_key", "subject_key", "project_key", "first_seen", "last_seen", "source_lineage_complete") if c in cols]
     cursor.execute(f"SELECT {', '.join(wanted)} FROM memory_tiers WHERE user_id=? AND guild_id=? AND tier=? ORDER BY id DESC", (user_id, guild_id, tier))
-    return [dict(zip(wanted, row)) for row in cursor.fetchall()]
+    rows = [dict(zip(wanted, row)) for row in cursor.fetchall()]
+    if private_channel_id is not None:
+        rows = [r for r in rows if memory_tier_private_channel(cursor.connection, guild_id=guild_id, tier_row_id=r["id"]) == private_channel_id]
+    return rows
 
 
 def _merge_or_insert_cluster(cursor, user_id: int, guild_id: int, tier: str, rows: list[dict], topic_key: str, source_trust: str, lifecycle_note: str):
     if not rows:
         return
     group = _memory_visibility_group(source_trust, rows[0].get("source_channel_policy", ""))
+    private_channel_id = memory_tier_private_channel(cursor.connection, guild_id=guild_id, tier_row_id=rows[0]["id"])
     lineage_complete = all(bool(r.get("source_lineage_complete")) for r in rows)
     compatible = []
-    for r in _fetch_tier_rows(cursor, user_id, guild_id, tier):
+    for r in _fetch_tier_rows(cursor, user_id, guild_id, tier, private_channel_id):
         if (
             (r.get("topic_key") or _memory_topic_key(r.get("summary", ""))) == topic_key
             and _memory_visibility_group(r.get("source_trust", ""), r.get("source_channel_policy", "")) == group
@@ -8810,9 +8815,19 @@ def _merge_or_insert_cluster(cursor, user_id: int, guild_id: int, tier: str, row
         return {"row_id": row_id, "summary": stored[0], "salience": stored[1], "tier": tier, "topic_key": topic_key, "updated_at": stored[2], "derived_from_rows": tuple(int(r.get("id") or 0) for r in rows if r.get("id"))}
 
 
-def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None = None) -> dict:
+def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None = None, *, private_channel_id: int | None = None) -> dict:
     limits = limits or calculate_adaptive_memory_limits(user_id, guild_id)
     result = {"short_to_medium": 0, "medium_to_long": 0, "aged_out": 0, "merged_topics": [], "limits": limits}
+    if private_channel_id is None:
+        with closing(sqlite3.connect(DB_FILE)) as scope_conn:
+            ids = [r[0] for r in scope_conn.execute("SELECT id FROM memory_tiers WHERE user_id=? AND guild_id=?", (user_id, guild_id))]
+            scopes = {memory_tier_private_channel(scope_conn, guild_id=guild_id, tier_row_id=row_id) for row_id in ids}
+        for scope in sorted(scopes):
+            part = _consolidate_memory_tiers(user_id, guild_id, limits, private_channel_id=scope)
+            for key in ("short_to_medium", "medium_to_long", "aged_out"):
+                result[key] += part[key]
+            result["merged_topics"].extend(part["merged_topics"])
+        return result
     shadow_tier_events = []
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -8821,7 +8836,7 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
             cursor = conn.cursor()
             cols = _memory_tiers_columns(cursor)
 
-            short_rows = _fetch_tier_rows(cursor, user_id, guild_id, "short")
+            short_rows = _fetch_tier_rows(cursor, user_id, guild_id, "short", private_channel_id)
             if len(short_rows) > limits["short"]:
                 overflow = short_rows[limits["short"]:]
                 buckets = defaultdict(list)
@@ -8839,7 +8854,7 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
                     result["short_to_medium"] += len(rows); result["merged_topics"].append(topic)
                 cursor.executemany("DELETE FROM memory_tiers WHERE id=?", [(r["id"],) for r in overflow])
 
-            med_rows = _fetch_tier_rows(cursor, user_id, guild_id, "medium")
+            med_rows = _fetch_tier_rows(cursor, user_id, guild_id, "medium", private_channel_id)
             if len(med_rows) > limits["medium"]:
                 overflow = med_rows[limits["medium"]:]
                 buckets = defaultdict(list)
@@ -8853,7 +8868,7 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
                     repeated = sum(int(r.get("mentions") or 1) for r in rows) >= 3 or len(rows) >= 2
                     high_salience = max(float(r.get("salience") or 0.0) for r in rows) >= 0.78
                     confirmed = any(any(k in (r.get("summary") or "").lower() for k in ("remember", "confirmed", "owner-confirmed", "this matters", "keep this")) for r in rows)
-                    safe = _memory_visibility_group(rows[0].get("source_trust", ""), rows[0].get("source_channel_policy", "")) != "sealed_test"
+                    safe = private_channel_id >= 0
                     if safe and (repeated or high_salience or confirmed):
                         shadow_event = _merge_or_insert_cluster(cursor, user_id, guild_id, "long", rows, topic, _consolidated_trust_for(rows), "crystallized_medium_to_long")
                         if shadow_event:
@@ -8871,8 +8886,12 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
                 if delete_ids:
                     cursor.executemany("DELETE FROM memory_tiers WHERE id=?", [(i,) for i in delete_ids])
 
-            cursor.execute("DELETE FROM memory_tiers WHERE id IN (SELECT id FROM memory_tiers WHERE user_id=? AND guild_id=? AND tier='long' ORDER BY salience DESC, mentions DESC, id DESC LIMIT -1 OFFSET ?)", (user_id, guild_id, limits["long"]))
-            result["aged_out"] += max(0, len(_fetch_tier_rows(cursor, user_id, guild_id, "long")) - limits["long"])
+            long_rows = sorted(_fetch_tier_rows(cursor, user_id, guild_id, "long", private_channel_id),
+                               key=lambda r: (r["salience"], r["mentions"], r["id"]), reverse=True)
+            expired = long_rows[limits["long"]:]
+            cursor.executemany("DELETE FROM memory_tiers WHERE id=?", [(r["id"],) for r in expired])
+            result["aged_out"] += len(expired)
+            result["aged_out"] += max(0, len(_fetch_tier_rows(cursor, user_id, guild_id, "long", private_channel_id)) - limits["long"])
     finally:
         conn.close()
     for event in shadow_tier_events:
@@ -8946,7 +8965,8 @@ def maybe_add_memory_trace(
     policy = (channel_policy or "").strip().lower() or "unknown"
     normalized_role = (role or "").strip().lower()
     decision = decide_memory_write_policy(route_mode, policy, normalized_role, content, normalized_role == "model")
-    if not decision.write_memory_tier:
+    if not decision.write_memory_tier and not (policy == "sealed_test" and normalized_role == "user"
+            and route_mode == ROUTE_MODE_NORMAL_CHAT and extract_user_facts(content)):
         LAST_MEMORY_SKIP_REASONS[decision.reason or "write_memory_tier_disabled"] += 1
         return
     return add_short_memory_trace(
@@ -8957,7 +8977,7 @@ def maybe_add_memory_trace(
         source_channel_policy=policy or "legacy_unknown",
         source_channel_name=channel_name or "",
         source_origin=source or "conversation",
-        source_trust="source_safe_public",
+        source_trust="sealed_test" if policy == "sealed_test" else "source_safe_public",
         connection=connection,
         source_conversation_row_ids=(source_conversation_row_id,) if source_conversation_row_id is not None else (),
     )
@@ -11322,7 +11342,7 @@ def decide_memory_write_policy(route_mode: str, channel_policy: str, author_role
         return MemoryWriteDecision(True, False, False, False, False, False, "unknown_policy_conversation_row_only", visibility)
     if not CHANNEL_POLICY_CONTRACTS.get(policy, CHANNEL_POLICY_CONTRACTS["unknown"]).get("passive_save", False) and mode == ROUTE_MODE_NORMAL_CHAT and not is_model_reply:
         return MemoryWriteDecision(True, False, False, False, False, False, f"{policy}_conversation_row_only", visibility)
-    if policy in {"sealed_test", "internal_controlled", "broadcast_memory", "protected_system", "reference_canon", "ai_image_tool"}:
+    if policy in {"internal_controlled", "broadcast_memory", "protected_system", "reference_canon", "ai_image_tool"}:
         return MemoryWriteDecision(True, False, False, False, False, False, f"{policy}_no_normal_durable_memory", visibility)
     if mode in SOURCE_INTERNAL_MODES or mode in {ROUTE_MODE_DIRECT_PAYLOAD, ROUTE_MODE_SIMPLE_GREETING, ROUTE_MODE_RELAY, ROUTE_MODE_AMBIENT}:
         return MemoryWriteDecision(True, policy in PUBLIC_CHAT_POLICIES and not is_model_reply, False, False, False, False, f"{mode}_durable_memory_disabled", visibility)
@@ -11332,7 +11352,7 @@ def decide_memory_write_policy(route_mode: str, channel_policy: str, author_role
     quality_ok = (not is_model_reply) and is_meaningful_memory_candidate(text, role) and len(text.split()) >= 5 and not text.endswith("?")
     if re.search(r"\b(?:lol|lmao|haha|hi|hey|yo|hello|thanks|thank you)\b", text.lower()) and len(text.split()) <= 8:
         quality_ok = False
-    tier_ok = policy in {"public_home", "public_context"} and mode == ROUTE_MODE_NORMAL_CHAT and quality_ok
+    tier_ok = policy in {"public_home", "public_context", "sealed_test"} and mode == ROUTE_MODE_NORMAL_CHAT and quality_ok
     presence_ok = CHANNEL_POLICY_CONTRACTS.get(policy, {}).get("presence", False) and not is_model_reply
     reason = "durable_memory_allowed" if tier_ok else "conversation_saved_durable_memory_skipped"
     return MemoryWriteDecision(True, profile_ok, habits_ok, relationship_ok, tier_ok, presence_ok, reason, visibility)
@@ -18323,11 +18343,12 @@ def prune_conversation_history(user_id: int, guild_id: int, max_rows: int = MAX_
                 int(row[0])
                 for row in conn.execute(
                     """
-                    SELECT id
-                    FROM conversations
-                    WHERE user_id=? AND guild_id=?
-                    ORDER BY id DESC
-                    LIMIT -1 OFFSET ?
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY CASE WHEN channel_policy='sealed_test' THEN channel_id ELSE 0 END
+                            ORDER BY id DESC) AS scope_position
+                        FROM conversations WHERE user_id=? AND guild_id=?
+                    ) WHERE scope_position>? ORDER BY id DESC
                     """,
                     (user_id, guild_id, keep_rows),
                 ).fetchall()
@@ -19717,7 +19738,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         except Exception as exc:
             logging.debug("relationship_v2_shadow_observe_user_failed error=%s", exc)
     # Reading additional rooms must not produce automatic Source File work.
-    if route_mode != "channel_observation":
+    if route_mode != "channel_observation" and channel_policy != "sealed_test":
         try:
             mark_subject_dirty_for_evidence(
                 DB_FILE,
@@ -19746,6 +19767,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
             limits=calculate_adaptive_memory_limits(
                 user_id, guild_id, channel_policy=channel_policy, user_text=content,
             ),
+            private_channel_id=int(channel_id or 0) if channel_policy == "sealed_test" else 0,
         )
     prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
     if (
@@ -25383,302 +25405,6 @@ def infer_topic(text: str) -> str:
         return "casual_banter"
     return "general"
 
-APPROVED_AUTOMATIC_MEMBER_FACT_KEYS = (
-    "preferred_name",
-    "pronouns",
-    "favorite_color",
-    "favorite_movie",
-)
-
-_MEMORY_ROLEPLAY_CUES_RE = re.compile(
-    r"\b(?:pretend|role[- ]?play|in (?:this|the) scene|my character|character says|"
-    r"if i (?:said|were)|hypothetically|just kidding|j/?k|sarcasm)\b",
-    re.I,
-)
-
-
-def _clean_approved_member_fact_value(value: str, *, max_chars: int) -> str:
-    raw = str(value or "")
-    if (
-        "\n" in raw
-        or "\r" in raw
-        or "```" in raw
-        or re.search(r"<@|@(?:everyone|here)\b", raw, flags=re.I)
-        or re.search(
-            r"(?:^|[\[<(])\s*(?:system|developer|assistant|current user request|"
-            r"user/member|bnl-?01|instructions?)\s*(?:[:\]>)])",
-            raw,
-            flags=re.I,
-        )
-    ):
-        return ""
-    cleaned = re.sub(r"\s+", " ", raw).strip(" \t\r\n.,!?;:")
-    cleaned = re.sub(
-        r"\s+(?:from now on|going forward|please)$",
-        "",
-        cleaned,
-        flags=re.I,
-    ).strip()
-    if not cleaned or cleaned.lower().startswith(("not ", "maybe ", "someone else")):
-        return ""
-    if re.search(
-        r"\b(?:ignore|disregard|override|reveal)\b.{0,40}"
-        r"\b(?:instruction|prompt|system|developer|secret|token)\b",
-        cleaned,
-        flags=re.I,
-    ):
-        return ""
-    return cleaned[:max_chars].strip()
-
-
-def _normalize_pronoun_value(value: str) -> str:
-    cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n.,!?;:").lower()
-    special = {
-        "any": "any pronouns",
-        "any pronouns": "any pronouns",
-        "no pronouns": "no pronouns",
-        "name only": "name only",
-        "my name only": "name only",
-    }
-    if cleaned in special:
-        return special[cleaned]
-    cleaned = re.sub(r"\s+(?:and|or)\s+", "/", cleaned)
-    cleaned = re.sub(r"\s*/\s*", "/", cleaned)
-    parts = [part for part in cleaned.split("/") if part]
-    if not (2 <= len(parts) <= 4):
-        return ""
-    if any(not re.fullmatch(r"[a-z][a-z'-]{0,19}", part) for part in parts):
-        return ""
-    return "/".join(parts)
-
-
-def _clean_fact_correction_value(key: str, value: str) -> str:
-    # Every correction regex must delimit its replacement explicitly. Do not
-    # strip a trailing word such as "Now": it can be part of a real movie title
-    # or preferred name.
-    cleaned = str(value or "").strip()
-    if key == "pronouns":
-        return _normalize_pronoun_value(cleaned)
-    return _clean_approved_member_fact_value(
-        cleaned,
-        max_chars=100 if key == "favorite_movie" else 40,
-    )
-
-
-def _extract_explicit_member_fact_corrections(text: str):
-    """Extract only an unambiguous affirmative replacement value."""
-    content = re.sub(r"\s+", " ", str(text or "")).strip()
-    candidates = []
-    patterns = (
-        (
-            "preferred_name",
-            0.94,
-            (
-                r"\b(?:do not|don['’]t|never)\s+call me\s+"
-                r"[A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?"
-                r"(?:\s+anymore)?\s*[,;—-]+\s*(?:please\s+)?call me\s+"
-                r"([A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?)(?=$|[.!?,;])",
-                r"\bmy preferred name (?:changed from\s+"
-                r"[A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}\s+to|is now)\s+"
-                r"([A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?)(?=$|[.!?,;])",
-                r"\b(?:actually[,;:]?\s*)?(?:please\s+)?call me\s+"
-                r"([A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?)\s+"
-                r"(?:now|instead)(?=$|[.!?,;])",
-            ),
-        ),
-        (
-            "favorite_color",
-            0.92,
-            (
-                r"\bmy favou?rite colou?r changed from\s+"
-                r"[A-Za-z][A-Za-z -]{0,39}\s+to\s+"
-                r"([A-Za-z][A-Za-z -]{0,39}?)(?=$|[.!?,;])",
-                r"\bmy favou?rite colou?r is no longer\s+"
-                r"[A-Za-z][A-Za-z -]{0,39}?\s*[,;—-]+\s*"
-                r"(?:it(?:'s| is)|my favou?rite colou?r is)\s+"
-                r"([A-Za-z][A-Za-z -]{0,39}?)(?=$|[.!?,;])",
-                r"\bmy favou?rite colou?r is\s+"
-                r"([A-Za-z][A-Za-z -]{0,39}?)\s+"
-                r"(?:now|instead|these days)(?=$|[.!?,;])",
-                r"\bmy favou?rite colou?r is now\s+"
-                r"([A-Za-z][A-Za-z -]{0,39}?)(?=$|[.!?,;])",
-            ),
-        ),
-        (
-            "favorite_movie",
-            0.94,
-            (
-                r"\bmy favou?rite movie changed from\s+"
-                r"[^.!?;]{1,100}?\s+to\s+"
-                r"([^.!?;]{1,100}?)(?=$|[.!?;])",
-                r"\bmy favou?rite movie is no longer\s+"
-                r"[^.!?;]{1,100}?\s*[,;—-]+\s*"
-                r"(?:it(?:'s| is)|my favou?rite movie is)\s+"
-                r"([^.!?;]{1,100}?)(?=$|[.!?;])",
-                r"\bmy favou?rite movie is now\s+"
-                r"([^.!?;]{1,100}?)(?=$|[.!?;])",
-                r"\bactually[,;:]?\s*my favou?rite movie is\s+"
-                r"([^.!?;]{1,100}?)(?=$|[.!?;])",
-            ),
-        ),
-        (
-            "pronouns",
-            0.94,
-            (
-                r"\bmy pronouns changed from\s+"
-                r"[A-Za-z/' -]{2,40}\s+to\s+"
-                r"([A-Za-z/' -]{2,40}?)(?=$|[.!?,;])",
-                r"\bi no longer use\s+[A-Za-z/' -]{2,40}?\s*[,;—-]+\s*"
-                r"i use\s+([A-Za-z/' -]{2,40}?)(?:\s+pronouns)?"
-                r"(?=$|[.!?,;])",
-                r"\bi use\s+([A-Za-z/' -]{2,40}?)\s+now\s*,?\s*"
-                r"not\s+[A-Za-z/' -]{2,40}(?=$|[.!?;])",
-                r"\bmy pronouns are\s+([A-Za-z/' -]{2,40}?)\s+"
-                r"(?:now|instead)(?=$|[.!?,;])",
-                r"\bmy pronouns are now\s+"
-                r"([A-Za-z/' -]{2,40}?)(?=$|[.!?,;])",
-            ),
-        ),
-    )
-    for key, confidence, key_patterns in patterns:
-        for pattern in key_patterns:
-            match = re.search(pattern, content, flags=re.I)
-            if not match:
-                continue
-            value = _clean_fact_correction_value(key, match.group(1))
-            if value and (key != "preferred_name" or len(value.split()) <= 4):
-                candidates.append((key, value, confidence))
-            break
-    return candidates
-
-
-_MEMBER_FACT_ACTION_TAIL_RE = re.compile(
-    r"\s+and\s+(?=(?:my\b|(?:please\s+)?(?:tell|show|give|make|write|"
-    r"draw|send|explain|help|ask|wave|respond|answer)\b))",
-    re.I,
-)
-
-
-def _split_member_fact_clauses(text: str) -> tuple[str, ...]:
-    """Split only at boundaries that cannot be part of a scalar fact value."""
-    clauses = []
-    # A question is not a self-report, but an independent question must not
-    # cancel a declaration elsewhere in the same turn. Keep the terminator
-    # until after that distinction has been made.
-    for sentence in re.findall(r"[^.!?;]+(?:[.!?;]+|$)", str(text or "")):
-        if "?" in sentence:
-            continue
-        sentence = sentence.rstrip(".!;")
-        for clause in _MEMBER_FACT_ACTION_TAIL_RE.split(sentence):
-            cleaned = re.sub(r"\s+", " ", clause).strip(" \t\r\n,")
-            cleaned = re.sub(r",\s*please$", " please", cleaned, flags=re.I)
-            if cleaned:
-                clauses.append(cleaned)
-    return tuple(clauses)
-
-
-def extract_user_facts(text: str):
-    """Return only approved, clear, direct self-authored member preferences.
-
-    This parser intentionally does not turn arbitrary ``remember`` requests,
-    broad likes/dislikes, projects, unscoped favorites, jokes, or statements
-    about another person into durable memory.
-    """
-    content = (text or "").strip()
-    if (
-        not content
-        or _MEMORY_ROLEPLAY_CUES_RE.search(content)
-        or re.search(r"[\"“”]", content)
-        or re.search(r"\b(?:he|she|they|someone|another person)\s+(?:said|says|wrote)\b", content, flags=re.I)
-    ):
-        return []
-
-    clauses = _split_member_fact_clauses(content)
-    correction_by_key = {}
-    for clause in clauses:
-        for fact in _extract_explicit_member_fact_corrections(clause):
-            correction_by_key[fact[0]] = fact
-
-    facts = list(correction_by_key.values())
-    patterns = (
-        (
-            r"\b(?:please\s+)?(?:call me|i go by|i prefer to be called|"
-            r"i want to be called|my preferred name is)\s+"
-            r"([A-Za-z0-9][A-Za-z0-9 _.'-]{0,39}?)(?=$|[.!?,;]|\s+and\s+my\b)",
-            "preferred_name",
-            0.90,
-        ),
-        (
-            r"\bmy (?:favorite|favourite) colou?r is\s+"
-            r"([A-Za-z][A-Za-z -]{0,39}?)(?=$|[.!?,;]|\s+and\s+my\b|"
-            r"\s+(?:now|these days)(?=$|[.!?,;])|"
-            r"\s+because\b|\s+and\s+i\s+(?:still|also|usually|often|always|"
-            r"like|love|wear|use|pick|choose)\b)",
-            "favorite_color",
-            0.88,
-        ),
-        (
-            r"\bmy (?:favorite|favourite) movie is\s+"
-            r"([^.!?\n]{1,100}?)(?=$|[.!?]|\s+and\s+my\b|\s+because\b|"
-            r"\s+and\s+i\s+(?:still|also|usually|often|always|watch|rewatch|"
-            r"like|love|own|quote|recommend)\b)",
-            "favorite_movie",
-            0.90,
-        ),
-    )
-    negative_clause_re = re.compile(
-        r"\b(?:no longer|used to|not anymore|"
-        r"(?:do not|don['’]t|never)\s+call me)\b",
-        re.I,
-    )
-    for clause in clauses:
-        if negative_clause_re.search(clause):
-            continue
-        for pattern, key, confidence in patterns:
-            if key in correction_by_key:
-                continue
-            match = re.search(pattern, clause, flags=re.I)
-            if not match:
-                continue
-            value = _clean_approved_member_fact_value(
-                match.group(1),
-                max_chars=100 if key == "favorite_movie" else 40,
-            )
-            if value and (key != "preferred_name" or len(value.split()) <= 4):
-                facts.append((key, value, confidence))
-
-    pronoun_patterns = (
-        r"\bmy pronouns are\s+([^.!?\n]{1,50}?)(?:\s+please)?$",
-        r"\bi use\s+([^.!?\n]{1,40}?)\s+pronouns(?:\s+please)?$",
-        r"\buse\s+([^.!?\n]{1,40}?)\s+(?:pronouns\s+)?for me(?:\s+please)?$",
-    )
-    if "pronouns" not in correction_by_key:
-        for clause in clauses:
-            if negative_clause_re.search(clause):
-                continue
-            match = next(
-                (
-                    candidate
-                    for pattern in pronoun_patterns
-                    if (candidate := re.search(pattern, clause, flags=re.I))
-                ),
-                None,
-            )
-            if not match:
-                continue
-            pronouns = _normalize_pronoun_value(match.group(1))
-            if pronouns:
-                facts.append(("pronouns", pronouns, 0.90))
-            break
-
-    unique = []
-    seen = set()
-    for fact in facts:
-        if fact[0] in APPROVED_AUTOMATIC_MEMBER_FACT_KEYS and fact[0] not in seen:
-            unique.append(fact)
-            seen.add(fact[0])
-    return unique
-
 @dataclass(frozen=True)
 class ApprovedMemberFactEvidence:
     key: str
@@ -27559,10 +27285,20 @@ def build_user_memory_context(
         guild_id,
         connection=connection,
     )
+    private_candidates = ()
+    if policy == "sealed_test" and int(channel_id or 0) > 0:
+        with (nullcontext(connection) if connection is not None else closing(sqlite3.connect(DB_FILE))) as private_conn:
+            private_candidates = sealed_tier_candidates(private_conn, GovernanceRequest(
+                guild_id, user_id, route_mode, "discord_prompt_assembly", channel_id=int(channel_id),
+                channel_policy=policy, user_text=user_text), extract_user_facts)
+        overrides = {c.predicate_key: c for c in private_candidates if c.source_type == 'sealed_member_fact'}
+        approved_facts = tuple(f for f in approved_facts if f.key not in overrides
+            or f.observed_at > overrides[f.key].observed_at)
     relation = get_relationship_state(
         user_id,
         guild_id,
         connection=connection,
+        private_channel_id=int(channel_id or 0) if policy == "sealed_test" else 0,
     )
     journal = get_relationship_journal(
         user_id,
@@ -27574,6 +27310,7 @@ def build_user_memory_context(
         user_id,
         guild_id,
         connection=connection,
+        private_channel_id=int(channel_id or 0) if policy == "sealed_test" else 0,
     )
     tier_rows = get_memory_tiers(
         user_id,
@@ -27626,6 +27363,15 @@ def build_user_memory_context(
                 ),
                 prepare_schema=not read_only,
             )
+            if policy == "sealed_test" and int(channel_id or 0) > 0:
+                private_gist = render_shadow_moment_context(
+                    moment_conn, guild_id=int(guild_id), channel_id=int(channel_id),
+                    participant_key=subject_key_for_user(user_id), visibility="sealed_test",
+                    topic_text=user_text or "", token_budget=120, freshness_days=180,
+                    prepare_schema=not read_only,
+                    attribution_target_key=(subject_key_for_user(moment_attribution_target_user_id)
+                        if int(moment_attribution_target_user_id or 0) > 0 else ""))
+                moment_gist_context = "\n".join(part for part in (moment_gist_context, private_gist) if part)
         except Exception as exc:
             logging.warning(
                 "moment_gist_canary_retrieval_failed guild_id=%s user_id=%s error=%s",
@@ -27644,8 +27390,9 @@ def build_user_memory_context(
             if source_metadata is not None:
                 source_metadata["moment_gist_rendered"] = True
             sections.append(
-                "Moment-based continuity gist (derived from eligible public "
-                "conversation; paraphrase only, never exact wording):\n"
+                "Moment-based continuity gist (derived from eligible "
+                + ("private-channel and public " if policy == "sealed_test" else "public ")
+                + "conversation; paraphrase only, never exact wording):\n"
                 + moment_gist_context
                 + "\nUse this to connect the current request to the remembered "
                 "meaning of an earlier shared event. Attribute people cautiously. "
@@ -27754,6 +27501,10 @@ def build_user_memory_context(
         for r in tier_rows:
             if _conversation_trace_is_questionable_personal_fact(r):
                 diagnostics["skipped"]["unapproved_personal_fact_trace"] += 1
+            elif len(r) > 6 and r[6] == "sealed_test":
+                # Only the source-revalidated exact-channel reader below may
+                # expose playground tiers, including on internal routes.
+                diagnostics["skipped"]["private_channel_boundary"] += 1
             elif _memory_row_public_safe(r) or allow_private:
                 visible_rows.append(r)
             else:
@@ -27819,6 +27570,16 @@ def build_user_memory_context(
                 "member claim.\n"
                 + "\n".join(tier_lines)
             )
+    if policy == "sealed_test" and int(channel_id or 0) > 0:
+        relevance = _memory_query_relevance((c.text for c in private_candidates), user_text)
+        private_candidates = sorted(private_candidates,
+            key=lambda c: (c.source_type == 'sealed_member_fact', relevance.get(c.text, 0), c.observed_at), reverse=True)[:4]
+        for candidate in private_candidates:
+            memory_context_units.append(MemberMemoryPromptUnit(
+                "private_continuity", candidate.text, relevance_text=candidate.text))
+        if private_candidates:
+            sections.append("Private channel continuity; attributed member statements, current corrections take precedence:\n"
+                            + "\n".join("- " + c.text for c in private_candidates[:4]))
     legacy_context = "\n".join(sections) if sections else "No durable memory yet."
 
     def withhold_relationship_tone() -> None:
@@ -27871,6 +27632,7 @@ def build_user_memory_context(
                     gov_conn,
                     gov_req,
                     legacy_context=legacy_context,
+                    private_fact_extractor=extract_user_facts,
                     include_review_moments=True,
                     initialize_schema=not read_only,
                     include_public_moment_gists=bool(
@@ -30628,6 +30390,7 @@ async def record_unified_response_assessment_shadow_after_send(
 
 
 _SOURCE_BEARING_MEMORY_MARKERS = (
+    "Private channel continuity;",
     "Member memory for ",
     "Moment-based continuity gist",
     "Approved direct self-reports:",
@@ -31024,7 +30787,7 @@ def _bounded_member_memory_context(
     if member_recall_query is not None:
         header += "Derived memory summaries (lower-authority hints, not quote authority):\n"
     units = tuple(metadata.get("memory_context_units") or ())
-    kinds = ("approved_fact", "short", "medium", "long", "governed", "moment", "relationship", "relationship_v2", "habits")
+    kinds = ("approved_fact", "short", "medium", "long", "governed", "private_continuity", "moment", "relationship", "relationship_v2", "habits")
     buckets = {
         kind: [unit for unit in units if unit.kind == kind and unit.text.strip()]
         for kind in kinds

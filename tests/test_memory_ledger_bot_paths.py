@@ -2550,6 +2550,11 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
 
     def test_prune_lifecycle_failure_rolls_back_ledger_moment_and_transcript(self):
         self.enable()
+        # This exercises purge rollback for unretained history. Private tier
+        # learning now correctly pins its sources and would prevent the purge.
+        trace = mock.patch.object(bnl01_bot, "maybe_add_memory_trace")
+        trace.start()
+        self.addCleanup(trace.stop)
         bnl01_bot.save_user_message(
             42,
             "Crow",

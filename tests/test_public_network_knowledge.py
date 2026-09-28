@@ -496,14 +496,25 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self._seed_publications()
         request = "Tell me about the Copper Kite instrumental?"
         answer = "The Journal described the room coming together around Copper Kite, and the Relay carried that listening exchange forward."
-        channel, generation, guard = await self._batch(
-            "sealed_test", request, answer, privileged=False,
-        )
+        real_guard = bnl01_bot.apply_guarded_response_regeneration
+
+        async def check_sources_before_delivery(*args, **kwargs):
+            # Validate the generation's basis before sending. Saving the reply
+            # afterwards can legitimately advance private relationship memory.
+            self._assert_publications_in_prompt_and_basis(
+                kwargs["prompt"], kwargs["prompt_source_bases"],
+            )
+            return await real_guard(*args, **kwargs)
+
+        with mock.patch.object(bnl01_bot, "apply_guarded_response_regeneration",
+                               side_effect=check_sources_before_delivery):
+            channel, generation, guard = await self._batch(
+                "sealed_test", request, answer, privileged=False,
+            )
         generation.assert_awaited_once()
         guard.assert_awaited_once()
-        self._assert_publications_in_prompt_and_basis(
-            generation.await_args.args[0], guard.await_args.kwargs["prompt_source_bases"],
-        )
+        self.assertIn(JOURNAL_BODY, generation.await_args.args[0])
+        self.assertIn(RELAY_BODY, generation.await_args.args[0])
         self.assertTrue(guard.await_args.kwargs["source_context_available"])
         self.assertEqual(channel.sent, [answer])
 

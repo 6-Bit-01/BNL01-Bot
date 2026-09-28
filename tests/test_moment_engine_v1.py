@@ -168,10 +168,11 @@ class MomentEngineV1Tests(unittest.TestCase):
         self.assertEqual(rows[0],("shared_activity","finalized"))
         self.assertGreaterEqual(len(rows),3)
 
-    def test_coherent_conversation_forms_moment_but_isolated_message_is_rejected(self):
+    def test_coherent_conversation_forms_moment_but_isolated_message_awaits_meaning(self):
         self.add(1,1,"user","the synth patch needs a warmer bass")
         self.sweep()
-        self.assertEqual(self.conn.execute("SELECT lifecycle_status FROM memory_moment_windows").fetchone()[0],"rejected")
+        self.assertEqual(self.conn.execute("SELECT lifecycle_status FROM memory_moment_windows").fetchone()[0],"awaiting_meaning")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory_moment_episodes").fetchone()[0],0)
         self.add(10,1,"user","the synth patch needs a warmer bass",mins=3)
         self.add(11,1,"model","I can compare that against the chorus",mins=3)
         self.add(12,1,"user","the synth patch should keep the bass warm",mins=3)

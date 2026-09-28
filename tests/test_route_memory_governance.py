@@ -1198,8 +1198,10 @@ class MemoryPolicyGovernanceTests(unittest.TestCase):
                 "I have a durable preference that would normally matter.",
                 False,
             )
-            self.assertFalse(decision.write_memory_tier)
+            self.assertEqual(decision.write_memory_tier, policy == 'sealed_test')
             self.assertFalse(decision.update_habits)
+            self.assertFalse(decision.update_relationship)
+            self.assertFalse(decision.update_profile)
 
     def test_throwaway_public_chatter_does_not_become_memory_tier(self):
         decision = bnl01_bot.decide_memory_write_policy(
@@ -1231,7 +1233,7 @@ class MemoryPolicyGovernanceTests(unittest.TestCase):
             False,
         )
         self.assertTrue(decision.save_conversation)
-        self.assertFalse(decision.write_memory_tier)
+        self.assertTrue(decision.write_memory_tier)
         self.assertFalse(decision.record_community_presence)
         self.assertEqual(decision.visibility, "test_only_no_public_relay")
         self.assertEqual(bnl01_bot.website_relay_eligibility("sealed_test"), "no")
