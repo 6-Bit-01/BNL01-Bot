@@ -108,6 +108,24 @@ class RelationshipMeaningTests(unittest.TestCase):
         self.assertIn('not thanking you.', request.prompt)
         self.assertTrue(rel.finish_relationship_meaning(self.conn, request, text='{"signals":[]}'))
 
+    def test_quote_scope_is_compared_with_actual_correction_context(self):
+        text = "A reviewer wrote 'Thanks for ignoring what I asked' in a film review. I am quoting the review, not talking about you."
+        self.observe(text)
+        quoted = rel.claim_relationship_meaning(self.conn)
+        self.assertIn('Explaining the scope of an example is not itself a relationship correction.', quoted.prompt)
+        self.assertIn('shown in this exchange or explicitly reported by the member', quoted.prompt)
+        self.assertTrue(rel.finish_relationship_meaning(self.conn, quoted, text='{"signals":[]}'))
+
+        self.source('You thanked me for ignoring your request.', role='model')
+        correction = 'No, I was quoting the reviewer, not thanking you.'
+        self.observe(correction)
+        corrected = rel.claim_relationship_meaning(self.conn)
+        self.assertIn('You thanked me for ignoring your request.', corrected.prompt)
+        self.assertTrue(rel.finish_relationship_meaning(self.conn, corrected,
+                        text=self.result('correction', correction)))
+        self.assertEqual(self.conn.execute('SELECT semantic_types_json FROM relationship_meaning_v2 WHERE receipt_id=?',
+                                          (corrected.receipt_id,)).fetchone()[0], '["correction"]')
+
     def test_single_boundary_does_not_require_a_moment_or_other_turn(self):
         self.observe('Enough with the jokes at my expense.')
         request = rel.claim_relationship_meaning(self.conn)
