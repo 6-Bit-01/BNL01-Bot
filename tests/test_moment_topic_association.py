@@ -186,6 +186,103 @@ class MomentTopicAssociationTests(unittest.TestCase):
                 self.assertIn("Test Member 3", rendered)
                 self.assertNotIn("Test Member Four:", rendered)
 
+    def followup_request(self, text="What exactly did they correct, and which part was your own commentary?"):
+        prior = "Recall the June 1 beans recipe conversation. Who suggested what?"
+        self.conn.execute("INSERT INTO conversations VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (9000, 1, 10, "Test Member Four", "user", prior, 99,
+             "sealed_test", "normal_chat", "2026-09-11T09:59:00+00:00"))
+        ledger.shadow_conversation_row(self.conn, row_id=9000, guild_id=1,
+            user_id=10, user_name="Test Member Four", role="user", content=prior,
+            channel_id=99, channel_name="bnl-testing", channel_policy="sealed_test",
+            route_mode="normal_chat", observed_at="2026-09-11T09:59:00+00:00")
+        return self.request(text, channel_id=99, channel_policy="sealed_test",
+            visibility_allowance="sealed_test", conversation_evidence=(
+                PacketConversationEvidence(text=prior, source_id=9000,
+                    speaker_user_id=10, speaker_label="Test Member Four"),
+                PacketConversationEvidence(text=text, speaker_user_id=10,
+                    speaker_label="Test Member Four", current_turn=True)))
+
+    def test_followup_reloads_original_moment_from_selected_human_request(self):
+        first, _ = self.add_moment(day=1)
+        self.add_moment(row_start=200, day=2)
+        request = self.followup_request()
+        packet = self.packet(request)
+        self.assertEqual([item.event_ref for item in self.historical(packet)], [first])
+        self.assertIn("Test Member 2", render_packet_context(packet)[0])
+        self.assertTrue(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+
+    def test_followup_preserves_date_instead_of_switching_to_similar_moment(self):
+        first, _ = self.add_moment(day=1)
+        other, _ = self.add_moment(row_start=200, day=2)
+        request = self.followup_request("What did they suggest about beans?")
+        without_context = replace(request, conversation_evidence=(request.conversation_evidence[-1],))
+        self.assertIn(other, [item.event_ref for item in self.historical(self.packet(without_context))])
+        self.assertEqual([item.event_ref for item in self.historical(self.packet(request))], [first])
+
+    def test_followup_chain_reloads_sources_within_small_prompt_budget(self):
+        first, _ = self.add_moment()
+        self.add_moment(row_start=200, day=2)
+        request = self.followup_request("Why did that matter?")
+        prior = "What did they suggest about beans?"
+        self.conn.execute("INSERT INTO conversations VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (9001, 1, 10, "Test Member Four", "user", prior, 99,
+             "sealed_test", "normal_chat", "2026-09-11T09:59:30+00:00"))
+        request = replace(request, budget_chars=1000, conversation_evidence=(
+            *request.conversation_evidence, PacketConversationEvidence(
+                text=prior, source_id=9001, speaker_user_id=10)))
+        packet = self.packet(request)
+        self.assertEqual([item.event_ref for item in self.historical(packet)], [first])
+        item = next(item for item in packet.items if item.event_ref == first)
+        self.assertIn(item.source_digest, render_packet_context(packet, max_chars=1000)[3])
+        self.assertTrue(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+        self.conn.execute("UPDATE conversations SET content='New topic: a microphone check.' WHERE id=9001")
+        self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+        self.assertFalse(self.historical(self.packet(request)))
+
+    def test_followup_anchor_edit_invalidates_even_when_same_moment_still_matches(self):
+        self.add_moment()
+        packet = self.packet(self.followup_request())
+        self.assertEqual(len(self.historical(packet)), 1)
+        self.conn.execute("UPDATE conversations SET content=content || ' Explain the disagreement.' WHERE id=9000")
+        self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+
+    def test_followup_cannot_inherit_another_speaker_or_channel_or_model_anchor(self):
+        self.add_moment()
+        request = self.followup_request()
+        for column, value in (("user_id", 11), ("channel_id", 100),
+                              ("channel_policy", "internal_controlled"), ("role", "model")):
+            with self.subTest(column=column):
+                previous = self.conn.execute(f"SELECT {column} FROM conversations WHERE id=9000").fetchone()[0]
+                self.conn.execute(f"UPDATE conversations SET {column}=? WHERE id=9000", (value,))
+                self.assertFalse(self.historical(self.packet(request)))
+                self.conn.execute(f"UPDATE conversations SET {column}=? WHERE id=9000", (previous,))
+
+    def test_forgotten_followup_anchor_cannot_reload_old_sources(self):
+        self.add_moment()
+        request = self.followup_request()
+        packet = self.packet(request)
+        self.assertEqual(len(self.historical(packet)), 1)
+        self.conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten' "
+                          "WHERE source_table='conversations' AND source_row_id='9000'")
+        self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
+        self.assertFalse(self.historical(self.packet(request)))
+
+    def test_followup_uses_source_row_not_supplied_evidence_text(self):
+        self.add_moment()
+        request = self.followup_request()
+        self.conn.execute("UPDATE conversations SET content='We finished a quick microphone check.' WHERE id=9000")
+        self.assertFalse(self.historical(self.packet(request)))
+
+    def test_explicit_replacement_or_stale_anchor_does_not_revive_old_moment(self):
+        self.add_moment()
+        request = self.followup_request()
+        for question in ("New topic: what did they correct about the amplifier?",
+                         "What did they correct in the June 2 conversation?"):
+            with self.subTest(question=question):
+                self.assertFalse(self.historical(self.packet(replace(request, user_text=question))))
+        self.conn.execute("UPDATE conversations SET timestamp='2026-09-10T09:59:00+00:00' WHERE id=9000")
+        self.assertFalse(self.historical(self.packet(request)))
+
     def test_historical_label_change_invalidates_selected_episode(self):
         moment_id, _roots = self.add_moment()
         packet = self.packet()
