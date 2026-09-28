@@ -5787,14 +5787,17 @@ def _safe_historical_participant_label(
     moment_id: str,
     participant_key: str,
 ) -> str:
+    owner_id = os.getenv("BNL_OWNER_USER_ID", "").strip()
+    owner_key = "discord_user:" + owner_id if owner_id.isdigit() and int(owner_id) > 0 else ""
     row = conn.execute(
         """
-        SELECT safe_display_name FROM memory_moment_participants
+        SELECT CASE WHEN participant_key=? THEN '6 Bit' ELSE safe_display_name END
+        FROM memory_moment_participants
         WHERE moment_id=? AND participant_key=?
           AND participant_role='human_author'
         ORDER BY participation_order LIMIT 1
         """,
-        (moment_id, participant_key),
+        (owner_key, moment_id, participant_key),
     ).fetchone()
     return _safe_participant_display_name(str(row[0] or "")) if row else ""
 
@@ -6258,39 +6261,41 @@ def select_public_situation_moment_gists(
             canonical_ledger_entry_id=str(row[10] or ""),
         ):
             continue
-        if require_topic_overlap:
-            contributions = []
-            participants = conn.execute(
-                """
-                SELECT participant_key FROM memory_moment_participants
-                WHERE moment_id=? AND participant_role='human_author'
-                  AND authored_entry_count>0
-                ORDER BY participation_order,participant_key LIMIT 12
-                """,
-                (moment_id,),
-            ).fetchall()
-            for index, (participant_key,) in enumerate(participants, start=1):
-                gist, _historical_label = _contribution_is_renderable(
-                    conn,
-                    moment_id=moment_id,
-                    participant_key=str(participant_key),
-                    guild_id=int(guild_id or 0),
-                    channel_id=int(row[7] or 0),
-                    channel_policy=str(row[8] or ""),
-                    route_mode=str(row[9] or "unknown"),
-                    visibility=visibility,
-                )
-                if gist:
-                    candidate = f"Original participant {index}: {gist}"
-                    combined = summary + " Historical contributions: " + " | ".join(contributions + [candidate])
-                    if used_words + len(combined.split()) <= max(1, int(token_budget or 0)):
-                        contributions.append(candidate)
-                if len(contributions) >= 3:
-                    break
-            if contributions:
-                summary += " Historical contributions: " + " | ".join(contributions)
-            if summary.casefold() in seen:
-                continue
+        contributions = []
+        participants = conn.execute(
+            """
+            SELECT participant_key FROM memory_moment_participants
+            WHERE moment_id=? AND participant_role='human_author'
+              AND authored_entry_count>0
+            ORDER BY participation_order,participant_key LIMIT 12
+            """,
+            (moment_id,),
+        ).fetchall()
+        for index, (participant_key,) in enumerate(participants, start=1):
+            gist, historical_label = _contribution_is_renderable(
+                conn,
+                moment_id=moment_id,
+                participant_key=str(participant_key),
+                guild_id=int(guild_id or 0),
+                channel_id=int(row[7] or 0),
+                channel_policy=str(row[8] or ""),
+                route_mode=str(row[9] or "unknown"),
+                visibility=visibility,
+            )
+            if gist:
+                # The recorded public label belongs to this source author,
+                # not the current requester or an inferred artist alias.
+                label = f" (recorded as {historical_label})" if historical_label else ""
+                candidate = f"Original participant {index}{label}: {gist}"
+                combined = summary + " Historical contributions: " + " | ".join(contributions + [candidate])
+                if used_words + len(combined.split()) <= max(1, int(token_budget or 0)):
+                    contributions.append(candidate)
+            if len(contributions) >= 3:
+                break
+        if contributions:
+            summary += " Historical contributions: " + " | ".join(contributions)
+        if summary.casefold() in seen:
+            continue
         words = summary.split()
         if (
             used_words + len(words) > max(1, int(token_budget or 0))
