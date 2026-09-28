@@ -935,6 +935,65 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
         self.conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten' WHERE entry_id=?", (roots[0],))
         self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
 
+    def test_explicit_journal_survives_recent_questions_and_requested_audience_comment(self):
+        import bnl01_bot as bot
+        from datetime import datetime, timedelta, timezone
+        from bnl_conversation_context_v2 import ConversationContextRequest, assemble_conversation_context_v2
+
+        self.add_journal("journal_comparison", title="Copper Antennas",
+                         body="I reflected on listeners supporting each other through a broken broadcast.")
+        self.conn.commit()
+        text = ("BNL, compare your published Journal 'Copper Antennas' with the September 25 show "
+                "conversation about community support. Give one specific reflection and one original "
+                "audience comment, keeping your interpretation separate from what the audience said.")
+        now = datetime(2026, 8, 10, 10, 1, tzinfo=timezone.utc)
+        for policy in ("sealed_test", "public_home"):
+            with self.subTest(policy=policy):
+                rows = [dict(id=i, role=role, content=content, user_id=7, user_name="Test Member",
+                             channel_id=10, channel_name="test-room", channel_policy=policy,
+                             timestamp=(now - timedelta(minutes=7-i)).isoformat())
+                        for i, role, content in (
+                            (1, "user", "Recall the correction about the missing shoes."),
+                            (2, "model", "The correction was about footwear."),
+                            (3, "user", "Check the September 19 conversation about that correction."),
+                            (4, "model", "It concerned a sole, not a soul."),
+                            (5, "user", "What practical question did the dream discussion leave open?"),
+                            (6, "model", "The practical question was calibration."),
+                        )]
+                context = assemble_conversation_context_v2(rows, ConversationContextRequest(
+                    guild_id=1, current_user_id=7, channel_id=10, channel_name="test-room",
+                    channel_policy=policy, route_mode="normal_chat", conversation_surface="mention_or_reply",
+                    current_texts=(text,), current_participants=frozenset({7}), is_direct_target=True,
+                    now=now, route_allowed_sources=frozenset({"conversation_continuity"}),
+                ))
+                frame = bot.build_live_conversation_orchestration_decision(
+                    engagement_decision="answer", engagement_reason="direct_request", channel_policy=policy,
+                    addressings=(), context_result=context, moment_situation=None, guild_id=1, channel_id=10,
+                    route_mode="normal_chat", conversation_surface="mention_or_reply", current_text=text,
+                    current_speaker_user_ids=(7,), current_speaker_labels=("Test Member",), influence_mode="live",
+                ).situation_frame
+                request = replace(self.request(text, snapshot=control_snapshot(), control_status="valid"),
+                    channel_policy=policy, subject_user_id=0, frame_status=frame.status,
+                    frame_schema_version=frame.schema_version, frame_revision=frame.frame_revision,
+                    frame_input_evidence_digest=frame.input_evidence_digest,
+                    frame_subject_requirement=frame.subject_requirement,
+                    frame_ambiguity_reasons=frame.ambiguity_reasons,
+                    frame_object_kind=frame.object_kind, frame_task_kind=frame.task_kind,
+                    frame_tasks=tuple(PacketFrameTask(**{key: getattr(task, key)
+                        for key in PacketFrameTask.__dataclass_fields__}) for task in frame.tasks))
+                packet = build_packet(self.conn, request, environ=self.flags, persist=False)
+                self.assertEqual(packet.diagnostics.journal_query_status, "eligible")
+                self.assertEqual(context.referent_status, "not_requested")
+                self.assertEqual(frame.status, "resolved")
+                rendered, lanes, _count, _digests = render_packet_context(packet)
+                self.assertIn(("journal_publication", 1), lanes)
+                self.assertIn("listeners supporting each other", rendered)
+                self.assertTrue(revalidate_packet(self.conn, packet, environ=self.flags,
+                    journal_control_snapshot=control_snapshot(), journal_control_snapshot_provided=True).valid)
+                self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags,
+                    journal_control_snapshot=control_snapshot(public_excluded=("journal_comparison",), digest="c" * 64),
+                    journal_control_snapshot_provided=True).valid)
+
     def test_packet_adapters_are_publication_only_and_revalidate_mutation(self):
         journal_id = "journal_packet_001"
         relay_id = "bnl-packet-001"
