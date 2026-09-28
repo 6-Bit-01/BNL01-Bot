@@ -1403,6 +1403,7 @@ def _resolve_nearby_contribution_referent(
     req: ConversationContextRequest,
     current_text: str,
     now: datetime,
+    pairs: Sequence[dict] = (),
 ) -> _ReferentResolution:
     """Resolve one bounded room contribution by structure and attribution."""
 
@@ -1611,6 +1612,34 @@ def _resolve_nearby_contribution_referent(
             labels=labels,
             reason="single_immediate_contribution",
         )
+    # A bare attribution follow-up can refer to the answer just given, even
+    # when the bounded room contains older exchanges. Bind the conversational
+    # target only: its human request reloads originals for factual attribution.
+    # Explicit people, contribution types, positions and Discord replies keep
+    # their existing resolution above; competing room turns remain ambiguous.
+    if (re.search(r"\b(?:who|which\s+(?:person|member|participant))\s+"
+                  r"(?:(?:actually|originally)\s+)?" + SPEAKER_ATTRIBUTION_REFERENT_RE.pattern,
+                  current_text, re.I)
+            and not type_requested and not dynamic_speaker_reference
+            and immediate and immediate[0] is candidates[0]
+            and set(req.current_participants) <= {int(req.current_user_id)}):
+        latest = immediate[0]
+        for pair in pairs:
+            if int(pair["model"].get("id") or 0) != int(latest.get("id") or 0):
+                continue
+            users = (tuple(pair.get("users") or ()) if pair.get("_room_group")
+                     else tuple(pair["user"].get("_cluster_rows") or (pair["user"],)))
+            participants = set(pair.get("_response_participant_ids") or (
+                int(user.get("user_id") or 0) for user in users))
+            eligible_ids = {int(row.get("id") or 0) for row in immediate}
+            if (users and participants == {int(req.current_user_id)}
+                    and all(int(user.get("id") or 0) in eligible_ids for user in users)):
+                return _ReferentResolution(
+                    status="resolved", candidates=(latest,), selected=(latest,),
+                    competing=tuple(row for row in candidates if row is not latest),
+                    labels=_referent_candidate_labels((latest,)),
+                    reason="latest_answer_continuation",
+                )
     return _ReferentResolution(
         status="ambiguous" if narrowed else "unresolved",
         candidates=narrowed,
@@ -1977,6 +2006,7 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         req,
         current_text,
         now,
+        pairs=pairs,
     )
     if (
         (EXPLICIT_NEW_TOPIC_RE.search(current_text) or req.current_recall_scope_complete)

@@ -11,6 +11,10 @@ from unittest import mock
 import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
+from bnl_conversation_context_v2 import (
+    ConversationContextRequest,
+    assemble_conversation_context_v2,
+)
 from bnl_shared_brain_synthesis import (
     _ordinary_rendered_evidence_refs,
     ordinary_chat_task_support_plan,
@@ -238,6 +242,54 @@ class MomentTopicAssociationTests(unittest.TestCase):
         self.conn.execute("UPDATE conversations SET content='New topic: a microphone check.' WHERE id=9001")
         self.assertFalse(revalidate_packet(self.conn, packet, environ=self.flags).valid)
         self.assertFalse(self.historical(self.packet(request)))
+
+    def test_short_attribution_followup_reaches_moment_through_real_context_and_frame(self):
+        first, _ = self.add_moment()
+        self.add_moment(row_start=200, day=2)
+        text = "Who said that, and when was that exchange?"
+        request = self.followup_request(text)
+        for row_id, role, content, second in (
+            (9001, "model", "Test Member Two made the suggestion on June 2.", 10),
+            (9002, "user", "What did they suggest about beans?", 20),
+            (9003, "model", "Test Member Two suggested roasted tomatoes.", 30),
+        ):
+            self.conn.execute("INSERT INTO conversations VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (row_id, 1, 10, "Test Member Four" if role == "user" else "BNL-01",
+                 role, content, 99, "sealed_test", "normal_chat",
+                 "2026-09-11T09:59:%02d+00:00" % second))
+        cursor = self.conn.execute("SELECT * FROM conversations WHERE id>=9000 ORDER BY id")
+        columns = [item[0] for item in cursor.description]
+        rows = [dict(zip(columns, values)) for values in cursor.fetchall()]
+        context = assemble_conversation_context_v2(rows, ConversationContextRequest(
+            guild_id=1, current_user_id=10, channel_id=99, channel_name="bnl-testing",
+            channel_policy="sealed_test", route_mode="normal_chat",
+            conversation_surface="mention_or_reply", current_texts=(text,),
+            current_participants=frozenset({10}), is_direct_target=True,
+            now=datetime.fromisoformat(request.now),
+            route_allowed_sources=frozenset({"conversation_continuity"}),
+        ))
+        frame = build_situation_frame_v1(
+            route_allowed=True, route_mode="normal_chat", conversation_surface="mention_or_reply",
+            channel_policy="sealed_test", current_text=text,
+            current_speaker_user_ids=(10,), current_speaker_labels=("Test Member Four",),
+            referent_status=context.referent_status, response_act="answer",
+            packet_revision="short_attribution",
+        )
+        self.assertEqual(context.referent_selected_row_ids, (9003,))
+        self.assertEqual(frame.status, "resolved")
+        evidence = tuple(PacketConversationEvidence(
+            text=row["content"], source_id=row["id"], speaker_user_id=row["user_id"],
+            speaker_label=row["user_name"],
+        ) for row in rows if row["role"] == "user" and row["id"] in context.selected_row_ids)
+        packet = self.packet(replace(request,
+            frame_revision=frame.frame_revision, frame_input_evidence_digest=frame.input_evidence_digest,
+            frame_status=frame.status, frame_ambiguity_reasons=frame.ambiguity_reasons,
+            frame_subject_requirement=frame.subject_requirement,
+            conversation_evidence=(*evidence, request.conversation_evidence[-1]),
+        ))
+        self.assertEqual([item.event_ref for item in self.historical(packet)], [first])
+        self.assertIn("Test Member 2", render_packet_context(packet)[0])
+        self.assertTrue(revalidate_packet(self.conn, packet, environ=self.flags).valid)
 
     def test_followup_anchor_edit_invalidates_even_when_same_moment_still_matches(self):
         self.add_moment()
