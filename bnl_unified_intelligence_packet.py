@@ -20,6 +20,11 @@ import sqlite3
 import uuid
 from typing import Any, Mapping, Sequence
 
+from bnl_conversation_context_v2 import (
+    CURRENT_CORRECTION_REPLACEMENT_RE,
+    EXPLICIT_NEW_TOPIC_RE,
+    IMMEDIATE_REFERENT_RECENCY_MINUTES,
+)
 from bnl_canon_source_contract import (
     AUTOMATIC_CANON_SIGNAL_IDENTITIES,
     CANON_ENTITY_IDENTITIES,
@@ -81,6 +86,7 @@ from bnl_journal import (
 )
 from bnl_moment_engine import (
     SITUATION_EPISODE_READ_VERSION,
+    resume_date_scope_requested,
     select_public_participant_moment_gists,
     select_situation_aware_episode_gists,
 )
@@ -295,6 +301,11 @@ _EPISODE_QUERY_RE = re.compile(
     r"(?:correction|retest|retry|completion)\s+(?:history|result|status)|"
     r"(?:resume|continue|reopen|return\s+to)\s+(?:that|this|the)|"
     r"(?:moment|episode|open\s+loop|unresolved\s+thread)s?)\b",
+    re.I,
+)
+_EPISODE_CONTEXT_REFERENCE_RE = re.compile(
+    r"\b(?:they|them|their|he|him|his|she|her|it|its|that|this|those|these)\b"
+    r"|^\s*(?:who|why|how|what)(?:\s+(?:else|next))?\s*\?\s*$",
     re.I,
 )
 _TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]*", re.I)
@@ -2869,13 +2880,15 @@ def _episode_projection_digest(
     item: Any,
     roots: tuple[str, ...],
     occurrences: tuple[str, ...],
+    selection_digest: str = "",
 ) -> str:
-    return _digest(
+    projection = _digest(
         SITUATION_EPISODE_READ_VERSION,
         item,
         roots,
         occurrences,
     )
+    return _digest(projection, selection_digest) if selection_digest else projection
 
 
 def _topic_association_requested(request: IntelligencePacketRequest) -> bool:
@@ -2915,8 +2928,65 @@ def _related_episode_history_allowed(request: IntelligencePacketRequest) -> bool
     )
 
 
+def _episode_continuation_queries(conn, request):
+    """Follow a bounded Context-selected human chain, never model assertions."""
+    text = str(request.user_text or "")
+    if (not _EPISODE_CONTEXT_REFERENCE_RE.search(text)
+            or EXPLICIT_NEW_TOPIC_RE.search(text)
+            or CURRENT_CORRECTION_REPLACEMENT_RE.search(text)
+            or resume_date_scope_requested(text)
+            or request.immediate_recap):
+        return ()
+    speakers = {int(item.speaker_user_id) for item in request.conversation_evidence
+                if item.current_turn and int(item.speaker_user_id or 0) > 0}
+    prior = [item for item in request.conversation_evidence
+             if not item.current_turn and int(item.source_id or 0) > 0]
+    if len(speakers) != 1 or not prior:
+        return ()
+    # Do not skip an intervening selected contribution from another speaker
+    # or use model text to manufacture a historical retrieval target.
+    now = _parse_time(request.now or _now())
+    eligible = _conversation_items(conn, request, IntelligencePacketDiagnostics(), [])
+    queries, chain, digests = [], [], []
+    for anchor in sorted(prior, key=lambda item: int(item.source_id), reverse=True)[:3]:
+        row = _conversation_row(conn, int(anchor.source_id))
+        stamp = _parse_time(row.get("timestamp"))
+        if (not row or row.get("role") != "user"
+                or int(row.get("user_id") or 0) not in speakers
+                or int(row.get("channel_id") or 0) != int(request.channel_id or 0)
+                or row.get("channel_policy") != request.channel_policy
+                or not stamp or not now
+                or not 0 <= (now - stamp).total_seconds() <= IMMEDIATE_REFERENT_RECENCY_MINUTES * 60):
+            break
+        states = conn.execute(
+            "SELECT lifecycle_status,channel_policy,public_usable FROM memory_ledger_entries "
+            "WHERE guild_id=? AND source_table='conversations' AND source_row_id=? "
+            "AND entry_type='observation' AND predicate_key='conversation'",
+            (int(request.guild_id or 0), str(anchor.source_id)),
+        ).fetchall()
+        if any(state[0] != "active" or state[1] != request.channel_policy
+               or (request.channel_policy in {"public_home", "public_context"} and not state[2])
+               for state in states):
+            break
+        item = next((item for item in eligible
+                     if item.source_ref == "conversation:%s" % anchor.source_id
+                     and item.lane == "conversation_context"), None)
+        if item is None:
+            break
+        chain.insert(0, item.text)
+        digests.append(item.source_digest)
+        queries.append(("\n".join(chain) + "\nCurrent follow-up: " + text, _digest(digests)))
+        if (not _EPISODE_CONTEXT_REFERENCE_RE.search(item.text)
+                or EXPLICIT_NEW_TOPIC_RE.search(item.text)
+                or CURRENT_CORRECTION_REPLACEMENT_RE.search(item.text)
+                or resume_date_scope_requested(item.text)):
+            break
+    return tuple(queries)
+
+
 def _episode_rows(conn, request, participant_key):
     topic_association = _topic_association_requested(request)
+    selection_digest = ""
     rows = select_situation_aware_episode_gists(
         conn, guild_id=int(request.guild_id or 0),
         participant_key=participant_key, topic_text=str(request.user_text or "")[:8000],
@@ -2937,7 +3007,21 @@ def _episode_rows(conn, request, participant_key):
             now=request.now or None,
         )
         topic_association = True
-    return rows, topic_association
+    if topic_association and not participant_key:
+        # Resolve the whole bounded chain before matching. An intermediate
+        # pronoun follow-up can match another event while losing the first date.
+        for query, anchor_digest in _episode_continuation_queries(conn, request)[-1:]:
+            continued_rows = select_situation_aware_episode_gists(
+                conn, guild_id=int(request.guild_id or 0), topic_text=query[:8000],
+                allowed_channel_policies=("public_home", "public_context"),
+                max_results=2, topic_association=True, association_date_scope=True,
+                now=request.now or None,
+            )
+            if continued_rows:
+                rows = continued_rows
+                selection_digest = anchor_digest
+                break
+    return rows, topic_association, selection_digest
 
 
 def _episode_attribution_mode(conn, request, moment_id):
@@ -2978,7 +3062,7 @@ def _episode_items(
         diagnostics.episode_query_status = "subject_has_no_discord_activity"
         return []
     participant_key = subject_key if subject_required else ""
-    rows, topic_association = _episode_rows(conn, request, participant_key)
+    rows, topic_association, selection_digest = _episode_rows(conn, request, participant_key)
     diagnostics.episode_candidate_count = len(rows)
     if topic_association:
         diagnostics.episode_query_status = (
@@ -3014,7 +3098,7 @@ def _episode_items(
                 source_class="moment_gist",
             )
             continue
-        source_digest = _episode_projection_digest(row, roots, occurrences)
+        source_digest = _episode_projection_digest(row, roots, occurrences, selection_digest)
         source_ref = "episode:%s:moment:%s" % (
             row.episode_id or "standalone",
             row.moment_id,
@@ -3035,7 +3119,7 @@ def _episode_items(
                 participant_key
                 or "event:%s" % (row.episode_id or row.moment_id)
             ),
-            predicate_key="episode_%s" % (
+            predicate_key="episode_followup" if selection_digest else "episode_%s" % (
                 str(request.frame_task_kind or request.frame_phase or "event")
             ),
             text=str(row.gist or "")[:1200],
@@ -3051,7 +3135,7 @@ def _episode_items(
                 else "episode_paraphrase"
             ),
             score=(
-                72.0 if topic_association else 88.0 + min(4, row.sequence_index)
+                72.0 if topic_association and not selection_digest else 88.0 + min(4, row.sequence_index)
             ),
             revalidation_kind="episode",
             revalidation_key=row.moment_id,
@@ -5538,8 +5622,10 @@ def _select_items(
         if lane and lane not in requested_public_lanes:
             requested_public_lanes.append(lane)
     if (
-        _EPISODE_QUERY_RE.search(request.user_text)
-        and _related_episode_history_allowed(request)
+        (_EPISODE_QUERY_RE.search(request.user_text)
+         and _related_episode_history_allowed(request))
+        or any(item.lane == "episode" and item.predicate_key == "episode_followup"
+               for item in candidates)
     ):
         requested_public_lanes.append("episode")
     requested_items = []
@@ -6009,7 +6095,7 @@ def _episode_version(
         if item.source_type == "participant_episode_gist"
         else ""
     )
-    rows, fresh_association = _episode_rows(conn, packet.request, participant_key)
+    rows, fresh_association, selection_digest = _episode_rows(conn, packet.request, participant_key)
     if fresh_association != topic_association:
         return ""
     for row in rows:
@@ -6039,7 +6125,7 @@ def _episode_version(
             or _episode_attribution_mode(conn, packet.request, row.moment_id) != item.attribution_mode
         ):
             return ""
-        return _episode_projection_digest(row, roots, occurrences)
+        return _episode_projection_digest(row, roots, occurrences, selection_digest)
     return ""
 
 
