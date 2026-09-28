@@ -604,3 +604,46 @@ rollback. It requires stopping the bot, preserving the failed database for
 diagnosis, restoring the verified backup, and restarting the previously known
 good code. Any live cutover requires a separate, explicit owner-approved
 operation.
+
+## Contextual Relationship interpretation comparison
+
+The existing Relationship owner can compare its phrase classifier with a model
+interpretation of each new eligible, directed human turn and up to seven earlier
+original turns from that member and BNL in the same room and half-hour window.
+It does not require a qualified Moment. Sealed tests, passive capture, other
+members, group replies, private sources, and ineligible routes do not enter.
+Originals are reopened in full within a bounded budget; derived summaries and
+old relationship scores cannot decide what a member meant.
+
+This stage is **comparison only**. It stores source references, a source digest,
+the old label, candidate signal types, and attempt status inside the Relationship
+owner. No generated explanation or transcript is stored there. Results do not
+alter relationship events, scores, settings, consent, memory, or public output.
+Model judgments and exact supporting excerpts are shape-checked, but this is not
+proof of semantic correctness. Compare real outcomes before proposing adoption.
+
+Activation requires an explicit owner decision for
+`BNL_RELATIONSHIP_V2_MEANING_SHADOW_ENABLED=1` and an exact guild allowlist in
+`BNL_RELATIONSHIP_V2_MEANING_GUILD_IDS`, with the existing Relationship and Ledger
+shadow gates enabled. The new gate defaults off. Deployment alone starts no new
+provider work. All public/live gates and the sealed tone canary remain independent.
+The existing minute maintenance loop processes at most one interpretation at a
+time through the accounted background provider route, with no provider retries
+or model fallback. A local denial before any physical call receives a durable
+one-hour deferral; an interrupted or attempted call is not automatically replayed.
+
+Acceptance must compare natural paraphrases of boundaries, reconciliation,
+support received, sarcasm, negation, quoted third-party speech, and mixed signals.
+The fixtures exercise the data path and fences; they do not demonstrate that the
+live provider chooses the correct labels. Inspect the aggregate
+`contextual_interpretation_comparison` in the existing Relationship evaluation
+report. Explicit consent-control labels are counted separately, not scored as
+semantic disagreements. The report rechecks current sources without writing.
+Edits, privacy changes, corrections and deletion invalidate dependent receipts;
+restoring a source does not resurrect its old interpretation.
+
+Rollback: disable the meaning shadow gate and restart normally. In-flight results
+recheck scope before saving. Existing relationship formation and consent settings
+continue unchanged; no table deletion or relationship backfill is needed. A later
+proposal to use contextual interpretations for relationship formation or public
+tone still needs its own comparison review and activation decision.

@@ -173,6 +173,9 @@ from bnl_moment_engine import (
     sweep_expired_windows as sweep_expired_moment_windows,
 )
 from bnl_relationship_engine import (
+    claim_relationship_meaning,
+    finish_relationship_meaning,
+    meaning_guild_ids as relationship_meaning_guild_ids,
     active_engagement_live_enabled as relationship_v2_active_engagement_live_enabled,
     ensure_relationship_v2_schema,
     governed_summary as governed_relationship_v2_summary,
@@ -32444,7 +32447,7 @@ def _generation_config_for_model(
     config_kwargs = {
         "max_output_tokens": policy.max_output_tokens,
     }
-    if route == 'moment_meaning_background':
+    if route in {'moment_meaning_background', 'relationship_meaning_background'}:
         config_kwargs['response_mime_type'] = 'application/json'
     if route in {BALLAD_ROUTE, BALLAD_MANUAL_ROUTE}:
         config_kwargs['response_mime_type'] = 'application/json'
@@ -36382,6 +36385,58 @@ async def _before_tiktok_live_memory_ingest_task():
 
 
 _moment_meaning_task: asyncio.Task | None = None
+_relationship_meaning_task: asyncio.Task | None = None
+
+
+async def _process_one_relationship_meaning() -> None:
+    """Run one optional comparison through the existing metered provider."""
+    request = None
+
+    def claim():
+        with closing(sqlite3.connect(DB_FILE, timeout=3)) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            return claim_relationship_meaning(conn)
+
+    def finish(**kwargs):
+        with closing(sqlite3.connect(DB_FILE, timeout=3)) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            return finish_relationship_meaning(conn, request, **kwargs)
+
+    try:
+        if not relationship_meaning_guild_ids():
+            return
+        request = await asyncio.to_thread(claim)
+        if request is None:
+            return
+        attempts = ProviderAttemptCounter()
+        result = await _generate_gemini_content_result_async(
+            request.prompt, 'relationship_meaning_background', attempt_counter=attempts)
+        deferred = (not result.success and attempts.count == 0
+                    and result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET)
+        applied = await asyncio.to_thread(
+            finish, text=result.text if result.success else '', budget_deferred=deferred,
+            reason='' if result.success or deferred else 'provider_unavailable')
+        logging.info('relationship_meaning_result receipt_id=%s comparison_saved=%s '
+                     'provider_ok=%s physical_attempts=%s budget_deferred=%s',
+                     request.receipt_id, applied, result.success, attempts.count, deferred)
+    except asyncio.CancelledError:
+        if request is not None:
+            await asyncio.to_thread(finish, reason='interrupted')
+        raise
+    except Exception as exc:
+        logging.warning('relationship_meaning_failed error_type=%s', type(exc).__name__)
+        if request is not None:
+            try:
+                await asyncio.to_thread(finish, reason='processing_error')
+            except Exception:
+                logging.warning('relationship_meaning_outcome_write_failed')
+
+
+def _start_relationship_meaning_work() -> None:
+    global _relationship_meaning_task
+    if relationship_meaning_guild_ids() and (
+            _relationship_meaning_task is None or _relationship_meaning_task.done()):
+        _relationship_meaning_task = asyncio.create_task(_process_one_relationship_meaning())
 
 
 def _moment_meaning_public_guilds() -> tuple[int, ...]:
@@ -36513,6 +36568,7 @@ async def moment_engine_sweep_task():
         # The same Moment workflow performs one background summarization at a
         # time; provider waits cannot delay this sweep or Discord handling.
         _start_moment_meaning_work()
+        _start_relationship_meaning_work()
         if moment_results or episode_results:
             logging.info(
                 "moment_engine_sweep finalized_or_rejected=%s "
