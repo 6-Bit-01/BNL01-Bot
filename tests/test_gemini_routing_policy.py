@@ -122,6 +122,18 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
                 for route in ("broadcast_ballad_manual", "broadcast_ballad_background"):
                     self.assertEqual(routing.policy_for_route(route).max_output_tokens, expected)
 
+    def test_ballad_review_keeps_parent_budget_lane_without_retry_or_fallback(self):
+        for suffix in ("manual", "background"):
+            writer = routing.policy_for_route("broadcast_ballad_" + suffix)
+            review = routing.policy_for_route("broadcast_ballad_review_" + suffix)
+            self.assertEqual(review.lane, writer.lane)
+            self.assertEqual(review.showday_protected, writer.showday_protected)
+            self.assertEqual(review.max_output_tokens, 4096)
+            self.assertEqual(review.provider_retries, 0)
+            self.assertFalse(review.allow_fallback)
+            self.assertEqual(routing.estimated_generation_reservation("abc", review),
+                             routing.single_attempt_reservation("abc", review))
+
     def test_relay_and_showday_keep_distinct_background_protection_flags(self):
         relay = routing.policy_for_route("website_relay_event")
         showday = routing.policy_for_route("showday_generation")

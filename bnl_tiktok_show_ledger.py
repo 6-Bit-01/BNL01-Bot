@@ -4994,7 +4994,7 @@ def build_broadcast_ballad_evidence(db_file: str, guild_id: int, show_id: str) -
             speaker_id = f"P{len(speakers) + 1}"
             speaker_ids[key] = speaker_id
             speakers[speaker_id] = {"name": label, "platform": surface}
-        chat.append([message.get("minuteOffset"), speaker_ids[key],
+        chat.append([message.get("minuteOffset"), speaker_ids[key], label,
                      track_ids.get(str(message.get("trackKey") or ""), ""), str(message.get("text") or "")])
 
     outcomes: dict = {}
@@ -5031,7 +5031,8 @@ def build_broadcast_ballad_evidence(db_file: str, guild_id: int, show_id: str) -
             track_ids[str(t.get("trackKey") or "")]: {"artist": t.get("projectLabel"), "title": t.get("title"),
                 "outcome": t.get("outcome"), "lane": t.get("lane")} for t in roster}),
         "PEOPLE DIRECTORY (original public identities): " + compact(speakers),
-        "FULL ELIGIBLE HUMAN CHAT [minutes from start, person, associated track or empty, words]:\n"
+        "FULL ELIGIBLE HUMAN CHAT [minutes from start, speaker ID, SPEAKER NAME (author, not addressee), "
+        "associated track or empty, original words]:\n"
         + "\n".join(compact(item) for item in chat),
         "SHOW CHRONOLOGY [minutes from start, event type, track or empty, detail, recorded data]:\n"
         + "\n".join(compact(item) for item in operations),
