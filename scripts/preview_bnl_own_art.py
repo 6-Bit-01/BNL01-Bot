@@ -10,12 +10,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, help="A new private directory under an existing parent")
-    parser.add_argument("--generate", action="store_true", help="Explicitly allow a concept call and, if BNL chooses, one image call")
+    parser.add_argument("--generate", action="store_true", help="Allow selection and development calls and, if BNL chooses, one image call")
+    parser.add_argument("--previous-preview", action="append", default=[], help="An explicit private receipt for a continuity study; never enters public history")
+    parser.add_argument("--study", choices=("open", "continuation", "variation"), default="open",
+                        help="Private acceptance intent; BNL still chooses the subject and complete image prompt")
     args = parser.parse_args()
     import bnl01_bot as bot
     from bnl_own_art import prepare_private_preview
     try:
-        result = prepare_private_preview(bot, args.output_dir, generate=args.generate)
+        result = prepare_private_preview(bot, args.output_dir, generate=args.generate,
+                                         previous_previews=args.previous_preview, study=args.study)
         print(json.dumps({key: result[key] for key in ("status", "published", "conceptCalls", "imageCalls")}))
         return 0
     except Exception as exc:

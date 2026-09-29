@@ -159,6 +159,7 @@ class ArtMomentContextTests(unittest.IsolatedAsyncioTestCase):
             _extract_text_and_tokens=lambda response: (response, 0))
         target = Path(self.fixture.db).parent / ("preview-" + stage)
         with mock.patch.object(art, "build_source_packet", return_value=packet), \
+             mock.patch.object(art, "build_source_packet_between", side_effect=lambda *_a, **_k: self.fixture.packet()), \
              mock.patch.object(art, "generate_private_image", side_effect=image) as image_mock:
             with self.assertRaisesRegex(ValueError, "art_moment_sources_changed"):
                 art.prepare_private_preview(fake, str(target), generate=True)

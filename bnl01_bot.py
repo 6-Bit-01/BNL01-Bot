@@ -34351,6 +34351,8 @@ async def revalidate_ambient_sources(guild_id: int, basis: dict, *, stage: str) 
         if valid and basis.get('art_journal_basis'):
             refreshed, changed = await asyncio.to_thread(_refresh_publication_prompt_source_basis, basis['art_journal_basis'])
             valid = not changed and bool(refreshed.publications)
+        if valid and basis.get('art_context'):
+            valid = await asyncio.to_thread(ambient_art.art_context_current, sys.modules[__name__], guild_id, basis['art_context'])
     except Exception as exc:
         logging.warning('ambient_source_check_unavailable error_type=%s', type(exc).__name__)
         valid = False
@@ -34376,6 +34378,9 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int,
         )
         art_available = ambient_art.available(sys.modules[__name__], guild_id)
         journal = ambient_art.journal_context(sys.modules[__name__], guild_id) if art_available else None
+        if art_available:
+            basis['art_context'] = ambient_art.build_art_context(sys.modules[__name__], guild_id,
+                                                               journal=journal, journal_provided=True)
         return recent, avoid, cues, broadcast, moments, art_available, journal
     try:
         recent_user, recent_ambient, cues, broadcast, moments, art_available, journal = await asyncio.to_thread(read_sources)
@@ -34392,6 +34397,9 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int,
         basis['art_journal_basis'] = journal
     references = [f'{table}:{row_id}' for table, rows in basis.get('rows', {}).items() for row_id in rows]
     references.extend(item['ref'] for item in moments)
+    art_context = basis.get('art_context')
+    if art_context:
+        references.extend(item['ref'] for item in [*art_context['sources'], *art_context['continuity']])
     prompt = (
         "You are BNL-01. Decide whether you have a worthwhile ambient thought to share in Discord. "
         "You may choose silence. This is your own presence, not an hourly activity report or a request service.\n"
@@ -34427,7 +34435,11 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int,
             "imagePrompt (4000 max), inspirationRefs (array from the supplied source references, empty for imagination). "
             "The text must stand on its own if image generation fails.\n"
             f"Allowed original source references: {json.dumps(references)}\n"
+            + ambient_art.build_own_art_creative_context()
         )
+        if art_context:
+            prompt += ambient_art.render_art_sources(art_context['sources'],
+                        ambient_art.continuity_for_prompt(art_context['continuity']))
         if journal:
             prompt += ("Optional art-only Journal relationship: you may add journalEntryId to the art object if "
                        "the image genuinely relates to one of these already published, eligible entries. "
@@ -34463,6 +34475,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int,
         if result and len(result) >= 10 and not unfounded and not is_incomplete_ambient_message(result) and not _too_similar(result, recent_ambient):
             if art_available and art:
                 basis['art'] = art
+                basis['art_caption'] = result
             if source_basis_out is not None:
                 source_basis_out.update(basis)
             _set_ambient_runtime_state(guild_id, mode='self_directed')
