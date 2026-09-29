@@ -151,7 +151,10 @@ class ShowIntervalConversationTests(unittest.TestCase):
 
     def test_whole_show_person_recall_keeps_its_existing_owner(self):
         for query in ("What did Neon Fox say during the show?", "What did 6 Bit say during yesterday's show?",
-                      "What did Neon Fox say during the session?"):
+                      "What did Neon Fox say during the session?",
+                      "During the August 28 BARCODE Radio show, what was the pottery-club exchange? Who said what?",
+                      "What did people say during BARCODE Radio [08-28-2026]?",
+                      "Who said that during the 2026-08-28 broadcast?"):
             with self.subTest(query=query):
                 self.assertIsNone(show_conversation_scope(self.ledger(), query))
 

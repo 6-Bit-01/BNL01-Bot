@@ -2300,9 +2300,10 @@ def show_conversation_interval_requested(user_text: str) -> bool:
     without_dates = query
     for pattern in _EXPLICIT_SHOW_DATE_PATTERNS:
         without_dates = pattern.sub("", without_dates)
+    without_dates = _SPACE_RE.sub(" ", without_dates)
     if re.search(
         r"\bduring\s+(?:(?:the|that|this|last|previous|prior|current|our)\s+|"
-        r"(?:yesterday|today|last night)['’]s\s+)*(?:show|broadcast|session|live)\b",
+        r"(?:yesterday|today|last night)['’]s\s+)*(?:barcode radio(?: show)?|show|broadcast|session|live)\b",
         without_dates, re.I,
     ) and not re.search(
         r"\b(?:track|song|minute)\b|t\+", re.split(r"\bduring\b", without_dates, flags=re.I)[-1], re.I,

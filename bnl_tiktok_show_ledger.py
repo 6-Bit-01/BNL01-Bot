@@ -9,10 +9,12 @@ not infer Discord identity, artist identity, canon, or relationship state.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -90,7 +92,7 @@ def show_preparation_only_requested(text: str) -> bool:
                           r"(?:(?:the|that|this) )?(?:show|broadcast|session)\b", str(text or ""), re.I))
 
 _SPACE_RE = re.compile(r"\s+")
-_QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]{2,}", re.IGNORECASE)
+_QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’]{2,}", re.IGNORECASE)
 _SHOW_QUERY_RE = re.compile(
     r"\b(?:tiktok|tik tok|barcode radio|broadcast|shows?|episodes?|live|chat|viewers?|"
     r"audience|track|song|queue|wheel|submissions?|intake|sponsor|break|preparation|preflight|pre-show|"
@@ -327,8 +329,12 @@ def _requested_show_date(user_text: str, *, now: Any = None) -> str:
 
 
 def _subject_continuity_requested(user_text: str) -> bool:
-    return bool(_SUBJECT_CONTINUITY_QUERY_RE.search(str(user_text or ""))
-                or self_public_activity_requested(user_text))
+    # A quoted speaker's "I/my" belongs to that source, not the requester.
+    request_text = str(user_text or "")
+    for literal in _current_show_quote_literals(request_text):
+        request_text = request_text.replace(literal, " ")
+    return bool(_SUBJECT_CONTINUITY_QUERY_RE.search(request_text)
+                or self_public_activity_requested(request_text))
 
 
 def _community_baseline_requested(user_text: str) -> bool:
@@ -2882,9 +2888,12 @@ def _message_relevance(
     query_terms: set[str],
     participant_refs: set[str],
     evidence_boosts: Mapping[str, int],
-) -> tuple[int, int, str]:
+    term_weights: Mapping[str, float] | None = None,
+) -> tuple[float, int, int, str]:
     text_terms = _query_terms(str(message.get("text") or ""))
-    score = 5 * len(query_terms.intersection(text_terms))
+    matching = query_terms.intersection(text_terms)
+    lexical_score = sum(term_weights.get(term, 0.0) for term in sorted(matching)) if term_weights is not None else 0.0
+    score = 5 * len(matching)
     score += max(
         0,
         int(evidence_boosts.get(str(message.get("eventId") or ""), 0)),
@@ -2896,10 +2905,26 @@ def _message_relevance(
     if message.get("queueReference"):
         score += 5
     return (
+        -lexical_score,
         -score,
         int(message.get("occurredAtMs") or 0),
         str(message.get("eventId") or ""),
     )
+
+
+def _recall_term_weights(
+    messages: Sequence[Mapping[str, Any]], query_terms: set[str],
+) -> dict[str, float]:
+    """Prefer distinctive source words before interaction/track popularity.
+
+    Count each word once per eligible message. Repetition in one utterance
+    cannot inflate relevance, and no unfiltered or separately stored corpus
+    supplies evidence. A bounded rendering still is not an absence search.
+    """
+    query_terms = query_terms - PUBLIC_MEMBER_RECALL_REQUEST_WORDS - {"who", "whom"}
+    counts = Counter(term for message in messages
+                     for term in query_terms.intersection(_query_terms(str(message.get("text") or ""))))
+    return {term: math.log1p(len(messages) / count) for term, count in counts.items()}
 
 
 def _selected_operational_events(
@@ -3544,6 +3569,7 @@ def _dialogue_episode_context_item(
                 query_terms=query_terms,
                 participant_refs=participant_refs,
                 evidence_boosts={},
+                term_weights=term_weights,
             ),
         )
         if participant_refs and _subject_continuity_requested(user_text):
@@ -3553,6 +3579,13 @@ def _dialogue_episode_context_item(
                 if str(item.get("subjectRef") or "") in participant_refs
             ]
         return ranked
+
+    term_weights = _recall_term_weights([
+        message for row in rows
+        for message in (messages_by_show.get(str(row.get("showKey") or ""), ())
+                        if messages_by_show is not None else _authored_show_messages(row.get("ledger") or {}))
+        if not general_recall or str(message.get("subjectRef") or "") in participant_refs
+    ], query_terms)
 
     for row in rows:
         ledger = row.get("ledger") or {}
@@ -4466,7 +4499,7 @@ def build_tiktok_show_evidence_context(
         "- Layer placement: operational chronology is a first-party record; authored TikTok/Discord text is attributed public observation; only repetition across independent finalized show roots may support a revisable community-pattern candidate. Nothing here auto-promotes to Declared, Legacy, or Core canon.",
         "- Keep source scopes independent: a current queue snapshot cannot establish historical participation or whether retained TikTok/Discord history exists. An absent track in a bounded roster selection is not proof that someone never submitted. Queue submission attribution is not proof of artist authorship or actual playback.",
     ]
-    query_terms = _query_terms(user_text)
+    query_terms = _query_terms(selection_query if candidate_context else user_text)
     wants_tracks = bool(_TRACK_QUERY_RE.search(user_text or ""))
     wants_topics = bool(_TOPIC_QUERY_RE.search(user_text or ""))
     bounded_message_limit = max(1, min(int(message_limit or 1), 16))
@@ -4501,12 +4534,14 @@ def build_tiktok_show_evidence_context(
             if _general_participant_recall(user_text, participant_matches):
                 messages = [message for message in messages
                             if str(message.get("subjectRef") or "") in participant_refs]
+            term_weights = _recall_term_weights(messages, query_terms)
             for surface in ("tiktok", "discord"):
                 ranked_messages = sorted(
                     [message for message in messages if message.get("surface") == surface],
                     key=lambda message: _message_relevance(
                         message, query_terms=query_terms,
                         participant_refs=participant_refs, evidence_boosts={},
+                        term_weights=term_weights,
                     ),
                 )
                 for message in ranked_messages[:min(2, bounded_message_limit)]:
@@ -4761,6 +4796,7 @@ def build_tiktok_show_evidence_context(
                 item for item in messages
                 if str(item.get("subjectRef") or "") in participant_refs
             ]
+        term_weights = _recall_term_weights(messages, message_query_terms)
         relevant_messages = sorted(
             messages,
             key=lambda item: _message_relevance(
@@ -4768,6 +4804,7 @@ def build_tiktok_show_evidence_context(
                 query_terms=message_query_terms,
                 participant_refs=participant_refs,
                 evidence_boosts=evidence_boosts,
+                term_weights=term_weights,
             ),
         )
         if participant_refs and _subject_continuity_requested(user_text):
