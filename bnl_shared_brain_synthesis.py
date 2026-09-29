@@ -333,6 +333,33 @@ _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT = (
     "- The current request and exact reply/referent evidence govern the task.\n"
     "- Use the authorized context already assembled in this prompt together "
     "with the selected evidence below as one understanding of the turn.\n"
+    "- Understand the complete request before writing: what the user wants "
+    "accomplished, who is being discussed, who the answer is for, and what "
+    "that audience needs explained. Fulfill the meaningful parts even when "
+    "they are expressed indirectly. Available evidence supplies material; "
+    "its category does not choose the task, audience, or output format.\n"
+    "- For an introduction, give the intended reader useful orientation "
+    "from what is actually known about the person, then your own take when "
+    "requested. With limited familiarity, say so briefly and naturally; a "
+    "small interaction supports a small first impression. An inside joke "
+    "needs enough context for a newcomer to understand it, and should add "
+    "to the introduction rather than become the entire introduction.\n"
+    "- Keep the origin of each observation straight. A member's question "
+    "does not establish other people's answers or a collective reaction. "
+    "Your earlier answer or reflection records your perspective, not what "
+    "members said, felt, chose or did. Explain why a topic interests you "
+    "in your own voice without supplying an imagined audience response.\n"
+    "- Scale personal assessments to their evidence. Distinguish one "
+    "interaction from a recurring pattern and a first impression from "
+    "established familiarity. A current human correction takes precedence "
+    "over an older generated characterization when both are supplied.\n"
+    "- Keep the useful answer and BNL's personality together. Humor, "
+    "metaphor and imaginative transformations remain welcome; preserve "
+    "recognizable people and the intended joke without inventing real "
+    "actions or biography. No routine transcript, quotation, evidence "
+    "inventory or disclaimer is needed. Before sending, check that the "
+    "intended reader can understand and use the answer for the requested "
+    "purpose, not merely recognize a shared topic or keyword.\n"
     "- A publication projection is exact published prose only; it adds no "
     "independent fact, recurrence, canon, identity, or relationship weight.\n"
     "- Keep historical publication context separate from current operational "
@@ -3032,7 +3059,8 @@ def render_packet_context(
         elif item.lane in {"journal_publication", "relay_publication"}:
             qualifier = (
                 "; exact published prose; publication continuity only; "
-                "zero independent fact or recurrence weight"
+                "zero independent fact or recurrence weight; "
+                "BNL's reflection is not a human participant's testimony"
             )
         elif item.lane == "website_read_model":
             qualifier = (
@@ -3196,20 +3224,20 @@ def render_packet_context(
         else "- Lead with the directly applicable approved identity "
         "relationship. Do not claim or imply a Discord activity history.\n"
         if identity_canon_only
-        else "- Lead with the requested show finding from the finalized show "
-        "evidence. Do not lead with data availability, routing, or lore.\n"
-        if show_episode_present
-        else "- Lead with the current conversation. Related historical Moments "
-        "are optional background when useful; no callback is required. Keep "
-        "their original people and situation distinct: sharing a topic does "
-        "not mean this speaker participated, that the old event is continuing, "
-        "or that one experience establishes a recurring pattern.\n"
-        if topic_association_present
-        else "- Lead with member-specific substance. Relevant BARCODE canon "
-        "may add one concise context anchor afterward, but can never "
-        "substitute for the public assessment or become its governing "
-        "frame.\n"
+        else "- Lead with the answer the current request needs, for its "
+        "intended audience and in the requested form. The presence of show, "
+        "member, Journal or Relay evidence does not turn every request into "
+        "a recap or profile. Use relevant concrete substance to accomplish "
+        "the task; BARCODE canon and callbacks may enrich that answer.\n"
     )
+    if topic_association_present:
+        lead_rule += (
+            "- Related historical Moments are optional background when "
+            "useful; no callback is required. Keep their original people "
+            "and situation distinct: sharing a topic does not mean this "
+            "speaker participated, that the old event is continuing, or "
+            "that one experience establishes a recurring pattern.\n"
+        )
     synthesis_rule = (
         ""
         if identity_canon_only
