@@ -119,6 +119,16 @@ def _bounded_env_int(
     return max(minimum, min(maximum, value))
 
 
+def daily_token_limit() -> int:
+    """Allow an operator testing window without changing the regular default."""
+    return _bounded_env_int(
+        "BNL_GEMINI_DAILY_TOKEN_LIMIT",
+        1_350_000,
+        minimum=1,
+        maximum=10_000_000,
+    )
+
+
 def journal_protected_tokens(daily_limit: int) -> int:
     configured = _bounded_env_int(
         "BNL_GEMINI_JOURNAL_PROTECTED_TOKENS",
