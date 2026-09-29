@@ -100,6 +100,31 @@ class RelationshipMeaningTests(unittest.TestCase):
         self.assertIn('quotations, lyrics, hypotheticals', request.prompt)
         self.assertIn('Several signals may coexist', request.prompt)
 
+    def test_recent_meaning_lookup_does_not_scan_unrelated_guild_ledger_history(self):
+        _row, other_root = self.source('An unrelated member contribution.', uid=3)
+        columns = [row[1] for row in self.conn.execute('PRAGMA table_info(memory_ledger_entries)')]
+        values = ["?" if name in {'entry_id', 'source_revision'} else name for name in columns]
+        self.conn.executemany(
+            'INSERT INTO memory_ledger_entries (' + ','.join(columns) + ') SELECT '
+            + ','.join(values) + ' FROM memory_ledger_entries WHERE entry_id=?',
+            ((f'unrelated-root-{i}', f'old-revision-{i}', other_root) for i in range(20000)),
+        )
+        expected = [self.source(f'Test exchange contribution {i}.') for i in range(8)]
+        steps = 0
+
+        def budget():
+            nonlocal steps
+            steps += 1000
+            return int(steps > 100000)
+
+        self.conn.set_progress_handler(budget, 1000)
+        try:
+            sources = rel._meaning_basis(self.conn, guild_id=1, user_id=2,
+                                         source_row_id=expected[-1][0])
+        finally:
+            self.conn.set_progress_handler(None, 0)
+        self.assertEqual([source['entry_id'] for source in sources], [root for _row, root in expected])
+
     def test_qualifier_after_ledger_preview_is_not_truncated(self):
         text = 'The loop is interesting. ' * 25 + 'I am quoting somebody else, not thanking you.'
         self.observe(text)

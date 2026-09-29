@@ -194,6 +194,44 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
                 self.assertIn("the green visuals during this song are wild.", rendered)
                 self.assertFalse(self.bot.finalized_show_packet_owner_requested(current, rendered))
 
+    def test_retelling_after_creative_followup_keeps_original_episode_scope(self):
+        current = (
+            "Now retell that same exchange in a short, natural paragraph for someone "
+            "who missed the show. Keep what was actually said separate from anything imagined."
+        )
+        self._context(current)
+        with sqlite3.connect(self.db_file) as conn:
+            for row_id, role, text in (
+                (9003, "user", "Give me two playful lyric lines inspired by that exchange."),
+                (9004, "model", "An imaginary scene from the 2026-08-21 show."),
+            ):
+                conn.execute(
+                    """INSERT INTO conversations
+                    (id,user_id,user_name,guild_id,channel_name,channel_policy,
+                     route_mode,role,content,timestamp,channel_id,message_id)
+                    VALUES (?,42,'Test Member',77,'bnl-testing','sealed_test',
+                            'normal_chat',?,?,?,9010,?)""",
+                    (row_id, role, text, (self.now - timedelta(seconds=9005-row_id)).isoformat(),
+                     90000 + row_id),
+                )
+        result, basis = self._context(current)
+        selection = {}
+        rendered = self.bot.build_tiktok_show_evidence_context_for_turn(
+            guild_id=77, user_text=current, subject_user_id=42,
+            conversation_basis=basis, conversation_context_result=result, selection_out=selection,
+        )
+        self.assertIn("2026-08-28", selection["selection_user_text"])
+        self.assertEqual([row[0] for row in selection["source_refs"]], ["show-attendance-1"])
+        self.assertNotIn("on 2026-08-21;", rendered)
+        self.assertNotIn("An imaginary scene", rendered)
+
+    def test_backward_exchange_reference_alone_cannot_select_an_arbitrary_show(self):
+        for current in ("Retell that same exchange for someone who missed the show.",
+                        "Summarize the same discussion from the broadcast."):
+            with self.subTest(current=current):
+                self.assertFalse(self.bot.is_tiktok_show_analysis_query(current))
+                self.assertEqual(self.bot.resolve_tiktok_show_analysis_request(current), "")
+
     def test_explicit_new_topic_does_not_inherit_a_show_or_old_referent(self):
         rendered, selection, result = self._show_context(
             "Separate topic: briefly explain why a checksum can detect a "

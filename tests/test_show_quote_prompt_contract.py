@@ -163,6 +163,8 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("invent imagery, not personal attributes", request)
                 self.assertIn("A pronoun referring to someone else inside a quotation does not establish the speaker's own pronouns", request)
                 self.assertIn("supported attribution and explicit self-identification", request)
+                self.assertIn("Missing confirmation supports uncertainty, not a categorical claim", request)
+                self.assertIn("A joke, suggestion, or proposal establishes what was said", request)
                 self.assert_no_response_form_mandates(request)
 
     async def test_each_optional_style_provider_preserves_facts_and_attribution(self):
@@ -197,6 +199,7 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Style changes must preserve factual content and source attribution.", request)
                 self.assertIn("Earlier BNL wording is not independent identity evidence.", request)
                 self.assertIn("invent imagery, not personal attributes", request)
+                self.assertIn("Missing confirmation supports uncertainty, not a categorical claim", request)
                 self.assert_no_response_form_mandates(request)
 
     def test_final_episode_contract_preserves_source_roles_and_scoped_uncertainty(self):

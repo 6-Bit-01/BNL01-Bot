@@ -1260,10 +1260,23 @@ def _transient_exact_reply_rows(
     return rows
 
 
+def _referent_input_text(text: str) -> str:
+    """Keep requested output format from becoming an input-source constraint."""
+    value = str(text or "")
+    if re.search(r"\b(?:retell|rephrase|rewrite|summari[sz]e|explain|describe|respond|answer)\b", value, re.I):
+        value = re.sub(
+            r"\b(?:in|as|into)\s+(?:a|an|one)\s+"
+            r"(?:(?:short|brief|natural|playful|simple|single|concise)[, ]+)*"
+            r"(?:paragraph|poem|story|response|answer)\b",
+            " ", value, flags=re.I,
+        )
+    return value
+
+
 def nearby_contribution_referent_requested(text: str) -> bool:
     """Recognize a structural reference without keying on one exact phrase."""
 
-    value = str(text or "")
+    value = _referent_input_text(text)
     # A time/event modifier such as "this evening" or "those shows" scopes the
     # request; it does not point at a previous room contribution. Keep the
     # original text for source/date selection and inspect only this local
@@ -1341,6 +1354,7 @@ def _narrow_referent_contribution_type(
 ) -> tuple[tuple[dict, ...], bool]:
     """Apply an explicitly requested contribution type without fallback."""
 
+    current_text = _referent_input_text(current_text)
     if LONG_FORM_REFERENT_NOUN_RE.search(current_text or ""):
         return (
             tuple(

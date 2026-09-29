@@ -714,7 +714,7 @@ def is_tiktok_show_analysis_continuation(text: str) -> bool:
     value = str(text or "")
     return bool(
         re.search(r"\b(?:that(?: same)?|the same)\s+"
-                  r"(?:chat|conversation|show|broadcast|episode|stream)\b", value, re.I)
+                  r"(?:chat|conversation|exchange|discussion|interaction|show|broadcast|episode|stream)\b", value, re.I)
         and not has_explicit_show_date(value)
         and not requested_history_window(value)
         and not re.search(r"\b(?:across|compare|other|different|latest|previous)\b", value, re.I)

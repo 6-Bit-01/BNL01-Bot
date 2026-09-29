@@ -1865,7 +1865,11 @@ PERSONAL_ATTRIBUTION_RULE = (
     "the answer to ask. This applies to factual explanations and creative "
     "follow-ups: invent imagery, not personal attributes. Preserve original "
     "quotations and their attribution. A pronoun referring to someone else "
-    "inside a quotation does not establish the speaker's own pronouns."
+    "inside a quotation does not establish the speaker's own pronouns. "
+    "A joke, suggestion, or proposal establishes what was said, not whether "
+    "the proposed action happened. Missing confirmation supports uncertainty, "
+    "not a categorical claim that the action did or did not happen. "
+    "Keep that distinction in factual corrections as well as creative follow-ups."
 )
 
 BNL01_SYSTEM_PROMPT = f"""You are BNL-01 (BARCODE Network Liaison Entity), an official liaison construct serving the BARCODE Network.

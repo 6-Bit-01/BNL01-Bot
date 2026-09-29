@@ -961,11 +961,18 @@ def _meaning_basis(conn: sqlite3.Connection, *, guild_id: int, user_id: int,
     if roots is None:
         if not _table_exists(conn, "memory_ledger_entries") or not _table_exists(conn, "conversations"):
             return []
+        # Keep the ledger's stored source key uncast so its existing source
+        # index can serve each recent conversation. Casting that indexed key
+        # to INTEGER scans the guild's ledger before sorting this tiny window.
+        # CROSS JOIN keeps newer SQLite planners from reversing that lookup
+        # into a guild-wide scan when many historical revisions are present.
         roots = [row[0] for row in conn.execute("""
-            SELECT e.entry_id FROM memory_ledger_entries e
-            JOIN conversations c ON c.id=CAST(e.source_row_id AS INTEGER) AND c.guild_id=e.guild_id
-            JOIN conversations target ON target.id=? AND target.guild_id=c.guild_id
-            WHERE e.source_table='conversations' AND e.guild_id=? AND c.user_id=?
+            SELECT e.entry_id FROM conversations target
+            CROSS JOIN conversations c ON c.guild_id=target.guild_id
+            CROSS JOIN memory_ledger_entries e
+              ON e.source_row_id=CAST(c.id AS TEXT) AND e.guild_id=c.guild_id
+            WHERE target.id=? AND target.guild_id=? AND c.user_id=?
+              AND e.source_table='conversations'
               AND c.channel_id=target.channel_id AND c.id<=target.id
               AND datetime(c.timestamp)>=datetime(target.timestamp,'-30 minutes')
               AND datetime(c.timestamp)<=datetime(target.timestamp)
