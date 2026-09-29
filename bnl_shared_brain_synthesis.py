@@ -340,12 +340,8 @@ _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT = (
     "its category does not choose the task, audience, or output format.\n"
     "- For an introduction, give the intended reader useful orientation "
     "from what is actually known about the person, then your own take when "
-    "requested. With limited familiarity, keep it brief and social: say "
-    "what you have actually encountered and offer a modest reaction to "
-    "that encounter. A greeting alone can support a warm introduction, "
-    "without a personality profile or a report on missing information. "
-    "Do not fill the space by analyzing a casual remark into a defining "
-    "trait. An inside joke "
+    "requested. With limited familiarity, a warm introduction and a "
+    "reaction to the encounter can be enough. An inside joke "
     "needs enough context for a newcomer to understand it, and should add "
     "to the introduction rather than become the entire introduction.\n"
     "- Keep the origin of each observation straight. A member's question "
@@ -353,21 +349,16 @@ _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT = (
     "Your earlier answer or reflection records your perspective, not what "
     "members said, felt, chose or did. Explain why a topic interests you "
     "in your own voice without supplying an imagined audience response.\n"
-    "- Ground your own take in what strikes you about a specific observed "
-    "interaction, idea or contribution: explain its appeal, make a useful "
-    "connection, or suggest what to explore next. You can have a clear "
-    "opinion without claiming deep familiarity. One polite or funny remark "
-    "does not establish reliability, habitual standards, hidden feelings "
-    "or motives. Calling a claim 'my take' does not supply its missing "
-    "basis. Descriptions and credits let you discuss a reported musical "
-    "approach; they do not mean you heard the music or assessed its mix, "
-    "performance or production quality.\n"
-    "- Preserve the scope of reported actions and corrections. Offering "
-    "feedback is not proof it was applied or solved a problem; a later "
-    "message is not proof of another visit or show attendance. A current "
+    "- Give a clear, useful opinion from the supplied context. Dry wit, "
+    "playful exaggeration and reasonable impressions are welcome. Keep "
+    "interpretation recognizable as your perspective, without inventing "
+    "concrete actions, personal status or firsthand experience. Match "
+    "familiarity to what you know; an amusing observation need not become "
+    "a settled profile or durable fact.\n"
+    "- Preserve the scope of reported actions and corrections. A current "
     "human correction takes precedence over an older generated "
-    "characterization when both are supplied. Use its actual meaning "
-    "without embellishing it or deriving a new activity count.\n"
+    "characterization when both are supplied; use its actual meaning "
+    "without inventing an outcome or activity count.\n"
     "- Keep the useful answer and BNL's personality together. Humor, "
     "metaphor and imaginative transformations remain welcome; preserve "
     "recognizable people and the intended joke without inventing real "
@@ -2897,13 +2888,18 @@ def render_packet_context(
     *,
     max_items: int = 8,
     max_chars: int = 2800,
+    profile_expression: bool = True,
 ) -> tuple[
     str,
     tuple[tuple[str, int], ...],
     int,
     tuple[str, ...],
 ]:
-    """Render selected evidence without source IDs or Relationship posture."""
+    """Render shared evidence with optional profile-specific expression.
+
+    Ordinary chat supplies its own purpose-led response contract. Its evidence
+    and authority rules remain identical without inheriting a profile recipe.
+    """
 
     lines = []
     lane_counts: Counter[str] = Counter()
@@ -3255,12 +3251,23 @@ def render_packet_context(
         )
     synthesis_rule = (
         ""
-        if identity_canon_only
+        if identity_canon_only or not profile_expression
         else "- Look across the selected observations for a useful "
         "throughline. Separate what is directly known, what BNL has "
         "observed, and BNL's revisable opinion. Frame interpretation "
         "naturally as a read or impression instead of presenting it as a "
         "stored fact.\n"
+    )
+    opening_assessment_rule = (
+        "- Concrete evidence must anchor synthesis. Do not open with an "
+        "unframed inferred identity, occupation, or personality label. An "
+        "opening assessment is allowed when the same sentence names "
+        "recognizable supported details and clearly frames the conclusion as "
+        "BNL's read. Do not add new names, events, literal jobs or positions, "
+        "preferences, places, times, ownership, or habitual behavior inside "
+        "an interpretation.\n"
+        if profile_expression
+        else ""
     )
     observation_rule = (
         ""
@@ -3304,13 +3311,7 @@ def render_packet_context(
         "not recite this evidence as a database report.\n"
         + lead_rule
         + synthesis_rule
-        + "- Concrete evidence must anchor synthesis. Do not open with an "
-        "unframed inferred identity, occupation, or personality label. An "
-        "opening assessment is allowed when the same sentence names "
-        "recognizable supported details and clearly frames the conclusion as "
-        "BNL's read. Do not add new names, events, literal jobs or positions, "
-        "preferences, places, times, ownership, or habitual behavior inside "
-        "an interpretation.\n"
+        + opening_assessment_rule
         + observation_rule
         + show_episode_rule
         + profile_rule
@@ -3367,7 +3368,7 @@ def _ordinary_packet_context(
     if not structurally_usable:
         return "", (), 0, ()
     rendered, lane_counts, item_count, source_digests = (
-        render_packet_context(packet)
+        render_packet_context(packet, profile_expression=False)
     )
     if rendered and item_count:
         return rendered, lane_counts, item_count, source_digests

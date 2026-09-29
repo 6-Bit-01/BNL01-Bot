@@ -405,6 +405,17 @@ _TASK_SEGMENT_START_RE = re.compile(
     % _TASK_LEAD_RE.pattern,
     re.I,
 )
+_ELLIPTICAL_EVALUATION_RE = re.compile(
+    r"^\s*(?:"
+    r"what(?:['’]s|\s+is|\s+are)\s+your\s+(?:own\s+)?"
+    r"(?:take|thoughts?|opinion|view|read|assessment|impression)|"
+    r"what\s+(?:do|did)\s+you\s+think|"
+    r"what\s+(?:impression|view|opinion|assessment|conclusion)\s+"
+    r"(?:have|had)\s+you\s+(?:formed|reached)|"
+    r"how\s+do\s+you\s+(?:feel|see\s+it)"
+    r")(?:\s+(?:on|about)\s+(?:this|that|it))?\s*[.!?]*\s*$",
+    re.I,
+)
 _VOLATILE_EXTERNAL_RE = re.compile(
     r"\b(?:weather|forecast|temperature|traffic|score|standings?|price|"
     r"stock|market|exchange\s+rate|news|headline|election|polls?|"
@@ -696,42 +707,104 @@ def _situation_object(text: str) -> str:
     return "multiple" if matches else "unknown"
 
 
-def _situation_task_segments(text: str) -> Tuple[str, ...]:
-    """Split only explicit ordered requests; never split ordinary noun lists."""
+def _situation_task_parts(
+    text: str,
+    *,
+    context_labels: Sequence[str] = (),
+) -> Tuple[Tuple[str, str], ...]:
+    """Return each full request segment and its authority-bearing clause.
+
+    Boundary cues are not a complete English task grammar. A clause that
+    does not start with a recognized cue can still carry the main request,
+    audience, or setup. Keep a subject-bearing request even when its verb is
+    unfamiliar; attach a plain lead-in to the next request instead of
+    treating it as either an independent task or disposable context. The
+    retained setup does not lend identity or source authority to a separate
+    explicit question.
+    """
 
     value = re.sub(r"\s+", " ", str(text or "")).strip()
     if not value:
         return ()
-    value = re.sub(
-        r"[?!.]+\s+(?=(?:(?:briefly|please|quickly|first)\s+)*%s)"
-        % _TASK_LEAD_RE.pattern,
-        "\n",
-        value,
-        flags=re.I,
-    )
-    value = re.sub(
-        r",?\s+(?:and|also|plus|then)\s+"
+    boundary = re.compile(
+        r"(?:[?!.]+\s+|,?\s+(?:and|also|plus|then)\s+|,\s+)"
         r"(?=(?:(?:briefly|please|quickly|first)\s+)*%s)"
         % _TASK_LEAD_RE.pattern,
-        "\n",
-        value,
-        flags=re.I,
+        re.I,
     )
-    value = re.sub(
-        r",\s+(?=(?:(?:briefly|please|quickly|first)\s+)*%s)"
-        % _TASK_LEAD_RE.pattern,
-        "\n",
-        value,
-        flags=re.I,
+    ranges = []
+    start = 0
+    for match in boundary.finditer(value):
+        if value[start:match.start()].strip(" ,;.!?"):
+            ranges.append((start, match.start()))
+        start = match.end()
+    if value[start:].strip(" ,;.!?"):
+        ranges.append((start, len(value)))
+
+    labels = tuple(str(label or "").strip() for label in context_labels if label)
+
+    def explicit_task(segment: str) -> bool:
+        # An observed display label can begin with a task word (e.g. Test).
+        # A declaration about that label remains context, not an instruction.
+        declaration = any(
+            re.match(
+                r"^%s\s+(?:is|are|was|were|has|have|had)\b"
+                % re.escape(label),
+                segment,
+                re.I,
+            )
+            for label in labels
+        )
+        if declaration:
+            return False
+        return bool(
+            _TASK_SEGMENT_START_RE.search(segment)
+            or any(
+                re.search(
+                    r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(label),
+                    segment,
+                    re.I,
+                )
+                for label in labels
+            )
+        )
+
+    merged_ranges = []
+    pending_start = None
+    for start, end in ranges:
+        segment = value[start:end].strip(" ,;.!?")
+        if pending_start is None:
+            pending_start = start
+        if explicit_task(segment):
+            merged_ranges.append((pending_start, end, start, end))
+            pending_start = None
+    if pending_start is not None:
+        # A trailing setup clause still belongs to the last complete task.
+        if merged_ranges:
+            full_start, _full_end, task_start, task_end = merged_ranges[-1]
+            merged_ranges[-1] = (full_start, len(value), task_start, task_end)
+        else:
+            merged_ranges.append((pending_start, len(value), pending_start, len(value)))
+    return tuple(
+        (
+            value[start:end].strip(" ,;.!?"),
+            value[task_start:task_end].strip(" ,;.!?"),
+        )
+        for start, end, task_start, task_end in merged_ranges
+    ) or ((str(text or ""), str(text or "")),)
+
+
+def _situation_task_segments(
+    text: str,
+    *,
+    context_labels: Sequence[str] = (),
+) -> Tuple[str, ...]:
+    return tuple(
+        segment
+        for segment, _task_clause in _situation_task_parts(
+            text, context_labels=context_labels,
+        )
     )
-    parts = tuple(part.strip(" ,;.!?") for part in value.split("\n"))
-    parts = tuple(part for part in parts if part)
-    explicit_tasks = tuple(
-        part for part in parts if _TASK_SEGMENT_START_RE.search(part)
-    )
-    if explicit_tasks and len(parts) > 1:
-        return explicit_tasks
-    return parts or (str(text or ""),)
 
 
 def situation_subject_label_spans(
@@ -753,7 +826,10 @@ def situation_subject_label_spans(
         selected.append((start, end))
     task_starts = []
     search_offset = 0
-    for segment in _situation_task_segments(value):
+    for segment in _situation_task_segments(
+        value,
+        context_labels=tuple(value[start:end] for start, end in selected),
+    ):
         match = re.search(
             re.escape(segment).replace(r"\ ", r"\s+"),
             value[search_offset:], re.I,
@@ -825,7 +901,13 @@ def situation_task_texts(
     text = str(current_text or "")
     if _situation_digest(text) != frame.current_text_digest:
         return ()
-    segments = _situation_task_segments(text)
+    segments = _situation_task_segments(
+        text,
+        context_labels=(
+            *frame.current_speaker_labels,
+            *(subject.label_hint for subject in frame.subjects),
+        ),
+    )
     tasks = tuple(frame.tasks or ())
     if not tasks or len(segments) != len(tasks):
         return ()
@@ -904,10 +986,19 @@ def _situation_tasks(
     subjects: Sequence[SituationSubjectReference],
     response_act: str,
     exact_reply_resolved: bool = False,
+    context_labels: Sequence[str] = (),
 ) -> Tuple[SituationTaskReference, ...]:
     tasks = []
     prior_unique_subject_index = None
-    for index, segment in enumerate(_situation_task_segments(text), start=1):
+    previous_task_subject_indexes = ()
+    parts = _situation_task_parts(
+        text,
+        context_labels=(
+            *context_labels,
+            *(subject.label_hint for subject in subjects),
+        ),
+    )
+    for index, (full_segment, segment) in enumerate(parts, start=1):
         phase = _situation_phase(segment)
         object_kind = _situation_object(segment)
         temporal_scope, currentness = _situation_temporal_scope(segment)
@@ -928,6 +1019,17 @@ def _situation_tasks(
             objective_kind=objective_kind,
         )
         subject_indexes = _task_subject_indexes(segment, subjects)
+        if (
+            not subject_indexes
+            and previous_task_subject_indexes
+            and object_kind == "unknown"
+            and _ELLIPTICAL_EVALUATION_RE.fullmatch(segment)
+        ):
+            # An evaluation with its object omitted continues the immediate
+            # task's complete subject scope. Do not choose between subjects,
+            # grant it a new external-knowledge authority, or carry a subject
+            # across an unrelated intervening task.
+            subject_indexes = previous_task_subject_indexes
         singular_deictic = bool(
             _CANON_SINGULAR_DEICTIC_RE.search(segment or "")
         )
@@ -1019,7 +1121,7 @@ def _situation_tasks(
         tasks.append(
             SituationTaskReference(
                 task_id="T%s" % index,
-                text_digest=_situation_digest(segment),
+                text_digest=_situation_digest(full_segment),
                 task_kind=task_kind,
                 object_kind=object_kind,
                 authority_scope=authority_scope,
@@ -1034,6 +1136,7 @@ def _situation_tasks(
             prior_unique_subject_index = subject_indexes[0]
         elif subject_indexes:
             prior_unique_subject_index = None
+        previous_task_subject_indexes = subject_indexes
     return tuple(tasks)
 
 
@@ -1068,20 +1171,34 @@ def _situation_event_relation(
     moment_topic_coherent: bool,
     moment_participant_overlap: bool,
     phase: str,
+    subject_label_spans: Sequence[Tuple[int, int]] = (),
 ) -> str:
     state = str(moment_situation_state or "none").strip().lower()
     text = str(current_text or "")
-    if _SITUATION_EXPLICIT_NEW_EVENT_RE.search(text):
+
+    def event_cue(pattern: Any) -> bool:
+        # Public labels can contain ordinary intent words. Matches touching
+        # an already-bound label are identity text, while independent cues
+        # elsewhere in the same request still describe the actual event.
+        return any(
+            not any(
+                match.start() < end and match.end() > start
+                for start, end in subject_label_spans
+            )
+            for match in pattern.finditer(text)
+        )
+
+    if event_cue(_SITUATION_EXPLICIT_NEW_EVENT_RE):
         return (
             "new_event_same_participant"
             if moment_participant_overlap
             else "new_event_or_uncertain"
         )
-    if _SITUATION_CONCURRENT_RE.search(text):
+    if event_cue(_SITUATION_CONCURRENT_RE):
         return "concurrent_activity"
-    if _SITUATION_PARTICIPANT_CHANGE_RE.search(text):
+    if event_cue(_SITUATION_PARTICIPANT_CHANGE_RE):
         return "comparison_or_participant_change"
-    if _SITUATION_EXPLICIT_RESUME_RE.search(text):
+    if event_cue(_SITUATION_EXPLICIT_RESUME_RE):
         return (
             "resume"
             if state not in {"", "none"} and moment_topic_coherent
@@ -1290,6 +1407,7 @@ def build_situation_frame_v1(
         subjects=subjects,
         response_act=str(response_act or "observe"),
         exact_reply_resolved=exact_reply_resolved,
+        context_labels=speaker_labels,
     )
 
     ambiguity = []
@@ -1351,6 +1469,18 @@ def build_situation_frame_v1(
         moment_topic_coherent=bool(moment_topic_coherent),
         moment_participant_overlap=bool(moment_participant_overlap),
         phase=phase,
+        subject_label_spans=tuple(
+            (match.start(), match.end())
+            for subject in subjects
+            if subject.label_hint
+            and subject.binding_method != "reversible_label_hint"
+            for match in re.finditer(
+                r"(?<![a-z0-9])%s(?![a-z0-9])"
+                % re.escape(subject.label_hint),
+                text,
+                re.I,
+            )
+        ),
     )
     if event_relation == "resume_unresolved":
         ambiguity.append("resume_target_unresolved")

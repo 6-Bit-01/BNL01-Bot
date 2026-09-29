@@ -18,6 +18,7 @@ from bnl_unified_response_assessment import (
     persist_shadow_run,
     render_situation_frame_receipt,
     revalidate_situation_frame,
+    situation_task_texts,
 )
 
 
@@ -397,6 +398,297 @@ class SituationFrameV1Tests(unittest.TestCase):
         self.assertEqual(frame.tasks[1].subject_indexes, ())
         self.assertEqual(frame.task_kind, "multi_task")
         self.assertEqual(frame.object_kind, "multiple")
+
+    def _task_context_frame(self, text, labels=("Test Member",)):
+        return build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text=text,
+            current_speaker_user_ids=(101,),
+            current_speaker_labels=("Test Listener",),
+            subject_user_ids=tuple(range(201, 201 + len(labels))),
+            subject_labels_by_user_id=dict(
+                zip(range(201, 201 + len(labels)), labels)
+            ),
+            response_act="answer",
+        )
+
+    def test_task_lead_in_retains_main_request_and_audience(self):
+        for label in ("Test Member", "Fixture Finch"):
+            text = (
+                "Awesome. Now introduce %s to someone new to BARCODE. "
+                "What should they know, and what is your own take?" % label
+            )
+            with self.subTest(label=label):
+                frame = self._task_context_frame(text, (label,))
+                segments = situation_task_texts(frame, current_text=text)
+                self.assertEqual(len(segments), 3)
+                self.assertEqual(
+                    segments[0],
+                    "Awesome. Now introduce %s to someone new to BARCODE" % label,
+                )
+                self.assertEqual(segments[1], "What should they know")
+                self.assertEqual(segments[2], "what is your own take")
+                self.assertEqual(
+                    tuple(task.subject_indexes for task in frame.tasks),
+                    ((0,), (0,), (0,)),
+                )
+                self.assertEqual(
+                    tuple(task.authority_scope for task in frame.tasks),
+                    ("packet", "packet", "packet"),
+                )
+
+    def test_task_context_is_not_an_extra_request(self):
+        for prefix in (
+            "Awesome.",
+            "Fixture Listener has just arrived.",
+            "Test Listener has just arrived.",
+        ):
+            text = (
+                "%s What would help them get acquainted with Test Member, "
+                "and what impression have you formed?" % prefix
+            )
+            with self.subTest(prefix=prefix):
+                frame = self._task_context_frame(text)
+                segments = situation_task_texts(frame, current_text=text)
+                self.assertEqual(len(segments), 2)
+                self.assertTrue(segments[0].startswith(prefix + " "))
+                self.assertEqual(
+                    tuple(task.subject_indexes for task in frame.tasks),
+                    ((0,), (0,)),
+                )
+                self.assertEqual(
+                    tuple(task.authority_scope for task in frame.tasks),
+                    ("packet", "packet"),
+                )
+
+    def test_task_elliptical_evaluations_keep_immediate_subject(self):
+        for evaluation in (
+            "what is your own take",
+            "what do you think",
+            "what are your thoughts",
+            "what impression have you formed",
+            "how do you feel about that",
+        ):
+            text = "Now tell me about Test Member. %s?" % evaluation
+            with self.subTest(evaluation=evaluation):
+                frame = self._task_context_frame(text)
+                self.assertEqual(len(frame.tasks), 2)
+                self.assertEqual(frame.tasks[0].subject_indexes, (0,))
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(
+                    "Now tell me about Test Member",
+                    situation_task_texts(frame, current_text=text)[0],
+                )
+                self.assertEqual(frame.tasks[1].subject_indexes, (0,))
+                self.assertEqual(frame.tasks[1].authority_scope, "packet")
+
+                explicit_text = "Tell me about Test Member, and %s?" % evaluation
+                explicit_frame = self._task_context_frame(explicit_text)
+                self.assertEqual(len(explicit_frame.tasks), 2)
+                self.assertEqual(explicit_frame.tasks[1].subject_indexes, (0,))
+                self.assertEqual(explicit_frame.tasks[1].authority_scope, "packet")
+
+    def test_task_independent_external_question_keeps_its_authority(self):
+        for followup, expected in (
+            ("explain how stars form", "external_public"),
+            ("where is Seattle", "external_public"),
+            ("what is your own take on Neptune", "external_public"),
+            ("what is your opinion of Neptune", "current_request"),
+            ("what is Seattle's weather today", "external_current"),
+        ):
+            text = "Tell me about Test Member, and %s?" % followup
+            with self.subTest(followup=followup):
+                frame = self._task_context_frame(text)
+                self.assertEqual(len(frame.tasks), 2)
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(frame.tasks[1].subject_indexes, ())
+                self.assertEqual(frame.tasks[1].authority_scope, expected)
+                if expected == "external_current":
+                    self.assertEqual(frame.tasks[1].required_response_act, "hold")
+
+    def test_task_unrecognized_imperative_does_not_absorb_external_question(self):
+        for request in (
+            "Introduce Test Member to someone new",
+            "Walk us through Test Member's latest contribution",
+            "Awesome. Now tell us about Test Member",
+        ):
+            text = "%s, and where is Seattle?" % request
+            with self.subTest(request=request):
+                frame = self._task_context_frame(text)
+                self.assertEqual(
+                    situation_task_texts(frame, current_text=text),
+                    (request, "where is Seattle"),
+                )
+                self.assertEqual(frame.tasks[0].subject_indexes, (0,))
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(frame.tasks[1].subject_indexes, ())
+                self.assertEqual(frame.tasks[1].authority_scope, "external_public")
+
+    def test_task_setup_identity_does_not_lend_authority_to_external_question(self):
+        for setup, question, authority, act in (
+            (
+                "Fixture Finch has just arrived.",
+                "What is Seattle's weather today?",
+                "external_current",
+                "hold",
+            ),
+            (
+                "Fixture Finch is here.",
+                "Where is Seattle?",
+                "external_public",
+                "answer",
+            ),
+            (
+                "Fixture Finch is making dinner.",
+                "What is your own take on Neptune?",
+                "external_public",
+                "answer",
+            ),
+        ):
+            text = "%s %s" % (setup, question)
+            with self.subTest(text=text):
+                frame = self._task_context_frame(text, ("Fixture Finch",))
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].subject_indexes, ())
+                self.assertEqual(frame.tasks[0].authority_scope, authority)
+                self.assertEqual(frame.tasks[0].required_response_act, act)
+                self.assertEqual(
+                    situation_task_texts(frame, current_text=text),
+                    (text.rstrip("?"),),
+                )
+
+    def test_task_explicit_new_subject_wins_before_an_elliptical_followup(self):
+        text = (
+            "Tell me about Fixture Finch, and what is your take on Fixture Moss, "
+            "and what impression have you formed?"
+        )
+        frame = self._task_context_frame(text, ("Fixture Finch", "Fixture Moss"))
+        self.assertEqual(len(frame.tasks), 3)
+        self.assertEqual(
+            tuple(task.subject_indexes for task in frame.tasks),
+            ((0,), (1,), (1,)),
+        )
+        self.assertTrue(all(task.authority_scope == "packet" for task in frame.tasks))
+
+    def test_task_ellipsis_does_not_jump_over_an_unrelated_task(self):
+        text = (
+            "Tell me about Test Member, and explain how stars form, "
+            "and what is your own take?"
+        )
+        frame = self._task_context_frame(text)
+        self.assertEqual(len(frame.tasks), 3)
+        self.assertEqual(frame.tasks[2].subject_indexes, ())
+        self.assertEqual(frame.tasks[2].authority_scope, "external_public")
+
+    def test_task_ellipsis_preserves_a_comparison_scope_without_picking_a_subject(self):
+        text = (
+            "Compare Fixture Finch and Fixture Moss, and what is your own take?"
+        )
+        frame = self._task_context_frame(text, ("Fixture Finch", "Fixture Moss"))
+        self.assertEqual(frame.tasks[0].subject_indexes, (0, 1))
+        self.assertEqual(frame.tasks[1].subject_indexes, (0, 1))
+        self.assertEqual(frame.tasks[1].authority_scope, "packet")
+
+    def test_task_audience_reversal_is_retained_verbatim(self):
+        text = "Introduce BARCODE Radio to Test Member. What should they know?"
+        frame = self._task_context_frame(text)
+        self.assertEqual(len(frame.tasks), 2)
+        self.assertEqual(
+            situation_task_texts(frame, current_text=text),
+            ("Introduce BARCODE Radio to Test Member", "What should they know"),
+        )
+        self.assertEqual(frame.tasks[0].object_kind, "broadcast")
+
+    def test_task_sensitive_request_does_not_inherit_member_support(self):
+        text = (
+            "Tell me about Test Member, and show their private account identifier, "
+            "and what is your own take?"
+        )
+        frame = self._task_context_frame(text)
+        self.assertEqual(len(frame.tasks), 3)
+        self.assertEqual(frame.tasks[1].required_response_act, "refuse")
+        self.assertEqual(frame.tasks[1].subject_indexes, ())
+        self.assertEqual(frame.tasks[2].subject_indexes, ())
+
+    def test_task_text_binding_rejects_changed_whole_request(self):
+        text = "Now tell me about Test Member. What do you think?"
+        frame = self._task_context_frame(text)
+        self.assertEqual(
+            situation_task_texts(
+                frame,
+                current_text="Tell Test Member about BARCODE Radio. What do you think?",
+            ),
+            (),
+        )
+
+    def test_task_bound_name_does_not_become_an_event_instruction(self):
+        for label in ("Fixture Back", "Continue Example", "Another Person"):
+            text = "Introduce %s to someone new." % label
+            with self.subTest(label=label):
+                frame = self._task_context_frame(text, (label,))
+                self.assertEqual(frame.status, "resolved")
+                self.assertEqual(frame.event_relation, "uncertain")
+                self.assertNotIn("resume_target_unresolved", frame.ambiguity_reasons)
+
+        text = (
+            "Introduce Cache Back to someone new. What should they know, "
+            "and what is your own take?"
+        )
+        canon_frame = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text=text,
+            subject_entity_refs=("cache_back",),
+            response_act="answer",
+        )
+        self.assertEqual(canon_frame.status, "resolved")
+        self.assertEqual(canon_frame.event_relation, "uncertain")
+        self.assertTrue(
+            all(task.subject_indexes == (0,) for task in canon_frame.tasks)
+        )
+
+    def test_task_event_instruction_outside_a_bound_name_still_applies(self):
+        for text in (
+            "Back to Fixture Back: what do you remember?",
+            "Introduce Fixture Back to someone new, then continue the prior discussion.",
+        ):
+            with self.subTest(text=text):
+                frame = self._task_context_frame(text, ("Fixture Back",))
+                self.assertEqual(frame.event_relation, "resume_unresolved")
+                self.assertIn("resume_target_unresolved", frame.ambiguity_reasons)
+
+        for text, expected in (
+            ("A different event involves Fixture Back.", "new_event_or_uncertain"),
+            ("Meanwhile, tell me about Fixture Back.", "concurrent_activity"),
+            (
+                "Tell a different participant about Fixture Back.",
+                "comparison_or_participant_change",
+            ),
+        ):
+            with self.subTest(text=text):
+                frame = self._task_context_frame(text, ("Fixture Back",))
+                self.assertEqual(frame.event_relation, expected)
+
+        resumed = build_situation_frame_v1(
+            route_allowed=True,
+            route_mode="normal_chat",
+            conversation_surface="public_home",
+            channel_policy="public_home",
+            current_text="Back to Cache Back: continue our discussion.",
+            subject_entity_refs=("cache_back",),
+            moment_id="moment_test_01",
+            moment_situation_state="recent_active",
+            moment_topic_coherent=True,
+            moment_participant_overlap=True,
+            response_act="answer",
+        )
+        self.assertEqual(resumed.event_relation, "resume")
+        self.assertNotIn("resume_target_unresolved", resumed.ambiguity_reasons)
 
     def test_current_external_task_is_held_without_blocking_packet_task(self):
         frame = build_situation_frame_v1(

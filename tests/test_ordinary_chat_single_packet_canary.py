@@ -11,6 +11,7 @@ import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
 from bnl_shared_brain_synthesis import (
+    _ordinary_rendered_evidence_refs,
     ORDINARY_CHAT_AUTHORITY,
     ORDINARY_CHAT_PUBLIC_ENABLED_ENV,
     ORDINARY_CHAT_ROUTE_FAMILY,
@@ -1294,14 +1295,109 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
                 self.assertIn("inside joke needs enough context", owned.prompt)
                 self.assertIn("limited familiarity", owned.prompt)
                 self.assertIn("a warm introduction", owned.prompt)
-                self.assertIn("specific observed interaction", owned.prompt)
-                self.assertIn("do not mean you heard the music", owned.prompt)
-                self.assertIn("without embellishing it", owned.prompt)
+                self.assertIn("clear, useful opinion", owned.prompt)
+                self.assertIn("playful exaggeration and reasonable impressions", owned.prompt)
+                self.assertIn("without inventing an outcome or activity count", owned.prompt)
                 self.assertIn("does not establish other people's answers", owned.prompt)
                 self.assertIn("Humor, metaphor and imaginative transformations", owned.prompt)
                 self.assertEqual(basis.packet.items, original_items)
                 second = build_packet_owned_prompt(owned.prompt, basis)
                 self.assertEqual(second.prompt, owned.prompt)
+
+    def test_ordinary_expression_preserves_profile_evidence_and_authority(self):
+        for status in ("not_applicable", "sparse", "rich"):
+            with self.subTest(profile_status=status):
+                packet = replace(
+                    self.packet,
+                    profile_sufficiency=replace(
+                        self.packet.profile_sufficiency,
+                        status=status,
+                    ),
+                )
+                legacy = render_packet_context(packet)
+                ordinary = render_packet_context(packet, profile_expression=False)
+                self.assertEqual(legacy[1:], ordinary[1:])
+                self.assertEqual(
+                    [line for line in legacy[0].splitlines() if line.startswith("[E")],
+                    [line for line in ordinary[0].splitlines() if line.startswith("[E")],
+                )
+                self.assertEqual(
+                    _ordinary_rendered_evidence_refs(packet, legacy[3]),
+                    _ordinary_rendered_evidence_refs(packet, ordinary[3]),
+                )
+                self.assertIn("useful throughline", legacy[0])
+                self.assertIn("An opening assessment is allowed", legacy[0])
+                self.assertNotIn("useful throughline", ordinary[0])
+                self.assertNotIn("An opening assessment is allowed", ordinary[0])
+                for shared_rule in (
+                    "Current-turn and current-room evidence outrank older material",
+                    "Do not turn repetition, inference, or a BNL-authored derivative",
+                    "Do not reconstruct quotations from a derived gist",
+                    "cannot invent a new member fact",
+                ):
+                    self.assertIn(shared_rule, legacy[0])
+                    self.assertIn(shared_rule, ordinary[0])
+                if status == "sparse":
+                    self.assertIn("one honest, narrow supported point", ordinary[0])
+                elif status == "rich":
+                    self.assertIn("at least two materially distinct points", ordinary[0])
+
+        self.assertEqual(
+            self.basis.rendered_context,
+            render_packet_context(self.packet, profile_expression=False)[0],
+        )
+        self.assertEqual(
+            self.basis.rendered_evidence_refs,
+            _ordinary_rendered_evidence_refs(
+                self.packet, render_packet_context(self.packet)[3]
+            ),
+        )
+
+    def test_introduction_purpose_and_opinion_share_bound_packet_support(self):
+        text = (
+            "Introduce Mac Modem to someone new. What should they know, "
+            "and what is your own take?"
+        )
+        basis = self._multi_subject_basis(text, (("mac_modem", "Mac Modem"),))
+        plan = ordinary_chat_task_support_plan(basis)
+        self.assertEqual(len(plan), 3)
+        bound_evidence = {
+            evidence_id
+            for evidence_id, _lane, _digest, subjects in basis.rendered_evidence_refs
+            if subjects == (0,)
+        }
+        self.assertTrue(bound_evidence)
+        for task, support in zip(basis.packet.request.frame_tasks, plan):
+            self.assertEqual(task.subject_indexes, (0,))
+            self.assertEqual(support.support_kind, "packet")
+            self.assertTrue(bound_evidence.intersection(support.evidence_ids))
+            self.assertNotIn("PUBLIC", support.evidence_ids)
+        original_context = "Current user request: " + text
+        prompt = build_packet_owned_prompt(original_context, basis)
+        self.assertTrue(prompt.ready)
+        self.assertIn(original_context, prompt.prompt)
+        self.assertIn(
+            'request="Introduce Mac Modem to someone new"',
+            prompt.prompt,
+        )
+        self.assertIn('request="What should they know"', prompt.prompt)
+        self.assertIn('request="what is your own take"', prompt.prompt)
+        self.assertNotIn("useful throughline", prompt.prompt)
+        self.assertNotIn("An opening assessment is allowed", prompt.prompt)
+
+    def test_external_opinion_object_does_not_inherit_intro_subject(self):
+        basis = self._multi_subject_basis(
+            "Introduce Mac Modem to someone new. What should they know, "
+            "and what is your own take on Neptune?",
+            (("mac_modem", "Mac Modem"),),
+        )
+        plan = ordinary_chat_task_support_plan(basis)
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(plan[0].support_kind, "packet")
+        self.assertEqual(plan[1].support_kind, "packet")
+        self.assertEqual(plan[2].support_kind, "external_public")
+        self.assertEqual(plan[2].evidence_ids, ("PUBLIC",))
+        self.assertEqual(basis.packet.request.frame_tasks[2].subject_indexes, ())
 
     def test_purpose_guidance_does_not_depend_on_retained_profile_evidence(self):
         basis = replace(self.basis, rendered_context="", rendered_evidence_refs=())
