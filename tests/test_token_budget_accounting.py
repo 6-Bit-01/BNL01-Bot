@@ -56,6 +56,34 @@ class TokenBudgetAccountingTests(unittest.TestCase):
             bnl01_bot._token_budget_reserved_by_lane.clear()
         self.tempdir.cleanup()
 
+    def test_testing_headroom_keeps_usage_and_dollar_enforcement(self):
+        today = "2026-07-26"
+        with mock.patch.object(bnl01_bot, "_pacific_usage_date", return_value=today):
+            bnl01_bot.record_token_usage(
+                bnl01_bot.TokenUsageBreakdown(total_tokens=1_002_340),
+                route="ordinary_chat_single_packet_canary", model="test-model",
+            )
+            with mock.patch.dict("os.environ", {}, clear=True):
+                normal = bnl01_bot.daily_token_limit()
+                with mock.patch.object(bnl01_bot, "DAILY_TOKEN_LIMIT", normal):
+                    with self.assertRaises(bnl01_bot.LocalModelBudgetExhausted):
+                        bnl01_bot.reserve_local_model_budget("test request", "normal_chat")
+                with mock.patch.dict("os.environ", {"BNL_GEMINI_DAILY_TOKEN_LIMIT": "1600000"}):
+                    testing = bnl01_bot.daily_token_limit()
+                with mock.patch.object(bnl01_bot, "DAILY_TOKEN_LIMIT", testing):
+                    with mock.patch.object(bnl01_bot, "_reserve_dollar_budget",
+                                           return_value=("", 0)) as dollars:
+                        reserved = bnl01_bot.reserve_local_model_budget("test request", "normal_chat")
+                        dollars.assert_called_once_with("test request", "normal_chat")
+                        bnl01_bot.release_local_model_budget(reserved)
+                    with mock.patch.object(bnl01_bot, "_reserve_dollar_budget",
+                                           side_effect=bnl01_bot.LocalModelBudgetExhausted("monthly_hard_limit")):
+                        with self.assertRaisesRegex(bnl01_bot.LocalModelBudgetExhausted, "monthly_hard_limit"):
+                            bnl01_bot.reserve_local_model_budget("test request", "normal_chat")
+                self.assertEqual(bnl01_bot.get_usage_stats()[0], 1_002_340)
+                self.assertEqual(bnl01_bot._token_budget_reserved_tokens, 0)
+                self.assertEqual(bnl01_bot._token_budget_reserved_by_lane, {})
+
     def test_provider_metadata_is_recorded_once_with_route_breakdown(self):
         with mock.patch.object(
             bnl01_bot,

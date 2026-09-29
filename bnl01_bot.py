@@ -526,6 +526,7 @@ from bnl_gemini_routing import (
     GeminiImageRequest,
     ProviderFailureKind,
     budget_ceiling_for_route,
+    daily_token_limit,
     estimate_gemini_prompt_tokens,
     estimated_generation_reservation,
     fallback_eligible_failure,
@@ -860,7 +861,7 @@ BNL_JOURNAL_AUTOMATION_ENABLED = os.getenv("BNL_JOURNAL_AUTOMATION_ENABLED", "tr
 BNL_COMMUNITY_SCOUTING_ENABLED = community_scouting_enabled()
 BNL_COMMUNITY_SCOUTING_MIN_SIGNALS = community_min_signals()
 
-DAILY_TOKEN_LIMIT = 1_350_000
+DAILY_TOKEN_LIMIT = daily_token_limit()
 
 
 def _bounded_env_int(

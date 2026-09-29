@@ -6,6 +6,33 @@ import bnl_gemini_routing as routing
 
 
 class GeminiRoutingPolicyTests(unittest.TestCase):
+    def test_daily_allowance_configuration_is_bounded_and_defaults_are_restorable(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(routing.daily_token_limit(), 1_350_000)
+            for configured, expected in (
+                ("1600000", 1_600_000), ("", 1_350_000),
+                ("invalid", 1_350_000), ("-1", 1),
+                ("999999999", 10_000_000),
+            ):
+                with self.subTest(configured=configured), mock.patch.dict(
+                    "os.environ", {"BNL_GEMINI_DAILY_TOKEN_LIMIT": configured},
+                ):
+                    self.assertEqual(routing.daily_token_limit(), expected)
+            self.assertEqual(routing.daily_token_limit(), 1_350_000)
+
+    def test_testing_allowance_preserves_both_unused_token_reserves(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            normal = routing.daily_token_limit()
+            with mock.patch.dict("os.environ", {"BNL_GEMINI_DAILY_TOKEN_LIMIT": "1600000"}):
+                testing = routing.daily_token_limit()
+            for limit, expected in ((normal, 1_021_946), (testing, 1_271_946)):
+                with self.subTest(limit=limit):
+                    self.assertEqual(routing.journal_protected_tokens(limit), 250_000)
+                    self.assertEqual(routing.relay_protected_tokens(limit), 100_000)
+                    self.assertEqual(routing.budget_ceiling_for_route(
+                        limit, "ordinary_chat_single_packet_canary", relay_used=21_946,
+                    ), expected)
+
     def test_defaults_use_stable_full_flash_models(self):
         self.assertEqual(routing.DEFAULT_PRIMARY_MODEL, "gemini-3.6-flash")
         self.assertEqual(routing.DEFAULT_FALLBACK_MODEL, "gemini-3.5-flash")
