@@ -94,6 +94,79 @@ class ReplySQLiteContentionTests(unittest.TestCase):
         finally:
             writer.close()
 
+    def test_model_commit_retries_after_reader_releases_without_duplicate_rows(self):
+        reader = self._hold_read("conversations")
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep", side_effect=lambda _delay: reader.rollback()) as backoff,
+            mock.patch.object(bot, "_shadow_memory_ledger_write") as shadow,
+            mock.patch.object(bot, "relationship_v2_shadow_enabled", return_value=False),
+        ):
+            bot.save_model_message(
+                42, 77, "A delivered private reply.", channel_id=700,
+                channel_name="bnl-testing", channel_policy="sealed_test",
+                discord_message_ids=(9001, 9002),
+            )
+        backoff.assert_called_once()
+        shadow.assert_called_once()
+        with self.connect(self.path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT user_id,channel_id,channel_policy,content FROM conversations"
+            ).fetchall(), [(42, 700, "sealed_test", "A delivered private reply.")])
+            self.assertEqual(conn.execute(
+                "SELECT channel_id,message_id FROM conversation_discord_message_links ORDER BY message_id"
+            ).fetchall(), [(700, 9001), (700, 9002)])
+
+    def test_model_insert_retries_after_writer_releases(self):
+        writer = self.connect(self.path)
+        self.connections.append(writer)
+        writer.execute("BEGIN EXCLUSIVE")
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep", side_effect=lambda _delay: writer.rollback()) as backoff,
+            mock.patch.object(bot, "_shadow_memory_ledger_write"),
+            mock.patch.object(bot, "relationship_v2_shadow_enabled", return_value=False),
+        ):
+            bot.save_model_message(42, 77, "Another delivered reply.",
+                                   channel_id=700, channel_policy="sealed_test")
+        backoff.assert_called_once()
+        self._assert_readable("conversations", 1)
+
+    def test_synthesis_receipt_retries_only_its_rolled_back_transaction(self):
+        reader = self._hold_read("response_style_log")
+
+        def finalize(conn, *_args, **_kwargs):
+            conn.execute("INSERT INTO response_style_log (guild_id,user_id,style_key,timestamp) VALUES (77,42,'steady_reply','now')")
+            return True
+
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep", side_effect=lambda _delay: reader.rollback()) as backoff,
+            mock.patch.object(bot, "finalize_shared_brain_synthesis_run", side_effect=finalize) as finalize_run,
+        ):
+            result = bot._finalize_shared_brain_synthesis_receipt(
+                object(), final_response="Already delivered.", response_sent=True,
+                candidate_live=True, guard_status="sent",
+            )
+        self.assertTrue(result)
+        backoff.assert_called_once()
+        self.assertEqual(finalize_run.call_count, 2)
+        self._assert_readable("response_style_log", 1)
+
+    def test_non_lock_database_failure_is_not_retried(self):
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep") as backoff,
+            mock.patch.object(bot, "finalize_shared_brain_synthesis_run",
+                              side_effect=sqlite3.OperationalError("no such table: missing")),
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+                bot._finalize_shared_brain_synthesis_receipt(
+                    object(), final_response="Already delivered.", response_sent=True,
+                    candidate_live=True, guard_status="sent",
+                )
+        backoff.assert_not_called()
+
     def test_style_history_lock_does_not_prevent_style_selection(self):
         writer = self.connect(self.path)
         self.connections.append(writer)

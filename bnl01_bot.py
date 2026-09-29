@@ -19816,6 +19816,28 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     )
     return decision
 
+def _persist_reply_transaction(write, *, operation: str):
+    """Retry only rolled-back local bookkeeping, never generation or delivery.
+
+    Closing each failed attempt releases its pending lock so the competing
+    reader/writer can finish. Exhaustion and non-lock failures stay visible.
+    Callers must keep external effects and post-commit learning outside write.
+    """
+    for attempt in range(3):
+        try:
+            with closing(sqlite3.connect(DB_FILE, timeout=5)) as conn, conn:
+                return write(conn)
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            busy = ((code & 255) in (5, 6) if isinstance(code, int) else
+                    str(exc).lower() in {"database is locked", "database table is locked"})
+            if not busy or attempt == 2:
+                raise
+            logging.warning("reply_persistence_retry operation=%s attempt=%s",
+                            operation, attempt + 1)
+            time.sleep(0.1 * (attempt + 1))
+
+
 def save_model_message(
     user_id: int,
     guild_id: int,
@@ -19862,8 +19884,7 @@ def save_model_message(
     primary_message_id = (
         delivered_message_ids[0] if delivered_message_ids else None
     )
-    # Roll back and close even when COMMIT fails and a task retains its traceback.
-    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+    def persist_conversation(conn):
         cursor = conn.cursor()
         conversation_columns = {
             str(row[1] or "")
@@ -19942,6 +19963,11 @@ def save_model_message(
             )
         observed_at = cursor.execute("SELECT timestamp FROM conversations WHERE id=?", (row_id,)).fetchone()
         observed_at = observed_at[0] if observed_at else ""
+        return row_id, observed_at
+
+    row_id, observed_at = _persist_reply_transaction(
+        persist_conversation, operation="model_conversation",
+    )
     _shadow_memory_ledger_write(
         "conversations_model",
         lambda ledger_conn: shadow_conversation_row(
@@ -46281,8 +46307,8 @@ def _finalize_shared_brain_synthesis_receipt(
     candidate_live: bool,
     guard_status: str,
 ) -> bool:
-    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
-        finalized = finalize_shared_brain_synthesis_run(
+    def persist_receipt(conn):
+        return finalize_shared_brain_synthesis_run(
             conn,
             decision,
             final_response=final_response,
@@ -46290,8 +46316,7 @@ def _finalize_shared_brain_synthesis_receipt(
             candidate_live=candidate_live,
             guard_status=guard_status,
         )
-        conn.commit()
-        return finalized
+    return _persist_reply_transaction(persist_receipt, operation="synthesis_receipt")
 
 
 async def safely_fallback_shared_brain_synthesis(
