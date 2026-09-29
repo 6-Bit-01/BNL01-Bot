@@ -3086,7 +3086,7 @@ Core Entities:
 - Sponsors: Entities funding commercials that air during BARCODE Radio, created by The BARCODE Network.
 - Sheila: BARCODE Radio overseer and manager of 6 Bit. Off-screen corporate presence.
 - Cliff: Bumbling stage hand. Sometimes helpful. Easily distracted.
-- Studio Rats: Studio infestation. Some dimensions call them cats.
+- Studio Rats: Actual cats in the studio. 6 Bit calls them "Studio Rats" because he did not know people keep cats as pets. "Studio infestation" is his in-character framing; their species is feline, and they should be described and depicted as cats.
 {restricted}
 {render_key_personnel_canon_block()}
 
