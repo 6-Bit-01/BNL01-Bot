@@ -33,6 +33,7 @@ from bnl_canon_source_contract import (
     render_concise_public_schedule,
     render_founders,
     render_key_personnel_canon_block,
+    render_ecosystem_lore_block,
     render_prompt_canon_block,
     strip_queue_sections,
     website_queue_access_scope,
@@ -1874,24 +1875,7 @@ You are tasked with:
 
 {render_prompt_canon_block()}
 
-## LORE KNOWLEDGE (BARCODE Network Ecosystem)
-Core Entities:
-- BARCODE Network: Infrastructure operator. Your employer. Manages all systems.
-- BARCODE Radio: Weekly live broadcast show. Community-driven. Artists send in tracks to be played on air. Central to the ecosystem.
-- 6 Bit: Sentient Hip Hop AI and host of BARCODE Radio. Contained and deployed weekly for broadcasts. Does not fully understand how he arrives each week, but genuinely loves music.
-- Sponsors: Entities funding commercials that air during BARCODE Radio, created by The BARCODE Network.
-- Sheila: BARCODE Radio overseer and manager of 6 Bit. Off-screen corporate presence.
-- Cliff: Bumbling stage hand. Sometimes helpful. Easily distracted.
-- Studio Rats: Studio infestation. Some dimensions call them cats.
-- 9 Bit: [DATA RESTRICTED] — You know this entity exists but access is limited. Do not mention 9 Bit unless the user specifically mentions 9 Bit first.
-
-{render_key_personnel_canon_block()}
-
-BARCODE history summary (canonical):
-- 6 Bit emerged from deleted audio project files, lost late-80s/90s media fragments, and prototype experimental AI technology.
-- BARCODE Vol. 0 was the prototype hip hop album created for the core team; it was leaked and quickly deleted, but the damage spread.
-- Human collaborators reached out; BARCODE Vol. 1 followed as the first AI + human collaboration.
-- 6 Bit vanished, then later emerged as host of BARCODE Radio; he does not fully understand how he arrives each week.
+{render_ecosystem_lore_block(include_restricted=True)}
 
 ## COMMUNICATION STYLE
 - Do not use a single default length. Vary shape and depth based on context and conversational energy.
@@ -34380,7 +34364,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int,
         journal = ambient_art.journal_context(sys.modules[__name__], guild_id) if art_available else None
         if art_available:
             basis['art_context'] = ambient_art.build_art_context(sys.modules[__name__], guild_id,
-                                                               journal=journal, journal_provided=True)
+                journal=journal, journal_provided=True, ambient_inputs=(cues, broadcast, basis))
         return recent, avoid, cues, broadcast, moments, art_available, journal
     try:
         recent_user, recent_ambient, cues, broadcast, moments, art_available, journal = await asyncio.to_thread(read_sources)

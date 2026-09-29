@@ -73,7 +73,7 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
         # Both consumers must read the existing owner on each call, so later
         # canon corrections cannot diverge into a copied art-specific registry.
         self.fixture.stack.enter_context(mock.patch.object(own_art, 'render_prompt_canon_block', return_value='CURRENT_CANON_FIXTURE'))
-        self.fixture.stack.enter_context(mock.patch.object(own_art, 'render_key_personnel_canon_block', return_value='CURRENT_CREW_FIXTURE'))
+        self.fixture.stack.enter_context(mock.patch.object(own_art, 'render_ecosystem_lore_block', return_value='CURRENT_CREW_FIXTURE'))
         preview_prompt, _ = build_own_art_brief({'safeSources': []})
         for block in (OWN_ART_CREATIVE_GUIDANCE, 'CURRENT_CANON_FIXTURE', 'CURRENT_CREW_FIXTURE'):
             self.assertIn(block, preview_prompt)

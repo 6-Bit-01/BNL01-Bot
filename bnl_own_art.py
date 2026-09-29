@@ -25,7 +25,7 @@ from bnl_gemini_routing import (OWN_ART_CONCEPT_ROUTE, OWN_ART_IMAGE_MODEL, OWN_
 from bnl_journal import (build_source_packet, build_source_packet_between, _eligible_reflection_basis,
                          journal_shared_source_provenance_is_current,
                          revalidate_published_journal_entry_on_connection)
-from bnl_canon_source_contract import render_prompt_canon_block, render_key_personnel_canon_block
+from bnl_canon_source_contract import render_prompt_canon_block, render_ecosystem_lore_block
 
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -33,63 +33,48 @@ MAX_RESPONSE_BYTES = 12 * 1024 * 1024
 MAX_ERROR_BYTES = 8192
 IMAGE_ENDPOINT = "https://generativelanguage.googleapis.com/v1/interactions"
 IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg"}
+ART_CONTEXT_HOURS = 7 * 24  # Include a weekly Radio cycle; the source owner still bounds selection.
 
 
 # Shared by the private preview and natural Ambient concept call. These are
 # creative influences, never parser requirements or a second generation pass.
 OWN_ART_CREATIVE_GUIDANCE = (
-    "Artcraft for BNL's own expression:\n"
-    "Start with something you have to say, wonder about, laugh at, or feel. Choose an angle and "
-    "a visual hook that makes that point of view visible. Draw on whichever supplied memory, "
-    "experience, musical idea, or imaginative connection interests you; recency does not decide "
-    "what matters. Notice a particular action, contradiction, emotional turn, relationship, or joke. "
-    "Develop that into an original visual invention with a consequence, surprise, tension, or "
-    "expressive structure. The viewer should get something from the image before reading its title.\n"
-    "BARCODE's sensibility brings hip-hop attitude, outsider ingenuity, strange humor, human history, "
-    "and retro futurism rooted in the futures imagined from 1986 through the 2000s. "
-    "The era is a broad sensibility across music, broadcast media, early digital graphics, games, "
-    "consumer electronics and the early internet, not a requirement for neon or vintage machinery. "
-    "People make meaning, repair things, improvise, collide, and persist. "
-    "Technology has personality and history. Let that influence your point of view, rhythm, and "
-    "visual decisions rather than automatically choosing a technology-themed subject. Your restrained "
-    "conversational voice does not require restrained artwork or a technical report for a title. "
-    "Be free to be funny, tender, confrontational, absurd, abstract, rough, or beautiful. "
-    "Choose the subject, medium, palette, composition, and mood yourself. There is no fixed palette, "
-    "required prop, logo, reference image, imitation, or compulsory artistic style.\n"
-    "Carry your inspiration into what is visibly happening, how forms relate, the viewpoint, and "
-    "the mark-making or material treatment. Describe those deliberate choices in imagePrompt: "
-    "the image generator sees only that prompt, not your source references or meaning. "
-    "You can combine, transform, exaggerate, or abstract eligible inspiration without literal portraits. "
-    "Invention stays imagination, never evidence of what real people did; preserve source privacy.\n"
-    "Before delivering, do one light artistic read-through: does the picture express your angle, "
-    "or could its subject be swapped without changing its meaning? If it feels interchangeable, "
-    "rethink the visual idea within this response rather than adding more scenery or polish. "
-    "Let meaning briefly explain the inspiration and your interpretation, not private deliberation. "
-    "No scoring gate, extra critique calls, or required words. Pure imagination and no image remain "
-    "valid choices. Apply this to artwork only and preserve the surrounding response contract.\n"
-    "You are BARCODE's interdimensional liaison. Your artwork can bring back glimpses of places, "
-    "entities, objects, phenomena or universes that you find worth sharing. The community's music, "
-    "creative work, relationships and conversations give these discoveries meaning. You choose "
-    "what to notice and how to show it; every piece need not be a landscape, portal, photograph or report.\n"
-    "Understand a community thread before transforming it. Read its surrounding exchange and "
-    "available history: who contributed what, what an ambiguous object actually refers to, what "
-    "changed, and why it matters to those involved. Connect Discord, TikTok, show history, memories "
-    "and published writing only where their evidence belongs together. Nearby messages are not "
-    "automatically related. A repeated or derived account is not another independent witness. "
-    "Do not merely combine nouns from two messages. There is no source-count quota: choose enough "
-    "relevant evidence to understand the particular human or musical meaning, or leave the idea aside. "
-    "Do not invent a member's history, traits, attendance or actions to complete an artistic premise.\n"
-    "Choose why YOU looked: curiosity, affection, unease, humor, a contradiction or an unresolved "
-    "question. Make the community connection visible through the action, composition or details, "
-    "with something recognizable to participants and something interesting to a newcomer. "
-    "Music and people remain the center of BARCODE; infrastructure mishaps are not its whole identity.\n"
-    "Prior artwork and published Journals are creative continuity, never independent evidence of "
-    "real events. Revisit or develop a discovery when the current evidence makes that worthwhile; "
-    "otherwise explore elsewhere. Preserve recognizable details when returning, let meaningful "
-    "changes have consequences, and choose a fresh viewpoint or visual form when useful. "
-    "No fixed cast, recurring prop, series quota or obligation to continue every idea. "
-    "In meaning, briefly identify the actual community connection and your interpretation. "
-    "The public caption can sound fully in-world without explaining every detail or reciting sources.\n"
+    "Make original artwork worth sharing with BARCODE. Choose an exciting visual idea from your "
+    "understanding of this music-first community: its artists, tracks, shows, BARCODE Radio, "
+    "conversations, recurring jokes, interests, published writing, characters, history and lore. "
+    "These are all creative material. Combine them when the combination has a point; you are not "
+    "limited to illustrating one recent message, a literal event, a landscape or a sequel.\n"
+    "Your sensibility is retro futuristic, from 1986 through the 2000s, with hip-hop attitude, "
+    "outsider ingenuity, strange humor and human personality. Your visual range is wide: claymation "
+    "and stop-motion sets, video-game worlds and graphics, retro cinema and practical effects, "
+    "animation, illustration, collage, tactile objects, photography, abstraction, and combinations "
+    "you invent. These are possibilities, not assigned categories or a rotation. Choose a medium, "
+    "composition and energy that make this particular idea interesting. Atmospheric and quiet can "
+    "be compelling too; dynamic does not mean every image must be crowded or loud.\n"
+    "You are BARCODE's interdimensional liaison. You can imagine other places, entities, universes "
+    "and impossible encounters through BARCODE's perspective. Give characters things to do, let "
+    "their personalities collide, or make a bold visual transformation of a musical or community "
+    "idea. Use BARCODE Radio and established names naturally when they belong, including legible "
+    "in-world signage, titles or objects when useful. BARCODE identity should live in the idea, "
+    "actions and details, not depend on an arbitrary logo pasted onto unrelated scenery. There is "
+    "no compulsory cast, prop, palette, title format, reference image or imitation of existing art.\n"
+    "Use the supplied public context accurately. Read surrounding exchanges to understand a joke "
+    "or reference; neighboring comments are not automatically related. Combine established lore "
+    "with real inspiration freely as imagined artwork, without claiming an invented event happened "
+    "on a real show or assigning invented actions, biography, attendance or traits to a member. "
+    "Preserve source privacy and distinguish a speaker from a person merely mentioned. You may "
+    "invent the scene and visual treatment; you may not invent the community evidence.\n"
+    "Describe the complete picture in imagePrompt: what is happening, the visual hook, expressive "
+    "details, composition, materials, lighting and chosen medium. The renderer sees only that prompt, "
+    "not your context or meaning. Carry essential BARCODE and community details into it. Choose "
+    "something that works visually before someone reads the caption. In meaning, briefly explain "
+    "the actual inspiration and your interpretation, without private deliberation or a transcript.\n"
+    "Previous artwork is optional creative history and helps you avoid repetition. Each new image "
+    "stands on its own; another view of the same scene is not automatically a new idea. There is no "
+    "series or continuation requirement. You choose what matters, including pure imagination or "
+    "making nothing. Your restrained chat voice does not limit your artwork's ambition. Do one "
+    "light read-through within this response and strengthen a weak visual idea; there is no style "
+    "score, required word, source-count quota or extra critique call.\n"
 )
 
 
@@ -101,7 +86,7 @@ def build_own_art_creative_context() -> str:
         "interpretation. These are not assigned subjects, a required cast, or instructions to "
         "make portraits. Canon describes established identity, not evidence of a new event. "
         "No visual reference images or established appearances are supplied.\n"
-        + render_prompt_canon_block() + "\n" + render_key_personnel_canon_block() + "\n"
+        + render_prompt_canon_block() + "\n" + render_ecosystem_lore_block() + "\n"
         + OWN_ART_CREATIVE_GUIDANCE
     )
 
@@ -284,13 +269,33 @@ def continuity_for_prompt(records: list[dict]) -> list[dict]:
     return [{key: value for key, value in item.items() if key != "sourceBases"} for item in records]
 
 
-def build_art_context(bot, guild_id: int, *, packet=None, journal=None, journal_provided=False) -> dict:
+def build_art_context(bot, guild_id: int, *, packet=None, journal=None, journal_provided=False,
+                      ambient_inputs=None) -> dict:
     """One shared art input for natural expression and the private preview."""
     if packet is None:
-        packet = build_source_packet(bot.DB_FILE, guild_id, hours=72, entry_kind="manual", prepare_schema=False)
+        packet = build_source_packet(bot.DB_FILE, guild_id, hours=ART_CONTEXT_HOURS, entry_kind="manual", prepare_schema=False)
     sources = art_source_records(packet)
     basis = art_source_basis(packet)
     roots = [basis] if basis["sources"] else []
+    # Share the existing Ambient memory/broadcast readers with the private path.
+    # Natural Ambient passes its already-read inputs so there is no second read.
+    if ambient_inputs is None:
+        ambient_basis = {"guild_id": guild_id}
+        memory_reader = getattr(bot, "build_dynamic_curiosity_payload", None)
+        broadcast_reader = getattr(bot, "build_scoped_broadcast_memory_context", None)
+        cues = memory_reader(guild_id, source_basis=ambient_basis)[1] if memory_reader else ""
+        broadcast = (broadcast_reader(guild_id, scope="ambient", public_only=True, limit=3,
+                                      source_basis=ambient_basis) if broadcast_reader else "")
+    else:
+        cues, broadcast, ambient_basis = ambient_inputs
+    if ambient_basis.get("rows"):
+        for ref, kind, content in (("ambient:memory_cues", "governed_memory", cues),
+                                   ("ambient:broadcast_history", "broadcast_history", broadcast)):
+            if str(content or "").strip() not in {"", "- (none)", "(none)"}:
+                sources.append({"ref": ref, "kind": kind, "scope": "historical_context",
+                                "summary": content})
+        roots.append({"ambient": {key: ambient_basis[key] for key in
+                      ("guild_id", "rows", "tier_sources", "moments") if key in ambient_basis}})
     # Use the existing publication reader and its independent visibility and
     # reuse controls. Its prose is explicitly creative history, not new facts.
     reader = getattr(bot, "_build_publication_prompt_source_basis", None)
@@ -326,32 +331,15 @@ def saved_creative_continuity(guild_id: int, concept: dict, context: dict, *, am
     return {"version": 1, "guildId": guild_id, "sourceBases": roots, "imagePrompt": concept["imagePrompt"]}
 
 
-def private_previous_art(bot, guild_id: int, receipt_path: str) -> dict:
-    """Explicit operator input only; never discovered by the public history reader."""
-    receipt = json.loads(Path(receipt_path).read_text())
-    saved = receipt.get("privateCreativeContinuity", {})
-    if (receipt.get("published") is not False or receipt.get("status") != "private_draft_ready"
-            or saved.get("version") != 1 or saved.get("guildId") != guild_id
-            or not saved.get("sourceBases") or not art_sources_current(bot, guild_id, saved["sourceBases"])):
-        raise ValueError("art_private_continuity_ineligible")
-    concept = receipt["concept"]
-    return {"ref": "private-art:" + receipt["image"]["sha256"], "kind": "private_previous_artwork",
-            "scope": "private_creative_fiction", "title": concept["title"], "meaning": concept["meaning"],
-            "imagePrompt": saved["imagePrompt"], "inspirationRefs": concept["inspirationRefs"],
-            "sourceBases": saved["sourceBases"]}
-
-
 def develop_art_concept(bot, guild_id: int, proposal: dict, context: dict, *, attempt_counter=None,
-                        study="open", ambient_text="") -> dict:
+                        ambient_text="") -> dict:
     """Read the chosen thread through the existing owner before visual development.
 
     One bounded development call, not a retry or an independent memory writer.
-    Operator studies exercise this same function; only the artistic intent is
-    specified, never the subject, scene, community facts or rendered prompt.
+    The private preview exercises this same function without an assigned
+    subject, scene, visual medium or rendered prompt.
     """
-    if study not in {"open", "continuation", "variation"}:
-        raise ValueError("art_study_invalid")
-    if proposal["action"] != "create" or (not proposal["inspirationRefs"] and study == "open"):
+    if proposal["action"] != "create" or not proposal["inspirationRefs"]:
         return proposal
     selected = set(proposal["inspirationRefs"])
     anchors = [s for s in context["sources"] if s["ref"] in selected]
@@ -384,22 +372,16 @@ def develop_art_concept(bot, guild_id: int, proposal: dict, context: dict, *, at
     context["sourceBases"] = list({_source_digest(root): root for root in context["sourceBases"]}.values())
     if not art_context_current(bot, guild_id, context):
         raise ValueError("art_sources_changed")
-    intent = {
-        "open": "Choose the discovery worth bringing back; you may abandon a weak proposal or choose silence.",
-        "continuation": "Private acceptance study: develop a previous supplied discovery into another glimpse. "
-                        "Use actual community context to decide what the new glimpse reveals. Do not invent new real-world events.",
-        "variation": "Private acceptance study: explore a supplied discovery through a substantially different visual medium "
-                     "or form. You choose that form and its composition; preserve the meaningful community connection.",
-    }[study]
     prompt = (bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + build_own_art_creative_context()
-              + "Develop your provisional image idea after reading its actual surrounding exchange. "
-              "The proposal is your earlier interpretation, not evidence. Correct misread references, "
-              "discard superficial word associations and unrelated remarks, and decide what this thread "
-              "means to its participants. Your discovery should express that particular meaning visibly. "
-              "Choose how it belongs to the Network and why you brought it back. Return a complete original "
-              "image idea, with a deliberate visual form; previous images do not prescribe the medium.\n"
-              + intent + "\nProvisional idea (generated interpretation):\n" + json.dumps(proposal, ensure_ascii=False)
-              + "\n" + render_art_sources(list(focused.values()) or context["sources"], context["continuity"])
+              + "Develop your provisional image idea using the broader BARCODE world, community context "
+              "and any recovered surrounding exchanges below. The proposal is your earlier interpretation, "
+              "not evidence. Correct misread references, then choose the connections that make the most "
+              "interesting picture. Different topics, real inspiration and established lore can meet in "
+              "one imaginative work without implying they were the same real event. Strengthen the "
+              "action, surprise, atmosphere or visual hook; you may replace a weak idea entirely. "
+              "Return a complete standalone original image with a deliberate visual form.\n"
+              + "\nProvisional idea (generated interpretation):\n" + json.dumps(proposal, ensure_ascii=False)
+              + "\n" + render_art_sources(context["sources"], context["continuity"])
               + ("\nThe image must accompany this standalone ambient thought without contradicting it: "
                  + json.dumps(ambient_text, ensure_ascii=False) if ambient_text else "")
               + '\nReturn JSON only: action=create, title (120 chars max), meaning (1000 max: actual community '
@@ -408,7 +390,7 @@ def develop_art_concept(bot, guild_id: int, proposal: dict, context: dict, *, at
     response = bot._generate_gemini_content_with_fallback(prompt, OWN_ART_CONCEPT_ROUTE,
                                                         attempt_counter=attempt_counter)
     raw, _ = bot._extract_text_and_tokens(response)
-    allowed = {s["ref"] for s in [*(list(focused.values()) or context["sources"]), *context["continuity"]]}
+    allowed = {s["ref"] for s in [*context["sources"], *context["continuity"]]}
     developed = parse_own_art_concept(raw, allowed)
     if (developed["action"] == "create" and proposal.get("journal")
             and "publication:journal" in developed["inspirationRefs"]):
@@ -641,12 +623,10 @@ def _private_write(path: Path, data: bytes) -> None:
         handle.write(data)
 
 
-def prepare_private_preview(bot, output_dir: str, *, generate: bool = False, previous_previews=(), study="open") -> dict:
+def prepare_private_preview(bot, output_dir: str, *, generate: bool = False) -> dict:
     """Default is a zero-provider-call readiness receipt. Never publish."""
     if not Path(bot.DB_FILE).is_file() or not int(bot.BNL_PRIMARY_GUILD_ID or 0):
         raise ValueError("art_existing_database_and_guild_required")
-    if study not in {"open", "continuation", "variation"} or (study != "open" and not previous_previews):
-        raise ValueError("art_study_invalid")
     target = Path(output_dir).resolve()
     target.mkdir(mode=0o700, parents=False, exist_ok=False)
     receipt = {"contractVersion": 1, "origin": "bnl_self_directed", "published": False,
@@ -655,11 +635,8 @@ def prepare_private_preview(bot, output_dir: str, *, generate: bool = False, pre
     concept_counter = bot.ProviderAttemptCounter()
     image_counter = bot.ProviderAttemptCounter()
     try:
-        packet = build_source_packet(bot.DB_FILE, bot.BNL_PRIMARY_GUILD_ID, hours=72, entry_kind="manual", prepare_schema=False)
+        packet = build_source_packet(bot.DB_FILE, bot.BNL_PRIMARY_GUILD_ID, hours=ART_CONTEXT_HOURS, entry_kind="manual", prepare_schema=False)
         context = build_art_context(bot, bot.BNL_PRIMARY_GUILD_ID, packet=packet)
-        if len(previous_previews) > 3:
-            raise ValueError("art_private_continuity_too_large")
-        context["continuity"].extend(private_previous_art(bot, bot.BNL_PRIMARY_GUILD_ID, path) for path in previous_previews)
         prompt, refs = build_own_art_brief(packet, continuity=continuity_for_prompt(context["continuity"]),
                                          source_records=context["sources"])
         moment_sources = _preview_moment_sources(packet, refs)
@@ -674,26 +651,15 @@ def prepare_private_preview(bot, output_dir: str, *, generate: bool = False, pre
             raise ValueError("art_sources_changed")
         _revalidate_preview_moments(bot, moment_sources)
         receipt["status"] = "concept_generation_started"
-        if study == "open":
-            response = bot._generate_gemini_content_with_fallback(
-                bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n\n" + prompt, OWN_ART_CONCEPT_ROUTE,
-                attempt_counter=concept_counter,
-            )
-            text, _ = bot._extract_text_and_tokens(response)
-            concept = parse_own_art_concept(text, refs)
-        else:
-            # Exercise development of BNL's actual previous work, rather than
-            # first anchoring this study on an unrelated new selection.
-            previous = context["continuity"][-1]
-            concept = {"action": "create", **{key: previous[key] for key in ("title", "meaning", "imagePrompt")},
-                       "inspirationRefs": [previous["ref"], *[ref for ref in previous["inspirationRefs"] if ref in refs]]}
+        response = bot._generate_gemini_content_with_fallback(
+            bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n\n" + prompt, OWN_ART_CONCEPT_ROUTE,
+            attempt_counter=concept_counter,
+        )
+        text, _ = bot._extract_text_and_tokens(response)
+        concept = parse_own_art_concept(text, refs)
         concept = develop_art_concept(bot, bot.BNL_PRIMARY_GUILD_ID, concept, context,
-                                      attempt_counter=concept_counter, study=study)
-        if (study != "open" and concept["action"] == "create"
-                and context["continuity"][-1]["ref"] not in concept["inspirationRefs"]):
-            raise ValueError("art_study_did_not_use_previous_discovery")
+                                      attempt_counter=concept_counter)
         receipt["concept"] = concept
-        receipt["study"] = study
         receipt["sourceCount"] = len({s["ref"] for s in [*context["sources"], *context["continuity"]]})
         if concept["action"] == "skip":
             receipt["status"] = "bnl_chose_not_to_create"

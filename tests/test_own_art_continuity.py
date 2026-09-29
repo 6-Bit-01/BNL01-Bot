@@ -55,6 +55,7 @@ class ArtContinuityTests(unittest.TestCase):
         expanded = packet()
         expanded["safeSources"].append({"refId": "fresh:99", "summary": "The answer explaining the musical joke",
                                         "observedAt": "2026-09-22T19:00:02Z", "sourceKind": "conversation"})
+        expanded["safeSources"] = expanded["safeSources"][-2:]
         expanded["privateSources"] = [{"summary": "PRIVATE_NEIGHBOR"}]
         fake = fixtures.OwnArtPreviewTests().fake_bot("unused")
         proposal = {**CONCEPT, "inspirationRefs": ["fresh:29"]}
@@ -68,6 +69,7 @@ class ArtContinuityTests(unittest.TestCase):
         self.assertFalse(read.call_args.kwargs["prepare_schema"])
         prompt = fake._generate_gemini_content_with_fallback.call_args.args[0]
         self.assertIn("The answer explaining the musical joke", prompt)
+        self.assertIn("A public musical contribution 0", prompt)
         self.assertNotIn("PRIVATE_NEIGHBOR", prompt)
         self.assertEqual(result["title"], developed["title"])
         self.assertIn("fresh:99", {s["ref"] for s in context["sources"]})
@@ -142,7 +144,7 @@ class ArtContinuityTests(unittest.TestCase):
         fake._build_publication_prompt_source_basis.return_value = None
         self.assertFalse(art.art_sources_current(fake, 42, [basis]))
 
-    def test_private_sequence_reuses_actual_receipt_and_never_enters_public_history(self):
+    def test_private_preview_is_standalone_and_never_enters_public_history(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Path(folder) / "db"
             db.touch()
@@ -153,28 +155,35 @@ class ArtContinuityTests(unittest.TestCase):
             with mock.patch.object(art, "build_source_packet", return_value=value), \
                  mock.patch.object(art, "build_source_packet_between", return_value=value), \
                  mock.patch.object(art, "generate_private_image", return_value=(PNG, {"mimeType": "image/png", "sha256": "image-fixture"})):
-                first = Path(folder) / "first"
-                receipt = art.prepare_private_preview(fake, str(first), generate=True)
-                self.assertEqual(receipt["status"], "private_draft_ready")
-                self.assertEqual(art.public_creative_history(fake, 123), [])
-                concept["inspirationRefs"].append("private-art:image-fixture")
-                fake._extract_text_and_tokens.return_value = (json.dumps(concept), 5)
-                second = art.prepare_private_preview(fake, str(Path(folder) / "second"), generate=True,
-                                                    previous_previews=[str(first / "receipt.json")], study="continuation")
-                prompt = fake._generate_gemini_content_with_fallback.call_args.args[0]
-                self.assertIn("private_creative_fiction", prompt)
-                self.assertNotIn("sourceBases", prompt)
-                self.assertEqual(len(second["privateCreativeContinuity"]["sourceBases"]), 1)
-                self.assertFalse(second["published"])
-                fake._extract_text_and_tokens.return_value = (json.dumps(CONCEPT), 5)
-                with self.assertRaisesRegex(ValueError, "did_not_use_previous_discovery"), \
-                     mock.patch.object(art, "generate_private_image") as image:
-                    art.prepare_private_preview(fake, str(Path(folder) / "failed-study"), generate=True,
-                                                previous_previews=[str(first / "receipt.json")], study="variation")
-                image.assert_not_called()
-                value["safeSources"].pop()
-                with self.assertRaisesRegex(ValueError, "continuity_ineligible"):
-                    art.private_previous_art(fake, 123, str(first / "receipt.json"))
+                receipt = art.prepare_private_preview(fake, str(Path(folder) / "independent"), generate=True)
+            self.assertEqual(receipt["status"], "private_draft_ready")
+            self.assertFalse(receipt["published"])
+            self.assertNotIn("study", receipt)
+            self.assertEqual(art.public_creative_history(fake, 123), [])
+
+    def test_art_has_existing_public_world_knowledge_without_restricted_lore(self):
+        prompt, _ = art.build_own_art_brief({})
+        for fact in ("BARCODE Radio", "Sheila", "Cliff", "Studio Rats", "BARCODE Vol. 0", "BARCODE Vol. 1"):
+            self.assertIn(fact, prompt)
+        self.assertNotIn("9 Bit", prompt)
+        self.assertIn("claymation", prompt)
+        self.assertIn("video-game", prompt)
+
+    def test_private_art_reuses_public_ambient_memory_and_broadcast_readers(self):
+        fake = fixtures.OwnArtPreviewTests().fake_bot("unused")
+        def memories(guild_id, *, source_basis):
+            source_basis["rows"] = {"memory_tiers": {1: "fixture"}}
+            return "self_directed", "A remembered public music collaboration."
+        fake.build_dynamic_curiosity_payload = memories
+        fake.build_scoped_broadcast_memory_context = mock.Mock(return_value="A recorded BARCODE Radio show moment.")
+        context = art.build_art_context(fake, 123, packet=packet())
+        refs = {s["ref"] for s in context["sources"]}
+        self.assertIn("ambient:memory_cues", refs)
+        self.assertIn("ambient:broadcast_history", refs)
+        self.assertTrue(fake.build_scoped_broadcast_memory_context.call_args.kwargs["public_only"])
+        fake.revalidate_ambient_local_sources = mock.Mock(return_value=False)
+        with mock.patch.object(art, "build_source_packet_between", return_value=packet()):
+            self.assertFalse(art.art_context_current(fake, 123, context))
 
     def test_saved_ambient_roots_survive_json_and_use_existing_privacy_owner(self):
         fake = SimpleNamespace(revalidate_ambient_local_sources=mock.Mock(return_value=True))
