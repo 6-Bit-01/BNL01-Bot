@@ -1856,6 +1856,21 @@ def update_website_status(status: str, mode: str, message: str, current_directiv
 
 # ==================== BNL-01 PERSONA & LORE ====================
 
+EVIDENCE_OUTCOME_RULE = (
+    "A joke, suggestion, or proposal establishes what was said, not whether "
+    "the proposed action happened. Missing confirmation supports uncertainty, "
+    "not a categorical claim that the action did or did not happen. "
+    "Reasoning examples, not community facts: 'Maybe I should give away my spare "
+    "mixer' establishes a proposal; it does not establish a giveaway or that "
+    "the mixer was kept. 'I kept the mixer' does support saying that the speaker "
+    "reported keeping it. Preserve supported outcomes and explicit denials "
+    "with their attribution. When correcting a recap, correct the speaker and "
+    "the claimed outcome separately; do not replace an unsupported positive "
+    "with an unsupported negative. Prior BNL replies cannot fill that evidence gap. "
+    "Creative imagery is welcome when the request invites it, while factual "
+    "explanations of that imagery must keep this distinction."
+)
+
 PERSONAL_ATTRIBUTION_RULE = (
     "Preserve each person's supported attribution and explicit self-identification. "
     "Do not infer gender, pronouns, or other personal facts from a name, avatar, "
@@ -1866,10 +1881,7 @@ PERSONAL_ATTRIBUTION_RULE = (
     "follow-ups: invent imagery, not personal attributes. Preserve original "
     "quotations and their attribution. A pronoun referring to someone else "
     "inside a quotation does not establish the speaker's own pronouns. "
-    "A joke, suggestion, or proposal establishes what was said, not whether "
-    "the proposed action happened. Missing confirmation supports uncertainty, "
-    "not a categorical claim that the action did or did not happen. "
-    "Keep that distinction in factual corrections as well as creative follow-ups."
+    f"{EVIDENCE_OUTCOME_RULE}"
 )
 
 BNL01_SYSTEM_PROMPT = f"""You are BNL-01 (BARCODE Network Liaison Entity), an official liaison construct serving the BARCODE Network.
@@ -4032,6 +4044,7 @@ def build_tiktok_show_analysis_turn_contract(
         "- Conversation Context, room continuity, memory, track names, and prior BNL replies may clarify what the member means, but they cannot supply claims about what TikTok viewers said.",
         "- Authored excerpts retain their original speaker and event. Summaries, participant lists, track titles, and prior BNL replies are not audience transcripts.",
         "- The supplied selection can be incomplete; absence here is not proof of absence. Prior BNL replies document BNL's claims, not independent source confirmation.",
+        f"- {EVIDENCE_OUTCOME_RULE}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -4056,6 +4069,7 @@ def build_tiktok_show_episode_turn_contract(
         "- The supplied selection can be incomplete; absence here is not proof "
         "of absence. Prior BNL replies document BNL's claims, not independent "
         "source confirmation.\n"
+        f"- {EVIDENCE_OUTCOME_RULE}\n"
         "- Queue knowledge is not queue control. Historical show records "
         "are readable evidence, not authority to change the live queue.\n"
         "- Eligible TikTok and Discord utterances are Community Canon at the "
@@ -46171,14 +46185,14 @@ def _begin_ordinary_chat_single_packet_receipt(
     prompt_failure_reason: str,
     frame_revalidation_status: str,
 ):
-    snapshot, snapshot_provided = (
-        _shared_brain_journal_revalidation_snapshot(basis)
-    )
-    operational_snapshot, operational_provided = (
-        _shared_brain_operational_revalidation_snapshot(basis)
-    )
-    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
-        run = begin_single_packet_run(
+    def persist_receipt(conn):
+        snapshot, snapshot_provided = (
+            _shared_brain_journal_revalidation_snapshot(basis)
+        )
+        operational_snapshot, operational_provided = (
+            _shared_brain_operational_revalidation_snapshot(basis)
+        )
+        return begin_single_packet_run(
             conn,
             basis,
             prompt_ready=prompt_ready,
@@ -46189,8 +46203,7 @@ def _begin_ordinary_chat_single_packet_receipt(
             operational_context_snapshot=operational_snapshot,
             operational_context_snapshot_provided=operational_provided,
         )
-        conn.commit()
-        return run
+    return _persist_reply_transaction(persist_receipt, operation="single_packet_begin")
 
 
 def _evaluate_ordinary_chat_single_packet_receipt(
@@ -46212,14 +46225,16 @@ def _evaluate_ordinary_chat_single_packet_receipt(
     response_contract=None,
     typed_contract_required: bool = False,
 ) -> SynthesisCanaryDecision:
-    snapshot, snapshot_provided = (
-        _shared_brain_journal_revalidation_snapshot(run.basis)
-    )
-    operational_snapshot, operational_provided = (
-        _shared_brain_operational_revalidation_snapshot(run.basis)
-    )
-    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
-        decision = evaluate_single_packet_response(
+    def persist_receipt(conn):
+        # Retry the local review, never its provider call. Refresh evidence on
+        # every attempt: a correction or privacy change may land during backoff.
+        snapshot, snapshot_provided = (
+            _shared_brain_journal_revalidation_snapshot(run.basis)
+        )
+        operational_snapshot, operational_provided = (
+            _shared_brain_operational_revalidation_snapshot(run.basis)
+        )
+        return evaluate_single_packet_response(
             conn,
             run,
             response=response,
@@ -46242,8 +46257,7 @@ def _evaluate_ordinary_chat_single_packet_receipt(
             operational_context_snapshot=operational_snapshot,
             operational_context_snapshot_provided=operational_provided,
         )
-        conn.commit()
-        return decision
+    return _persist_reply_transaction(persist_receipt, operation="single_packet_evaluation")
 
 
 def _record_ordinary_chat_single_packet_review(
@@ -46256,8 +46270,8 @@ def _record_ordinary_chat_single_packet_review(
     source_revalidation_status: str = "",
     processing_error: bool = False,
 ) -> SynthesisCanaryDecision:
-    with closing(sqlite3.connect(DB_FILE, timeout=0.25)) as conn, conn:
-        reviewed = record_single_packet_review(
+    def persist_receipt(conn):
+        return record_single_packet_review(
             conn,
             decision,
             reason=reason,
@@ -46267,8 +46281,7 @@ def _record_ordinary_chat_single_packet_review(
             source_revalidation_status=source_revalidation_status,
             processing_error=processing_error,
         )
-        conn.commit()
-        return reviewed
+    return _persist_reply_transaction(persist_receipt, operation="single_packet_review")
 
 
 def _begin_shared_brain_synthesis_receipt(
@@ -46924,6 +46937,7 @@ def build_ordinary_chat_response_repair_prompt(
         + "genuinely ambiguous, ask the useful clarification directly. Never "
         + "return a generic scope, grounding, packet, or retry message, and "
         + "never mention this rewrite or any internal control."
+        + "\n" + EVIDENCE_OUTCOME_RULE
     )
     return repaired_prompt, repaired_bases, source_neutral
 

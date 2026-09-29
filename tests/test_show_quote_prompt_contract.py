@@ -69,6 +69,48 @@ def show_context(events_available=True):
 
 
 class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_outcome_distinctions_reach_initial_and_source_rebuilt_replies(self):
+        # Use a proposal and an explicit reported outcome together: the rule
+        # must not turn all negative statements into blanket uncertainty.
+        facts = (
+            'Test Member: "Maybe I should give away my spare mixer."\n'
+            'Test Guest: "I kept my mixer."'
+        )
+        request = "What do those messages establish happened?"
+        source = SimpleNamespace(rendered_context=facts)
+        with mock.patch.object(bot, "refresh_prompt_source_basis", return_value=(source, False)):
+            repaired, bases, neutral = bot.build_ordinary_chat_response_repair_prompt(
+                "An outdated source block.", reason="prompt_source_changed",
+                prompt_source_bases=(source,), current_user_text=request,
+            )
+        self.assertEqual(bases, (source,))
+        self.assertFalse(neutral)
+        self.assertNotIn("An outdated source block.", repaired)
+        self.assertIn(bot.EVIDENCE_OUTCOME_RULE, repaired)
+        prompts = (facts + "\nCurrent user request: " + request, repaired)
+        for route in ("get_gemini_response", bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE):
+            for prompt in prompts:
+                with self.subTest(route=route, rebuilt=prompt == repaired):
+                    generate = mock.AsyncMock(return_value=bot.GenerationResult(
+                        True, "A source-grounded answer.", route=route,
+                    ))
+                    with (
+                        mock.patch.object(bot, "check_quota_availability", return_value=True),
+                        mock.patch.object(bot, "_generate_gemini_content_result_async", generate),
+                    ):
+                        await bot.get_gemini_response(
+                            prompt, 101, 1, route=route,
+                            source_context_available=True, allow_style_rewrite=False,
+                        )
+                    generate.assert_awaited_once()
+                    sent = " ".join(generate.await_args.args[0].split())
+                    self.assertIn(" ".join(facts.split()), sent)
+                    self.assertIn(request, sent)
+                    self.assertIn(bot.EVIDENCE_OUTCOME_RULE, sent)
+                    self.assertIn("Preserve supported outcomes and explicit denials", sent)
+                    self.assertIn("do not replace an unsupported positive with an unsupported negative", sent)
+                    self.assert_no_response_form_mandates(sent)
+
     def assert_no_response_form_mandates(self, prompt):
         normalized = " ".join(prompt.casefold().split())
         for wording_mandate in (
@@ -215,6 +257,7 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(AUTHORSHIP_PROVENANCE, normalized)
         self.assertIn(BOUNDED_COVERAGE, normalized)
         self.assertIn(PRIOR_BNL_PROVENANCE, normalized)
+        self.assertIn(bot.EVIDENCE_OUTCOME_RULE, normalized)
         self.assert_no_response_form_mandates(contract)
         self.assertEqual(bot.build_tiktok_show_episode_turn_contract(""), "")
         self.assertEqual(bot.build_tiktok_show_episode_turn_contract("Current queue state: closed"), "")
