@@ -1894,6 +1894,22 @@ class StructuralReferentTests(unittest.TestCase):
         )
         self.assertEqual(result.referent_selected_row_ids, ())
 
+    def test_output_format_does_not_replace_the_requested_input_contribution(self):
+        for request in (
+            "Explain your previous answer in a short, natural paragraph.",
+            "Rewrite your previous reply as a playful poem.",
+            "Retell your previous response as a simple story.",
+        ):
+            with self.subTest(request=request):
+                result = assemble_conversation_context_v2(
+                    [_context_row(1, "What does the switch do?", minutes=2),
+                     _context_row(2, "It turns on the lights.", role="model",
+                                  user_name="BNL-01", minutes=1)],
+                    _context_request(request),
+                )
+                self.assertEqual(result.referent_status, "resolved")
+                self.assertEqual(result.referent_selected_row_ids, (2,))
+
     def test_multiple_same_speaker_contributions_require_clarification(self):
         first = (
             "The first passage follows a brass signal through a sleeping "
