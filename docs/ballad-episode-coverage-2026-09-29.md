@@ -9,7 +9,7 @@ show, so earlier attempts disappeared from the writer's variety context.
 
 ## Change
 
-`broadcast-ballad-6` reads the exact finalized, authorized episode through
+`broadcast-ballad-7` reads the exact finalized, authorized episode through
 the existing show owner. It reopens current public TikTok originals and uses
 the existing public Discord interval reader. All eligible human messages are
 ordered on the show clock with compact person and track references. The whole
@@ -31,11 +31,31 @@ Fresh compositions receive the selected catalog versions plus up to twelve
 additional distinct creative approaches from the current episode's latest
 64 versions. Restores and edits with unchanged title/style/palette are
 deduplicated. Literal line endings are no longer supplied as exemplar text.
-The writer is directed to consider different exchanges and human stories,
-then make distinct choices in theme, hook, emotional movement, rhythm,
-instrumentation, vocal character and structure. A genre label change alone
-is insufficient. Producer constraints still win. An explicit Polish retains
-its selected draft rather than applying new-song requirements.
+For rich episodes the writer weaves several meaningful threads and gives a
+broader cast substantive roles. A hook or musical connection unifies those
+scenes without restricting the song to one person or pair. Earlier creative
+profiles help identify overlooked participants and exchanges across generations;
+there is no mention quota, forced roll call or exclusion of familiar people.
+
+Distinctive language from actual human exchanges receives a medium-light
+creative preference: uncommon words, unexpected combinations, funny phrasing,
+images and callbacks. Speaker/context, emotional relevance and musical fit
+matter more than rarity. This is prompt guidance, not a keyword ranker, required
+vocabulary, extra selection pass or instruction to quote verbatim.
+
+New compositions choose their form from the material. Ballad-specific guidance
+explicitly overrides the shared Verse/Chorus/Bridge default while preserving
+the shared lyric craft standards. Distinct choices in theme, rhythm, pacing,
+instrumentation, vocal character and section development are requested; a new
+genre label over the same chorus/break/final-swell pattern is insufficient.
+Producer constraints still win. An explicit Polish retains its selected draft,
+cast and structure rather than applying new-song requirements.
+
+The writer checks time offsets and exact track labels for factual connections.
+Musically joining distant scenes does not establish adjacency, causation or
+audience reaction. Banter stays banter; liner notes cannot turn lyrical invention
+into an event or biography. These are generation instructions, not an automatic
+semantic validator or a guarantee that the model will obey them.
 
 There is one provider attempt per command, with unchanged routes, output
 allowances and spending controls. Full episode input costs more than ten
@@ -63,9 +83,19 @@ isolation, private-row exclusion, absent originals, unavailable Discord,
 distinct prior attempts, source changes during generation, idempotent receipts
 and preservation of existing drafts and selected recordings.
 
-Code tests cannot certify artistic variety. After an owner-authorized deployment
-and private audition, compare new drafts from the same episode for different
-source-grounded stories and audibly different arrangements, with coherent
-personal details and accurate numeric scope. Preserve original drafts. Do not
-publish test songs or advance other production gates. No data migration is
-needed; rollback is an ordinary code revert and bot restart.
+Two owner-authorized private auditions of version 6 used the actual candidate
+writer and production spending controls with an isolated creative-history copy.
+Each made one provider call, passed fresh-source revalidation, and left the live
+catalog unchanged. Estimated combined model cost was $0.13582425. The songs
+changed their focal stories but remained narrow in cast and repeated structural
+choices. One incorrectly described distant track plays as consecutive. Those
+findings and owner feedback motivated version 7; they are not evidence of its
+creative quality.
+
+Code tests cannot certify artistic variety or semantic accuracy. In a separately
+authorized private audition of version 7, compare broader source-grounded stories,
+substantive participant coverage, selective use of real community phrasing and
+different musical forms. Verify factual connections and numeric scope against
+the episode. Preserve original drafts. Private testing can use the candidate
+before deployment; it never authorizes publication or other production gates.
+No data migration is needed; rollback is an ordinary code revert and bot restart.
