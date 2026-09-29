@@ -229,7 +229,7 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history[0]["title"], original["title"])
         self.assertEqual(history[0]["style"], original["style"])
         self.assertEqual(history[0]["palette"]["hook"], original["palette"]["hook"])
-        self.assertIn("the last one home.", history[0]["lineEndingsUsed"])
+        self.assertNotIn("lineEndingsUsed", history[0])
         self.assertNotIn("lyrics", history[0])
         self.assertNotIn("The chairs stayed warm after the room went quiet.", prompt)
         self.assertIsNone(json.loads(remainder.split("\nWRITING REMINDER:", 1)[0]))
@@ -265,10 +265,45 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
             "\nEXISTING DRAFT (only revise if requested):\n", 1)[0])
         self.assertTrue(history[0]["selectedForShow"])
         self.assertEqual(history[0]["title"], original["title"])
-        self.assertIn("the last one home.", history[0]["lineEndingsUsed"])
+        self.assertNotIn("lineEndingsUsed", history[0])
         self.assertNotIn("Unselected experiment", prompt)
         self.assertNotIn("Different words entirely.", prompt)
         self.assertEqual(len(versions(self.db, 77, "show-1")), 2)
+
+    async def test_same_show_generation_remembers_distinct_attempts_not_only_latest(self):
+        original = (await self.run_command())["version"]
+        second = await self.run_command({**self.command, "id": "edit-2", "kind": "edit",
+            "baseVersion": original["id"], "content": dict(title="Dancing Chairs", lyrics="New dancing story",
+            style="Fast garage rock", palette={"angle": "dance", "hook": "Dance now"})})
+        restored = await self.run_command({**self.command, "id": "restore-3", "kind": "restore",
+            "baseVersion": second["version"]["id"], "restoreVersion": original["id"]})
+        await self.run_command({**self.command, "id": "fresh-4", "baseVersion": restored["version"]["id"],
+            "catalogVersions": {"show-1": original["id"]}})
+        prompt = self.generate.await_args.args[0]
+        history = json.loads(prompt.split("PRIOR CREATIVE CATALOG:\n", 1)[1].split(
+            "\nEXISTING DRAFT (only revise if requested):\n", 1)[0])
+        self.assertEqual([v["title"] for v in history], [original["title"], "Dancing Chairs"])
+        self.assertTrue(history[0]["selectedForShow"])
+        self.assertNotIn("lyrics", history[1])
+        self.assertIn("rhythmic feel", prompt)
+        self.assertIn("substantially different central idea", prompt)
+        self.assertEqual(self.generate.await_count, 2)
+
+    async def test_source_change_during_generation_cannot_save_or_return_a_stale_draft(self):
+        original = (await self.run_command())["version"]
+        for fresh in (("", ""), ("Corrected source", "b" * 64)):
+            command = {**self.command, "id": "changed-" + str(bool(fresh[0])), "baseVersion": original["id"]}
+            check = AsyncMock(return_value=fresh)
+            result = await execute_command(self.db, 77, command,
+                evidence_reader=lambda _: ("Initial public show", "a" * 64),
+                generate=self.generate, revalidate_evidence=check)
+            self.assertEqual(result["error"], "show_sources_changed_try_manually")
+            self.assertNotIn("version", result)
+            self.assertEqual(versions(self.db, 77, "show-1"), [original])
+            check.assert_awaited_once()
+            calls = self.generate.await_count
+            self.assertEqual(await self.run_command(command), result)
+            self.assertEqual(self.generate.await_count, calls)
 
     def test_manual_and_automatic_commands_use_their_budget_priority(self):
         self.assertEqual(route_for_command(self.command), MANUAL_ROUTE)

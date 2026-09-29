@@ -36929,12 +36929,16 @@ async def _run_ballad_control_cycle():
                     raise ValueError("generation_unavailable_try_manually")
                 return BalladGeneration(result.text, result.finish_reason)
 
-            evidence = await asyncio.to_thread(
-                build_broadcast_ballad_evidence, DB_FILE, BNL_PRIMARY_GUILD_ID, command["showId"],
-            ) if command.get("kind") in {"generate", "polish"} else ("", "")
+            async def read_ballad_evidence():
+                return await asyncio.to_thread(
+                    build_broadcast_ballad_evidence, DB_FILE, BNL_PRIMARY_GUILD_ID, command["showId"],
+                )
+
+            evidence = await read_ballad_evidence() if command.get("kind") in {"generate", "polish"} else ("", "")
             receipt = await execute_ballad_command(
                 DB_FILE, BNL_PRIMARY_GUILD_ID, command,
                 evidence_reader=lambda _cmd: evidence, generate=generate,
+                revalidate_evidence=read_ballad_evidence,
             )
             await asyncio.to_thread(_ballad_control_request_sync, "POST", receipt)
     except Exception as exc:
