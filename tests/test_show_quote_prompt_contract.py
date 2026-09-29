@@ -138,6 +138,33 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_response_form_mandates(request)
         self.assertNotIn("The green lights changed.", request)
 
+    async def test_creative_followup_cannot_treat_prior_bnl_pronouns_as_identity_evidence(self):
+        # Check the actual provider inputs, including the no-packet fallback.
+        # This proves transport of the constraint, not the model's compliance.
+        original = 'Test Listener: "She turned on the green lights."'
+        self_identification = 'Test Guest: "I use he/him pronouns."'
+        prior = 'Prior BNL reply: "Test Listener said she was teaching pottery."'
+        prompt = (original + "\n" + self_identification + "\n" + prior
+                  + "\nWrite two imaginative lyrics, then separate chat facts from imagery.")
+        for route in ("get_gemini_response", bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE):
+            with self.subTest(route=route):
+                generate = mock.AsyncMock(return_value=bot.GenerationResult(True, "A supported answer.", route=route))
+                with (
+                    mock.patch.object(bot, "check_quota_availability", return_value=True),
+                    mock.patch.object(bot, "_generate_gemini_content_result_async", generate),
+                ):
+                    await bot.get_gemini_response(prompt, 101, 1, route=route,
+                                                  source_context_available=True, allow_style_rewrite=False)
+                generate.assert_awaited_once()
+                request = " ".join(generate.await_args.args[0].split())
+                for text in (original, self_identification, prior):
+                    self.assertIn(text, request)
+                self.assertIn("Earlier BNL wording is not independent identity evidence.", request)
+                self.assertIn("invent imagery, not personal attributes", request)
+                self.assertIn("A pronoun referring to someone else inside a quotation does not establish the speaker's own pronouns", request)
+                self.assertIn("supported attribution and explicit self-identification", request)
+                self.assert_no_response_form_mandates(request)
+
     async def test_each_optional_style_provider_preserves_facts_and_attribution(self):
         original = 'Test Member said, "The green lights changed."'
         for expected_route, rolls in (
@@ -168,6 +195,8 @@ class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
                 request = style.await_args.args[0]
                 self.assertIn(original, request)
                 self.assertIn("Style changes must preserve factual content and source attribution.", request)
+                self.assertIn("Earlier BNL wording is not independent identity evidence.", request)
+                self.assertIn("invent imagery, not personal attributes", request)
                 self.assert_no_response_form_mandates(request)
 
     def test_final_episode_contract_preserves_source_roles_and_scoped_uncertainty(self):
