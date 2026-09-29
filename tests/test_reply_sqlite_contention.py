@@ -189,6 +189,130 @@ class ReplySQLiteContentionTests(unittest.TestCase):
         self.assertEqual(bot.get_recent_response_styles(77, limit=1),
                          ["deep_focus"])
 
+    def _packet(self, evidence_items=()):
+        with mock.patch.dict(os.environ, {
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+            "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+            "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+        }):
+            return bot._build_unified_intelligence_packet_shadow(
+                guild_id=77, route_mode="normal_chat", channel_policy="sealed_test",
+                conversation_surface="free_speak_sealed_mirror", channel_id=700,
+                current_text="Explain rhythm.", current_speaker_user_ids=(42,),
+                current_speaker_labels=("Test Member",), target_user_ids=(),
+                participant_user_ids=(42,), conversation_evidence_items=evidence_items,
+                source_context_snapshot="", source_context_authorized=False,
+                operational_context_snapshot="", operational_context_authorized=False,
+                current_direct=True,
+            )
+
+    def test_packet_commit_recovers_after_reader_releases_with_one_receipt(self):
+        reader = self._hold_read("response_style_log")
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep", side_effect=lambda _delay: reader.rollback()) as backoff,
+        ):
+            packet = self._packet()
+        self.assertIsNotNone(packet)
+        backoff.assert_called_once()
+        self.assertTrue(packet.diagnostics.receipt_run_id)
+        with self.connect(self.path) as conn:
+            rows = conn.execute("SELECT run_id FROM memory_governance_intelligence_packet_runs").fetchall()
+        self.assertEqual(rows, [(packet.diagnostics.receipt_run_id,)])
+        for conn in self.connections[1:]:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+
+    def test_packet_retry_rebuilds_from_sources_after_a_concurrent_deletion(self):
+        source_text = "The green lights follow the rhythm."
+        with self.connect(self.path) as conn:
+            conn.execute("""INSERT INTO conversations
+                (id,user_id,user_name,guild_id,channel_id,channel_policy,route_mode,role,content,timestamp)
+                VALUES (900,42,'Test Member',77,700,'sealed_test','normal_chat','user',?,'2026-09-29T12:00:00+00:00')""", (source_text,))
+        evidence = bot.ConversationEvidenceItem(
+            source_id=900, speaker_user_id=42, speaker_label="Test Member",
+            text=source_text, current_turn=True, semantic_roles=(), option_anchors=(),
+            criterion_positive_terms=(), criterion_negative_terms=(),
+        )
+        reader = self._hold_read("conversations")
+        built = []
+        real_build = bot.build_unified_intelligence_packet
+
+        def capture(conn, request, **kwargs):
+            result = real_build(conn, request, **kwargs)
+            built.append(result)
+            return result
+
+        def withdraw(_delay):
+            reader.rollback()
+            with self.connect(self.path) as conn:
+                conn.execute("DELETE FROM conversations WHERE id=900")
+
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep", side_effect=withdraw),
+            mock.patch.object(bot, "build_unified_intelligence_packet", side_effect=capture),
+        ):
+            packet = self._packet((evidence,))
+        self.assertEqual(len(built), 2)
+        self.assertTrue(any(source_text in item.text for item in built[0].items))
+        self.assertIs(packet, built[1])
+        self.assertFalse(any(source_text in item.text for item in packet.items))
+        self._assert_readable("memory_governance_intelligence_packet_runs", 1)
+
+    def test_packet_read_recovers_after_exclusive_writer_releases(self):
+        writer = self.connect(self.path)
+        self.connections.append(writer)
+        writer.execute("BEGIN EXCLUSIVE")
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep", side_effect=lambda _delay: writer.rollback()) as backoff,
+        ):
+            packet = self._packet()
+        self.assertIsNotNone(packet)
+        backoff.assert_called_once()
+        self._assert_readable("memory_governance_intelligence_packet_runs", 1)
+
+    def test_packet_exhaustion_stays_unavailable_without_retaining_pending_lock(self):
+        self._hold_read("response_style_log")
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep") as backoff,
+            self.assertLogs(level="WARNING") as logs,
+        ):
+            self.assertIsNone(self._packet())
+        self.assertEqual(backoff.call_count, 2)
+        self._assert_readable("memory_governance_intelligence_packet_runs")
+        self.assertTrue(any("sqlite_busy=1" in line for line in logs.output))
+
+    def test_packet_non_lock_failure_is_diagnosed_without_retry_or_error_content(self):
+        detail = "no such table: private_fixture_detail"
+        with (
+            mock.patch.object(bot, "build_unified_intelligence_packet",
+                              side_effect=sqlite3.OperationalError(detail)),
+            mock.patch.object(bot.time, "sleep") as backoff,
+            self.assertLogs(level="WARNING") as logs,
+        ):
+            self.assertIsNone(self._packet())
+        backoff.assert_not_called()
+        self.assertTrue(any("sqlite_busy=0" in line for line in logs.output))
+        self.assertFalse(any("private_fixture_detail" in line for line in logs.output))
+
+    def test_style_commit_recovers_after_reader_releases_without_duplicate(self):
+        reader = self._hold_read("response_style_log")
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep", side_effect=lambda _delay: reader.rollback()) as backoff,
+        ):
+            self.assertTrue(bot.log_response_style(77, 42, "steady_reply"))
+        backoff.assert_called_once()
+        self._assert_readable("response_style_log", 1)
+
 
 if __name__ == "__main__":
     unittest.main()
