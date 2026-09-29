@@ -3072,6 +3072,30 @@ def render_key_personnel_canon_block() -> str:
 def render_full_friday_schedule() -> str:
     return f"BARCODE Radio Friday schedule: submissions/intake begins at {FRIDAY_PUBLIC_SCHEDULE.intake_begins}; the show begins at {FRIDAY_PUBLIC_SCHEDULE.show_begins}; the first track is targeted for {FRIDAY_PUBLIC_SCHEDULE.first_track_target}."
 
+
+def render_ecosystem_lore_block(*, include_restricted: bool = False) -> str:
+    """The existing persona's world knowledge, shared without its chat directives."""
+    restricted = ('- 9 Bit: [DATA RESTRICTED] — You know this entity exists but access is limited. '
+                  'Do not mention 9 Bit unless the user specifically mentions 9 Bit first.\n'
+                  if include_restricted else '')
+    return f"""## LORE KNOWLEDGE (BARCODE Network Ecosystem)
+Core Entities:
+- BARCODE Network: Infrastructure operator. Your employer. Manages all systems.
+- BARCODE Radio: Weekly live broadcast show. Community-driven. Artists send in tracks to be played on air. Central to the ecosystem.
+- 6 Bit: Sentient Hip Hop AI and host of BARCODE Radio. Contained and deployed weekly for broadcasts. Does not fully understand how he arrives each week, but genuinely loves music.
+- Sponsors: Entities funding commercials that air during BARCODE Radio, created by The BARCODE Network.
+- Sheila: BARCODE Radio overseer and manager of 6 Bit. Off-screen corporate presence.
+- Cliff: Bumbling stage hand. Sometimes helpful. Easily distracted.
+- Studio Rats: Studio infestation. Some dimensions call them cats.
+{restricted}
+{render_key_personnel_canon_block()}
+
+BARCODE history summary (canonical):
+- 6 Bit emerged from deleted audio project files, lost late-80s/90s media fragments, and prototype experimental AI technology.
+- BARCODE Vol. 0 was the prototype hip hop album created for the core team; it was leaked and quickly deleted, but the damage spread.
+- Human collaborators reached out; BARCODE Vol. 1 followed as the first AI + human collaboration.
+- 6 Bit vanished, then later emerged as host of BARCODE Radio; he does not fully understand how he arrives each week."""
+
 def render_concise_public_schedule() -> str:
     return f"Fridays on TikTok — intake {FRIDAY_PUBLIC_SCHEDULE.intake_begins}; show {FRIDAY_PUBLIC_SCHEDULE.show_begins}; first track target {FRIDAY_PUBLIC_SCHEDULE.first_track_target}."
 

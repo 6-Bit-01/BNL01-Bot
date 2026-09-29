@@ -11,6 +11,8 @@ from unittest import mock
 
 import test_ambient_show_context as fixtures
 import bnl_ambient_art as art
+from bnl_own_art import OWN_ART_CREATIVE_GUIDANCE, build_own_art_brief
+import bnl_own_art as own_art
 
 bot = fixtures.bot
 REAL_GET = bot.get_gemini_response
@@ -63,6 +65,34 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis), '')
         self.assertTrue(basis['declined'])
         self.provider.assert_awaited_once()
+
+    async def test_creative_guidance_reaches_both_concept_paths_only_when_art_available(self):
+        # Reproduce the disconnected creative briefs through the real Ambient
+        # source assembly, including the existing art gate and provider boundary.
+        self.provider.return_value = json.dumps({'action': 'post', 'text': TEXT, 'art': CONCEPT})
+        # Both consumers must read the existing owner on each call, so later
+        # canon corrections cannot diverge into a copied art-specific registry.
+        self.fixture.stack.enter_context(mock.patch.object(own_art, 'render_prompt_canon_block', return_value='CURRENT_CANON_FIXTURE'))
+        self.fixture.stack.enter_context(mock.patch.object(own_art, 'render_ecosystem_lore_block', return_value='CURRENT_CREW_FIXTURE'))
+        preview_prompt, _ = build_own_art_brief({'safeSources': []})
+        for block in (OWN_ART_CREATIVE_GUIDANCE, 'CURRENT_CANON_FIXTURE', 'CURRENT_CREW_FIXTURE'):
+            self.assertIn(block, preview_prompt)
+        for available in (False, True):
+            with self.subTest(available=available), \
+                    mock.patch.object(art, 'available', return_value=available), \
+                    mock.patch.object(art, 'journal_context', return_value=None):
+                self.provider.reset_mock()
+                basis = {}
+                self.assertEqual(await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis), TEXT)
+                self.provider.assert_awaited_once()
+                prompt = self.provider.call_args.args[0]
+                for block in (OWN_ART_CREATIVE_GUIDANCE, 'CURRENT_CANON_FIXTURE', 'CURRENT_CREW_FIXTURE'):
+                    self.assertEqual(block in prompt, available)
+                self.assertEqual('art' in basis, available)
+                if available:
+                    # A freely chosen abstract concept is still accepted as-is;
+                    # taste guidance is not a vocabulary or style validator.
+                    self.assertEqual(basis['art']['imagePrompt'], CONCEPT['imagePrompt'])
 
     async def test_total_repair_limit_is_two_even_for_incomplete_then_duplicate(self):
         self.provider.return_value = 'An unfinished thought and'
@@ -196,6 +226,35 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_scheduler_attaches_one_image_and_distinguishes_delivery(self):
         await self._run_art_scheduler_case()
+
+    async def test_creative_lineage_stays_local_and_development_uses_shared_function(self):
+        with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}), \
+             mock.patch.object(art, 'journal_context', return_value=None):
+            self.provider.return_value = json.dumps({'action': 'post', 'text': TEXT, 'art': CONCEPT})
+            basis = {}
+            await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis)
+            with mock.patch.object(art, 'develop_art_concept', return_value=CONCEPT) as develop, \
+                 mock.patch.object(art, 'generate_private_image', return_value=(b'jpeg', {'sha256': 'fixture', 'mimeType': 'image/jpeg'})):
+                result = await art.prepare(bot, 42, basis)
+            develop.assert_called_once()
+            self.assertEqual(develop.call_args.kwargs['ambient_text'], TEXT)
+            self.assertNotIn('privateCreativeContinuity', result['metadata'])
+            saved = json.loads(self.execute('SELECT metadata_json FROM bnl_own_art_delivery')[0][0])
+            self.assertIn('privateCreativeContinuity', saved)
+
+    async def test_source_change_during_development_blocks_image_provider(self):
+        with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}), \
+             mock.patch.object(art, 'journal_context', return_value=None):
+            self.provider.return_value = json.dumps({'action': 'post', 'text': TEXT, 'art': CONCEPT})
+            basis = {}
+            await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis)
+            def develop(*args, **kwargs):
+                self.execute("UPDATE conversations SET channel_policy='sealed_test'")
+                return CONCEPT
+            with mock.patch.object(art, 'develop_art_concept', side_effect=develop), \
+                 mock.patch.object(art, 'generate_private_image') as image:
+                self.assertIsNone(await art.prepare(bot, 42, basis))
+            image.assert_not_called()
 
     async def test_withdrawal_during_delivery_reservation_is_checked_before_send(self):
         await self._run_art_scheduler_case(withdraw=True)

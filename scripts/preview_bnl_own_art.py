@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, help="A new private directory under an existing parent")
-    parser.add_argument("--generate", action="store_true", help="Explicitly allow a concept call and, if BNL chooses, one image call")
+    parser.add_argument("--generate", action="store_true", help="Allow selection and development calls and, if BNL chooses, one image call")
     args = parser.parse_args()
     import bnl01_bot as bot
     from bnl_own_art import prepare_private_preview
