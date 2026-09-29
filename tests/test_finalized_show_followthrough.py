@@ -54,7 +54,7 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
             environ=show_fixture.ENABLED_QUEUE_ENV,
         )
 
-    def _context(self, current, *, prior_user_id=42, exact_other_reply=False):
+    def _context(self, current, *, prior_user_id=42, exact_other_reply=False, prior_text=None):
         with sqlite3.connect(self.db_file) as conn:
             conn.executemany(
                 """INSERT OR REPLACE INTO conversations
@@ -64,7 +64,7 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
                 [
                     (9001, prior_user_id, "Test Member", 77, "bnl-testing",
                      "sealed_test", "normal_chat", "user",
-                     "Give me a recap of the 2026-08-28 show.",
+                     prior_text or "Give me a recap of the 2026-08-28 show.",
                      (self.now - timedelta(minutes=2)).isoformat(), 9010, 99001),
                     (9002, prior_user_id, "BNL-01", 77, "bnl-testing",
                      "sealed_test", "normal_chat", "model",
@@ -135,6 +135,47 @@ class FinalizedShowFollowthroughTests(unittest.TestCase):
         self.assertTrue(selection["source_refs"])
         self.assertTrue(selection["candidate_context"])
         self.assertNotIn("Here is the recorded recap.", rendered)
+
+    def test_creative_followup_keeps_the_human_dated_source_scope(self):
+        current = (
+            "Give me two short, playful retro-radio lyric lines inspired by that exchange. "
+            "Keep the speaker straight and the joke a joke, but use some imaginative imagery. "
+            "Then briefly separate what comes from the real chat from what you invented for the lyrics."
+        )
+        prior = (
+            'Here are the two original August 28 show chat lines with their recorded authors: '
+            'Test Listener: "I am teaching pottery club." Test Host: "Do they need marimbas?" '
+            'Does the record establish that anyone actually did it?'
+        )
+        result, basis = self._context(current, prior_text=prior)
+        selection = {}
+        rendered = self.bot.build_tiktok_show_evidence_context_for_turn(
+            guild_id=77, user_text=current, subject_user_id=42,
+            conversation_basis=basis, conversation_context_result=result,
+            selection_out=selection,
+        )
+        self.assertEqual([row[0] for row in selection["source_refs"]], ["show-attendance-1"])
+        self.assertIn(prior, selection["selection_user_text"])
+        self.assertTrue(selection["candidate_context"])
+        self.assertNotIn("on 2026-08-21;", rendered)
+        # Human-provided source text selects a scope; it is not copied into
+        # authored evidence in place of a fresh read from that episode.
+        self.assertNotIn("teaching pottery club", rendered)
+        self.assertIn("the green visuals during this song are wild.", rendered)
+        source_basis = self.bot.build_finalized_show_prompt_source_basis(
+            rendered, guild_id=77, selection=selection,
+        )
+        fresh, changed = self.bot.refresh_prompt_source_basis(source_basis)
+        self.assertFalse(changed)
+        self.assertEqual(fresh.rendered_context, rendered)
+        self.assertEqual(fresh.authored_excerpts, source_basis.authored_excerpts)
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute("DELETE FROM tiktok_show_evidence_ledgers WHERE show_key=?",
+                         ("show-attendance-1",))
+        fresh, changed = self.bot.refresh_prompt_source_basis(source_basis)
+        self.assertTrue(changed)
+        self.assertEqual(fresh.rendered_context, "")
+        self.assertEqual(fresh.authored_excerpts, ())
 
     def test_generic_request_gets_labeled_candidates_without_show_ownership(self):
         for current in (

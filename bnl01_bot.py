@@ -4227,6 +4227,10 @@ def build_tiktok_show_evidence_context_for_turn(
                         item.text, "Durable BARCODE Radio show episode memory:"
                     )
                     or is_live_show_reaction_query(item.text, check_show_date=False)
+                    or (
+                        has_explicit_show_date(item.text)
+                        and re.search(r"\b(?:show|broadcast|episode|stream|chat|barcode radio)\b", item.text, re.I)
+                    )
                 )
             ):
                 selection_query = tiktok_show_evidence_query + "\n" + item.text

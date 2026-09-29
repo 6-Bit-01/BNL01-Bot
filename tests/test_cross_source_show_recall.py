@@ -113,6 +113,32 @@ class CrossSourceShowRecallTests(unittest.TestCase):
         self.assertEqual(len(selection["source_refs"]), 1)
         self.assertEqual(selection["source_refs"][0][0], "test-show-2026-08-28")
 
+    def test_plain_language_exchange_recall_keeps_rare_words_and_both_authors(self):
+        date = self.add_show()
+        for index in range(40):
+            self.message(date, "Who was speaking in the records? Please check the evidence.",
+                         subject="tiktok_user:distractor", name="Test Neighbor",
+                         handle="test.neighbor")
+        originals = (
+            ("I'm teaching at pottery club so playing this.", "Test Listener", "test.listener"),
+            ("@test.listener Know what the class needs? Some marimbas!", "Test Host", "test.host"),
+        )
+        for text, name, handle in originals:
+            self.message(date, text, subject="tiktok_user:" + handle, name=name, handle=handle)
+        self.sync()
+        for query in (
+            "During the August 28 BARCODE Radio show, what was the pottery-club/marimbas exchange? Who said what to whom?",
+            "Check the August 28 TikTok text-chat records for pottery club and marimbas. Who was speaking, and who were they addressing?",
+        ):
+            with self.subTest(query=query):
+                contexts, selection = self.contexts(query)
+                for context in contexts:
+                    for text, name, _handle in originals:
+                        self.assertIn(text, context)
+                        self.assertIn(name, context)
+                selected_text = {item[5] for item in selection["authored_excerpts"]}
+                self.assertTrue({item[0] for item in originals}.issubset(selected_text))
+
     def test_unmatched_terms_keep_the_named_person_available_in_both_views(self):
         date = self.add_show()
         self.message(date, "I brought amber lanterns for the courtyard.")
