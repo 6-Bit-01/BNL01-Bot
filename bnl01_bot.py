@@ -512,6 +512,8 @@ from bnl_broadcast_ballads import (
     execute_command as execute_ballad_command, ROUTE as BALLAD_ROUTE,
     MANUAL_ROUTE as BALLAD_MANUAL_ROUTE, route_for_command as ballad_route_for_command,
     BalladGeneration, response_schema as ballad_response_schema,
+    REVIEW_ROUTE as BALLAD_REVIEW_ROUTE, MANUAL_REVIEW_ROUTE as BALLAD_MANUAL_REVIEW_ROUTE,
+    attribution_review_schema as ballad_attribution_review_schema,
 )
 from bnl_tiktok_show_ledger import build_broadcast_ballad_evidence
 
@@ -32230,6 +32232,9 @@ def _generation_config_for_model(
     if route in {BALLAD_ROUTE, BALLAD_MANUAL_ROUTE}:
         config_kwargs['response_mime_type'] = 'application/json'
         config_kwargs['response_schema'] = ballad_response_schema()
+    if route in {BALLAD_REVIEW_ROUTE, BALLAD_MANUAL_REVIEW_ROUTE}:
+        config_kwargs['response_mime_type'] = 'application/json'
+        config_kwargs['response_schema'] = ballad_attribution_review_schema()
     normalized_model = str(model_name or "").lower()
     if "gemini-2.5" in normalized_model:
         legacy_budget = min(
@@ -36914,13 +36919,11 @@ async def _run_ballad_control_cycle():
         for command in control.get("commands", [])[:2]:
             command = {**command, "catalogVersions": control.get("catalogVersions", {})}
             route = ballad_route_for_command(command)
-            async def generate(prompt):
-                if not check_quota_availability(route):
+            async def call_ballad_model(prompt, call_route):
+                if not check_quota_availability(call_route):
                     raise ValueError("local_model_budget_exhausted")
                 result = await asyncio.wait_for(_generate_gemini_content_result_async(
-                    # The system prompt already carries the shared songwriting
-                    # protocol; retain one copy plus the Ballad-specific brief.
-                    BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + prompt.removeprefix(SUNO_LYRIC_PROTOCOL + "\n"), route,
+                    prompt, call_route,
                 ), timeout=120)
                 if not result.success:
                     if result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET:
@@ -36928,6 +36931,14 @@ async def _run_ballad_control_cycle():
                         raise ValueError(f"budget_restricted:{reason}")
                     raise ValueError("generation_unavailable_try_manually")
                 return BalladGeneration(result.text, result.finish_reason)
+
+            async def generate(prompt):
+                return await call_ballad_model(
+                    BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + prompt.removeprefix(SUNO_LYRIC_PROTOCOL + "\n"), route)
+
+            async def review_attribution(prompt):
+                review_route = BALLAD_MANUAL_REVIEW_ROUTE if route == BALLAD_MANUAL_ROUTE else BALLAD_REVIEW_ROUTE
+                return await call_ballad_model(prompt, review_route)
 
             async def read_ballad_evidence():
                 return await asyncio.to_thread(
@@ -36939,6 +36950,7 @@ async def _run_ballad_control_cycle():
                 DB_FILE, BNL_PRIMARY_GUILD_ID, command,
                 evidence_reader=lambda _cmd: evidence, generate=generate,
                 revalidate_evidence=read_ballad_evidence,
+                review_attribution=review_attribution,
             )
             await asyncio.to_thread(_ballad_control_request_sync, "POST", receipt)
     except Exception as exc:

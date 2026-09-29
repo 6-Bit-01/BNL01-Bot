@@ -19,17 +19,19 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
         self.db = str(Path(self.tmp.name) / "test.db")
         self.command = dict(id="draft-1", showId="show-1", showDate="2026-09-11", kind="generate", baseVersion=None, options={})
         self.generate = AsyncMock(return_value=json.dumps(dict(title="The Chairs Stayed Warm", lyrics="[Verse]\nThe chairs stayed warm after the room went quiet.\n[Chorus]\nLeave a light for the last one home.", style="1977 chamber soul with dub bass, brushed drums and a close dry vocal.", palette=dict(topics="the last listener", hook="Leave a light", genres="chamber soul, dub"))))
+        self.review = AsyncMock(return_value=BalladGeneration('{"verdict":"supported","issues":[]}', "STOP"))
 
     async def run_command(self, command=None, **kw):
         return await execute_command(self.db, 77, command or self.command,
             evidence_reader=kw.get("reader", lambda _: ("Authorized public show record", "a" * 64)),
-            generate=self.generate)
+            generate=self.generate, review_attribution=self.review)
 
     async def test_duplicate_transport_replays_exact_version_without_generation(self):
         first = await self.run_command()
         second = await self.run_command()
         self.assertEqual(first, second)
         self.generate.assert_awaited_once()
+        self.review.assert_awaited_once()
         self.assertEqual(len(versions(self.db, 77, "show-1")), 1)
 
     async def test_liner_notes_share_the_song_call_and_survive_edit_restore_and_replay(self):
@@ -296,7 +298,7 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
             check = AsyncMock(return_value=fresh)
             result = await execute_command(self.db, 77, command,
                 evidence_reader=lambda _: ("Initial public show", "a" * 64),
-                generate=self.generate, revalidate_evidence=check)
+                generate=self.generate, revalidate_evidence=check, review_attribution=self.review)
             self.assertEqual(result["error"], "show_sources_changed_try_manually")
             self.assertNotIn("version", result)
             self.assertEqual(versions(self.db, 77, "show-1"), [original])
@@ -304,6 +306,89 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
             calls = self.generate.await_count
             self.assertEqual(await self.run_command(command), result)
             self.assertEqual(self.generate.await_count, calls)
+
+    async def test_rejected_attribution_never_saves_returns_or_retries_the_candidate(self):
+        original = (await self.run_command())["version"]
+        output = json.loads(self.generate.return_value)
+        output["lyrics"] = "Test Listener handed espresso to the children."
+        self.generate.return_value = json.dumps(output)
+        self.review.return_value = BalladGeneration(json.dumps({"verdict": "unsupported", "issues": [
+            "Test Host made a joking suggestion to Test Listener; the source records no action."]}), "STOP")
+        command = {**self.command, "id": "wrong-speaker", "baseVersion": original["id"]}
+        result = await self.run_command(command, reader=lambda _: (
+            'Test Host: @Test Listener, know what those kids need? Some espresso!', "b" * 64))
+        self.assertEqual(result["error"], "ballad_attribution_review_failed")
+        self.assertNotIn("version", result)
+        self.assertNotIn("espresso", json.dumps(result))
+        self.assertEqual(versions(self.db, 77, "show-1"), [original])
+        self.assertEqual(await self.run_command(command), result)
+        self.assertEqual((self.generate.await_count, self.review.await_count), (2, 2))
+        review_prompt = self.review.await_args.args[0]
+        self.assertIn(output["lyrics"], review_prompt)
+        self.assertIn("Test Host: @Test Listener", review_prompt)
+
+    async def test_attribution_review_covers_notes_and_preserves_approved_creative_copy(self):
+        output = json.loads(self.generate.return_value)
+        output["linerNotes"] = {"about": "Test Host joked about espresso.", "mentions": "Test Listener"}
+        self.generate.return_value = json.dumps(output)
+        result = await self.run_command()
+        version = result["version"]
+        self.assertEqual(version["lyrics"], output["lyrics"])
+        self.assertEqual(version["style"], output["style"])
+        self.assertIn("Test Host joked about espresso", self.review.await_args.args[0])
+        self.assertEqual(version["attributionReview"]["status"], "passed")
+        self.assertEqual(version["attributionReview"]["sourceDigest"], version["sourceDigest"])
+        self.assertEqual(len(version["attributionReview"]["draftDigest"]), 64)
+        # An old check must not certify new human edits or a later restore.
+        edited = await self.run_command({**self.command, "id": "edit", "kind": "edit",
+            "baseVersion": version["id"], "content": dict(title="Edited", lyrics="Other words", style="Soul")})
+        restored = await self.run_command({**self.command, "id": "restore", "kind": "restore",
+            "baseVersion": edited["version"]["id"], "restoreVersion": version["id"]})
+        self.assertNotIn("attributionReview", edited["version"])
+        self.assertNotIn("attributionReview", restored["version"])
+        self.review.assert_awaited_once()
+
+    async def test_unavailable_uncertain_or_invalid_review_cannot_release_copy(self):
+        reviews = [None, "supported", BalladGeneration('{"verdict":"supported","issues":[]}', "MAX_TOKENS"),
+            BalladGeneration('not JSON', "STOP"), BalladGeneration('{"verdict":"supported"}', "STOP"),
+            BalladGeneration('{"verdict":"supported","issues":["An unsupported action."]}', "STOP"),
+            BalladGeneration('{"verdict":"uncertain","issues":[]}', "STOP")]
+        for i, review in enumerate(reviews):
+            with self.subTest(review=review):
+                self.review.return_value = review
+                result = await self.run_command({**self.command, "id": f"bad-review-{i}"})
+                self.assertEqual(result["outcome"], "failed")
+                self.assertNotIn("version", result)
+        self.assertEqual(versions(self.db, 77, "show-1"), [])
+
+    async def test_missing_reviewer_does_not_spend_on_an_uncheckable_draft(self):
+        result = await execute_command(self.db, 77, self.command,
+            evidence_reader=lambda _: ("Source", "a" * 64), generate=self.generate)
+        self.assertEqual(result["error"], "ballad_attribution_review_unavailable")
+        self.generate.assert_not_awaited()
+
+    async def test_review_failure_keeps_safe_budget_reason_and_hides_provider_details(self):
+        for i, failure in enumerate((ValueError("budget_restricted:monthly_hard_limit"),
+                                     ValueError("Private provider request text"), TimeoutError())):
+            self.review.side_effect = failure
+            command = {**self.command, "id": f"review-failure-{i}"}
+            result = await self.run_command(command)
+            self.assertEqual(result["error"], "budget_restricted:monthly_hard_limit" if i == 0
+                             else "ballad_attribution_review_unavailable")
+            self.assertEqual(await self.run_command(command), result)
+            self.assertNotIn("version", result)
+        self.assertEqual((self.generate.await_count, self.review.await_count), (3, 3))
+
+    async def test_source_change_during_review_cannot_release_a_passing_verdict(self):
+        check = AsyncMock(side_effect=[("Source", "a" * 64), ("Corrected source", "b" * 64)])
+        result = await execute_command(self.db, 77, self.command,
+            evidence_reader=lambda _: ("Source", "a" * 64), generate=self.generate,
+            review_attribution=self.review, revalidate_evidence=check)
+        self.assertEqual(result["error"], "show_sources_changed_try_manually")
+        self.assertNotIn("version", result)
+        self.review.assert_awaited_once()
+        self.assertEqual(check.await_count, 2)
+        self.assertEqual(versions(self.db, 77, "show-1"), [])
 
     def test_manual_and_automatic_commands_use_their_budget_priority(self):
         self.assertEqual(route_for_command(self.command), MANUAL_ROUTE)

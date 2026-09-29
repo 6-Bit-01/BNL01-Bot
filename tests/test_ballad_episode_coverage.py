@@ -92,3 +92,17 @@ class BalladEpisodeCoverageTests(unittest.TestCase):
 
     def test_digest_and_order_are_stable_for_unchanged_sources(self):
         self.assertEqual(self.read(), self.read())
+
+    def test_named_addressee_does_not_replace_the_recorded_speaker(self):
+        words = "@Test Listener, know what those kids need? Some espresso!"
+        record_source_event(self.db, guild_id=77, source_kind="tiktok_live_chat",
+            source_key="addressed-banter", occurred_at_ms=fixture.stamp("2026-08-29T00:02:00Z"),
+            raw_text=words, sanitized_summary="", channel_policy="public_context",
+            subject_ref="tiktok_user:test_host", private_display_name="Test Host", public_usable=True,
+            metadata={"eventType": "comment", "handle": "test_host"})
+        text, _ = self.read()
+        row = next(json.loads(line) for line in text.splitlines() if line.startswith("[") and words in line)
+        self.assertEqual(row[2], "Test Host (@test_host)")
+        self.assertEqual(row[4], words)
+        directory = json.loads(text.split("PEOPLE DIRECTORY (original public identities): ", 1)[1].splitlines()[0])
+        self.assertEqual(directory[row[1]]["name"], "Test Host (@test_host)")

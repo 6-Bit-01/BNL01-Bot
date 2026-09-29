@@ -99,14 +99,19 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
                        kind="generate", baseVersion=None, options={})
         control = {"contractVersion": 1, "commands": [command], "catalogVersions": {}}
         result = bot.GenerationResult(True, '{"title":"Last Light","lyrics":"[Chorus]\\nLeave a light","style":"1977 chamber soul","palette":{}}')
+        review = bot.GenerationResult(True, '{"verdict":"supported","issues":[]}', finish_reason="STOP")
         with mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", self.fixture.guild_id), \
              mock.patch.object(bot, "check_quota_availability", return_value=True), \
-             mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(return_value=result)) as generate, \
+             mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=[result, review])) as generate, \
              mock.patch.object(bot, "_ballad_control_request_sync", side_effect=[control, OSError("delivery unavailable"), control, {"ok": True}]) as transport:
             await bot._run_ballad_control_cycle()
             await bot._run_ballad_control_cycle()
-        generate.assert_awaited_once()
-        prompt = generate.call_args.args[0]
+        self.assertEqual(generate.await_count, 2)
+        prompt = generate.call_args_list[0].args[0]
+        review_prompt, review_route = generate.call_args_list[1].args
+        self.assertEqual(review_route, "broadcast_ballad_review_manual")
+        self.assertNotIn(bot.SUNO_LYRIC_PROTOCOL, review_prompt)
+        self.assertIn("ORIGINAL_EPISODE_JSON:", review_prompt)
         self.assertEqual(prompt.count(bot.SUNO_LYRIC_PROTOCOL), 1)
         self.assertIn("AUTHORIZED SHOW EVIDENCE:", prompt)
         self.assertIn("linerNotes", prompt)
@@ -150,12 +155,18 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
         output = json.dumps(dict(title="Last Light", style="1977 chamber soul", palette={}, linerNotes=notes, lyrics=lyrics))
         if interrupted:
             output = output[:-12]
-        provider = mock.Mock(return_value=SimpleNamespace(
+        writer_result = SimpleNamespace(
             candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text=output)]),
                         finish_reason=bot.genai.types.FinishReason.MAX_TOKENS if interrupted else bot.genai.types.FinishReason.STOP)],
             usage_metadata=SimpleNamespace(total_token_count=1400, prompt_token_count=1000,
                 candidates_token_count=100, thoughts_token_count=300, cached_content_token_count=0),
-        ))
+        )
+        review_result = SimpleNamespace(
+            candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(
+                text='{"verdict":"supported","issues":[]}')]), finish_reason=bot.genai.types.FinishReason.STOP)],
+            usage_metadata=writer_result.usage_metadata,
+        )
+        provider = mock.Mock(side_effect=[writer_result, review_result])
         env = {
             "BNL_GEMINI_MONTHLY_TARGET_USD": "20", "BNL_GEMINI_MONTHLY_HARD_LIMIT_USD": "24",
             "BNL_GEMINI_DAILY_SOFT_LIMIT_USD": "0.65", "BNL_GEMINI_BUDGET_ENFORCEMENT_ENABLED": "true",
@@ -175,10 +186,11 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(bot, "_ballad_control_request_sync", side_effect=[control, {"ok": True}, control, {"ok": True}]) as transport:
             await bot._run_ballad_control_cycle()
             await bot._run_ballad_control_cycle()
-        provider.assert_called_once()
-        budget.assert_called_once()
-        self.assertEqual(budget.call_args.kwargs["route"], expected_route)
-        self.assertEqual(budget.call_args.kwargs["month_nanos"], 11_481_236_100)
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(budget.call_count, 2)
+        review_route = expected_route.replace("broadcast_ballad_", "broadcast_ballad_review_")
+        self.assertEqual([call.kwargs["route"] for call in budget.call_args_list], [expected_route, review_route])
+        self.assertTrue(all(call.kwargs["month_nanos"] == 11_481_236_100 for call in budget.call_args_list))
         receipt = transport.call_args_list[1].args[1]
         self.assertEqual(receipt["outcome"], "complete")
         self.assertEqual(receipt["version"]["title"], "Last Light")
@@ -192,7 +204,7 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Incomplete response", receipt["version"]["note"])
         else:
             self.assertEqual(receipt["version"]["lyrics"], lyrics)
-        config = provider.call_args.kwargs["config"]
+        config = provider.call_args_list[0].kwargs["config"]
         self.assertEqual(config.max_output_tokens, 16_384)
         self.assertEqual(config.response_mime_type, "application/json")
         schema = bot.genai.types.Schema.model_validate(config.response_schema)
@@ -200,10 +212,37 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(schema.required), set(schema.property_ordering))
         self.assertEqual(set(schema.properties["linerNotes"].required), set(notes))
         self.assertIsNone(config.thinking_config)
+        review_config = provider.call_args_list[1].kwargs["config"]
+        self.assertEqual(review_config.max_output_tokens, 4096)
+        self.assertEqual(review_config.response_mime_type, "application/json")
+        review_schema = bot.genai.types.Schema.model_validate(review_config.response_schema)
+        self.assertEqual(review_schema.property_ordering, ["verdict", "issues"])
+        self.assertEqual(set(review_schema.required), {"verdict", "issues"})
         self.assertEqual(receipt, transport.call_args_list[3].args[1])
         with sqlite3.connect(bot.DB_FILE) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM token_usage_events WHERE route=?",
                                          (expected_route,)).fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM token_usage_events WHERE route=?",
+                                         (review_route,)).fetchone()[0], 1)
+
+    async def test_ballad_review_quota_failure_cannot_deliver_unchecked_song(self):
+        command = dict(id="review-budget-draft", showId="show-attendance-1", showDate="2026-08-28",
+                       kind="generate", baseVersion=None, options={})
+        control = {"contractVersion": 1, "commands": [command], "catalogVersions": {}}
+        result = bot.GenerationResult(True, '{"title":"Light","lyrics":"Leave a light","style":"Soul"}',
+                                      finish_reason="STOP")
+        with mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", self.fixture.guild_id), \
+             mock.patch.object(bot, "check_quota_availability", side_effect=[True, False]) as quota, \
+             mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(return_value=result)) as generate, \
+             mock.patch.object(bot, "_ballad_control_request_sync", side_effect=[control, {"ok": True}, control, {"ok": True}]) as transport:
+            await bot._run_ballad_control_cycle()
+            await bot._run_ballad_control_cycle()
+        generate.assert_awaited_once()
+        self.assertEqual(quota.call_count, 2)
+        receipt = transport.call_args_list[1].args[1]
+        self.assertEqual(receipt["error"], "local_model_budget_exhausted")
+        self.assertNotIn("version", receipt)
+        self.assertEqual(receipt, transport.call_args_list[3].args[1])
 
     async def test_manual_ballad_reaches_provider_at_reported_spend(self):
         await self.ballad_reaches_provider_at_reported_spend("manual-draft-1", "broadcast_ballad_manual")
