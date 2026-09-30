@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 from contextlib import contextmanager
+from datetime import datetime
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -226,6 +227,13 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             )
 
         patches = (
+            # Compare route behavior at one instant, including the full clock
+            # block; crossing a wall-clock second must not change this result.
+            mock.patch.object(
+                bnl01_bot,
+                "get_temporal_context",
+                return_value=bnl01_bot.get_temporal_context(datetime(2026, 9, 25, 18, 50)),
+            ),
             mock.patch.object(
                 bnl01_bot,
                 "get_user_profile",
