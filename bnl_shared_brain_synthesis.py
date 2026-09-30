@@ -333,6 +333,39 @@ _ORDINARY_CHAT_FACTUAL_OWNER_CONTRACT = (
     "- The current request and exact reply/referent evidence govern the task.\n"
     "- Use the authorized context already assembled in this prompt together "
     "with the selected evidence below as one understanding of the turn.\n"
+    "- Understand the complete request before writing: what the user wants "
+    "accomplished, who is being discussed, who the answer is for, and what "
+    "that audience needs explained. Fulfill the meaningful parts even when "
+    "they are expressed indirectly. Available evidence supplies material; "
+    "its category does not choose the task, audience, or output format.\n"
+    "- For an introduction, give the intended reader useful orientation "
+    "from what is actually known about the person, then your own take when "
+    "requested. With limited familiarity, a warm introduction and a "
+    "reaction to the encounter can be enough. An inside joke "
+    "needs enough context for a newcomer to understand it, and should add "
+    "to the introduction rather than become the entire introduction.\n"
+    "- Keep the origin of each observation straight. A member's question "
+    "does not establish other people's answers or a collective reaction. "
+    "Your earlier answer or reflection records your perspective, not what "
+    "members said, felt, chose or did. Explain why a topic interests you "
+    "in your own voice without supplying an imagined audience response.\n"
+    "- Give a clear, useful opinion from the supplied context. Dry wit, "
+    "playful exaggeration and reasonable impressions are welcome. Keep "
+    "interpretation recognizable as your perspective, without inventing "
+    "concrete actions, personal status or firsthand experience. Match "
+    "familiarity to what you know; an amusing observation need not become "
+    "a settled profile or durable fact.\n"
+    "- Preserve the scope of reported actions and corrections. A current "
+    "human correction takes precedence over an older generated "
+    "characterization when both are supplied; use its actual meaning "
+    "without inventing an outcome or activity count.\n"
+    "- Keep the useful answer and BNL's personality together. Humor, "
+    "metaphor and imaginative transformations remain welcome; preserve "
+    "recognizable people and the intended joke without inventing real "
+    "actions or biography. No routine transcript, quotation, evidence "
+    "inventory or disclaimer is needed. Before sending, check that the "
+    "intended reader can understand and use the answer for the requested "
+    "purpose, not merely recognize a shared topic or keyword.\n"
     "- A publication projection is exact published prose only; it adds no "
     "independent fact, recurrence, canon, identity, or relationship weight.\n"
     "- Keep historical publication context separate from current operational "
@@ -2855,13 +2888,18 @@ def render_packet_context(
     *,
     max_items: int = 8,
     max_chars: int = 2800,
+    profile_expression: bool = True,
 ) -> tuple[
     str,
     tuple[tuple[str, int], ...],
     int,
     tuple[str, ...],
 ]:
-    """Render selected evidence without source IDs or Relationship posture."""
+    """Render shared evidence with optional profile-specific expression.
+
+    Ordinary chat supplies its own purpose-led response contract. Its evidence
+    and authority rules remain identical without inheriting a profile recipe.
+    """
 
     lines = []
     lane_counts: Counter[str] = Counter()
@@ -3032,7 +3070,8 @@ def render_packet_context(
         elif item.lane in {"journal_publication", "relay_publication"}:
             qualifier = (
                 "; exact published prose; publication continuity only; "
-                "zero independent fact or recurrence weight"
+                "zero independent fact or recurrence weight; "
+                "BNL's reflection is not a human participant's testimony"
             )
         elif item.lane == "website_read_model":
             qualifier = (
@@ -3196,28 +3235,39 @@ def render_packet_context(
         else "- Lead with the directly applicable approved identity "
         "relationship. Do not claim or imply a Discord activity history.\n"
         if identity_canon_only
-        else "- Lead with the requested show finding from the finalized show "
-        "evidence. Do not lead with data availability, routing, or lore.\n"
-        if show_episode_present
-        else "- Lead with the current conversation. Related historical Moments "
-        "are optional background when useful; no callback is required. Keep "
-        "their original people and situation distinct: sharing a topic does "
-        "not mean this speaker participated, that the old event is continuing, "
-        "or that one experience establishes a recurring pattern.\n"
-        if topic_association_present
-        else "- Lead with member-specific substance. Relevant BARCODE canon "
-        "may add one concise context anchor afterward, but can never "
-        "substitute for the public assessment or become its governing "
-        "frame.\n"
+        else "- Lead with the answer the current request needs, for its "
+        "intended audience and in the requested form. The presence of show, "
+        "member, Journal or Relay evidence does not turn every request into "
+        "a recap or profile. Use relevant concrete substance to accomplish "
+        "the task; BARCODE canon and callbacks may enrich that answer.\n"
     )
+    if topic_association_present:
+        lead_rule += (
+            "- Related historical Moments are optional background when "
+            "useful; no callback is required. Keep their original people "
+            "and situation distinct: sharing a topic does not mean this "
+            "speaker participated, that the old event is continuing, or "
+            "that one experience establishes a recurring pattern.\n"
+        )
     synthesis_rule = (
         ""
-        if identity_canon_only
+        if identity_canon_only or not profile_expression
         else "- Look across the selected observations for a useful "
         "throughline. Separate what is directly known, what BNL has "
         "observed, and BNL's revisable opinion. Frame interpretation "
         "naturally as a read or impression instead of presenting it as a "
         "stored fact.\n"
+    )
+    opening_assessment_rule = (
+        "- Concrete evidence must anchor synthesis. Do not open with an "
+        "unframed inferred identity, occupation, or personality label. An "
+        "opening assessment is allowed when the same sentence names "
+        "recognizable supported details and clearly frames the conclusion as "
+        "BNL's read. Do not add new names, events, literal jobs or positions, "
+        "preferences, places, times, ownership, or habitual behavior inside "
+        "an interpretation.\n"
+        if profile_expression
+        else ""
     )
     observation_rule = (
         ""
@@ -3261,13 +3311,7 @@ def render_packet_context(
         "not recite this evidence as a database report.\n"
         + lead_rule
         + synthesis_rule
-        + "- Concrete evidence must anchor synthesis. Do not open with an "
-        "unframed inferred identity, occupation, or personality label. An "
-        "opening assessment is allowed when the same sentence names "
-        "recognizable supported details and clearly frames the conclusion as "
-        "BNL's read. Do not add new names, events, literal jobs or positions, "
-        "preferences, places, times, ownership, or habitual behavior inside "
-        "an interpretation.\n"
+        + opening_assessment_rule
         + observation_rule
         + show_episode_rule
         + profile_rule
@@ -3324,7 +3368,7 @@ def _ordinary_packet_context(
     if not structurally_usable:
         return "", (), 0, ()
     rendered, lane_counts, item_count, source_digests = (
-        render_packet_context(packet)
+        render_packet_context(packet, profile_expression=False)
     )
     if rendered and item_count:
         return rendered, lane_counts, item_count, source_digests

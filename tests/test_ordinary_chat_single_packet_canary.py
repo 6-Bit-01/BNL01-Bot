@@ -11,6 +11,7 @@ import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
 from bnl_shared_brain_synthesis import (
+    _ordinary_rendered_evidence_refs,
     ORDINARY_CHAT_AUTHORITY,
     ORDINARY_CHAT_PUBLIC_ENABLED_ENV,
     ORDINARY_CHAT_ROUTE_FAMILY,
@@ -1239,6 +1240,187 @@ class OrdinaryChatSinglePacketCanaryTests(unittest.TestCase):
         )
         self.assertTrue(valid)
         self.assertEqual(status, "passed")
+
+    def test_incidental_show_evidence_cannot_assign_the_answer_purpose(self):
+        base = self.packet.items[0]
+        show = replace(
+            base,
+            lane="show_episode",
+            source_type="barcode_show_operations",
+            source_digest="purpose-show",
+            text="The completed Test Broadcast included Test Artist's First Light.",
+        )
+        for text in (
+            "Introduce Test Member to a newcomer. What should they know?",
+            "Help a first-time listener get acquainted with Test Member; add your take.",
+            "What from your latest Journal deserves another conversation, and why?",
+            "Turn that real show exchange into an outrageous pirate-radio advert.",
+            "What happened in the latest show?",
+        ):
+            for items in ((show, base), (base, show)):
+                with self.subTest(text=text, show_first=items[0] is show):
+                    packet = replace(
+                        self.packet,
+                        request=replace(self.packet.request, user_text=text),
+                        items=items,
+                    )
+                    rendered, lanes, _count, digests = render_packet_context(packet)
+                    self.assertIn(show.text, rendered)
+                    self.assertIn(show.source_digest, digests)
+                    self.assertIn("show_episode", dict(lanes))
+                    self.assertNotIn("Lead with the requested show finding", rendered)
+                    self.assertIn("Lead with the answer the current request needs", rendered)
+
+    def test_response_purpose_guidance_is_shared_and_idempotent(self):
+        for policy in ("public_home", "public_context", "sealed_test"):
+            with self.subTest(policy=policy):
+                basis = replace(
+                    self.basis,
+                    packet=replace(
+                        self.packet,
+                        request=replace(self.packet.request, channel_policy=policy),
+                    ),
+                )
+                original_items = basis.packet.items
+                base_prompt = (
+                    "BNL's established personality and playful tone.\n"
+                    "Current request: introduce Test Member to a first-time listener "
+                    "and give your own take."
+                )
+                owned = build_packet_owned_prompt(base_prompt, basis)
+                self.assertTrue(owned.ready)
+                self.assertIn(base_prompt, owned.prompt)
+                self.assertIn(basis.rendered_context, owned.prompt)
+                self.assertIn("who the answer is for", owned.prompt)
+                self.assertIn("inside joke needs enough context", owned.prompt)
+                self.assertIn("limited familiarity", owned.prompt)
+                self.assertIn("a warm introduction", owned.prompt)
+                self.assertIn("clear, useful opinion", owned.prompt)
+                self.assertIn("playful exaggeration and reasonable impressions", owned.prompt)
+                self.assertIn("without inventing an outcome or activity count", owned.prompt)
+                self.assertIn("does not establish other people's answers", owned.prompt)
+                self.assertIn("Humor, metaphor and imaginative transformations", owned.prompt)
+                self.assertEqual(basis.packet.items, original_items)
+                second = build_packet_owned_prompt(owned.prompt, basis)
+                self.assertEqual(second.prompt, owned.prompt)
+
+    def test_ordinary_expression_preserves_profile_evidence_and_authority(self):
+        for status in ("not_applicable", "sparse", "rich"):
+            with self.subTest(profile_status=status):
+                packet = replace(
+                    self.packet,
+                    profile_sufficiency=replace(
+                        self.packet.profile_sufficiency,
+                        status=status,
+                    ),
+                )
+                legacy = render_packet_context(packet)
+                ordinary = render_packet_context(packet, profile_expression=False)
+                self.assertEqual(legacy[1:], ordinary[1:])
+                self.assertEqual(
+                    [line for line in legacy[0].splitlines() if line.startswith("[E")],
+                    [line for line in ordinary[0].splitlines() if line.startswith("[E")],
+                )
+                self.assertEqual(
+                    _ordinary_rendered_evidence_refs(packet, legacy[3]),
+                    _ordinary_rendered_evidence_refs(packet, ordinary[3]),
+                )
+                self.assertIn("useful throughline", legacy[0])
+                self.assertIn("An opening assessment is allowed", legacy[0])
+                self.assertNotIn("useful throughline", ordinary[0])
+                self.assertNotIn("An opening assessment is allowed", ordinary[0])
+                for shared_rule in (
+                    "Current-turn and current-room evidence outrank older material",
+                    "Do not turn repetition, inference, or a BNL-authored derivative",
+                    "Do not reconstruct quotations from a derived gist",
+                    "cannot invent a new member fact",
+                ):
+                    self.assertIn(shared_rule, legacy[0])
+                    self.assertIn(shared_rule, ordinary[0])
+                if status == "sparse":
+                    self.assertIn("one honest, narrow supported point", ordinary[0])
+                elif status == "rich":
+                    self.assertIn("at least two materially distinct points", ordinary[0])
+
+        self.assertEqual(
+            self.basis.rendered_context,
+            render_packet_context(self.packet, profile_expression=False)[0],
+        )
+        self.assertEqual(
+            self.basis.rendered_evidence_refs,
+            _ordinary_rendered_evidence_refs(
+                self.packet, render_packet_context(self.packet)[3]
+            ),
+        )
+
+    def test_introduction_purpose_and_opinion_share_bound_packet_support(self):
+        text = (
+            "Introduce Mac Modem to someone new. What should they know, "
+            "and what is your own take?"
+        )
+        basis = self._multi_subject_basis(text, (("mac_modem", "Mac Modem"),))
+        plan = ordinary_chat_task_support_plan(basis)
+        self.assertEqual(len(plan), 3)
+        bound_evidence = {
+            evidence_id
+            for evidence_id, _lane, _digest, subjects in basis.rendered_evidence_refs
+            if subjects == (0,)
+        }
+        self.assertTrue(bound_evidence)
+        for task, support in zip(basis.packet.request.frame_tasks, plan):
+            self.assertEqual(task.subject_indexes, (0,))
+            self.assertEqual(support.support_kind, "packet")
+            self.assertTrue(bound_evidence.intersection(support.evidence_ids))
+            self.assertNotIn("PUBLIC", support.evidence_ids)
+        original_context = "Current user request: " + text
+        prompt = build_packet_owned_prompt(original_context, basis)
+        self.assertTrue(prompt.ready)
+        self.assertIn(original_context, prompt.prompt)
+        self.assertIn(
+            'request="Introduce Mac Modem to someone new"',
+            prompt.prompt,
+        )
+        self.assertIn('request="What should they know"', prompt.prompt)
+        self.assertIn('request="what is your own take"', prompt.prompt)
+        self.assertNotIn("useful throughline", prompt.prompt)
+        self.assertNotIn("An opening assessment is allowed", prompt.prompt)
+
+    def test_external_opinion_object_does_not_inherit_intro_subject(self):
+        basis = self._multi_subject_basis(
+            "Introduce Mac Modem to someone new. What should they know, "
+            "and what is your own take on Neptune?",
+            (("mac_modem", "Mac Modem"),),
+        )
+        plan = ordinary_chat_task_support_plan(basis)
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(plan[0].support_kind, "packet")
+        self.assertEqual(plan[1].support_kind, "packet")
+        self.assertEqual(plan[2].support_kind, "external_public")
+        self.assertEqual(plan[2].evidence_ids, ("PUBLIC",))
+        self.assertEqual(basis.packet.request.frame_tasks[2].subject_indexes, ())
+
+    def test_purpose_guidance_does_not_depend_on_retained_profile_evidence(self):
+        basis = replace(self.basis, rendered_context="", rendered_evidence_refs=())
+        original = "Current request: welcome a member you have only just met."
+        owned = build_packet_owned_prompt(original, basis)
+        self.assertTrue(owned.ready)
+        self.assertIn(original, owned.prompt)
+        self.assertIn("limited familiarity", owned.prompt)
+        self.assertNotIn("Test Member", owned.prompt)
+        self.assertEqual(owned.replaced_factual_context_count, 0)
+
+    def test_publication_prose_retains_its_interpretation_boundary(self):
+        publication = replace(
+            self.packet.items[0],
+            lane="journal_publication",
+            source_digest="purpose-journal",
+            text="I wondered which city I would visit if I could outrun sound.",
+        )
+        packet = replace(self.packet, items=(publication,))
+        rendered, _lanes, _count, digests = render_packet_context(packet)
+        self.assertIn(publication.text, rendered)
+        self.assertEqual(digests, (publication.source_digest,))
+        self.assertIn("BNL's reflection is not a human participant's testimony", rendered)
 
     def test_bnl_self_identity_prompt_keeps_subject_scoped_canon(self):
         basis = self._multi_subject_basis(
