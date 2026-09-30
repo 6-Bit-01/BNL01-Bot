@@ -32,6 +32,13 @@ roadmap complete.
   return to a prior event. Only matches overlapping bound names are excluded;
   a genuine resume instruction elsewhere in the request still applies.
 
+The request helper also has an existing show-selection consumer. That consumer
+needs the authority-bearing question rather than the full preserved lead-in:
+an incidental person correction must not replace the show already under
+discussion. Full wording and request-only clauses therefore remain explicit,
+separate views of the same input, with the original source and correction text
+still available to the model.
+
 The repair retains the whole request, preserves bounded subject continuity
 across dependent clauses, and lets the ordinary-response contract own ordinary
 expression. The existing profile path keeps its specialized recipe. Evidence
@@ -103,13 +110,39 @@ not evidence of broken production identity links. Profile sufficiency was
 not_applicable for these third-person requests in both the real classifier and
 the fixtures; the preview-only personal-recall helper emitted no extra text.
 
-The structural integration revision described above has not yet received a new
-paid rehearsal. Its final focused Linux run passed 112 tests, with six additional
-legacy profile/identity regressions passing against the unchanged renderer.
-Independent review checked unrelated external questions, current-information
-holds, privacy refusals, name/event collisions, and unchanged source provenance.
-Compilation and whitespace checks passed. Full validation runs in GitHub CI
-under the owner's existing CI-first decision.
+Structural revision `a10d2bfddfa39a91f8bf736881295f049a8718a7` then received
+one separately authorized nine-call rehearsal. All nine completed for an
+estimated $0.0640695. Independent and primary review agree on five passes, two
+acceptable but overbuilt introductions, and two factual errors. The rich artist
+reply turns one feedback exchange into routine behavior and states an unobserved
+clean low-end result. The correction preserves one visit but dates it today,
+when only the correction date is established. The reversed introduction,
+Journal reflection, actual group discussion, creative advert and original-joke
+follow-up pass. The playful metaphors themselves are allowed.
+
+Across all rounds, 27 calls cost an estimated $0.19975275. All 335 candidate
+files matched their published Git blobs before the latest run. The accounting
+guard recorded no forbidden database access; schema bookkeeping accompanied
+the permitted accounting tables. No Discord send, memory ingestion or production
+setting change occurred. The nine-call authorization is exhausted; these
+results do not authorize another paid loop.
+
+That revision passed 112 focused Linux tests and six legacy profile/identity
+regressions, but full CI exposed five failing assertions on each Python version
+out of 3,695 tests: ambiguous-person task splitting and requested-show follow-up
+selection. The transport/scheduler job passed. Those regressions require repair
+before deployment; focused success was not complete integration acceptance.
+Full validation uses GitHub CI under the owner's existing CI-first decision.
+
+The subsequent repair keeps coordinated declarations as context and gives the
+existing show selector the explicit request-only view. No original acceptance
+assertion is relaxed. A zero-provider comparison found identical complete
+Situation Frames for all nine paid rehearsal requests before and after this
+repair; the renderer and ordinary-expression instructions are unchanged.
+This does not turn the two remaining semantic errors into passes.
+The repaired combined suite passed 161 tests in 79.495 seconds, covering
+requested-show delivery, the ordinary acceptance matrix, Situation Frames and
+ordinary packet synthesis. Existing show-selection expectations stayed intact.
 
 Earlier code checks passed on `119edec`: 3,678 tests on each of
 Python 3.9 and 3.12, plus 56 transport tests and scheduler/systemd checks. Those

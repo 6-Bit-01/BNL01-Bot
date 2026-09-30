@@ -742,20 +742,21 @@ def _situation_task_parts(
         ranges.append((start, len(value)))
 
     labels = tuple(str(label or "").strip() for label in context_labels if label)
+    label_pattern = "(?:%s)" % "|".join(
+        re.escape(label) for label in sorted(set(labels), key=len, reverse=True)
+    )
+    declaration_pattern = re.compile(
+        r"^%s(?:(?:\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+)%s)*"
+        r"\s+(?:is|are|was|were|has|have|had)\b"
+        % (label_pattern, label_pattern),
+        re.I,
+    ) if labels else None
 
     def explicit_task(segment: str) -> bool:
         # An observed display label can begin with a task word (e.g. Test).
-        # A declaration about that label remains context, not an instruction.
-        declaration = any(
-            re.match(
-                r"^%s\s+(?:is|are|was|were|has|have|had)\b"
-                % re.escape(label),
-                segment,
-                re.I,
-            )
-            for label in labels
-        )
-        if declaration:
+        # A declaration about one or several labels remains context, not an
+        # instruction or a resolved antecedent for an ambiguous pronoun.
+        if declaration_pattern is not None and declaration_pattern.search(segment):
             return False
         return bool(
             _TASK_SEGMENT_START_RE.search(segment)
@@ -802,6 +803,26 @@ def _situation_task_segments(
     return tuple(
         segment
         for segment, _task_clause in _situation_task_parts(
+            text, context_labels=context_labels,
+        )
+    )
+
+
+def situation_request_clauses(
+    text: str,
+    *,
+    context_labels: Sequence[str] = (),
+) -> Tuple[str, ...]:
+    """Return actual request clauses for existing scoped evidence readers.
+
+    A retained correction or other lead-in still reaches the response model
+    through the full task text. It must not retarget a separate request to an
+    incidental person or source when a reader determines retrieval scope.
+    """
+
+    return tuple(
+        task_clause
+        for _segment, task_clause in _situation_task_parts(
             text, context_labels=context_labels,
         )
     )

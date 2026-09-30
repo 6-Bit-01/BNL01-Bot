@@ -2694,10 +2694,18 @@ def _general_participant_recall(
 ) -> bool:
     # Incidental names in a correction/declaration do not retarget a separate
     # question to that person's whole history. Inspect the actual request
-    # clauses, using the same task segmentation as the Situation Frame.
-    from bnl_unified_response_assessment import _situation_task_segments
+    # clauses from the Situation Frame's shared parser. Its full task wording
+    # preserves contextual declarations for the model, not participant scope.
+    from bnl_unified_response_assessment import situation_request_clauses
 
-    request_text = "\n".join(_situation_task_segments(str(user_text or "")))
+    request_text = "\n".join(situation_request_clauses(
+        str(user_text or ""),
+        context_labels=tuple(
+            str(user_text or "")[start:end]
+            for start, end, _participant
+            in _participant_label_occurrences(participants, user_text)
+        ),
+    ))
     requested_participants = tuple(
         participant for participant in participants
         if _participant_named(request_text, participant)

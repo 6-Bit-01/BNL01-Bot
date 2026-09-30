@@ -18,6 +18,7 @@ from bnl_unified_response_assessment import (
     persist_shadow_run,
     render_situation_frame_receipt,
     revalidate_situation_frame,
+    situation_request_clauses,
     situation_task_texts,
 )
 
@@ -558,6 +559,67 @@ class SituationFrameV1Tests(unittest.TestCase):
                 self.assertEqual(
                     situation_task_texts(frame, current_text=text),
                     (text.rstrip("?"),),
+                )
+
+    def test_task_coordinated_subject_setup_preserves_pronoun_ambiguity(self):
+        for setup, labels in (
+            (
+                "Fixture Finch and Fixture Moss are both part of BARCODE.",
+                ("Fixture Finch", "Fixture Moss"),
+            ),
+            (
+                "Fixture Finch, Fixture Moss, and Fixture Reed are part of BARCODE.",
+                ("Fixture Finch", "Fixture Moss", "Fixture Reed"),
+            ),
+        ):
+            text = setup + " What is his role in the Network?"
+            with self.subTest(setup=setup):
+                frame = self._task_context_frame(text, labels)
+                self.assertEqual(frame.status, "ambiguous")
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(frame.tasks[0].required_response_act, "clarify")
+                self.assertEqual(frame.tasks[0].subject_indexes, ())
+                self.assertEqual(
+                    situation_task_texts(frame, current_text=text),
+                    (text.rstrip("?"),),
+                )
+
+    def test_task_request_clause_view_does_not_retarget_incidental_correction(self):
+        text = (
+            "Fixture Finch is a guy. He told you that. Also, did you notice "
+            "any tension or chemistry between people?"
+        )
+        frame = self._task_context_frame(text, ("Fixture Finch",))
+        self.assertEqual(
+            situation_task_texts(frame, current_text=text),
+            (text.rstrip("?"),),
+        )
+        self.assertEqual(
+            situation_request_clauses(text, context_labels=("Fixture Finch",)),
+            ("did you notice any tension or chemistry between people",),
+        )
+        # Readers without a bound label still exclude a non-task lead-in.
+        self.assertEqual(
+            situation_request_clauses(text),
+            ("did you notice any tension or chemistry between people",),
+        )
+
+    def test_task_request_clause_view_preserves_explicit_member_recall(self):
+        for text, expected in (
+            (
+                "Fixture Finch is a guy. What do you remember about Fixture Finch?",
+                ("What do you remember about Fixture Finch",),
+            ),
+            (
+                "Walk us through Fixture Finch's latest contribution, and where is Seattle?",
+                ("Walk us through Fixture Finch's latest contribution", "where is Seattle"),
+            ),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    situation_request_clauses(text, context_labels=("Fixture Finch",)),
+                    expected,
                 )
 
     def test_task_explicit_new_subject_wins_before_an_elliptical_followup(self):
