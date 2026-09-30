@@ -458,7 +458,7 @@ _JOURNAL_QUERY_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 _JOURNAL_LATEST_RE = re.compile(
-    r"\b(?:latest|newest|most\s+recent|current)\b",
+    r"\b(?:latest|newest|most\s+recent(?:ly)?|current)\b",
     re.IGNORECASE,
 )
 _JOURNAL_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
