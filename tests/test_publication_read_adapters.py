@@ -12,10 +12,12 @@ import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
 import bnl_website_relay_state as relay
+from bnl_canon_source_contract import Confidence, SourceClass, Visibility
 from bnl_shared_brain_synthesis import (
     audit_ordinary_chat_candidate_claims,
     begin_single_packet_run,
     build_ordinary_chat_basis,
+    build_packet_owned_prompt,
     evaluate_single_packet_response,
     ordinary_chat_task_support_plan,
     parse_ordinary_chat_response_contract,
@@ -900,6 +902,204 @@ class PublicationPacketIntegrationTests(PublicationReadAdapterTests):
             journal_control_snapshot=snapshot,
             journal_control_status=control_status,
         )
+
+    def publication_hint_request(self, text, *, policy="sealed_test"):
+        frame = build_situation_frame_v1(
+            route_allowed=True, route_mode="normal_chat",
+            conversation_surface="mention_or_reply", channel_policy=policy,
+            current_text=text, current_speaker_user_ids=(7,),
+            current_speaker_labels=("Test Speaker",),
+            subject_label_hints=("Test Visitor",),
+            referent_status="not_requested", response_act="answer",
+        )
+        request = replace(
+            self.request(text, snapshot=control_snapshot(), control_status="valid"),
+            subject_user_id=0, participant_user_ids=(7,), channel_policy=policy,
+            visibility_allowance="sealed_test" if policy == "sealed_test" else "public_safe",
+            budget_chars=2400,
+            conversation_evidence=(PacketConversationEvidence(
+                text=text, speaker_user_id=7, speaker_label="Test Speaker", current_turn=True,
+            ),),
+            frame_schema_version=frame.schema_version, frame_revision=frame.frame_revision,
+            frame_input_evidence_digest=frame.input_evidence_digest,
+            frame_status=frame.status, frame_subject_requirement=frame.subject_requirement,
+            frame_ambiguity_reasons=frame.ambiguity_reasons,
+            frame_subjects=tuple(PacketFrameSubject(**{
+                key: getattr(subject, key) for key in PacketFrameSubject.__dataclass_fields__
+            }) for subject in frame.subjects),
+            frame_tasks=tuple(PacketFrameTask(**{
+                key: getattr(task, key) for key in PacketFrameTask.__dataclass_fields__
+            }) for task in frame.tasks),
+            frame_task_kind=frame.task_kind, frame_object_kind=frame.object_kind,
+            frame_event_ref=frame.event_ref, frame_event_relation=frame.event_relation,
+            frame_phase=frame.phase, frame_temporal_scope=frame.temporal_scope,
+            frame_currentness=frame.currentness,
+        )
+        return request, frame
+
+    def publication_hint_basis(self, request, frame, packet):
+        flags = {
+            **self.flags,
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10",
+        }
+        frame_validation = revalidate_situation_frame(
+            frame, current_text=request.user_text, route_mode=request.route_mode,
+            conversation_surface=request.conversation_surface, channel_policy=request.channel_policy,
+            packet_source_snapshot_digest=packet.source_snapshot_digest,
+        )
+        assessment = build_unified_response_assessment(
+            guild_id=1, route_mode=request.route_mode, channel_policy=request.channel_policy,
+            conversation_surface=request.conversation_surface, current_speaker_user_ids=(7,),
+            participant_user_ids=(7,), speaker_labels=("Test Speaker",),
+            current_text=request.user_text, prompt_lanes=packet.assessment_lanes,
+            packet_selected_lanes=packet.assessment_lanes,
+            packet_excluded_lanes=packet.assessment_exclusions,
+            packet_missing_lanes=packet.assessment_missing_lanes,
+            packet_conflict_reasons=packet.diagnostics.conflict_reasons,
+            packet_revalidation_status=packet.diagnostics.revalidation_status,
+            situation_frame=frame, frame_revalidation=frame_validation,
+        )
+        basis = build_ordinary_chat_basis(
+            guild_id=1, user_id=7, channel_id=10, route_mode=request.route_mode,
+            channel_policy=request.channel_policy, current_direct=True,
+            user_text=request.user_text, packet=packet, assessment=assessment, environ=flags,
+        )
+        self.assertIsNotNone(basis)
+        return basis
+
+    def test_unrelated_label_keeps_independent_journal_and_relay_through_final_prompt(self):
+        self.add_journal("journal_hint", title="Room for Disagreement",
+                         body="Keeping room for disagreement made collaboration easier.")
+        self.add_relay("relay_hint", message="Listeners made room for disagreement.")
+        questions = (
+            ("BNL, we can put that rough exchange behind us. The limit on teasing still stands. "
+             "Which part of your latest published Journal deserves another conversation, and why?",
+             "journal_publication", "Keeping room for disagreement"),
+            ("What did your latest published Journal say?", "journal_publication", "Keeping room for disagreement"),
+            ("What did your latest Relay say?", "relay_publication", "Listeners made room for disagreement"),
+        )
+        for policy in ("sealed_test", "public_home"):
+            for text, lane, excerpt in questions:
+                with self.subTest(policy=policy, text=text):
+                    request, frame = self.publication_hint_request(text, policy=policy)
+                    packet = build_packet(self.conn, request, environ=self.flags)
+                    self.assertEqual(packet.subject_resolution.status, "unresolved")
+                    self.assertIn(lane, {item.lane for item in packet.items})
+                    self.assertFalse(packet.diagnostics.invalid_invariants)
+                    self.assertEqual(packet.diagnostics.revalidation_status, "passed")
+                    validation = revalidate_packet(
+                        self.conn, packet, environ=self.flags,
+                        journal_control_snapshot=control_snapshot(), journal_control_snapshot_provided=True,
+                    )
+                    self.assertTrue(validation.valid)
+                    self.assertEqual(validation.status, "passed")
+                    basis = self.publication_hint_basis(request, frame, packet)
+                    final = build_packet_owned_prompt("Current user request: " + text, basis)
+                    self.assertTrue(final.ready, final.reason)
+                    self.assertIn(excerpt, final.prompt)
+                    self.assertIn("zero independent fact or recurrence weight", final.prompt)
+                    publication_task = next(task for task in frame.tasks
+                                            if task.object_kind == ("journal" if lane == "journal_publication" else "relay"))
+                    plan = next(plan for plan in ordinary_chat_task_support_plan(basis)
+                                if plan.task_id == publication_task.task_id)
+                    self.assertEqual(plan.support_kind, "packet")
+                    self.assertTrue(plan.evidence_ids)
+
+    def test_independent_journal_answer_does_not_resolve_unrelated_member_question(self):
+        self.add_journal("journal_partial", body="Room for disagreement kept collaboration open.")
+        ledger.insert_ledger_entry(self.conn, ledger.LedgerEntry(
+            guild_id=1, source_table="member_preferences", source_row_id=7,
+            source_role="member_self_report", entry_type="preference", subject_key="discord_user:7",
+            subject_display_name="Test Speaker", predicate_key="favorite_instrument",
+            value="tuned glass percussion", source_class=SourceClass.FIRST_PARTY_RECORD,
+            channel_id=10, channel_policy="public_home", route_mode="normal_chat",
+            visibility=Visibility.PUBLIC, confidence=Confidence.HIGH, public_usable=True,
+            observed_at=NOW,
+        ))
+        text = "What is in your latest Journal? And who is Test Visitor?"
+        request, frame = self.publication_hint_request(text)
+        packet = build_packet(self.conn, request, environ=self.flags)
+        self.assertEqual(packet.subject_resolution.status, "unresolved")
+        self.assertIn("journal_publication", {item.lane for item in packet.items})
+        self.assertEqual(packet.diagnostics.revalidation_status, "passed")
+        self.assertTrue(all(item.lane in {"current_intent", "journal_publication"} for item in packet.items))
+        basis = self.publication_hint_basis(request, frame, packet)
+        plans = {plan.task_id: plan for plan in ordinary_chat_task_support_plan(basis)}
+        publication_task = next(task for task in frame.tasks if task.object_kind == "journal")
+        member_task = next(task for task in frame.tasks if task.subject_requirement == "required")
+        self.assertEqual(plans[publication_task.task_id].support_kind, "packet")
+        self.assertTrue(plans[publication_task.task_id].evidence_ids)
+        self.assertIn(plans[member_task.task_id].support_kind, {"hold", "clarify"})
+        self.assertFalse(plans[member_task.task_id].evidence_ids)
+        final = build_packet_owned_prompt("Current user request: " + text, basis)
+        self.assertTrue(final.ready)
+        self.assertIn("Room for disagreement", final.prompt)
+        self.assertNotIn("tuned glass percussion", final.prompt)
+
+    def test_publication_exception_does_not_waive_person_or_referent_requirements(self):
+        self.add_journal("journal_bound", body="Test Visitor discussed glass percussion.")
+        for text in (
+            "What did Test Visitor contribute to your latest Journal?",
+            "What does your latest Journal say about Test Visitor?",
+            "What is in your latest Journal? What does your latest Journal say about Test Visitor?",
+            "What did that Journal entry say?",
+        ):
+            with self.subTest(text=text):
+                request, _ = self.publication_hint_request(text)
+                packet = build_packet(self.conn, request, environ=self.flags)
+                self.assertFalse(any(item.lane == "journal_publication" for item in packet.items))
+                rendered, _lanes, _count, _digests = render_packet_context(packet)
+                self.assertNotIn("Test Visitor discussed glass percussion", rendered)
+        request, _ = self.publication_hint_request("What is in your latest Journal?")
+        for reason in ("reply_target_unresolved", "resume_target_unresolved", "publication_referent_unresolved"):
+            with self.subTest(reason=reason):
+                ambiguous = replace(request, frame_status="ambiguous", frame_ambiguity_reasons=(reason,))
+                packet = build_packet(self.conn, ambiguous, environ=self.flags)
+                self.assertFalse(any(item.lane == "journal_publication" for item in packet.items))
+
+    def test_independent_publication_still_rechecks_privacy_revision_and_subject_binding(self):
+        self.add_journal("journal_withdrawn", body="A reflection awaiting another conversation.")
+        self.add_relay("relay_withdrawn", message="A reflection awaiting another conversation.")
+        request, _ = self.publication_hint_request("What is in your latest Journal?")
+        packet = build_packet(self.conn, request, environ=self.flags)
+        self.assertIn("journal_publication", {item.lane for item in packet.items})
+        validation = revalidate_packet(self.conn, packet, environ=self.flags)
+        self.assertTrue(validation.valid)
+        self.assertEqual(validation.status, "passed")
+        changed_subject = replace(packet, request=replace(
+            packet.request, frame_subjects=(PacketFrameSubject(
+                user_id=7, label_hint="Test Speaker", binding_method="existing_typed_target", confidence="high",
+            ),),
+        ))
+        self.assertFalse(revalidate_packet(self.conn, changed_subject, environ=self.flags).valid)
+        for snapshot in (
+            control_snapshot(public_excluded=("journal_withdrawn",), digest="b" * 64),
+            control_snapshot(memory_excluded=("journal_withdrawn",), digest="c" * 64),
+        ):
+            with self.subTest(snapshot=snapshot):
+                self.assertFalse(revalidate_packet(
+                    self.conn, packet, environ=self.flags,
+                    journal_control_snapshot=snapshot, journal_control_snapshot_provided=True,
+                ).valid)
+        self.add_journal("journal_withdrawn", revision=2, body="The corrected reflection.",
+                         published_at="2026-08-04T01:00:00Z")
+        self.assertFalse(revalidate_packet(
+            self.conn, packet, environ=self.flags,
+            journal_control_snapshot=control_snapshot(), journal_control_snapshot_provided=True,
+        ).valid)
+        relay_request, _ = self.publication_hint_request("What is in your latest Relay?")
+        relay_packet = build_packet(self.conn, relay_request, environ=self.flags)
+        self.assertIn("relay_publication", {item.lane for item in relay_packet.items})
+        validation = revalidate_packet(self.conn, relay_packet, environ=self.flags)
+        self.assertTrue(validation.valid)
+        self.assertEqual(validation.status, "passed")
+        self.conn.execute("DELETE FROM website_relay_history WHERE relay_id='relay_withdrawn'")
+        self.assertFalse(revalidate_packet(self.conn, relay_packet, environ=self.flags).valid)
 
     def test_incidental_publications_do_not_crowd_out_recalled_moment(self):
         import test_moment_topic_association as topic_tests
