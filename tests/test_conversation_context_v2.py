@@ -45,6 +45,58 @@ def req(**kw):
     return ConversationContextRequest(**base)
 
 class ConversationContextV2Tests(unittest.TestCase):
+    def test_explicit_publication_sources_do_not_request_a_nearby_room_contribution(self):
+        history = [
+            row(1, "user", "Recall the correction about the missing shoes.", minutes=4),
+            row(2, "model", "The correction concerned footwear.", minutes=3),
+            row(3, "user", "What question did our earlier discussion leave open?", minutes=2),
+            row(4, "model", "Earlier we discussed intake feedback.", minutes=1),
+        ]
+        for text in (
+            "BNL, we can put that rough exchange behind us. The limit on teasing still stands. "
+            "Which part of your latest published Journal deserves another conversation, and why?",
+            "What do you think of the newest Relay message?",
+            "Explain a passage from your latest Journal.",
+            "From your latest published Journal, tell me one part worth discussing and why it stuck with you.",
+            "Read your latest Journal and pick one topic from it.",
+            "I mean your newest published Journal. Choose a subject from it and explain why it matters.",
+            "I read your Journal. Tell me about it.",
+        ):
+            for policy in ("public_home", "sealed_test"):
+                with self.subTest(text=text, policy=policy):
+                    result = assemble_conversation_context_v2(
+                        [dict(item, channel_policy=policy) for item in history],
+                        req(current_texts=(text,), channel_policy=policy),
+                    )
+                    self.assertEqual(result.referent_status, "not_requested")
+                    self.assertNotEqual(result.referent_reason, "no_bounded_same_room_candidates")
+
+    def test_publication_words_do_not_erase_other_message_or_exact_reply_references(self):
+        history = [
+            row(1, "user", "The copper tuning fork was my contribution.", minutes=2, mid=111),
+            row(2, "model", "Your copper tuning fork gave us a useful comparison.", minutes=1, mid=112),
+        ]
+        for text in (
+            "Read your latest Journal and explain the previous message.",
+            "Who wrote that in your latest Journal?",
+            "What did that Journal entry mean?",
+            "Compare the latest Journal with it.",
+            "Read the latest Journal and explain how it differs from it.",
+        ):
+            with self.subTest(text=text):
+                result = assemble_conversation_context_v2(history, req(current_texts=(text,)))
+                self.assertNotEqual(result.referent_status, "not_requested")
+        for text in (
+            "Which part of your latest Journal deserves another conversation?",
+            "Who wrote that in your latest Journal?",
+        ):
+            with self.subTest(exact_reply=text):
+                result = assemble_conversation_context_v2(history, req(
+                    current_texts=(text,), referenced_message_ids=(111,),
+                ))
+                self.assertEqual(result.referent_reason, "discord_reply_source")
+                self.assertEqual(result.referent_selected_row_ids, (1,))
+
     def test_attribution_followup_uses_latest_answer_to_same_requester(self):
         rows = [
             row(1, "user", "Recall the June 1 recipe discussion.", minutes=4),
