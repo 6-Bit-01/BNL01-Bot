@@ -541,9 +541,11 @@ disabled by default and requires all of the following:
 - all three global live switches off; and
 - a direct `normal_chat` request in `sealed_test`, for the requesting member.
 
-This reads existing member posture through the Relationship owner. It does not
-admit sealed messages as relationship evidence, change channel policy, grant
-another member's posture, or authorize proactive messages. Aggregate
+This reads existing member posture through the Relationship owner. Eligible
+public history and this sealed room's own isolated history can inform its
+private view. It does not write sealed evidence into public relationship state,
+change channel policy, grant another member's posture, or authorize proactive
+messages. Aggregate
 `relationship_v2_prompt` logs identify whether the sealed authority supplied
 tone, without logging scores, relationship labels, or private evidence.
 
@@ -553,8 +555,9 @@ memory question in the approved channel. Check the selected path and send-time
 source refresh as well as the replies. Disable the sealed switch and confirm
 ordinary routing returns. No public activation follows automatically.
 
-This integration does not replace the phrase-based event classifier or prove
-semantic relationship formation. Contextual classification, source withdrawal,
+The public event classifier and durable relationship state remain unchanged.
+The optional semantic private read described below does not prove semantic
+relationship formation in public. Contextual classification, source withdrawal,
 repair over time, and representative comparisons remain prerequisites for
 broader Relationship activation. Artist assessments, factual memory tiers,
 Core promotion, and autonomous engagement retain their existing owners.
@@ -610,15 +613,18 @@ operation.
 The existing Relationship owner can compare its phrase classifier with a model
 interpretation of each new eligible, directed human turn and up to seven earlier
 original turns from that member and BNL in the same room and half-hour window.
-It does not require a qualified Moment. Sealed tests, passive capture, other
-members, group replies, private sources, and ineligible routes do not enter.
+It does not require a qualified Moment. Public comparisons exclude sealed tests;
+isolated private comparisons retain their exact sealed channel scope. Passive
+capture, other members, group replies, unrelated private sources, and ineligible
+routes do not enter.
 Originals are reopened in full within a bounded budget; derived summaries and
 old relationship scores cannot decide what a member meant.
 
 This stage is **comparison only**. It stores source references, a source digest,
 the old label, candidate signal types, and attempt status inside the Relationship
-owner. No generated explanation or transcript is stored there. Results do not
-alter relationship events, scores, settings, consent, memory, or public output.
+owner. No generated explanation or transcript is stored there. Comparison
+collection does not alter relationship events, scores, settings, consent,
+memory, or public output.
 Model judgments and exact supporting excerpts are shape-checked, but this is not
 proof of semantic correctness. Compare real outcomes before proposing adoption.
 
@@ -647,3 +653,44 @@ recheck scope before saving. Existing relationship formation and consent setting
 continue unchanged; no table deletion or relationship backfill is needed. A later
 proposal to use contextual interpretations for relationship formation or public
 tone still needs its own comparison review and activation decision.
+
+## Semantic tone inside the sealed Relationship canary
+
+The existing sealed canary can use validated interpretation results for its
+temporary same-member tone calculation. This additionally requires the meaning
+comparison switch and approved meaning guild scope. Deployment does not enable
+the canary. The global Relationship, Governance and Active Engagement live
+switches remain off, so ordinary shared-brain routing remains available.
+
+The Relationship owner reopens every interpretation's original target and bound
+context and verifies the stored digest. Eligible public history and only the
+current sealed room's private history can contribute. A result replaces the
+phrase classification for that human target, rather than adding another copy of
+the evidence. A validated empty result suppresses a phrase false positive;
+validated signals can also cover a paraphrase that produced no phrase event.
+The existing weights and state calculation are reused without persisting the
+temporary result as public state, an event, a preference, or a memory fact.
+
+Explicit consent and relationship-mode controls keep their existing authority.
+Interpretations cannot grant consent, infer an opt-in, supply a model acceptance,
+or add positive relationship evidence from BNL's own prose. Missing or unfinished
+interpretations may use eligible current phrase evidence. Withdrawn, malformed,
+or source-mismatched interpretations cannot revive their older phrase label.
+Corrections, including a standalone `correction_of` link, retire affected
+interpretations; removing the link later does not restore the old result.
+
+Acceptance must activate both ordinary private scope and the sealed Relationship
+scope in the same test and assert that the ordinary route actually ran. A test
+override alone is not that proof. Check factual context and the private tone unit
+together, one generation call, member/channel/guild isolation, source withdrawal,
+current boundaries, explicit controls and send-time refresh. Mocked provider
+tests prove those connections, not model judgment or natural reliability.
+
+After a separate owner-approved deployment and activation, start with one member
+in the existing private testing channel. Exercise varied wording of a boundary,
+repair and a factual recall request without forcing a transcript or exposing
+private labels. Public semantic relationship behavior and autonomous engagement
+remain outside that canary. Roll back by disabling
+`BNL_RELATIONSHIP_V2_SEALED_CANARY_ENABLED` and restarting normally; retain the
+comparison receipts. Turning off only the meaning switch returns the enabled
+sealed canary to its existing phrase-based read.

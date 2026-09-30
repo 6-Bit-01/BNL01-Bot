@@ -31,6 +31,9 @@ EVENT_TYPES = (
     "repair_attempt", "repair_accepted", "open_loop", "follow_up", "return_recognition", "explicit_relationship_mode_preference",
     "explicit_engagement_opt_out", "explicit_engagement_opt_in", "model_audit", "model_playful_rivalry_acceptance", "unclassified",
 )
+EXPLICIT_CONTROL_TYPES = frozenset({
+    "explicit_relationship_mode_preference", "explicit_engagement_opt_out", "explicit_engagement_opt_in",
+})
 WEIGHTS: dict[str, dict[str, float]] = {
     "acknowledgement": {"rapport": .04, "familiarity": .03},
     "appreciation": {"rapport": .12, "support": .03},
@@ -209,6 +212,26 @@ def ensure_relationship_v2_schema(conn: sqlite3.Connection) -> None:
             WHERE receipt_id IN (SELECT receipt_id FROM relationship_meaning_roots_v2
               WHERE guild_id=NEW.guild_id AND entry_id=NEW.target_entry_id);
             END""")
+        # Existing databases already have v1. Add the correction fence without
+        # dropping that trigger, and retire pre-upgrade correction receipts once.
+        correction_fence_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='rel_meaning_lineage_correction_v2'"
+        ).fetchone()
+        cur.execute("""CREATE TRIGGER IF NOT EXISTS rel_meaning_lineage_correction_v2
+            AFTER INSERT ON memory_ledger_lineage
+            WHEN NEW.lineage_type='correction_of' BEGIN
+            UPDATE relationship_meaning_v2 SET status='source_invalidated',semantic_types_json='[]'
+            WHERE receipt_id IN (SELECT receipt_id FROM relationship_meaning_roots_v2
+              WHERE guild_id=NEW.guild_id AND entry_id=NEW.target_entry_id);
+            END""")
+        if not correction_fence_exists:
+            cur.execute("""UPDATE relationship_meaning_v2
+                SET status='source_invalidated',semantic_types_json='[]'
+                WHERE receipt_id IN (
+                    SELECT r.receipt_id FROM relationship_meaning_roots_v2 r
+                    JOIN memory_ledger_lineage l ON l.guild_id=r.guild_id
+                      AND l.target_entry_id=r.entry_id
+                    WHERE l.lineage_type='correction_of')""")
     for sql in (
         "CREATE INDEX IF NOT EXISTS idx_relv2_events_subject ON relationship_events_v2(guild_id, subject_user_id, lifecycle, observed_at)",
         "CREATE INDEX IF NOT EXISTS idx_relv2_events_source ON relationship_events_v2(guild_id, source_table, source_row_id)",
@@ -364,12 +387,12 @@ def proactive_consent_decision(
         return False, "member_opt_out"
     return True, "proactive_consent_allowed"
 
-def rebuild_state(conn: sqlite3.Connection, *, guild_id: int, subject_user_id: int, evaluated_at: str = "", private_channel_id: int = 0) -> dict[str, Any]:
+def rebuild_state(conn: sqlite3.Connection, *, guild_id: int, subject_user_id: int, evaluated_at: str = "", private_channel_id: int = 0, meaning_canary: bool = False, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     ensure_relationship_v2_schema(conn); eval_dt = parse_utc(evaluated_at or _now())
     settings = get_member_settings(conn, guild_id=guild_id, user_id=subject_user_id)
     scores = {d: 0.0 for d in DIMENSIONS}; counts: dict[str, int] = {}; excluded: dict[str, int] = {}; last_user = last_direct = last_repair = ""
     opt_out = _latest_pref(conn, guild_id=guild_id, user_id=subject_user_id, key="proactive") == "disabled"
-    raw = conn.execute("SELECT event_type,actor_role,observed_at,lifecycle,direction,channel_policy,channel_id,source_row_id "
+    raw = conn.execute("SELECT event_type,actor_role,observed_at,lifecycle,direction,channel_policy,channel_id,source_row_id,source_table "
                        "FROM relationship_events_v2 WHERE guild_id=? AND subject_user_id=? "
                        "AND (channel_policy<>'sealed_test' OR channel_id=?) ORDER BY observed_at,event_id",
                        (guild_id, subject_user_id, private_channel_id if private_channel_id > 0 else -1)).fetchall()
@@ -377,7 +400,39 @@ def rebuild_state(conn: sqlite3.Connection, *, guild_id: int, subject_user_id: i
     private_preferences = {}
     private_sources = {source['row_id']: source for source in private_conversation_sources(
         conn, guild_id=guild_id, user_id=subject_user_id, channel_id=private_channel_id)}
+    use_meaning = bool(meaning_canary and guild_id in meaning_guild_ids(environ)
+        and sealed_canary_enabled(guild_id=guild_id, user_id=subject_user_id,
+            channel_id=private_channel_id, route_mode='normal_chat', channel_policy='sealed_test',
+            direct=True, environ=environ))
+    meanings = _sealed_meaning_evidence(conn, guild_id=guild_id, user_id=subject_user_id,
+        channel_id=private_channel_id) if use_meaning else {}
+    lexical_seen = set()
+    boundary_events = []
     for event in raw:
+        source_row_id = int(event[7]) if str(event[7]).isdigit() else 0
+        ordinary_human = (event[1] == 'user' and event[8] == 'conversations'
+                          and event[0] not in EXPLICIT_CONTROL_TYPES)
+        if use_meaning and ordinary_human:
+            # A ready empty judgment replaces a lexical false positive too.
+            # Withdrawn/invalid results never revive the superseded old label.
+            if source_row_id in meanings:
+                if event[3] != ('review_only' if event[5] == 'sealed_test' else 'active'):
+                    meanings[source_row_id] = None
+                continue
+            if event[3] != ('review_only' if event[5] == 'sealed_test' else 'active'):
+                continue
+            source = _current_relationship_target(conn, guild_id=guild_id,
+                user_id=subject_user_id, source_row_id=source_row_id,
+                private_channel_id=private_channel_id)
+            if (not source or source['channel_id'] != event[6]
+                    or source['ledger']['channel_policy'] != event[5]
+                    or classify_message(source['text'], actor_role='user', directed=True,
+                        channel_policy='public_home', route_mode=source['ledger']['route_mode'])[0] != event[0]
+                    or (source_row_id, event[0]) in lexical_seen):
+                continue
+            lexical_seen.add((source_row_id, event[0]))
+            if event[0] in {'boundary', 'boundary_respected'}:
+                boundary_events.append((parse_utc(source['timestamp']), source_row_id, event[0]))
         if event[5] == 'sealed_test':
             source = private_sources.get(int(event[7])) if str(event[7]).isdigit() else None
             if not source or event[3] != 'review_only':
@@ -393,6 +448,20 @@ def rebuild_state(conn: sqlite3.Connection, *, guild_id: int, subject_user_id: i
                 private_preferences['rivalry'] = True
         else:
             rows.append(event[:5])
+    for evidence in meanings.values():
+        if evidence is not None:
+            source, types = evidence
+            rows.extend((kind, 'user', source['timestamp'], 'active', 'user_to_bnl') for kind in types)
+            if 'boundary' in types:
+                boundary_events.append((parse_utc(source['timestamp']), source['row_id'], 'boundary'))
+            elif ('boundary_respected' in types and classify_message(source['text'], actor_role='user',
+                    directed=True, channel_policy='public_home', route_mode=source['ledger']['route_mode'])[0]
+                    == 'boundary_respected'):
+                # Recognizing that a limit was respected is not permission to
+                # resume. Reopening retains the existing explicit human path.
+                boundary_events.append((parse_utc(source['timestamp']), source['row_id'], 'boundary_respected'))
+    if use_meaning:
+        rows.sort(key=lambda row: (parse_utc(row[2]), row[0]))
     if 'proactive' in private_preferences:
         opt_out = not private_preferences['proactive']
     model_accept = 0
@@ -412,6 +481,10 @@ def rebuild_state(conn: sqlite3.Connection, *, guild_id: int, subject_user_id: i
     if counts.get("boundary", 0) and not counts.get("boundary_respected", 0): scores["boundary_alignment"] = min(scores["boundary_alignment"], -0.15)
     rivalry = "neutral"
     active_boundary = counts.get("boundary", 0) > counts.get("boundary_respected", 0)
+    if use_meaning and boundary_events:
+        active_boundary = sorted(boundary_events)[-1][2] == 'boundary'
+        if active_boundary:
+            scores['boundary_alignment'] = min(scores['boundary_alignment'], -.15)
     explicit_opt_in = _latest_pref(conn, guild_id=guild_id, user_id=subject_user_id, key="playful_rivalry_opt_in") == "enabled"
     explicit_opt_in = private_preferences.get("rivalry", explicit_opt_in)
     if opt_out or active_boundary or not settings["playful_rivalry_enabled"]: rivalry = "neutral"
@@ -423,7 +496,13 @@ def rebuild_state(conn: sqlite3.Connection, *, guild_id: int, subject_user_id: i
     stage = "new" if scores["familiarity"] < .1 else "known" if scores["trust"] < .2 else "trusted"
     if private_channel_id <= 0:
         now = _now(); conn.execute("""INSERT OR REPLACE INTO relationship_state_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (guild_id, subject_user_id, subject_key_for_user(subject_user_id), *[_clamp(scores[d]) for d in DIMENSIONS], json.dumps(counts, sort_keys=True), last_user, last_direct, last_repair, stage, rivalry, 1 if opt_out else 0, eval_dt.isoformat(), now, SCHEMA_VERSION))
-    return {**{d: _clamp(scores[d]) for d in DIMENSIONS}, "evidence_counts": counts, "excluded_counts": excluded, "relationship_stage": stage, "rivalry_state": rivalry, "engagement_opt_out": opt_out}
+    state = {**{d: _clamp(scores[d]) for d in DIMENSIONS}, "evidence_counts": counts, "excluded_counts": excluded, "relationship_stage": stage, "rivalry_state": rivalry, "engagement_opt_out": opt_out}
+    if use_meaning:
+        state['active_boundary'] = active_boundary
+        state['meaning_basis_digest'] = _hash(json.dumps([
+            (row_id, evidence[0]['meaning_digest'], evidence[1]) if evidence else (row_id, None)
+            for row_id, evidence in sorted(meanings.items())], sort_keys=True))
+    return state
 
 def set_member_setting(conn: sqlite3.Connection, *, guild_id: int, user_id: int, proactive_enabled: bool | None = None, playful_rivalry_enabled: bool | None = None) -> dict[str, Any]:
     ensure_relationship_v2_schema(conn); now=_now(); sk=subject_key_for_user(user_id)
@@ -457,8 +536,11 @@ def governed_summary(conn: sqlite3.Connection, *, guild_id: int, user_id: int, r
     ): return ""
     ensure_relationship_v2_schema(conn); settings = get_member_settings(conn, guild_id=guild_id, user_id=user_id)
     row=conn.execute("SELECT rapport,trust,familiarity,friction,support,repair,relationship_stage,rivalry_state,engagement_opt_out FROM relationship_state_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).fetchone()
+    active_private_boundary = False
     if channel_policy == "sealed_test" and channel_id > 0:
-        state = rebuild_state(conn, guild_id=guild_id, subject_user_id=user_id, private_channel_id=channel_id)
+        state = rebuild_state(conn, guild_id=guild_id, subject_user_id=user_id, private_channel_id=channel_id,
+                              meaning_canary=scoped, environ=environ)
+        active_private_boundary = state.get('active_boundary', False)
         row = tuple(state[k] for k in ('rapport','trust','familiarity','friction','support','repair',
                                       'relationship_stage','rivalry_state','engagement_opt_out'))
     if not row: return ""
@@ -475,6 +557,8 @@ def governed_summary(conn: sqlite3.Connection, *, guild_id: int, user_id: int, r
     if not proactive_allowed: safe.append("No proactive recognition or follow-up.")
     if rivalry == "mutual_rivalry" and settings["playful_rivalry_enabled"] and proactive_allowed: safe.append("Rivalry only if the member continues it now.")
     if fric > .05 or repair > .05: safe.append("Allow repair; do not replay old friction.")
+    if active_private_boundary:
+        safe.append("Respect the member's stated limits; repair or gratitude alone does not withdraw them.")
     # The fixed clauses fit the existing 500-character allowance together.
     # Never truncate away a member boundary or the current-context precedence.
     return " ".join(safe)
@@ -527,10 +611,16 @@ def shadow_packet_posture(
         """,
         (int(guild_id or 0), int(user_id or 0)),
     ).fetchone()
+    active_private_boundary = False
     if channel_policy == 'sealed_test' and channel_id > 0:
-        state = rebuild_state(conn, guild_id=guild_id, subject_user_id=user_id, private_channel_id=channel_id)
+        state = rebuild_state(conn, guild_id=guild_id, subject_user_id=user_id, private_channel_id=channel_id,
+            meaning_canary=sealed_canary_enabled(guild_id=guild_id, user_id=user_id,
+                channel_id=channel_id, route_mode=route_mode, channel_policy=channel_policy,
+                direct=direct, environ=environ), environ=environ)
+        active_private_boundary = state.get('active_boundary', False)
         private_sources = private_conversation_sources(conn, guild_id=guild_id, user_id=user_id, channel_id=channel_id)
-        version = _hash(str(row[7]) if row else '', channel_id, _meaning_digest(list(private_sources)))
+        version = _hash(str(row[7]) if row else '', channel_id, _meaning_digest(list(private_sources)),
+                        state.get('meaning_basis_digest', ''))
         row = tuple(state[k] for k in ('rapport', 'familiarity', 'friction', 'repair',
                      'relationship_stage', 'rivalry_state', 'engagement_opt_out')) + (version, SCHEMA_VERSION)
     if not row:
@@ -561,7 +651,7 @@ def shadow_packet_posture(
         else "low_history"
     )
     boundary_mode = (
-        "repair_aware"
+        "boundary_active" if active_private_boundary else "repair_aware"
         if float(friction or 0) > 0.05 or float(repair or 0) > 0.05
         else "ordinary"
     )
@@ -910,7 +1000,7 @@ def _meaning_source(conn: sqlite3.Connection, entry_id: str, *, guild_id: int,
             or entry["route_mode"] not in RELATIONSHIP_LIVE_ROUTES
             or entry["lifecycle_status"] not in {"active", "review_only"}
             or conn.execute("SELECT 1 FROM memory_ledger_lineage WHERE guild_id=? "
-                            "AND target_entry_id=? AND lineage_type IN ('supersedes','retracts')",
+                            "AND target_entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')",
                             (guild_id, entry_id)).fetchone()):
         return None
     cursor = conn.execute("SELECT * FROM conversations WHERE id=? AND guild_id=? AND user_id=?",
@@ -1057,6 +1147,63 @@ def _meaning_current_sources(conn: sqlite3.Connection, row: tuple) -> list[dict[
         return []
 
 
+def _current_relationship_target(conn: sqlite3.Connection, *, guild_id: int,
+                                 user_id: int, source_row_id: int,
+                                 private_channel_id: int) -> dict[str, Any] | None:
+    """Validate original evidence for the canary's lexical fallback only."""
+    if not _table_exists(conn, 'memory_ledger_entries'):
+        return None
+    roots = conn.execute("SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? "
+        "AND source_table='conversations' AND source_row_id=? ORDER BY entry_id",
+        (guild_id, str(source_row_id)))
+    for (root,) in roots:
+        source = _meaning_source(conn, root, guild_id=guild_id, user_id=user_id,
+                                 private_channel_id=private_channel_id)
+        if source and source['role'] == 'user':
+            return source
+    return None
+
+
+def _sealed_meaning_evidence(conn: sqlite3.Connection, *, guild_id: int,
+                             user_id: int, channel_id: int) -> dict[int, Any]:
+    """Ephemeral replacements, never events or public state.
+
+    Missing or not-yet-interpreted sources retain the validated lexical fallback.
+    A withdrawn, malformed or stale receipt withholds that target instead of
+    reviving its old lexical label. Ready empty results intentionally mean none.
+    """
+    evidence = {}
+    rows = conn.execute("SELECT receipt_id,guild_id,subject_user_id,source_row_id,root_ids_json,source_digest,"
+        "legacy_type,semantic_types_json,status,scope_channel_id FROM relationship_meaning_v2 "
+        "WHERE version=? AND guild_id=? AND subject_user_id=? AND scope_channel_id IN (0,?) "
+        "ORDER BY source_row_id,receipt_id", (MEANING_VERSION, guild_id, user_id, channel_id))
+    for row in rows:
+        # Explicit member controls retain their separate, existing authority.
+        if row[6] in EXPLICIT_CONTROL_TYPES:
+            continue
+        sources = _meaning_current_sources(conn, row[:6])
+        source = sources[-1] if sources else None
+        expected_scope = (source['channel_id'] if source
+            and source['ledger']['channel_policy'] == 'sealed_test' else 0)
+        if (not source or expected_scope != row[9]
+                or row[8] in {'source_invalidated', 'invalid_result'}):
+            evidence[row[3]] = None
+            continue
+        if row[8] != 'ready':
+            continue
+        try:
+            types = json.loads(row[7])
+            if (not isinstance(types, list) or len(types) > 3
+                    or not all(isinstance(kind, str) and kind in MEANING_EVENT_TYPES for kind in types)
+                    or len(set(types)) != len(types)):
+                raise ValueError('invalid_signal_types')
+        except (TypeError, ValueError):
+            evidence[row[3]] = None
+            continue
+        evidence[row[3]] = ({**source, 'meaning_digest': row[5]}, tuple(sorted(types)))
+    return evidence
+
+
 def claim_relationship_meaning(conn: sqlite3.Connection, *, now: datetime | None = None) -> RelationshipMeaningRequest | None:
     guilds = meaning_guild_ids()
     if not guilds:
@@ -1113,8 +1260,7 @@ def claim_relationship_meaning(conn: sqlite3.Connection, *, now: datetime | None
 
 
 # Consent and rivalry opt-in remain with explicit existing member controls.
-MEANING_EVENT_TYPES = frozenset(EVENT_TYPES) - {
-    "explicit_relationship_mode_preference", "explicit_engagement_opt_out", "explicit_engagement_opt_in",
+MEANING_EVENT_TYPES = frozenset(EVENT_TYPES) - EXPLICIT_CONTROL_TYPES - {
     "model_audit", "model_playful_rivalry_acceptance", "unclassified",
 }
 
