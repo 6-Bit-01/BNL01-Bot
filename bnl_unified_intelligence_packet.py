@@ -5253,42 +5253,58 @@ def _relay_publication_items(
 def _subject_independent_publication_lanes(
     request: IntelligencePacketRequest,
 ) -> frozenset[str]:
-    """Keep publication tasks separate from unrelated subject ambiguity."""
+    """Keep independent publication tasks separate from subject uncertainty.
+
+    This does not resolve a person or waive publication, reply or event
+    ambiguity. The publication owner still selects and revalidates its source;
+    only an explicit task that needs no person can use that source lane.
+    """
 
     ambiguity_reasons = frozenset(
         str(reason or "").strip().lower()
         for reason in request.frame_ambiguity_reasons
         if str(reason or "").strip()
     )
-    concrete_subjects = tuple(
-        subject
-        for subject in request.frame_subjects
-        if int(subject.user_id or 0) > 0
-        or str(subject.entity_ref or "").strip()
-    )
+    frame_status = str(request.frame_status or "").strip().lower()
+    subject_only_ambiguities = frozenset({
+        "multiple_subject_candidates", "member_label_unresolved",
+        "third_party_subject_unresolved", "required_subject_unresolved",
+    })
     if (
-        str(request.frame_status or "").strip().lower() != "ambiguous"
-        or ambiguity_reasons != frozenset({"multiple_subject_candidates"})
+        frame_status not in {"resolved", "ambiguous"}
+        or (frame_status == "resolved" and ambiguity_reasons)
+        or (frame_status == "ambiguous" and not ambiguity_reasons)
+        or not ambiguity_reasons.issubset(subject_only_ambiguities)
         or str(request.frame_subject_requirement or "").strip().lower()
         != "required"
-        or len(concrete_subjects) < 2
     ):
         return frozenset()
 
     lanes = set()
+    subject_bound_lanes = set()
     for task in request.frame_tasks:
         object_kind = str(task.object_kind or "").strip().lower()
+        if object_kind not in {"journal", "relay"}:
+            continue
+        lane = "%s_publication" % object_kind
+        if (
+            str(task.subject_requirement or "").strip().lower() == "required"
+            or task.subject_indexes
+        ):
+            # The existing publication reader receives the combined query.
+            # Do not lend its lane to a different, person-dependent task for
+            # that same owner without separately scoped publication evidence.
+            subject_bound_lanes.add(lane)
+            continue
         if (
             str(task.authority_scope or "").strip().lower() == "packet"
             and str(task.task_kind or "").strip().lower()
             == "retrieve_publication"
             and str(task.subject_requirement or "").strip().lower()
-            != "required"
-            and not task.subject_indexes
-            and object_kind in {"journal", "relay"}
+            == "not_applicable"
         ):
-            lanes.add("%s_publication" % object_kind)
-    return frozenset(lanes)
+            lanes.add(lane)
+    return frozenset(lanes - subject_bound_lanes)
 
 
 def _filter_frame_applicable_candidates(
@@ -5318,7 +5334,7 @@ def _filter_frame_applicable_candidates(
         reason = "frame_subject_%s" % subject_resolution.status
         subject_independent_publication_lanes = (
             _subject_independent_publication_lanes(request)
-            if subject_resolution.status == "ambiguous"
+            if subject_resolution.status in {"ambiguous", "unresolved"}
             else frozenset()
         )
         for item in candidates:
@@ -6575,7 +6591,7 @@ def _revalidate_packet_in_snapshot(
         _subject_independent_publication_lanes(packet.request)
     )
     subject_independent_publication_content = bool(
-        current_subject_resolution.status == "ambiguous"
+        current_subject_resolution.status in {"ambiguous", "unresolved"}
         and subject_independent_publication_lanes
         and any(
             item.lane in subject_independent_publication_lanes
@@ -6853,7 +6869,7 @@ def _packet_invariants(
     invalid = []
     subject_independent_publication_lanes = (
         _subject_independent_publication_lanes(packet.request)
-        if packet.subject_resolution.status == "ambiguous"
+        if packet.subject_resolution.status in {"ambiguous", "unresolved"}
         else frozenset()
     )
     accepted_subject_keys = {
