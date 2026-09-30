@@ -18,6 +18,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot as bot
 import bnl_journal as journal
+from bnl_shared_brain_synthesis import ordinary_chat_task_support_plan
 
 
 class PublicationPromptLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -74,6 +75,180 @@ class PublicationPromptLifecycleTests(unittest.IsolatedAsyncioTestCase):
             source_kind="journal", journal_control_snapshot=self.snapshot,
             journal_control_snapshot_provided=True,
         )
+
+    def enable_actual_publication_pipeline(self):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.dict(os.environ, {
+            **{key: "false" for key in os.environ
+               if key.startswith("BNL_") and key.endswith("_ENABLED")},
+            "BNL_CONVERSATION_CONTEXT_V2_ENABLED": "true",
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_PUBLIC_ENABLED": "true",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_GUILD_IDS": "1",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_USER_IDS": "7",
+            "BNL_ORDINARY_CHAT_SINGLE_PACKET_CHANNEL_IDS": "10",
+        }))
+        bot.init_db()
+        bot.upsert_user_profile(7, 1, "Test Speaker")
+        self.addCleanup(bot.purge_member_memory_caches, 7, 1)
+        self.pipeline_now = datetime.fromisoformat(self.snapshot.observed_at)
+        stack.enter_context(mock.patch.object(
+            bot, "_journal_publication_control_snapshot_sync", return_value=(self.snapshot, "valid"),
+        ))
+        stack.enter_context(mock.patch.object(bot, "get_temporal_context",
+            return_value=bot.get_temporal_context(self.pipeline_now)))
+        stack.enter_context(mock.patch.object(bot, "should_allow_greeting", return_value=False))
+        stack.enter_context(mock.patch.object(bot, "choose_response_style",
+            return_value=("balanced", "Respond naturally.")))
+
+    def actual_publication_prompt(self, text, policy, *, unrelated_hint=False,
+                                  history=None, history_age_minutes=0):
+        # Neutral earlier exchanges exercise the real history selector. They
+        # are not the latest Journal and must not become its source authority.
+        history = history or (
+            ("user", "Recall the correction about the missing shoes."),
+            ("model", "The correction concerned footwear."),
+            ("user", "What practical question did the earlier discussion leave open?"),
+            ("model", "Earlier we discussed intake feedback."),
+        )
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("DELETE FROM conversations")
+            for index, (role, content) in enumerate(history, 1):
+                conn.execute("""INSERT INTO conversations(
+                    guild_id,user_id,user_name,role,content,channel_id,channel_name,
+                    channel_policy,route_mode,timestamp
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""", (
+                    1, 7, "Test Speaker", role, content, 10, "test-room", policy,
+                    "normal_chat", (self.pipeline_now - timedelta(minutes=history_age_minutes+5-index)).isoformat(),
+                ))
+        context_out = {}
+        surface = bot.conversation_surface_for_channel_policy(policy)
+        room = bot.build_conversation_context_v2_for_prompt(
+            guild_id=1, current_user_id=7, channel_id=10, channel_name="test-room",
+            channel_policy=policy, route_mode="normal_chat", conversation_surface=surface,
+            current_texts=(text,), current_participants={7}, is_direct_target=True,
+            now=self.pipeline_now, result_out=context_out,
+        )
+        context = context_out["result"]
+        orchestration = bot.build_live_conversation_orchestration_decision(
+            engagement_decision="answer", engagement_reason="direct_request",
+            channel_policy=policy, addressings=(), context_result=context,
+            moment_situation=None, guild_id=1, channel_id=10, route_mode="normal_chat",
+            conversation_surface=surface, current_text=text,
+            current_speaker_user_ids=(7,), current_speaker_labels=("Test Speaker",),
+            # A reversible label is a hint, never a fabricated person binding.
+            subject_label_hints=("Test Visitor",) if unrelated_hint else (),
+            influence_mode="live",
+        )
+        metadata = {}
+        prompt, *_ = bot.build_user_aware_prompt(
+            7, 1, "Test Speaker", text, channel_id=10, channel_name="test-room",
+            channel_policy=policy, route_mode="normal_chat", is_direct_interaction=True,
+            room_context=room, conversation_context_result=context,
+            conversation_orchestration=orchestration, prompt_metadata=metadata,
+        )
+        self.assertTrue(metadata["ordinary_chat_single_packet_applied"])
+        basis = metadata["ordinary_chat_single_packet_basis"]
+        self.assertIsNotNone(basis)
+        final = bot.build_packet_owned_prompt(prompt, basis)
+        return context, orchestration.situation_frame, basis, final
+
+    def test_live_journal_requests_survive_real_context_frame_packet_pipeline(self):
+        self.enable_actual_publication_pipeline()
+        requests = (
+            "BNL, we can put that rough exchange behind us. The limit on teasing still stands. "
+            "Which part of your latest published Journal deserves another conversation, and why?",
+            "BNL, I mean your most recently published Journal. Pick one actual topic from it "
+            "and tell me why you think it matters to the community.",
+            "I mean your newest published Journal. Choose a subject from it and explain why it matters.",
+        )
+        for policy in ("public_home", "sealed_test"):
+            for index, text in enumerate(requests):
+                variants = ((False, 0), (True, 0), (False, 130)) if index == 0 else ((False, 0), (True, 0))
+                prior = (("user", requests[0]), ("model", "Which Journal edition do you mean?")) if index else None
+                for hint, history_age in variants:
+                    with self.subTest(policy=policy, request=text, hint=hint, history_age=history_age):
+                        context, frame, basis, final = self.actual_publication_prompt(
+                            text, policy, unrelated_hint=hint, history=prior,
+                            history_age_minutes=history_age,
+                        )
+                        diagnostics = basis.packet.diagnostics
+                        self.assertEqual(diagnostics.journal_query_status, "eligible")
+                        self.assertEqual(diagnostics.journal_control_status, "valid")
+                        self.assertGreater(diagnostics.journal_candidate_count, 0)
+                        path = {
+                            "frame": frame.status,
+                            "tasks": [(task.task_kind, task.object_kind, task.authority_scope) for task in frame.tasks],
+                            "source_status": diagnostics.revalidation_status,
+                            "selected_lanes": [item.lane for item in basis.packet.items],
+                            "journal_in_final_prompt": "Receivers caught the signal" in final.prompt,
+                        }
+                        self.assertEqual(context.referent_status, "not_requested", path)
+                        if history_age:
+                            self.assertEqual(context.referent_candidate_count, 0)
+                            self.assertFalse(context.referent_selected_row_ids)
+                        self.assertNotIn("referent_unresolved", frame.ambiguity_reasons)
+                        journal_tasks = [task for task in frame.tasks
+                                         if task.object_kind == "journal" and task.task_kind == "retrieve_publication"]
+                        self.assertTrue(journal_tasks)
+                        self.assertFalse(any(task.authority_scope == "external_public" for task in frame.tasks))
+                        self.assertEqual(basis.packet.diagnostics.revalidation_status, "passed")
+                        publications = [item for item in basis.packet.items if item.lane == "journal_publication"]
+                        self.assertEqual([item.source_ref for item in publications], ["journal:journal_lifecycle:1"])
+                        self.assertIn("Receivers caught the signal", publications[0].text)
+                        self.assertNotIn("intake feedback", publications[0].text)
+                        self.assertTrue(final.ready, final.reason)
+                        self.assertIn("Ceramic Receivers", final.prompt)
+                        self.assertIn(text, final.prompt)
+                        plans = {plan.task_id: plan for plan in ordinary_chat_task_support_plan(basis)}
+                        for task in journal_tasks:
+                            self.assertEqual(plans[task.task_id].support_kind, "packet")
+                            self.assertTrue(plans[task.task_id].evidence_ids)
+                        self.assertFalse(bot.refresh_prompt_source_basis(basis)[1])
+
+    def test_actual_publication_pipeline_keeps_person_and_ambiguous_reference_fences(self):
+        self.enable_actual_publication_pipeline()
+        for policy in ("public_home", "sealed_test"):
+            for text in (
+                "What did that Journal entry say?",
+                "What does your latest published Journal say about Test Visitor?",
+                "What is in your latest Journal? What does your latest Journal say about Test Visitor?",
+            ):
+                with self.subTest(policy=policy, text=text):
+                    _context, frame, basis, final = self.actual_publication_prompt(
+                        text, policy, unrelated_hint=True,
+                    )
+                    self.assertFalse(any(item.lane == "journal_publication" for item in basis.packet.items))
+                    self.assertNotIn("Receivers caught the signal", final.prompt)
+                    self.assertTrue(frame.ambiguity_reasons or
+                                    any(task.subject_requirement == "required" for task in frame.tasks))
+        text = "I mean your latest published Journal. Where is Seattle?"
+        _context, frame, _basis, _final = self.actual_publication_prompt(text, "sealed_test")
+        self.assertTrue(any(task.authority_scope == "external_public" for task in frame.tasks))
+
+    def test_actual_publication_pipeline_rechecks_source_withdrawal(self):
+        self.enable_actual_publication_pipeline()
+        text = "BNL, I mean your most recently published Journal. Pick one actual topic from it."
+        _context, _frame, basis, final = self.actual_publication_prompt(text, "sealed_test", unrelated_hint=True)
+        self.assertEqual(basis.packet.diagnostics.journal_query_status, "eligible")
+        self.assertEqual(basis.packet.diagnostics.journal_control_status, "valid")
+        self.assertGreater(basis.packet.diagnostics.journal_candidate_count, 0)
+        self.assertTrue(final.ready)
+        self.assertIn("Receivers caught the signal", final.prompt)
+        self.assertFalse(bot.refresh_prompt_source_basis(basis)[1])
+        hidden = replace(self.snapshot, public_excluded_entry_ids=("journal_lifecycle",), digest="b" * 64)
+        with mock.patch.object(bot, "_journal_publication_control_snapshot_sync", return_value=(hidden, "valid")):
+            self.assertTrue(bot.refresh_prompt_source_basis(basis)[1])
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='retired'")
+        self.assertTrue(bot.refresh_prompt_source_basis(basis)[1])
 
     async def test_wrapper_builds_once_off_loop_and_publishes_metadata(self):
         loop_thread = threading.get_ident()

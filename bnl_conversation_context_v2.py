@@ -73,8 +73,40 @@ DEFINITE_CONTRIBUTION_REFERENT_RE = re.compile(
 )
 NEARBY_REFERENT_ACT_RE = re.compile(
     r"\b(?:analy[sz](?:e|is)|explain|review|read|respond|answer|"
-    r"summari[sz]e|interpret|discuss|continue|mean|think|said|wrote|"
+    r"summari[sz]e|interpret|discuss|continue|compare|contrast|mean|think|said|wrote|"
     r"posted|shared|sent|called|refer(?:ring)?\s+to)\b",
+    re.I,
+)
+_PUBLICATION_REFERENCE_RE = re.compile(
+    r"\b(?:(?P<determiner>this|that|these|those|the|your|our|my|BNL(?:-01)?['’]s)\s+)?"
+    r"(?:(?:latest|newest|most\s+recent(?:ly)?|current|last|previous|prior|earlier|recent(?:ly)?|"
+    r"published|accepted|saved|public|daily|weekly)\s+)*"
+    r"(?P<owner>journal|relay)\b(?:['’]s)?"
+    r"(?:\s+(?:latest|newest|most\s+recent(?:ly)?|current|published|accepted|saved|public))*"
+    r"(?:\s+(?:entry|entries|message|post|publication|excerpt))?"
+    r"(?:\s+(?:dated|from|of|on)\s+20\d{2}-\d{2}-\d{2})?"
+    r"(?:\s+(?:titled|called)\s+[\"'][^\"'\n]+[\"'])?",
+    re.I,
+)
+_PUBLICATION_ID_REFERENCE_RE = re.compile(r"\b(journal|relay)_[a-z0-9._:-]+\b", re.I)
+_PUBLICATION_CONTENT_NOUN = r"(?:topics?|subjects?|points?|themes?|parts?|sections?|passages?|entries|entry|ideas?|observations?|details?)"
+_PUBLICATION_LOCAL_OBJECT = r"(?:it|its|(?:this|that|these|those)(?:\s+" + _PUBLICATION_CONTENT_NOUN + r")?)\b"
+_PUBLICATION_CONTINUATION_RE = re.compile(
+    r"^\s*(?:(?:please|briefly|quickly|first|and|also|then)\s+)*(?:"
+    r"(?:why|how\s+so|why\s+so|how\s+come)\s*[.!?]*\s*$|"
+    r"(?:explain|summari[sz]e|interpret|discuss|review|read|retell|rephrase|rewrite|"
+    r"describe|expand\s+on|tell\s+me\s+about)\s+" + _PUBLICATION_LOCAL_OBJECT + r"|"
+    r"(?:(?:tell|show)\s+me\s+|explain\s+)?(?:what|which|why|how)\s+"
+    r"(?:(?:do|does|did|is|was|are|were|can|could|would|should|has|had)\s+)?"
+    r"(?:you\s+(?:think|feel|believe|say)\s+)?" + _PUBLICATION_LOCAL_OBJECT + r"|"
+    r"(?:pick|choose|select|take|find|explain|discuss|what|which|"
+    r"give\s+me|tell\s+me|show\s+me)\s+"
+    r"(?:[a-z][\w'-]*\s+){0,4}" + _PUBLICATION_CONTENT_NOUN + r"\s+"
+    r"(?:from|in|of)\s+(?:it|this|that)\b|"
+    r"(?:what(?:['’]s|\s+is|\s+are)\s+your\s+(?:own\s+)?"
+    r"(?:take|thoughts?|opinion|view|read|assessment|impression)|"
+    r"what\s+(?:do|did)\s+you\s+think|how\s+do\s+you\s+(?:feel|see\s+it))"
+    r"(?:\s+(?:on|about)\s+(?:this|that|it))?\s*[.!?]*\s*$)",
     re.I,
 )
 SPEAKER_ATTRIBUTION_REFERENT_RE = re.compile(
@@ -1273,6 +1305,91 @@ def _referent_input_text(text: str) -> str:
     return value
 
 
+def independent_publication_reference_spans(text: str) -> tuple[tuple[int, int, str], ...]:
+    """Find locally named publication sources, without selecting their content.
+
+    Journal/Relay owners retain identity, availability and privacy decisions.
+    A deictic source still needs its real referent; naming a source family or
+    explicit publication ID does not require a nearby Discord contribution.
+    """
+    value = str(text or "")
+    spans = [(match.start(), match.end(), match.group(1).lower())
+             for match in _PUBLICATION_ID_REFERENCE_RE.finditer(value)]
+    for match in _PUBLICATION_REFERENCE_RE.finditer(value):
+        determiner = str(match.group('determiner') or '').lower()
+        if determiner in {'this', 'that', 'these', 'those'}:
+            continue
+        if not determiner and re.search(
+            r"\b(?:this|that|these|those)\s+(?:[a-z][\w-]*\s+){0,2}$",
+            value[:match.start()], re.I,
+        ):
+            continue
+        spans.append((match.start(), match.end(), match.group('owner').lower()))
+    return tuple(sorted(spans))
+
+
+def publication_continuation_requested(text: str) -> bool:
+    """Recognize a dependent publication object, not an incidental pronoun."""
+    value = str(text or '')
+    return bool(not _PUBLICATION_REFERENCE_RE.search(value)
+                and not _PUBLICATION_ID_REFERENCE_RE.search(value)
+                and _PUBLICATION_CONTINUATION_RE.search(value))
+
+
+def publication_reference_context(clause: str, context: str) -> str:
+    """Retain the nearest named publication only through dependent clauses."""
+    if not context or not publication_continuation_requested(clause):
+        return ''
+    for span in reversed(tuple(re.finditer(r'[^.!?;]+(?:[.!?;]+|$)', context))):
+        prior = span.group().strip(' ,;.!?')
+        sources = independent_publication_reference_spans(prior)
+        owners = {owner for _start, _end, owner in sources}
+        has_unbound_source = any(
+            (match.start(), match.end(), match.group('owner').lower()) not in sources
+            for match in _PUBLICATION_REFERENCE_RE.finditer(prior)
+        )
+        if len(owners) == 1 and not has_unbound_source:
+            retained = context[span.start():].strip(' ,;.!?')
+            return re.sub(r'\s+(?:and|also|plus|then)\s*$', '', retained, flags=re.I)
+        if not publication_continuation_requested(prior):
+            break
+    return ''
+
+
+def _publication_scoped_referent_text(clause: str, *, inherited_source: bool = False) -> str:
+    """Remove only cues locally bound to an explicit publication source."""
+    spans = independent_publication_reference_spans(clause)
+    if not spans and not inherited_source:
+        return clause
+    characters = list(clause)
+    for start, end, _owner in spans:
+        characters[start:end] = ' ' * (end - start)
+    local_pronouns = r'\b(?:it|its|this|that|these|those)\b' if inherited_source else r'\bit(?:s)?\b'
+    for match in re.finditer(local_pronouns, clause, re.I):
+        preceding_ends = [end for _start, end, _owner in spans if end <= match.start()]
+        if not inherited_source and not preceding_ends:
+            continue
+        local_start = max(preceding_ends) if preceding_ends else 0
+        object_clause = clause[local_start:match.end()]
+        continuation = _PUBLICATION_CONTINUATION_RE.search(object_clause)
+        direct_object = bool(continuation and continuation.end() == len(object_clause))
+        # "Compare the Journal with it" still needs the other source. A
+        # subsequent explanation of it/its content can use the locally named
+        # publication, without turning a nearby room message into its source.
+        if re.search(r"\b(?:with|to|against|versus|vs|than|beside|between|by)\s+$",
+                     clause[:match.start()], re.I):
+            continue
+        if not direct_object and re.search(r'\b(?:from|of|about)\s+$', clause[:match.start()], re.I):
+            continue
+        if any(start <= match.start() < end for start, end in (
+            (attribution.start(), attribution.end())
+            for attribution in SPEAKER_ATTRIBUTION_REFERENT_RE.finditer(clause)
+        )):
+            continue
+        characters[match.start():match.end()] = ' ' * (match.end() - match.start())
+    return ''.join(characters)
+
+
 def nearby_contribution_referent_requested(text: str) -> bool:
     """Recognize a structural reference without keying on one exact phrase."""
 
@@ -1282,12 +1399,19 @@ def nearby_contribution_referent_requested(text: str) -> bool:
     # original text for source/date selection and inspect only this local
     # view for structural pointers.
     structural_text = TEMPORAL_REFERENT_MODIFIER_RE.sub(" ", value)
+    clauses = tuple(re.split(r"[.!?;\n]+", structural_text))
+    scoped_clauses = []
+    prior_context = ''
+    for clause in clauses:
+        inherited = publication_reference_context(clause, prior_context)
+        scoped_clauses.append(_publication_scoped_referent_text(clause, inherited_source=bool(inherited)))
+        prior_context = ('%s. %s' % (inherited, clause)) if inherited else clause
     attribution = bool(SPEAKER_ATTRIBUTION_REFERENT_RE.search(value))
     current_payload_complete = bool(
         CURRENT_TURN_NAMED_PAYLOAD_RE.search(value)
     )
     explicit_historical_position = bool(
-        POSITIONAL_REFERENT_RE.search(structural_text)
+        any(POSITIONAL_REFERENT_RE.search(clause) for clause in scoped_clauses)
     )
     if (
         current_payload_complete
@@ -1297,7 +1421,7 @@ def nearby_contribution_referent_requested(text: str) -> bool:
         return False
     # Do not combine a pointer from one statement with a request in another:
     # a correction followed by an independent question is still two acts.
-    for clause in re.split(r"[.!?;\n]+", structural_text):
+    for original_clause, clause in zip(clauses, scoped_clauses):
         pointer = bool(NEARBY_REFERENT_POINTER_RE.search(clause))
         noun = bool(NEARBY_REFERENT_NOUN_RE.search(clause))
         act = bool(NEARBY_REFERENT_ACT_RE.search(clause))
@@ -1308,7 +1432,7 @@ def nearby_contribution_referent_requested(text: str) -> bool:
         # existing resolution paths.
         definite_contribution = bool(DEFINITE_CONTRIBUTION_REFERENT_RE.search(clause))
         if (
-            SPEAKER_ATTRIBUTION_REFERENT_RE.search(clause)
+            SPEAKER_ATTRIBUTION_REFERENT_RE.search(original_clause)
             or (pointer and MODEL_REASONING_REFERENT_RE.search(clause))
             or (pointer and noun)
             or (definite_contribution and act)

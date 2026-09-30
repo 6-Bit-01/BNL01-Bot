@@ -23,7 +23,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from bnl_canon_source_contract import BNL01, CANON_ENTITY_IDENTITIES
-from bnl_conversation_context_v2 import assess_payload_grounding
+from bnl_conversation_context_v2 import (
+    assess_payload_grounding,
+    publication_reference_context,
+)
 
 
 ASSESSMENT_VERSION = "unified_response_assessment_v8"
@@ -707,12 +710,27 @@ def _situation_object(text: str) -> str:
     return "multiple" if matches else "unknown"
 
 
+def _publication_task_continuation(clause: str, context: str) -> str:
+    """Retain a publication antecedent only across dependent request clauses.
+
+    This is transient request scope, not source evidence. Keep the nearest
+    publication clause and its dependent chain, including any member or time
+    qualifiers on that clause. An independent task or setup ends the chain;
+    unrelated labels elsewhere in the full segment never acquire authority.
+    """
+
+    if _situation_object(clause) != "unknown":
+        return clause
+    retained = publication_reference_context(clause, context)
+    return "%s. %s" % (retained, clause) if retained else clause
+
+
 def _situation_task_parts(
     text: str,
     *,
     context_labels: Sequence[str] = (),
-) -> Tuple[Tuple[str, str], ...]:
-    """Return each full request segment and its authority-bearing clause.
+) -> Tuple[Tuple[str, str, str], ...]:
+    """Return each full segment, authority scope, and original action clause.
 
     Boundary cues are not a complete English task grammar. A clause that
     does not start with a recognized cue can still carry the main request,
@@ -786,13 +804,18 @@ def _situation_task_parts(
             merged_ranges[-1] = (full_start, len(value), task_start, task_end)
         else:
             merged_ranges.append((pending_start, len(value), pending_start, len(value)))
-    return tuple(
-        (
-            value[start:end].strip(" ,;.!?"),
-            value[task_start:task_end].strip(" ,;.!?"),
+    parts = []
+    previous_clause = ""
+    for start, end, task_start, task_end in merged_ranges:
+        full_segment = value[start:end].strip(" ,;.!?")
+        clause = value[task_start:task_end].strip(" ,;.!?")
+        setup = value[start:task_start].strip(" ,;.!?")
+        scoped_clause = _publication_task_continuation(
+            clause, setup or previous_clause,
         )
-        for start, end, task_start, task_end in merged_ranges
-    ) or ((str(text or ""), str(text or "")),)
+        parts.append((full_segment, scoped_clause, clause))
+        previous_clause = scoped_clause
+    return tuple(parts) or ((str(text or ""),) * 3,)
 
 
 def _situation_task_segments(
@@ -802,7 +825,7 @@ def _situation_task_segments(
 ) -> Tuple[str, ...]:
     return tuple(
         segment
-        for segment, _task_clause in _situation_task_parts(
+        for segment, _task_clause, _action_clause in _situation_task_parts(
             text, context_labels=context_labels,
         )
     )
@@ -822,7 +845,7 @@ def situation_request_clauses(
 
     return tuple(
         task_clause
-        for _segment, task_clause in _situation_task_parts(
+        for _segment, task_clause, _action_clause in _situation_task_parts(
             text, context_labels=context_labels,
         )
     )
@@ -1019,17 +1042,17 @@ def _situation_tasks(
             *(subject.label_hint for subject in subjects),
         ),
     )
-    for index, (full_segment, segment) in enumerate(parts, start=1):
-        phase = _situation_phase(segment)
+    for index, (full_segment, segment, action_clause) in enumerate(parts, start=1):
+        phase = _situation_phase(action_clause)
         object_kind = _situation_object(segment)
         temporal_scope, currentness = _situation_temporal_scope(segment)
         evidence = build_conversation_evidence_item(
-            text=segment,
+            text=action_clause,
             current_turn=True,
         )
         objective_kind = _objective_kind(
-            objective=_current_objective(segment),
-            current_options=_extract_option_anchors(segment),
+            objective=_current_objective(action_clause),
+            current_options=_extract_option_anchors(action_clause),
             immediate_recap=False,
             exact_quote_requested=False,
             evidence_items=(evidence,),
