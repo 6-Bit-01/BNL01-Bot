@@ -279,24 +279,38 @@ class PublicationReadAdapterTests(unittest.TestCase):
             body="The new note reached the public Journal.",
             published_at="2026-08-05T01:00:00Z",
         )
-        selected = journal.select_published_journal_entries_on_connection(
-            self.conn,
-            guild_id=1,
-            user_text=(
-                "what did the latest Journal say about BARCODE Radio "
-                "broadcast queue audience?"
-            ),
-            control_snapshot=control_snapshot(),
-            now=NOW,
-        )
+        for edition in ("latest", "most recent", "most recently published", "MOST  RECENTLY PUBLISHED"):
+            with self.subTest(edition=edition):
+                selected = journal.select_published_journal_entries_on_connection(
+                    self.conn,
+                    guild_id=1,
+                    user_text=(
+                        f"what did the {edition} Journal say about BARCODE Radio "
+                        "broadcast queue audience?"
+                    ),
+                    control_snapshot=control_snapshot(),
+                    now=NOW,
+                )
 
-        self.assertEqual(selected.status, "eligible")
-        self.assertEqual(selected.query_mode, "latest")
-        self.assertEqual(len(selected.publications), 1)
-        self.assertEqual(
-            selected.publications[0].entry_id,
-            "journal_newer_light",
-        )
+                self.assertEqual(selected.status, "eligible")
+                self.assertEqual(selected.query_mode, "latest")
+                self.assertEqual(len(selected.publications), 1)
+                self.assertEqual(selected.publications[0].entry_id, "journal_newer_light")
+
+    def test_most_recently_keeps_explicit_identity_and_date_precedence(self):
+        self.add_journal("journal_requested", published_at="2026-08-04T01:00:00Z")
+        self.add_journal("journal_newest", published_at="2026-08-05T01:00:00Z")
+        for text, mode in (
+            ("Read the most recently published Journal entry journal_requested.", "exact_identity"),
+            ("Read the most recently published Journal on 2026-08-04.", "exact_date"),
+        ):
+            with self.subTest(text=text):
+                selected = journal.select_published_journal_entries_on_connection(
+                    self.conn, guild_id=1, user_text=text,
+                    control_snapshot=control_snapshot(), now=NOW,
+                )
+                self.assertEqual(selected.query_mode, mode)
+                self.assertEqual([item.entry_id for item in selected.publications], ["journal_requested"])
 
     def test_natural_journal_topic_preserves_recent_publications_for_reasoning(self):
         self.add_journal(

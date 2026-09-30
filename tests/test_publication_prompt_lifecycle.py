@@ -40,10 +40,14 @@ class PublicationPromptLifecycleTests(unittest.IsolatedAsyncioTestCase):
             fresh_for_seconds=120,
             public_excluded_entry_ids=(), memory_excluded_entry_ids=(),
         )
+        self.add_journal("journal_lifecycle", "Ceramic Receivers", "Ceramic receivers returned.",
+                         "Receivers caught the signal.", "2026-08-02T01:00:00Z")
+
+    def add_journal(self, entry_id, title, excerpt, body, published_at, *, lifecycle="published"):
         entry = {
-            "entryId": "journal_lifecycle", "revision": 1,
-            "title": "Ceramic Receivers", "excerpt": "Ceramic receivers returned.",
-            "sections": [{"heading": "Carrier Notes", "body": "Receivers caught the signal."}],
+            "entryId": entry_id, "revision": 1,
+            "title": title, "excerpt": excerpt,
+            "sections": [{"heading": "Carrier Notes", "body": body}],
             "authoredAt": "2026-08-02T00:00:00Z",
             "sourceWindowStart": "2026-08-01T00:00:00Z",
             "sourceWindowEnd": "2026-08-02T00:00:00Z",
@@ -63,10 +67,10 @@ class PublicationPromptLifecycleTests(unittest.IsolatedAsyncioTestCase):
                   content_hash,source_window_start,source_window_end,authored_at,
                   published_at,created_at,updated_at
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (entry["entryId"], 1, 1, "published", entry["title"], entry["excerpt"],
+                (entry["entryId"], 1, 1, lifecycle, entry["title"], entry["excerpt"],
                  sections, payload, payload.encode(), entry["contentHash"],
                  entry["sourceWindowStart"], entry["sourceWindowEnd"], entry["authoredAt"],
-                 "2026-08-02T01:00:00Z", entry["authoredAt"], entry["authoredAt"]),
+                 published_at, entry["authoredAt"], entry["authoredAt"]),
             )
 
     def basis(self):
@@ -212,6 +216,43 @@ class PublicationPromptLifecycleTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(plans[task.task_id].support_kind, "packet")
                             self.assertTrue(plans[task.task_id].evidence_ids)
                         self.assertFalse(bot.refresh_prompt_source_basis(basis)[1])
+
+    def test_most_recently_selects_the_newest_edition_through_the_real_prompt_pipeline(self):
+        self.enable_actual_publication_pipeline()
+        self.add_journal(
+            "journal_older_dense", "An actual community topic",
+            "An actual topic that matters to the community.",
+            "Earlier intake feedback was a community topic worth discussing.",
+            "2026-07-25T01:00:00Z",
+        )
+        self.add_journal(
+            "journal_unpublished", "Unpublished future edition", "This is only a draft.",
+            "Unpublished copy must not become the newest publication.", None,
+            lifecycle="draft",
+        )
+        text = ("BNL, I mean your most recently published Journal. Pick one actual topic from it "
+                "and tell me why you think it matters to the community.")
+        history = (("user", "Which part of your latest Journal deserves another conversation?"),
+                   ("model", "Which Journal edition do you mean?"))
+        for policy in ("public_home", "sealed_test"):
+            for hint in (False, True):
+                with self.subTest(policy=policy, unrelated_hint=hint):
+                    _context, _frame, basis, final = self.actual_publication_prompt(
+                        text, policy, unrelated_hint=hint, history=history,
+                    )
+                    publications = [item for item in basis.packet.items if item.lane == "journal_publication"]
+                    self.assertEqual([item.source_ref for item in publications], ["journal:journal_lifecycle:1"])
+                    self.assertTrue(final.ready, final.reason)
+                    self.assertIn("Receivers caught the signal", final.prompt)
+                    self.assertNotIn("Earlier intake feedback was a community topic", final.prompt)
+                    self.assertNotIn("Unpublished copy must not", final.prompt)
+                    self.assertFalse(bot.refresh_prompt_source_basis(basis)[1])
+
+        self.add_journal(
+            "journal_just_published", "A later published edition", "A newer edition is now public.",
+            "A newer release supersedes the selection before delivery.", "2026-08-03T01:00:00Z",
+        )
+        self.assertTrue(bot.refresh_prompt_source_basis(basis)[1])
 
     def test_actual_publication_pipeline_keeps_person_and_ambiguous_reference_fences(self):
         self.enable_actual_publication_pipeline()
