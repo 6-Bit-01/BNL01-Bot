@@ -30,6 +30,10 @@ LINER_NOTE_FIELDS = ("about", "inspiration", "mentions", "inspiredBy")
 PALETTE_FIELDS = ("angle", "hook", "topics", "imagery", "genres", "era", "arrangement")
 PUBLICATION_READ_LIMIT = 2_000_000
 PUBLICATION_LOOKBACK_DAYS = 30
+PUBLICATION_CARD_LIMITS = {
+    "title": 240, "show_date": 40, "show_title": 180, "style": 700,
+    "about": 350, "mentions": 350, "inspired_by": 350,
+}
 
 
 def _digest(value):
@@ -137,7 +141,19 @@ def select_editorial_publications(conn, guild_id, snapshot, *, observed_before, 
         basis = {"sourceKind": "published_ballad", "sourceId": song["showId"], "versionId": song["versionId"],
                  "audioId": song["audioId"], "publishedAt": song["publishedAt"], "versionHash": local[1],
                  "publicationHash": song["publicationHash"], "sourceVersion": _digest([song["publicationHash"], local[1]])}
-        selected.append({"summary": text, "basis": basis, "showLink": song["url"]})
+        # The released version supplies a small, typed publication description.
+        # Retain the legacy summary for existing consumers; downstream writers
+        # need not reconstruct these fields from flattened JSON prose.
+        notes = song["linerNotes"]
+        card = {
+            "title": song["title"], "show_date": song["showDate"],
+            "show_title": song["showTitle"], "style": song["style"],
+            "about": notes["about"], "mentions": notes["mentions"],
+            "inspired_by": notes["inspiredBy"],
+        }
+        selected.append({"summary": text, "basis": basis, "showLink": song["url"],
+                         "publication_card": {key: card[key][:limit]
+                                              for key, limit in PUBLICATION_CARD_LIMITS.items()}})
         if len(selected) >= max(1, min(limit, 2)):
             break
     return selected

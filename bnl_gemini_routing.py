@@ -300,11 +300,18 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             allow_fallback=False,
         )
     if lane == "background":
+        # The multi-paragraph edition envelope and model thinking exhausted
+        # the ordinary Ambient bound. Keep its existing two-call owner and
+        # budget reservations, while honoring the shared explicit override.
+        edition_route = normalized_route in {
+            "ambient_generation_community_edition",
+            "ambient_generation_community_edition_repair",
+        }
         return GeminiRoutePolicy(
             lane=lane,
             max_output_tokens=_bounded_env_int(
                 "BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS",
-                4_096,
+                8_192 if edition_route else 4_096,
                 minimum=1_024,
                 maximum=16_384,
             ),

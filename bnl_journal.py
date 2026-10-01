@@ -3864,6 +3864,10 @@ def build_packet_from_sources(
         "basisKind": "published_ballad", "scope": JOURNAL_REFLECTION_SCOPE,
         "publicSafe": True, "reuseEligible": True,
         "summary": project_summary(item["summary"], limit=6000),
+        "publication_card": {
+            key: project_summary(str((item.get("publication_card") or {}).get(key) or ""), limit=limit)
+            for key, limit in ballads.PUBLICATION_CARD_LIMITS.items()
+        },
         "showLink": item["showLink"],
         "sourceObservedAt": item["basis"]["publishedAt"], "sourceVersion": item["basis"]["sourceVersion"],
     } for item in published_ballads]

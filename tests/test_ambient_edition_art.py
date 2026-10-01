@@ -72,6 +72,19 @@ class AmbientEditionArtTests(unittest.TestCase):
         self.assertIn("WITHDRAWN ORIGINAL TEXT", self.provider.call_args.args[0])
         self.bot.revalidate_ambient_local_sources.assert_not_called()
 
+    def test_existing_development_keeps_full_creative_publication_and_continuity(self):
+        self.context["packet_filter"] = self.public_expansion
+        self.context["sources"].append({"ref": "journal:fixture", "kind": "published_journal",
+                                        "summary": "FULL_CREATIVE_JOURNAL_NARRATIVE"})
+        self.context["continuity"] = [{"ref": "prior-art:fixture", "title": "Earlier clay signal",
+                                       "meaning": "RETAINED_ART_CONTINUITY", "sourceBases": []}]
+        art.develop_art_concept(self.bot, 42, self.proposal, self.context)
+        self.provider.assert_called_once()
+        prompt = self.provider.call_args.args[0]
+        self.assertIn("FULL_CREATIVE_JOURNAL_NARRATIVE", prompt)
+        self.assertIn("RETAINED_ART_CONTINUITY", prompt)
+        self.assertNotIn("WITHDRAWN ORIGINAL TEXT", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

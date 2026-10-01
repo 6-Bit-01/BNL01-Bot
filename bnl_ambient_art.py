@@ -31,16 +31,24 @@ def enabled(bot, guild_id):
             and guild_id == bot.BNL_PRIMARY_GUILD_ID and bool(guild_id))
 
 
-def _db(bot):
-    conn = sqlite3.connect(bot.DB_FILE, timeout=0.5)
+def _ensure_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS bnl_own_art_delivery (
         pacific_day TEXT PRIMARY KEY, art_id TEXT UNIQUE NOT NULL,
         guild_id INTEGER NOT NULL, status TEXT NOT NULL,
         discord_message_id TEXT NOT NULL DEFAULT '',
         website_status TEXT NOT NULL DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}'
     )""")
-    conn.commit()
-    return conn
+
+
+def _db(bot):
+    conn = sqlite3.connect(bot.DB_FILE, timeout=0.5)
+    try:
+        _ensure_schema(conn)
+        conn.commit()
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def available(bot, guild_id):
@@ -66,13 +74,19 @@ def claim(bot, guild_id):
 
 
 def record(bot, art_id, status, *, metadata=None, message_id=None, website_status=None):
-    with closing(_db(bot)) as conn, conn:
-        conn.execute("UPDATE bnl_own_art_delivery SET status=? WHERE art_id=?", (status, art_id))
-        for column, value in (("metadata_json", json.dumps(metadata) if metadata is not None else None),
-                              ("discord_message_id", str(message_id) if message_id is not None else None),
-                              ("website_status", website_status)):
-            if value is not None:
-                conn.execute(f"UPDATE bnl_own_art_delivery SET {column}=? WHERE art_id=?", (value, art_id))
+    # Retry only this local, atomic receipt through the existing SQLite owner.
+    # Generation, filesystem preparation and external delivery remain outside.
+    values = (status, json.dumps(metadata) if metadata is not None else None,
+              str(message_id) if message_id is not None else None, website_status, art_id)
+
+    def write(conn):
+        _ensure_schema(conn)
+        conn.execute("UPDATE bnl_own_art_delivery SET status=?, "
+                     "metadata_json=COALESCE(?,metadata_json), "
+                     "discord_message_id=COALESCE(?,discord_message_id), "
+                     "website_status=COALESCE(?,website_status) WHERE art_id=?", values)
+
+    bot._persist_reply_transaction(write, operation="ambient_art_receipt")
 
 
 def journal_context(bot, guild_id):
@@ -143,25 +157,31 @@ async def prepare(bot, guild_id, basis):
     if not concept or not enabled(bot, guild_id):
         return None
     art_id = None
+    stage = "claim"
     try:
         art_id = await asyncio.to_thread(claim, bot, guild_id)
         if not art_id:
             return None
         if basis.get("art_context"):
+            stage = "concept_development"
             concept = await asyncio.to_thread(develop_art_concept, bot, guild_id, concept,
                                               basis["art_context"], ambient_text=basis.get("art_caption", ""))
             if concept["action"] == "skip":
+                stage = "declined_receipt"
                 await asyncio.to_thread(record, bot, art_id, "bnl_declined_after_development")
                 return None
             basis["art"] = concept
             continuity = saved_creative_continuity(guild_id, concept, basis["art_context"], ambient_basis=basis)
         else:
             continuity = None
+        stage = "source_check_before_image"
         if not await bot.revalidate_ambient_sources(guild_id, basis, stage="before_image"):
             raise ValueError("art_sources_changed")
+        stage = "image_generation"
         image, receipt = await asyncio.to_thread(generate_private_image, bot, concept["imagePrompt"])
         if len(image) > PUBLIC_MAX_IMAGE_BYTES:
             raise ValueError("art_public_image_too_large")
+        stage = "source_check_after_image"
         if not await bot.revalidate_ambient_sources(guild_id, basis, stage="after_image"):
             raise ValueError("art_sources_changed")
         now = bot._pacific_now().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -170,12 +190,16 @@ async def prepare(bot, guild_id, basis):
                     "sourceJournals": [{"entryId": p.entry_id, "revision": p.revision, "contentHash": p.content_hash}
                                        for p in getattr(basis.get("art_journal_basis"), "publications", ())]}
         folder = Path(bot.DB_FILE).resolve().parent / "bnl-own-art" / art_id
+        stage = "private_receipt"
         folder.mkdir(mode=0o700, parents=True, exist_ok=False)
         _private_write(folder / ("image" + IMAGE_EXTENSIONS[receipt["mimeType"]]), image)
-        _private_write(folder / "receipt.json", json.dumps({"metadata": metadata, "image": receipt}).encode())
         private_metadata = dict(metadata)
         if continuity:
             private_metadata["privateCreativeContinuity"] = continuity
+        # Keep the original private lineage beside the already-rendered image
+        # even if database persistence exhausts its bounded contention retries.
+        _private_write(folder / "receipt.json", json.dumps({"metadata": private_metadata, "image": receipt}).encode())
+        stage = "draft_receipt"
         await asyncio.to_thread(record, bot, art_id, "draft_ready", metadata=private_metadata)
         return {"image": image, "metadata": metadata}
     except Exception as exc:
@@ -184,7 +208,11 @@ async def prepare(bot, guild_id, basis):
                 await asyncio.to_thread(record, bot, art_id, "generation_failed_or_withdrawn")
             except (sqlite3.Error, OSError):
                 pass  # The durable claim already closes this day to another image.
-        logging.warning("ambient_art_unavailable error_type=%s", type(exc).__name__)
+        category = ("sqlite_busy" if bot._sqlite_busy(exc) else
+                    "sqlite_failure" if isinstance(exc, sqlite3.Error) else "operation_failed")
+        logging.warning("ambient_art_unavailable stage=%s error_type=%s category=%s sqlite_code=%s sqlite_name=%s",
+                        stage, type(exc).__name__, category, getattr(exc, "sqlite_errorcode", None),
+                        getattr(exc, "sqlite_errorname", None))
         return None
 
 

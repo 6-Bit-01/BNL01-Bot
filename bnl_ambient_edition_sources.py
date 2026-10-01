@@ -15,7 +15,7 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from bnl_journal import build_source_packet_between, _eligible_reflection_basis
+from bnl_journal import build_source_packet_between, _eligible_reflection_basis, _evenly_sample
 from bnl_journal_source_store import query_source_events, timestamp_to_epoch_ms
 from bnl_tiktok_live_context import tiktok_show_evidence_key, tiktok_show_records
 
@@ -23,6 +23,34 @@ from bnl_tiktok_live_context import tiktok_show_evidence_key, tiktok_show_record
 MAX_ACTIVITY_ITEMS = 48
 MAX_REFLECTION_ITEMS = 8
 MAX_ITEMS = 64
+
+
+def evidence_role(item):
+    """Classify owner-projected source kinds, never a model's authority claim.
+
+    A contribution establishes what someone expressed, not independent proof
+    of every claim in it. A BNL publication establishes what BNL published.
+    Neither storage nor a current-window label upgrades derived narration.
+    """
+    kind = str(item.get("kind") or "")
+    if kind in {"journal", "published_journal", "relay", "published_relay",
+                "website_relay", "published_ballad", "accepted_relay_continuity"}:
+        return "bnl_expression"
+    if kind in {"conversation", "discord_message", "tiktok_live_chat"}:
+        return "original_contribution"
+    if kind == "public_source_history" and str(item.get("source_type") or "") in {"discord_message", "tiktok_live_chat"}:
+        return "original_contribution"
+    if kind == "finalized_show":
+        return "recorded_event"
+    if kind in {"approved_canon", "established_broadcast_memory"}:
+        return "established_context"
+    return "governed_interpretation"
+
+
+def _with_evidence_roles(items):
+    for item in items:
+        item["evidence_role"] = evidence_role(item)
+    return items
 
 
 def _utc(value):
@@ -95,6 +123,24 @@ def _episode_links(bot, packet, guild_id):
         return {}
 
 
+def _interleave(groups, limit):
+    """Share a fixed source budget among groups that actually have material."""
+    remaining = [iter(group) for group in groups if group]
+    chosen = []
+    while remaining and len(chosen) < limit:
+        active = []
+        for group in remaining:
+            item = next(group, None)
+            if item is None:
+                continue
+            chosen.append(item)
+            active.append(group)
+            if len(chosen) == limit:
+                break
+        remaining = active
+    return chosen
+
+
 def _fair_activity(items):
     """Keep the owner's chronology, with room for quiet speakers and source kinds."""
     if len(items) <= MAX_ACTIVITY_ITEMS:
@@ -105,25 +151,49 @@ def _fair_activity(items):
         # a reward for posting the most messages or being a familiar member.
         speaker = tuple(item["subject_refs"]) or item.get("participant_alias") or item["label"]
         buckets.setdefault((item["kind"], str(speaker)), []).append(item)
-    chosen = []
     # Spread each speaker's slots through their chronology instead of taking
     # only their newest/oldest cluster.
+    kinds = {}
     for key, rows in buckets.items():
         order = [0, len(rows) - 1]
         order.extend(range(1, len(rows) - 1))
-        buckets[key] = [rows[i] for i in dict.fromkeys(order)]
-    while buckets and len(chosen) < MAX_ACTIVITY_ITEMS:
-        for key in list(buckets):
-            chosen.append(buckets[key].pop(0))
-            if not buckets[key]:
-                del buckets[key]
-            if len(chosen) == MAX_ACTIVITY_ITEMS:
-                break
+        kinds.setdefault(key[0], []).append([rows[i] for i in dict.fromkeys(order)])
+    # A flattened (kind, speaker) queue let many early speakers consume every
+    # slot before a later completed show. Share by kind first, then by author.
+    # Missing kinds reserve nothing; these are input candidates, not required
+    # article sections or a demand to feature particular people.
+    slots = {kind: 0 for kind in kinds}
+    for kind in _interleave([[kind] * sum(map(len, authors)) for kind, authors in kinds.items()], MAX_ACTIVITY_ITEMS):
+        slots[kind] += 1
+    chosen = []
+    for kind, authors in kinds.items():
+        # More distinct authors than slots must not always discard the later
+        # part of the day. Reuse the owner's chronological sampling primitive.
+        candidates = _evenly_sample(authors, slots[kind])
+        chosen.extend(_interleave(candidates, slots[kind]))
     return sorted(chosen, key=lambda s: (s["occurred_at"], s["ref"]))
+
+
+def _fair_reflections(packet, start, end):
+    eligible = []
+    for source in _eligible_reflection_basis(packet):
+        observed = _utc(source.get("sourceObservedAt"))
+        timeless = source.get("basisKind") == "approved_canon" and not source.get("sourceObservedAt")
+        if timeless or (observed is not None and observed < end):
+            eligible.append(source)
+    eligible.sort(key=lambda s: (
+        s.get("basisKind") == "published_ballad" and start <= (_utc(s.get("sourceObservedAt")) or datetime.min.replace(tzinfo=timezone.utc)) < end,
+        _utc(s.get("sourceObservedAt")) or datetime.min.replace(tzinfo=timezone.utc),
+        str(s.get("refId") or "")), reverse=True)
+    kinds = {}
+    for source in eligible:
+        kinds.setdefault(source["basisKind"], []).append(source)
+    return _interleave(list(kinds.values()), MAX_REFLECTION_ITEMS)
 
 
 def _packet_items(bot, packet, start, end, guild_id):
     originals = {str(s.get("refId")): s for s in packet.get("privateSources", []) if isinstance(s, dict)}
+    original_context = packet.get("_ambient_original_context", {})
     episode_links = _episode_links(bot, packet, guild_id)
     activity = []
     for source in packet.get("safeSources", []):
@@ -134,7 +204,7 @@ def _packet_items(bot, packet, start, end, guild_id):
             continue
         subjects, labels = _subjects(source, originals.get(str(source["refId"]), {}))
         kind = str(source.get("sourceKind") or "community_activity")
-        activity.append({
+        item = {
             "ref": str(source["refId"]), "kind": kind,
             "text": str(source["summary"])[:4000 if kind == "finalized_show" else 1000],
             "label": str(source.get("publicSpeakerName") or source.get("conversationSurface") or kind),
@@ -142,28 +212,38 @@ def _packet_items(bot, packet, start, end, guild_id):
             "subject_refs": subjects, "subject_labels": labels, "scope": "window_activity",
             "participant_alias": str(source.get("participantAlias") or ""),
             "conversation_surface": str(source.get("conversationSurface") or ""),
-        })
+        }
+        # Only the current original-owner fence supplies room identity. A
+        # shared room and nearby time are context, not an inferred reply edge.
+        room_ref = original_context.get(str(source["refId"]), {}).get("room_ref")
+        if room_ref:
+            item["room_ref"] = room_ref
+        activity.append(item)
     items = _fair_activity(activity)
-    reflections = sorted(_eligible_reflection_basis(packet), key=lambda s: (
-        s.get("basisKind") == "published_ballad" and start <= (_utc(s.get("sourceObservedAt")) or datetime.min.replace(tzinfo=timezone.utc)) < end,
-        _utc(s.get("sourceObservedAt")) or datetime.min.replace(tzinfo=timezone.utc),
-        str(s.get("refId") or "")), reverse=True)
-    for source in reflections[:MAX_REFLECTION_ITEMS]:
+    for source in _fair_reflections(packet, start, end):
         observed = _utc(source.get("sourceObservedAt"))
-        if observed is None or observed >= end:
-            continue
         kind = str(source["basisKind"])
         published = kind == "published_ballad"
         item = {
             "ref": str(source["refId"]), "kind": kind,
+            "source_type": str(source.get("sourceType") or ""),
             "text": str(source["summary"])[:6000 if published else 1200],
             "label": "Broadcast Ballad" if published else kind.replace("_", " "),
             "url": _owner_url(bot, source.get("showLink")) if published else "",
-            "occurred_at": "" if published else _iso(observed),
+            "occurred_at": "" if published or observed is None else _iso(observed),
             "published_at": _iso(observed) if published else "",
             "subject_refs": [], "subject_labels": {},
             "scope": "window_publication" if published and observed >= start else "historical_context",
         }
+        room_ref = original_context.get(str(source["refId"]), {}).get("room_ref")
+        if room_ref:
+            item["room_ref"] = room_ref
+        if published:
+            card = _ballad_publication_card(source.get("publication_card"))
+            if card:
+                item["publication_card"] = card
+                if card.get("title"):
+                    item["label"] = card["title"]
         # These are governed public contributions, not private participant keys.
         if kind == "public_moment":
             item["contributions"] = [
@@ -171,7 +251,7 @@ def _packet_items(bot, packet, start, end, guild_id):
                 for c in source.get("contributions", [])[:3] if isinstance(c, dict)
             ]
         items.append(item)
-    return items
+    return _with_evidence_roles(items)
 
 
 def _root_digests(packet, refs):
@@ -185,6 +265,7 @@ def _root_digests(packet, refs):
 
 def _fence_discord_originals(bot, guild_id, packet, start, end):
     """Captured archive visibility cannot override an original's current controls."""
+    packet = {**packet, "_ambient_original_context": {}}
     originals = [source for source in packet.get("privateSources", [])
                  if source.get("sourceKind") == "conversation" and (
                      source.get("conversationSurface") == "discord"
@@ -243,6 +324,11 @@ def _fence_discord_originals(bot, guild_id, packet, start, end):
             continue
         eligible.add(ref)
         rows.append(row)
+        channel_id = row.get("channel_id")
+        if str(channel_id or "").isdigit() and int(channel_id) > 0:
+            packet["_ambient_original_context"][ref] = {
+                "room_ref": "discord-room:" + _digest([guild_id, int(channel_id)])[:24],
+            }
     bot._remember_ambient_sources(saved, "conversations", rows)
     rejected = {str(source.get("refId")) for source in originals} - eligible
     if not rejected:
@@ -257,6 +343,34 @@ def _fence_discord_originals(bot, guild_id, packet, start, end):
     packet["aggregateCounts"] = {**packet.get("aggregateCounts", {}),
         "eligibleConversations": max(0, int(packet.get("aggregateCounts", {}).get("eligibleConversations", 0)) - rejected_fresh)}
     return packet, saved
+
+
+def _card_text(value, limit):
+    return value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def _ballad_publication_card(value):
+    """Copy structured fields already sanitized by the publication owner."""
+    if not isinstance(value, dict):
+        return {}
+    from bnl_broadcast_ballads import PUBLICATION_CARD_LIMITS
+    return {key: text for key, limit in PUBLICATION_CARD_LIMITS.items()
+            if (text := _card_text(value.get(key), limit))}
+
+
+def _journal_publication_card(publication):
+    try:
+        sections = json.loads(publication.sections_json)
+    except (ValueError, TypeError, AttributeError):
+        sections = []
+    if not isinstance(sections, list):
+        sections = []
+    return {
+        "title": _card_text(getattr(publication, "title", ""), 240),
+        "excerpt": _card_text(getattr(publication, "excerpt", ""), 800),
+        "section_headings": [heading for section in sections[:8] if isinstance(section, dict)
+                             and (heading := _card_text(section.get("heading"), 140))],
+    }
 
 
 def _publication_items(bot, guild_id, start, end):
@@ -292,11 +406,12 @@ def _publication_items(bot, guild_id, start, end):
             if kind == "journal":
                 item["reported_window_start"] = publication.source_window_start
                 item["reported_window_end"] = publication.source_window_end
+                item["publication_card"] = _journal_publication_card(publication)
             items.append(item)
             selected.append(ref)
         if selected:
             bases.append(source_basis)
-    return items, bases
+    return _with_evidence_roles(items), bases
 
 
 def build_context(bot, guild_id, channel_id, *, basis, now=None):
