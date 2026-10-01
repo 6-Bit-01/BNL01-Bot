@@ -128,6 +128,7 @@ _RENDERABLE_LANES = {
     "assessment_observation",
     "approved_fact",
     "moment",
+    "bnl_impression",
     "episode",
     "show_episode",
     "atomic_knowledge",
@@ -177,6 +178,7 @@ _LANE_LABELS = {
     "assessment_observation": "question-scoped public observation",
     "approved_fact": "approved direct fact",
     "moment": "episode gist",
+    "bnl_impression": "BNL's retained impression",
     "episode": "frame-bound episode",
     "show_episode": "finalized BARCODE Radio evidence",
     "atomic_knowledge": "durable observation",
@@ -244,6 +246,7 @@ _LANE_RENDER_PRIORITY = {
     "show_episode": 2,
     "episode": 2,
     "moment": 3,
+    "bnl_impression": 4,
     "assessment_observation": 4,
     "open_loop": 5,
     "conversation_context": 6,
@@ -2659,6 +2662,10 @@ def _safe_evidence_text(value: Any, limit: int = 700) -> str:
 
 
 def _item_evidence_text(item: Any) -> str:
+    # A remembered perspective may enrich expression; it never corroborates
+    # an external claim or supplies a member-profile observation.
+    if getattr(item, "lane", "") == "bnl_impression":
+        return ""
     return " ".join(
         value
         for value in (
@@ -2902,6 +2909,7 @@ def render_packet_context(
     """
 
     lines = []
+    rendered_impression_contexts: set[str] = set()
     lane_counts: Counter[str] = Counter()
     source_digests = []
     used = 0
@@ -2995,6 +3003,8 @@ def render_packet_context(
     for item in ordered_items:
         if item.lane not in _RENDERABLE_LANES:
             continue
+        if item.lane == "bnl_impression" and item.event_ref not in rendered_impression_contexts:
+            continue
         if item.lane == "canon" and not _canon_relevant_to_profile_request(
             packet,
             item,
@@ -3029,6 +3039,11 @@ def render_packet_context(
         qualifier = ""
         if item.lane == "moment":
             qualifier = "; paraphrase only"
+        elif item.lane == "bnl_impression":
+            qualifier = (
+                "; BNL's revisable perspective; zero independent fact or recurrence weight; "
+                "not a human participant's testimony"
+            )
         elif item.lane == "episode":
             if item.usage == "historical_topic_context":
                 label = "related historical Moment"
@@ -3077,12 +3092,15 @@ def render_packet_context(
             qualifier = (
                 "; current read-only snapshot; temporary operational context"
             )
-        if item.lane in {"moment", "episode"} and item.observed_at:
+        if item.lane in {"moment", "episode", "bnl_impression"} and item.observed_at:
             try:
                 observed = datetime.fromisoformat(str(item.observed_at).replace("Z", "+00:00"))
                 if observed.tzinfo is None:
                     observed = observed.replace(tzinfo=timezone.utc)
-                qualifier += "; conversation last activity " + observed.astimezone(
+                qualifier += (
+                    "; source exchange last activity " if item.lane == "bnl_impression"
+                    else "; conversation last activity "
+                ) + observed.astimezone(
                     ZoneInfo("America/Los_Angeles")
                 ).isoformat(timespec="seconds") + " (Pacific)"
             except (TypeError, ValueError, OverflowError):
@@ -3101,6 +3119,8 @@ def render_packet_context(
         elif used + len(line) > max_chars:
             break
         lines.append(line)
+        if item.source_type == "impression_moment_context":
+            rendered_impression_contexts.add(item.event_ref)
         lane_counts[item.lane] += 1
         source_digests.append(item.source_digest)
         used += len(line)
@@ -3111,7 +3131,16 @@ def render_packet_context(
     temporal_rule = (
         "- Conversation times date the original exchange, not the time of a later memory revision "
         "or publication, and do not date an event merely mentioned in that exchange.\n"
-        if any(lane_counts[lane] for lane in ("moment", "episode")) else ""
+        if any(lane_counts[lane] for lane in ("moment", "episode", "bnl_impression")) else ""
+    )
+    impression_rule = (
+        "- A retained impression is BNL's earlier perspective on the accompanying original exchange. "
+        "Use it only when it helps this turn; no callback or repeated wording is required. It can "
+        "inform his attitude, questions or changing mind, but cannot establish another person's "
+        "traits, feelings, motives or actions. Original evidence and current corrections prevail. "
+        "Keep a present reaction distinct from what BNL thought then, and never use his old "
+        "interpretation to corroborate a fact, quotation, recurring pattern or canon.\n"
+        if lane_counts["bnl_impression"] else ""
     )
     profile = getattr(packet, "profile_sufficiency", None)
     profile_status = str(
@@ -3306,6 +3335,7 @@ def render_packet_context(
         + "\n".join(lines)
         + "\nResponse rules:\n"
         + temporal_rule
+        + impression_rule
         +
         "- Answer the current user naturally in BNL's established voice; do "
         "not recite this evidence as a database report.\n"
@@ -3488,7 +3518,7 @@ def _ordinary_task_allowed_lanes(task: Any) -> frozenset[str]:
                 "source_file",
             }
         )
-    return frozenset(_RENDERABLE_LANES)
+    return frozenset(_RENDERABLE_LANES - {"bnl_impression"})
 
 
 def ordinary_chat_task_support_plan(
@@ -7403,6 +7433,7 @@ def _ordinary_chat_authorized_support_segments(
                 str(getattr(item, "subject_key", "") or ""),
             )
             for item in tuple(getattr(basis.packet, "items", ()) or ())
+            if str(getattr(item, "lane", "") or "") != "bnl_impression"
             if (
                 str(getattr(item, "lane", "") or ""),
                 str(getattr(item, "source_digest", "") or ""),

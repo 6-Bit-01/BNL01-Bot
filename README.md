@@ -546,6 +546,36 @@ still remains.
 
 ## Release baseline
 
+### Shared impression pilot (disabled by default)
+
+The existing Moment meaning call can retain an optional, source-linked BNL
+reaction alongside its separate summary and human contributions. This pilot
+does not add a scheduler, model call, memory store, relationship score, or
+automatic promotion to durable belief/canon. Formation requires
+`BNL_IMPRESSIONS_FORMATION_ENABLED` and an explicit `BNL_IMPRESSIONS_GUILD_IDS`
+allowlist. Reading independently requires `BNL_IMPRESSIONS_USE_ENABLED` and the
+same allowlist. All are off/unscoped by default; deployment is not activation.
+
+One Moment-owned reader supplies conversation and Journal context. A reaction
+has zero factual/profile/recurrence authority. Its original human anchors,
+complete exchange, and current privacy/source state must still match before
+use. Public reads exclude sealed conversations; a sealed room can read eligible
+public experience and only its own private impressions. Existing forgetting
+and deletion erase affected impression payloads. Gate withdrawal invalidates
+prepared packets. Ordinary source changes withdraw stale impressions; this
+pilot does not automatically replay old generations or backfill history.
+
+The enabled Journal path can explore selected experiences instead of meeting
+person/time-segment coverage quotas. It preserves original grounding, the
+four-attempt limit, and existing preparation, approval and delivery owners.
+Relays, Ambient, artwork, Ballads, dossiers, memory-tier promotion, and
+Relationship activation remain outside this pilot.
+
+Acceptance requires separately approved, bounded real-source previews showing
+that untouched conversation and Journal outputs use the same retained
+perspective usefully and accurately. Controlled tests prove boundaries and
+transport, not model judgment or natural production reliability.
+
 Before merging a runtime change:
 
 1. Install the committed dependency versions.

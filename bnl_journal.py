@@ -303,9 +303,9 @@ def _context_claim_clauses(text: str) -> list[str]:
 
 def _creative_reflection_clause(clause: str, packet: dict[str, Any]) -> bool:
     """Allow this clause's framed imagination/opinion, not adjacent assertions."""
-    if not packet.get("creativeReflectionAllowed"):
+    if not packet.get("creativeReflectionAllowed") and not _has_moment_impressions(packet):
         return False
-    frame = _IMAGINED_SCENE_RE.search(clause)
+    frame = _IMAGINED_SCENE_RE.search(clause) if packet.get("creativeReflectionAllowed") else None
     if frame:
         return not (
             _EXTERNAL_ACTIVITY_VERB_RE.search(clause[:frame.start()])
@@ -3731,10 +3731,13 @@ def journal_shared_source_provenance_is_current(
     *, propagate_database_errors: bool = False,
 ) -> bool:
     """Revalidate exact saved bases in the caller's snapshot, without writes."""
-    from bnl_moment_engine import public_moment_source_basis
+    from bnl_moment_engine import public_moment_source_basis, read_moment_impression
     from bnl_tiktok_show_ledger import select_finalized_show_operations
 
-    if not isinstance(provenance, list) or len(provenance) > 12:
+    if not isinstance(provenance, list):
+        return False
+    impressions = [item for item in provenance if isinstance(item, dict) and item.get("sourceKind") == "moment_impression"]
+    if len(impressions) > 3 or len(provenance) - len(impressions) > 12:
         return False
     try:
         for source in provenance:
@@ -3742,6 +3745,13 @@ def journal_shared_source_provenance_is_current(
                 return False
             if source.get("sourceKind") == "public_moment":
                 basis = public_moment_source_basis(conn, guild_id=guild_id, moment_id=source["sourceId"])
+                if basis is None or basis["sourceVersion"] != source["sourceVersion"]:
+                    return False
+            elif source.get("sourceKind") == "moment_impression":
+                basis = read_moment_impression(
+                    conn, guild_id=guild_id, moment_id=source["sourceId"],
+                    channel_policy="public_home", channel_id=0,
+                )
                 if basis is None or basis["sourceVersion"] != source["sourceVersion"]:
                     return False
             elif source.get("sourceKind") == "finalized_show":
@@ -3813,6 +3823,29 @@ def build_packet_from_sources(
     ballad_snapshot = ballads.read_publication_catalog() if has_ballads else None
     with _read_source_database(db_path) as conn:
         operations, moment_basis, shared_provenance = _journal_shared_inputs(conn, guild_id, start, end, private_sources)
+        from bnl_moment_engine import select_moment_impressions
+        impressions = select_moment_impressions(
+            conn, guild_id=guild_id,
+            topic_text=" ".join(journal_topic_counts([*private_sources, *operations], limit=30)),
+            channel_policy="public_home", channel_id=0, observed_before=end, max_results=3,
+        )
+        for item in impressions:
+            ref = "reflection:impression:" + _hash(item["momentId"])[:24]
+            moment_basis.append({
+                "refId": ref, "basisKind": "moment_impression", "scope": JOURNAL_REFLECTION_SCOPE,
+                "publicSafe": True, "reuseEligible": True, "summary": item["summary"],
+                "impression": item["impression"], "reason": item["reason"],
+                "authority": "bnl_subjective_perspective_not_event_evidence",
+                "sourceObservedAt": item["observedAt"], "sourceStartedAt": item["startedAt"],
+                "sourceVersion": item["sourceVersion"], "contributions": item["contributions"],
+                "channelPolicy": item["channelPolicy"], "evidence": item["evidence"],
+            })
+            shared_provenance.append({
+                "refId": ref, "sourceKind": "moment_impression", "sourceId": item["momentId"],
+                "sourceVersion": item["sourceVersion"], "subjectRefs": item["subjectRefs"],
+                "canonicalLedgerEntryId": item["canonicalLedgerEntryId"],
+                "originalSourceRefs": item["originalSourceRefs"],
+            })
         published_ballads = ballads.select_editorial_publications(conn, guild_id, ballad_snapshot, observed_before=end)
         for item in published_ballads:
             basis = item["basis"]
@@ -3828,7 +3861,7 @@ def build_packet_from_sources(
         identity_tokens = _journal_identity_tokens(conn, guild_id)
     public_by_subject = {p["subjectRef"]: p for p in people}
     replacements: dict[str, set[str]] = {}
-    window_display_names = list(dict.fromkeys(window_display_names + [s["displayName"] for s in historical_authors if s["displayName"]]))
+    window_display_names = list(dict.fromkeys(window_display_names + [s["displayName"] for s in historical_authors if s.get("displayName")]))
     for source in [*relays, *conversations, *historical_authors]:
         name = str(source.get("displayName") or "").strip()
         if name:
@@ -3853,6 +3886,19 @@ def build_packet_from_sources(
 
     for item in moment_basis:
         item["summary"] = project_summary(item["summary"])
+        if item.get("basisKind") == "moment_impression":
+            item["impression"] = project_summary(item["impression"])
+            item["reason"] = project_summary(item["reason"])
+            item["evidence"] = [{
+                "refId": "original:" + _hash(evidence["sourceRef"])[:24],
+                "participantAlias": ("bnl" if evidence.get("role") != "user" else
+                                     "participant-" + _hash("journal-participant", guild_id, evidence.get("subjectRef", ""))[:8]),
+                "publicSpeakerName": ("BNL" if evidence.get("role") != "user" else
+                                      public_by_subject.get(evidence.get("subjectRef"), {}).get("publicName", "")),
+                "role": evidence["role"], "observedAt": evidence["observedAt"],
+                "authority": "speech_only" if evidence.get("role") != "user" else "original_contribution",
+                "summary": project_summary(evidence["text"], limit=2000),
+            } for evidence in item["evidence"]]
         item["contributions"] = [
             {"participantAlias": "participant-" + _hash("journal-participant", guild_id, c["subjectRef"])[:8],
              "publicSpeakerName": public_by_subject.get(c["subjectRef"], {}).get("publicName", ""),
@@ -3909,7 +3955,9 @@ def build_packet_from_sources(
     counts["reflectionRelays"] = len(relay_basis)
     counts["promptConversations"] = len([s for s in private_sources if s.get("sourceKind") == "conversation"])
     counts["promptFinalizedShows"] = len(operations)
-    counts["publicMomentContext"] = len(moment_basis)
+    counts["publicMomentContext"] = sum(item.get("basisKind") != "moment_impression" for item in moment_basis)
+    if impressions:
+        counts["subjectiveImpressionContext"] = len(impressions)
     counts["publishedBalladContext"] = len(ballad_basis)
     packet = {
         "entryKind": entry_kind if entry_kind in {"daily", "weekly", "manual"} else "manual",
@@ -4009,6 +4057,17 @@ def build_packet_from_sources(
         })
     if relay_provenance:
         packet.setdefault("privateReflectionBasisProvenance", {}).setdefault("historicalSourceEvents", []).extend(relay_provenance)
+    if _has_moment_impressions(packet):
+        # The same evidence remains available. The Journal may select the
+        # experiences that matter to this reflection without staging a roll call.
+        packet["evidenceCoverageContract"] = {
+            **packet["evidenceCoverageContract"], "minimumDistinctFreshSources": 0,
+            "requiredSourceKinds": [], "minimumDistinctFreshSourcesByKind": {},
+            "minimumDistinctParticipants": 0, "minimumDistinctWindowSegments": 0,
+            "subjectiveSelectionMode": True,
+        }
+        packet["reflectionBasisContract"]["basisKinds"] = sorted(
+            JOURNAL_REFLECTION_BASIS_KINDS | {"moment_impression"})
     packet["generationContextLanes"] = context_lanes
     packet["privateContextLaneProvenance"] = private_lane_provenance
     packet["history"] = retrieve_history(
@@ -4253,7 +4312,7 @@ def _eligible_reflection_basis(packet: dict[str, Any]) -> list[dict[str, Any]]:
         if (
             not ref_id.startswith("reflection:")
             or ref_id in seen_refs
-            or str(item.get("basisKind") or "") not in JOURNAL_REFLECTION_BASIS_KINDS
+            or str(item.get("basisKind") or "") not in JOURNAL_REFLECTION_BASIS_KINDS | {"moment_impression"}
             or str(item.get("scope") or "") != JOURNAL_REFLECTION_SCOPE
             or item.get("publicSafe") is not True
             or item.get("reuseEligible") is not True
@@ -4264,9 +4323,21 @@ def _eligible_reflection_basis(packet: dict[str, Any]) -> list[dict[str, Any]]:
             )
         ):
             continue
+        if item.get("basisKind") == "moment_impression" and not (
+            item.get("authority") == "bnl_subjective_perspective_not_event_evidence"
+            and str(item.get("impression") or "").strip()
+            and str(item.get("reason") or "").strip()
+            and isinstance(item.get("evidence"), list) and item["evidence"]
+        ):
+            continue
         records.append(item)
         seen_refs.add(ref_id)
     return records
+
+
+def _has_moment_impressions(packet: dict[str, Any]) -> bool:
+    return any(item.get("basisKind") == "moment_impression"
+               for item in _eligible_reflection_basis(packet))
 
 
 def build_generation_prompt(
@@ -4461,22 +4532,71 @@ def build_generation_prompt(
             else ""
         )
     )
+    if _has_moment_impressions(packet):
+        safe_packet["editorialContract"].update({
+            "personalReflectionExpected": True, "preserveGroundedDetail": True,
+            "selectMeaningfulExperiences": True,
+        })
+        beats_rule = (
+            "\nChoose the experience or tension that matters to BNL and develop his perspective through it. "
+            "Let his attitude, taste, doubts, humor and evolving understanding shape the entry; "
+            "the events are its grounding, not a play-by-play outline. Keep the concrete details "
+            "that make the chosen experiences recognizable. Do not force a lesson or emotion."
+        )
+        daily_spine_rule = (
+            "\nOriginal contributions establish what happened; a saved impression establishes only "
+            "BNL's revisable response to it. Select meaningful experiences rather than reporting "
+            "every person or interval. A thematic connection belongs to his viewpoint, not to "
+            "an invented causal link or shared occasion between separate conversations."
+        )
+        window_rule = "\nThe source window limits current-event claims; its segments and counts are not an outline to cover."
+        cadence_rule = (
+            "\nThis is BNL's personal Network Journal, a sustained reflection grounded in eligible "
+            "experiences. It is not the community recap or a complete record of this window."
+        )
+        coverage_rule = (
+            "\nCite the original evidence behind factual claims and the impression behind a remembered "
+            "perspective. Source breadth is available context, not a quota of names, events or time segments."
+        )
+        section_source_rule = (
+            "\nEvery section needs an eligible source reference. A purely reflective section may cite "
+            "a moment_impression alone. Claims that people acted in the current window still require "
+            "fresh evidence in that section; impressions never count as fresh activity or corroboration."
+        )
+        reflection_rule += (
+            "\nShared Moment impressions are BNL's own earlier, revisable perspective, not objective "
+            "assessments of a person. Their accompanying original contributions, dates and speakers "
+            "remain separate evidence. He may revisit, question or develop an impression in his own "
+            "voice without treating it as canon or a fact about someone's motives. Do not report "
+            "a remembered experience as happening again. His own taste or response needs no factual "
+            "inference lane; a new claim about another person still does. No obligatory warm closing, "
+            "recap structure, fixed emotional arc or description of his archival duties."
+        )
     reality_rule = (
         "Claims about real events, people, times, places, actions, motives, outcomes, relationships, dialogue and emotional states must follow the cited evidence. Clearly imagined scene details and BNL's personal reflections are creative expression, not claims of real events."
         if packet.get("creativeReflectionAllowed")
         else "Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
     )
+    editorial_override = "\nJOURNAL EDITORIAL OVERRIDE: For this route, a lived community chronicle takes priority over BNL's general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
+    identity_rule = "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
+    reaction_rule = "\nBNL's personality can live in the selection, phrasing, dry humor, and point of view. A first-person reaction is welcome when it adds something, but is not required. Avoid repeating a stock confession or affectionate closing. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
+    if _has_moment_impressions(packet):
+        editorial_override = "\nJOURNAL PURPOSE: This is BNL's introspective personal Journal, not a community report. His developing perspective should organize the concrete material, without flattening his established Network personality."
+        identity_rule = "\nRemain the same BNL-01 Network intelligence who experienced these exchanges. Let his established attitude, curiosity, dry humor and contradictions carry into the Journal; do not substitute a generic warm narrator or describe his job."
+        reaction_rule = "\nDevelop what stays with BNL and why, what he questions or connects, and what the experience means to him. Let that thinking unfold alongside the relevant details rather than adding a reaction after a recap. No quota of pronouns, forced emotion, stock confession or required moral."
+        reality_rule = "Never invent another person's actions, motives, history, feelings or circumstances. BNL's own present tastes, feelings and questions are subjective expression and need not have appeared in a source. Keep them distinct from external claims and preserve uncertainty, joking intent and later corrections in the original evidence."
+        quote_rule += " BNL may quote his own saved impression as an earlier personal thought, citing its impression ref; this does not make it evidence about anyone else."
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
         "\nWrite 1-3 sections and 250-500 total words. Choose the section count and length to suit this entry's material. Give every section a real narrative job instead of inventorying activity."
-        "\nJOURNAL EDITORIAL OVERRIDE: For this route, a lived community chronicle takes priority over BNL's general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
+        f"{editorial_override}"
         f"{beats_rule}"
-        "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
+        f"{identity_rule}"
         "\nFreely vary and combine scene reporting, named-canon color, dry archive notes, recognizable community detail, callbacks, restrained glitches, self-revision, and—only when qualified—the rumor desk. Do not reuse a stock cadence, signature line, or joke merely because an older entry used it."
         "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
         "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
-        "\nBNL's personality can live in the selection, phrasing, dry humor, and point of view. A first-person reaction is welcome when it adds something, but is not required. Avoid repeating a stock confession or affectionate closing. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
+        f"{reaction_rule}"
         "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. "
         f"{reality_rule}"
         f"{daily_spine_rule}"
@@ -4714,6 +4834,13 @@ def _article_privacy_reason(
         for source in [*packet.get("safeSources", []), *_eligible_reflection_basis(packet)]
         if source.get("refId")
     }
+    refs.update(
+        str(evidence["refId"])
+        for source in _eligible_reflection_basis(packet)
+        if source.get("basisKind") == "moment_impression"
+        for evidence in source.get("evidence", [])
+        if isinstance(evidence, dict) and evidence.get("refId")
+    )
     if any(ref in public_text for ref in refs) or re.search(r"\b(?:fresh|week|memory|rumor|inference|reflection):[a-z0-9:._-]+\b", public_text, re.I):
         return "source_ref_leak"
     if _PUBLIC_LEAK_RE.search(public_text):
@@ -4792,6 +4919,8 @@ def validate_article(
         for source in _eligible_reflection_basis(packet)
         if source.get("refId")
     }
+    impression_refs = {str(source["refId"]) for source in _eligible_reflection_basis(packet)
+                       if source.get("basisKind") == "moment_impression"}
     historical_basis_mode = historical_basis_mode or bool(reflection_refs)
     valid_refs = fresh_refs | reflection_refs
     if not valid_refs:
@@ -4813,11 +4942,13 @@ def validate_article(
         if (
             (source_recovery or (reflection_refs and not low_activity))
             and not ({str(ref) for ref in refs} & fresh_refs)
+            and not ({str(ref) for ref in refs} & impression_refs)
         ):
             return "current_activity_without_fresh_source"
         if (
             low_activity
             and not ({str(ref) for ref in refs} & fresh_refs)
+            and not ({str(ref) for ref in refs} & impression_refs)
             and not _REFLECTION_SCOPE_CUE_RE.search(
                 str(section.get("body") or "")
             )
@@ -5289,6 +5420,24 @@ def _generation_error_details(exc: Exception) -> tuple[str, str]:
     return "provider_failure", "provider_failure"
 
 
+def _moment_impression_generation_guard(db_path: str, guild_id: int, packet: dict[str, Any]):
+    """Recheck every supplied impression, including one the writer never cites."""
+    provenance = [item for item in packet.get("privateSharedSourceProvenance", [])
+                  if isinstance(item, dict) and item.get("sourceKind") == "moment_impression"]
+    if not provenance:
+        return None
+
+    def current() -> str:
+        try:
+            with _read_source_database(db_path) as conn:
+                if journal_shared_source_provenance_is_current(conn, guild_id, provenance):
+                    return ""
+        except sqlite3.Error:
+            pass
+        return "privacy_source_ineligible"
+    return current
+
+
 def _generate_article_with_repairs(
     packet: dict[str, Any],
     generator: Callable[[dict[str, Any], str], str],
@@ -5296,6 +5445,7 @@ def _generate_article_with_repairs(
     attempt_observer: Optional[Callable[[dict[str, Any]], None]] = None,
     *,
     max_attempts: Optional[int] = None,
+    generation_guard: Optional[Callable[[], str]] = None,
 ) -> tuple[Optional[dict[str, Any]], str, bool]:
     """Return the best blocking-clean article without letting polish cancel publication."""
     def observe(event: dict[str, Any]) -> None:
@@ -5314,6 +5464,10 @@ def _generate_article_with_repairs(
     attempt_limit = JOURNAL_GENERATION_ATTEMPTS if max_attempts is None else max(1, min(int(max_attempts), JOURNAL_GENERATION_ATTEMPTS))
     for attempt in range(attempt_limit):
         attempt_number = attempt + 1
+        if generation_guard:
+            guard_reason = generation_guard()
+            if guard_reason:
+                return None, guard_reason, False
         observe({
             "generationAttempt": attempt_number,
             "phase": "started",
@@ -5340,7 +5494,15 @@ def _generate_article_with_repairs(
                     repair_details=last_repair_details,
                 ) if attempt else build_generation_prompt(packet),
             )
+            if generation_guard:
+                guard_reason = generation_guard()
+                if guard_reason:
+                    return None, guard_reason, False
         except Exception as exc:
+            if generation_guard:
+                guard_reason = generation_guard()
+                if guard_reason:
+                    return None, guard_reason, False
             if retained_publishable is not None:
                 observe({
                     "generationAttempt": attempt_number,
@@ -5511,6 +5673,7 @@ def generate_and_store_packet_draft(
         generator,
         prior_titles,
         attempt_observer,
+        generation_guard=_moment_impression_generation_guard(db_path, guild_id, packet),
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id=entry_id)
@@ -5594,7 +5757,14 @@ def generate_test_preview(
     # parseable, privacy-clean result even when attribution or coverage needs
     # attention. Never enter the production repair or storage lifecycle.
     try:
+        guard = _moment_impression_generation_guard(db_path, guild_id, packet)
+        if guard and guard():
+            result["reason"] = "privacy_source_ineligible"
+            return result
         raw = generator(packet, build_generation_prompt(packet))
+        if guard and guard():
+            result["reason"] = "privacy_source_ineligible"
+            return result
     except Exception as exc:
         result["reason"] = _generation_error_details(exc)[0]
         return result
@@ -5796,6 +5966,7 @@ def regenerate_draft(
         packet,
         generator,
         prior_titles,
+        generation_guard=_moment_impression_generation_guard(db_path, guild_id, packet),
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id, old_revision)

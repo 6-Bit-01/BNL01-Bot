@@ -48,6 +48,7 @@ _LIVE_GATES = (
     "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED",
 )
 _LOWER_PRECEDENCE_LANES = (
+    "bnl_impression",
     "show_state",
     "website_read_model",
     "source_context",
@@ -61,6 +62,7 @@ _LOWER_PRECEDENCE_LANES = (
 )
 _KNOWN_LANES = frozenset(
     (
+        "bnl_impression",
         "current_exchange",
         "conversation_context",
         "show_state",
