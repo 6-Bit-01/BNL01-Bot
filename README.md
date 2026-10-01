@@ -565,6 +565,11 @@ feelings, faithful paraphrase, humor, canon and metaphor.
 
 A complete private review must cover every unit, identify supported source
 excerpts and their original speakers, and report unresolved discrepancies.
+Each unit is covered by exact text spans so factual clauses inside personal
+reflection receive their own evidence and verdict. Room and Pacific-time fields
+can be cited directly. The provider receives the ordered JSON review schema;
+a single complete JSON fence and unambiguous public speaker names normalize
+locally without weakening original-author or quote checks.
 Unknown anchors, wrong speaker bindings, incomplete reviews and negative or
 uncertain verdicts cannot release a candidate. BNL-derived speech cannot serve
 as evidence that another person actually did something. A local digest binds
@@ -576,7 +581,9 @@ The existing four-attempt ceiling is unchanged: write, review, and if necessary
 repair and review again. A final-slot rewrite without review is withheld. Only
 an exact reviewed advisory candidate can survive later polish failure. The
 source editor uses the same Journal route and spending controls but does not
-receive the writer's persona; incomplete provider responses cannot pass. Source
+receive the writer's persona; incomplete provider responses cannot pass. A
+malformed review stops the run instead of repeating an identical paid request.
+Source
 eligibility and preparation ownership are rechecked before and after every call.
 Preparation still starts at 6:30 PM Pacific; 7 PM releases the saved approved
 payload without a new generation call. No new scheduler or publication owner.
@@ -618,8 +625,10 @@ Historical corrections use the existing Journal owner and revision store. The ow
 private command is `!bnl journal correct ENTRY_ID | revision=N | hash=PUBLISHED_HASH | note=PUBLIC_NOTE`.
 It creates a review draft using the original entry's exact source window and the same
 four-attempt generation/revision path. It does not publish, change the original date,
-reopen the completed scheduled occurrence, or write community memory. The old prose is
-editable material, never evidence. Later Journals and the target entry are excluded
+reopen the completed scheduled occurrence, or write community memory. The writer
+reconstructs the entry from eligible originals, without receiving the defective
+old prose as a template. Its identity and immutable revision history remain
+separate from writing inputs. Later Journals and the target entry are excluded
 from the historical comparison basis.
 
 Review, exact-hash approval and explicit delivery remain separate. Original sources,

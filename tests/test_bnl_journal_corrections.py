@@ -113,7 +113,7 @@ class JournalCorrectionTests(unittest.TestCase):
         return journal.approve_draft(self.db, 1, self.entry_id, result.content_hash, 2,
                                      correction_guard=self.controls, **kwargs)
 
-    def test_preview_reuses_exact_historical_window_and_editable_original_without_writes(self):
+    def test_preview_reconstructs_exact_historical_window_without_old_prose_or_writes(self):
         before = Path(self.db).read_bytes()
         with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
             result, generator = self.generate(preview=True)
@@ -124,13 +124,45 @@ class JournalCorrectionTests(unittest.TestCase):
         self.assertNotIn("future concert", json.dumps(result["packet"]))
         self.assertNotIn(self.entry_id, json.dumps(result["packet"]["history"]))
         self.assertEqual(prompts.call_args_list[0].kwargs["repair_reason"], "published_correction")
-        self.assertIn("assigned the unfinished chorus incorrectly", prompts.call_args_list[0].kwargs["previous_output"])
+        self.assertEqual("", prompts.call_args_list[0].kwargs["previous_output"])
+        writing_prompt = generator.call_args_list[0].args[1]
+        self.assertNotIn("assigned the unfinished chorus incorrectly", writing_prompt)
+        self.assertNotIn("The First Chorus", writing_prompt)
+        self.assertNotIn("Complete previous draft", writing_prompt)
+        self.assertNotIn("Make a targeted correction", writing_prompt)
+        self.assertIn("Reconstruct this historical Journal", writing_prompt)
+        projected, _ = json.JSONDecoder().raw_decode(writing_prompt.split("Generation-safe packet:\n", 1)[1])
+        self.assertEqual(projected["freshSources"], result["packet"]["safeSources"])
+        self.assertEqual((projected["sourceWindowStart"], projected["sourceWindowEnd"]), (START, END))
         self.assertEqual(prompts.call_count, 1)
         self.assertTrue(is_source_review(generator.call_args_list[1].args[1]))
         units, evidence = review_inputs(generator.call_args_list[1].args[1])
         self.assertIn(result["article"]["title"], [unit["text"] for unit in units])
         self.assertEqual(evidence["sourceWindowEnd"], END)
         self.assertEqual(result["originalPublishedAt"], PUBLISHED)
+
+    def test_historical_reconstruction_cannot_reintroduce_accidental_old_output(self):
+        defective = self.article(self.packet, title="Obsolete Invented Encore",
+                                 body="Test Composer performed an invented encore on Mars.")
+        prompt = journal.build_generation_prompt(
+            self.packet, repair_reason="published_correction", previous_output=defective,
+        )
+        self.assertNotIn("Obsolete Invented Encore", prompt)
+        self.assertNotIn("invented encore on Mars", prompt)
+        self.assertIn("The unfinished chorus still needs another listen.", prompt)
+        self.assertIn("later clarifications", prompt)
+        self.assertIn("personal reactions", prompt)
+
+    def test_ordinary_repair_still_receives_the_new_candidate_and_located_failure(self):
+        candidate = self.article(self.packet, title="A New Candidate Needs Review")
+        prompt = journal.build_generation_prompt(
+            self.packet, repair_reason="source_attribution_failed", previous_output=candidate,
+            repair_details=[{"field": "sections[0].body", "check": "speaker_mismatch"}],
+        )
+        self.assertIn("Complete previous draft", prompt)
+        self.assertIn("A New Candidate Needs Review", prompt)
+        self.assertIn("speaker_mismatch", prompt)
+        self.assertIn("Make a targeted correction", prompt)
 
     def test_new_revision_is_draft_with_lineage_and_unchanged_original(self):
         original = self.stored(1)

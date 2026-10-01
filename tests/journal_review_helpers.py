@@ -38,17 +38,18 @@ def supported_review(prompt):
             break
     if not anchor:
         raise AssertionError("Mock review needs an actual supplied original source")
-    return json.dumps({"verdict": "supported", "units": [
-        {"unitId": unit["unitId"], "kind": "factual", "verdict": "supported",
-         "evidence": [anchor], "issues": []} for unit in units
-    ]})
+    return json.dumps({"units": [
+        {"unitId": unit["unitId"], "spans": [
+            {"text": unit["text"], "kind": "factual", "evidence": [anchor],
+             "issues": [], "verdict": "supported"}]} for unit in units
+    ], "verdict": "supported"})
 
 
 def rejected_review(prompt, *, issue="The candidate reverses the original attribution."):
     response = json.loads(supported_review(prompt))
     response["verdict"] = "unsupported"
     target = next(unit for unit in response["units"] if ".body:" in unit["unitId"])
-    target.update(verdict="unsupported", evidence=[], issues=[issue])
+    target["spans"][0].update(verdict="unsupported", evidence=[], issues=[issue])
     return json.dumps(response)
 
 

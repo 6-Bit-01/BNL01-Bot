@@ -151,12 +151,16 @@ _PUBLIC_LEAK_RE = re.compile(
 
 _REPAIR_GUIDANCE = {
     "published_correction": (
-        "Correct the supplied published article against the eligible original-window sources. "
-        "Its prose and old citation lists are editable material, never evidence. Keep supported "
-        "details and meaningful personal reflection; reshape report-like passages into BNL's Journal while fixing misattribution, invented actions and unsupported "
-        "event connections. Omit or narrow a claim when its original support is unavailable. "
-        "Do not replace it with a present-day recap or invent missing sources. The public correction "
-        "note is supplied separately by the owner; do not add an announcement to the article."
+        "Reconstruct this historical Journal from the eligible original-window sources. "
+        "The earlier article is deliberately not supplied as a writing template. Let the originals "
+        "determine the title, organization and account; preserve their concrete detail, named "
+        "contributions, musical and project specifics, jokes, chronology and later clarifications. "
+        "Keep questions, accusations and subsequent explanations attached to their actual speakers, "
+        "without turning a disputed interpretation into a settled event. Weave BNL's personal "
+        "reactions and thematic connections through that grounded account. Omit or narrow a claim "
+        "when its original support is unavailable. Cover the same historical window, not a "
+        "present-day recap. The public correction note is supplied separately by the owner; "
+        "do not announce this reconstruction process in the article. Return the complete Journal JSON."
     ),
     "source_grounded_revision": (
         "Review the complete draft against the ORIGINAL generation-safe packet before approving its writing. "
@@ -4628,7 +4632,12 @@ def build_generation_prompt(
             else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
         )
     repair = ""
-    if repair_reason:
+    if repair_reason == "published_correction":
+        # The defective publication remains the revision/CAS predecessor, not
+        # a prose template. Even an accidentally supplied previous_output must
+        # not reintroduce its unsupported narrative into this first draft.
+        repair = "\nHistorical reconstruction required because: published_correction. " + _REPAIR_GUIDANCE[repair_reason]
+    elif repair_reason:
         guidance = _REPAIR_GUIDANCE.get(
             repair_reason,
             "Correct the named validation failure and return the complete JSON response.",
@@ -5608,6 +5617,15 @@ def _source_review_evidence(packet: dict[str, Any]) -> dict[str, Any]:
                     "sourceRole": "approved_canon",
                     "summary": json.dumps(asdict(fact), ensure_ascii=False, default=str)}
                    for fact in CANON_FACTS if fact.visibility == Visibility.PUBLIC_SAFE)
+    # Keep original exchanges and delivered BNL speech together, by room and
+    # local time, before interpretations. Preserve every source and its role;
+    # proximity is not itself a reply or causal relationship.
+    sources.sort(key=lambda item: (
+        0 if item.get("sourceKind") == "conversation" or item.get("sourceRole") == "bnl_utterance" else 1,
+        str(item.get("roomRef") or ""),
+        str(item.get("observedAtPacific") or item.get("observedAt") or item.get("sourceObservedAt") or ""),
+        str(item.get("refId") or ""),
+    ))
     return {"sources": sources, "contextLanes": lanes,
             "sourceWindowStart": packet.get("sourceWindowStart"),
             "sourceWindowEnd": packet.get("sourceWindowEnd"),
@@ -5691,9 +5709,10 @@ def _generate_article_with_repairs(
                 if reason == "source_attribution_failed":
                     # Repair the original candidate, not the review JSON.
                     candidate = None
-                # Malformed/incomplete review retries the same candidate in
-                # the remaining slots. Never turn a review into an article.
-                continue
+                    continue
+                # A protocol failure needs a code/input fix, not another
+                # identical paid request. Never return an unreviewed draft.
+                return (retained, "", True) if retained else (None, reason, False)
             candidate["metadata"]["sourceReview"] = receipt
             if not candidate_validation:
                 observe({**event, "outcome": "accepted", "reason": ""})
@@ -6215,15 +6234,6 @@ def generate_published_correction_preview(
         note_article = {"title": note.strip(), "excerpt": "", "sections": []}
         if _article_privacy_reason(note_article, packet):
             return {**result, "reason": "invalid_correction_note"}
-        sections = json.loads(original["sections_json"])
-        original_refs = metadata.get("sourceRefIds") or {}
-        editable = {
-            "title": original["title"], "excerpt": original["excerpt"],
-            "sections": [{"heading": section["heading"], "body": section["body"],
-                          "sourceRefIds": original_refs.get(section["heading"], [])}
-                         for section in sections],
-            "metadata": {"contextUses": []},
-        }
         source_guard = _generation_guard_for_packet(
             db_path, guild_id, packet, validate_original_sources=True,
             original_source_controls=original_source_controls,
@@ -6238,11 +6248,12 @@ def generate_published_correction_preview(
                 base_reason = _published_correction_base_reason(conn, guild_id, entry_id, context)
             return base_reason or source_guard()
 
-        # The old article is never a source and cannot satisfy source breadth.
-        # Its old refs may be absent from the current eligible historical packet.
+        # Reconstruct from the original evidence. Supplying the old prose as an
+        # editable draft would anchor the writer to the very account at issue.
+        # The original still controls lineage, revision and publication checks.
         article, reason, advisory = _generate_article_with_repairs(
             packet, generator, [], attempt_observer, generation_guard=current,
-            initial_output=_json(editable), initial_repair_reason="published_correction",
+            initial_repair_reason="published_correction",
         )
         if article is None:
             return {**result, "reason": reason}

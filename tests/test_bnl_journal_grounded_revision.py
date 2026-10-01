@@ -171,25 +171,24 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         generator.assert_not_called()
         self.assertNotIn("private failure detail", json.dumps(events))
 
-    def test_bad_review_uses_remaining_slots_without_a_fifth_call_or_first_draft_fallback(self):
+    def test_bad_review_stops_without_spending_remaining_slots_or_returning_first_draft(self):
         for bad_revision, expected in (("not json", "source_review_invalid"),
                                        (self.draft(), "source_review_invalid")):
             with self.subTest(reason=expected):
                 (article, reason, advisory), generator, _ = self.run_sequence(
                     [self.draft(), bad_revision, bad_revision, bad_revision], max_attempts=99)
-                self.assertEqual(generator.call_count, 4)
+                self.assertEqual(generator.call_count, 2)
                 self.assertIsNone(article)
                 self.assertEqual(reason, expected)
                 self.assertFalse(advisory)
                 self.assertTrue(all(is_source_review(call.args[1]) for call in generator.call_args_list[1:]))
 
-    def test_malformed_review_can_retry_same_candidate_in_remaining_slot(self):
+    def test_malformed_review_does_not_repeat_identical_paid_request(self):
         first = self.draft(title="One More Listen Tomorrow")
         (article, reason, advisory), generator, _ = self.run_sequence([first, "not json", supported_review])
-        self.assertEqual(generator.call_count, 3)
-        self.assert_reviewed_candidate(article, first)
-        self.assertEqual(generator.call_args_list[1].args[1], generator.call_args_list[2].args[1])
-        self.assertEqual(reason, "")
+        self.assertEqual(generator.call_count, 2)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "source_review_invalid")
         self.assertFalse(advisory)
 
     def test_first_acceptable_draft_in_final_slot_is_withheld(self):

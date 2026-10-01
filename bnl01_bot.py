@@ -32380,7 +32380,7 @@ def _generation_config_for_model(
     config_kwargs = {
         "max_output_tokens": policy.max_output_tokens,
     }
-    if route in {'moment_meaning_background', 'relationship_meaning_background'}:
+    if route in {'moment_meaning_background', 'relationship_meaning_background', JOURNAL_ROUTE}:
         config_kwargs['response_mime_type'] = 'application/json'
     if route in {BALLAD_ROUTE, BALLAD_MANUAL_ROUTE}:
         config_kwargs['response_mime_type'] = 'application/json'
@@ -32585,6 +32585,10 @@ def _generate_model_with_retry(
             model_name,
             route,
         )
+        if route == JOURNAL_ROUTE and isinstance(contents, str):
+            from bnl_journal_attribution import REVIEW_PREFIX, response_schema
+            if contents.startswith(REVIEW_PREFIX):
+                generation_config.response_schema = response_schema()
         if attempt_counter is not None:
             attempt_counter.mark_started()
         try:
