@@ -1,0 +1,284 @@
+"""The edition reads existing governed owners without a new archive or model."""
+import copy
+from datetime import datetime, timezone
+import json
+import sqlite3
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+import bnl_ambient_edition_sources as edition
+from bnl_journal import JOURNAL_REFLECTION_SCOPE
+
+
+NOW = datetime(2026, 9, 30, 3, tzinfo=timezone.utc)
+STAMP = "2026-09-29T20:00:00Z"
+
+
+def activity(ref="fresh:1", subject="discord_user:123", surface="discord", speaker="Test Member", timestamp=STAMP):
+    safe = {"refId": ref, "sourceKind": "conversation", "summary": "A strange bass sound sparked a lively discussion.",
+            "observedAt": timestamp, "publicSpeakerName": speaker, "conversationSurface": surface,
+            "participantAlias": "participant-" + ref, "channelPolicy": "public_home"}
+    return safe, {**safe, "subjectRef": subject, "messageId": 7654}
+
+
+class EditionSourcesTests(unittest.TestCase):
+    def setUp(self):
+        source, original = activity()
+        self.packet = {"safeSources": [source], "privateSources": [original],
+                       "privateSharedSourceProvenance": [], "reflectionBasis": [],
+                       "sourceArchiveAvailable": True, "coverageComplete": True,
+                       "aggregateCounts": {"eligibleConversations": 1}}
+        self.reader = mock.patch.object(edition, "build_source_packet_between", side_effect=lambda *a, **k: copy.deepcopy(self.packet)).start()
+        self.original_fence = mock.patch.object(edition, "_fence_discord_originals", side_effect=lambda bot, guild, packet, *a: (packet, {"guild_id": guild})).start()
+        self.addCleanup(mock.patch.stopall)
+        self.bot = SimpleNamespace(DB_FILE="not-a-real-database", _pacific_now=lambda: NOW,
+                                   _journal_website_base_url=lambda: "https://site.test",
+                                   _build_publication_prompt_source_basis=mock.Mock(return_value=None),
+                                   _refresh_publication_prompt_source_basis=mock.Mock(side_effect=lambda basis: (basis, False)),
+                                   revalidate_ambient_local_sources=mock.Mock(return_value=True))
+
+    def context(self):
+        self.basis = {"guild_id": 7}
+        return edition.build_context(self.bot, 7, 9, basis=self.basis, now=NOW)
+
+    def test_exact_window_existing_reader_and_no_art_dependency(self):
+        context = self.context()
+        self.reader.assert_called_once_with("not-a-real-database", 7, "2026-09-29T03:00:00Z", "2026-09-30T03:00:00Z",
+                                            entry_kind="daily", prepare_schema=False)
+        self.assertIs(self.basis["edition_context"], context)
+        self.assertEqual(context["items"][0]["subject_refs"], ["discord_user:123"])
+        self.assertEqual(context["items"][0]["subject_labels"], {"discord_user:123": "Test Member"})
+        self.assertEqual(context["items"][0]["guild_id"], 7)
+        self.assertEqual(context["coverage"]["eligible_conversations"], 1)
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+
+    def test_tiktok_correlated_discord_subject_is_never_tag_authority(self):
+        safe, original = activity(surface="tiktok_live_chat")
+        self.packet.update(safeSources=[safe], privateSources=[original])
+        item = self.context()["items"][0]
+        self.assertEqual(item["subject_refs"], [])
+        self.assertEqual(item["subject_labels"], {})
+
+    def test_private_names_and_provenance_never_enter_model_items(self):
+        self.packet["privateSources"][0]["displayName"] = "PRIVATE_ACCOUNT_LABEL"
+        self.packet["privateSources"][0]["rawSummary"] = "PRIVATE_ARCHIVE_TEXT"
+        self.packet["privatePublicPeople"] = [{"privateAlias": "PRIVATE_ACCOUNT_LABEL"}]
+        context = self.context()
+        self.assertNotIn("PRIVATE_", json.dumps(context["items"]))
+        self.assertNotIn("PRIVATE_", json.dumps(context["_root_digests"]))
+
+    def test_unnamed_speaker_gets_no_guess_from_subject_or_text(self):
+        self.packet["safeSources"][0]["publicSpeakerName"] = ""
+        self.packet["safeSources"][0]["summary"] = "Test Member asked someone a question."
+        self.assertEqual(self.context()["items"][0]["subject_refs"], [])
+
+    def test_window_excludes_future_and_old_activity_but_keeps_start(self):
+        values = [activity(ref=str(index), timestamp=timestamp) for index, timestamp in enumerate((
+            "2026-09-29T02:59:59Z", "2026-09-29T03:00:00Z", "2026-09-30T03:00:00Z", "invalid"))]
+        self.packet.update(safeSources=[v[0] for v in values], privateSources=[v[1] for v in values])
+        self.assertEqual([item["ref"] for item in self.context()["items"]], ["1"])
+
+    def test_publication_time_never_becomes_event_time_and_links_are_real_route(self):
+        publication = SimpleNamespace(entry_id="journal_daily_2026-09-28_abcd", title="A New Perspective", excerpt="An older discussion revisited.",
+                                      sections_json='[{"heading":"Music","body":"Test Member discussed a sound."}]',
+                                      published_at=STAMP, created_at=STAMP, source_window_start="2026-09-27T01:00:00Z",
+                                      source_window_end="2026-09-28T01:00:00Z", revision=1)
+        basis = SimpleNamespace(publications=(publication,))
+        self.bot._build_publication_prompt_source_basis.side_effect = lambda **kw: basis if kw["source_kind"] == "journal" else None
+        context = self.context()
+        item = context["items"][0]
+        self.assertEqual(item["kind"], "published_journal")
+        self.assertEqual(item["occurred_at"], "")
+        self.assertEqual(item["reported_window_end"], "2026-09-28T01:00:00Z")
+        self.assertEqual(item["url"], "https://site.test/journal/journal_daily_2026-09-28_abcd")
+        self.assertEqual(item["subject_refs"], [])
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+        self.bot._refresh_publication_prompt_source_basis.return_value = (SimpleNamespace(publications=()), True)
+        self.bot._refresh_publication_prompt_source_basis.side_effect = None
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+
+    def test_old_publication_is_not_announced_as_a_new_release(self):
+        self.bot._build_publication_prompt_source_basis.return_value = SimpleNamespace(publications=(SimpleNamespace(published_at="2026-09-28T01:00:00Z"),))
+        self.assertEqual(len(self.context()["items"]), 1)
+
+    def test_ballad_release_uses_owner_metadata_url_and_historical_label(self):
+        self.packet["reflectionBasis"] = [{"refId": "reflection:ballad:1", "basisKind": "published_ballad",
+            "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True, "reuseEligible": True,
+            "summary": "A creative release about an older show; mentions Test Member.",
+            "showLink": "https://site.test/radio/archive?view=shows&show=show-1#broadcast-ballad",
+            "sourceObservedAt": "2026-09-27T12:00:00Z", "sourceVersion": "version-1"}]
+        context = self.context()
+        item = context["items"][-1]
+        self.assertEqual(item["scope"], "historical_context")
+        self.assertEqual(item["occurred_at"], "")
+        self.assertEqual(item["subject_refs"], [])
+        self.assertTrue(item["url"].endswith("show-1#broadcast-ballad"))
+        self.packet["reflectionBasis"][0]["sourceVersion"] = "version-2"
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+
+    def test_invalid_or_other_site_link_never_becomes_public_link(self):
+        self.assertEqual(edition._owner_url(self.bot, "https://site.test.evil.test/steal"), "")
+        self.assertEqual(edition._owner_url(self.bot, "https://other.test/radio/show-1"), "")
+        self.assertEqual(edition._owner_url(self.bot, "javascript:alert(1)"), "")
+
+    def test_episode_link_requires_current_public_exact_session_and_withdrawal_blocks_send(self):
+        self.packet["safeSources"] = [{"refId": "show:1", "sourceKind": "finalized_show",
+                                      "summary": "A recorded show ended.", "observedAt": STAMP}]
+        self.packet["privateSharedSourceProvenance"] = [{"refId": "show:1", "sourceKind": "finalized_show",
+                                                        "sourceId": "session-1", "sourceVersion": "v1"}]
+        self.bot.BNL_PRIMARY_GUILD_ID = 7
+        self.bot.fetch_bnl_read_model = mock.Mock(return_value={"shows": [
+            {"sessionId": "session-1", "showDate": "2026-09-29", "status": "archived"}]})
+        self.bot.public_show_evidence_archive = mock.Mock(side_effect=lambda model: model)
+        context = self.context()
+        self.assertEqual(context["items"][0]["url"], "https://site.test/radio/archive?view=shows&show=session-1")
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+        self.bot.public_show_evidence_archive.side_effect = lambda model: {}
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+        self.assertEqual(self.context()["items"][0]["url"], "")
+
+    def test_episode_link_never_matches_another_show_on_the_same_date(self):
+        self.packet["safeSources"] = [{"refId": "show:1", "sourceKind": "finalized_show",
+                                      "summary": "A recorded show ended.", "observedAt": STAMP}]
+        self.packet["privateSharedSourceProvenance"] = [{"refId": "show:1", "sourceKind": "finalized_show",
+                                                        "sourceId": "session-1", "sourceVersion": "v1"}]
+        self.bot.BNL_PRIMARY_GUILD_ID = 7
+        self.bot.fetch_bnl_read_model = mock.Mock(return_value={"shows": [
+            {"sessionId": "session-2", "showDate": "2026-09-29", "status": "archived"}]})
+        self.bot.public_show_evidence_archive = lambda model: model
+        self.assertEqual(self.context()["items"][0]["url"], "")
+
+    def test_correction_deletion_original_subject_change_and_forgery_fail_closed(self):
+        context = self.context()
+        self.packet["privateSources"][0]["subjectRef"] = "discord_user:456"
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+        self.packet["privateSources"][0]["subjectRef"] = "discord_user:123"
+        self.packet["safeSources"][0]["summary"] = "Corrected contribution."
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+        self.packet["safeSources"] = []
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+        context["items"][0]["url"] = "https://other.test/fiction"
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+
+    def test_invisible_root_version_change_invalidates_same_rendered_summary(self):
+        self.packet["privateSharedSourceProvenance"] = [{"refId": "fresh:1", "sourceVersion": "v1"}]
+        context = self.context()
+        self.packet["privateSharedSourceProvenance"][0]["sourceVersion"] = "v2"
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+
+    def test_bounded_selection_leaves_room_for_quiet_people_and_shows(self):
+        values = [activity(ref="fresh:" + str(n), subject="discord_user:123") for n in range(100)]
+        values.append(activity(ref="quiet", subject="discord_user:456", speaker="Quiet Contributor"))
+        self.packet.update(safeSources=[v[0] for v in values], privateSources=[v[1] for v in values])
+        self.packet["safeSources"].append({"refId": "show:1", "sourceKind": "finalized_show", "summary": "The recorded show ended after 43 tracks.", "observedAt": STAMP})
+        context = self.context()
+        self.assertEqual(len(context["items"]), edition.MAX_ACTIVITY_ITEMS)
+        self.assertIn("quiet", [s["ref"] for s in context["items"]])
+        self.assertIn("show:1", [s["ref"] for s in context["items"]])
+
+    def test_wrong_guild_cannot_read_or_revalidate(self):
+        with self.assertRaises(ValueError):
+            edition.build_context(self.bot, 7, 9, basis={"guild_id": 8}, now=NOW)
+        self.reader.assert_not_called()
+        self.assertFalse(edition.revalidate(self.bot, 8, self.context()))
+
+    def test_original_ambient_governance_failure_blocks_archive_reprojection(self):
+        context = self.context()
+        self.bot.revalidate_ambient_local_sources.return_value = False
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+        self.bot.revalidate_ambient_local_sources.assert_called_once_with(7, {"guild_id": 7})
+
+
+class OriginalDiscordFenceTests(unittest.TestCase):
+    def setUp(self):
+        safe, original = activity()
+        self.packet = {"safeSources": [safe], "privateSources": [original],
+                       "sourceArchiveAvailable": True, "aggregateCounts": {"eligibleConversations": 1}}
+        self.row = {"id": 42, "user_id": 123, "content": "Original content", "channel_policy": "public_home"}
+        self.event = {"event_seq": 1, "source_kind": "discord_message", "source_key": "7654",
+                      "raw_text": "Original content", "metadata": {"conversationRowId": 42}}
+        self.bot = SimpleNamespace(DB_FILE="memory-fixture", _ambient_source_rows=mock.Mock(return_value=[self.row]),
+                                   _remember_ambient_sources=lambda basis, table, rows: basis.setdefault("rows", {}).update(
+                                       {table: {r["id"]: edition._digest(r) for r in rows}}))
+
+    def fence(self):
+        conn = sqlite3.connect(":memory:")
+        with mock.patch.object(edition.sqlite3, "connect", return_value=conn), mock.patch.object(
+                edition, "query_source_events", return_value=SimpleNamespace(events=(self.event,))):
+            return edition._fence_discord_originals(self.bot, 7, self.packet, "2026-09-29T03:00:00Z", "2026-09-30T03:00:00Z")
+
+    def test_original_owner_receives_exact_row_and_saved_hash(self):
+        packet, basis = self.fence()
+        self.assertEqual(packet["safeSources"], self.packet["safeSources"])
+        self.assertEqual(basis["rows"]["conversations"], {42: edition._digest(self.row)})
+        self.assertEqual(self.bot._ambient_source_rows.call_args.kwargs, {"row_ids": {42}})
+
+    def test_live_privacy_forget_or_deletion_rejects_still_public_archive_copy(self):
+        self.bot._ambient_source_rows.return_value = []
+        packet, basis = self.fence()
+        self.assertEqual(packet["safeSources"], [])
+        self.assertEqual(packet["privateSources"], [])
+        self.assertEqual(basis["rows"]["conversations"], {})
+        self.assertEqual(packet["aggregateCounts"]["eligibleConversations"], 0)
+
+    def test_withdrawn_original_is_absent_from_edition_and_optional_art_input(self):
+        from bnl_own_art import art_source_records
+        self.bot._ambient_source_rows.return_value = []
+        self.bot._pacific_now = lambda: NOW
+        self.bot._journal_website_base_url = lambda: "https://site.test"
+        self.bot._build_publication_prompt_source_basis = mock.Mock(return_value=None)
+        self.bot._merge_ambient_source_hashes = lambda basis, table, rows: basis.setdefault("rows", {}).update({table: rows})
+        conn = sqlite3.connect(":memory:")
+        with mock.patch.object(edition.sqlite3, "connect", return_value=conn), mock.patch.object(
+                edition, "query_source_events", return_value=SimpleNamespace(events=(self.event,))), mock.patch.object(
+                edition, "build_source_packet_between", return_value=self.packet):
+            context = edition.build_context(self.bot, 7, 9, basis={"guild_id": 7}, now=NOW)
+        self.assertEqual(context["items"], [])
+        self.assertEqual(art_source_records(context["_packet"]), [])
+
+    def test_corrected_original_does_not_authorize_old_archived_text(self):
+        self.row["content"] = "Corrected original content"
+        self.assertEqual(self.fence()[0]["safeSources"], [])
+
+    def test_historical_archive_reflection_uses_same_original_fence_and_art_filter(self):
+        from bnl_own_art import art_source_records
+        self.packet["safeSources"] = []
+        self.packet["privateSources"] = []
+        self.packet["reflectionBasis"] = [{"refId": "reflection:event:1", "basisKind": "public_source_history",
+            "sourceType": "discord_message", "scope": JOURNAL_REFLECTION_SCOPE,
+            "publicSafe": True, "reuseEligible": True, "summary": "A historical public observation.",
+            "sourceVersion": "archive-v1", "sourceObservedAt": "2026-09-27T20:00:00Z"}]
+        self.packet["privateReflectionBasisProvenance"] = {"historicalSourceEvents": [
+            {"refId": "reflection:event:1", "sourceKind": "discord_message", "eventSeq": 1,
+             "subjectRef": "discord_user:123", "occurredAtMs": 1790539200000}]}
+        packet, basis = self.fence()
+        self.assertEqual(len(packet["reflectionBasis"]), 1)
+        self.assertEqual(basis["rows"]["conversations"], {42: edition._digest(self.row)})
+        self.bot._ambient_source_rows.return_value = []
+        packet, basis = self.fence()
+        self.assertEqual(packet["reflectionBasis"], [])
+        self.assertEqual(art_source_records(packet), [])
+        self.assertEqual(packet["privateReflectionBasisProvenance"]["historicalSourceEvents"], [])
+        self.assertEqual(basis["rows"]["conversations"], {})
+
+    def test_historical_reflection_without_original_provenance_is_not_reused(self):
+        self.packet["safeSources"] = []
+        self.packet["privateSources"] = []
+        self.packet["reflectionBasis"] = [{"refId": "reflection:event:1", "basisKind": "public_source_history",
+            "sourceType": "discord_message", "scope": JOURNAL_REFLECTION_SCOPE,
+            "publicSafe": True, "reuseEligible": True, "summary": "Missing its original proof.",
+            "sourceVersion": "archive-v1", "sourceObservedAt": "2026-09-27T20:00:00Z"}]
+        self.assertEqual(self.fence()[0]["reflectionBasis"], [])
+
+    def test_missing_original_binding_is_not_guessed_from_message_id(self):
+        self.event["metadata"] = {}
+        self.assertEqual(self.fence()[0]["safeSources"], [])
+
+    def test_wrong_subject_cannot_borrow_a_public_original(self):
+        self.row["user_id"] = 999
+        self.assertEqual(self.fence()[0]["safeSources"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
