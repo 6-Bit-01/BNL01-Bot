@@ -360,6 +360,9 @@ def develop_art_concept(bot, guild_id: int, proposal: dict, context: dict, *, at
         end = min(stamp + timedelta(minutes=6), datetime.now(timezone.utc))
         expanded = build_source_packet_between(bot.DB_FILE, guild_id, start.isoformat(), end.isoformat(),
                                               entry_kind="manual", prepare_schema=False)
+        packet_filter = context.get("packet_filter")
+        if callable(packet_filter):
+            expanded = packet_filter(expanded, start.isoformat(), end.isoformat())
         records = art_source_records(expanded)
         focused.update({s["ref"]: s for s in records})
         if records:

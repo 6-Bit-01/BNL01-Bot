@@ -17,6 +17,7 @@ from contextlib import AsyncExitStack, closing, nullcontext
 from pathlib import Path
 import sys
 import bnl_ambient_art as ambient_art
+import bnl_ambient_edition as ambient_edition
 from bnl_creative_protocol import GLITCH_PROTOCOL, SUNO_LYRIC_PROTOCOL, bound_suno_style_copy, creative_variation_hint, has_vocal_copy
 from typing import Any, Awaitable, Callable, Mapping, Union
 
@@ -25335,6 +25336,9 @@ def ambient_capacity_decision(
     else:
         allowed = state["capacityUsed"] < cap
         reason = "capacity_available" if allowed else "daily_cap_reached"
+        if (source_type == "ambient" and ambient_edition.enabled(sys.modules[__name__], guild_id)
+                and state["sourceCounts"].get("ambient", 0) >= 1):
+            allowed, reason = False, "community_edition_already_posted_today"
     return {
         **state,
         "allowed": allowed,
@@ -34384,6 +34388,9 @@ async def revalidate_ambient_sources(guild_id: int, basis: dict, *, stage: str) 
         current = await asyncio.to_thread(build_ambient_current_show_context, guild_id)
         valid = (basis.get('show') == _ambient_show_basis(current)
                  and await asyncio.to_thread(revalidate_ambient_local_sources, guild_id, basis))
+        if valid and basis.get('edition_context'):
+            valid = await asyncio.to_thread(ambient_edition.revalidate_sources,
+                                            sys.modules[__name__], guild_id, basis['edition_context'])
         if valid and basis.get('art_journal_basis'):
             refreshed, changed = await asyncio.to_thread(_refresh_publication_prompt_source_basis, basis['art_journal_basis'])
             valid = not changed and bool(refreshed.publications)
@@ -34399,6 +34406,9 @@ async def revalidate_ambient_sources(guild_id: int, basis: dict, *, stage: str) 
 
 async def generate_dynamic_ambient(guild_id: int, channel_id: int,
                                    *, source_basis_out: dict | None = None) -> str:
+    if ambient_edition.enabled(sys.modules[__name__], guild_id):
+        return await ambient_edition.generate(sys.modules[__name__], guild_id, channel_id,
+                                              source_basis_out=source_basis_out)
     basis = {'guild_id': guild_id}
     if source_basis_out is not None:
         source_basis_out.clear()
@@ -35742,7 +35752,7 @@ async def ambient_message_task():
                         schedule_next_day_ambient(guild_id, last_msg or "")
                         continue
 
-                    dormant_echo = await prepare_dormant_echo_canary(
+                    dormant_echo = {"status": "edition_owns_ambient_slot"} if ambient_edition.enabled(sys.modules[__name__], guild_id) else await prepare_dormant_echo_canary(
                         guild_id,
                         channel_id,
                         channel,
@@ -35777,7 +35787,14 @@ async def ambient_message_task():
                     art = await ambient_art.prepare(sys.modules[__name__], guild_id, source_basis)
                     if art:
                         await asyncio.to_thread(ambient_art.record, sys.modules[__name__], art['metadata']['artId'], 'discord_delivery_reserved')
+                    if art and art['metadata']['artId'] != 'bnl-art-' + _pacific_now().date().isoformat():
+                        art = None  # Never attach yesterday's claim after midnight.
+                    edition_payload = None
+                    if source_basis.get('edition'):
+                        edition_payload = await ambient_edition.delivery_payload(
+                            sys.modules[__name__], guild_id, source_basis, art)
                     if (not await revalidate_ambient_sources(guild_id, source_basis, stage='before_send')
+                            or (source_basis.get('edition') and edition_payload is None)
                             or not allow_passive_memory_for_policy(resolve_channel_policy(channel))
                             or is_community_image_channel(channel)):
                         if art:
@@ -35786,14 +35803,27 @@ async def ambient_message_task():
                         _reschedule_ambient_soon(guild_id, last_msg or '')
                         continue
                     if art and art['metadata']['artId'] != 'bnl-art-' + _pacific_now().date().isoformat():
-                        art = None  # Midnight must not charge yesterday's claim to today's send.
+                        art = None  # Membership/source checks can cross midnight too.
+                        if edition_payload:
+                            payload_kwargs = edition_payload[1]
+                            stale_file = payload_kwargs.pop('file', None)
+                            if stale_file:
+                                stale_file.close()
+                            payload_kwargs['embed'].set_image(url=None)
                     send_started = time.monotonic()
                     send_outcome = 'unconfirmed'
+                    next_scheduled = None
                     try:
                         kwargs = {'allowed_mentions': discord.AllowedMentions.none()}
-                        if art:
+                        content = msg
+                        if source_basis.get('edition'):
+                            content, kwargs = edition_payload
+                            # Reserve the next opportunity before transport so a
+                            # crash/uncertain send cannot repeat member pings.
+                            next_scheduled = schedule_next_day_ambient(guild_id, last_msg or '')
+                        elif art:
                             kwargs['file'] = ambient_art.discord_file(sys.modules[__name__], art)
-                        delivered = await channel.send(msg, **kwargs)
+                        delivered = await channel.send(content, **kwargs)
                         send_outcome = 'confirmed'
                     except Exception:
                         # Do not retry an ambiguous send on the next five-minute tick.
@@ -35811,12 +35841,15 @@ async def ambient_message_task():
                         if await revalidate_ambient_sources(guild_id, source_basis, stage='before_website_art'):
                             await asyncio.to_thread(ambient_art.publish_website, sys.modules[__name__], art)
 
-                    next_scheduled = schedule_after_ambient_post(
-                        guild_id,
-                        msg,
-                        capacity["capacityUsed"] + 1,
-                        now_pacific=now,
-                    )
+                    if next_scheduled is not None:
+                        update_guild_ambient_times(guild_id, msg, next_scheduled)
+                    else:
+                        next_scheduled = schedule_after_ambient_post(
+                            guild_id,
+                            msg,
+                            capacity["capacityUsed"] + 1,
+                            now_pacific=now,
+                        )
                     logging.info(f"📡 Ambient posted successfully in guild {guild_id}")
                     logging.info(f"📡 Next ambient scheduled for guild {guild_id} at {next_scheduled}")
 
