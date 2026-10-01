@@ -111,6 +111,44 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertIn("windowSegmentActivity", prompt)
         self.assertNotIn("Do not include direct quotes", prompt)
 
+    def test_reflective_editorial_contract_keeps_sources_and_coverage_across_modes(self):
+        # The editorial change must not relax evidence or only apply on quiet days.
+        for flags in ({}, {"entryKind": "weekly"}, {"sourceRecoveryMode": True},
+                      {"lowActivityMode": True, "creativeReflectionAllowed": True}):
+            with self.subTest(flags=flags):
+                packet = {**self.packet, **flags}
+                for reason in ("", "source_grounded_revision", "published_correction"):
+                    prompt = journal.build_generation_prompt(packet, repair_reason=reason,
+                                                             previous_output="{}" if reason else "")
+                    projected, _ = json.JSONDecoder().raw_decode(prompt.split("Generation-safe packet:\n", 1)[1])
+                    contract = projected["editorialContract"]
+                    self.assertTrue(contract["personalReflectionExpected"])
+                    self.assertTrue(contract["preserveGroundedDetail"])
+                    self.assertFalse(contract["fixedSectionTemplate"])
+                    self.assertEqual([], contract["requiredBeatsAcrossEntry"])
+                    self.assertEqual(packet["safeSources"], projected["freshSources"])
+                    self.assertEqual(packet["evidenceCoverageContract"], projected["evidenceCoverageContract"])
+                    self.assertEqual(bool(packet.get("creativeReflectionAllowed")),
+                                     projected["creativeReflectionAllowed"])
+
+    def test_reflection_retains_detail_without_authorizing_external_inference(self):
+        detail = "A producer brought a bass sketch into the room."
+        reflection = "I am fond of the unfinished edge; it leaves me curious about what another pass might change."
+        for flags in ({}, {"entryKind": "weekly"}, {"sourceRecoveryMode": True}):
+            with self.subTest(flags=flags):
+                packet = {**self.packet, **flags}
+                article = _article(packet, opening=detail, reaction_text=reflection)
+                before = json.dumps(article, sort_keys=True)
+                self.assertEqual("", journal.validate_article(article, packet, []))
+                self.assertEqual(before, json.dumps(article, sort_keys=True))
+                self.assertIn(detail, article["sections"][0]["body"])
+                self.assertIn(reflection, article["sections"][0]["body"])
+                for unsupported in ("I think a regular secretly dislikes the producer.",
+                                    "I wonder whether their silence means anger.",
+                                    "I am fond of the sketch, but I think the producer released it tonight."):
+                    suspect = _article(packet, opening=detail, reaction_text=unsupported)
+                    self.assertEqual("undeclared_context_use", journal.validate_article(suspect, packet, []))
+
     def test_degraded_relay_window_enters_source_recovery_and_rejects_thin_citations(self):
         source_store.ensure_schema(self.db)
         current_start = datetime(2026, 7, 23, 7, tzinfo=timezone.utc)

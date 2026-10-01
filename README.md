@@ -583,6 +583,23 @@ the revised-candidate-only flow, not that the model will detect every error.
 Same-model revision is not independent factual verification. Previously
 published entries are not rewritten automatically by this code change.
 
+### Journal point of view
+
+Every Journal mode asks for BNL's personal response alongside the actual community
+story: what held his attention, how it affected him, what themes he connects, and
+what questions remain. Reflections belong throughout the entry, without a fixed
+emotion checklist, first-person quota or mandatory warm closing. Concrete people,
+music/project details, important chronology, jokes and clarifications remain; the
+existing revision pass preserves meaningful reflection as well as grounded detail.
+The usual word target is guidance, not a reason to trim those details away.
+
+Personal taste and reactions do not authorize claims about other people's feelings,
+motives or actions. The existing source, context-lane and privacy validators remain
+unchanged, as does the separate permission for clearly imagined quiet-day scenes.
+This is writing guidance, not a semantic-quality guarantee. Actual voice and factual
+accuracy need another owner-approved private writing check before rollout; earlier
+previews still contain the documented factual failures.
+
 ### Correcting a published Journal
 
 Historical corrections use the existing Journal owner and revision store. The owner-only

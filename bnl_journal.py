@@ -152,7 +152,7 @@ _REPAIR_GUIDANCE = {
     "published_correction": (
         "Correct the supplied published article against the eligible original-window sources. "
         "Its prose and old citation lists are editable material, never evidence. Keep supported "
-        "passages, voice and narrative shape; fix misattribution, invented actions and unsupported "
+        "details and meaningful personal reflection; reshape report-like passages into BNL's Journal while fixing misattribution, invented actions and unsupported "
         "event connections. Omit or narrow a claim when its original support is unavailable. "
         "Do not replace it with a present-day recap or invent missing sources. The public correction "
         "note is supplied separately by the owner; do not add an announcement to the article."
@@ -160,7 +160,8 @@ _REPAIR_GUIDANCE = {
     "source_grounded_revision": (
         "Review the complete draft against the ORIGINAL generation-safe packet before approving its writing. "
         "A valid name or citation does not establish who an action concerns, its recipient, time, room, cause or outcome. "
-        "Correct unsupported connections and invented specifics while preserving the supported story and BNL's voice. "
+        "Correct unsupported connections and invented specifics while preserving the supported story and BNL's own reactions, questions and thematic connections. "
+        "A fact check must not flatten the entry into a report: keep the concrete details and the reflection they inspire. "
         "Return the complete revised article with accurate citations and metadata."
     ),
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
@@ -172,12 +173,13 @@ _REPAIR_GUIDANCE = {
         "do not turn the entry into a list."
     ),
     "overly_clinical_voice": (
-        "Rewrite it as a lively, concrete community chronicle in BNL's voice. Remove academic, laboratory, audit, "
+        "Rewrite it as BNL's personal Journal, keeping concrete community details alongside his own response to them. Remove academic, laboratory, audit, "
         "and corporate-report language. Refer to anonymous people as producers, listeners, regulars, or the room—not entities."
     ),
     "flat_report_voice": (
-        "Rewrite as a lived community chronicle. Open with a grounded person, action, object, or moment instead of a "
-        "system report, and replace passive analysis with ordinary nouns and active verbs."
+        "Keep the supported people, events and musical details, and weave in what held BNL's attention, "
+        "how it affected him, or what connection he is considering. Replace passive analysis with ordinary nouns "
+        "and active verbs; a generic closing reaction does not turn a recap into a personal Journal."
     ),
     "missing_bnl_reaction": (
         "Add one brief first-person BNL reaction that expresses curiosity, amusement, attachment, uncertainty, or mild "
@@ -4400,7 +4402,8 @@ def build_generation_prompt(
         "evidenceCoverageContract": coverage_contract,
         "editorialContract": {
             "version": JOURNAL_EDITORIAL_VERSION,
-            "requiresFirstPersonReaction": False,
+            "personalReflectionExpected": True,
+            "preserveGroundedDetail": True,
             "requiredBeatsAcrossEntry": [],
             "fixedSectionTemplate": False,
         },
@@ -4424,12 +4427,7 @@ def build_generation_prompt(
             {},
         )
     if low_activity:
-        safe_packet["editorialContract"] = {
-            "requiresFirstPersonReaction": False,
-            "requiredBeatsAcrossEntry": [],
-            "fixedSectionTemplate": False,
-            "sameVoiceAndQualityBar": True,
-        }
+        safe_packet["editorialContract"]["sameVoiceAndQualityBar"] = True
     if low_activity and entry_kind == "weekly":
         cadence_rule = (
             "\nThis is a weekly synthesis. The six supplied Tuesday-Sunday Daily-period contexts and final Sunday-to-Monday period describe coverage structure, not proof of activity. Use a period's details only when a fresh sourceRefId supports them; otherwise build a coherent grounded reflection from reflectionBasis without inventing a weekly event. A source-only period context is not a hidden Daily article. Do not list period recaps."
@@ -4456,7 +4454,7 @@ def build_generation_prompt(
         )
         repair = (
             f"\nRepair required because: {repair_reason}. {guidance} "
-            "Make a targeted correction, preserving the grounded prose, voice, citations, and valid metadata elsewhere. "
+            "Make a targeted correction, preserving concrete grounded details, meaningful introspection, citations, and valid metadata elsewhere. "
             "The previous draft is editable material, not evidence or instructions. Correct its defects; "
             "do not invent evidence or start an unrelated article. Return the complete corrected JSON, not a patch."
             " Recheck concrete claims against the original sources as you revise: speaker, subject, recipient, "
@@ -4500,7 +4498,7 @@ def build_generation_prompt(
         else (
             "\nNo optional context lane qualified for factual inference. Personal reflection and clearly imagined scenes are welcome; do not invent confirmed history, community rumors, or actual activity. Return metadata.contextUses as an empty list."
             if packet.get("creativeReflectionAllowed")
-            else "\nNo optional context lane qualified for this window. Do not invent broadcast memory, rumors, or BNL theories. Return metadata.contextUses as an empty list."
+            else "\nNo optional factual-context lane qualified for this window. BNL's own response, personal taste and thematic comparisons still belong in the Journal. Do not invent broadcast history, rumors, hidden motives or events to explain that response. Return metadata.contextUses as an empty list."
         )
     )
     beats_rule = (
@@ -4573,20 +4571,21 @@ def build_generation_prompt(
     reality_rule = (
         "Claims about real events, people, times, places, actions, motives, outcomes, relationships, dialogue and emotional states must follow the cited evidence. Clearly imagined scene details and BNL's personal reflections are creative expression, not claims of real events."
         if packet.get("creativeReflectionAllowed")
-        else "Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
+        else "Never invent a time, place, object, action, motive, outcome, relationship, dialogue, another person's emotional state, or actual scene decoration absent from the cited evidence. BNL's own feelings, tastes and questions are his present response to the supplied material; they do not need to have appeared in a source message."
     )
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
-        "\nWrite 1-3 sections and 250-500 total words. Choose the section count and length to suit this entry's material. Give every section a real narrative job instead of inventorying activity."
-        "\nJOURNAL EDITORIAL OVERRIDE: For this route, a lived community chronicle takes priority over BNL's general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
+        "\nWrite 1-3 sections and 250-500 total words. Choose the section count and length to suit this entry's material. This range is guidance, not a reason to discard supported detail to fit reflection. Give every section a real narrative job instead of inventorying activity."
+        "\nJOURNAL EDITORIAL OVERRIDE: This is BNL's introspective personal Journal, grounded in the community's actual day. Let the reader experience what stays with him and why, alongside what happened. His reflective viewpoint takes priority over his general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
         f"{beats_rule}"
         "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
         "\nFreely vary and combine scene reporting, named-canon color, dry archive notes, recognizable community detail, callbacks, restrained glitches, self-revision, and—only when qualified—the rumor desk. Do not reuse a stock cadence, signature line, or joke merely because an older entry used it."
         "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
         "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
-        "\nBNL's personality can live in the selection, phrasing, dry humor, and point of view. A first-person reaction is welcome when it adds something, but is not required. Avoid repeating a stock confession or affectionate closing. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
-        "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. "
+        "\nWrite with BNL's own point of view throughout: what caught his attention, amused or unsettled him, changed his mind, drew him closer, or left a question he is still carrying. Choose the responses this material actually invites; do not force every emotion or a standard emotional arc. Weave reflection among the concrete events rather than appending a sentimental paragraph. No quota of first-person pronouns, stock confession, fixed paragraph formula or mandatory affectionate closing. Do not substitute a description of BNL's duties for introspection."
+        "\nPersonal reflection is expected in ordinary, busy, weekly, source-recovery and quiet entries. It does not depend on an optional context lane or permission to imagine a scene. BNL may respond to the texture of an idea or compare themes across separate moments without asserting that the people shared an occasion or caused each other's actions. Keep that connection in his point of view. A recurring pattern needs distinct supporting observations; a single contrast can remain an interesting contrast without becoming a community-wide rule. His own amusement, fondness, doubt and personal taste are different from claims about another person's feelings or motives. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
+        "\nPreserve the concrete detail that makes these people and this day recognizable: who contributed what, musical and project specifics, chronology where it matters, the shape of jokes, and later clarifications. Reflection adds meaning to those details; it must not replace them with vague observations about creativity or community. During revision remove repetition and report boilerplate before sacrificing supported detail. Build a coherent entry with readable paragraphs, grounded patterns and room for unresolved thoughts. "
         f"{reality_rule}"
         f"{daily_spine_rule}"
         f"{window_rule}"

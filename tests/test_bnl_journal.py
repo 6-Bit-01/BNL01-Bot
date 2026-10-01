@@ -68,7 +68,7 @@ class JournalTests(unittest.TestCase):
         self.assertNotIn('discord_user:7', prompt)
         self.assertNotIn('relationship_journal', json.dumps(packet))
         self.assertNotIn('secret internal', json.dumps(packet))
-        self.assertIn('community chronicle', prompt)
+        self.assertIn("BNL's introspective personal Journal", prompt)
         self.assertIn('Never call people entities or organisms', prompt)
         self.assertIn('Do not invent nicknames', prompt)
         self.assertIn('Juicy means lively pattern recognition', prompt)
