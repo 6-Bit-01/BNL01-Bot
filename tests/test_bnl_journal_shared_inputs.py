@@ -8,6 +8,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
@@ -182,6 +183,7 @@ class JournalSharedInputsTests(unittest.TestCase):
 
     def test_correction_during_generation_cannot_become_a_saved_draft(self):
         packet = self.packet()
+        @with_supported_review
         def generator(value, _prompt):
             with sqlite3.connect(self.db) as conn:
                 conn.execute("UPDATE memory_ledger_entries SET normalized_value='The earlier source was corrected.' WHERE entry_id=?", (self.roots[0],))
@@ -239,7 +241,7 @@ class JournalSharedInputsTests(unittest.TestCase):
 
     def test_scheduled_show_revision_survives_restart_and_posts_exact_bytes_once(self):
         self.add_show()
-        prepared = automation.prepare_daily(self.db, 1, lambda packet, prompt: article_json(packet),
+        prepared = automation.prepare_daily(self.db, 1, with_supported_review(lambda packet, prompt: article_json(packet)),
             target_day=date(2026, 8, 27), force=True)
         self.assertEqual(prepared.status, "prepared", prepared)
         with sqlite3.connect(self.db) as conn:
@@ -271,7 +273,7 @@ class JournalSharedInputsTests(unittest.TestCase):
 
     def test_show_revised_after_prepare_retires_packet_and_keeps_occurrence_owed(self):
         self.add_show()
-        prepared = automation.prepare_daily(self.db, 1, lambda packet, prompt: article_json(packet),
+        prepared = automation.prepare_daily(self.db, 1, with_supported_review(lambda packet, prompt: article_json(packet)),
             target_day=date(2026, 8, 27), force=True)
         self.assertEqual(prepared.status, "prepared", prepared)
         revised = show_fixture.archived_show()

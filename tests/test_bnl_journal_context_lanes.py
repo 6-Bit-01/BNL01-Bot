@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import bnl_journal as journal
+from tests.journal_review_helpers import is_source_review, review_inputs, supported_review, with_supported_review
 
 
 def _long_body(opening: str) -> str:
@@ -420,17 +421,18 @@ class JournalContextLaneTests(unittest.TestCase):
 
         def generator(_packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                self.assertEqual(3, len(calls))
+                units, evidence = review_inputs(prompt)
+                self.assertIn(claim, " ".join(unit["text"] for unit in units))
+                self.assertIn(memory["laneRefId"], {source["refId"] for source in evidence["sources"]})
+                return supported_review(prompt)
             if len(calls) == 1:
                 return raw
             previous = json.loads(prompt.split("Complete previous draft (not evidence):\n", 1)[1])
-            if len(calls) == 2:
-                self.assertEqual(candidate, previous)
-                self.assertIn(memory["laneRefId"], prompt.split("Validation targets", 1)[1])
-            else:
-                self.assertEqual(3, len(calls))
-                self.assertEqual(corrected, previous)
-                self.assertIn("source_grounded_revision", prompt)
-                self.assertNotIn("Validation targets", prompt)
+            self.assertEqual(2, len(calls))
+            self.assertEqual(candidate, previous)
+            self.assertIn(memory["laneRefId"], prompt.split("Validation targets", 1)[1])
             return json.dumps(corrected)
 
         article, reason, advisory = journal._generate_article_with_repairs(packet, generator, [])
@@ -711,7 +713,7 @@ class JournalContextLaneTests(unittest.TestCase):
                     1,
                     entry_id,
                     72,
-                    lambda *_args: json.dumps(generated),
+                    with_supported_review(lambda *_args: json.dumps(generated)),
                 )
             self.assertTrue(result.ok, result.reason)
             build_packet.assert_called_once_with(self.db, 1, 72, entry_kind=kind)

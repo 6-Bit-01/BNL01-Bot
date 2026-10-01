@@ -8,7 +8,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 import bnl_journal as journal
+import bnl_journal_attribution as attribution
 import bnl_journal_source_store as source_store
+from tests.journal_review_helpers import (
+    is_source_review, rejected_review, review_inputs, supported_review, with_supported_review,
+)
 
 
 class JournalGroundedRevisionTests(unittest.TestCase):
@@ -47,7 +51,13 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         }, indent=2)
 
     def run_sequence(self, outputs, *, prior_titles=None, max_attempts=None, generation_guard=None):
-        generator = Mock(side_effect=outputs)
+        remaining = iter(outputs)
+        def generate(_packet, prompt):
+            output = next(remaining)
+            if isinstance(output, Exception):
+                raise output
+            return output(prompt) if callable(output) else output
+        generator = Mock(side_effect=generate)
         events = []
         result = journal._generate_article_with_repairs(
             self.packet, generator, prior_titles or [], events.append,
@@ -56,27 +66,31 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         )
         return result, generator, events
 
-    def test_valid_first_draft_requires_second_call_with_exact_draft_and_original_packet(self):
+    def assert_reviewed_candidate(self, article, raw):
+        expected = journal.parse_generated_json(raw)
+        actual = copy.deepcopy(article)
+        receipt = actual["metadata"].pop("sourceReview")
+        self.assertEqual(actual, expected)
+        self.assertEqual(receipt["articleDigest"], attribution.article_digest(expected))
+
+    def test_valid_first_draft_requires_source_only_review_of_exact_candidate_and_original_packet(self):
         first = self.draft()
-        final = self.draft("Test Listener still has a chorus in progress. I have room for another listen.",
-                           title="Room for the Next Listen")
         before = copy.deepcopy(self.packet)
         with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
-            (article, reason, advisory), generator, events = self.run_sequence([first, final])
+            (article, reason, advisory), generator, events = self.run_sequence([first, supported_review])
         self.assertEqual(generator.call_count, 2)
         self.assertTrue(all(call.args[0] is self.packet for call in generator.call_args_list))
         self.assertEqual(self.packet, before)
-        self.assertEqual(prompts.call_args_list[1].kwargs["repair_reason"], "source_grounded_revision")
-        self.assertEqual(prompts.call_args_list[1].kwargs["previous_output"], first)
+        self.assertEqual(prompts.call_count, 1)
         first_packet, _ = json.JSONDecoder().raw_decode(
             generator.call_args_list[0].args[1].split("Generation-safe packet:\n", 1)[1])
-        second_packet, _ = json.JSONDecoder().raw_decode(
-            generator.call_args_list[1].args[1].split("Generation-safe packet:\n", 1)[1])
-        self.assertEqual(first_packet, second_packet)
-        supplied_draft = generator.call_args_list[1].args[1].split(
-            "Complete previous draft (not evidence):\n", 1)[1]
-        self.assertEqual(json.loads(supplied_draft), json.loads(first))
-        self.assertEqual(article, journal.parse_generated_json(final))
+        units, evidence = review_inputs(generator.call_args_list[1].args[1])
+        self.assertEqual(units, attribution.public_units(journal.parse_generated_json(first)))
+        self.assertEqual(first_packet["freshSources"], [source for source in evidence["sources"]
+                                                       if source["refId"].startswith("fresh:")])
+        self.assertTrue(any(source.get("sourceRole") == "approved_canon" for source in evidence["sources"]))
+        self.assertNotIn("Generation-safe packet:", generator.call_args_list[1].args[1])
+        self.assert_reviewed_candidate(article, first)
         self.assertEqual(reason, "")
         self.assertFalse(advisory)
         self.assertEqual([event["outcome"] for event in events if event["phase"] == "finished"],
@@ -85,14 +99,13 @@ class JournalGroundedRevisionTests(unittest.TestCase):
 
     def test_structural_repair_does_not_replace_grounded_revision(self):
         first_acceptable = self.draft()
-        final = self.draft(title="The Chorus Can Wait")
         with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
-            (article, reason, _), generator, _ = self.run_sequence(["not json", first_acceptable, final])
+            (article, reason, _), generator, _ = self.run_sequence(["not json", first_acceptable, supported_review])
         self.assertEqual(generator.call_count, 3)
         self.assertEqual(prompts.call_args_list[1].kwargs["repair_reason"], "malformed_json")
-        self.assertEqual(prompts.call_args_list[2].kwargs["repair_reason"], "source_grounded_revision")
-        self.assertEqual(prompts.call_args_list[2].kwargs["previous_output"], first_acceptable)
-        self.assertEqual(article["title"], "The Chorus Can Wait")
+        self.assertEqual(prompts.call_count, 2)
+        self.assertTrue(is_source_review(generator.call_args_list[2].args[1]))
+        self.assert_reviewed_candidate(article, first_acceptable)
         self.assertEqual(reason, "")
 
     def test_unreviewed_advisory_is_not_a_fallback_when_revision_provider_fails(self):
@@ -118,11 +131,10 @@ class JournalGroundedRevisionTests(unittest.TestCase):
     def test_reviewed_advisory_survives_later_polish_failure(self):
         title = "A Previously Published Title"
         first = self.draft("Test Composer asked about the chorus.", title=title)
-        reviewed = self.draft("Test Listener is still working on the chorus.", title=title)
         (article, reason, advisory), generator, events = self.run_sequence(
-            [first, reviewed, RuntimeError("provider stopped")], prior_titles=[title])
+            [first, supported_review, RuntimeError("provider stopped")], prior_titles=[title])
         self.assertEqual(generator.call_count, 3)
-        self.assertEqual(article, journal.parse_generated_json(reviewed))
+        self.assert_reviewed_candidate(article, first)
         self.assertEqual(reason, "")
         self.assertTrue(advisory)
         finished = [event for event in events if event["phase"] == "finished"]
@@ -133,9 +145,9 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         title = "A Previously Published Title"
         reviewed = self.draft("Test Listener is still working on the chorus.", title=title)
         (article, reason, advisory), generator, _ = self.run_sequence(
-            [self.draft(title=title), reviewed, "not json", "not json"], prior_titles=[title])
+            [reviewed, supported_review, "not json", "not json"], prior_titles=[title])
         self.assertEqual(generator.call_count, 4)
-        self.assertEqual(article, journal.parse_generated_json(reviewed))
+        self.assert_reviewed_candidate(article, reviewed)
         self.assertEqual(reason, "")
         self.assertTrue(advisory)
 
@@ -143,7 +155,7 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         title = "A Previously Published Title"
         guard = Mock(side_effect=["", "", "", "", "privacy_source_ineligible"])
         (article, reason, advisory), generator, _ = self.run_sequence(
-            [self.draft(title=title)] * 4, prior_titles=[title], generation_guard=guard)
+            [self.draft(title=title), supported_review], prior_titles=[title], generation_guard=guard)
         self.assertEqual(generator.call_count, 2)
         self.assertIsNone(article)
         self.assertEqual(reason, "privacy_source_ineligible")
@@ -159,9 +171,9 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         generator.assert_not_called()
         self.assertNotIn("private failure detail", json.dumps(events))
 
-    def test_bad_revision_uses_remaining_slots_without_a_fifth_call_or_first_draft_fallback(self):
-        for bad_revision, expected in (("not json", "malformed_json"),
-                                       (self.draft(refs=["fresh:missing"]), "invalid_section_source_refs")):
+    def test_bad_review_uses_remaining_slots_without_a_fifth_call_or_first_draft_fallback(self):
+        for bad_revision, expected in (("not json", "source_review_invalid"),
+                                       (self.draft(), "source_review_invalid")):
             with self.subTest(reason=expected):
                 (article, reason, advisory), generator, _ = self.run_sequence(
                     [self.draft(), bad_revision, bad_revision, bad_revision], max_attempts=99)
@@ -169,12 +181,14 @@ class JournalGroundedRevisionTests(unittest.TestCase):
                 self.assertIsNone(article)
                 self.assertEqual(reason, expected)
                 self.assertFalse(advisory)
+                self.assertTrue(all(is_source_review(call.args[1]) for call in generator.call_args_list[1:]))
 
-    def test_malformed_revision_can_be_repaired_in_remaining_slot(self):
-        final = self.draft(title="One More Listen Tomorrow")
-        (article, reason, advisory), generator, _ = self.run_sequence([self.draft(), "not json", final])
+    def test_malformed_review_can_retry_same_candidate_in_remaining_slot(self):
+        first = self.draft(title="One More Listen Tomorrow")
+        (article, reason, advisory), generator, _ = self.run_sequence([first, "not json", supported_review])
         self.assertEqual(generator.call_count, 3)
-        self.assertEqual(article, journal.parse_generated_json(final))
+        self.assert_reviewed_candidate(article, first)
+        self.assertEqual(generator.call_args_list[1].args[1], generator.call_args_list[2].args[1])
         self.assertEqual(reason, "")
         self.assertFalse(advisory)
 
@@ -196,10 +210,10 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         generator.assert_not_called()
         store.assert_not_called()
 
-    def test_attribution_and_event_connection_analogs_only_return_the_supplied_revision(self):
+    def test_attribution_and_event_connection_analogs_require_repair_and_new_review(self):
         # Both flawed drafts currently pass structural checks. These fixtures
-        # prove they reach source-grounded revision and never escape as the
-        # final result; they do not prove Gemini will identify their mistakes.
+        # Explicit mocked editor judgments require a repair and another review;
+        # they do not prove Gemini will identify these semantic mistakes.
         cases = (
             ("Test Composer said the new chorus was finished.",
              "Test Composer asked Test Listener about the chorus; Test Listener said it was unfinished."),
@@ -210,11 +224,16 @@ class JournalGroundedRevisionTests(unittest.TestCase):
             with self.subTest(flawed=flawed):
                 first, reviewed = self.draft(flawed), self.draft(corrected)
                 self.assertEqual(journal.validate_article(journal.parse_generated_json(first), self.packet, []), "")
-                (article, reason, _), generator, _ = self.run_sequence([first, reviewed])
-                self.assertEqual(generator.call_count, 2)
+                with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
+                    (article, reason, _), generator, _ = self.run_sequence(
+                        [first, rejected_review, reviewed, supported_review])
+                self.assertEqual(generator.call_count, 4)
                 self.assertIn(flawed, generator.call_args_list[1].args[1])
                 self.assertIn(self.packet["safeSources"][1]["summary"], generator.call_args_list[1].args[1])
-                self.assertEqual(article["sections"][0]["body"], corrected)
+                self.assertEqual(prompts.call_args_list[1].kwargs["repair_reason"], "source_attribution_failed")
+                self.assertEqual(prompts.call_args_list[1].kwargs["previous_output"], first)
+                self.assertTrue(prompts.call_args_list[1].kwargs["repair_details"])
+                self.assert_reviewed_candidate(article, reviewed)
                 self.assertEqual(reason, "")
 
 
@@ -268,7 +287,7 @@ class JournalArchivedGenerationGuardTests(unittest.TestCase):
 
     def test_archive_backed_regeneration_keeps_old_draft_when_source_is_withdrawn(self):
         original = journal.generate_and_store_packet_draft(
-            self.db, 1, self.packet, lambda packet, _prompt: self.draft(packet))
+            self.db, 1, self.packet, with_supported_review(lambda packet, _prompt: self.draft(packet)))
         self.assertTrue(original.ok, original.reason)
         calls = []
         removed = []

@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
@@ -481,6 +482,8 @@ class JournalLowActivityTests(unittest.TestCase):
 
         def generator(source_packet, _prompt):
             calls.append(1)
+            if is_source_review(_prompt):
+                return supported_review(_prompt)
             return generated_reflection_json(source_packet)
 
         with patch.object(

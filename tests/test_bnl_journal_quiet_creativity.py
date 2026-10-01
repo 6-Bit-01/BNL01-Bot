@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as archive
@@ -194,6 +195,8 @@ class QuietJournalTests(unittest.TestCase):
         calls = []
         def writer(source_packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             article = self.article(source_packet, "Tonight I imagine the queue as a hallway of humming doors.")
             for section in article["sections"]:
                 section["sourceRefIds"] = article["sourceRefIds"][section["heading"]]

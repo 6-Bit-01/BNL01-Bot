@@ -555,33 +555,45 @@ dates. Original contributions and recorded show events establish activity;
 BNL's Relays and earlier Journals remain interpretation and continuity, not
 independent confirmation of events.
 
-The first blocking-clean generated article is now a draft for source-grounded
-revision, including when only editorial advisories remain. The next call
-receives the exact draft and the same original source packet to check people,
-recipients, chronology, room connections, later clarifications and invented
-specifics while retaining BNL's humor and narrative voice. The existing source
-eligibility and preparation-owner checks run before and after each call;
-withdrawn sources or lost ownership stop generation without a fallback.
-Validation and release-time revalidation still apply. Only a revised candidate can be
-saved; an unreviewed first draft cannot become a fallback. A reviewed candidate
-with only editorial advisories can still survive later polish failure.
+The first blocking-clean article requires a source-only editorial review of its
+exact final wording. This replaces the former mandatory rewrite; a reviewer
+cannot silently change the article it approves. It receives every public prose
+unit and the eligible original evidence, including related messages and later
+clarifications. The review checks speaker, recipient, uncertainty, actual
+conduct, room, chronology and causal connections while allowing BNL's own
+feelings, faithful paraphrase, humor, canon and metaphor.
 
-The existing four-attempt ceiling is unchanged. Normal successful preparation
-now uses two generation calls instead of usually one, increasing cost and latency within
-the existing spending controls. Structural repairs use the same allowance;
-if the first acceptable draft arrives on the last call, it is withheld because
-revision has no remaining slot. There is no fifth Journal attempt for revision. Preparation
-still starts at 6:30 PM Pacific and 7 PM releases the saved approved payload
-without a new generation call. Existing release, privacy and recovery fences
-remain in charge.
+A complete private review must cover every unit, identify supported source
+excerpts and their original speakers, and report unresolved discrepancies.
+Unknown anchors, wrong speaker bindings, incomplete reviews and negative or
+uncertain verdicts cannot release a candidate. BNL-derived speech cannot serve
+as evidence that another person actually did something. A local digest binds
+accepted review to the exact prose, citations and context declarations. The
+receipt stays in existing private Journal metadata, outside the public payload.
+This is inspectable model judgment, not a deterministic proof of semantic truth.
 
-The one-call private Journal inspection still shows an **unreviewed first
-draft**. Its result and private message explicitly distinguish structural
-checks from publication approval; it does not run the revision, publish or
-write community memory. Mocked regression tests prove source preservation and
-the revised-candidate-only flow, not that the model will detect every error.
-Same-model revision is not independent factual verification. Previously
-published entries are not rewritten automatically by this code change.
+The existing four-attempt ceiling is unchanged: write, review, and if necessary
+repair and review again. A final-slot rewrite without review is withheld. Only
+an exact reviewed advisory candidate can survive later polish failure. The
+source editor uses the same Journal route and spending controls but does not
+receive the writer's persona; incomplete provider responses cannot pass. Source
+eligibility and preparation ownership are rechecked before and after every call.
+Preparation still starts at 6:30 PM Pacific; 7 PM releases the saved approved
+payload without a new generation call. No new scheduler or publication owner.
+
+Historical corrections can also receive bounded, retained, delivered BNL
+utterances near eligible human messages in the same public room and window.
+These establish only what BNL said and when; they add no factual roots, activity
+counts or section citations. Existing original-source controls and exact row
+revalidation apply at generation, approval and delivery. Private, undelivered,
+group or otherwise unsupported rows are excluded. This context is correction-only
+because that path supplies the original-source control callback. Missing BNL
+speech stays unknown in other Journal paths, not reconstructed from persona.
+
+The one-call private inspection remains an **unreviewed first draft**. Mocked
+regressions prove protocol enforcement and source handling, not that the model
+will identify every semantic error. Actual writing still needs source-by-source
+quality assessment. Published entries are never rewritten automatically.
 
 ### Journal point of view
 

@@ -16,6 +16,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 
 
 TARGET_DAY = date(2026, 7, 20)
@@ -168,7 +169,7 @@ class PreparedReleaseTests(unittest.TestCase):
         return automation.prepare_daily(
             self.db,
             1,
-            generator or (lambda packet, _prompt: article_json(packet)),
+            with_supported_review(generator or (lambda packet, _prompt: article_json(packet))),
             target_day=TARGET_DAY,
             force=True,
         )
@@ -278,7 +279,7 @@ class PreparedReleaseTests(unittest.TestCase):
 
         def generate(packet, _prompt):
             calls.append(packet)
-            if len(calls) == 3:
+            if len(calls) == 2:
                 subject = next(source["subjectRef"] for source in packet["privateSources"]
                                if source.get("sourceKind") == "conversation")
                 removed.append(source_store.purge_user_discord_sources(
@@ -289,7 +290,7 @@ class PreparedReleaseTests(unittest.TestCase):
             return json.dumps(value)
 
         result = self.prepare(generate)
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(removed, [1])
         self.assertEqual(result.reason, "privacy_source_ineligible")
         self.assert_owed_occurrence_has_no_revision_link(result)
@@ -763,7 +764,7 @@ class PreparedReleaseTests(unittest.TestCase):
 
         def full_quality_generator(packet, prompt):
             generation_calls.append((packet, prompt))
-            return article_json(packet)
+            return supported_review(prompt) if is_source_review(prompt) else article_json(packet)
 
         with sqlite3.connect(self.db) as conn:
             conn.execute(
@@ -806,7 +807,7 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertEqual(2, len(generation_calls))
         self.assertEqual(first_attempt[0], generation_calls[0])
         self.assertEqual(generation_calls[0][0], generation_calls[1][0])
-        self.assertIn("source_grounded_revision", generation_calls[1][1])
+        self.assertTrue(is_source_review(generation_calls[1][1]))
 
     def test_automatic_generation_cycles_are_bounded_but_occurrence_stays_owed(self):
         generation_calls = []
@@ -904,7 +905,7 @@ class PreparedReleaseTests(unittest.TestCase):
         recovered = automation.prepare_daily(
             self.db,
             1,
-            lambda packet, _prompt: article_json(packet),
+            with_supported_review(lambda packet, _prompt: article_json(packet)),
             target_day=TARGET_DAY,
             force=False,
         )
@@ -1170,7 +1171,7 @@ class PreparedReleaseTests(unittest.TestCase):
 
         result = self.prepare(repaired)
         self.assertEqual("prepared", result.status, result)
-        self.assertEqual(3, len(calls))
+        self.assertEqual(2, len(calls))
 
         with sqlite3.connect(self.db) as conn:
             conn.row_factory = sqlite3.Row
@@ -1229,12 +1230,12 @@ class PreparedReleaseTests(unittest.TestCase):
                 "id INTEGER PRIMARY KEY AUTOINCREMENT)"
             )
 
-        def accounted(packet, _prompt):
+        def accounted(packet, prompt):
             with sqlite3.connect(self.db) as conn:
                 conn.execute("INSERT INTO token_usage_events DEFAULT VALUES")
-            return article_json(packet)
+            return supported_review(prompt) if is_source_review(prompt) else article_json(packet)
 
-        result = self.prepare(accounted)
+        result = automation.prepare_daily(self.db, 1, accounted, target_day=TARGET_DAY, force=True)
         self.assertEqual("prepared", result.status, result)
         with sqlite3.connect(self.db) as conn:
             preparation = conn.execute(

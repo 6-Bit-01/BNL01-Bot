@@ -9909,7 +9909,14 @@ def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
         raise LocalModelBudgetExhausted(
             "local_model_budget_exhausted"
         )
-    response = _generate_gemini_content_with_fallback(f"{BNL01_SYSTEM_PROMPT}\n\n{prompt}", JOURNAL_ROUTE)
+    # The already-budgeted review pass is a source editor, not a second
+    # performance of the writing persona. Route/spending ownership stays put.
+    from bnl_journal_attribution import REVIEW_PREFIX
+    reviewing = prompt.startswith(REVIEW_PREFIX)
+    response = _generate_gemini_content_with_fallback(
+        prompt if reviewing else f"{BNL01_SYSTEM_PROMPT}\n\n{prompt}", JOURNAL_ROUTE)
+    if reviewing and _gemini_finish_reason(response) != "STOP":
+        raise RuntimeError("journal_source_review_incomplete")
     text, _tokens = _extract_text_and_tokens(response)
     return text or ""
 

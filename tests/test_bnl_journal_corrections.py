@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import bnl_journal as journal
 import bnl_journal_source_store as store
+from tests.journal_review_helpers import is_source_review, review_inputs, with_supported_review
 
 
 START = "2026-09-28T00:00:00Z"
@@ -92,7 +93,7 @@ class JournalCorrectionTests(unittest.TestCase):
                 "control_authority_identity": (1, "revision", "digest", (), ()), **overrides}
 
     def generate(self, *, preview=False, generator=None, **kwargs):
-        generator = generator or Mock(side_effect=lambda packet, _prompt: self.article(packet))
+        generator = generator or Mock(side_effect=with_supported_review(lambda packet, _prompt: self.article(packet)))
         fn = journal.generate_published_correction_preview if preview else journal.generate_published_correction_draft
         return fn(self.db, 1, self.entry_id, generator, **self.kwargs(**kwargs)), generator
 
@@ -124,7 +125,11 @@ class JournalCorrectionTests(unittest.TestCase):
         self.assertNotIn(self.entry_id, json.dumps(result["packet"]["history"]))
         self.assertEqual(prompts.call_args_list[0].kwargs["repair_reason"], "published_correction")
         self.assertIn("assigned the unfinished chorus incorrectly", prompts.call_args_list[0].kwargs["previous_output"])
-        self.assertEqual(prompts.call_args_list[1].kwargs["repair_reason"], "source_grounded_revision")
+        self.assertEqual(prompts.call_count, 1)
+        self.assertTrue(is_source_review(generator.call_args_list[1].args[1]))
+        units, evidence = review_inputs(generator.call_args_list[1].args[1])
+        self.assertIn(result["article"]["title"], [unit["text"] for unit in units])
+        self.assertEqual(evidence["sourceWindowEnd"], END)
         self.assertEqual(result["originalPublishedAt"], PUBLISHED)
 
     def test_new_revision_is_draft_with_lineage_and_unchanged_original(self):
@@ -168,8 +173,8 @@ class JournalCorrectionTests(unittest.TestCase):
         generator.assert_not_called()
         rejected = journal.reject_draft(self.db, 1, self.entry_id, "Needs another pass", 2)
         self.assertTrue(rejected.ok, rejected.reason)
-        replacement, generator = self.generate(generator=Mock(side_effect=lambda packet, _prompt:
-                                               self.article(packet, title="The Chorus, Reconsidered")))
+        replacement, generator = self.generate(generator=Mock(side_effect=with_supported_review(lambda packet, _prompt:
+                                               self.article(packet, title="The Chorus, Reconsidered"))))
         self.assertTrue(replacement.ok, replacement.reason)
         self.assertEqual((replacement.revision, generator.call_count), (2, 2))
         self.assertNotEqual(replacement.content_hash, first.content_hash)

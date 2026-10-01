@@ -25,6 +25,7 @@ from bnl_journal import (
     deliver_approved,
     generate_and_store_packet_draft,
     journal_broadcast_memory_provenance_is_eligible,
+    journal_exchange_context_invalidation_reason,
     journal_public_people_are_current,
     journal_packet_needs_reflection_refresh,
     journal_metadata_needs_reflection_refresh,
@@ -1565,6 +1566,11 @@ def _frozen_packet_invalidation_reason(
         return "privacy_memory_ineligible"
     if not journal_shared_source_provenance_is_current(conn, guild_id, packet.get("privateSharedSourceProvenance", [])):
         return "privacy_source_ineligible"
+    exchange_reason = journal_exchange_context_invalidation_reason(
+        conn, guild_id, packet, original_source_controls=original_source_controls,
+    )
+    if exchange_reason:
+        return exchange_reason
     refs = {
         str(source.get("refId") or "")
         for source in packet.get("privateSources", [])
