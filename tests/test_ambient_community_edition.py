@@ -1,5 +1,6 @@
 """Community editions use the real Ambient owner with isolated source data."""
 import asyncio
+import copy
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import json
@@ -14,6 +15,7 @@ import bnl_ambient_art as art
 import bnl_ambient_edition as edition
 import bnl_ambient_edition_sources as sources
 from bnl_journal_source_store import backfill_legacy_sources
+from bnl_journal import JOURNAL_REFLECTION_SCOPE
 
 
 bot = fixtures.bot
@@ -78,10 +80,72 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         return json.dumps({"action": "post", "headline": "A rhythm worth following",
                            "paragraphs": paragraphs, "art": None})
 
-    def add_message(self, text, when, *, policy="public_home", user_id=8):
+    def add_message(self, text, when, *, policy="public_home", user_id=8, label="Another Member"):
         self.execute("INSERT INTO conversations(user_id,user_name,guild_id,channel_id,channel_name,channel_policy,role,content,timestamp) "
-                     "VALUES(?,'Another Member',42,100,'barcode-bot',?,'user',?,?)",
-                     (user_id, policy, text, when))
+                     "VALUES(?,?,42,100,'barcode-bot',?,'user',?,?)",
+                     (user_id, label, policy, text, when))
+
+    def representative_owner_inputs(self, *, show=False, ballad=False, moment=False):
+        """Replace published-owner data, retaining real Discord/source assembly.
+
+        These fixtures exercise evidence routing and delivery. Mocked writing
+        cannot establish the quality of an actual generated community edition.
+        """
+        real_packet = sources.build_source_packet_between
+        extras = {"safeSources": [], "privateSharedSourceProvenance": [], "reflectionBasis": []}
+        if show:
+            extras["safeSources"].append({
+                "refId": "show:fixture-1", "sourceKind": "finalized_show",
+                "observedAt": self.stamp(hours=2),
+                "summary": "The recorded show included 43 tracks and 180500 taps.",
+            })
+            extras["privateSharedSourceProvenance"].append({
+                "refId": "show:fixture-1", "sourceKind": "finalized_show",
+                "sourceId": "fixture-show-1", "sourceVersion": "show-v1",
+            })
+            self.stack.enter_context(mock.patch.object(bot, "public_show_evidence_archive", return_value={
+                "shows": [{"sessionId": "fixture-show-1", "showDate": "2026-09-11", "status": "archived"}],
+            }))
+        if ballad:
+            extras["reflectionBasis"].append({
+                "refId": "reflection:ballad:fixture-1", "basisKind": "published_ballad",
+                "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True, "reuseEligible": True,
+                "summary": "An invented choir of 999 moons sings about the September 9 show and Test Listener.",
+                "showLink": "https://site.test/radio/archive?view=shows&show=fixture-older-show#broadcast-ballad",
+                "sourceObservedAt": self.stamp(minutes=15), "sourceVersion": "ballad-v1",
+            })
+        if moment:
+            extras["reflectionBasis"].append({
+                "refId": "reflection:moment:fixture-1", "basisKind": "public_moment",
+                "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True, "reuseEligible": True,
+                "summary": "An earlier exchange explored leaving space in a rhythm.",
+                "sourceObservedAt": self.stamp(days=2), "sourceVersion": "moment-v1",
+                "contributions": [{"publicSpeakerName": "Earlier Member", "summary": "Proposed leaving space."}],
+            })
+        def packet(*args, **kwargs):
+            result = real_packet(*args, **kwargs)
+            for key, values in extras.items():
+                result[key] = list(result.get(key, ())) + copy.deepcopy(values)
+            return result
+        self.stack.enter_context(mock.patch.object(sources, "build_source_packet_between", side_effect=packet))
+        return extras
+
+    async def deliver_representative(self, response):
+        captured = []
+        async def boundary(contents, route, **kwargs):
+            material = self.material(contents)
+            captured.append((contents, route, material))
+            value = response(material)
+            return SimpleNamespace(success=True, text=json.dumps(value))
+        channel, guild, _ = self.scheduler(fetch_effect=lambda user_id: SimpleNamespace(
+            id=user_id, bot=False, guild=SimpleNamespace(id=42)))
+        with mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
+                mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=boundary)) as provider, \
+                mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite:
+            await bot.ambient_message_task.coro()
+        rewrite.assert_not_awaited()
+        return channel, guild, provider, captured
 
     def add_publication(self, *, body="Ceramic receivers caught a strange signal."):
         publication = SimpleNamespace(
@@ -260,6 +324,178 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [8], "parse": []})
         self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 1)
         rewrite.assert_not_awaited()
+
+    async def test_quiet_day_can_deliver_one_original_contribution_without_invented_sections(self):
+        selected = {}
+        def response(material):
+            original = next(item for item in material["original_contributions"]
+                            if item["scope"] == "window_activity")
+            selected.update(original)
+            subject = original["subject_refs"][0]
+            return {"action": "post", "paragraphs": [{
+                "text": "[[person:" + subject + "]] left a rhythm idea for the room to explore.",
+                "sourceRefs": [original["ref"]], "subjectRefs": [subject],
+            }], "art": None}
+        channel, guild, provider, captured = await self.deliver_representative(response)
+        provider.assert_awaited_once()
+        channel.send.assert_awaited_once()
+        embed = channel.send.call_args.kwargs["embed"]
+        self.assertNotIn("title", embed.to_dict())
+        self.assertNotIn("\n\n", embed.description)
+        self.assertIn(selected["subject_labels"][selected["subject_refs"][0]], embed.description)
+        self.assertEqual(captured[0][2]["recorded_events"], [])
+        self.assertEqual(captured[0][2]["bnl_expressions"], [])
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [7], "parse": []})
+        guild.fetch_member.assert_awaited_once_with(7)
+
+    async def test_busy_show_day_keeps_quiet_contributor_show_authority_and_exact_episode_link(self):
+        for index in range(75):
+            self.add_message("Another beat observation " + str(index), self.stamp(minutes=80 - index),
+                             user_id=20, label="Frequent Member")
+        self.add_message("A rare glass-harmonica rhythm could leave the middle open.", self.stamp(minutes=7),
+                         user_id=8, label="Quiet Contributor")
+        self.archive()
+        self.representative_owner_inputs(show=True)
+        expected = {}
+        def response(material):
+            contributor = next(item for item in material["original_contributions"]
+                               if "discord_user:8" in item.get("subject_refs", ()))
+            show = next(item for item in material["recorded_events"] if item["kind"] == "finalized_show")
+            expected.update(contributor=contributor, show=show)
+            return {"action": "post", "paragraphs": [{
+                "text": "The recorded show carried 43 tracks and 180500 taps; [[person:discord_user:8]] "
+                        "also proposed a glass-harmonica rhythm. That leaves an interesting direction to explore.",
+                "sourceRefs": [show["ref"], contributor["ref"]], "subjectRefs": ["discord_user:8"],
+            }], "art": None}
+        channel, guild, provider, captured = await self.deliver_representative(response)
+        provider.assert_awaited_once()
+        channel.send.assert_awaited_once()
+        self.assertEqual(expected["show"]["evidence_role"], "recorded_event")
+        self.assertEqual(expected["contributor"]["evidence_role"], "original_contribution")
+        self.assertGreater(len(captured[0][2]["original_contributions"]), 2)
+        self.assertIn("https://site.test/radio/archive?view=shows&show=fixture-show-1",
+                      channel.send.call_args.kwargs["embed"].description)
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [8], "parse": []})
+        guild.fetch_member.assert_awaited_once_with(8)
+
+    async def test_new_journal_and_ballad_can_announce_older_reporting_without_new_event_claims(self):
+        self.execute("UPDATE conversations SET channel_policy='sealed_test'")
+        self.add_publication()
+        self.representative_owner_inputs(ballad=True)
+        expected = {}
+        def response(material):
+            journal = next(item for item in material["bnl_expressions"] if item["kind"] == "published_journal")
+            ballad = next(item for item in material["bnl_expressions"] if item["kind"] == "published_ballad")
+            expected.update(journal=journal, ballad=ballad)
+            return {"action": "post", "paragraphs": [{
+                "text": "Two new publications revisit earlier material: the Journal follows ceramic receivers, "
+                        "while my Ballad gives the September 9 show an imaginary choir. Both are available below.",
+                "publicationRefs": [journal["ref"], ballad["ref"]],
+            }], "art": None}
+        channel, guild, provider, captured = await self.deliver_representative(response)
+        provider.assert_awaited_once()
+        channel.send.assert_awaited_once()
+        self.assertEqual(captured[0][2]["recorded_events"], [])
+        for item in expected.values():
+            self.assertEqual(item["evidence_role"], "bnl_expression")
+            self.assertEqual(item["occurred_at"], "")
+            self.assertEqual(item["scope"], "window_publication")
+            self.assertNotIn("text", item)
+        self.assertLess(sources._utc(expected["journal"]["reported_window_end"]),
+                        sources._utc(expected["journal"]["published_at"]))
+        description = channel.send.call_args.kwargs["embed"].description
+        self.assertIn("https://site.test/journal/journal_daily_2026-09-10_fixture", description)
+        self.assertIn("https://site.test/radio/archive?view=shows&show=fixture-older-show#broadcast-ballad", description)
+        self.assertNotIn("999", description)
+        self.assertIsNone(channel.send.call_args.args[0])
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [], "parse": []})
+        guild.fetch_member.assert_not_awaited()
+
+    async def test_mixed_day_delivers_connected_prose_with_all_roles_and_only_featured_verified_person(self):
+        self.add_message("A new arrangement leaves space around the percussion.", self.stamp(minutes=3),
+                         user_id=8, label="Test Arranger")
+        self.add_message("WITHHELD_MIXED_DAY", self.stamp(minutes=2), policy="sealed_test", user_id=9)
+        self.archive()
+        self.add_publication()
+        self.representative_owner_inputs(show=True, ballad=True, moment=True)
+        expected = {}
+        def response(material):
+            original = next(item for item in material["original_contributions"]
+                            if "discord_user:8" in item.get("subject_refs", ()))
+            show = next(item for item in material["recorded_events"] if item["kind"] == "finalized_show")
+            journal = next(item for item in material["bnl_expressions"] if item["kind"] == "published_journal")
+            ballad = next(item for item in material["bnl_expressions"] if item["kind"] == "published_ballad")
+            moment = next(item for item in material["governed_interpretations"] if item["kind"] == "public_moment")
+            expected["refs"] = [item["ref"] for item in (original, show, journal, ballad, moment)]
+            return {"action": "post", "paragraphs": [{
+                "text": "[[person:discord_user:8]] proposed leaving space around percussion after a show with "
+                        "43 recorded tracks. An earlier exchange explored that idea too. It gives me a fresh "
+                        "way to revisit my newly published Journal and Ballad without treating either as another witness.",
+                "sourceRefs": [original["ref"], show["ref"]],
+                "publicationRefs": [journal["ref"], ballad["ref"]], "contextRefs": [moment["ref"]],
+                "subjectRefs": ["discord_user:8"],
+            }], "art": None}
+        channel, guild, provider, captured = await self.deliver_representative(response)
+        provider.assert_awaited_once()
+        channel.send.assert_awaited_once()
+        self.assertEqual(len(expected["refs"]), 5)
+        self.assertNotIn("WITHHELD_MIXED_DAY", captured[0][0])
+        material = captured[0][2]
+        self.assertTrue(all(material[key] for key in (
+            "original_contributions", "recorded_events", "bnl_expressions", "governed_interpretations")))
+        description = channel.send.call_args.kwargs["embed"].description
+        self.assertEqual(description.count("https://site.test/"), 3)
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [8], "parse": []})
+        self.assertEqual(channel.send.call_args.args[0], "Featuring: <@8>")
+        guild.fetch_member.assert_awaited_once_with(8)
+
+    async def test_real_wrapper_repairs_actual_unbound_draft_with_paragraph_and_source_binding_feedback(self):
+        self.add_message("My new arrangement keeps room around the percussion.", self.stamp(minutes=3),
+                         user_id=8, label="Test Arranger")
+        self.archive()
+        drafts = []
+        support = {}
+        def response(material):
+            first = next(item for item in material["original_contributions"]
+                         if "discord_user:7" in item.get("subject_refs", ()))
+            arranger = next(item for item in material["original_contributions"]
+                            if "discord_user:8" in item.get("subject_refs", ()))
+            support.update(first=first, arranger=arranger)
+            value = {"action": "post", "paragraphs": [{
+                "text": "[[person:discord_user:8]] described an arrangement with space around the percussion.",
+                # The first draft attaches the wrong person's source to its
+                # attribution. The second keeps the prose and corrects proof.
+                "sourceRefs": [first["ref"] if not drafts else arranger["ref"]],
+                "subjectRefs": ["discord_user:8"],
+            }], "art": None}
+            drafts.append(json.dumps(value))
+            return value
+        channel, guild, provider, captured = await self.deliver_representative(response)
+        self.assertEqual(provider.await_count, 2)
+        self.assertEqual([item[1] for item in captured], [
+            "ambient_generation", "ambient_generation.conversation_grounding_regeneration"])
+        repair_prompt = captured[1][0]
+        raw_rejected = repair_prompt.split("Rejected draft:\n", 1)[1].split("\nValidation feedback:\n", 1)[0]
+        self.assertEqual(json.loads(raw_rejected), drafts[0])
+        feedback_text = repair_prompt.split("Validation feedback:\n", 1)[1]
+        feedback, _ = json.JSONDecoder().raw_decode(feedback_text)
+        self.assertEqual(feedback["reason"], "edition_unbound_subject")
+        self.assertEqual(feedback["paragraph"], 1)
+        self.assertFalse(feedback["draftTruncated"])
+        self.assertTrue(feedback["instruction"])
+        self.assertEqual(feedback["details"]["tokenSubjects"], ["discord_user:8"])
+        self.assertEqual(feedback["details"]["declaredSubjects"], ["discord_user:8"])
+        self.assertEqual(feedback["details"]["supportedByParagraph"], ["discord_user:7"])
+        self.assertEqual(feedback["details"]["eligibleBindings"]["discord_user:8"]["sourceRefs"],
+                         [support["arranger"]["ref"]])
+        self.assertIn("original_contribution", feedback["referenceFields"]["sourceRefs"])
+        self.assertEqual(feedback["referenceFields"]["publicationRefs"], ["bnl_expression"])
+        self.assertEqual(captured[0][2], captured[1][2])
+        channel.send.assert_awaited_once()
+        guild.fetch_member.assert_awaited_once_with(8)
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [8], "parse": []})
+        self.assertNotIn("Validation feedback", channel.send.call_args.kwargs["embed"].description)
+        self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 1)
 
     async def test_withdrawal_during_generation_discards_without_repair(self):
         def withdraw(prompt, *args, **kwargs):

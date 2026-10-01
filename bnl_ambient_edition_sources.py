@@ -15,7 +15,7 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from bnl_journal import build_source_packet_between, _eligible_reflection_basis
+from bnl_journal import build_source_packet_between, _eligible_reflection_basis, _evenly_sample
 from bnl_journal_source_store import query_source_events, timestamp_to_epoch_ms
 from bnl_tiktok_live_context import tiktok_show_evidence_key, tiktok_show_records
 
@@ -123,6 +123,24 @@ def _episode_links(bot, packet, guild_id):
         return {}
 
 
+def _interleave(groups, limit):
+    """Share a fixed source budget among groups that actually have material."""
+    remaining = [iter(group) for group in groups if group]
+    chosen = []
+    while remaining and len(chosen) < limit:
+        active = []
+        for group in remaining:
+            item = next(group, None)
+            if item is None:
+                continue
+            chosen.append(item)
+            active.append(group)
+            if len(chosen) == limit:
+                break
+        remaining = active
+    return chosen
+
+
 def _fair_activity(items):
     """Keep the owner's chronology, with room for quiet speakers and source kinds."""
     if len(items) <= MAX_ACTIVITY_ITEMS:
@@ -133,21 +151,44 @@ def _fair_activity(items):
         # a reward for posting the most messages or being a familiar member.
         speaker = tuple(item["subject_refs"]) or item.get("participant_alias") or item["label"]
         buckets.setdefault((item["kind"], str(speaker)), []).append(item)
-    chosen = []
     # Spread each speaker's slots through their chronology instead of taking
     # only their newest/oldest cluster.
+    kinds = {}
     for key, rows in buckets.items():
         order = [0, len(rows) - 1]
         order.extend(range(1, len(rows) - 1))
-        buckets[key] = [rows[i] for i in dict.fromkeys(order)]
-    while buckets and len(chosen) < MAX_ACTIVITY_ITEMS:
-        for key in list(buckets):
-            chosen.append(buckets[key].pop(0))
-            if not buckets[key]:
-                del buckets[key]
-            if len(chosen) == MAX_ACTIVITY_ITEMS:
-                break
+        kinds.setdefault(key[0], []).append([rows[i] for i in dict.fromkeys(order)])
+    # A flattened (kind, speaker) queue let many early speakers consume every
+    # slot before a later completed show. Share by kind first, then by author.
+    # Missing kinds reserve nothing; these are input candidates, not required
+    # article sections or a demand to feature particular people.
+    slots = {kind: 0 for kind in kinds}
+    for kind in _interleave([[kind] * sum(map(len, authors)) for kind, authors in kinds.items()], MAX_ACTIVITY_ITEMS):
+        slots[kind] += 1
+    chosen = []
+    for kind, authors in kinds.items():
+        # More distinct authors than slots must not always discard the later
+        # part of the day. Reuse the owner's chronological sampling primitive.
+        candidates = _evenly_sample(authors, slots[kind])
+        chosen.extend(_interleave(candidates, slots[kind]))
     return sorted(chosen, key=lambda s: (s["occurred_at"], s["ref"]))
+
+
+def _fair_reflections(packet, start, end):
+    eligible = []
+    for source in _eligible_reflection_basis(packet):
+        observed = _utc(source.get("sourceObservedAt"))
+        timeless = source.get("basisKind") == "approved_canon" and not source.get("sourceObservedAt")
+        if timeless or (observed is not None and observed < end):
+            eligible.append(source)
+    eligible.sort(key=lambda s: (
+        s.get("basisKind") == "published_ballad" and start <= (_utc(s.get("sourceObservedAt")) or datetime.min.replace(tzinfo=timezone.utc)) < end,
+        _utc(s.get("sourceObservedAt")) or datetime.min.replace(tzinfo=timezone.utc),
+        str(s.get("refId") or "")), reverse=True)
+    kinds = {}
+    for source in eligible:
+        kinds.setdefault(source["basisKind"], []).append(source)
+    return _interleave(list(kinds.values()), MAX_REFLECTION_ITEMS)
 
 
 def _packet_items(bot, packet, start, end, guild_id):
@@ -172,14 +213,8 @@ def _packet_items(bot, packet, start, end, guild_id):
             "conversation_surface": str(source.get("conversationSurface") or ""),
         })
     items = _fair_activity(activity)
-    reflections = sorted(_eligible_reflection_basis(packet), key=lambda s: (
-        s.get("basisKind") == "published_ballad" and start <= (_utc(s.get("sourceObservedAt")) or datetime.min.replace(tzinfo=timezone.utc)) < end,
-        _utc(s.get("sourceObservedAt")) or datetime.min.replace(tzinfo=timezone.utc),
-        str(s.get("refId") or "")), reverse=True)
-    for source in reflections[:MAX_REFLECTION_ITEMS]:
+    for source in _fair_reflections(packet, start, end):
         observed = _utc(source.get("sourceObservedAt"))
-        if observed is None or observed >= end:
-            continue
         kind = str(source["basisKind"])
         published = kind == "published_ballad"
         item = {
@@ -188,7 +223,7 @@ def _packet_items(bot, packet, start, end, guild_id):
             "text": str(source["summary"])[:6000 if published else 1200],
             "label": "Broadcast Ballad" if published else kind.replace("_", " "),
             "url": _owner_url(bot, source.get("showLink")) if published else "",
-            "occurred_at": "" if published else _iso(observed),
+            "occurred_at": "" if published or observed is None else _iso(observed),
             "published_at": _iso(observed) if published else "",
             "subject_refs": [], "subject_labels": {},
             "scope": "window_publication" if published and observed >= start else "historical_context",

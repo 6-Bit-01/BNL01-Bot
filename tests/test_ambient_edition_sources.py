@@ -180,6 +180,91 @@ class EditionSourcesTests(unittest.TestCase):
         self.assertIn("quiet", [s["ref"] for s in context["items"]])
         self.assertIn("show:1", [s["ref"] for s in context["items"]])
 
+    def test_busy_distinct_speakers_do_not_starve_later_show_or_late_contribution(self):
+        values = [activity(ref="busy:" + str(n), subject="discord_user:" + str(1000 + n),
+                           speaker="Test Member " + str(n), timestamp="2026-09-29T08:00:00Z") for n in range(80)]
+        values.append(activity(ref="late-question", subject="discord_user:2000", speaker="Late Contributor",
+                               timestamp="2026-09-30T02:40:00Z"))
+        self.packet.update(safeSources=[v[0] for v in values], privateSources=[v[1] for v in values])
+        self.packet["safeSources"].append({"refId": "completed-show", "sourceKind": "finalized_show",
+            "summary": "Recorded show operations include 43 played tracks.", "observedAt": "2026-09-30T02:50:00Z"})
+        context = self.context()
+        refs = {s["ref"] for s in context["items"]}
+        self.assertEqual(len(refs), edition.MAX_ACTIVITY_ITEMS)
+        self.assertIn("completed-show", refs)
+        self.assertIn("late-question", refs)
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+
+    def test_timeless_approved_canon_is_available_without_inventing_an_event_date(self):
+        self.packet["safeSources"] = []
+        self.packet["privateSources"] = []
+        self.packet["reflectionBasis"] = [{"refId": "reflection:canon:fixture", "basisKind": "approved_canon",
+            "sourceType": "approved_canon", "sourceVersion": "canon-v1", "scope": JOURNAL_REFLECTION_SCOPE,
+            "publicSafe": True, "reuseEligible": True, "summary": "A fictional station archivist collects obsolete radio dials."}]
+        context = self.context()
+        self.assertEqual(len(context["items"]), 1)
+        item = context["items"][0]
+        self.assertEqual(item["evidence_role"], "established_context")
+        self.assertEqual(item["scope"], "historical_context")
+        self.assertEqual(item["occurred_at"], "")
+        self.assertEqual(item["published_at"], "")
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+
+    def test_many_recent_retellings_do_not_hide_governed_moment_or_approved_context(self):
+        def reflection(ref, kind, timestamp="2026-09-29T20:00:00Z"):
+            return {"refId": "reflection:" + ref, "basisKind": kind, "sourceObservedAt": timestamp,
+                    "sourceVersion": "v1", "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True,
+                    "reuseEligible": True, "summary": "Fictional community context " + ref}
+        self.packet["reflectionBasis"] = [reflection("retelling-" + str(n), "accepted_relay_continuity") for n in range(8)]
+        self.packet["reflectionBasis"].extend([
+            reflection("moment", "public_moment", "2026-09-28T18:00:00Z"),
+            reflection("release", "published_ballad"),
+            reflection("canon", "approved_canon", ""),
+        ])
+        context = self.context()
+        refs = {s["ref"] for s in context["items"]}
+        self.assertIn("reflection:release", refs)
+        self.assertIn("reflection:moment", refs)
+        self.assertIn("reflection:canon", refs)
+        self.assertEqual(len(refs), 1 + edition.MAX_REFLECTION_ITEMS)
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+
+    def test_busy_mixed_window_retains_fresh_journal_ballads_and_show_candidates(self):
+        values = [activity(ref="mixed:" + str(n), subject="discord_user:" + str(3000 + n % 12),
+                           speaker="Test Contributor " + str(n % 12)) for n in range(160)]
+        self.packet.update(safeSources=[v[0] for v in values], privateSources=[v[1] for v in values])
+        self.packet["safeSources"].append({"refId": "show:mixed", "sourceKind": "finalized_show",
+            "summary": "Recorded operations establish the show ended after 43 tracks.", "observedAt": STAMP})
+        self.packet["reflectionBasis"] = [
+            {"refId": "reflection:ballad:" + str(n), "basisKind": "published_ballad",
+             "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True, "reuseEligible": True,
+             "summary": "A newly released fictional Broadcast Ballad " + str(n),
+             "showLink": "https://site.test/radio/archive?view=shows&show=fixture-" + str(n) + "#broadcast-ballad",
+             "sourceObservedAt": STAMP, "sourceVersion": "v1"} for n in range(2)]
+        publication = SimpleNamespace(entry_id="journal_mixed_fixture", title="Fictional Community Edition",
+            excerpt="A reflection on the day's contributions.", sections_json='[{"heading":"Contributions","body":"An eligible public reflection."}]',
+            published_at=STAMP, created_at=STAMP, source_window_start="2026-09-28T03:00:00Z",
+            source_window_end="2026-09-29T03:00:00Z", revision=1)
+        self.bot._build_publication_prompt_source_basis.side_effect = lambda **kw: (
+            SimpleNamespace(publications=(publication,)) if kw["source_kind"] == "journal" else None)
+        context = self.context()
+        by_ref = {item["ref"]: item for item in context["items"]}
+        self.assertEqual(len(context["items"]), edition.MAX_ACTIVITY_ITEMS + 3)
+        self.assertIn("show:mixed", by_ref)
+        self.assertEqual(by_ref["journal:journal_mixed_fixture"]["scope"], "window_publication")
+        for n in range(2):
+            self.assertEqual(by_ref["reflection:ballad:" + str(n)]["scope"], "window_publication")
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+
+    def test_single_kind_uses_available_slots_and_empty_window_adds_no_forced_categories(self):
+        values = [activity(ref="single:" + str(n)) for n in range(100)]
+        self.packet.update(safeSources=[v[0] for v in values], privateSources=[v[1] for v in values])
+        context = self.context()
+        self.assertEqual(len(context["items"]), edition.MAX_ACTIVITY_ITEMS)
+        self.assertEqual({item["kind"] for item in context["items"]}, {"conversation"})
+        self.packet.update(safeSources=[], privateSources=[], reflectionBasis=[])
+        self.assertEqual(self.context()["items"], [])
+
     def test_wrong_guild_cannot_read_or_revalidate(self):
         with self.assertRaises(ValueError):
             edition.build_context(self.bot, 7, 9, basis={"guild_id": 8}, now=NOW)
