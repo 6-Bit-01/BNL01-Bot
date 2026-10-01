@@ -14,6 +14,7 @@ import pytz
 import bnl_broadcast_ballads as ballads
 from bnl_journal import (
     JOURNAL_SITE_REQUEST_BODY_MAX_BYTES,
+    PUBLIC_POLICIES,
     SCHEDULED_PREPARED_STATE,
     JournalResult,
     _attempt_fence_owned,
@@ -31,7 +32,7 @@ from bnl_journal import (
     journal_topic_counts,
     utc_now_iso,
 )
-from bnl_journal_source_store import journal_release_privacy_fence
+from bnl_journal_source_store import journal_release_privacy_fence, timestamp_to_epoch_ms
 
 PACIFIC = pytz.timezone("US/Pacific")
 CADENCE_CONTRACT_VERSION = 2
@@ -1554,6 +1555,9 @@ def _frozen_packet_invalidation_reason(
     conn: sqlite3.Connection,
     guild_id: int,
     packet: dict[str, Any],
+    *,
+    validate_original_sources: bool = False,
+    original_source_controls: Optional[Callable[..., tuple[str, AbstractSet[int]]]] = None,
 ) -> str:
     if journal_packet_needs_reflection_refresh(packet):
         return "journal_reflection_contract_changed"
@@ -1598,6 +1602,10 @@ def _frozen_packet_invalidation_reason(
         str(packet.get("sourceWindowEnd") or ""),
     ):
         return "privacy_memory_ineligible"
+    if validate_original_sources:
+        return _journal_original_source_invalidation_reason(
+            conn, guild_id, packet, original_source_controls=original_source_controls,
+        )
     return ""
 
 
@@ -1607,14 +1615,141 @@ def _generation_guard_for_packet(
     packet: dict[str, Any],
     *,
     attempt_fence: Optional[tuple[str, int]] = None,
+    validate_original_sources: bool = False,
+    original_source_controls: Optional[Callable[..., tuple[str, AbstractSet[int]]]] = None,
 ) -> Callable[[], str]:
     """Recheck the existing frozen-source and lease owners between calls."""
     def guard() -> str:
         with _read_source_database(db_path) as conn:
             if not _attempt_fence_owned(conn, attempt_fence):
                 return "preparation_epoch_lost"
-            return _frozen_packet_invalidation_reason(conn, guild_id, packet)
+            return _frozen_packet_invalidation_reason(
+                conn, guild_id, packet, validate_original_sources=validate_original_sources,
+                original_source_controls=original_source_controls,
+            )
     return guard
+
+
+def _journal_original_source_invalidation_reason(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    packet: dict[str, Any],
+    *,
+    original_source_controls: Optional[Callable[..., tuple[str, AbstractSet[int]]]] = None,
+) -> str:
+    """Fence historical corrections against current original-source controls.
+
+    Unlike Ambient's short-window selection, an old Journal can legitimately
+    outlive retained conversation rows. The immutable eligible archive remains
+    its source when ordinary retention removed a row; a surviving changed row,
+    archive removal, or explicit governance withdrawal cannot be ignored.
+    The existing recall owner supplies governance decisions, never ledger text.
+    """
+    refs = {
+        str(source.get("refId") or "")
+        for source in packet.get("privateSources", [])
+        if isinstance(source, dict) and source.get("sourceKind") == "conversation"
+        and source.get("conversationSurface") == "discord"
+    }
+    refs.update(
+        str(source.get("refId") or "")
+        for source in packet.get("reflectionBasis", [])
+        if isinstance(source, dict) and source.get("basisKind") == "public_source_history"
+        and source.get("sourceType") == "discord_message"
+    )
+    if not refs:
+        return ""
+    sequences = _fresh_event_sequences(refs)
+    if not packet.get("sourceArchiveAvailable") or len(sequences) != len(refs):
+        return "privacy_source_ineligible"
+    try:
+        rows = []
+        ordered = sorted(sequences)
+        for offset in range(0, len(ordered), 400):
+            chunk = ordered[offset:offset + 400]
+            cursor = conn.execute(
+                "SELECT event_seq,source_kind,source_key,occurred_at_ms,channel_id,channel_policy,subject_ref,"
+                "raw_text,public_usable,metadata_json FROM bnl_journal_source_events "
+                "WHERE guild_id=? AND event_seq IN (%s)" % ",".join("?" for _ in chunk),
+                (guild_id, *chunk),
+            )
+            names = [column[0] for column in cursor.description]
+            rows.extend(dict(zip(names, row)) for row in cursor.fetchall())
+        if len(rows) != len(sequences):
+            return "privacy_source_ineligible"
+        bindings: dict[int, list[dict[str, Any]]] = {}
+        subjects: dict[int, int] = {}
+        for event in rows:
+            if (event["source_kind"] != "discord_message" or not event["public_usable"]
+                    or event["channel_policy"] not in PUBLIC_POLICIES):
+                return "privacy_source_ineligible"
+            metadata = json.loads(event["metadata_json"] or "{}")
+            if not isinstance(metadata, dict):
+                return "privacy_source_ineligible"
+            row_id = metadata.get("conversationRowId") or metadata.get("legacyRowId")
+            if not row_id:
+                match = re.fullmatch(r"legacy_row:([1-9]\d*)", str(event["source_key"] or ""))
+                row_id = match.group(1) if match else None
+            if not row_id:
+                # Older capture without a row binding must not reinterpret a
+                # Discord message ID as a local conversation row ID.
+                continue
+            subject = re.fullmatch(r"discord_user:([1-9]\d*)", str(event["subject_ref"] or ""))
+            if not re.fullmatch(r"[1-9]\d*", str(row_id)) or subject is None:
+                return "privacy_source_ineligible"
+            row_id, user_id = int(row_id), int(subject.group(1))
+            if row_id in subjects and subjects[row_id] != user_id:
+                return "privacy_source_ineligible"
+            subjects[row_id] = user_id
+            bindings.setdefault(row_id, []).append(event)
+        if not bindings:
+            return ""
+        controls_exist = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_ledger_entries'",
+        ).fetchone())
+        if controls_exist:
+            if original_source_controls is None:
+                return "journal_original_controls_unavailable"
+            _digest, blocked = original_source_controls(
+                conn, guild_id=guild_id, source_users=subjects, source_table="conversations",
+            )
+            if set(subjects) & set(blocked):
+                return "privacy_source_ineligible"
+        columns = {str(row[1]) for row in conn.execute("PRAGMA main.table_info(conversations)")}
+        if not columns:
+            return ""
+        required = {"id", "guild_id", "user_id", "role", "content", "channel_policy"}
+        if not required <= columns:
+            return "journal_original_controls_unavailable"
+        fields = sorted(required | ({"channel_id", "public_usable", "visibility", "timestamp"} & columns))
+        ordered = sorted(bindings)
+        for offset in range(0, len(ordered), 400):
+            chunk = ordered[offset:offset + 400]
+            # No guild predicate here: a rebound ID is a changed source, not
+            # the ordinary absence caused by conversation retention.
+            current = conn.execute(
+                "SELECT %s FROM conversations WHERE id IN (%s)"
+                % (",".join(fields), ",".join("?" for _ in chunk)), chunk,
+            ).fetchall()
+            for raw in current:
+                row = dict(zip(fields, raw))
+                if (int(row["guild_id"] or 0) != guild_id
+                        or int(row["user_id"] or 0) != subjects[row["id"]]
+                        or row["role"] != "user"
+                        or row["channel_policy"] not in PUBLIC_POLICIES
+                        or row.get("public_usable", 1) != 1
+                        or row.get("visibility", "public") not in {"public", "public_safe"}):
+                    return "privacy_source_ineligible"
+                for event in bindings[row["id"]]:
+                    if (str(row["content"] or "") != str(event["raw_text"] or "")
+                            or row["channel_policy"] != event["channel_policy"]
+                            or ("timestamp" in columns and timestamp_to_epoch_ms(row["timestamp"]) != event["occurred_at_ms"])
+                            or ("channel_id" in columns and event["channel_id"] is not None
+                                and row["channel_id"] != event["channel_id"])):
+                        return "journal_original_source_changed"
+    except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        return "journal_original_controls_unavailable"
+    return ""
 
 
 def _freeze_or_load_packet(
@@ -3344,6 +3479,56 @@ def release_prepared_entry(
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
+        latest = conn.execute(
+            "SELECT e.revision,e.lifecycle_state,e.source_window_start,e.source_window_end,m.metadata_json "
+            "FROM bnl_journal_entries e LEFT JOIN bnl_journal_private_metadata m "
+            "ON m.guild_id=e.guild_id AND m.entry_id=e.entry_id AND m.revision=e.revision "
+            "WHERE e.guild_id=? AND e.entry_id=? ORDER BY e.revision DESC LIMIT 1",
+            (guild_id, str(entry_id)),
+        ).fetchone()
+        if latest and latest["lifecycle_state"] in {"draft", "approved_pending_delivery", "delivery_failed", "published"}:
+            try:
+                metadata = json.loads(latest["metadata_json"] or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            if isinstance(metadata, dict) and "publishedCorrection" in metadata:
+                from bnl_journal import _published_correction_base_reason
+
+                context = metadata["publishedCorrection"]
+                if latest["lifecycle_state"] == "published":
+                    correction = context.get("correction") if isinstance(context, dict) else None
+                    previous = conn.execute(
+                        "SELECT revision,content_hash FROM bnl_journal_entries WHERE guild_id=? "
+                        "AND entry_id=? AND revision=? AND lifecycle_state='published'",
+                        (guild_id, str(entry_id), int(latest["revision"]) - 1),
+                    ).fetchone()
+                    if (not isinstance(correction, dict) or not previous
+                            or correction.get("previousRevision") != previous["revision"]
+                            or correction.get("previousContentHash") != previous["content_hash"]):
+                        return AutomationResult(False, "manual", "held", "correction_revision_invalid", str(entry_id), int(latest["revision"]))
+                    return AutomationResult(
+                        True, "manual", "published", "already_published", str(entry_id), int(latest["revision"]),
+                        str(latest["source_window_start"]), str(latest["source_window_end"]), idempotent=True,
+                    )
+                try:
+                    reason = (_published_correction_base_reason(
+                        conn, guild_id, str(entry_id), context,
+                        candidate_revision=int(latest["revision"]),
+                    ) if isinstance(context, dict) else "correction_revision_invalid")
+                except (TypeError, ValueError, AttributeError):
+                    reason = "correction_revision_invalid"
+                if reason:
+                    return AutomationResult(False, "manual", "held", reason, str(entry_id), int(latest["revision"]))
+                scheduled_correction = conn.execute(
+                    "SELECT 1 FROM bnl_journal_automation_runs "
+                    "WHERE guild_id=? AND journal_entry_id=? AND journal_revision=? LIMIT 1",
+                    (guild_id, str(entry_id), int(latest["revision"])),
+                ).fetchone()
+                if not scheduled_correction:
+                    # The predecessor's completed occurrence does not own a
+                    # later explicitly reviewed correction. Keep that run
+                    # closed and let the existing manual delivery owner act.
+                    return None
         row = conn.execute(
             "SELECT cadence,source_window_start,source_window_end "
             "FROM bnl_journal_automation_runs "

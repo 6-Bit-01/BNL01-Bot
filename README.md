@@ -583,6 +583,33 @@ the revised-candidate-only flow, not that the model will detect every error.
 Same-model revision is not independent factual verification. Previously
 published entries are not rewritten automatically by this code change.
 
+### Correcting a published Journal
+
+Historical corrections use the existing Journal owner and revision store. The owner-only
+private command is `!bnl journal correct ENTRY_ID | revision=N | hash=PUBLISHED_HASH | note=PUBLIC_NOTE`.
+It creates a review draft using the original entry's exact source window and the same
+four-attempt generation/revision path. It does not publish, change the original date,
+reopen the completed scheduled occurrence, or write community memory. The old prose is
+editable material, never evidence. Later Journals and the target entry are excluded
+from the historical comparison basis.
+
+Review, exact-hash approval and explicit delivery remain separate. Original sources,
+current source-governance decisions, publication controls and the published predecessor
+are rechecked during generation, approval and immediately before sending. A changed
+source or authority holds the correction. Normal source retention alone does not
+invalidate an eligible archived original; explicit purges, edits and privacy changes do.
+Only a rejected unpublished correction can be replaced by a newly reviewed attempt;
+approved or pending delivery revisions cannot be overwritten.
+
+The companion website contract retains the URL, original publication date and archive
+position, adds a correction note/date, and preserves prior revisions. Delivering a
+correction requires that website support first. Existing entry visibility and memory
+exclusions remain in force. Journal history selects only the current published revision;
+conversation, Relay and Ambient publication readers retain exact revision/digest checks.
+Derived Journal prose remains interpretation, not independent confirmation of events.
+Separate downstream human retellings still require their own source-level correction;
+this is not a blanket memory reset or an automatic archive rewrite.
+
 ## Release baseline
 
 Before merging a runtime change:
