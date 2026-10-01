@@ -218,9 +218,13 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 result = await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis)
                 self.assertGreater(len(result), 280)
                 self.assertEqual(basis["edition"]["headline"], "A rhythm worth following")
-                provider.assert_awaited_once()
+                self.assertEqual(provider.await_count, 2)
                 contents, route = provider.call_args.args
-                self.assertEqual(route, "ambient_generation.community_edition")
+                self.assertEqual([call.args[1] for call in provider.await_args_list], [
+                    "ambient_generation.community_edition", "ambient_generation.community_edition_repair"])
+                self.assertEqual(route, "ambient_generation.community_edition_repair")
+                self.assertEqual(self.raw_material(provider.await_args_list[0].args[0]),
+                                 self.raw_material(contents))
                 self.assertEqual(bot._generation_config_for_model(bot.GEMINI_MODEL, route).max_output_tokens, 8192)
                 self.assert_edition_voice(contents)
                 raw = self.raw_material(contents)
@@ -412,7 +416,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "sourceRefs": [original["ref"]], "subjectRefs": [subject],
             }], "art": None}
         channel, guild, provider, captured = await self.deliver_representative(response)
-        provider.assert_awaited_once()
+        self.assertEqual(provider.await_count, 2)
         channel.send.assert_awaited_once()
         embed = channel.send.call_args.kwargs["embed"]
         self.assertNotIn("title", embed.to_dict())
@@ -444,7 +448,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "sourceRefs": [show["ref"], contributor["ref"]], "subjectRefs": ["discord_user:8"],
             }], "art": None}
         channel, guild, provider, captured = await self.deliver_representative(response)
-        provider.assert_awaited_once()
+        self.assertEqual(provider.await_count, 2)
         channel.send.assert_awaited_once()
         self.assertEqual(expected["show"]["evidence_role"], "recorded_event")
         self.assertEqual(expected["contributor"]["evidence_role"], "original_contribution")
@@ -469,7 +473,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "publicationRefs": [journal["ref"], ballad["ref"]],
             }], "art": None}
         channel, guild, provider, captured = await self.deliver_representative(response)
-        provider.assert_awaited_once()
+        self.assertEqual(provider.await_count, 2)
         channel.send.assert_awaited_once()
         self.assertEqual(captured[0][2]["recorded_events"], [])
         for item in expected.values():
@@ -512,7 +516,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "subjectRefs": ["discord_user:8"],
             }], "art": None}
         channel, guild, provider, captured = await self.deliver_representative(response)
-        provider.assert_awaited_once()
+        self.assertEqual(provider.await_count, 2)
         channel.send.assert_awaited_once()
         self.assertEqual(len(expected["refs"]), 5)
         self.assertNotIn("WITHHELD_MIXED_DAY", captured[0][0])
@@ -572,6 +576,126 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [8], "parse": []})
         self.assertNotIn("Validation feedback", channel.send.call_args.kwargs["embed"].description)
         self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 1)
+
+    async def test_valid_first_draft_is_revised_before_delivery_with_original_sources_and_owned_links(self):
+        # Mocked prose proves the two-stage delivery contract, not that the
+        # model can independently discover every chronology or attribution error.
+        earlier = "Do not let a bucket of code boss your music around."
+        later = "I have now shared two newly finished tracks."
+        self.add_message(earlier, self.stamp(hours=2), user_id=8, label="Test Creator")
+        self.add_message(later, self.stamp(minutes=3), user_id=8, label="Test Creator")
+        self.archive()
+        self.add_publication()
+        drafts, calls = [], []
+        revised_text = ("[[person:discord_user:8]] warned against code bossing music around earlier, "
+                        "then later shared two finished tracks. I like the priorities. "
+                        "My new Journal revisits an older discussion about receivers.")
+
+        async def boundary(contents, route, **kwargs):
+            self.assert_edition_voice(contents)
+            channel.send.assert_not_awaited()
+            prepare.assert_not_awaited()
+            material = self.material(contents)
+            originals = [item for item in material["original_contributions"]
+                         if item.get("text") in (earlier, later)]
+            journal = material["new_publications"][0]
+            calls.append((contents, route, material))
+            text = ("[[person:discord_user:8]] shared two finished tracks, prompting the earlier "
+                    "warning about code bossing music around.") if len(calls) == 1 else revised_text
+            value = {"action": "post", "paragraphs": [{
+                "text": text, "sourceRefs": [item["ref"] for item in originals],
+                "publicationRefs": [journal["ref"]], "subjectRefs": ["discord_user:8"],
+            }], "art": None}
+            drafts.append(json.dumps(value))
+            return SimpleNamespace(success=True, text=drafts[-1])
+
+        channel, guild, _ = self.scheduler(fetch_effect=lambda user_id: SimpleNamespace(
+            id=user_id, bot=False, guild=SimpleNamespace(id=42)))
+        authority_guard = bot.should_reject_unsupported_source_authority
+        with mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
+                mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=boundary)) as provider, \
+                mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite, \
+                mock.patch.object(bot, "should_reject_unsupported_source_authority", wraps=authority_guard) as guard, \
+                mock.patch.object(art, "prepare", new=mock.AsyncMock(return_value=None)) as prepare:
+            await bot.ambient_message_task.coro()
+
+        self.assertEqual(provider.await_count, 2)
+        self.assertEqual([item[1] for item in calls], [
+            "ambient_generation.community_edition", "ambient_generation.community_edition_repair"])
+        self.assertEqual(calls[0][2], calls[1][2])
+        review = calls[1][0]
+        encoded = review.split("Draft for editorial review:\n", 1)[1].split("\nValidation feedback:\n", 1)[0]
+        self.assertEqual(json.loads(encoded), drafts[0])
+        feedback, _ = json.JSONDecoder().raw_decode(review.split("Validation feedback:\n", 1)[1])
+        self.assertEqual(feedback["reason"], "edition_editorial_review")
+        self.assertEqual(guard.call_count, 2)
+        self.assertEqual(guard.call_args_list[0].args[1], guard.call_args_list[1].args[1])
+        self.assertNotIn("Draft for editorial review", guard.call_args_list[1].args[1])
+        self.assertNotIn("prompting the earlier", guard.call_args_list[1].args[1])
+        channel.send.assert_awaited_once()
+        self.assertEqual(channel.send.call_args.kwargs["embed"].description,
+                         revised_text.replace("[[person:discord_user:8]]", "Test Creator") +
+                         "\n[Ceramic Receivers](<https://site.test/journal/journal_daily_2026-09-10_fixture>)")
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [8], "parse": []})
+        guild.fetch_member.assert_awaited_once_with(8)
+        self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 1)
+        rewrite.assert_not_awaited()
+
+    async def test_unsuccessful_editorial_call_never_falls_back_to_valid_first_draft_or_generates_art(self):
+        for outcome in ("skip", "invalid", "empty", "failure", "budget_denied"):
+            with self.subTest(outcome=outcome):
+                self.execute("DELETE FROM guild_configs")
+                self.execute("DELETE FROM ambient_log")
+                calls = []
+                async def boundary(contents, route, **kwargs):
+                    channel.send.assert_not_awaited()
+                    prepare.assert_not_awaited()
+                    calls.append(route)
+                    if len(calls) == 1:
+                        return SimpleNamespace(success=True, text=self.response(contents))
+                    if outcome == "failure":
+                        return SimpleNamespace(success=False, error_category="fixture_unavailable")
+                    text = ('{"action":"skip"}' if outcome == "skip" else
+                            "" if outcome == "empty" else '{"action":"post","paragraphs":[]}')
+                    return SimpleNamespace(success=True, text=text)
+
+                channel, guild, _ = self.scheduler()
+                quota = [True, False] if outcome == "budget_denied" else [True, True]
+                with mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
+                        mock.patch.object(bot, "check_quota_availability", side_effect=quota) as allowance, \
+                        mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=boundary)) as provider, \
+                        mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite, \
+                        mock.patch.object(art, "prepare", new=mock.AsyncMock()) as prepare:
+                    await bot.ambient_message_task.coro()
+                self.assertEqual(provider.await_count, 1 if outcome == "budget_denied" else 2)
+                self.assertEqual(allowance.call_count, 2)
+                channel.send.assert_not_awaited()
+                guild.fetch_member.assert_not_awaited()
+                prepare.assert_not_awaited()
+                rewrite.assert_not_awaited()
+                self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 0)
+
+    async def test_source_withdrawal_during_editorial_call_discards_both_drafts(self):
+        calls = []
+        async def boundary(contents, route, **kwargs):
+            calls.append(route)
+            answer = self.response(contents)
+            if len(calls) == 2:
+                self.execute("UPDATE conversations SET channel_policy='sealed_test'")
+            return SimpleNamespace(success=True, text=answer)
+
+        channel, guild, _ = self.scheduler()
+        with mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
+                mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=boundary)) as provider, \
+                mock.patch.object(art, "prepare", new=mock.AsyncMock()) as prepare:
+            await bot.ambient_message_task.coro()
+        self.assertEqual(provider.await_count, 2)
+        channel.send.assert_not_awaited()
+        guild.fetch_member.assert_not_awaited()
+        prepare.assert_not_awaited()
+        self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 0)
 
     async def test_withdrawal_during_generation_discards_without_repair(self):
         def withdraw(prompt, *args, **kwargs):
@@ -644,7 +768,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 1)
         await bot.ambient_message_task.coro()
         self.assertEqual(channel.send.await_count, 1)
-        self.assertEqual(self.provider.await_count, 1)
+        self.assertEqual(self.provider.await_count, 2)
 
     async def test_delivery_preserves_a_personal_interpretation_before_the_factual_update(self):
         opening = "That unfinished rhythm has somewhere to go. I am leaving the door open. "
@@ -691,7 +815,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await bot.ambient_message_task.coro()
         await bot.ambient_message_task.coro()
         channel.send.assert_awaited_once()
-        self.provider.assert_awaited_once()
+        self.assertEqual(self.provider.await_count, 2)
         self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 0)
 
     async def test_process_cancellation_after_acceptance_keeps_durable_next_day_reservation(self):
@@ -701,7 +825,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         channel.send.side_effect = None
         await bot.ambient_message_task.coro()
         channel.send.assert_awaited_once()
-        self.provider.assert_awaited_once()
+        self.assertEqual(self.provider.await_count, 2)
         self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 0)
 
     async def test_high_activity_cap_does_not_authorize_a_second_edition(self):
@@ -716,7 +840,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.fixture.now += timedelta(hours=5)
         await bot.ambient_message_task.coro()
         channel.send.assert_awaited_once()
-        self.provider.assert_awaited_once()
+        self.assertEqual(self.provider.await_count, 2)
 
     async def test_old_day_art_never_remains_in_a_prebuilt_edition_attachment(self):
         channel, _guild, _ = self.scheduler()

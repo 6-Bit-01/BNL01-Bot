@@ -285,7 +285,7 @@ events retain both dates, with their exact source-owned return links.
 The existing public canon and lore owners supply context whether or not art is
 available. Website information order is not a rule for BNL's speaking order.
 The generation wrapper also reuses the existing public personality clauses
-for the edition and its single repair: curiosity, unusual observations and
+for the edition draft and revision: curiosity, unusual observations and
 humor anchored in BARCODE details. It replaces only the compact voice block,
 retaining the same evidence controls. Ordinary conversation and legacy Ambient
 prompt strings stay unchanged. The caller asks BNL to speak directly to his
@@ -328,13 +328,26 @@ The validator rejects references declared in the wrong role; it does not prove
 that every sentence is semantically supported. Automated checks verify prompt
 assembly and source/delivery boundaries; factual and editorial quality still
 require reviewing actual BNL output.
-The existing single repair receives the rejected draft as bounded untrusted
-data plus the specific validation failure. Reference failures identify the
-paragraph, reference role or eligible subject bindings so the model can fix
-that draft. This does not add another model call, loosen a source/mention fence
-or establish semantic support for its claims. Representative quiet, show,
-publication and mixed-day fixtures exercise selection and delivery; they do
-not substitute for real-source editorial auditions.
+Every nonempty proposed post receives one final editorial revision through the
+existing second-call route. It compares concrete attribution, temporal/causal
+connections and room relationships to the original sources, and develops BNL's
+own observations while preserving legitimate humor and lore. If the first
+draft fails structural validation, this same second call also receives the
+specific paragraph/reference/subject feedback and repairs it. The draft is
+bounded untrusted writing, never another source; final authority checks use
+the original source prompt without the draft appended.
+
+The two-call maximum is unchanged, but a successful post now normally uses
+both calls rather than one, increasing normal text cost and latency within the
+existing spending controls. An initial skip, empty result, provider failure or
+source withdrawal stops early. The first draft cannot be delivered, used for
+member notifications or selected for image preparation. If revision fails or
+its allowance is unavailable, the post is withheld; there is no first-draft
+fallback or third call. Final source/privacy/reference checks and send-time
+revalidation still apply. This is the same model revising its writing, not
+independent factual verification or a guarantee of accurate, engaging prose.
+Representative quiet, show, publication and mixed-day fixtures exercise the
+flow; they do not substitute for real-source editorial auditions.
 The editorial brief distinguishes an evidenced connection between remarks from
 a connection inferred out of a later retelling. It keeps humor, metaphor and
 fictional perspective available, while real operational claims still require
