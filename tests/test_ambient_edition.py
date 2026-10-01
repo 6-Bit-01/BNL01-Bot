@@ -40,6 +40,22 @@ class EditionExpressionTests(unittest.TestCase):
         self.assertEqual(result["subject_refs"], ("discord_user:123",))
         self.assertNotIn("<@", result["description"])
 
+    def test_interpretation_can_lead_without_rewriting_the_source_bound_passage(self):
+        for opening in (
+            "I keep imagining a receiver you could reshape with your hands.",
+            "A receiver you can reshape by hand seems like an excellent misuse of clay.",
+        ):
+            with self.subTest(opening=opening):
+                text = (opening + " [[person:discord_user:123]] imagined a clay radio. "
+                        "The newly published Journal gives that idea somewhere else to wander.")
+                self.draft["stories"][0]["text"] = text
+                result = self.parse()
+                expected = text.replace("[[person:discord_user:123]]", "Test Member")
+                self.assertEqual(result["description"], expected +
+                                 "\n[Clay Radio Notes](<https://example.test/journal/entry>)")
+                self.assertEqual(result["source_refs"], ("conversation:1", "journal:entry"))
+                self.assertEqual(result["subject_refs"], ("discord_user:123",))
+
     def test_deduplicate_links_across_independent_stories(self):
         self.draft["stories"].append({"text": "The Journal also considers the texture of sound.",
                                       "sourceRefs": ["journal:entry"], "subjectRefs": []})
@@ -98,6 +114,19 @@ class EditionExpressionTests(unittest.TestCase):
         self.assertNotIn("NEVER_RENDER_PRIVATE_ROOTS", prompt)
         self.assertIn("Return art:null", prompt)
         self.assertIn("quieter people", prompt)
+
+    def test_public_identity_comes_from_existing_owners_independently_of_art(self):
+        for art_available in (False, True):
+            with self.subTest(art_available=art_available), \
+                    mock.patch.object(edition, "render_prompt_canon_block", return_value="CURRENT_PUBLIC_CANON") as canon, \
+                    mock.patch.object(edition, "render_ecosystem_lore_block", return_value="CURRENT_PUBLIC_LORE") as lore:
+                prompt = edition.build_prompt(self.context, current_time="September 29", show_context="unknown",
+                                              recent_editions=[], art_available=art_available)
+                article_context = prompt.split("Eligible material:\n", 1)[0]
+                self.assertIn("CURRENT_PUBLIC_CANON", article_context)
+                self.assertIn("CURRENT_PUBLIC_LORE", article_context)
+                canon.assert_called_once_with()
+                lore.assert_called_once_with(include_restricted=False)
 
     def test_disabled_until_exact_activation_and_only_primary_guild(self):
         bot = SimpleNamespace(BNL_PRIMARY_GUILD_ID=42)

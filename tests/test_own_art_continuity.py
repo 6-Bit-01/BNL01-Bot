@@ -1,5 +1,6 @@
 """The existing public owners supply art; previous pictures are only fiction."""
 import json
+import gc
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ import test_own_art_preview as fixtures
 from test_own_art_preview import CONCEPT, PNG
 import bnl_own_art as art
 import bnl_ambient_art as ambient
+import bnl_journal as journal
 import test_publication_read_adapters as publications
 
 
@@ -103,12 +105,47 @@ class ArtContinuityTests(unittest.TestCase):
         with mock.patch.object(art, "build_source_packet_between", return_value=value) as read:
             self.assertTrue(art.art_sources_current(fake, 42, [basis]))
             self.assertFalse(read.call_args.kwargs["prepare_schema"])
+            self.assertEqual(basis.pop("entryKind"), "manual")
+            self.assertTrue(art.art_sources_current(fake, 42, [basis]))
+            self.assertEqual(read.call_args.kwargs["entry_kind"], "manual")
             value["safeSources"].append({"refId": "fresh:100", "summary": "Unrelated later arrival"})
             self.assertTrue(art.art_sources_current(fake, 42, [basis]))
             value["safeSources"][0]["summary"] = "Corrected musical contribution"
             self.assertFalse(art.art_sources_current(fake, 42, [basis]))
             value["safeSources"].pop(0)
             self.assertFalse(art.art_sources_current(fake, 42, [basis]))
+
+    def test_daily_and_weekly_reflection_roots_revalidate_in_their_original_mode(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        # Some existing Journal schema helpers rely on SQLite object cleanup.
+        self.addCleanup(gc.collect)
+        db = str(Path(directory.name) / "art-context.db")
+        journal.ensure_schema(db)
+        fake = SimpleNamespace(DB_FILE=db)
+        for mode in ("daily", "weekly"):
+            with self.subTest(mode=mode):
+                value = art.build_source_packet_between(db, 42,
+                    "2026-09-29T00:00:00Z", "2026-09-30T00:00:00Z",
+                    entry_kind=mode, prepare_schema=False)
+                self.assertTrue(any(item["kind"] == "approved_canon" for item in art.art_source_records(value)))
+                basis = json.loads(json.dumps(art.art_source_basis(value)))
+                self.assertEqual(basis["entryKind"], mode)
+                self.assertTrue(art.art_sources_current(fake, 42, [basis]))
+                # Revalidate actual source-owner withdrawal, not a mocked fence.
+                with mock.patch.object(journal, "CANON_FACTS", ()):
+                    self.assertFalse(art.art_sources_current(fake, 42, [basis]))
+
+    def test_explicit_invalid_source_modes_fail_closed_instead_of_falling_back(self):
+        value = packet()
+        basis = art.art_source_basis(value)
+        fake = SimpleNamespace(DB_FILE="unused")
+        for mode in (None, "", "private", "DAILY", [], {}):
+            with self.subTest(mode=mode), mock.patch.object(art, "build_source_packet_between") as read:
+                self.assertFalse(art.art_sources_current(fake, 42, [{**basis, "entryKind": mode}]))
+                read.assert_not_called()
+                with self.assertRaisesRegex(ValueError, "entry_kind_invalid"):
+                    art.art_source_basis({**value, "entryKind": mode})
 
     def test_history_requires_confirmed_delivery_same_guild_and_current_roots(self):
         with tempfile.TemporaryDirectory() as folder:

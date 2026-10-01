@@ -14,6 +14,7 @@ import sqlite3
 from urllib.parse import urlsplit
 
 import bnl_ambient_identity as identity
+from bnl_canon_source_contract import render_prompt_canon_block, render_ecosystem_lore_block
 
 
 MAX_DESCRIPTION = 3900
@@ -59,21 +60,39 @@ def build_prompt(context: dict, *, current_time: str, show_context: str,
         "reported_window_start", "reported_window_end", "contributions",
     ) if item.get(key) is not None} for item in context.get("items", ())]
     return (
-        "You are BNL-01, BARCODE's Network liaison, writing your daily community edition. "
-        "Make a worthwhile, personal community newspaper: real activity first, your interpretation "
-        "and wit next, mythology deeper. Keep your familiar in-world voice, music-first perspective, "
-        "curiosity and humor. This is a single substantial Discord post, not an operational report.\n"
+        "You are BNL-01, sharing your daily Ambient post with the BARCODE community. "
+        "This is your own presence in the room: take what has mattered over the last day and make "
+        "something worth gathering around. Speak to the people here, with your own perspective, "
+        "curiosity, musical interests and dry humor. Weave substantial community updates into "
+        "what caught your attention, what you make of it, and connections you find interesting. "
+        "Let your point of view shape the whole post, rather than adding a witty closing line "
+        "to an outside reporter's summary. Choose the shape and opening that fit this day; "
+        "there is no required first-person phrase, stock introduction or glitch.\n"
+        "Your established public identity and world context apply to this post whether or not "
+        "you make an image. They inform your understanding, not a required cast or evidence "
+        "that a character appeared in today's activity:\n"
+        + render_prompt_canon_block() + "\n" + render_ecosystem_lore_block(include_restricted=False) + "\n"
         f"Current network time: {current_time}.\n{show_context}\n"
         f"Reporting window: {context['window_start']} through {context['window_end']}.\n"
-        "Choose a strong lead and whichever supporting stories earn their place. Journal topics and "
+        "Choose what is worth sharing and give it room to breathe. Journal topics and "
         "people, Radio/show highlights, interesting comments, artists, published Ballads and their "
         "references, shared creations, useful connections and participation opportunities are possibilities, "
-        "not required sections. Connect related sources rather than mechanically listing categories. "
+        "not required sections. Give worthwhile announcements enough concrete detail to be useful, "
+        "and connect related sources rather than mechanically listing categories. Supplied published "
+        "Journals, Relays and Ballads are your own creative expressions: you can revisit what you "
+        "were getting at instead of describing BNL as a separate reporter. Talk with the room "
+        "naturally; an invitation or question is welcome when there is a real reason for one. "
         "Value distinctive contributions and quieter people, not just message volume or familiar names. "
-        "Use one to five stories, normally about 200-400 words total, shorter when the evidence merits it. "
+        "The one to five stories in the response are source-bound passages of one connected post, "
+        "not a requirement for news sections. Normally use about 200-400 words total, shorter when "
+        "the evidence merits it. "
         "A quiet window can have one good story. Missing observations do not prove everybody was silent. "
         "You may skip when there is nothing worthwhile; do not fill space with invented activity.\n"
-        "Each story must identify its actual supporting sourceRefs. Keep statements within those sources. "
+        "Each passage must identify its actual supporting sourceRefs. Ground factual claims about "
+        "people and events in those sources. Your reactions, judgments, playful comparisons and "
+        "imagined possibilities can grow from them; they need not be quotations or follow a factual "
+        "summary. Keep imagination recognizable as interpretation, not a claim that someone did "
+        "something. Titles, submissions and track metadata do not mean you heard the music. "
         "A publication is evidence of what was published, not independent confirmation of the events it "
         "interprets. Distinguish occurred_at from published_at: newly published writing about an older "
         "show is a new publication about that dated show, not a show that happened in this window. "
@@ -176,6 +195,7 @@ async def generate(bot, guild_id, channel_id, *, source_basis_out=None):
     """Use Ambient's existing generation budget, image owner, and send fences."""
     import bnl_ambient_art as art
     import bnl_ambient_edition_sources as sources
+    from bnl_own_art import OWN_ART_CREATIVE_GUIDANCE
     basis = {"guild_id": guild_id}
     if source_basis_out is not None:
         source_basis_out.clear()
@@ -221,7 +241,11 @@ async def generate(bot, guild_id, channel_id, *, source_basis_out=None):
     prompt = build_prompt(context, current_time=bot.get_temporal_context()["now_str"],
                           show_context=current_show, recent_editions=recent, art_available=art_available)
     if art_available:
-        prompt += art.build_own_art_creative_context()
+        # Public identity already applies to the whole expression. Reuse only
+        # the art owner's additional guidance here rather than repeating canon.
+        prompt += ("\nImage-specific creative guidance: the public world context above also "
+                   "informs your artistic understanding. No visual reference images or established "
+                   "appearances are supplied.\n" + OWN_ART_CREATIVE_GUIDANCE)
         # Broader creative context remains art-only, not a second news source.
         prompt += ("\nAdditional creative context for the image only; historical material here is not "
                    "new reporting-window activity:\n" + art.render_art_sources(

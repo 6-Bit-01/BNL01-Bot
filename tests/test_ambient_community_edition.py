@@ -106,19 +106,56 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         generate.assert_not_awaited()
 
     async def test_real_provider_wrapper_preserves_rich_envelope_without_voice_rewrite(self):
+        self.add_message("WITHHELD_EDITION_MARKER", self.stamp(minutes=4), policy="sealed_test")
+        self.archive()
         async def boundary(contents, route, **kwargs):
             return SimpleNamespace(success=True, text=self.response(contents))
-        with mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
-                mock.patch.object(bot, "check_quota_availability", return_value=True), \
-                mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=boundary)) as provider, \
-                mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite:
-            basis = {}
-            result = await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis)
-        self.assertGreater(len(result), 280)
-        self.assertEqual(basis["edition"]["headline"], "A rhythm worth following")
-        provider.assert_awaited_once()
-        self.assertEqual(provider.call_args.args[1], "ambient_generation")
-        rewrite.assert_not_awaited()
+        for art_available in (False, True):
+            with self.subTest(art_available=art_available), \
+                    mock.patch.object(art, "available", return_value=art_available), \
+                    mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
+                    mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                    mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=boundary)) as provider, \
+                    mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite:
+                basis = {}
+                result = await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis)
+                self.assertGreater(len(result), 280)
+                self.assertEqual(basis["edition"]["headline"], "A rhythm worth following")
+                provider.assert_awaited_once()
+                contents, route = provider.call_args.args
+                self.assertEqual(route, "ambient_generation")
+                self.assertTrue(contents.startswith(bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT))
+                article_context = contents.split("Eligible material:\n", 1)[0]
+                self.assertIn(edition.render_prompt_canon_block(), article_context)
+                self.assertIn(edition.render_ecosystem_lore_block(include_restricted=False), article_context)
+                self.assertEqual(contents.count(edition.render_prompt_canon_block()), 1)
+                self.assertEqual(contents.count(edition.render_ecosystem_lore_block(include_restricted=False)), 1)
+                self.assertNotIn("9 Bit", article_context)
+                self.assertIn("A new rhythm is forming in the room.", contents)
+                for private in ("WITHHELD_EDITION_MARKER", "PRIVATE PAYMENT VALUE", "PRIVATE OPERATOR VALUE",
+                                "privateSharedSourceProvenance", "_discord_basis"):
+                    self.assertNotIn(private, contents)
+                self.assertEqual("art_context" in basis, art_available)
+                if art_available:
+                    self.assertEqual(basis["art_context"]["basis"]["entryKind"], "daily")
+                    self.assertTrue(any(ref.startswith("reflection:canon:")
+                                        for ref in basis["art_context"]["basis"]["sources"]))
+                rewrite.assert_not_awaited()
+
+    async def test_real_provider_failure_never_becomes_an_edition_or_voice_retry(self):
+        for art_available in (False, True):
+            with self.subTest(art_available=art_available), \
+                    mock.patch.object(art, "available", return_value=art_available), \
+                    mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
+                    mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                    mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(
+                        return_value=SimpleNamespace(success=False, error_category="fixture_unavailable"))) as provider, \
+                    mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite:
+                basis = {}
+                self.assertEqual(await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis), "")
+                self.assertEqual(basis, {})
+                provider.assert_awaited_once()
+                rewrite.assert_not_awaited()
 
     async def test_real_day_source_adapter_excludes_old_future_and_private_independent_of_art(self):
         self.add_message("OLD_DAY_MARKER", self.stamp(days=2))
@@ -162,6 +199,22 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.provider.side_effect = withdraw
         self.assertEqual(await bot.generate_dynamic_ambient(42, 100), "")
         self.provider.assert_awaited_once()
+
+    async def test_art_enabled_real_provider_discards_a_withdrawn_original_without_repair(self):
+        async def withdraw(contents, route, **kwargs):
+            response = self.response(contents)
+            self.execute("UPDATE conversations SET channel_policy='sealed_test'")
+            return SimpleNamespace(success=True, text=response)
+        with mock.patch.object(art, "available", return_value=True), \
+                mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
+                mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=withdraw)) as provider, \
+                mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite:
+            basis = {}
+            self.assertEqual(await bot.generate_dynamic_ambient(42, 100, source_basis_out=basis), "")
+            self.assertEqual(basis, {})
+            provider.assert_awaited_once()
+            rewrite.assert_not_awaited()
 
     async def test_silence_is_one_decision_and_not_an_error(self):
         self.provider.side_effect = None
@@ -210,6 +263,20 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await bot.ambient_message_task.coro()
         self.assertEqual(channel.send.await_count, 1)
         self.assertEqual(self.provider.await_count, 1)
+
+    async def test_delivery_preserves_a_personal_interpretation_before_the_factual_update(self):
+        opening = "That unfinished rhythm has somewhere to go. I am leaving the door open. "
+        def reflect(prompt, *args, **kwargs):
+            value = json.loads(self.response(prompt))
+            value["stories"][0]["text"] = opening + value["stories"][0]["text"]
+            return json.dumps(value)
+        self.provider.side_effect = reflect
+        channel, _guild, _ = self.scheduler()
+        await bot.ambient_message_task.coro()
+        channel.send.assert_awaited_once()
+        description = channel.send.call_args.kwargs["embed"].description
+        self.assertTrue(description.startswith(opening + "Test Member noticed"))
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [7], "parse": []})
 
     async def test_membership_lookup_withdrawal_is_caught_by_final_source_fence(self):
         def withdraw(_user_id):

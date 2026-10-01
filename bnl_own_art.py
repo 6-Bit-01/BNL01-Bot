@@ -166,7 +166,11 @@ def _source_digest(source: dict) -> str:
 
 
 def art_source_basis(packet: dict) -> dict:
-    return {"start": packet.get("sourceWindowStart", ""), "end": packet.get("sourceWindowEnd", ""),
+    entry_kind = packet.get("entryKind", "manual")
+    if entry_kind not in ("daily", "weekly", "manual"):
+        raise ValueError("art_source_entry_kind_invalid")
+    return {"entryKind": entry_kind,
+            "start": packet.get("sourceWindowStart", ""), "end": packet.get("sourceWindowEnd", ""),
             "sources": {s["ref"]: _source_digest(s) for s in art_source_records(packet)}}
 
 
@@ -218,8 +222,14 @@ def art_sources_current(bot, guild_id: int, bases: list[dict]) -> bool:
                 continue
             if not basis.get("start") or not basis.get("end") or not isinstance(basis.get("sources"), dict):
                 return False
+            # Daily/weekly projections can include eligible historical roots
+            # that the manual projection omits. Re-read the original mode;
+            # legacy receipts retain their previous manual reconstruction.
+            entry_kind = basis.get("entryKind", "manual")
+            if entry_kind not in ("daily", "weekly", "manual"):
+                return False
             packet = build_source_packet_between(bot.DB_FILE, guild_id, basis["start"], basis["end"],
-                                                 entry_kind="manual", prepare_schema=False)
+                                                 entry_kind=entry_kind, prepare_schema=False)
             current = art_source_basis(packet)["sources"]
             if any(current.get(ref) != digest for ref, digest in basis["sources"].items()):
                 return False
