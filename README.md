@@ -284,12 +284,21 @@ counting BNL's retellings as additional events. New publications about older
 events retain both dates, with their exact source-owned return links.
 The existing public canon and lore owners supply context whether or not art is
 available. Website information order is not a rule for BNL's speaking order.
+The generation wrapper also reuses the existing public personality clauses
+for the edition and its single repair: curiosity, unusual observations and
+humor anchored in BARCODE details. It replaces only the compact voice block,
+retaining the same evidence controls. Ordinary conversation and legacy Ambient
+prompt strings stay unchanged. The caller asks BNL to speak directly to his
+community; the newspaper purpose determines coverage, not a formal report voice.
 The message has natural paragraphs, an optional title, and no article word
 target. Original contributions and recorded events are presented before BNL's
-authored publications. Originals are chronological, with opaque room references
-derived from current eligible Discord rows and gaps between retained samples in
-each known room. Different rooms/threads stay distinct; absent context stays
-unknown. A preceding sample is not a reply edge. Historical human-to-human reply
+authored publications. Originals are presented as separate room/surface/scope
+excerpts, chronological within each block, with opaque room references from
+current eligible Discord rows and gaps between retained samples. Missing-room
+originals remain independent, including when their speakers or platforms match.
+The selection and underlying show chronology are partial, not complete exchanges
+or an exhaustive event list. Different rooms/threads stay distinct; a preceding
+sample is not a reply edge or proof of silence. Historical human-to-human reply
 targets were not captured and are not reconstructed from proximity.
 
 Fresh and earlier publications have separate compact catalogs. Journal cards

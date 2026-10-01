@@ -55,9 +55,29 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def archive(self):
         backfill_legacy_sources(bot.DB_FILE, 42)
 
-    def material(self, prompt):
+    def raw_material(self, prompt):
         encoded = prompt.split("Eligible material:\n", 1)[1].split("\nRecent Ambient editions", 1)[0]
         return json.loads(encoded)
+
+    def material(self, prompt):
+        # Fixture writers select evidence by role; normalize the room-separated
+        # provider view without changing the actual production prompt or refs.
+        raw = self.raw_material(prompt)
+        originals = [item for room in raw["room_excerpts"] for item in room["remarks"]]
+        originals.extend(raw["unassociated_originals"])
+        return {"original_contributions": originals,
+                **{key: value for key, value in raw.items()
+                   if key not in {"room_excerpts", "unassociated_originals"}}}
+
+    def assert_edition_voice(self, contents):
+        self.assertTrue(contents.startswith(bot.BNL01_AMBIENT_EDITION_SYSTEM_PROMPT))
+        self.assertEqual(contents.count(bot.BNL01_PUBLIC_PERSONALITY_PROMPT), 1)
+        for trait in bot._BNL01_PUBLIC_PERSONALITY_LINES:
+            self.assertIn(trait, bot.BNL01_SYSTEM_PROMPT)
+            self.assertEqual(contents.count(trait), 1)
+        self.assertNotIn(bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT, contents)
+        self.assertNotIn("## RESTRICTED TOPICS", contents)
+        self.assertNotIn("- Nickname Policy:", contents)
 
     def response(self, prompt, *args, **kwargs):
         items = [item for group in self.material(prompt).values() for item in group]
@@ -202,7 +222,16 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 contents, route = provider.call_args.args
                 self.assertEqual(route, "ambient_generation.community_edition")
                 self.assertEqual(bot._generation_config_for_model(bot.GEMINI_MODEL, route).max_output_tokens, 8192)
-                self.assertTrue(contents.startswith(bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT))
+                self.assert_edition_voice(contents)
+                raw = self.raw_material(contents)
+                self.assertNotIn("original_contributions", raw)
+                room = next(room for room in raw["room_excerpts"]
+                            if any(item["text"] == "A new rhythm is forming in the room."
+                                   for item in room["remarks"]))
+                self.assertTrue(room["room_ref"].startswith("discord-room:"))
+                self.assertEqual(room["conversation_surface"], "discord")
+                self.assertTrue(all(item["evidence_role"] == "original_contribution"
+                                    for item in room["remarks"]))
                 article_context = contents.split("Eligible material:\n", 1)[0]
                 self.assertIn(edition.render_prompt_canon_block(), article_context)
                 self.assertIn(edition.render_ecosystem_lore_block(include_restricted=False), article_context)
@@ -223,6 +252,36 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(any(ref.startswith("reflection:canon:")
                                         for ref in basis["art_context"]["basis"]["sources"]))
                 rewrite.assert_not_awaited()
+
+    async def test_public_personality_is_scoped_to_edition_calls_without_changing_other_packet_routes(self):
+        exact_prompt = 'AUTHORIZED_SOURCE_PAYLOAD: {"speaker":"Test Member","text":"An unfinished rhythm."}'
+        raw_response = ' {"action":"skip"} \n'
+        edition_routes = {"ambient_generation.community_edition", "ambient_generation.community_edition_repair"}
+        routes = [bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE, "ambient_generation",
+                  "ambient_generation.conversation_grounding_regeneration", *sorted(edition_routes)]
+        with mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(
+                    return_value=SimpleNamespace(success=True, text=raw_response))) as provider, \
+                mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite:
+            for route in routes:
+                with self.subTest(route=route):
+                    before = provider.await_count
+                    result = await REAL_GET(exact_prompt, 0, 42, route=route,
+                                            source_context_available=True,
+                                            ambient_envelope=route != bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE)
+                    self.assertEqual(result, raw_response)
+                    self.assertEqual(provider.await_count, before + 1)
+                    contents, actual_route = provider.call_args.args
+                    self.assertEqual(actual_route, route)
+                    self.assertEqual(contents.count(exact_prompt), 1)
+                    if route in edition_routes:
+                        self.assert_edition_voice(contents)
+                    else:
+                        self.assertTrue(contents.startswith(bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT))
+                        self.assertEqual(contents.count(bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT), 1)
+                        self.assertNotIn(bot.BNL01_PUBLIC_PERSONALITY_PROMPT, contents)
+                        self.assertNotIn(bot.BNL01_AMBIENT_EDITION_SYSTEM_PROMPT, contents)
+            rewrite.assert_not_awaited()
 
     async def test_real_provider_failure_never_becomes_an_edition_or_voice_retry(self):
         for art_available in (False, True):
@@ -284,6 +343,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         accepted = {}
 
         async def boundary(contents, route, **kwargs):
+            self.assert_edition_voice(contents)
             material = self.material(contents)
             original = next(item for item in material["original_contributions"] if item.get("text") == original_text)
             journal = next(item for item in (material["new_publications"] + material["earlier_publications"]) if item["kind"] == "published_journal")

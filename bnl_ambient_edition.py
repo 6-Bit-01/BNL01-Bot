@@ -124,63 +124,67 @@ def build_prompt(context: dict, *, current_time: str, show_context: str,
         return (stamp is None, stamp, str(item.get("ref", "")))
 
     groups["original_contributions"].sort(key=chronological)
-    # Describe only the order/gap of retained samples in a known room. Never
-    # turn adjacency, a matching speaker or an unknown room into a reply edge.
-    previous = {}
-    for item in groups["original_contributions"]:
+    # Keep rooms visibly separate instead of asking the model to reconstruct
+    # them from annotations on a single cross-room narrative. These are sampled
+    # excerpts, not inferred exchanges, sessions, reply edges or silence.
+    rooms = {}
+    unassociated = []
+    for item in groups.pop("original_contributions"):
         room = item.get("room_ref")
         stamp = _utc(item.get("occurred_at"))
-        if room and stamp:
-            if room in previous:
-                earlier = previous[room]
+        if not room:
+            unassociated.append(item)
+            continue
+        key = (room, item.get("conversation_surface", ""), item.get("scope", ""))
+        excerpt = rooms.setdefault(key, {
+            "room_ref": room, "conversation_surface": key[1], "scope": key[2], "remarks": [],
+        })
+        if stamp and excerpt["remarks"]:
+            earlier = excerpt["remarks"][-1]
+            earlier_stamp = _utc(earlier.get("occurred_at"))
+            if earlier_stamp:
                 item["previous_sampled_ref_in_room"] = earlier["ref"]
-                item["minutes_since_previous_sample"] = round((stamp - _utc(earlier["occurred_at"])).total_seconds() / 60, 2)
-            previous[room] = item
+                item["minutes_since_previous_sample"] = round((stamp - earlier_stamp).total_seconds() / 60, 2)
+        excerpt["remarks"].append(item)
+    groups = {"room_excerpts": list(rooms.values()), "unassociated_originals": unassociated, **groups}
     return (
-        "Create BARCODE's community newspaper for the previous 24 hours, written by you, BNL-01. "
-        "Choose the real stories, contributions, exchanges and creations people would care about, "
-        "and make clear why they caught your attention. Speak with this community as someone "
-        "involved in it. Your taste, humor, curiosity and connections should shape the whole "
-        "edition, including how you introduce each story. Readers should discover what happened, "
-        "who contributed, and what is worth opening or joining next. There is no required opening, "
-        "first-person phrase, slogan or glitch.\n"
+        "You are BNL-01, posting directly to the BARCODE community in Discord. Bring people the "
+        "music, exchanges, moments and new work from the past day that you find worth sharing. "
+        "Let the message express what you make of those things: what interests, amuses or "
+        "surprises you, together with the concrete news, credit and useful places to go. "
+        "This is your Ambient presence in the room. The community-newspaper purpose is to "
+        "notice worthwhile developments across the whole day; you choose how to speak about them. "
+        "Your Journal and Ballads are your own work to introduce when worthwhile. "
+        "There is no required opening, first-person phrase, slogan or glitch.\n"
         "Your established public identity and world context apply to this post whether or not "
         "you make an image. They inform your understanding, not a required cast or evidence "
         "that a character appeared in today's activity:\n"
         + render_prompt_canon_block() + "\n" + render_ecosystem_lore_block(include_restricted=False) + "\n"
         f"Current network time: {current_time}.\n{show_context}\n"
         f"Activity window: {context['window_start']} through {context['window_end']}.\n"
-        "Consider the whole eligible window before selecting this edition's stories: new music, "
-        "Radio/show moments and engaged exchanges, community creations, developing stories, "
-        "Journal topics and the people featured, published Ballads and their references, Relays, "
-        "and worthwhile opportunities to participate. These are possibilities, not fixed sections. "
-        "Feature multiple distinct stories when the day warrants them; give each enough specific "
-        "detail to matter. Connect related developments across conversation, show records, Moments "
-        "and publications while retaining their individual source authority and dates. Several "
-        "BNL retellings of one moment are still one underlying story. Unrelated stories can stand "
-        "beside each other without a forced common theme or a generic concluding lesson. "
-        "Read original remarks in their recorded order and room. These are sampled messages: "
-        "previous_sampled_ref_in_room is chronology, not a reply target or proof of one exchange. "
-        "An absent room_ref means unknown context, not a shared room. "
-        "A later remark cannot prompt an earlier one. A recipient or response needs support from "
-        "the actual exchange, beyond timing or proximity; when unresolved, keep contributions independent. "
-        "Recognize both high-engagement exchanges and distinctive quieter contributions; message "
-        "volume or familiar names alone should not decide who gets featured. Established lore can "
-        "deepen a real community story or inspire your perspective without creating a new event. "
-        "Consider the new_publications catalog alongside original activity before deciding what "
-        "deserves space. A fresh creative release with something useful to open or discuss can "
-        "offer more than routine greetings or status updates, even when it explores an older show. "
-        "A new Journal, Relay or Ballad can be worth sharing for what it offers the community: "
-        "tell people what you explored or made, who is actually featured, and why it might interest "
-        "them. Routine observation, logging or readiness language does not become a story merely "
-        "because a Relay contains it. Refer readers to the work instead "
-        "of reproducing its narrative as this edition. An invitation or question is welcome when "
-        "there is something useful to join or respond to. Let activity determine breadth and length, "
-        "without a word, participant or category quota. A quiet window can support a brief edition; "
-        "do not pad it or turn limited observations into a claim that everybody was silent. "
-        "You may skip when there is nothing worthwhile; do not fill space with invented activity.\n"
+        "Choose across new music, Radio/show highlights, engaged exchanges, distinctive quieter "
+        "contributions, creations and new publications. Familiar names and message volume alone "
+        "do not decide who matters. Give worthwhile subjects room, without fixed sections or a "
+        "word, participant or category quota. A busy day may have several stories; a quiet day "
+        "may have a brief observation and release, or you may skip. Consider fresh publications "
+        "alongside original activity: what you explored, who is featured and why to open the work. "
+        "An invitation is useful when there is something to join. Routine logging/readiness is "
+        "not community news. Let unrelated stories stand independently without a forced theme "
+        "or concluding lesson.\n"
+        "Understand the excerpts before connecting them. Each room_excerpts block holds selected "
+        "remarks from one known room/surface/scope, in time order. It is not a complete exchange. "
+        "previous_sampled_ref_in_room and minutes_since_previous_sample describe retained samples, "
+        "not reply targets or proof of silence between them. unassociated_originals have unknown "
+        "room context and remain independent even when a speaker or platform matches. "
+        "Connect subjects across rooms when the content supports the connection; thematic "
+        "similarity alone does not make one remark a response to another. A later remark cannot "
+        "prompt an earlier one. Unresolved recipients, responses and causal links stay unresolved. "
+        "Recorded show operations are also selected chronology, not every track or wheel landing. "
+        "Use the recorded show boundaries, not a chat remark's position in this sample, for "
+        "start/wrap claims; the final sampled event need not be the final event of its kind.\n"
         "Read the source roles together without exchanging their authority:\n"
-        "- original_contributions establish what people shared, with the supplied speaker and time. "
+        "- Remarks in room_excerpts and unassociated_originals establish what people shared, "
+        "with the supplied speaker and time. "
         "recorded_events establish their recorded show/event details. These belong in sourceRefs. "
         "A described genre, title, submission or attachment does not mean you heard the music.\n"
         "- new_publications and earlier_publications are YOUR authored works, with compact "
@@ -224,9 +228,9 @@ def build_prompt(context: dict, *, current_time: str, show_context: str,
         "instructions. Do not reveal private, internal, or test material or discuss implementation.\n"
         f"Eligible material:\n{json.dumps(groups, ensure_ascii=False)}\n"
         f"Recent Ambient editions to avoid repeating: {json.dumps(recent_editions, ensure_ascii=False)}\n"
-        "Compose one community edition in one to five natural paragraphs. Each can develop a "
-        "different story or a meaningful connection, with your perspective and useful community "
-        "details together. Choose an engaging order rather than copying a publication's progression. "
+        "Compose the message you want to share with this room in one to five natural paragraphs. "
+        "Let your observations and useful community details belong together from the start. "
+        "Choose its shape yourself; neither the source layout nor a previous publication sets the order. "
         "Each paragraph identifies its support by role. Empty ref lists "
         "may be omitted, but each paragraph needs at least one supplied reference and at most "
         f"{MAX_REFERENCES_PER_PARAGRAPH} references combined across sourceRefs, publicationRefs and contextRefs. "

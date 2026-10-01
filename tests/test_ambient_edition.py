@@ -213,8 +213,8 @@ class EditionExpressionTests(unittest.TestCase):
         journal["private_receipt"] = "PRIVATE_ITEM_RECEIPT"
         original_context = copy.deepcopy(self.context)
         prompt, material = self.prompt_material()
-        self.assertEqual(next(iter(material)), "original_contributions")
-        self.assertEqual(material["original_contributions"][0]["text"], self.context["items"][1]["text"])
+        self.assertEqual(next(iter(material)), "room_excerpts")
+        self.assertEqual(material["unassociated_originals"][0]["text"], self.context["items"][1]["text"])
         publication = material["new_publications"][0]
         self.assertEqual(publication["publication_card"], {
             "title": "Clay Radio Notes", "excerpt": "An exploration of handmade receivers.",
@@ -230,7 +230,9 @@ class EditionExpressionTests(unittest.TestCase):
                        "PRIVATE_ABOUT", "PRIVATE_ITEM_RECEIPT", "NEVER_RENDER_PRIVATE_ROOTS"):
             self.assertNotIn(hidden, prompt)
         self.assertEqual(self.context, original_context)  # Full evidence remains available to its owner.
-        self.assertEqual({item["ref"] for group in material.values() for item in group},
+        flattened = [item for name, group in material.items() if name != "room_excerpts" for item in group]
+        flattened.extend(item for excerpt in material["room_excerpts"] for item in excerpt["remarks"])
+        self.assertEqual({item["ref"] for item in flattened},
                          {item["ref"] for item in self.context["items"]})
 
     def test_publication_cards_distinguish_new_release_from_older_subject_and_history(self):
@@ -317,22 +319,72 @@ class EditionExpressionTests(unittest.TestCase):
         self.context["items"] = rows
         original_context = copy.deepcopy(self.context)
         prompt, material = self.prompt_material()
-        ordered = material["original_contributions"]
-        self.assertEqual([row["ref"] for row in ordered],
-                         ["c:early", "c:other-room", "c:unknown-1", "c:unknown-2", "c:late"])
-        self.assertEqual(ordered[-1]["previous_sampled_ref_in_room"], "c:early")
-        self.assertEqual(ordered[-1]["minutes_since_previous_sample"], 321.52)
-        for item in ordered[:-1]:
+        first_room, second_room = material["room_excerpts"]
+        self.assertEqual([row["ref"] for row in first_room["remarks"]], ["c:early", "c:late"])
+        self.assertEqual([row["ref"] for row in second_room["remarks"]], ["c:other-room"])
+        self.assertEqual([row["ref"] for row in material["unassociated_originals"]],
+                         ["c:unknown-1", "c:unknown-2"])
+        later = first_room["remarks"][-1]
+        self.assertEqual(later["previous_sampled_ref_in_room"], "c:early")
+        self.assertEqual(later["minutes_since_previous_sample"], 321.52)
+        independent = first_room["remarks"][:1] + second_room["remarks"] + material["unassociated_originals"]
+        for item in independent:
             self.assertNotIn("previous_sampled_ref_in_room", item)
             self.assertNotIn("minutes_since_previous_sample", item)
-        for item in ordered[2:4]:
+        for item in material["unassociated_originals"]:
             self.assertNotIn("room_ref", item)
-        for item in ordered:
+        for item in independent + [later]:
             self.assertNotIn("reply_to", item)
             self.assertNotIn("channel_id", item)
         self.assertNotIn("UNVERIFIED_REPLY", prompt)
         self.assertNotIn("PRIVATE_RAW_ROOM", prompt)
         self.assertEqual(self.context, original_context)
+
+    def test_same_author_across_rooms_does_not_form_one_presented_exchange(self):
+        original = {**self.context["items"][0], "conversation_surface": "discord", "scope": "window_activity"}
+        self.context["items"] = [
+            {**original, "ref": "c:work", "room_ref": "room:general",
+             "occurred_at": "2026-09-29T20:02:00Z", "text": "Done with work."},
+            {**original, "ref": "c:origin", "room_ref": "room:music",
+             "occurred_at": "2026-09-29T03:24:00Z", "text": "My first origin track."},
+        ]
+        _, material = self.prompt_material()
+        excerpts = material["room_excerpts"]
+        self.assertEqual([e["room_ref"] for e in excerpts], ["room:music", "room:general"])
+        for excerpt, ref in zip(excerpts, ("c:origin", "c:work")):
+            self.assertEqual(len(excerpt["remarks"]), 1)
+            item = excerpt["remarks"][0]
+            self.assertEqual(item["ref"], ref)
+            self.assertEqual(item["subject_refs"], original["subject_refs"])
+            self.assertNotIn("previous_sampled_ref_in_room", item)
+        # Separate presentation does not forbid a supported thematic connection
+        # or discard the speaker's source bindings. No semantic claim is tested here.
+        self.draft["paragraphs"] = [{
+            "text": "[[person:discord_user:123]] shared an origin track and later checked in after work.",
+            "sourceRefs": ["c:origin", "c:work"], "subjectRefs": ["discord_user:123"],
+        }]
+        self.assertEqual(self.parse()["source_refs"], ("c:origin", "c:work"))
+
+    def test_unknown_rooms_historical_scopes_and_surfaces_do_not_gain_false_neighbors(self):
+        original = {**self.context["items"][0], "room_ref": "room:shared", "conversation_surface": "discord"}
+        self.context["items"] = [
+            {**original, "ref": "c:old", "scope": "historical_context", "occurred_at": "2026-09-27T04:00:00Z"},
+            {**original, "ref": "c:today", "scope": "window_activity"},
+            {**original, "ref": "c:surface", "scope": "window_activity", "conversation_surface": "another_surface"},
+            {**original, "ref": "c:missing-time", "scope": "window_activity", "occurred_at": "unknown"},
+            {**original, "ref": "c:unknown-1", "room_ref": "", "conversation_surface": "tiktok_live_chat"},
+            {**original, "ref": "c:unknown-2", "room_ref": "", "conversation_surface": "tiktok_live_chat"},
+        ]
+        _, material = self.prompt_material()
+        self.assertEqual(len(material["room_excerpts"]), 3)
+        known = [item for excerpt in material["room_excerpts"] for item in excerpt["remarks"]]
+        unknown = material["unassociated_originals"]
+        self.assertEqual([item["ref"] for item in unknown], ["c:unknown-1", "c:unknown-2"])
+        self.assertCountEqual([item["ref"] for item in known + unknown],
+                              [item["ref"] for item in self.context["items"]])
+        for item in known + unknown:
+            self.assertNotIn("previous_sampled_ref_in_room", item)
+            self.assertNotIn("minutes_since_previous_sample", item)
 
     def test_bad_reference_shapes_and_unknown_publication_context_refs_are_rejected(self):
         for field in ("sourceRefs", "publicationRefs", "contextRefs"):
