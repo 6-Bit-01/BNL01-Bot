@@ -253,11 +253,14 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
     async def test_interrupted_ballad_keeps_metadata_and_finish_reason_through_worker(self):
         await self.ballad_reaches_provider_at_reported_spend("manual-cutoff-1", "broadcast_ballad_manual", interrupted=True)
 
-    def test_ballad_schema_does_not_change_chat_or_journal_output_format(self):
-        for route in ("ordinary_chat_single_packet_canary", "bnl_journal_generation", "website_relay_event"):
-            config = bot._generation_config_for_model("gemini-3.6-flash", route)
-            self.assertIsNone(config.response_schema)
-            self.assertIsNone(config.response_mime_type)
+    def test_ballad_schema_preserves_each_other_routes_output_format(self):
+        for route, expected_mime in (("ordinary_chat_single_packet_canary", None),
+                                     (bot.JOURNAL_ROUTE, "application/json"),
+                                     ("website_relay_event", None)):
+            with self.subTest(route=route):
+                config = bot._generation_config_for_model("gemini-3.6-flash", route)
+                self.assertIsNone(config.response_schema)
+                self.assertEqual(config.response_mime_type, expected_mime)
 
     async def test_revision_intent_does_not_promote_casual_phrases(self):
         self.assertTrue(bot._detect_request_intent(FEEDBACK)[0])
