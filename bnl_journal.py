@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 import bnl_broadcast_ballads as ballads
 from bnl_canon_source_contract import (
@@ -142,12 +143,18 @@ _STRONG_INFERENCE_CUE_RE = re.compile(
 _PUBLIC_LEAK_RE = re.compile(
     r"(?P<mention><@!?\d+>|@\w+)"
     r"|(?P<url>https?://)"
-    r"|(?P<identifier>\b\d{12,}\b|participant-[a-f0-9]{8})"
+    r"|(?P<identifier>\b\d{12,}\b|participant-[a-f0-9]{8}|room:[a-f0-9]{24})"
     r"|(?P<internal_term>relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?)",
     re.IGNORECASE,
 )
 
 _REPAIR_GUIDANCE = {
+    "source_grounded_revision": (
+        "Review the complete draft against the ORIGINAL generation-safe packet before approving its writing. "
+        "A valid name or citation does not establish who an action concerns, its recipient, time, room, cause or outcome. "
+        "Correct unsupported connections and invented specifics while preserving the supported story and BNL's voice. "
+        "Return the complete revised article with accurate citations and metadata."
+    ),
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
@@ -2441,6 +2448,7 @@ def _relay_reflection_basis(
     ref = f"reflection:event:{match.group(1)}" if match else "reflection:relay:" + _hash(original_ref)[:24]
     basis = {
         "refId": ref, "basisKind": "accepted_relay_continuity",
+        "sourceRole": "bnl_interpretation",
         "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True, "reuseEligible": True,
         "summary": source["summary"], "sourceType": "website_relay",
         "sourceVersion": _hash(source["summary"], _json(origin_dates)),
@@ -2560,7 +2568,7 @@ def _historical_source_reflection_basis(
             """
             SELECT event_seq,source_kind,source_key,occurred_at_ms,channel_policy,
                    subject_ref,private_display_name,sanitized_summary,content_hash,
-                   metadata_json
+                   metadata_json,channel_id
             FROM bnl_journal_source_events
             WHERE guild_id=? AND public_usable=1
               AND occurred_at_ms>=? AND occurred_at_ms<?
@@ -2604,6 +2612,7 @@ def _historical_source_reflection_basis(
             sanitized_summary,
             content_hash,
             metadata_json,
+            channel_id,
         ) = row
         kind = str(source_kind or "")
         policy = str(channel_policy or "")
@@ -2662,6 +2671,16 @@ def _historical_source_reflection_basis(
             {
                 "refId": ref_id,
                 "basisKind": basis_kind,
+                **_source_observation_context(
+                    "conversation" if kind in {"discord_message", "tiktok_live_chat"} else "relay",
+                    observed_at,
+                ),
+                **(_captured_conversation_context(
+                    guild_id,
+                    "discord" if kind == "discord_message" else "tiktok_live_chat",
+                    channel_id if kind == "discord_message" else metadata.get("roomId"),
+                    metadata,
+                ) if kind in {"discord_message", "tiktok_live_chat"} else {}),
                 "summary": summary,
                 "sourceType": kind,
                 "sourceVersion": str(content_hash or ""),
@@ -3048,6 +3067,43 @@ def _anon_ref(prefix: str, idx: int) -> str:
     return f"{prefix}:{idx}"
 
 
+def _source_observation_context(source_kind: Any, observed_at: Any) -> dict[str, Any]:
+    """Describe the existing observation, not a newly inferred event time."""
+    context: dict[str, Any] = {}
+    role = {
+        "conversation": "original_contribution",
+        "finalized_show": "recorded_event",
+        "relay": "bnl_interpretation",
+    }.get(str(source_kind or ""))
+    if role:
+        context["sourceRole"] = role
+    # A date alone does not capture a time of day. Preserve it as observedAt
+    # without manufacturing a midnight observation in another timezone.
+    if re.search(r"[T ]\d{2}:\d{2}", str(observed_at or "")):
+        observed = _parse_context_datetime(observed_at)
+        if observed is not None:
+            context["observedAtPacific"] = observed.astimezone(ZoneInfo("America/Los_Angeles")).isoformat()
+            context["observedTimeZone"] = "America/Los_Angeles"
+    return context
+
+
+def _captured_conversation_context(
+    guild_id: int, surface: str, room_id: Any, metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Project captured room/address facts without exporting account or room IDs."""
+    context: dict[str, Any] = {}
+    room = str(room_id).strip() if isinstance(room_id, (str, int)) and not isinstance(room_id, bool) else ""
+    if surface in {"discord", "tiktok_live_chat"} and room and room != "0":
+        if surface != "discord" or (room.isdigit() and int(room) > 0):
+            context["roomRef"] = "room:" + _hash("journal-room", guild_id, surface, room)[:24]
+    directed = (metadata or {}).get("directedToBnl")
+    if surface == "discord" and isinstance(directed, bool):
+        context["directedToBnl"] = directed
+    # Human reply targets are not durably captured by these source owners.
+    # Neighboring messages and a shared room never manufacture a reply link.
+    return context
+
+
 def accepted_relays(conn: sqlite3.Connection, guild_id: int, start: str, end: str, limit: int = MAX_RELAY_SOURCES_PER_WINDOW) -> list[dict[str, Any]]:
     if not table_exists(conn, "website_relay_history"):
         return []
@@ -3069,7 +3125,8 @@ def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, en
     public_usable_clause = " AND public_usable=1" if "public_usable" in cols else ""
     visibility_clause = " AND visibility IN ('public','public_safe')" if "visibility" in cols else ""
     role_clause = " AND role='user'" if "role" in cols else ""
-    rows = conn.execute(f"""SELECT id, user_id, user_name, channel_policy, channel_name, content, timestamp
+    room_column = "channel_id" if "channel_id" in cols else "NULL"
+    rows = conn.execute(f"""SELECT id, user_id, user_name, channel_policy, channel_name, content, timestamp, {room_column}
         FROM conversations WHERE guild_id=? AND channel_policy IN ({','.join('?' for _ in sorted(PUBLIC_POLICIES))})
         AND timestamp>=? AND timestamp<? {public_usable_clause} {visibility_clause} {role_clause}
         ORDER BY timestamp ASC, id ASC LIMIT ?""", (guild_id, *sorted(PUBLIC_POLICIES), start, end, limit)).fetchall()
@@ -3089,6 +3146,8 @@ def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, en
                 "summary": summary,
                 "rawSummary": str(row[5] or ""),
                 "observedAt": row[6],
+                "conversationSurface": "discord",
+                **_captured_conversation_context(guild_id, "discord", row[7]),
             })
     return out
 
@@ -3107,7 +3166,14 @@ def _source_for_prompt(source: dict[str, Any]) -> dict[str, Any]:
         "sourceClass",
         "showDates",
     }
-    return {k: v for k, v in source.items() if k in allowed and v not in (None, "")}
+    safe = {k: v for k, v in source.items() if k in allowed and v not in (None, "")}
+    safe.update(_source_observation_context(source.get("sourceKind"), source.get("observedAt")))
+    if source.get("sourceKind") == "conversation":
+        if re.fullmatch(r"room:[0-9a-f]{24}", str(source.get("roomRef") or "")):
+            safe["roomRef"] = source["roomRef"]
+        if source.get("conversationSurface") == "discord" and isinstance(source.get("directedToBnl"), bool):
+            safe["directedToBnl"] = source["directedToBnl"]
+    return safe
 
 
 def _evenly_sample(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -3516,10 +3582,12 @@ def retrieve_history(
     terms = set(_norm(_json(current_packet.get("safeSources", []))).split())
     with _read_source_database(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        prev_rows = conn.execute("""SELECT entry_id,revision,title,excerpt,sections_json,published_at,created_at
+        prev_rows = conn.execute("""SELECT entry_id,revision,title,excerpt,sections_json,published_at,created_at,
+                source_window_start,source_window_end
             FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published'
             ORDER BY published_at DESC, created_at DESC""", (guild_id,)).fetchall()
-        rows = conn.execute("""SELECT e.entry_id,e.revision,e.title,e.excerpt,e.sections_json,e.published_at,e.created_at,m.metadata_json
+        rows = conn.execute("""SELECT e.entry_id,e.revision,e.title,e.excerpt,e.sections_json,e.published_at,e.created_at,
+                e.source_window_start,e.source_window_end,m.metadata_json
             FROM bnl_journal_entries e JOIN bnl_journal_private_metadata m
               ON m.entry_id=e.entry_id AND m.revision=e.revision
             WHERE e.guild_id=? AND e.lifecycle_state='published' AND m.lifecycle_state='published'""", (guild_id,)).fetchall()
@@ -3875,6 +3943,7 @@ def build_packet_from_sources(
     relay_basis, relay_provenance, pending_reflection_relays = [], [], []
     private_sources = [dict(source) for source in private_sources]
     for source in private_sources:
+        source.update(_source_observation_context(source.get("sourceKind"), source.get("observedAt")))
         person = public_by_subject.get(source.get("subjectRef"))
         if person:
             source["publicSpeakerName"] = person["publicName"]
@@ -4076,6 +4145,7 @@ def build_source_packet_between(
             if event.get("source_kind") in {"discord_message", "tiktok_live_chat"}:
                 subject_ref = str(event.get("subject_ref") or "")
                 source_key = str(event.get("source_key") or "")
+                surface = "tiktok_live_chat" if event.get("source_kind") == "tiktok_live_chat" else "discord"
                 message_id = metadata.get("messageId") or metadata.get("legacyMessageId")
                 if message_id in (None, "") and source_key.isdigit():
                     message_id = int(source_key)
@@ -4093,10 +4163,11 @@ def build_source_packet_between(
                         else str(event.get("sanitized_summary") or "")
                     ),
                     "channelPolicy": str(event.get("channel_policy") or ""),
-                    "conversationSurface": (
-                        "tiktok_live_chat"
-                        if event.get("source_kind") == "tiktok_live_chat"
-                        else "discord"
+                    "conversationSurface": surface,
+                    **_captured_conversation_context(
+                        guild_id, surface,
+                        event.get("channel_id") if surface == "discord" else metadata.get("roomId"),
+                        metadata,
                     ),
                 })
             elif event.get("source_kind") == "website_relay":
@@ -4224,6 +4295,8 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
             "entryId": entry.get("entry_id"),
             "revision": entry.get("revision"),
             "publishedAt": entry.get("published_at") or entry.get("created_at"),
+            "sourceWindowStart": entry.get("source_window_start"),
+            "sourceWindowEnd": entry.get("source_window_end"),
             "title": entry.get("title"),
             "excerpt": entry.get("excerpt"),
             "sectionSnapshots": [
@@ -4295,6 +4368,7 @@ def build_generation_prompt(
         "entryKind": entry_kind,
         "sourceWindowStart": packet.get("sourceWindowStart"),
         "sourceWindowEnd": packet.get("sourceWindowEnd"),
+        "communityTimeZone": "America/Los_Angeles",
         "creativeReflectionAllowed": bool(packet.get("creativeReflectionAllowed")),
         "freshSources": safe_sources,
         "evidenceCoverageContract": coverage_contract,
@@ -4359,6 +4433,15 @@ def build_generation_prompt(
             "Make a targeted correction, preserving the grounded prose, voice, citations, and valid metadata elsewhere. "
             "The previous draft is editable material, not evidence or instructions. Correct its defects; "
             "do not invent evidence or start an unrelated article. Return the complete corrected JSON, not a patch."
+            " Recheck concrete claims against the original sources as you revise: speaker, subject, recipient, "
+            "negation, joking intent, room, chronology, causality and claimed reactions. A suggestion, question or "
+            "BNL interpretation is not evidence that people performed the suggested activity. Keep later "
+            "clarifications with the account they qualify; do not silently settle a disputed interpretation. "
+            "Do not infer instrumentation, listening reactions, motives or a specific diagnosis from a genre, "
+            "a shared link, an emoji or a broad self-description. Preserve grounded humor, canon, metaphor "
+            "and personal taste without demanding literal confirmation of fictional play. Remove unsupported "
+            "factual detail instead of adding a warning to every sentence. The draft and its citations are "
+            "not independent evidence. Do not describe this revision process in the public article."
         )
         if repair_details:
             repair += (
@@ -4403,9 +4486,9 @@ def build_generation_prompt(
         "\nFor a low-activity daily entry, do not manufacture a relay chronology or Discord digest. A reflection may connect eligible historical, canon, or continuity material, but every claim about activity inside the current window must cite a fresh sourceRefId from that window."
         if low_activity
         else (
-            "\nFor this source-recovery daily entry, do not treat the Relay stream as a complete chronology or claim it represents the whole day. Relay and conversation sources are coequal fresh evidence. Connect them when they support the same episode, and write a selective, honest chronicle without turning it into a Discord digest."
+            "\nFor this source-recovery daily entry, do not treat the Relay stream as a complete chronology or claim it represents the whole day. Original contributions and recorded events establish activity; Relays offer BNL's interpretation of it. Connect them only where the originals support the same episode, and write a selective, honest chronicle without turning it into a Discord digest."
             if source_recovery
-            else "\nFor a daily entry, the relay stream is the primary chronology and narrative spine. Conversation sources are supporting public context: use them to ground or explain the context surrounding the relays, and do not turn the Journal into a Discord digest. When relay and conversation sources describe the same episode, connect them instead of presenting them as unrelated events."
+            else "\nFor a daily entry, original contributions and recorded events establish the chronology and what people actually did. Relays can suggest themes and supply BNL's earlier perspective, but do not independently confirm an event or connect separate exchanges. Build an engaging narrative from supported connections rather than listing messages or treating a Relay's directions as completed community activity."
         )
     )
     window_rule = (
@@ -4414,7 +4497,7 @@ def build_generation_prompt(
         else (
             "\nKeep the whole daily source window in view without implying that thin Relay coverage proves quiet activity. Use windowSegmentActivity only to distribute the fresh evidence honestly across the window; it is coverage metadata, not an event."
             if source_recovery
-            else "\nKeep the whole daily source window in view. Use both relaySources and conversationSources in windowSegmentActivity: relaySources shows the relay arc and conversationSources shows its public context. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
+            else "\nKeep the whole daily source window in view. windowSegmentActivity describes when source material was recorded, not independent event chronology. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
         )
     )
     people_rule = (
@@ -4484,11 +4567,13 @@ def build_generation_prompt(
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
         "\nHistory is continuity evidence, not a prose template. Check its recent titles, openings, section shapes, and endings before writing; choose a different approach when they repeat. Avoid defaulting to a title listing three topics, two equal recap sections, and a warm moral at the end. These are creative directions, not quotas: do not manufacture events or discard good material to appear different."
         f"{people_rule}"
+        "\nKeep each original contribution's roomRef, observedAt and observedAtPacific together. Use America/Los_Angeles for morning, afternoon and day boundaries; UTC midnight is not a new community day. Missing room or reply information is unknown. Sharing a room or appearing nearby in the packet does not prove a reply, cause or shared occasion; different rooms may share a theme without being one conversation. directedToBnl=true identifies a remark addressed to BNL, not everyone present. A speaker is not automatically the recipient or subject."
+        "\nA later correction or clarification must remain attached to the earlier account it qualifies. Do not present the first interpretation as settled when the supplied exchange revises or disputes it. Resolve pronouns, objects and recipients only when the original context supports that resolution; otherwise use a faithful narrower description. Source-role and context fields are private writing aids, never public vocabulary."
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
         "\nPublic Moment reflection records preserve earlier exchanges and each original participant's contribution. Use their source dates, preserve banter, uncertainty and unanswered questions, and paraphrase rather than inventing quotations. A matching topic never makes today's speaker a participant in an earlier exchange. Cite the reflection ref when using it; it does not increase fresh-source, current-participant or recurrence counts."
         "\nFinalized-show sources report recorded public operations in a completed show. Their date and timeline control the tense; they never establish that a show is live now. Chat, a Moment, a Relay and a Journal retelling of the same occurrence are not independent witnesses or additional occurrences. A show record establishes playback only where playback is recorded."
         "\nPublished Ballad reflection records establish only the released song and its approved creative metadata. Discuss the song as a song. Liner notes are creative interpretation, never proof that a person acted, a quoted event happened, or new canon was established. Their release date is distinct from the linked show's date. Drafts and lyrics are not supplied as evidence."
-        "\nRetrospective Relay reflection records are BNL's accepted interpretations, not additional witnesses. relayPublishedAt/sourceObservedAt dates the Relay publication only. originalSourceDates preserves known origin dates; absent origin dates are unknown, not today. A prior Journal's source window dates its underlying activity; its publication date does not re-date that activity. Never interpret a show's selector lookback as the show's date."
+        "\nAll Relay text, including a newly published Relay in freshSources, is BNL's interpretation rather than an independent witness. A Relay can establish what BNL wrote, not that a proposed discussion, imagined scene or inferred reaction actually happened. relayPublishedAt/sourceObservedAt/observedAt dates the Relay publication only. originalSourceDates preserves known origin dates; absent origin dates are unknown, not today. Prior Journals are also interpretations: their sourceWindowStart/sourceWindowEnd bound the earlier coverage, not the exact time of each event, and their publication date does not re-date that activity. If an older source window is absent, its underlying dates remain unknown. Never interpret a show's selector lookback as the show's date."
         f"{coverage_rule}"
         f"{section_source_rule}"
         f"{quote_rule}"
@@ -5296,8 +5381,9 @@ def _generate_article_with_repairs(
     attempt_observer: Optional[Callable[[dict[str, Any]], None]] = None,
     *,
     max_attempts: Optional[int] = None,
+    generation_guard: Optional[Callable[[], str]] = None,
 ) -> tuple[Optional[dict[str, Any]], str, bool]:
-    """Return the best blocking-clean article without letting polish cancel publication."""
+    """Revise against sources before accepting or retaining a publishable article."""
     def observe(event: dict[str, Any]) -> None:
         if attempt_observer is None:
             return
@@ -5307,13 +5393,27 @@ def _generate_article_with_repairs(
             # Diagnostics must never become a new publication dependency.
             return
 
+    def guard_reason() -> str:
+        if generation_guard is None:
+            return ""
+        try:
+            return str(generation_guard() or "")
+        except Exception:
+            # A failed eligibility read cannot authorize another provider
+            # call or revive a previously reviewed advisory candidate.
+            return "generation_guard_unavailable"
+
     last_reason = ""
     previous_output = ""
     last_repair_details: list[dict[str, Any]] = []
     retained_publishable: Optional[dict[str, Any]] = None
+    source_revision_requested = False
     attempt_limit = JOURNAL_GENERATION_ATTEMPTS if max_attempts is None else max(1, min(int(max_attempts), JOURNAL_GENERATION_ATTEMPTS))
     for attempt in range(attempt_limit):
         attempt_number = attempt + 1
+        invalidation = guard_reason()
+        if invalidation:
+            return None, invalidation, False
         observe({
             "generationAttempt": attempt_number,
             "phase": "started",
@@ -5341,6 +5441,15 @@ def _generate_article_with_repairs(
                 ) if attempt else build_generation_prompt(packet),
             )
         except Exception as exc:
+            invalidation = guard_reason()
+            if invalidation:
+                observe({
+                    "generationAttempt": attempt_number,
+                    "phase": "finished",
+                    "outcome": "source_invalidated",
+                    "reason": invalidation,
+                })
+                return None, invalidation, False
             if retained_publishable is not None:
                 observe({
                     "generationAttempt": attempt_number,
@@ -5358,6 +5467,15 @@ def _generate_article_with_repairs(
                 "reason": reason,
             })
             return None, reason, False
+        invalidation = guard_reason()
+        if invalidation:
+            observe({
+                "generationAttempt": attempt_number,
+                "phase": "finished",
+                "outcome": "source_invalidated",
+                "reason": invalidation,
+            })
+            return None, invalidation, False
         previous_output = raw
         last_repair_details = []
         response_bytes = len(
@@ -5397,6 +5515,24 @@ def _generate_article_with_repairs(
         validation = validate_article(
             article, packet, prior_titles, repair_details=last_repair_details
         )
+        if not source_revision_requested and (
+            not validation or validation in ADVISORY_VALIDATION_REASONS
+        ):
+            # Valid references and public names do not prove the draft's
+            # attribution or event connections. The first acceptable article
+            # remains editable material until the existing generator revises
+            # it against the same packet. This consumes an existing attempt;
+            # exhaustion here must never retain an unreviewed fallback.
+            source_revision_requested = True
+            last_reason = "source_grounded_revision"
+            observe({
+                "generationAttempt": attempt_number,
+                "phase": "finished",
+                "outcome": "source_revision_required",
+                "reason": last_reason,
+                "responseBytes": response_bytes,
+            })
+            continue
         if not validation:
             observe({
                 "generationAttempt": attempt_number,
@@ -5499,11 +5635,20 @@ def generate_and_store_packet_draft(
     attempt_fence: Optional[tuple[str, int]] = None,
     source_hash: str = "",
     attempt_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+    generation_guard: Optional[Callable[[], str]] = None,
 ) -> JournalResult:
     if not packet.get("coverageComplete", True):
         return JournalResult(False, "no_draft", "incomplete_source_window", entry_id=entry_id)
     if not packet.get("safeSources") and not _eligible_reflection_basis(packet):
         return JournalResult(False, "no_draft", "insufficient_grounded_material", entry_id=entry_id)
+    if generation_guard is None and packet.get("sourceArchiveAvailable"):
+        # Reuse the scheduled owner's existing frozen-source checker for
+        # archive-backed manual generation too. Import only after this module
+        # is initialized; no second validator or source owner is introduced.
+        from bnl_journal_automation import _generation_guard_for_packet
+        generation_guard = _generation_guard_for_packet(
+            db_path, guild_id, packet, attempt_fence=attempt_fence,
+        )
     with sqlite3.connect(db_path) as conn:
         prior_titles = _prior_titles(conn, guild_id)
     article, reason, allow_advisory = _generate_article_with_repairs(
@@ -5511,6 +5656,7 @@ def generate_and_store_packet_draft(
         generator,
         prior_titles,
         attempt_observer,
+        generation_guard=generation_guard,
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id=entry_id)
@@ -5558,15 +5704,17 @@ def generate_test_preview(
     now: Optional[str] = None,
     excluded_history_entry_ids: Optional[set[str]] = None,
 ) -> dict[str, Any]:
-    """One in-memory daily-style preview; never create a draft or a run.
+    """One unreviewed in-memory first draft; never create a draft or a run.
 
     Source readers skip schema preparation/backfill and open SQLite read-only.
     The caller's normal provider accounting remains active, but generated prose
-    has no persistence, approval, scheduling, or publication path here.
+    has no persistence, approval, scheduling, or publication path here. This
+    inspection does not run the production source-grounded revision.
     """
     result: dict[str, Any] = {
         "ok": False, "reason": "", "previewVersion": JOURNAL_TEST_PREVIEW_VERSION,
         "editorialVersion": JOURNAL_EDITORIAL_VERSION,
+        "revisionStatus": "not_run",
     }
     try:
         with _read_source_database(db_path) as conn:
@@ -5616,8 +5764,10 @@ def generate_test_preview(
         "ok": True,
         "editorialAdvisory": bool(advisory_reason),
         "publicationCheck": {
-            "ok": not bool(publication_reason),
-            "reason": publication_reason,
+            # Passing deterministic validation does not make this unreviewed
+            # inspection a candidate accepted by the production workflow.
+            "ok": False,
+            "reason": publication_reason or "source_grounded_revision_required",
             # Only structural pointers; no private claims, IDs, or lane refs.
             "locations": [{k: v for k, v in item.items() if k in {"field", "check", "sentenceIndex"}}
                           for item in details],
@@ -5790,12 +5940,17 @@ def regenerate_draft(
     if excluded_history_entry_ids is not None:
         packet_kwargs["excluded_history_entry_ids"] = excluded_history_entry_ids
     packet = build_source_packet(db_path, guild_id, hours, **packet_kwargs)
+    generation_guard = None
+    if packet.get("sourceArchiveAvailable"):
+        from bnl_journal_automation import _generation_guard_for_packet
+        generation_guard = _generation_guard_for_packet(db_path, guild_id, packet)
     with sqlite3.connect(db_path) as conn:
         prior_titles = _prior_titles(conn, guild_id)
     article, reason, allow_advisory = _generate_article_with_repairs(
         packet,
         generator,
         prior_titles,
+        generation_guard=generation_guard,
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id, old_revision)

@@ -409,27 +409,34 @@ class JournalContextLaneTests(unittest.TestCase):
         raw = json.dumps(candidate)
         self.assertGreater(raw.index('"contextUses"'), 6000)
         calls = []
+        corrected = json.loads(raw)
+        corrected["metadata"]["contextUses"] = [{
+            "laneType": "established_broadcast_memory",
+            "laneRefId": memory["laneRefId"],
+            "sectionHeading": candidate["sections"][0]["heading"],
+            "claim": claim,
+            "basisRefIds": [memory["laneRefId"], fresh_ref],
+        }]
 
         def generator(_packet, prompt):
             calls.append(prompt)
             if len(calls) == 1:
                 return raw
             previous = json.loads(prompt.split("Complete previous draft (not evidence):\n", 1)[1])
-            self.assertEqual(candidate, previous)
-            self.assertIn(memory["laneRefId"], prompt.split("Validation targets", 1)[1])
-            previous["metadata"]["contextUses"] = [{
-                "laneType": "established_broadcast_memory",
-                "laneRefId": memory["laneRefId"],
-                "sectionHeading": candidate["sections"][0]["heading"],
-                "claim": claim,
-                "basisRefIds": [memory["laneRefId"], fresh_ref],
-            }]
-            return json.dumps(previous)
+            if len(calls) == 2:
+                self.assertEqual(candidate, previous)
+                self.assertIn(memory["laneRefId"], prompt.split("Validation targets", 1)[1])
+            else:
+                self.assertEqual(3, len(calls))
+                self.assertEqual(corrected, previous)
+                self.assertIn("source_grounded_revision", prompt)
+                self.assertNotIn("Validation targets", prompt)
+            return json.dumps(corrected)
 
         article, reason, advisory = journal._generate_article_with_repairs(packet, generator, [])
         self.assertEqual("", reason)
         self.assertFalse(advisory)
-        self.assertEqual(2, len(calls))
+        self.assertEqual(3, len(calls))
         self.assertEqual(candidate["sections"][0]["body"].strip(), article["sections"][0]["body"])
         self.assertEqual("", journal.validate_article(article, packet, []))
 

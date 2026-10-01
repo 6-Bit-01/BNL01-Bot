@@ -544,6 +544,45 @@ does not enable this canary or any global v2 live gate. See
 for the implemented/enabled/observed distinction and the ordered work that
 still remains.
 
+## Journal source-grounded revision
+
+Journal preparation preserves original speakers, captured room context,
+timestamps in UTC and Pacific time, and explicit addressing to BNL. Room
+references are opaque and scoped to the guild and surface. Missing room or
+reply context remains unknown; nearby remarks do not become replies. Prior
+Journal snippets retain their actual source windows alongside publication
+dates. Original contributions and recorded show events establish activity;
+BNL's Relays and earlier Journals remain interpretation and continuity, not
+independent confirmation of events.
+
+The first blocking-clean generated article is now a draft for source-grounded
+revision, including when only editorial advisories remain. The next call
+receives the exact draft and the same original source packet to check people,
+recipients, chronology, room connections, later clarifications and invented
+specifics while retaining BNL's humor and narrative voice. The existing source
+eligibility and preparation-owner checks run before and after each call;
+withdrawn sources or lost ownership stop generation without a fallback.
+Validation and release-time revalidation still apply. Only a revised candidate can be
+saved; an unreviewed first draft cannot become a fallback. A reviewed candidate
+with only editorial advisories can still survive later polish failure.
+
+The existing four-attempt ceiling is unchanged. Normal successful preparation
+now uses two generation calls instead of usually one, increasing cost and latency within
+the existing spending controls. Structural repairs use the same allowance;
+if the first acceptable draft arrives on the last call, it is withheld because
+revision has no remaining slot. There is no fifth Journal attempt for revision. Preparation
+still starts at 6:30 PM Pacific and 7 PM releases the saved approved payload
+without a new generation call. Existing release, privacy and recovery fences
+remain in charge.
+
+The one-call private Journal inspection still shows an **unreviewed first
+draft**. Its result and private message explicitly distinguish structural
+checks from publication approval; it does not run the revision, publish or
+write community memory. Mocked regression tests prove source preservation and
+the revised-candidate-only flow, not that the model will detect every error.
+Same-model revision is not independent factual verification. Previously
+published entries are not rewritten automatically by this code change.
+
 ## Release baseline
 
 Before merging a runtime change:

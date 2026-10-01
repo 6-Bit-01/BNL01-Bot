@@ -313,7 +313,7 @@ class JournalAutomationTests(unittest.TestCase):
         )
 
         self.assertEqual(("published", "published"), (short_result.status, long_result.status))
-        self.assertEqual(2, len(calls))
+        self.assertEqual(4, len(calls))
         self.assertTrue(
             all(
                 "Write 1-3 sections and 250-500 total words."
@@ -940,7 +940,7 @@ class JournalAutomationTests(unittest.TestCase):
         )
         self.assertEqual("published", first.status)
         self.assertEqual("published", second.status)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertTrue(calls[0]["lowActivityMode"])
         self.assertTrue(calls[0]["reflectionBasis"])
         self.assertTrue(

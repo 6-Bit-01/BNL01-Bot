@@ -10442,9 +10442,10 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
             # Check DM delivery before spending any model budget. Never fall
             # back to posting the article in the invoking channel.
             await message.author.send(
-                f"Preparing one private Journal test from the last {hours} hours. "
+                f"Preparing one private Journal first draft from the last {hours} hours. "
                 "This stays out of publication, saved Journals, and BNL memory. "
-                "Normal model budget applies; there is no automatic rewrite.",
+                "Normal model budget applies; there is no automatic rewrite. "
+                "This inspection does not include the production revision against its sources.",
                 allowed_mentions=mentions,
             )
         except discord.HTTPException:
@@ -10460,7 +10461,12 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
             article = result["article"]
             publication_check = result.get("publicationCheck") or {}
             review_note = ""
-            if publication_check.get("reason"):
+            if publication_check.get("reason") == "source_grounded_revision_required":
+                review_note = (
+                    "This first draft has not been checked and revised against its sources. "
+                    "It is included for inspection, not approved for publication.\n\n"
+                )
+            elif publication_check.get("reason"):
                 locations = list(dict.fromkeys(
                     str(item["field"]) for item in publication_check.get("locations", []) if item.get("field")
                 ))
@@ -10470,7 +10476,7 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
                     + ".\nThe writing is included below for inspection. This test is not approved for publication.\n\n"
                 )
             text = (
-                "**Private Journal test — not saved or published**\n"
+                "**Private Journal first draft — unreviewed, not saved or published**\n"
                 f"Preview version: `{result.get('previewVersion', 'unknown')}`\n"
                 f"Writing version: `{result['editorialVersion']}`\n"
                 f"Window: {result['sourceWindowStart']} to {result['sourceWindowEnd']}\n\n"

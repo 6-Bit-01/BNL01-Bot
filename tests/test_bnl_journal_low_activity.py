@@ -508,7 +508,7 @@ class JournalLowActivityTests(unittest.TestCase):
 
         self.assertEqual("prepared", first.status, first)
         self.assertEqual("prepared", second.status, second)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         with sqlite3.connect(self.db) as conn:
             lifecycle, reason = conn.execute(
                 "SELECT lifecycle_state,reason FROM bnl_journal_automation_runs"

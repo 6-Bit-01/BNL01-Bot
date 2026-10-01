@@ -16,6 +16,8 @@ from bnl_journal import (
     JOURNAL_SITE_REQUEST_BODY_MAX_BYTES,
     SCHEDULED_PREPARED_STATE,
     JournalResult,
+    _attempt_fence_owned,
+    _read_source_database,
     approve_draft,
     build_source_packet_between,
     canonical_payload_hash,
@@ -1599,6 +1601,22 @@ def _frozen_packet_invalidation_reason(
     return ""
 
 
+def _generation_guard_for_packet(
+    db_path: str,
+    guild_id: int,
+    packet: dict[str, Any],
+    *,
+    attempt_fence: Optional[tuple[str, int]] = None,
+) -> Callable[[], str]:
+    """Recheck the existing frozen-source and lease owners between calls."""
+    def guard() -> str:
+        with _read_source_database(db_path) as conn:
+            if not _attempt_fence_owned(conn, attempt_fence):
+                return "preparation_epoch_lost"
+            return _frozen_packet_invalidation_reason(conn, guild_id, packet)
+    return guard
+
+
 def _freeze_or_load_packet(
     db_path: str,
     guild_id: int,
@@ -2500,6 +2518,9 @@ def _prepare_packet(
         revision=revision,
         attempt_fence=(run_id, preparation_epoch),
         source_hash=source_hash,
+        generation_guard=_generation_guard_for_packet(
+            db_path, guild_id, packet, attempt_fence=(run_id, preparation_epoch),
+        ),
         attempt_observer=lambda event: _record_generation_attempt_event(
             db_path,
             run_id,

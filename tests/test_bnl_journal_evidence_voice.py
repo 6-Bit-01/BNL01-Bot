@@ -103,11 +103,11 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertIn("concrete current-window evidence", prompt)
         self.assertIn("Never invent a time, place, object, action", prompt)
         self.assertIn("Use a direct quote only rarely", prompt)
-        self.assertIn("relay stream is the primary chronology and narrative spine", prompt)
-        self.assertIn("Conversation sources are supporting public context", prompt)
-        self.assertIn("do not turn the Journal into a Discord digest", prompt)
+        self.assertIn("original contributions and recorded events establish the chronology", prompt)
+        self.assertIn("Relays can suggest themes", prompt)
+        self.assertNotIn("relay stream is the primary chronology and narrative spine", prompt)
         self.assertIn("Keep the whole daily source window in view", prompt)
-        self.assertIn("Use both relaySources and conversationSources", prompt)
+        self.assertIn("not independent event chronology", prompt)
         self.assertIn("windowSegmentActivity", prompt)
         self.assertNotIn("Do not include direct quotes", prompt)
 
@@ -234,7 +234,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
 
         prompt = journal.build_generation_prompt(packet)
         self.assertIn("SOURCE-RECOVERY EVIDENCE RULE", prompt)
-        self.assertIn("coequal fresh evidence", prompt)
+        self.assertIn("Original contributions and recorded events establish activity", prompt)
         self.assertNotIn(
             "relay stream is the primary chronology and narrative spine",
             prompt,

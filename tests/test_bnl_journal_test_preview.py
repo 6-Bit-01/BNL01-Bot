@@ -91,7 +91,9 @@ class JournalTestPreviewTests(unittest.TestCase):
         for conn in connections:
             conn.close()
         self.assertTrue(result["ok"], result)
-        self.assertEqual({"ok": True, "reason": "", "locations": []}, result["publicationCheck"])
+        self.assertEqual({"ok": False, "reason": "source_grounded_revision_required", "locations": []},
+                         result["publicationCheck"])
+        self.assertEqual("not_run", result["revisionStatus"])
         self.assertEqual(1, len(calls))
         self.assertEqual(before, hashlib.sha256(Path(self.db).read_bytes()).hexdigest())
         self.assertEqual({"title", "excerpt", "sections"}, set(result["article"]))
@@ -113,6 +115,9 @@ class JournalTestPreviewTests(unittest.TestCase):
             generate.assert_called_once()
             if expected:
                 self.assertTrue(result["editorialAdvisory"])
+                self.assertEqual("not_run", result["revisionStatus"])
+                self.assertFalse(result["publicationCheck"]["ok"])
+                self.assertEqual("source_grounded_revision_required", result["publicationCheck"]["reason"])
 
     def test_incomplete_archive_does_not_spend_budget(self):
         with sqlite3.connect(self.db) as conn:
@@ -150,6 +155,7 @@ class JournalTestPreviewTests(unittest.TestCase):
                 self.assertEqual("", result["reason"])
                 self.assertEqual(finding, result["publicationCheck"]["reason"])
                 self.assertFalse(result["publicationCheck"]["ok"])
+                self.assertEqual("not_run", result["revisionStatus"])
                 self.assertIn("fresh rhythm", result["article"]["sections"][0]["body"])
                 if finding == "undeclared_context_use":
                     self.assertIn("excerpt", [item["field"] for item in result["publicationCheck"]["locations"]])
@@ -234,6 +240,8 @@ class JournalTestCommandTests(unittest.IsolatedAsyncioTestCase):
         self.preview = {
             "ok": True, "reason": "", "editorialVersion": journal.JOURNAL_EDITORIAL_VERSION,
             "previewVersion": journal.JOURNAL_TEST_PREVIEW_VERSION,
+            "revisionStatus": "not_run",
+            "publicationCheck": {"ok": False, "reason": "source_grounded_revision_required", "locations": []},
             "sourceWindowStart": "start", "sourceWindowEnd": "end",
             "article": {"title": "Test Preview Title", "excerpt": "Test preview excerpt.",
                         "sections": [{"heading": "Test heading", "body": "Test preview body."}]},
@@ -261,6 +269,10 @@ class JournalTestCommandTests(unittest.IsolatedAsyncioTestCase):
         dm_text = "\n".join(c.args[0] for c in self.message.author.send.call_args_list)
         self.assertIn("Test Preview Title", dm_text)
         self.assertIn("Test preview body.", dm_text)
+        self.assertIn("first draft — unreviewed", dm_text)
+        self.assertIn("not been checked and revised against its sources", dm_text)
+        self.assertIn("not approved for publication", dm_text)
+        self.assertNotIn("Journal test stopped", dm_text)
         self.message.channel.send.assert_not_called()
         self.assertNotIn("Test preview body.", str(self.message.reply.call_args_list))
 

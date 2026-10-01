@@ -96,7 +96,7 @@ class JournalTests(unittest.TestCase):
 
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(res.ok, res.reason)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertIn('Use a direct quote only rarely', calls[0])
         with sqlite3.connect(self.db) as c:
             self.assertEqual(
@@ -122,16 +122,22 @@ class JournalTests(unittest.TestCase):
             if len(calls) == 1:
                 return raw
             previous = json.loads(prompt.split('Complete previous draft (not evidence):\n', 1)[1])
-            self.assertEqual(original, previous)
-            self.assertIn('"field":"excerpt","check":"mention"', prompt)
-            self.assertIn('"field":"sections[0].body","check":"url"', prompt)
+            if len(calls) == 2:
+                self.assertEqual(original, previous)
+                self.assertIn('"field":"excerpt","check":"mention"', prompt)
+                self.assertIn('"field":"sections[0].body","check":"url"', prompt)
+            else:
+                self.assertEqual(3, len(calls))
+                self.assertEqual(json.loads(article_json(_packet)), previous)
+                self.assertIn('source_grounded_revision', prompt)
+                self.assertNotIn('Validation targets', prompt)
             self.assertNotIn('Rewrite it completely', prompt)
             return article_json(_packet)
 
         with self.assertLogs(level='INFO') as captured:
             result = j.generate_and_store_packet_draft(self.db, 1, packet, generator)
         self.assertTrue(result.ok, result.reason)
-        self.assertEqual(2, len(calls))
+        self.assertEqual(3, len(calls))
         logs = '\n'.join(captured.output)
         self.assertIn('journal_repair_requested', logs)
         self.assertIn('targets=excerpt:mention,sections[0].body:url', logs)
@@ -175,8 +181,13 @@ class JournalTests(unittest.TestCase):
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(res.ok, res.reason)
         self.assertEqual(2, len(calls))
-        self.assertIn('overly_clinical_voice', calls[1])
-        self.assertIn('lively, concrete community chronicle', calls[1])
+        self.assertIn('source_grounded_revision', calls[1])
+        previous = json.loads(calls[1].split('Complete previous draft (not evidence):\n', 1)[1])
+        self.assertIn('Records indicate continuous effort across entities.', previous['sections'][0]['body'])
+        with sqlite3.connect(self.db) as conn:
+            title, sections = conn.execute("SELECT title,sections_json FROM bnl_journal_entries").fetchone()
+        self.assertEqual(title, 'Lively Rewritten Pass')
+        self.assertNotIn('Records indicate', sections)
 
     def test_editorial_polish_cannot_cancel_a_blocking_clean_entry(self):
         calls = []
@@ -205,7 +216,7 @@ class JournalTests(unittest.TestCase):
 
         def gen(packet, prompt):
             calls.append(prompt)
-            if len(calls) == 1:
+            if len(calls) <= 2:
                 return article_json(
                     packet,
                     title='Retained Safe Candidate',
@@ -215,7 +226,30 @@ class JournalTests(unittest.TestCase):
 
         result = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(result.ok, result.reason)
+        self.assertEqual(3, len(calls))
+        self.assertIn('source_grounded_revision', calls[1])
+        self.assertIn('overly_clinical_voice', calls[2])
+
+    def test_unreviewed_advisory_is_not_stored_after_revision_provider_failure(self):
+        calls = []
+
+        def gen(packet, prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return article_json(
+                    packet, title='Unreviewed Safe Candidate',
+                    leak=' Records indicate continuous effort across entities.',
+                )
+            raise RuntimeError('provider down before source revision')
+
+        result = j.generate_and_store_draft(self.db, 1, 24, gen)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, 'provider_failure')
         self.assertEqual(2, len(calls))
+        self.assertIn('source_grounded_revision', calls[1])
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM bnl_journal_private_metadata").fetchone()[0], 0)
 
     def test_advisory_style_never_hides_a_blocking_context_failure(self):
         def gen(packet, prompt):
@@ -282,7 +316,7 @@ class JournalTests(unittest.TestCase):
 
         result = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(result.ok, result.reason)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertIn('Use a direct quote only rarely', calls[0])
         self.assertNotIn('Do not include direct quotes', calls[0])
 
