@@ -128,6 +128,51 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             policy = routing.policy_for_route("website_relay_event")
         self.assertEqual(policy.max_output_tokens, 4_096)
 
+    def test_ambient_edition_output_headroom_is_scoped_to_initial_and_repair(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            ordinary = routing.policy_for_route("ambient_generation")
+            for route in ("ambient_generation.community_edition", "ambient_generation.community_edition_repair"):
+                with self.subTest(route=route):
+                    policy = routing.policy_for_route(route)
+                    self.assertEqual(policy.max_output_tokens, 8_192)
+                    self.assertEqual(
+                        {key: value for key, value in policy.__dict__.items()
+                         if key != "max_output_tokens"},
+                        {key: value for key, value in ordinary.__dict__.items()
+                         if key != "max_output_tokens"},
+                    )
+            for route in (
+                "ambient_generation",
+                "ambient_generation.conversation_grounding_regeneration",
+                "ambient_generation.community_edition_other",
+                "website_relay_event", "showday_generation", "normal_chat",
+            ):
+                with self.subTest(unchanged_route=route):
+                    self.assertEqual(routing.policy_for_route(route).max_output_tokens, 4_096)
+
+    def test_ambient_edition_preserves_existing_background_override_and_bounds(self):
+        for configured, expected in (
+            ("1536", 1_536), ("12000", 12_000), ("1", 1_024),
+            ("999999", 16_384), ("", 8_192), ("invalid", 8_192),
+        ):
+            with self.subTest(configured=configured), mock.patch.dict(
+                "os.environ", {"BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS": configured},
+                clear=True,
+            ):
+                for route in ("ambient_generation.community_edition", "ambient_generation.community_edition_repair"):
+                    self.assertEqual(routing.policy_for_route(route).max_output_tokens, expected)
+
+    def test_ambient_edition_reserves_full_headroom_once_and_keeps_protected_reserves(self):
+        with mock.patch.dict("os.environ", {"BNL_GEMINI_PROVIDER_RETRIES": "2"}, clear=True):
+            for route in ("ambient_generation.community_edition", "ambient_generation.community_edition_repair"):
+                with self.subTest(route=route):
+                    policy = routing.policy_for_route(route)
+                    self.assertEqual(routing.estimated_generation_reservation("abc", policy), 8_193)
+                    self.assertEqual(routing.single_attempt_reservation("abc", policy), 8_193)
+                    self.assertEqual(policy.provider_retries, 0)
+                    self.assertFalse(policy.allow_fallback)
+                    self.assertEqual(routing.budget_ceiling_for_route(1_350_000, route), 1_000_000)
+
     def test_ballad_allowance_is_reserved_once_without_changing_other_routes(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             for route in ("broadcast_ballad_manual", "broadcast_ballad_background"):

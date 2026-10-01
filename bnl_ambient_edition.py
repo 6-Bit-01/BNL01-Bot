@@ -19,6 +19,7 @@ from bnl_canon_source_contract import render_prompt_canon_block, render_ecosyste
 
 MAX_DESCRIPTION = 3900
 MAX_HEADLINE = 140
+MAX_REFERENCES_PER_PARAGRAPH = 12
 _PERSON = re.compile(r"\[\[person:(discord_user:[1-9][0-9]{0,24})\]\]")
 _REFERENCE_ROLES = {
     "sourceRefs": {"original_contribution", "recorded_event"},
@@ -110,11 +111,16 @@ def build_prompt(context: dict, *, current_time: str, show_context: str,
         "and publications while retaining their individual source authority and dates. Several "
         "BNL retellings of one moment are still one underlying story. Unrelated stories can stand "
         "beside each other without a forced common theme or a generic concluding lesson. "
+        "Connect remarks as one exchange only when their wording or supplied conversation context "
+        "establishes the shared subject or reply. When that link is unclear, leave it unresolved; "
+        "a later recap cannot assign a brief remark its missing meaning. "
         "Recognize both high-engagement exchanges and distinctive quieter contributions; message "
         "volume or familiar names alone should not decide who gets featured. Established lore can "
         "deepen a real community story or inspire your perspective without creating a new event. "
-        "A new Journal, Relay or Ballad is itself news: tell people what you explored or made, who "
-        "is actually featured, and why it might interest them. Refer readers to the work instead "
+        "A new Journal, Relay or Ballad can be worth sharing for what it offers the community: "
+        "tell people what you explored or made, who is actually featured, and why it might interest "
+        "them. Routine observation, logging or readiness language does not become a story merely "
+        "because a Relay contains it. Refer readers to the work instead "
         "of reproducing its narrative as this edition. An invitation or question is welcome when "
         "there is something useful to join or respond to. Let activity determine breadth and length, "
         "without a word, participant or category quota. A quiet window can support a brief edition; "
@@ -135,6 +141,9 @@ def build_prompt(context: dict, *, current_time: str, show_context: str,
         "Your judgments, humor, comparisons and imagined possibilities can grow from all this "
         "material. They do not have to sound like the source prose or wait behind a factual summary. "
         "Keep imagination recognizable as interpretation, not a claim that someone did something. "
+        "Technical, impossible and mechanical language remains welcome as character expression, "
+        "jokes and metaphor. Claims that a real check ran, a service is healthy or an operation "
+        "happened still need supplied evidence. "
         "These support distinctions stay internal; the visible message should read naturally. "
         "Distinguish occurred_at from published_at: newly published writing about an older "
         "show is a new publication about that dated show, not a show that happened in this window. "
@@ -162,7 +171,11 @@ def build_prompt(context: dict, *, current_time: str, show_context: str,
         "different story or a meaningful connection, with your perspective and useful community "
         "details together. Choose an engaging order rather than copying a publication's progression. "
         "Each paragraph identifies its support by role. Empty ref lists "
-        "may be omitted, but each paragraph needs at least one supplied reference.\n"
+        "may be omitted, but each paragraph needs at least one supplied reference and at most "
+        f"{MAX_REFERENCES_PER_PARAGRAPH} references combined across sourceRefs, publicationRefs and contextRefs. "
+        "Select the references that support that paragraph's claims and person bindings; do not "
+        "list every source considered. If a story needs more support, split it into focused "
+        "paragraphs within the existing paragraph and body limits, or narrow its claims.\n"
         'Return JSON only: {"action":"skip"} or {"action":"post",'
         '"paragraphs":[{"text":"...","sourceRefs":[],"publicationRefs":[],"contextRefs":[],"subjectRefs":[]}],"art":null}. '
         'You may add "headline":"..." when useful.\n'
@@ -218,9 +231,14 @@ def parse_response(raw: str, context: dict) -> dict:
                     sourceRoles={ref: evidence_role(items[ref]) for ref in declared})
             refs.extend(declared)
         if (not isinstance(text, str) or len(text.strip()) < 10
-                or not refs or len(refs) > 12
+                or not refs
                 or not isinstance(people, list) or any(not isinstance(ref, str) for ref in people)):
             raise ValueError("edition_missing_or_unknown_source")
+        if len(refs) > MAX_REFERENCES_PER_PARAGRAPH:
+            raise EditionValidationError(
+                "edition_too_many_references", paragraph=paragraph_number,
+                count=len(refs), limit=MAX_REFERENCES_PER_PARAGRAPH,
+                countsByField={field: len(passage.get(field, [])) for field in _REFERENCE_ROLES})
         admitted_subjects = {ref for key in refs for ref in items[key].get("subject_refs", ())}
         tokens = set(_PERSON.findall(text))
         if tokens != set(people) or not tokens.issubset(admitted_subjects):
@@ -278,6 +296,12 @@ def build_repair_prompt(prompt, raw, error):
             "to satisfy a tag. A supplied public name can remain plain text when no binding exists."),
         "edition_source_role_mismatch": "Move each reference to the field matching its supplied evidence role.",
         "edition_missing_or_unknown_source": "Use lists of existing supplied references; every paragraph needs support.",
+        "edition_too_many_references": (
+            f"Keep at most {MAX_REFERENCES_PER_PARAGRAPH} references per paragraph across sourceRefs, "
+            "publicationRefs and contextRefs combined. Keep only claim-relevant supporting references "
+            "and remove redundant ones. Preserve the original support for each attributed person "
+            "and the correct evidence roles. If necessary, narrow the paragraph's claims or separate "
+            "distinct stories within the existing paragraph limit; do not leave claims unsupported."),
         "edition_too_long_with_links": "Shorten the body enough for its source-owned links within 3900 UTF-16 units.",
         "edition_repetitive": "Choose worthwhile material or an angle not already covered by recent editions; otherwise skip.",
         "edition_unsupported_source_authority": "Remove unsupported lookup, authority or operator-causality claims.",
@@ -287,6 +311,7 @@ def build_repair_prompt(prompt, raw, error):
         "reason": reason,
         "instruction": explanations.get(reason, "Return a valid complete edition using the required JSON envelope."),
         "referenceFields": {field: sorted(roles) for field, roles in _REFERENCE_ROLES.items()},
+        "referenceLimitPerParagraph": MAX_REFERENCES_PER_PARAGRAPH,
     }
     if isinstance(error, EditionValidationError):
         feedback["paragraph"] = error.paragraph
@@ -363,7 +388,7 @@ async def generate(bot, guild_id, channel_id, *, source_basis_out=None):
                    "new reporting-window activity:\n" + art.render_art_sources(
                        basis["art_context"]["sources"],
                        art.continuity_for_prompt(basis["art_context"]["continuity"])))
-    route = "ambient_generation"
+    route = "ambient_generation.community_edition"
     for attempt in range(2):
         try:
             raw = await bot.get_gemini_response(
@@ -416,7 +441,7 @@ async def generate(bot, guild_id, channel_id, *, source_basis_out=None):
         except (ValueError, TypeError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, ValueError) else "edition_invalid_structure"
             logging.info("ambient_edition_draft_rejected guild=%s reason=%s", guild_id, reason)
-            route = "ambient_generation.conversation_grounding_regeneration"
+            route = "ambient_generation.community_edition_repair"
             if attempt == 0:
                 prompt = build_repair_prompt(prompt, raw, exc)
     return ""

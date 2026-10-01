@@ -32,6 +32,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(mock.patch.dict(os.environ, {
             "BNL_AMBIENT_COMMUNITY_EDITION_ENABLED": "true",
             "BNL_OWN_ART_ENABLED": "false",
+            "BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS": "",
         }))
         self.stack.enter_context(mock.patch.object(bot, "_ambient_post_locks", {}, create=True))
         self.stack.enter_context(mock.patch.object(bot, "_journal_website_base_url", return_value="https://site.test"))
@@ -134,6 +135,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         captured = []
         async def boundary(contents, route, **kwargs):
             material = self.material(contents)
+            self.assertEqual(bot._generation_config_for_model(bot.GEMINI_MODEL, route).max_output_tokens, 8192)
             captured.append((contents, route, material))
             value = response(material)
             return SimpleNamespace(success=True, text=json.dumps(value))
@@ -192,7 +194,8 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(basis["edition"]["headline"], "A rhythm worth following")
                 provider.assert_awaited_once()
                 contents, route = provider.call_args.args
-                self.assertEqual(route, "ambient_generation")
+                self.assertEqual(route, "ambient_generation.community_edition")
+                self.assertEqual(bot._generation_config_for_model(bot.GEMINI_MODEL, route).max_output_tokens, 8192)
                 self.assertTrue(contents.startswith(bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT))
                 article_context = contents.split("Eligible material:\n", 1)[0]
                 self.assertIn(edition.render_prompt_canon_block(), article_context)
@@ -305,7 +308,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(provider.await_count, 2)
         self.assertEqual([route for _, route in captured], [
-            "ambient_generation", "ambient_generation.conversation_grounding_regeneration"])
+            "ambient_generation.community_edition", "ambient_generation.community_edition_repair"])
         for material, _ in captured:
             self.assertEqual(next(iter(material)), "original_contributions")
             original = next(item for item in material["original_contributions"] if item.get("text") == original_text)
@@ -473,7 +476,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         channel, guild, provider, captured = await self.deliver_representative(response)
         self.assertEqual(provider.await_count, 2)
         self.assertEqual([item[1] for item in captured], [
-            "ambient_generation", "ambient_generation.conversation_grounding_regeneration"])
+            "ambient_generation.community_edition", "ambient_generation.community_edition_repair"])
         repair_prompt = captured[1][0]
         raw_rejected = repair_prompt.split("Rejected draft:\n", 1)[1].split("\nValidation feedback:\n", 1)[0]
         self.assertEqual(json.loads(raw_rejected), drafts[0])

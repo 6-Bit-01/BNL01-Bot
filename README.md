@@ -291,6 +291,9 @@ context remain available with their existing scope. Journal, Relay and Ballad
 prose is explicitly BNL's expression, not another witness to a community event.
 Each paragraph separates original/event references, publication references and
 context references while retaining its own person bindings and owned links.
+The prompt and validator share a maximum of 12 references per paragraph. A
+reference-limit failure reports the paragraph, count and limit so the existing
+repair can narrow claims or split a story while preserving attribution.
 The validator rejects references declared in the wrong role; it does not prove
 that every sentence is semantically supported. Automated checks verify prompt
 assembly and source/delivery boundaries; factual and editorial quality still
@@ -302,6 +305,19 @@ that draft. This does not add another model call, loosen a source/mention fence
 or establish semantic support for its claims. Representative quiet, show,
 publication and mixed-day fixtures exercise selection and delivery; they do
 not substitute for real-source editorial auditions.
+The editorial brief distinguishes an evidenced connection between remarks from
+a connection inferred out of a later retelling. It keeps humor, metaphor and
+fictional perspective available, while real operational claims still require
+evidence. Publications earn coverage through their community interest, without
+padding a quiet edition with routine status language.
+Community-edition generation and its one repair use dedicated Ambient routes
+with an 8,192-token default output allowance, including provider-managed
+thinking. The existing `BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS` override still
+applies when explicitly set. Legacy Ambient and other background routes retain
+their existing defaults. The reservation uses the full route allowance through
+the existing token/dollar guards; there are no provider retries or model fallback
+and no increase to daily/monthly ceilings or protected reserves. This adds room
+to finish the envelope, not a guarantee of completion or editorial accuracy.
 
 Artwork receipt writes use the existing bounded SQLite transaction retries;
 only the local receipt is retried, never image generation or Discord delivery.

@@ -33665,7 +33665,8 @@ async def get_gemini_response(
             # The optional persona rewrite must not obscure its scoped results.
             allow_style_rewrite = False
         structured_ambient_route = ambient_envelope and route in {
-            "ambient_generation", "ambient_generation.conversation_grounding_regeneration"
+            "ambient_generation", "ambient_generation.conversation_grounding_regeneration",
+            "ambient_generation.community_edition", "ambient_generation.community_edition_repair",
         }
         one_call_packet_route = (
             str(route or "") == ORDINARY_CHAT_SINGLE_PACKET_ROUTE

@@ -219,6 +219,92 @@ class EditionExpressionTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "missing_or_unknown_source"):
                         edition.parse_response(json.dumps(candidate), self.context)
 
+    def _paragraph_with_references(self, count):
+        paragraph = copy.deepcopy(self.draft["paragraphs"][0])
+        paragraph["sourceRefs"] = ["conversation:1"]
+        for index in range(count - 3):
+            ref = "conversation:extra-" + str(index)
+            self.context["items"].append({
+                "ref": ref, "kind": "conversation", "label": "Test Contribution",
+                "text": "Another contribution about making a receiver.",
+                "subject_refs": [], "subject_labels": {},
+            })
+            paragraph["sourceRefs"].append(ref)
+        self.context["items"].append({
+            "ref": "moment:reference-limit", "kind": "public_moment",
+            "text": "An earlier discussion explored handmade receivers.", "subject_refs": [],
+        })
+        paragraph["contextRefs"] = ["moment:reference-limit"]
+        return paragraph
+
+    def test_twelve_combined_references_are_accepted_with_attribution_and_owned_link(self):
+        self.assertEqual(edition.MAX_REFERENCES_PER_PARAGRAPH, 12)
+        self.draft["paragraphs"] = [self._paragraph_with_references(12)]
+        result = self.parse()
+        self.assertEqual(len(result["source_refs"]), 12)
+        self.assertEqual(result["subject_refs"], ("discord_user:123",))
+        self.assertIn("https://example.test/journal/entry", result["description"])
+
+    def test_thirteen_combined_references_have_distinct_typed_count_feedback(self):
+        self.draft["paragraphs"].append(self._paragraph_with_references(13))
+        with self.assertRaises(edition.EditionValidationError) as rejected:
+            self.parse()
+        self.assertEqual(str(rejected.exception), "edition_too_many_references")
+        self.assertEqual(rejected.exception.paragraph, 2)
+        self.assertEqual(rejected.exception.details, {
+            "count": 13, "limit": 12,
+            "countsByField": {"sourceRefs": 11, "publicationRefs": 1, "contextRefs": 1},
+        })
+
+    def test_too_many_reference_repair_preserves_draft_and_identifies_bounded_support_change(self):
+        self.draft["paragraphs"] = [self._paragraph_with_references(13)]
+        raw = json.dumps(self.draft)
+        with self.assertRaises(edition.EditionValidationError) as rejected:
+            self.parse()
+        repaired = edition.build_repair_prompt("original eligible context", raw, rejected.exception)
+        encoded_draft, encoded_feedback = repaired.split("Rejected draft:\n", 1)[1].split("\nValidation feedback:\n")
+        self.assertEqual(json.loads(encoded_draft), raw)
+        feedback = json.loads(encoded_feedback)
+        self.assertEqual(feedback["reason"], "edition_too_many_references")
+        self.assertEqual(feedback["paragraph"], 1)
+        self.assertEqual(feedback["details"]["count"], 13)
+        self.assertEqual(feedback["details"]["limit"], 12)
+        self.assertEqual(feedback["referenceLimitPerParagraph"], 12)
+        self.assertIn("12", feedback["instruction"])
+        generic = edition.build_repair_prompt("context", raw, ValueError("edition_missing_or_unknown_source"))
+        self.assertNotEqual(feedback["instruction"], json.loads(generic.split("Validation feedback:\n", 1)[1])["instruction"])
+        self.assertNotIn("NEVER_RENDER_PRIVATE_ROOTS", repaired)
+        # Feedback does not auto-truncate or silently waive the support fence.
+        with self.assertRaisesRegex(edition.EditionValidationError, "too_many_references"):
+            self.parse()
+        self.draft["paragraphs"][0]["sourceRefs"].pop()
+        accepted = self.parse()
+        self.assertEqual(len(accepted["source_refs"]), 12)
+        self.assertEqual(accepted["subject_refs"], ("discord_user:123",))
+
+    def test_unknown_or_misclassified_reference_is_not_disguised_as_excess_count(self):
+        original = self._paragraph_with_references(13)
+        for replacement, reason in (("unknown:1", "edition_missing_or_unknown_source"),
+                                    ("journal:entry", "edition_source_role_mismatch")):
+            with self.subTest(replacement=replacement):
+                paragraph = copy.deepcopy(original)
+                paragraph["sourceRefs"][-1] = replacement
+                self.draft["paragraphs"] = [paragraph]
+                with self.assertRaises(edition.EditionValidationError) as rejected:
+                    self.parse()
+                self.assertEqual(str(rejected.exception), reason)
+                self.assertEqual(rejected.exception.paragraph, 1)
+
+    def test_reference_limit_is_per_paragraph_and_counts_duplicates_explicitly(self):
+        paragraph = self._paragraph_with_references(12)
+        self.draft["paragraphs"] = [paragraph, copy.deepcopy(paragraph)]
+        self.assertEqual(self.parse()["action"], "post")
+        self.draft["paragraphs"][1]["sourceRefs"].append("conversation:1")
+        with self.assertRaisesRegex(edition.EditionValidationError, "too_many_references") as rejected:
+            self.parse()
+        self.assertEqual(rejected.exception.paragraph, 2)
+        self.assertEqual(rejected.exception.details["count"], 13)
+
     def test_missing_evidence_cannot_become_a_fake_quiet_day_story(self):
         with self.assertRaisesRegex(ValueError, "missing_or_unknown_source"):
             edition.parse_response(json.dumps(self.draft), {**self.context, "items": []})
