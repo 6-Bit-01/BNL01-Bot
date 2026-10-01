@@ -104,6 +104,86 @@ class BalladJournalInputsTests(unittest.TestCase):
             self.assertEqual(ballads.select_editorial_publications(conn, 1, snapshot, observed_before=journal_fixture.END), [])
             self.assertEqual(conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 0)
 
+    def test_released_version_carries_only_explicit_publication_card_fields(self):
+        self.catalog[0]["linerNotes"]["mentions"] = "Test Artist and Test Listener"
+        self.catalog[0]["linerNotes"]["privateNotes"] = "PRIVATE_LINER_NOTES"
+        snapshot = ballads.read_publication_catalog()
+        with sqlite3.connect(self.db) as conn:
+            selected = ballads.select_editorial_publications(
+                conn, 1, snapshot, observed_before=journal_fixture.END)
+        self.assertEqual(selected[0]["publication_card"], {
+            "title": "The Chairs Stayed Warm", "show_date": "2026-08-28",
+            "show_title": "Friday Radio", "style": "Chamber soul with dub bass",
+            "about": "A song about the last light", "mentions": "Test Artist and Test Listener",
+            "inspired_by": "An earlier broadcast",
+        })
+        self.assertIn("Published Broadcast Ballad", selected[0]["summary"])
+        for field in ("lyrics", "rawOutput", "options", "palette", "versionId", "url", "inspiration", "privateNotes"):
+            self.assertNotIn(field, selected[0]["publication_card"])
+        self.assertNotIn("PRIVATE_LINER_NOTES", json.dumps(selected))
+
+    def test_publication_card_keeps_catalog_bounds_and_historical_show_date(self):
+        self.catalog[0]["show"]["showDate"] = "2026-08-01"
+        self.catalog[0]["show"]["title"] = "S" * 500
+        self.catalog[0]["linerNotes"].update({key: "N" * 600 for key in ("about", "mentions", "inspiredBy")})
+        packet = self.packet()
+        item = next(s for s in packet["reflectionBasis"] if s["basisKind"] == "published_ballad")
+        card = item["publication_card"]
+        self.assertEqual(set(card), set(ballads.PUBLICATION_CARD_LIMITS))
+        for key, limit in ballads.PUBLICATION_CARD_LIMITS.items():
+            self.assertIsInstance(card[key], str)
+            self.assertLessEqual(len(card[key]), limit)
+        self.assertEqual(card["show_date"], "2026-08-01")
+        self.assertEqual(item["sourceObservedAt"], "2026-08-28T12:00:00Z")
+        self.assertEqual(item["scope"], journal.JOURNAL_REFLECTION_SCOPE)
+        self.assertFalse(any(s["sourceKind"] == "published_ballad" for s in packet["safeSources"]))
+        self.assertEqual(packet["aggregateCounts"]["eligibleConversations"], 0)
+
+    def test_every_card_field_passes_existing_public_identity_projection(self):
+        snapshot = ballads.read_publication_catalog()
+        with sqlite3.connect(self.db) as conn:
+            selected = ballads.select_editorial_publications(
+                conn, 1, snapshot, observed_before=journal_fixture.END)
+        # Exercise every field at the public projection boundary. Real catalog
+        # selection is covered above; a new field cannot bypass name controls.
+        selected[0]["publication_card"] = {
+            key: "Test Member 2 / <@999> / Private Member"
+            for key in ballads.PUBLICATION_CARD_LIMITS
+        }
+        selected[0]["publication_card"]["privateNotes"] = "PRIVATE_CARD_FIELD"
+        with mock.patch.object(ballads, "select_editorial_publications", return_value=selected), \
+             mock.patch.object(journal, "_journal_identity_tokens", return_value=["Test Member 2", "Private Member"]), \
+             mock.patch.dict(os.environ, {"BNL_OWNER_USER_ID": "2"}):
+            packet = self.fixture.packet()
+        card = next(s["publication_card"] for s in packet["reflectionBasis"] if s["basisKind"] == "published_ballad")
+        self.assertEqual(set(card), set(ballads.PUBLICATION_CARD_LIMITS))
+        for value in card.values():
+            self.assertIn("6 Bit", value)
+            self.assertNotIn("Test Member 2", value)
+            self.assertNotIn("Private Member", value)
+            self.assertNotIn("<@", value)
+        self.assertNotIn("PRIVATE_CARD_FIELD", json.dumps(packet))
+
+    def test_card_metadata_change_or_retraction_invalidates_existing_release_basis(self):
+        with sqlite3.connect(self.db) as conn:
+            selected = ballads.select_editorial_publications(
+                conn, 1, ballads.read_publication_catalog(), observed_before=journal_fixture.END)
+        basis = [selected[0]["basis"]]
+        original = copy.deepcopy(self.catalog)
+        for field in ("about", "mentions", "inspiredBy"):
+            with self.subTest(field=field):
+                self.catalog = copy.deepcopy(original)
+                self.catalog[0]["linerNotes"][field] = "Corrected public description"
+                self.assertEqual(ballads.publication_source_failure(basis, ballads.read_publication_catalog()),
+                                 "ballad_publication_changed")
+        self.catalog = copy.deepcopy(original)
+        self.catalog[0]["show"]["title"] = "Corrected historical show title"
+        self.assertEqual(ballads.publication_source_failure(basis, ballads.read_publication_catalog()),
+                         "ballad_publication_changed")
+        self.catalog = []
+        self.assertEqual(ballads.publication_source_failure(basis, ballads.read_publication_catalog()),
+                         "ballad_publication_changed")
+
     def test_unpublished_unknown_version_wrong_guild_and_corrupt_version_are_ineligible(self):
         saved = copy.deepcopy(self.catalog)
         for catalog in ([], [{**saved[0], "version": {**saved[0]["version"], "id": "unknown"}}]):

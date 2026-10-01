@@ -68,26 +68,74 @@ def source_url(value: object) -> str:
 
 def build_prompt(context: dict, *, current_time: str, show_context: str,
                  recent_editions: list, art_available: bool) -> str:
-    from bnl_ambient_edition_sources import evidence_role
+    from bnl_ambient_edition_sources import evidence_role, _utc
 
     # Private source receipts and root bookkeeping must never become model input.
-    groups = {"original_contributions": [], "recorded_events": [], "bnl_expressions": [],
+    groups = {"original_contributions": [], "recorded_events": [],
+              "new_publications": [], "earlier_publications": [], "bnl_interpretations": [],
               "governed_interpretations": [], "established_context": []}
-    group_for_role = dict(zip(
-        ("original_contribution", "recorded_event", "bnl_expression", "governed_interpretation", "established_context"),
-        groups,
-    ))
+    group_for_role = {"original_contribution": "original_contributions",
+                      "recorded_event": "recorded_events",
+                      "governed_interpretation": "governed_interpretations",
+                      "established_context": "established_context"}
     for item in context.get("items", ()):
         role = evidence_role(item)
         rendered = {key: item.get(key) for key in (
             "ref", "kind", "label", "text", "occurred_at", "published_at", "scope", "source_type",
-            "subject_refs", "subject_labels", "publicSpeakerName",
+            "subject_refs", "subject_labels", "publicSpeakerName", "room_ref", "conversation_surface",
             "reported_window_start", "reported_window_end", "contributions",
         ) if item.get(key) is not None}
         rendered["evidence_role"] = role
         if role == "bnl_expression":
-            rendered["expression_text"] = rendered.pop("text", "")
-        groups[group_for_role[role]].append(rendered)
+            # News of a work needs its owned release metadata, not the full
+            # earlier narration that can overwhelm the original contributions.
+            # The complete source and private roots remain in context for
+            # auditing, revalidation and the separate image owner.
+            text = rendered.pop("text", "")
+            recorded_at = rendered.pop("occurred_at", "")
+            rendered["author"] = "BNL-01"
+            if item.get("kind") in {"published_journal", "published_ballad"}:
+                card = item.get("publication_card")
+                rendered["publication_card"] = {
+                    key: value for key, value in (card.items() if isinstance(card, dict) else ())
+                    if key in {"title", "excerpt", "show_date", "show_title", "style", "about", "mentions", "inspired_by"}
+                    and isinstance(value, str)
+                }
+                if isinstance(card, dict) and isinstance(card.get("section_headings"), list):
+                    rendered["publication_card"]["section_headings"] = [
+                        heading for heading in card["section_headings"] if isinstance(heading, str)]
+                if not rendered["publication_card"]:
+                    rendered["publication_card"] = {"title": item.get("label", "")}
+                rendered["has_public_link"] = bool(source_url(item.get("url")))
+                group = "new_publications" if item.get("scope") == "window_publication" else "earlier_publications"
+            else:
+                # A Relay's recording date is not a date for events described
+                # in its interpretation, including procedural/speculative text.
+                rendered["expression_recorded_at"] = recorded_at or item.get("published_at", "")
+                rendered["expression_scope"] = rendered.pop("scope", "")
+                rendered["interpretation_excerpt"] = text[:320]
+                group = "bnl_interpretations"
+        else:
+            group = group_for_role[role]
+        groups[group].append(rendered)
+
+    def chronological(item):
+        stamp = _utc(item.get("occurred_at"))
+        return (stamp is None, stamp, str(item.get("ref", "")))
+
+    groups["original_contributions"].sort(key=chronological)
+    # Describe only the order/gap of retained samples in a known room. Never
+    # turn adjacency, a matching speaker or an unknown room into a reply edge.
+    previous = {}
+    for item in groups["original_contributions"]:
+        room = item.get("room_ref")
+        stamp = _utc(item.get("occurred_at"))
+        if room and stamp:
+            if room in previous:
+                earlier = previous[room]
+                item["previous_sampled_ref_in_room"] = earlier["ref"]
+                item["minutes_since_previous_sample"] = round((stamp - _utc(earlier["occurred_at"])).total_seconds() / 60, 2)
+            previous[room] = item
     return (
         "Create BARCODE's community newspaper for the previous 24 hours, written by you, BNL-01. "
         "Choose the real stories, contributions, exchanges and creations people would care about, "
@@ -111,12 +159,17 @@ def build_prompt(context: dict, *, current_time: str, show_context: str,
         "and publications while retaining their individual source authority and dates. Several "
         "BNL retellings of one moment are still one underlying story. Unrelated stories can stand "
         "beside each other without a forced common theme or a generic concluding lesson. "
-        "Connect remarks as one exchange only when their wording or supplied conversation context "
-        "establishes the shared subject or reply. When that link is unclear, leave it unresolved; "
-        "a later recap cannot assign a brief remark its missing meaning. "
+        "Read original remarks in their recorded order and room. These are sampled messages: "
+        "previous_sampled_ref_in_room is chronology, not a reply target or proof of one exchange. "
+        "An absent room_ref means unknown context, not a shared room. "
+        "A later remark cannot prompt an earlier one. A recipient or response needs support from "
+        "the actual exchange, beyond timing or proximity; when unresolved, keep contributions independent. "
         "Recognize both high-engagement exchanges and distinctive quieter contributions; message "
         "volume or familiar names alone should not decide who gets featured. Established lore can "
         "deepen a real community story or inspire your perspective without creating a new event. "
+        "Consider the new_publications catalog alongside original activity before deciding what "
+        "deserves space. A fresh creative release with something useful to open or discuss can "
+        "offer more than routine greetings or status updates, even when it explores an older show. "
         "A new Journal, Relay or Ballad can be worth sharing for what it offers the community: "
         "tell people what you explored or made, who is actually featured, and why it might interest "
         "them. Routine observation, logging or readiness language does not become a story merely "
@@ -130,11 +183,15 @@ def build_prompt(context: dict, *, current_time: str, show_context: str,
         "- original_contributions establish what people shared, with the supplied speaker and time. "
         "recorded_events establish their recorded show/event details. These belong in sourceRefs. "
         "A described genre, title, submission or attachment does not mean you heard the music.\n"
-        "- bnl_expressions are YOUR earlier writing, lyrics and interpretations. expression_text is "
-        "available for reflecting on, discussing or announcing that work using publicationRefs. "
-        "Its narration and embellishments cannot supply missing event facts or corroborate themselves "
-        "through another BNL retelling. When originals are present, use them for what people actually "
-        "said or did; use your writing for what you made of it.\n"
+        "- new_publications and earlier_publications are YOUR authored works, with compact "
+        "publication_card metadata. Their titles, excerpts, topics, genres, mentions and imagery "
+        "describe the work you published, not additional evidence that its story happened. "
+        "Announce or discuss the work using publicationRefs; has_public_link means readers can "
+        "open its owner-supplied link. Use original contributions for what people said or did.\n"
+        "- bnl_interpretations are YOUR prior thoughts, including Relay continuity. They can "
+        "inform your perspective, but cannot fill an original's missing recipient, chronology or "
+        "event. Their recording time dates the interpretation. Their procedures are not reports "
+        "that an operation happened. Use publicationRefs if discussing these thoughts themselves.\n"
         "- governed_interpretations and established_context belong in contextRefs. Retain their "
         "historical scope and attributed contributions. A Moment's interpretation, an old memory "
         "and a repeated recap do not become additional witnesses to a new event.\n"
@@ -383,11 +440,13 @@ async def generate(bot, guild_id, channel_id, *, source_basis_out=None):
         prompt += ("\nImage-specific creative guidance: the public world context above also "
                    "informs your artistic understanding. No visual reference images or established "
                    "appearances are supplied.\n" + OWN_ART_CREATIVE_GUIDANCE)
-        # Broader creative context remains art-only, not a second news source.
-        prompt += ("\nAdditional creative context for the image only; historical material here is not "
-                   "new reporting-window activity:\n" + art.render_art_sources(
-                       basis["art_context"]["sources"],
-                       art.continuity_for_prompt(basis["art_context"]["continuity"])))
+        # The existing development stage receives the full artistic history
+        # and continuity after the edition chooses its featured roots. Feeding
+        # those narratives into this same text call would undo the compact
+        # publication projection, including the alternate Journal alias.
+        prompt += ("\nPropose an image from this edition's featured references when it adds meaning. "
+                   "Your existing image-development stage will receive the broader creative "
+                   "history and continuity to develop that provisional idea.\n")
     route = "ambient_generation.community_edition"
     for attempt in range(2):
         try:

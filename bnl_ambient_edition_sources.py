@@ -193,6 +193,7 @@ def _fair_reflections(packet, start, end):
 
 def _packet_items(bot, packet, start, end, guild_id):
     originals = {str(s.get("refId")): s for s in packet.get("privateSources", []) if isinstance(s, dict)}
+    original_context = packet.get("_ambient_original_context", {})
     episode_links = _episode_links(bot, packet, guild_id)
     activity = []
     for source in packet.get("safeSources", []):
@@ -203,7 +204,7 @@ def _packet_items(bot, packet, start, end, guild_id):
             continue
         subjects, labels = _subjects(source, originals.get(str(source["refId"]), {}))
         kind = str(source.get("sourceKind") or "community_activity")
-        activity.append({
+        item = {
             "ref": str(source["refId"]), "kind": kind,
             "text": str(source["summary"])[:4000 if kind == "finalized_show" else 1000],
             "label": str(source.get("publicSpeakerName") or source.get("conversationSurface") or kind),
@@ -211,7 +212,13 @@ def _packet_items(bot, packet, start, end, guild_id):
             "subject_refs": subjects, "subject_labels": labels, "scope": "window_activity",
             "participant_alias": str(source.get("participantAlias") or ""),
             "conversation_surface": str(source.get("conversationSurface") or ""),
-        })
+        }
+        # Only the current original-owner fence supplies room identity. A
+        # shared room and nearby time are context, not an inferred reply edge.
+        room_ref = original_context.get(str(source["refId"]), {}).get("room_ref")
+        if room_ref:
+            item["room_ref"] = room_ref
+        activity.append(item)
     items = _fair_activity(activity)
     for source in _fair_reflections(packet, start, end):
         observed = _utc(source.get("sourceObservedAt"))
@@ -228,6 +235,15 @@ def _packet_items(bot, packet, start, end, guild_id):
             "subject_refs": [], "subject_labels": {},
             "scope": "window_publication" if published and observed >= start else "historical_context",
         }
+        room_ref = original_context.get(str(source["refId"]), {}).get("room_ref")
+        if room_ref:
+            item["room_ref"] = room_ref
+        if published:
+            card = _ballad_publication_card(source.get("publication_card"))
+            if card:
+                item["publication_card"] = card
+                if card.get("title"):
+                    item["label"] = card["title"]
         # These are governed public contributions, not private participant keys.
         if kind == "public_moment":
             item["contributions"] = [
@@ -249,6 +265,7 @@ def _root_digests(packet, refs):
 
 def _fence_discord_originals(bot, guild_id, packet, start, end):
     """Captured archive visibility cannot override an original's current controls."""
+    packet = {**packet, "_ambient_original_context": {}}
     originals = [source for source in packet.get("privateSources", [])
                  if source.get("sourceKind") == "conversation" and (
                      source.get("conversationSurface") == "discord"
@@ -307,6 +324,11 @@ def _fence_discord_originals(bot, guild_id, packet, start, end):
             continue
         eligible.add(ref)
         rows.append(row)
+        channel_id = row.get("channel_id")
+        if str(channel_id or "").isdigit() and int(channel_id) > 0:
+            packet["_ambient_original_context"][ref] = {
+                "room_ref": "discord-room:" + _digest([guild_id, int(channel_id)])[:24],
+            }
     bot._remember_ambient_sources(saved, "conversations", rows)
     rejected = {str(source.get("refId")) for source in originals} - eligible
     if not rejected:
@@ -321,6 +343,34 @@ def _fence_discord_originals(bot, guild_id, packet, start, end):
     packet["aggregateCounts"] = {**packet.get("aggregateCounts", {}),
         "eligibleConversations": max(0, int(packet.get("aggregateCounts", {}).get("eligibleConversations", 0)) - rejected_fresh)}
     return packet, saved
+
+
+def _card_text(value, limit):
+    return value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def _ballad_publication_card(value):
+    """Copy structured fields already sanitized by the publication owner."""
+    if not isinstance(value, dict):
+        return {}
+    from bnl_broadcast_ballads import PUBLICATION_CARD_LIMITS
+    return {key: text for key, limit in PUBLICATION_CARD_LIMITS.items()
+            if (text := _card_text(value.get(key), limit))}
+
+
+def _journal_publication_card(publication):
+    try:
+        sections = json.loads(publication.sections_json)
+    except (ValueError, TypeError, AttributeError):
+        sections = []
+    if not isinstance(sections, list):
+        sections = []
+    return {
+        "title": _card_text(getattr(publication, "title", ""), 240),
+        "excerpt": _card_text(getattr(publication, "excerpt", ""), 800),
+        "section_headings": [heading for section in sections[:8] if isinstance(section, dict)
+                             and (heading := _card_text(section.get("heading"), 140))],
+    }
 
 
 def _publication_items(bot, guild_id, start, end):
@@ -356,6 +406,7 @@ def _publication_items(bot, guild_id, start, end):
             if kind == "journal":
                 item["reported_window_start"] = publication.source_window_start
                 item["reported_window_end"] = publication.source_window_end
+                item["publication_card"] = _journal_publication_card(publication)
             items.append(item)
             selected.append(ref)
         if selected:

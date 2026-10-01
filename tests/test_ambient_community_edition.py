@@ -112,6 +112,8 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "refId": "reflection:ballad:fixture-1", "basisKind": "published_ballad",
                 "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True, "reuseEligible": True,
                 "summary": "An invented choir of 999 moons sings about the September 9 show and Test Listener.",
+                "publication_card": {"title": "The Moon Choir", "show_date": "2026-09-09",
+                                     "about": "An imagined choir inspired by an earlier show."},
                 "showLink": "https://site.test/radio/archive?view=shows&show=fixture-older-show#broadcast-ballad",
                 "sourceObservedAt": self.stamp(minutes=15), "sourceVersion": "ballad-v1",
             })
@@ -178,12 +180,16 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_provider_wrapper_preserves_rich_envelope_without_voice_rewrite(self):
         self.add_message("WITHHELD_EDITION_MARKER", self.stamp(minutes=4), policy="sealed_test")
+        publication = self.add_publication(body="UNSUPPORTED_JOURNAL_NARRATIVE: Everyone heard an imaginary instrument.")
+        publication.rendered_context = "UNSUPPORTED_JOURNAL_NARRATIVE: Everyone heard an imaginary instrument."
+        publication.journal_control_snapshot = None
         self.archive()
         async def boundary(contents, route, **kwargs):
             return SimpleNamespace(success=True, text=self.response(contents))
         for art_available in (False, True):
             with self.subTest(art_available=art_available), \
                     mock.patch.object(art, "available", return_value=art_available), \
+                    mock.patch("bnl_own_art.journal_art_basis", return_value={"ambient": {"guild_id": 42, "rows": {}}}), \
                     mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
                     mock.patch.object(bot, "check_quota_availability", return_value=True), \
                     mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=boundary)) as provider, \
@@ -202,6 +208,8 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(edition.render_ecosystem_lore_block(include_restricted=False), article_context)
                 self.assertEqual(contents.count(edition.render_prompt_canon_block()), 1)
                 self.assertEqual(contents.count(edition.render_ecosystem_lore_block(include_restricted=False)), 1)
+                self.assertNotIn("UNSUPPORTED_JOURNAL_NARRATIVE", contents)
+                self.assertIn("An earlier discussion revisited.", contents)
                 self.assertNotIn("9 Bit", article_context)
                 self.assertIn("A new rhythm is forming in the room.", contents)
                 for private in ("WITHHELD_EDITION_MARKER", "PRIVATE PAYMENT VALUE", "PRIVATE OPERATOR VALUE",
@@ -209,6 +217,8 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(private, contents)
                 self.assertEqual("art_context" in basis, art_available)
                 if art_available:
+                    self.assertTrue(any("UNSUPPORTED_JOURNAL_NARRATIVE" in source.get("summary", "")
+                                        for source in basis["art_context"]["sources"]))
                     self.assertEqual(basis["art_context"]["basis"]["entryKind"], "daily")
                     self.assertTrue(any(ref.startswith("reflection:canon:")
                                         for ref in basis["art_context"]["basis"]["sources"]))
@@ -276,7 +286,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async def boundary(contents, route, **kwargs):
             material = self.material(contents)
             original = next(item for item in material["original_contributions"] if item.get("text") == original_text)
-            journal = next(item for item in material["bnl_expressions"] if item["kind"] == "published_journal")
+            journal = next(item for item in (material["new_publications"] + material["earlier_publications"]) if item["kind"] == "published_journal")
             captured.append((material, route))
             if len(captured) == 1:
                 # A publication ref in the original-fact lane must be rejected
@@ -312,11 +322,13 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for material, _ in captured:
             self.assertEqual(next(iter(material)), "original_contributions")
             original = next(item for item in material["original_contributions"] if item.get("text") == original_text)
-            journal = next(item for item in material["bnl_expressions"] if item["kind"] == "published_journal")
+            journal = next(item for item in (material["new_publications"] + material["earlier_publications"]) if item["kind"] == "published_journal")
             self.assertEqual(original["evidence_role"], "original_contribution")
             self.assertEqual(journal["evidence_role"], "bnl_expression")
             self.assertNotIn("text", journal)
-            self.assertIn(journal_text, journal["expression_text"])
+            self.assertNotIn("expression_text", journal)
+            self.assertEqual(journal["publication_card"]["excerpt"], "An earlier discussion revisited.")
+            self.assertNotIn(journal_text, json.dumps(material))
             self.assertFalse(any(item["ref"] == journal["ref"] for item in material["recorded_events"]))
         channel.send.assert_awaited_once()
         embed = channel.send.call_args.kwargs["embed"]
@@ -347,7 +359,8 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("\n\n", embed.description)
         self.assertIn(selected["subject_labels"][selected["subject_refs"][0]], embed.description)
         self.assertEqual(captured[0][2]["recorded_events"], [])
-        self.assertEqual(captured[0][2]["bnl_expressions"], [])
+        self.assertEqual(captured[0][2]["new_publications"], [])
+        self.assertEqual(captured[0][2]["earlier_publications"], [])
         self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [7], "parse": []})
         guild.fetch_member.assert_awaited_once_with(7)
 
@@ -387,8 +400,8 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.representative_owner_inputs(ballad=True)
         expected = {}
         def response(material):
-            journal = next(item for item in material["bnl_expressions"] if item["kind"] == "published_journal")
-            ballad = next(item for item in material["bnl_expressions"] if item["kind"] == "published_ballad")
+            journal = next(item for item in (material["new_publications"] + material["earlier_publications"]) if item["kind"] == "published_journal")
+            ballad = next(item for item in (material["new_publications"] + material["earlier_publications"]) if item["kind"] == "published_ballad")
             expected.update(journal=journal, ballad=ballad)
             return {"action": "post", "paragraphs": [{
                 "text": "Two new publications revisit earlier material: the Journal follows ceramic receivers, "
@@ -401,7 +414,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0][2]["recorded_events"], [])
         for item in expected.values():
             self.assertEqual(item["evidence_role"], "bnl_expression")
-            self.assertEqual(item["occurred_at"], "")
+            self.assertNotIn("occurred_at", item)
             self.assertEqual(item["scope"], "window_publication")
             self.assertNotIn("text", item)
         self.assertLess(sources._utc(expected["journal"]["reported_window_end"]),
@@ -426,8 +439,8 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             original = next(item for item in material["original_contributions"]
                             if "discord_user:8" in item.get("subject_refs", ()))
             show = next(item for item in material["recorded_events"] if item["kind"] == "finalized_show")
-            journal = next(item for item in material["bnl_expressions"] if item["kind"] == "published_journal")
-            ballad = next(item for item in material["bnl_expressions"] if item["kind"] == "published_ballad")
+            journal = next(item for item in (material["new_publications"] + material["earlier_publications"]) if item["kind"] == "published_journal")
+            ballad = next(item for item in (material["new_publications"] + material["earlier_publications"]) if item["kind"] == "published_ballad")
             moment = next(item for item in material["governed_interpretations"] if item["kind"] == "public_moment")
             expected["refs"] = [item["ref"] for item in (original, show, journal, ballad, moment)]
             return {"action": "post", "paragraphs": [{
@@ -445,7 +458,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("WITHHELD_MIXED_DAY", captured[0][0])
         material = captured[0][2]
         self.assertTrue(all(material[key] for key in (
-            "original_contributions", "recorded_events", "bnl_expressions", "governed_interpretations")))
+            "original_contributions", "recorded_events", "new_publications", "governed_interpretations")))
         description = channel.send.call_args.kwargs["embed"].description
         self.assertEqual(description.count("https://site.test/"), 3)
         self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [8], "parse": []})

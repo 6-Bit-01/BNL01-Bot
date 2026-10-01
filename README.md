@@ -286,9 +286,30 @@ The existing public canon and lore owners supply context whether or not art is
 available. Website information order is not a rule for BNL's speaking order.
 The message has natural paragraphs, an optional title, and no article word
 target. Original contributions and recorded events are presented before BNL's
-authored publications; governed memory, Moment contributions and established
-context remain available with their existing scope. Journal, Relay and Ballad
-prose is explicitly BNL's expression, not another witness to a community event.
+authored publications. Originals are chronological, with opaque room references
+derived from current eligible Discord rows and gaps between retained samples in
+each known room. Different rooms/threads stay distinct; absent context stays
+unknown. A preceding sample is not a reply edge. Historical human-to-human reply
+targets were not captured and are not reconstructed from proximity.
+
+Fresh and earlier publications have separate compact catalogs. Journal cards
+use the published title, excerpt and section headings; Ballad cards use the
+existing verified release title, style, topic/mention notes and covered show
+date. Cards expose link availability while delivery retains the exact owned URL.
+Full publication narratives remain in the selected source/audit basis, but are
+not copied into this Ambient writing prompt, including when artwork is enabled.
+The existing subsequent image-development stage still receives the full artistic
+history and continuity to develop the provisional image; no extra call is added.
+The existing Ballad selector passes
+these additional structured fields through the Journal's public identity
+projection; other consumers retain their prior summaries. No new source read or
+publication owner is introduced.
+
+Relay interpretations are a separate, bounded secondary lane. Their recording
+date is not an event date, and their procedural language does not establish that
+an operation occurred. Governed memory, Moment contributions and established
+context remain available with their existing scope. BNL-authored work remains
+expression rather than another witness to a community event.
 Each paragraph separates original/event references, publication references and
 context references while retaining its own person bindings and owned links.
 The prompt and validator share a maximum of 12 references per paragraph. A
