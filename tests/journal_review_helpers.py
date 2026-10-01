@@ -7,7 +7,7 @@ Production code must never import this module.
 from functools import wraps
 import json
 
-from bnl_journal_attribution import ASSESSMENT_CHECKS, REVIEW_PREFIX
+from bnl_journal_attribution import ASSESSMENT_CHECKS, REVIEW_PREFIX, source_authority
 
 
 def is_source_review(prompt):
@@ -32,7 +32,8 @@ def supported_review(prompt):
         for contribution in source.get("contributions") or [source]:
             if contribution.get("summary"):
                 anchor = {"refId": source["refId"], "quote": contribution["summary"],
-                          "speaker": str(contribution.get("participantAlias") or ""), "use": "speech"}
+                          "speaker": str(contribution.get("participantAlias") or ""),
+                          "use": "speech" if source_authority(source) in {"original", "speech_only"} else "context"}
                 break
         if anchor:
             break
@@ -55,6 +56,21 @@ def rejected_review(prompt, *, issue="The candidate reverses the original attrib
     response["verdict"] = "unsupported"
     target = next(unit for unit in response["units"] if ".body:" in unit["unitId"])
     target["spans"][0].update(verdict="unsupported", evidence=[], issues=[issue])
+    return json.dumps(response)
+
+
+def supported_review_with_anchor(prompt, *, unit_id, source_ref):
+    """Choose one exact evidence dependency, not a semantic support judgment."""
+    response = json.loads(supported_review(prompt))
+    _, evidence = review_inputs(prompt)
+    source = next(source for source in evidence["sources"] if source["refId"] == source_ref)
+    contribution = next(item for item in source.get("contributions") or [source] if item.get("summary"))
+    unit = next(unit for unit in response["units"] if unit["unitId"] == unit_id)
+    unit["spans"][0]["evidence"] = [{
+        "refId": source_ref, "quote": contribution["summary"],
+        "speaker": str(contribution.get("participantAlias") or ""),
+        "use": "speech" if source_authority(source) in {"original", "speech_only"} else "context",
+    }]
     return json.dumps(response)
 
 

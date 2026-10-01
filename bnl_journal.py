@@ -2076,7 +2076,7 @@ def _approved_journal_broadcast_memory(
     identity_tokens = _journal_identity_tokens(conn, guild_id)
     window_end = _parse_context_datetime(source_window_end) or datetime.now(timezone.utc)
     source_terms = {
-        str(source.get("refId")): _topic_terms(str(source.get("summary") or ""))
+        str(source.get("refId")): _context_claim_terms(str(source.get("summary") or ""))
         for source in safe_sources
         if source.get("refId")
     }
@@ -2098,7 +2098,9 @@ def _approved_journal_broadcast_memory(
         summary = sanitize_source_summary(str(cleaned_summary or ""), identity_tokens)
         if not summary:
             continue
-        memory_terms = _topic_terms(summary)
+        # Candidate retrieval may suggest continuity; shared grammar does not
+        # identify a connection, and retrieval never establishes actual reuse.
+        memory_terms = _context_claim_terms(summary)
         matched_refs = sorted(
             ref_id for ref_id, terms in source_terms.items() if len(memory_terms & terms) >= 2
         )
@@ -4508,10 +4510,10 @@ def build_source_packet(
 
 
 def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
+    """Keep continuity references without making past prose a style template."""
     def compact(entry: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
         if not entry:
             return None
-        sections = json.loads(entry.get("sections_json") or "[]") if isinstance(entry.get("sections_json"), str) else []
         return {
             "entryId": entry.get("entry_id"),
             "revision": entry.get("revision"),
@@ -4519,15 +4521,7 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
             "sourceWindowStart": entry.get("source_window_start"),
             "sourceWindowEnd": entry.get("source_window_end"),
             "title": entry.get("title"),
-            "excerpt": entry.get("excerpt"),
-            "sectionSnapshots": [
-                {
-                    "heading": str(section.get("heading", ""))[:80],
-                    "bodyExcerpt": str(section.get("body", ""))[:420],
-                }
-                for section in sections[:3]
-                if isinstance(section, dict)
-            ],
+            "authority": "bnl_interpretation",
         }
     return {
         "previousEntry": compact(history.get("previousEntry")),
@@ -4535,6 +4529,15 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
         "recurringTopicCounts": dict(sorted((history.get("recurringTopicCounts") or {}).items(), key=lambda kv: (-kv[1], kv[0]))[:12]),
         "matchingContinuityNotes": [str(n)[:240] for n in history.get("matchingContinuityNotes", [])[:8]],
     }
+
+
+def _journal_prompt_source(source: dict[str, Any]) -> dict[str, Any]:
+    """One authority label at the existing writer/reviewer read boundary."""
+    projected = dict(source)
+    projected["authority"] = attribution.source_authority(source)
+    if projected["authority"] == "derived_context":
+        projected["sourceRole"] = "bnl_interpretation"
+    return projected
 
 
 def _eligible_reflection_basis(packet: dict[str, Any]) -> list[dict[str, Any]]:
@@ -4575,8 +4578,8 @@ def build_generation_prompt(
     source_recovery = bool(packet.get("sourceRecoveryMode"))
     historical_basis_mode = low_activity or source_recovery
     context_lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
-    safe_sources = packet.get("safeSources", [])[:MAX_PROMPT_SOURCES]
-    reflection_basis = _eligible_reflection_basis(packet)
+    safe_sources = [_journal_prompt_source(source) for source in packet.get("safeSources", [])[:MAX_PROMPT_SOURCES]]
+    reflection_basis = [_journal_prompt_source(source) for source in _eligible_reflection_basis(packet)]
     coverage_contract = packet.get("evidenceCoverageContract")
     if not isinstance(coverage_contract, dict):
         coverage_contract = build_evidence_coverage_contract(
@@ -4592,6 +4595,7 @@ def build_generation_prompt(
         "communityTimeZone": "America/Los_Angeles",
         "creativeReflectionAllowed": bool(packet.get("creativeReflectionAllowed")),
         "freshSources": safe_sources,
+        "exchangeContext": [_journal_prompt_source(source) for source in packet.get("exchangeContext", [])],
         "evidenceCoverageContract": coverage_contract,
         "editorialContract": {
             "version": JOURNAL_EDITORIAL_VERSION,
@@ -4610,7 +4614,6 @@ def build_generation_prompt(
         "weeklyFinalPeriod": packet.get("weeklyFinalPeriodContext"),
         "windowSegmentActivity": packet.get("windowSegmentActivity", []),
         "privateGenerationContextLanes": context_lanes,
-        "exchangeContext": packet.get("exchangeContext", []),
     }
     if source_recovery:
         safe_packet["sourceRecoveryMode"] = True
@@ -4772,30 +4775,32 @@ def build_generation_prompt(
         if packet.get("creativeReflectionAllowed")
         else "Never invent a time, place, object, action, motive, outcome, relationship, dialogue, another person's emotional state, or actual scene decoration absent from the cited evidence. BNL's own feelings, tastes and questions are his present response to the supplied material; they do not need to have appeared in a source message."
     )
+    # Preserve deliberate top-level evidence order while canonicalizing nested
+    # records, so reloading a frozen packet produces the identical retry input.
+    generation_packet_json = "{" + ", ".join(
+        json.dumps(key) + ": " + json.dumps(value, ensure_ascii=False, sort_keys=True)
+        for key, value in safe_packet.items()
+    ) + "}"
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
         "\nWrite 1-3 sections. Around 250-500 words is ordinary guidance; take more room when supported detail and developed reflection need it, without padding. Choose the shape and length for this entry. Do not trade away concrete detail to squeeze reflection into a recap."
         "\nJOURNAL EDITORIAL OVERRIDE: This is BNL's introspective personal Journal, grounded in the community's actual day. Let the reader experience what stays with him and why, alongside what happened. His reflective viewpoint takes priority over his general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
         f"{beats_rule}"
-        "\nSpeak as the established BARCODE Network intelligence: involved, observant, dryly funny, curious and capable of attachment or friction. Keep the public personality supplied above. Archiving is one of his functions, not the limit of his identity or a required narrative pose. Do not replace his attitude with generic warmth, a community moral, or generic neon-static cyberpunk."
-        "\nFreely vary and combine scene reporting, named-canon color, dry archive notes, recognizable community detail, callbacks, restrained glitches, self-revision, and—only when qualified—the rumor desk. Do not reuse a stock cadence, signature line, or joke merely because an older entry used it."
-        "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
-        "\nFind an opening in a particular thought, tension, person, action, object or moment this evidence gives BNL. Ground the thought in recognizable detail as it develops. Do not default to a report introduction such as The Network observes or Records indicate."
-        "\nWrite with BNL's own point of view throughout: what caught his attention, amused or unsettled him, changed his mind, drew him closer, or left a question he is still carrying. Choose the responses this material actually invites; do not force every emotion or a standard emotional arc. Weave reflection among the concrete events rather than appending a sentimental paragraph. No quota of first-person pronouns, stock confession, fixed paragraph formula or mandatory affectionate closing. Do not substitute a description of BNL's duties for introspection."
-        "\nPersonal reflection is expected in ordinary, busy, weekly, source-recovery and quiet entries. It does not depend on an optional context lane or permission to imagine a scene. BNL may respond to the texture of an idea or compare themes across separate moments without asserting that the people shared an occasion or caused each other's actions. Keep that connection in his point of view. A recurring pattern needs distinct supporting observations; a single contrast can remain an interesting contrast without becoming a community-wide rule. His own amusement, fondness, doubt and personal taste are different from claims about another person's feelings or motives. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
-        "\nPreserve the concrete detail that makes these people and this day recognizable: who contributed what, musical and project specifics, chronology where it matters, the shape of jokes, and later clarifications. Reflection adds meaning to those details; it must not replace them with vague observations about creativity or community. During revision remove repetition and report boilerplate before sacrificing supported detail. Build a coherent entry with readable paragraphs, grounded patterns and room for unresolved thoughts. "
+        "\nLet BNL's thought organize the entry: what does he make of these experiences, and why do they stay with him? Develop that thought through the specific people, music, projects, jokes and later clarifications that prompted it. Preserve who contributed what and chronology where it matters. Reflection must add to that detail, not replace it. A sequence of updates with I noticed or I found this interesting attached is still a report; a description of his duties is not introspection."
+        "\nSpeak as the established BARCODE Network intelligence, with the public personality supplied above: involved, observant, dryly funny, curious and capable of attachment or friction. Use clear, concrete language while allowing his attitude, callbacks, named canon and unresolved questions to give the entry character. There is no required emotional arc, stock community moral, first-person quota, fixed paragraph formula or mandatory affectionate closing. Do not imitate an older entry's cadence or hide ordinary activity behind machine-analysis jargon."
+        "\nThis reflective freedom applies to ordinary, busy, weekly, source-recovery and quiet entries. BNL's own tastes, feelings and questions need no factual inference lane. He can connect themes across separate moments without claiming that the people shared an occasion or caused each other's actions; keep that connection in his viewpoint. A recurring pattern needs distinct supporting observations, while a single contrast can stay a contrast. Claims about another person's feelings or motives remain evidence-bound. Reserve speculation about external facts for a properly declared bnl_inference context use. During revision remove repetition and report boilerplate before sacrificing supported detail. "
         f"{reality_rule}"
         f"{daily_spine_rule}"
         f"{window_rule}"
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
-        "\nHistory is continuity evidence, not a prose template. Check its recent titles, openings, section shapes, and endings before writing; choose a different approach when they repeat. Avoid defaulting to a title listing three topics, two equal recap sections, and a warm moral at the end. These are creative directions, not quotas: do not manufacture events or discard good material to appear different."
+        "\nHistory supplies publication references, recurring topics and continuity notes. It is BNL's earlier interpretation, not a writing example or independent confirmation. The current eligible original records establish what happened; current reflection should develop from those experiences."
         f"{people_rule}"
         "\nKeep each original contribution's roomRef, observedAt and observedAtPacific together. Use America/Los_Angeles for morning, afternoon and day boundaries; UTC midnight is not a new community day. Missing room or reply information is unknown. Sharing a room or appearing nearby in the packet does not prove a reply, cause or shared occasion; different rooms may share a theme without being one conversation. directedToBnl=true identifies a remark addressed to BNL, not everyone present. A speaker is not automatically the recipient or subject."
         "\nA later correction or clarification must remain attached to the earlier account it qualifies. Do not present the first interpretation as settled when the supplied exchange revises or disputes it. Resolve pronouns, objects and recipients only when the original context supports that resolution; otherwise use a faithful narrower description. Source-role and context fields are private writing aids, never public vocabulary."
         "\nOptional exchangeContext records establish only what BNL actually said and when, not whether his description of a person was true. They add no fresh-source or participant breadth and are not section citations. If the relevant BNL reply is absent, its wording, reaction and timing are unknown; do not reconstruct them from his persona or from another person's interpretation."
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
-        "\nPublic Moment reflection records preserve earlier exchanges and each original participant's contribution. Use their source dates, preserve banter, uncertainty and unanswered questions, and paraphrase rather than inventing quotations. A matching topic never makes today's speaker a participant in an earlier exchange. Cite the reflection ref when using it; it does not increase fresh-source, current-participant or recurrence counts."
+        "\nUse source authority consistently: original records establish recorded speech/actions; speech_only establishes BNL's actual utterance without endorsing it; derived_context is a prior interpretation. Public Moments and their participant contributions are generated summaries, not original human quotations or independent proof. They can suggest a connection to investigate in the original records. Keep a participant's allegation distinct from another participant's later explanation; neither repetition nor a summary's confident wording settles the disagreement. Cite a Moment when reflecting on that interpretation, preserve its date, and never count it as another occurrence or witness."
         "\nFinalized-show sources report recorded public operations in a completed show. Their date and timeline control the tense; they never establish that a show is live now. Chat, a Moment, a Relay and a Journal retelling of the same occurrence are not independent witnesses or additional occurrences. A show record establishes playback only where playback is recorded."
         "\nPublished Ballad reflection records establish only the released song and its approved creative metadata. Discuss the song as a song. Liner notes are creative interpretation, never proof that a person acted, a quoted event happened, or new canon was established. Their release date is distinct from the linked show's date. Drafts and lyrics are not supplied as evidence."
         "\nAll Relay text, including a newly published Relay in freshSources, is BNL's interpretation rather than an independent witness. A Relay can establish what BNL wrote, not that a proposed discussion, imagined scene or inferred reaction actually happened. relayPublishedAt/sourceObservedAt/observedAt dates the Relay publication only. originalSourceDates preserves known origin dates; absent origin dates are unknown, not today. Prior Journals are also interpretations: their sourceWindowStart/sourceWindowEnd bound the earlier coverage, not the exact time of each event, and their publication date does not re-date that activity. If an older source window is absent, its underlying dates remain unknown. Never interpret a show's selector lookback as the show's date."
@@ -4804,7 +4809,7 @@ def build_generation_prompt(
         f"{quote_rule}"
         "\nDo not include URLs, Discord pings, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms. Public names do not authorize private details."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
-        f"{cadence_rule}{context_rule}{reflection_rule}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
+        f"{cadence_rule}{context_rule}{reflection_rule}\nGeneration-safe packet:\n{generation_packet_json}"
         f"{repair}"
     )
 
@@ -5278,32 +5283,24 @@ def validate_article(
         (None, "excerpt", str(article.get("excerpt") or "")),
         *[(heading, body_fields[heading], text) for heading, text in section_text.items()],
     ]
+    # Undeclared historical use is determined by the source anchors in the
+    # mandatory review, not by words that happen to occur in another memory.
+    # Explicit inference/rumor framing and declaration integrity stay local.
     for lane_ref, lane_contract in context_contract.items():
-        claim_terms = set(lane_contract.get("claimTerms") or set())
-        distinctive_terms = set(lane_contract.get("distinctiveClaimTerms") or set())
+        if lane_contract.get("laneType") != "bnl_inference":
+            continue
         for heading, field, location_text in public_locations:
             if heading is not None and (lane_ref, heading) in declared_pairs:
                 continue
             for sentence_index, sentence in enumerate(_context_sentences(location_text)):
-                if lane_contract.get("laneType") == "bnl_inference":
-                    themes = set(lane_contract.get("candidateThemes") or set())
-                    if (
-                        len(themes) >= 2
-                        and _STRONG_INFERENCE_CUE_RE.search(sentence)
-                        and _claim_overlap(themes, sentence) >= 2
-                    ):
-                        undeclared = True
-                        report(field, "undeclared_inference", laneRefId=lane_ref, sentenceIndex=sentence_index)
-                    continue
+                themes = set(lane_contract.get("candidateThemes") or set())
                 if (
-                    len(claim_terms) >= 3
-                    and _claim_overlap(claim_terms, sentence) >= 3
-                ) or (
-                    len(distinctive_terms) >= 2
-                    and _claim_overlap(distinctive_terms, sentence) >= 2
+                    len(themes) >= 2
+                    and _STRONG_INFERENCE_CUE_RE.search(sentence)
+                    and _claim_overlap(themes, sentence) >= 2
                 ):
                     undeclared = True
-                    report(field, "undeclared_lane_overlap", laneRefId=lane_ref, sentenceIndex=sentence_index)
+                    report(field, "undeclared_inference", laneRefId=lane_ref, sentenceIndex=sentence_index)
     if undeclared:
         return "undeclared_context_use"
     norm_title = _norm(article.get("title", ""))
@@ -5635,7 +5632,7 @@ def _source_review_evidence(packet: dict[str, Any]) -> dict[str, Any]:
         str(item.get("observedAtPacific") or item.get("observedAt") or item.get("sourceObservedAt") or ""),
         str(item.get("refId") or ""),
     ))
-    return {"sources": sources, "contextLanes": lanes,
+    return {"sources": [_journal_prompt_source(source) for source in sources], "contextLanes": lanes,
             "sourceWindowStart": packet.get("sourceWindowStart"),
             "sourceWindowEnd": packet.get("sourceWindowEnd"),
             "communityTimeZone": "America/Los_Angeles"}
@@ -5682,6 +5679,11 @@ def _generate_article_with_repairs(
         if invalidation:
             return None, invalidation, False
         reviewing = candidate is not None
+        if attempt and not reviewing and limit - attempt < 2:
+            # A rewrite cannot be released without another review. Preserve an
+            # earlier reviewed candidate or the actual failure instead of
+            # spending the final call on output that must be discarded.
+            return (retained, "", True) if retained else (None, last_reason or "generation_failed", False)
         observe({"generationAttempt": attempt + 1, "phase": "started", "repairReason": last_reason})
         if attempt:
             logging.info("journal_repair_requested version=%s attempt=%s reason=%s targets=%s",
@@ -5711,7 +5713,10 @@ def _generate_article_with_repairs(
         event = {"generationAttempt": attempt + 1, "phase": "finished",
                  "responseBytes": len(str(raw).encode("utf-8", errors="replace"))}
         if reviewing:
-            receipt, reason, targets = attribution.accept_review(raw, candidate, evidence["sources"])
+            receipt, reason, targets = attribution.accept_review(
+                raw, candidate, evidence["sources"],
+                context_contract=_context_lane_ref_contract(packet),
+            )
             if reason:
                 last_reason = reason
                 observe({**event, "outcome": "source_review_rejected", "reason": reason})

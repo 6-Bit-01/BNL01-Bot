@@ -141,12 +141,12 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         self.assertNotIn("retainedPublishable", finished[0])
         self.assertTrue(finished[1]["retainedPublishable"])
 
-    def test_reviewed_advisory_survives_exhausted_malformed_polish(self):
+    def test_reviewed_advisory_survives_malformed_polish_without_unreviewable_last_rewrite(self):
         title = "A Previously Published Title"
         reviewed = self.draft("Test Listener is still working on the chorus.", title=title)
         (article, reason, advisory), generator, _ = self.run_sequence(
             [reviewed, supported_review, "not json", "not json"], prior_titles=[title])
-        self.assertEqual(generator.call_count, 4)
+        self.assertEqual(generator.call_count, 3)
         self.assert_reviewed_candidate(article, reviewed)
         self.assertEqual(reason, "")
         self.assertTrue(advisory)
@@ -191,14 +191,36 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         self.assertEqual(reason, "source_review_invalid")
         self.assertFalse(advisory)
 
-    def test_first_acceptable_draft_in_final_slot_is_withheld(self):
-        for limit, outputs in ((1, [self.draft()]), (4, ["not json"] * 3 + [self.draft()])):
+    def test_unreviewed_draft_is_withheld_and_unreviewable_last_rewrite_is_not_called(self):
+        for limit, outputs, calls, failure in (
+            (1, [self.draft()], 1, "source_grounded_revision"),
+            (4, ["not json"] * 3 + [self.draft()], 3, "malformed_json"),
+        ):
             with self.subTest(limit=limit):
                 (article, reason, advisory), generator, _ = self.run_sequence(outputs, max_attempts=limit)
-                self.assertEqual(generator.call_count, limit)
+                self.assertEqual(generator.call_count, calls)
                 self.assertIsNone(article)
-                self.assertEqual(reason, "source_grounded_revision")
+                self.assertEqual(reason, failure)
                 self.assertFalse(advisory)
+
+    def test_rejected_review_after_structural_retry_does_not_spend_on_unreviewable_rewrite(self):
+        (article, reason, advisory), generator, _ = self.run_sequence(
+            ["not json", self.draft(), rejected_review, self.draft()])
+        self.assertEqual(generator.call_count, 3)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertFalse(advisory)
+
+    def test_source_withdrawal_still_discards_retained_candidate_before_last_slot_stop(self):
+        title = "A Previously Published Title"
+        guard = Mock(side_effect=["", "", "", "", "", "", "privacy_source_ineligible"])
+        (article, reason, advisory), generator, _ = self.run_sequence(
+            [self.draft(title=title), supported_review, "not json"],
+            prior_titles=[title], generation_guard=guard)
+        self.assertEqual(generator.call_count, 3)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "privacy_source_ineligible")
+        self.assertFalse(advisory)
 
     def test_no_source_packet_still_stops_before_generation(self):
         packet = {"safeSources": [], "coverageComplete": True}

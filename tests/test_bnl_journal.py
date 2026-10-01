@@ -79,7 +79,8 @@ class JournalTests(unittest.TestCase):
         def gen(packet, prompt):
             calls.append(prompt); return 'not-json'
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
-        self.assertFalse(res.ok); self.assertEqual(len(calls), j.JOURNAL_GENERATION_ATTEMPTS)
+        self.assertFalse(res.ok); self.assertEqual(len(calls), j.JOURNAL_GENERATION_ATTEMPTS - 1)
+        self.assertEqual(res.reason, 'malformed_json')
         with sqlite3.connect(self.db) as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
 

@@ -1,8 +1,10 @@
 """Memory attribution must identify claim content, not grammar or a date alone."""
 import copy
+import json
 import unittest
 
 import bnl_journal as journal
+from tests.journal_review_helpers import is_source_review, supported_review_with_anchor
 
 
 class JournalContextAttributionTests(unittest.TestCase):
@@ -15,17 +17,21 @@ class JournalContextAttributionTests(unittest.TestCase):
             "safeSources": [
                 {"refId": "fresh:1", "sourceKind": "conversation",
                  "summary": "I watched last week's show quietly while getting used to the room.",
-                 "publicSpeakerName": "Test Listener"},
+                 "publicSpeakerName": "Test Listener", "participantAlias": "participant-listener",
+                 "sourceRole": "original_contribution"},
                 {"refId": "fresh:2", "sourceKind": "conversation",
                  "summary": "The fragmented instances are returning.",
-                 "publicSpeakerName": "Test Signal"},
+                 "publicSpeakerName": "Test Signal", "participantAlias": "participant-signal",
+                 "sourceRole": "original_contribution"},
                 {"refId": "fresh:3", "sourceKind": "conversation",
                  "summary": "Do you remember the tangled broadcast cables?",
-                 "publicSpeakerName": "Test Listener"},
+                 "publicSpeakerName": "Test Listener", "participantAlias": "participant-listener",
+                 "sourceRole": "original_contribution"},
             ],
             "privatePublicPeople": [
-                {"publicName": "Test Listener", "sourceRefIds": ["fresh:1", "fresh:3"]},
-                {"publicName": "Test Signal", "sourceRefIds": ["fresh:2"]},
+                {"publicName": "Test Listener", "participantAlias": "participant-listener",
+                 "sourceRefIds": ["fresh:1", "fresh:3"]},
+                {"publicName": "Test Signal", "participantAlias": "participant-signal", "sourceRefIds": ["fresh:2"]},
             ],
             "generationContextLanes": {
                 "establishedBroadcastMemory": [
@@ -48,6 +54,14 @@ class JournalContextAttributionTests(unittest.TestCase):
             "sourceRefIds": {"Room to Listen": ["fresh:1", "fresh:2", "fresh:3"]},
             "metadata": {"contextUses": []},
         }
+
+    def review_with_anchor(self, article, source_ref, *, unit_id="sections[0].body:0", packet=None):
+        packet = self.packet if packet is None else packet
+        evidence = journal._source_review_evidence(packet)
+        prompt = journal.attribution.review_prompt(article, evidence)
+        verdict = supported_review_with_anchor(prompt, unit_id=unit_id, source_ref=source_ref)
+        return journal.attribution.accept_review(
+            verdict, article, evidence["sources"], context_contract=journal._context_lane_ref_contract(packet))
 
     def test_personal_reflection_does_not_borrow_a_memory_through_pronouns_and_grammar(self):
         article = self.article(
@@ -82,15 +96,17 @@ class JournalContextAttributionTests(unittest.TestCase):
     def test_distinctive_historical_fact_still_requires_memory_declaration(self):
         article = self.article(
             "During the earlier show, tangled cables sent a technician scrambling to repair the feed.")
-        details = []
-        self.assertEqual(journal.validate_article(article, self.packet, [], repair_details=details),
-                         "undeclared_context_use")
+        self.assertEqual(journal.validate_article(article, self.packet, []), "")
+        receipt, reason, details = self.review_with_anchor(article, "memory:cables")
+        self.assertIsNone(receipt)
+        self.assertEqual(reason, "source_attribution_failed")
         self.assertTrue(any(item.get("laneRefId") == "memory:cables"
-                            and item.get("check") == "undeclared_lane_overlap" for item in details))
+                            and item.get("check") == "missing_context_declaration" for item in details))
 
     def test_relative_date_does_not_exempt_an_actual_historical_event(self):
         article = self.article("Last week, an imaginary pirate hacked the feed and escaped a prison.")
-        self.assertEqual(journal.validate_article(article, self.packet, []), "undeclared_context_use")
+        self.assertEqual(journal.validate_article(article, self.packet, []), "")
+        self.assertEqual(self.review_with_anchor(article, "memory:transmission")[1], "source_attribution_failed")
 
     def test_correctly_declared_historical_fact_remains_usable(self):
         claim = "During the earlier show, tangled cables sent a technician scrambling to repair the feed."
@@ -101,6 +117,38 @@ class JournalContextAttributionTests(unittest.TestCase):
             "basisRefIds": ["memory:cables", "fresh:3"],
         }]
         self.assertEqual(journal.validate_article(article, self.packet, []), "")
+        self.assertEqual(self.review_with_anchor(article, "memory:cables")[1], "")
+
+    def test_two_incidental_distinctive_words_do_not_spend_a_repair_before_original_review(self):
+        packet = copy.deepcopy(self.packet)
+        fresh = "I am taking time to get used to this room over the coming month."
+        packet["safeSources"][0]["summary"] = fresh
+        packet["generationContextLanes"]["establishedBroadcastMemory"] = [{
+            "laneRefId": "memory:unrelated", "epistemicStatus": "established_network_record",
+            "summary": "The fictional tower became unstable over time.",
+            "matchedFreshSourceRefIds": ["fresh:2"],
+        }]
+        article = self.article(fresh)
+        details = []
+        self.assertEqual(journal.validate_article(article, packet, [], repair_details=details), "")
+        self.assertEqual(details, [])
+        self.assertEqual(self.review_with_anchor(article, "fresh:1", packet=packet)[1], "")
+        calls = []
+        generated = copy.deepcopy(article)
+        for section in generated["sections"]:
+            section["sourceRefIds"] = generated["sourceRefIds"][section["heading"]]
+        del generated["sourceRefIds"]
+
+        def generator(_packet, prompt):
+            calls.append(prompt)
+            return (supported_review_with_anchor(prompt, unit_id="sections[0].body:0", source_ref="fresh:1")
+                    if is_source_review(prompt) else json.dumps(generated))
+
+        accepted, reason, advisory = journal._generate_article_with_repairs(packet, generator, [])
+        self.assertIsNotNone(accepted, reason)
+        self.assertEqual(reason, "")
+        self.assertFalse(advisory)
+        self.assertEqual(len(calls), 2)
 
     def test_explicit_inference_and_rumor_checks_remain_enforced(self):
         for body in (

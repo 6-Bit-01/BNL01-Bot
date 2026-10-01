@@ -1,3 +1,4 @@
+import copy
 import json
 import sqlite3
 import tempfile
@@ -126,7 +127,8 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
                     self.assertTrue(contract["preserveGroundedDetail"])
                     self.assertFalse(contract["fixedSectionTemplate"])
                     self.assertEqual([], contract["requiredBeatsAcrossEntry"])
-                    self.assertEqual(packet["safeSources"], projected["freshSources"])
+                    self.assertEqual([journal._journal_prompt_source(source) for source in packet["safeSources"]],
+                                     projected["freshSources"])
                     self.assertEqual(packet["evidenceCoverageContract"], projected["evidenceCoverageContract"])
                     self.assertEqual(bool(packet.get("creativeReflectionAllowed")),
                                      projected["creativeReflectionAllowed"])
@@ -148,6 +150,44 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
                                     "I am fond of the sketch, but I think the producer released it tonight."):
                     suspect = _article(packet, opening=detail, reaction_text=unsupported)
                     self.assertEqual("undeclared_context_use", journal.validate_article(suspect, packet, []))
+
+    def test_writer_and_reviewer_keep_originals_and_actual_bnl_reply_above_derived_accounts(self):
+        packet = copy.deepcopy(self.packet)
+        packet["safeSources"].append({
+            "refId": "fresh:dispute", "sourceKind": "conversation",
+            "summary": "I think the station joke was meant as an introduction.",
+            "participantAlias": "participant-eeeeeeee", "publicSpeakerName": "Test Host",
+            "roomRef": "room:public", "observedAtPacific": "2026-07-19T15:20:00-07:00",
+        })
+        packet["exchangeContext"] = [{
+            "refId": "exchange:reply", "sourceKind": "conversation", "sourceRole": "bnl_utterance",
+            "summary": "Test Listener, your badge is missing from my imaginary station.",
+            "roomRef": "room:public", "observedAtPacific": "2026-07-19T15:00:00-07:00",
+        }]
+        packet["reflectionBasis"] = [{
+            "refId": "reflection:moment", "basisKind": "public_moment", "sourceKind": "conversation",
+            "sourceRole": "original_contribution", "scope": journal.JOURNAL_REFLECTION_SCOPE,
+            "publicSafe": True, "reuseEligible": True, "sourceVersion": "moment-v1",
+            "summary": "An earlier summary settled the joke as a factual error.",
+            "contributions": [{"participantAlias": "participant-eeeeeeee",
+                               "summary": "Test Host called the story false."}],
+        }]
+        before = copy.deepcopy(packet)
+        prompt = journal.build_generation_prompt(packet)
+        writer, _ = json.JSONDecoder().raw_decode(prompt.split("Generation-safe packet:\n", 1)[1])
+        reviewed = {source["refId"]: source for source in journal._source_review_evidence(packet)["sources"]}
+        supplied = writer["freshSources"] + writer["exchangeContext"] + writer["reflectionBasis"]
+        for source in supplied:
+            self.assertEqual(source, reviewed[source["refId"]])
+        self.assertEqual("original", reviewed["fresh:dispute"]["authority"])
+        self.assertEqual("speech_only", reviewed["exchange:reply"]["authority"])
+        self.assertEqual("derived_context", reviewed["reflection:moment"]["authority"])
+        self.assertEqual("bnl_interpretation", reviewed["reflection:moment"]["sourceRole"])
+        self.assertEqual(packet, before)
+        self.assertEqual(before["safeSources"][-1]["summary"], reviewed["fresh:dispute"]["summary"])
+        self.assertEqual(before["reflectionBasis"][0]["contributions"], reviewed["reflection:moment"]["contributions"])
+        self.assertLess(prompt.index('"freshSources":'), prompt.index('"history":'))
+        self.assertLess(prompt.index('"exchangeContext":'), prompt.index('"reflectionBasis":'))
 
     def test_degraded_relay_window_enters_source_recovery_and_rejects_thin_citations(self):
         source_store.ensure_schema(self.db)
@@ -662,7 +702,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertEqual([], excluded["matchingContinuityNotes"])
         self.assertEqual([], excluded["matchingUnresolvedQuestions"])
 
-    def test_history_prompt_keeps_bounded_public_prose_without_private_questions(self):
+    def test_history_prompt_keeps_continuity_without_prose_examples_or_private_questions(self):
         entry = {
             "entry_id": "journal-old",
             "revision": 2,
@@ -672,15 +712,27 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
                 {"heading": "The Chorus Returned", "body": "A detailed public-safe callback " * 40}
             ]),
             "published_at": "2026-07-10T12:00:00Z",
+            "source_window_start": "2026-07-09T01:30:00Z",
+            "source_window_end": "2026-07-10T01:30:00Z",
         }
         bounded = journal._bounded_history_for_prompt({
             "previousEntry": entry,
             "relevantOlderEntries": [entry],
+            "recurringTopicCounts": {"chorus": 2},
+            "matchingContinuityNotes": ["The unfinished chorus is an earlier thread."],
             "matchingUnresolvedQuestions": ["Will the chorus return in another form?"],
         })
-        snapshot = bounded["previousEntry"]["sectionSnapshots"][0]
-        self.assertEqual("The Chorus Returned", snapshot["heading"])
-        self.assertLessEqual(len(snapshot["bodyExcerpt"]), 420)
+        previous = bounded["previousEntry"]
+        self.assertEqual("journal-old", previous["entryId"])
+        self.assertEqual(2, previous["revision"])
+        self.assertEqual("2026-07-09T01:30:00Z", previous["sourceWindowStart"])
+        self.assertEqual("2026-07-10T01:30:00Z", previous["sourceWindowEnd"])
+        self.assertEqual("bnl_interpretation", previous["authority"])
+        self.assertNotIn("sectionSnapshots", previous)
+        self.assertNotIn("excerpt", previous)
+        self.assertNotIn("A detailed public-safe callback", json.dumps(bounded))
+        self.assertEqual({"chorus": 2}, bounded["recurringTopicCounts"])
+        self.assertEqual(["The unfinished chorus is an earlier thread."], bounded["matchingContinuityNotes"])
         self.assertNotIn("matchingUnresolvedQuestions", bounded)
 
 

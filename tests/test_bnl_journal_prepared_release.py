@@ -1150,7 +1150,7 @@ class PreparedReleaseTests(unittest.TestCase):
 
         result = self.prepare(malformed)
         self.assertEqual("held", result.status, result)
-        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS - 1, len(calls))
         self.assertEqual("malformed_json", result.reason)
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0])

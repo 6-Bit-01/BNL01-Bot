@@ -111,7 +111,8 @@ class JournalAttributionTests(unittest.TestCase):
     def test_public_name_must_bind_to_quoted_contribution_within_the_cited_source(self):
         data = self.verdict()
         anchor = next(u for u in self.spans(data) if u["kind"] == "factual")["evidence"][0]
-        self.sources.append({"refId": "fresh:exchange", "contributions": copy.deepcopy(self.sources[:2])})
+        self.sources.append({"refId": "fresh:exchange", "sourceRole": "original_contribution",
+                             "contributions": copy.deepcopy(self.sources[:2])})
         anchor.update(refId="fresh:exchange", speaker="Test Listener")
         self.assertEqual(self.accept(data)[1], "")
         anchor["speaker"] = "Test Host"
@@ -245,6 +246,118 @@ class JournalAttributionTests(unittest.TestCase):
         self.assertEqual(self.accept(data)[1], "source_review_derived_as_fact")
         target["evidence"][0]["use"] = "speech"
         self.assertEqual(self.accept(data)[1], "")
+
+    def test_derived_contributor_prose_cannot_masquerade_as_original_speech(self):
+        for kind in ("public_moment", "published_journal", "published_ballad", "accepted_relay_continuity"):
+            with self.subTest(kind=kind):
+                self.sources.append({"refId": "reflection:" + kind, "basisKind": kind,
+                                     "contributions": [copy.deepcopy(self.sources[0])]})
+                data = self.verdict()
+                anchor = next(s for s in self.spans(data) if s["kind"] == "factual")["evidence"][0]
+                anchor["refId"] = "reflection:" + kind
+                for use in ("speech", "event"):
+                    anchor["use"] = use
+                    self.assertEqual(self.accept(data)[1], "source_review_derived_as_fact")
+                # It remains available as interpretation/publication context.
+                anchor["use"] = "context"
+                self.assertEqual(self.accept(data)[1], "")
+
+    def test_same_fresh_wording_does_not_imply_use_of_unrelated_memory(self):
+        self.sources.append({"refId": "memory:old", "summary": "The bot invented it during an older unrelated joke.",
+                             "epistemicStatus": "established_network_record"})
+        contract = {"memory:old": {"laneType": "established_broadcast_memory"}}
+        data = self.verdict()
+        self.assertEqual(review.accept_review(json.dumps(data), self.article, self.sources,
+                                             context_contract=contract)[1], "")
+
+    def test_memory_and_rumor_anchor_require_exact_section_and_lane_declaration(self):
+        for lane_type, role in (("established_broadcast_memory", "established_memory"),
+                                ("community_rumor", "rumor")):
+            with self.subTest(lane_type=lane_type):
+                source = {"refId": "lane:test", "summary": "An earlier discussion about the sticker.",
+                          "authority": role}
+                sources = [*self.sources, source]
+                contract = {"lane:test": {"laneType": lane_type}}
+                data = self.verdict()
+                body = next(unit for unit in data["units"] if ".body:" in unit["unitId"])
+                body["spans"][0]["evidence"] = [
+                    {"refId": "lane:test", "quote": source["summary"], "speaker": "", "use": "context"}]
+                self.article["metadata"]["contextUses"] = []
+                receipt, reason, targets = review.accept_review(json.dumps(data), self.article, sources,
+                                                                context_contract=contract)
+                self.assertIsNone(receipt)
+                self.assertEqual(reason, "source_attribution_failed")
+                self.assertEqual(targets[0]["check"], "missing_context_declaration")
+                self.assertEqual(targets[0]["field"], "sections[0].body")
+                self.assertEqual(targets[0]["laneRefId"], "lane:test")
+                self.assertEqual(targets[0]["laneType"], lane_type)
+                declaration = {"laneRefId": "lane:test", "laneType": lane_type,
+                               "sectionHeading": self.article["sections"][0]["heading"]}
+                for key, wrong in (("sectionHeading", "Another Section"), ("laneRefId", "lane:other"),
+                                   ("laneType", "bnl_inference")):
+                    self.article["metadata"]["contextUses"] = [dict(declaration, **{key: wrong})]
+                    self.assertEqual(review.accept_review(json.dumps(data), self.article, sources,
+                                                         context_contract=contract)[1], "source_attribution_failed")
+                self.article["metadata"]["contextUses"] = [declaration]
+                receipt, reason, _ = review.accept_review(json.dumps(data), self.article, sources,
+                                                         context_contract=contract)
+                self.assertEqual(reason, "")
+                self.assertEqual(len(receipt["assessments"]), 4)
+                self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
+
+    def test_title_or_excerpt_cannot_borrow_body_memory_declaration(self):
+        source = {"refId": "memory:earlier", "summary": "An earlier sticker discussion.",
+                  "authority": "established_memory"}
+        contract = {source["refId"]: {"laneType": "established_broadcast_memory"}}
+        self.article["metadata"]["contextUses"] = [{"laneRefId": source["refId"],
+            "laneType": "established_broadcast_memory", "sectionHeading": "Who Said What"}]
+        for field in ("title", "excerpt"):
+            with self.subTest(field=field):
+                data = self.verdict()
+                unit = next(unit for unit in data["units"] if unit["unitId"] == field + ":0")
+                unit["spans"][0]["evidence"] = [
+                    {"refId": source["refId"], "quote": source["summary"], "speaker": "", "use": "context"}]
+                _, reason, targets = review.accept_review(json.dumps(data), self.article, [*self.sources, source],
+                                                          context_contract=contract)
+                self.assertEqual(reason, "source_attribution_failed")
+                self.assertEqual(targets[0]["field"], field)
+
+    def test_source_authority_uses_owner_role_not_confident_derived_wording(self):
+        self.assertEqual(review.source_authority(self.sources[0]), "original")
+        self.assertEqual(review.source_authority(self.sources[2]), "speech_only")
+        self.assertEqual(review.source_authority({"sourceRole": "recorded_event"}), "original")
+        self.assertEqual(review.source_authority({"basisKind": "public_source_history"}), "original")
+        self.assertEqual(review.source_authority({"sourceRole": "approved_canon"}), "canon")
+        self.assertEqual(review.source_authority({"epistemicStatus": "established_network_record"}), "established_memory")
+        self.assertEqual(review.source_authority({"sourceRole": "unconfirmed_rumor"}), "rumor")
+        for source in ({"basisKind": "public_moment", "sourceRole": "original_contribution"},
+                       {"sourceRole": "bnl_interpretation", "authority": "original"},
+                       {"summary": "The truth has been confirmed by all participants."}):
+            self.assertEqual(review.source_authority(source), "derived_context")
+
+    def test_reviewer_receives_primary_records_first_and_only_declared_context_metadata(self):
+        derived = {"refId": "reflection:earlier", "basisKind": "public_moment",
+                   "summary": "The earlier automated description was invented."}
+        evidence = {"sources": [derived, self.sources[2], *self.sources[:2]], "contextLanes": {}}
+        original = copy.deepcopy(evidence)
+        self.article["metadata"]["privateFixture"] = "never project this field"
+        self.article["metadata"]["contextUses"] = [{"laneRefId": "memory:earlier", "laneType": "established_broadcast_memory",
+                                                  "sectionHeading": "Who Said What", "claim": "A declared public claim.",
+                                                  "basisRefIds": ["exchange:original"],
+                                                  "privateFixture": "never project this nested field"}]
+        prompt = review.review_prompt(self.article, evidence)
+        projected, _ = json.JSONDecoder().raw_decode(prompt.split("ORIGINAL_EVIDENCE_JSON: ", 1)[1])
+        self.assertEqual([s["authority"] for s in projected["sources"]],
+                         ["speech_only", "original", "original", "derived_context"])
+        self.assertEqual(evidence, original)
+        declarations, _ = json.JSONDecoder().raw_decode(prompt.split("CANDIDATE_CONTEXT_USES_JSON: ", 1)[1])
+        self.assertEqual(declarations, [{key: value for key, value in self.article["metadata"]["contextUses"][0].items()
+                                        if key != "privateFixture"}])
+        self.assertNotIn("never project this field", prompt)
+        self.assertNotIn("never project this nested field", prompt)
+        for text in ("An allegation cannot erase the utterance", "contributor summaries are still derived prose",
+                     "Shared words or themes", "Fresh evidence can support its own wording"):
+            self.assertIn(text, prompt)
 
     def test_genuine_personal_reflection_does_not_need_invented_external_anchor(self):
         data = self.verdict()

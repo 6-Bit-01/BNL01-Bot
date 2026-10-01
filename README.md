@@ -550,10 +550,15 @@ Journal preparation preserves original speakers, captured room context,
 timestamps in UTC and Pacific time, and explicit addressing to BNL. Room
 references are opaque and scoped to the guild and surface. Missing room or
 reply context remains unknown; nearby remarks do not become replies. Prior
-Journal snippets retain their actual source windows alongside publication
-dates. Original contributions and recorded show events establish activity;
+Journal continuity references retain their actual source windows alongside
+publication dates, recurring topics and continuity notes, without supplying
+whole older paragraphs as writing examples. Original contributions and recorded
+show events establish activity;
 BNL's Relays and earlier Journals remain interpretation and continuity, not
-independent confirmation of events.
+independent confirmation of events. Writer and reviewer use the same source
+authority projection. Generated Moment participant summaries remain derived
+context rather than original human speech. Recorded BNL replies establish what
+BNL said, even when that account is disputed, without proving the account true.
 
 The Journal writer uses BNL's shared public personality and public canon with
 Journal-specific scope. It does not inherit chat-only restrictions on recalling
@@ -586,14 +591,17 @@ Unknown anchors, wrong speaker bindings, incomplete reviews and negative or
 uncertain verdicts cannot release a candidate. BNL-derived speech cannot serve
 as evidence that another person actually did something. A local digest binds
 accepted review to the exact prose, paragraph/section structure, citations and
-context declarations. The
-receipt stays in existing private Journal metadata, outside the public payload.
+context declarations. Accepted memory/rumor anchors must have a matching lane
+declaration in that section; titles and excerpts cannot borrow another section's
+declaration. Shared words alone never prove memory use. Candidate memory retrieval
+filters grammatical terms, while actual source use is checked by the source editor.
+The receipt stays in existing private Journal metadata, outside the public payload.
 This is inspectable model judgment, not a deterministic proof of semantic truth.
 
 The existing four-attempt ceiling is unchanged: write, review, and if necessary
 repair and review again. Both factual and whole-entry editorial findings enter
 that existing repair path; neither adds a model stage or an extra allowance.
-A final-slot rewrite without review is withheld. Only
+If a rewrite cannot fit with its required review, the unused final call is skipped. Only
 an exact reviewed advisory candidate can survive later polish failure. The
 source editor uses the same Journal route and spending controls but does not
 receive the writer's persona; incomplete provider responses cannot pass. A

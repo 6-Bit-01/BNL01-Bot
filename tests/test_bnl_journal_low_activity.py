@@ -450,7 +450,7 @@ class JournalLowActivityTests(unittest.TestCase):
         self.assertEqual("insufficient_grounded_material", result.reason)
         self.assertEqual([], calls)
 
-    def test_blocking_low_activity_output_uses_all_four_repairs_and_no_fallback(self):
+    def test_blocking_low_activity_output_reserves_review_slot_and_has_no_fallback(self):
         packet = self.packet()
         calls = []
 
@@ -469,7 +469,7 @@ class JournalLowActivityTests(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual("current_activity_without_fresh_source", result.reason)
-        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS - 1, len(calls))
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(
                 0,

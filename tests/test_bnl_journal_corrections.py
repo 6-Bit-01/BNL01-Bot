@@ -132,7 +132,8 @@ class JournalCorrectionTests(unittest.TestCase):
         self.assertNotIn("Make a targeted correction", writing_prompt)
         self.assertIn("Reconstruct this historical Journal", writing_prompt)
         projected, _ = json.JSONDecoder().raw_decode(writing_prompt.split("Generation-safe packet:\n", 1)[1])
-        self.assertEqual(projected["freshSources"], result["packet"]["safeSources"])
+        self.assertEqual(projected["freshSources"],
+                         [journal._journal_prompt_source(source) for source in result["packet"]["safeSources"]])
         self.assertEqual((projected["sourceWindowStart"], projected["sourceWindowEnd"]), (START, END))
         self.assertEqual(prompts.call_count, 1)
         self.assertTrue(is_source_review(generator.call_args_list[1].args[1]))

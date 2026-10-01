@@ -81,7 +81,10 @@ class JournalReviewTransportContractTests(unittest.TestCase):
         packet = {"safeSources": [interpretation, later, human], "exchangeContext": [speech]}
         with patch.object(journal, "CANON_FACTS", []):
             evidence = journal._source_review_evidence(packet)
-        self.assertEqual(evidence["sources"], [human, speech, later, interpretation])
+        self.assertEqual(evidence["sources"], [
+            {**human, "authority": "original"}, speech, {**later, "authority": "original"},
+            {**interpretation, "authority": "derived_context"},
+        ])
         self.assertEqual(packet["safeSources"], [interpretation, later, human])
 
 
