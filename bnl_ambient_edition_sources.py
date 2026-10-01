@@ -25,6 +25,34 @@ MAX_REFLECTION_ITEMS = 8
 MAX_ITEMS = 64
 
 
+def evidence_role(item):
+    """Classify owner-projected source kinds, never a model's authority claim.
+
+    A contribution establishes what someone expressed, not independent proof
+    of every claim in it. A BNL publication establishes what BNL published.
+    Neither storage nor a current-window label upgrades derived narration.
+    """
+    kind = str(item.get("kind") or "")
+    if kind in {"journal", "published_journal", "relay", "published_relay",
+                "website_relay", "published_ballad", "accepted_relay_continuity"}:
+        return "bnl_expression"
+    if kind in {"conversation", "discord_message", "tiktok_live_chat"}:
+        return "original_contribution"
+    if kind == "public_source_history" and str(item.get("source_type") or "") in {"discord_message", "tiktok_live_chat"}:
+        return "original_contribution"
+    if kind == "finalized_show":
+        return "recorded_event"
+    if kind in {"approved_canon", "established_broadcast_memory"}:
+        return "established_context"
+    return "governed_interpretation"
+
+
+def _with_evidence_roles(items):
+    for item in items:
+        item["evidence_role"] = evidence_role(item)
+    return items
+
+
 def _utc(value):
     if isinstance(value, datetime):
         parsed = value
@@ -156,6 +184,7 @@ def _packet_items(bot, packet, start, end, guild_id):
         published = kind == "published_ballad"
         item = {
             "ref": str(source["refId"]), "kind": kind,
+            "source_type": str(source.get("sourceType") or ""),
             "text": str(source["summary"])[:6000 if published else 1200],
             "label": "Broadcast Ballad" if published else kind.replace("_", " "),
             "url": _owner_url(bot, source.get("showLink")) if published else "",
@@ -171,7 +200,7 @@ def _packet_items(bot, packet, start, end, guild_id):
                 for c in source.get("contributions", [])[:3] if isinstance(c, dict)
             ]
         items.append(item)
-    return items
+    return _with_evidence_roles(items)
 
 
 def _root_digests(packet, refs):
@@ -296,7 +325,7 @@ def _publication_items(bot, guild_id, start, end):
             selected.append(ref)
         if selected:
             bases.append(source_basis)
-    return items, bases
+    return _with_evidence_roles(items), bases
 
 
 def build_context(bot, guild_id, channel_id, *, basis, now=None):

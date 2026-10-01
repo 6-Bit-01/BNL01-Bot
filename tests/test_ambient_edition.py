@@ -26,8 +26,8 @@ class EditionExpressionTests(unittest.TestCase):
             ],
         }
         self.draft = {"action": "post", "headline": "A radio made of clay",
-                      "stories": [{"text": "[[person:discord_user:123]] imagined a clay radio. That deserves a second look.",
-                                   "sourceRefs": ["conversation:1", "journal:entry"],
+                      "paragraphs": [{"text": "[[person:discord_user:123]] imagined a clay radio. That deserves a second look.",
+                                   "sourceRefs": ["conversation:1"], "publicationRefs": ["journal:entry"],
                                    "subjectRefs": ["discord_user:123"]}], "art": None}
 
     def parse(self):
@@ -48,7 +48,7 @@ class EditionExpressionTests(unittest.TestCase):
             with self.subTest(opening=opening):
                 text = (opening + " [[person:discord_user:123]] imagined a clay radio. "
                         "The newly published Journal gives that idea somewhere else to wander.")
-                self.draft["stories"][0]["text"] = text
+                self.draft["paragraphs"][0]["text"] = text
                 result = self.parse()
                 expected = text.replace("[[person:discord_user:123]]", "Test Member")
                 self.assertEqual(result["description"], expected +
@@ -57,8 +57,8 @@ class EditionExpressionTests(unittest.TestCase):
                 self.assertEqual(result["subject_refs"], ("discord_user:123",))
 
     def test_deduplicate_links_across_independent_stories(self):
-        self.draft["stories"].append({"text": "The Journal also considers the texture of sound.",
-                                      "sourceRefs": ["journal:entry"], "subjectRefs": []})
+        self.draft["paragraphs"].append({"text": "The Journal also considers the texture of sound.",
+                                      "publicationRefs": ["journal:entry"], "subjectRefs": []})
         body = self.parse()["description"]
         self.assertEqual(body.count("https://example.test/journal/entry"), 1)
         self.assertIn("\n\nThe Journal", body)
@@ -66,40 +66,107 @@ class EditionExpressionTests(unittest.TestCase):
     def test_unknown_source_and_person_cannot_become_authority(self):
         for key, value in (("sourceRefs", ["journal:invented"]), ("subjectRefs", ["discord_user:456"])):
             with self.subTest(key=key):
-                original = self.draft["stories"][0][key]
-                self.draft["stories"][0][key] = value
+                original = self.draft["paragraphs"][0][key]
+                self.draft["paragraphs"][0][key] = value
                 with self.assertRaises(ValueError):
                     self.parse()
-                self.draft["stories"][0][key] = original
+                self.draft["paragraphs"][0][key] = original
 
     def test_a_person_in_another_story_does_not_authorize_this_story(self):
-        self.draft["stories"][0]["sourceRefs"] = ["journal:entry"]
+        self.draft["paragraphs"][0]["sourceRefs"] = []
         with self.assertRaisesRegex(ValueError, "unbound_subject"):
             self.parse()
 
     def test_notifications_and_invented_urls_are_never_model_authored(self):
         for suffix in (" <@123>", " <@&456>", " @everyone", " @here", " https://evil.test", " www.evil.test"):
             with self.subTest(suffix=suffix):
-                original = self.draft["stories"][0]["text"]
-                self.draft["stories"][0]["text"] += suffix
+                original = self.draft["paragraphs"][0]["text"]
+                self.draft["paragraphs"][0]["text"] += suffix
                 with self.assertRaisesRegex(ValueError, "unowned_link_or_mention"):
                     self.parse()
-                self.draft["stories"][0]["text"] = original
+                self.draft["paragraphs"][0]["text"] = original
 
     def test_long_complete_article_is_not_trimmed_to_legacy_280_chars(self):
-        self.draft["stories"][0]["text"] += " The interesting part was the shared musical idea." * 18
+        self.draft["paragraphs"][0]["text"] += " The interesting part was the shared musical idea." * 18
         result = self.parse()
         self.assertGreater(len(result["description"]), 800)
         self.assertTrue(result["description"].endswith("journal/entry>)"))
 
     def test_platform_limit_includes_source_links_and_utf16(self):
-        self.draft["stories"][0]["text"] += "🎵" * 1900
+        self.draft["paragraphs"][0]["text"] += "🎵" * 1900
         with self.assertRaisesRegex(ValueError, "too_long"):
             self.parse()
 
     def test_skip_and_one_story_are_valid_without_required_categories(self):
         self.assertEqual(edition.parse_response('{"action":"skip"}', self.context), {"action": "skip"})
         self.assertEqual(self.parse()["action"], "post")
+
+    def test_untitled_message_and_publication_only_reflection_keep_natural_prose(self):
+        self.draft.pop("headline")
+        text = "I keep returning to the clay receiver in my Journal. It still has a strange pull."
+        self.draft["paragraphs"] = [{"text": text, "publicationRefs": ["journal:entry"]}]
+        result = self.parse()
+        self.assertEqual(result["headline"], "")
+        self.assertEqual(result["description"], text + "\n[Clay Radio Notes](<https://example.test/journal/entry>)")
+        self.assertEqual(result["subject_refs"], ())
+
+    def test_bnls_own_publications_cannot_be_declared_original_event_support(self):
+        for kind in ("journal", "published_journal", "relay", "published_relay",
+                     "published_ballad", "accepted_relay_continuity"):
+            with self.subTest(kind=kind):
+                self.context["items"][1]["kind"] = kind
+                self.context["items"][1]["evidence_role"] = "original_contribution"
+                self.draft["paragraphs"][0]["sourceRefs"] = ["conversation:1", "journal:entry"]
+                self.draft["paragraphs"][0]["publicationRefs"] = []
+                with self.assertRaisesRegex(ValueError, "source_role_mismatch"):
+                    self.parse()
+
+    def test_original_support_cannot_be_relabelled_as_bnls_expression(self):
+        self.draft["paragraphs"][0]["sourceRefs"] = []
+        self.draft["paragraphs"][0]["publicationRefs"] = ["conversation:1", "journal:entry"]
+        with self.assertRaisesRegex(ValueError, "source_role_mismatch"):
+            self.parse()
+
+    def test_moment_context_retains_attributed_contributions_without_becoming_new_event(self):
+        moment = {"ref": "moment:1", "kind": "public_moment", "scope": "historical_context",
+                  "text": "A past conversation about clay instruments.", "occurred_at": "2026-09-01T12:00:00Z",
+                  "contributions": [{"speaker": "Test Member", "summary": "Proposed a clay receiver."}]}
+        self.context["items"].append(moment)
+        text = "That older clay-instrument conversation still gives me ideas for impossible receivers."
+        self.draft["paragraphs"] = [{"text": text, "contextRefs": ["moment:1"]}]
+        self.assertEqual(self.parse()["description"], text)
+        prompt = edition.build_prompt(self.context, current_time="September 29", show_context="unknown",
+                                      recent_editions=[], art_available=False)
+        material = json.loads(prompt.split("Eligible material:\n")[1].split("\nRecent Ambient editions")[0])
+        retained = material["governed_interpretations"][0]
+        self.assertEqual(retained["contributions"], moment["contributions"])
+        self.assertEqual(retained["occurred_at"], moment["occurred_at"])
+        self.draft["paragraphs"][0] = {"text": text, "sourceRefs": ["moment:1"]}
+        with self.assertRaisesRegex(ValueError, "source_role_mismatch"):
+            self.parse()
+
+    def test_grouped_prompt_retains_sources_but_does_not_promote_finished_publication_prose(self):
+        self.context["items"].reverse()  # Owner selection can place publications first.
+        self.context["items"][0]["text"] = "The room erupted in applause over a fictional acoustic rhythm."
+        prompt = edition.build_prompt(self.context, current_time="September 29", show_context="unknown",
+                                      recent_editions=[], art_available=False)
+        material = json.loads(prompt.split("Eligible material:\n")[1].split("\nRecent Ambient editions")[0])
+        self.assertEqual(next(iter(material)), "original_contributions")
+        self.assertEqual(material["original_contributions"][0]["text"], self.context["items"][1]["text"])
+        publication = material["bnl_expressions"][0]
+        self.assertEqual(publication["expression_text"], self.context["items"][0]["text"])
+        self.assertNotIn("text", publication)
+        self.assertEqual({item["ref"] for group in material.values() for item in group},
+                         {item["ref"] for item in self.context["items"]})
+
+    def test_bad_reference_shapes_and_unknown_publication_context_refs_are_rejected(self):
+        for field in ("sourceRefs", "publicationRefs", "contextRefs"):
+            for refs in (None, "journal:entry", [None], ["unknown:1"]):
+                with self.subTest(field=field, refs=refs):
+                    candidate = copy.deepcopy(self.draft)
+                    candidate["paragraphs"][0][field] = refs
+                    with self.assertRaisesRegex(ValueError, "missing_or_unknown_source"):
+                        edition.parse_response(json.dumps(candidate), self.context)
 
     def test_missing_evidence_cannot_become_a_fake_quiet_day_story(self):
         with self.assertRaisesRegex(ValueError, "missing_or_unknown_source"):

@@ -50,6 +50,7 @@ class EditionSourcesTests(unittest.TestCase):
         self.assertEqual(context["items"][0]["subject_refs"], ["discord_user:123"])
         self.assertEqual(context["items"][0]["subject_labels"], {"discord_user:123": "Test Member"})
         self.assertEqual(context["items"][0]["guild_id"], 7)
+        self.assertEqual(context["items"][0]["evidence_role"], "original_contribution")
         self.assertEqual(context["coverage"]["eligible_conversations"], 1)
         self.assertTrue(edition.revalidate(self.bot, 7, context))
 
@@ -89,6 +90,7 @@ class EditionSourcesTests(unittest.TestCase):
         context = self.context()
         item = context["items"][0]
         self.assertEqual(item["kind"], "published_journal")
+        self.assertEqual(item["evidence_role"], "bnl_expression")
         self.assertEqual(item["occurred_at"], "")
         self.assertEqual(item["reported_window_end"], "2026-09-28T01:00:00Z")
         self.assertEqual(item["url"], "https://site.test/journal/journal_daily_2026-09-28_abcd")
@@ -111,6 +113,7 @@ class EditionSourcesTests(unittest.TestCase):
         context = self.context()
         item = context["items"][-1]
         self.assertEqual(item["scope"], "historical_context")
+        self.assertEqual(item["evidence_role"], "bnl_expression")
         self.assertEqual(item["occurred_at"], "")
         self.assertEqual(item["subject_refs"], [])
         self.assertTrue(item["url"].endswith("show-1#broadcast-ballad"))
@@ -188,6 +191,70 @@ class EditionSourcesTests(unittest.TestCase):
         self.bot.revalidate_ambient_local_sources.return_value = False
         self.assertFalse(edition.revalidate(self.bot, 7, context))
         self.bot.revalidate_ambient_local_sources.assert_called_once_with(7, {"guild_id": 7})
+
+    def test_activity_projection_separates_member_speech_show_operations_and_relay(self):
+        self.packet["safeSources"].extend([
+            {"refId": "show:1", "sourceKind": "finalized_show", "observedAt": STAMP,
+             "summary": "The recorded show included 43 tracks."},
+            {"refId": "relay:1", "sourceKind": "relay", "observedAt": STAMP,
+             "summary": "BNL's published interpretation of the room."},
+        ])
+        context = self.context()
+        by_ref = {item["ref"]: item for item in context["items"]}
+        self.assertEqual(by_ref["fresh:1"]["evidence_role"], "original_contribution")
+        self.assertEqual(by_ref["show:1"]["evidence_role"], "recorded_event")
+        # A current publication timestamp does not grant independent authority.
+        self.assertEqual(by_ref["relay:1"]["scope"], "window_activity")
+        self.assertEqual(by_ref["relay:1"]["evidence_role"], "bnl_expression")
+        self.assertEqual(by_ref["relay:1"]["text"], "BNL's published interpretation of the room.")
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+
+    def test_reflection_projection_preserves_original_history_and_context_roles(self):
+        definitions = (
+            ("public_source_history", "discord_message", "original_contribution"),
+            ("public_source_history", "tiktok_live_chat", "original_contribution"),
+            ("public_source_history", "", "governed_interpretation"),
+            ("public_moment", "", "governed_interpretation"),
+            ("approved_canon", "approved_canon", "established_context"),
+            ("established_broadcast_memory", "broadcast_memory", "established_context"),
+            ("accepted_relay_continuity", "website_relay", "bnl_expression"),
+        )
+        self.packet["reflectionBasis"] = [
+            {"refId": "reflection:" + str(index), "basisKind": kind, "sourceType": source_type,
+             "scope": JOURNAL_REFLECTION_SCOPE, "publicSafe": True, "reuseEligible": True,
+             "summary": "Existing source text " + str(index), "sourceObservedAt": "2026-09-27T20:00:00Z",
+             "sourceVersion": "v1", "contributions": [{"publicSpeakerName": "Test Member", "summary": "An attributed contribution."}]}
+            for index, (kind, source_type, _role) in enumerate(definitions)
+        ]
+        context = self.context()
+        by_ref = {item["ref"]: item for item in context["items"]}
+        for index, (_kind, source_type, role) in enumerate(definitions):
+            item = by_ref["reflection:" + str(index)]
+            self.assertEqual(item["evidence_role"], role)
+            self.assertEqual(item["source_type"], source_type)
+            self.assertEqual(item["text"], "Existing source text " + str(index))
+            self.assertEqual(item["scope"], "historical_context")
+        self.assertEqual(by_ref["reflection:3"]["contributions"], [
+            {"speaker": "Test Member", "summary": "An attributed contribution."}])
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+        self.packet["reflectionBasis"][0]["sourceVersion"] = "withdrawn-root-version"
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
+
+    def test_role_metadata_cannot_upgrade_bnl_output_or_unknown_context(self):
+        for kind in ("journal", "published_journal", "relay", "published_relay", "website_relay",
+                     "published_ballad", "accepted_relay_continuity"):
+            with self.subTest(kind=kind):
+                self.assertEqual(edition.evidence_role({"kind": kind, "scope": "window_activity",
+                    "source_type": "discord_message", "evidence_role": "original_contribution"}), "bnl_expression")
+        for item in ({"kind": "unknown"}, {"kind": "public_source_history"},
+                     {"kind": "public_source_history", "source_type": "website_relay"}):
+            self.assertEqual(edition.evidence_role({**item, "evidence_role": "recorded_event"}), "governed_interpretation")
+
+    def test_projected_role_is_pinned_in_the_same_item_hash(self):
+        context = self.context()
+        self.assertTrue(edition.revalidate(self.bot, 7, context))
+        context["items"][0]["evidence_role"] = "recorded_event"
+        self.assertFalse(edition.revalidate(self.bot, 7, context))
 
 
 class OriginalDiscordFenceTests(unittest.TestCase):

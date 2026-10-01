@@ -52,37 +52,42 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def archive(self):
         backfill_legacy_sources(bot.DB_FILE, 42)
 
-    def response(self, prompt, *args, **kwargs):
+    def material(self, prompt):
         encoded = prompt.split("Eligible material:\n", 1)[1].split("\nRecent Ambient editions", 1)[0]
-        items = json.loads(encoded)
+        return json.loads(encoded)
+
+    def response(self, prompt, *args, **kwargs):
+        items = [item for group in self.material(prompt).values() for item in group]
         selected = next((item for item in items if item["kind"] == "conversation"), None)
         if selected is None:
             return '{"action":"skip"}'
         subject = next(iter(selected.get("subject_refs", ())), None)
         person = "[[person:" + subject + "]]" if subject else "A community member"
-        story = (person + " noticed an unexpected rhythm taking shape. That is worth listening to: "
+        paragraph = (person + " noticed an unexpected rhythm taking shape. That is worth listening to: "
                  "the conversation makes room for an unusual sound without demanding a polished release. "
                  "I like that kind of opening. A small observation can give the next conversation "
                  "somewhere interesting to go, and this one deserves more than a passing glance.")
-        stories = [{"text": story, "sourceRefs": [selected["ref"]],
+        paragraphs = [{"text": paragraph, "sourceRefs": [selected["ref"]],
+                    "publicationRefs": [], "contextRefs": [],
                     "subjectRefs": [subject] if subject else []}]
         journal = next((item for item in items if item["kind"] == "published_journal"), None)
         if journal:
-            stories.append({"text": "A newly published Journal revisits an earlier discussion about ceramic receivers.",
-                            "sourceRefs": [journal["ref"]], "subjectRefs": []})
+            paragraphs.append({"text": "A newly published Journal revisits an earlier discussion about ceramic receivers.",
+                               "sourceRefs": [], "publicationRefs": [journal["ref"]],
+                               "contextRefs": [], "subjectRefs": []})
         return json.dumps({"action": "post", "headline": "A rhythm worth following",
-                           "stories": stories, "art": None})
+                           "paragraphs": paragraphs, "art": None})
 
     def add_message(self, text, when, *, policy="public_home", user_id=8):
         self.execute("INSERT INTO conversations(user_id,user_name,guild_id,channel_id,channel_name,channel_policy,role,content,timestamp) "
                      "VALUES(?,'Another Member',42,100,'barcode-bot',?,'user',?,?)",
                      (user_id, policy, text, when))
 
-    def add_publication(self):
+    def add_publication(self, *, body="Ceramic receivers caught a strange signal."):
         publication = SimpleNamespace(
             entry_id="journal_daily_2026-09-10_fixture", revision=1,
             title="Ceramic Receivers", excerpt="An earlier discussion revisited.",
-            sections_json='[{"heading":"Music","body":"Ceramic receivers caught a strange signal."}]',
+            sections_json=json.dumps([{"heading": "Music", "body": body}]),
             published_at=self.stamp(minutes=10), created_at=self.stamp(minutes=20),
             source_window_start=self.stamp(days=2), source_window_end=self.stamp(days=1))
         basis = SimpleNamespace(publications=(publication,))
@@ -191,6 +196,71 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bot, "_refresh_publication_prompt_source_basis", return_value=(SimpleNamespace(publications=()), True)):
             self.assertFalse(await bot.revalidate_ambient_sources(42, basis, stage="before_send"))
 
+    async def test_real_wrapper_keeps_journal_expression_separate_and_repairs_wrong_role_once(self):
+        original_text = ("My new project is an electronic collaboration about an optimistic future. "
+                         "I have not shared any audio here.")
+        journal_text = "The member's booming acoustic rhythm filled the room while everyone cheered."
+        self.add_message(original_text, self.stamp(minutes=3))
+        self.archive()
+        self.add_publication(body=journal_text)
+        captured = []
+        accepted = {}
+
+        async def boundary(contents, route, **kwargs):
+            material = self.material(contents)
+            original = next(item for item in material["original_contributions"] if item.get("text") == original_text)
+            journal = next(item for item in material["bnl_expressions"] if item["kind"] == "published_journal")
+            captured.append((material, route))
+            if len(captured) == 1:
+                # A publication ref in the original-fact lane must be rejected
+                # before any transport, regardless of its plausible prose.
+                value = {"action": "post", "paragraphs": [{
+                    "text": journal_text, "sourceRefs": [journal["ref"]],
+                    "publicationRefs": [], "contextRefs": [], "subjectRefs": [],
+                }], "art": None}
+            else:
+                subject = original["subject_refs"][0]
+                marker = "[[person:" + subject + "]]"
+                text = ("That is an optimistic future I can get behind. " + marker +
+                        " described an electronic collaboration; the audio itself has not been shared here. "
+                        "My Journal took a different imaginative angle, and it is linked below.")
+                accepted["text"] = text.replace(marker, original["subject_labels"][subject])
+                value = {"action": "post", "paragraphs": [{
+                    "text": text, "sourceRefs": [original["ref"]],
+                    "publicationRefs": [journal["ref"]], "contextRefs": [], "subjectRefs": [subject],
+                }], "art": None}
+            return SimpleNamespace(success=True, text=json.dumps(value))
+
+        channel, _guild, _ = self.scheduler(fetch_effect=lambda user_id: SimpleNamespace(
+            id=user_id, bot=False, guild=SimpleNamespace(id=42)))
+        with mock.patch.object(bot, "get_gemini_response", new=REAL_GET), \
+                mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                mock.patch.object(bot, "_generate_gemini_content_result_async", new=mock.AsyncMock(side_effect=boundary)) as provider, \
+                mock.patch.object(bot, "_generate_gemini_content_with_fallback_async", new=mock.AsyncMock()) as rewrite:
+            await bot.ambient_message_task.coro()
+
+        self.assertEqual(provider.await_count, 2)
+        self.assertEqual([route for _, route in captured], [
+            "ambient_generation", "ambient_generation.conversation_grounding_regeneration"])
+        for material, _ in captured:
+            self.assertEqual(next(iter(material)), "original_contributions")
+            original = next(item for item in material["original_contributions"] if item.get("text") == original_text)
+            journal = next(item for item in material["bnl_expressions"] if item["kind"] == "published_journal")
+            self.assertEqual(original["evidence_role"], "original_contribution")
+            self.assertEqual(journal["evidence_role"], "bnl_expression")
+            self.assertNotIn("text", journal)
+            self.assertIn(journal_text, journal["expression_text"])
+            self.assertFalse(any(item["ref"] == journal["ref"] for item in material["recorded_events"]))
+        channel.send.assert_awaited_once()
+        embed = channel.send.call_args.kwargs["embed"]
+        self.assertNotIn("title", embed.to_dict())
+        self.assertEqual(embed.description, accepted["text"] +
+                         "\n[Ceramic Receivers](<https://site.test/journal/journal_daily_2026-09-10_fixture>)")
+        self.assertNotIn(journal_text, embed.description)
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict(), {"users": [8], "parse": []})
+        self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 1)
+        rewrite.assert_not_awaited()
+
     async def test_withdrawal_during_generation_discards_without_repair(self):
         def withdraw(prompt, *args, **kwargs):
             answer = self.response(prompt)
@@ -268,7 +338,7 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         opening = "That unfinished rhythm has somewhere to go. I am leaving the door open. "
         def reflect(prompt, *args, **kwargs):
             value = json.loads(self.response(prompt))
-            value["stories"][0]["text"] = opening + value["stories"][0]["text"]
+            value["paragraphs"][0]["text"] = opening + value["paragraphs"][0]["text"]
             return json.dumps(value)
         self.provider.side_effect = reflect
         channel, _guild, _ = self.scheduler()
