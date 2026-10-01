@@ -555,13 +555,25 @@ dates. Original contributions and recorded show events establish activity;
 BNL's Relays and earlier Journals remain interpretation and continuity, not
 independent confirmation of events.
 
-The first blocking-clean article requires a source-only editorial review of its
+The Journal writer uses BNL's shared public personality and public canon with
+Journal-specific scope. It does not inherit chat-only restrictions on recalling
+authorized context, restricted lore, or a separate archive-keeper personality.
+The evidence window supplies experiences; BNL's developing thoughts organize
+the entry. Length guidance can expand for meaningful detail and reflection.
+
+The first blocking-clean article requires a source and whole-Journal review of its
 exact final wording. This replaces the former mandatory rewrite; a reviewer
 cannot silently change the article it approves. It receives every public prose
 unit and the eligible original evidence, including related messages and later
 clarifications. The review checks speaker, recipient, uncertainty, actual
 conduct, room, chronology and causal connections while allowing BNL's own
-feelings, faithful paraphrase, humor, canon and metaphor.
+feelings, faithful paraphrase, humor, canon and metaphor. Before checking spans,
+the same review evaluates the complete paragraphs for event relationships,
+speaker stance, sustained Journal perspective, and retention of meaningful
+detail. Separately supported statements must not invent a response, cause or
+shared occasion when connected. A recap with a generic reaction is not proof
+of introspection; no pronoun, emotion or phrase quota substitutes for that
+judgment. All four assessments must be present and supported.
 
 A complete private review must cover every unit, identify supported source
 excerpts and their original speakers, and report unresolved discrepancies.
@@ -573,12 +585,15 @@ locally without weakening original-author or quote checks.
 Unknown anchors, wrong speaker bindings, incomplete reviews and negative or
 uncertain verdicts cannot release a candidate. BNL-derived speech cannot serve
 as evidence that another person actually did something. A local digest binds
-accepted review to the exact prose, citations and context declarations. The
+accepted review to the exact prose, paragraph/section structure, citations and
+context declarations. The
 receipt stays in existing private Journal metadata, outside the public payload.
 This is inspectable model judgment, not a deterministic proof of semantic truth.
 
 The existing four-attempt ceiling is unchanged: write, review, and if necessary
-repair and review again. A final-slot rewrite without review is withheld. Only
+repair and review again. Both factual and whole-entry editorial findings enter
+that existing repair path; neither adds a model stage or an extra allowance.
+A final-slot rewrite without review is withheld. Only
 an exact reviewed advisory candidate can survive later polish failure. The
 source editor uses the same Journal route and spending controls but does not
 receive the writer's persona; incomplete provider responses cannot pass. A

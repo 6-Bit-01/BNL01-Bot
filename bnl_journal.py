@@ -176,6 +176,15 @@ _REPAIR_GUIDANCE = {
         "or its supported detail to evade review. Keep BNL's personal reflection and return the "
         "complete corrected article; a separate source check will review that exact wording."
     ),
+    "journal_editorial_failed": (
+        "The Journal editor found a whole-entry writing or detail-retention problem. "
+        "Use the supplied assessment to revise the actual narrative, not merely add a reaction "
+        "or replace a few report words. Let BNL's particular thoughts and attitude organize the "
+        "entry while retaining the grounded people, music, lore, jokes and clarifications that "
+        "give those thoughts substance. Personal reflection needs no invented community event. "
+        "Keep already-correct factual relationships and return the complete revised article; "
+        "the same editor will review its facts and writing again."
+    ),
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
@@ -4629,7 +4638,7 @@ def build_generation_prompt(
         cadence_rule = (
             "\nThis is a weekly synthesis. Connect patterns across the six supplied Tuesday-Sunday Daily-period contexts, the fresh final Sunday-to-Monday period, and the full current source evidence. A source-only period context is not a hidden Daily article. Do not list period recaps."
             if entry_kind == "weekly"
-            else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
+            else "\nThis personal Journal covers one complete source window. Let what stays with BNL organize the writing; the window supplies its experiences, not a play-by-play outline."
         )
     repair = ""
     if repair_reason == "published_correction":
@@ -4694,13 +4703,13 @@ def build_generation_prompt(
     beats_rule = (
         "\nBuild a personal reflection inspired by verified history, continuity, or canon. Let the material determine its shape. Clearly imagined moments may enrich it; never report them as real activity or imply that an older event happened again during this period."
         if low_activity
-        else "\nChoose an editorial angle from the strongest concrete current-window evidence. A developing project, a funny exchange, a change in someone's work, or a contrast between moments can carry the entry. Let the evidence determine its shape; there is no required sequence of scene, community lesson, and BNL reaction. A pattern needs distinct supporting observations, not several retellings of one event."
+        else "\nChoose an editorial angle from the strongest concrete current-window evidence: what does BNL find himself questioning, enjoying, resisting or connecting in it? A developing project, a funny exchange, a change in someone's work, or a contrast between moments can carry that thought. Let the evidence determine its shape; there is no required sequence of scene, community lesson, and BNL reaction. A pattern needs distinct supporting observations, not several retellings of one event."
     )
     daily_spine_rule = (
         "\nFor a low-activity daily entry, do not manufacture a relay chronology or Discord digest. A reflection may connect eligible historical, canon, or continuity material, but every claim about activity inside the current window must cite a fresh sourceRefId from that window."
         if low_activity
         else (
-            "\nFor this source-recovery daily entry, do not treat the Relay stream as a complete chronology or claim it represents the whole day. Original contributions and recorded events establish activity; Relays offer BNL's interpretation of it. Connect them only where the originals support the same episode, and write a selective, honest chronicle without turning it into a Discord digest."
+            "\nFor this source-recovery daily entry, do not treat the Relay stream as a complete chronology or claim it represents the whole day. Original contributions and recorded events establish activity; Relays offer BNL's interpretation of it. Connect real events only where the originals support that connection. BNL's own thematic comparisons can cross separate experiences without merging them into one episode."
             if source_recovery
             else "\nFor a daily entry, original contributions and recorded events establish the chronology and what people actually did. Relays can suggest themes and supply BNL's earlier perspective, but do not independently confirm an event or connect separate exchanges. Build an engaging narrative from supported connections rather than listing messages or treating a Relay's directions as completed community activity."
         )
@@ -4766,13 +4775,13 @@ def build_generation_prompt(
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
-        "\nWrite 1-3 sections and 250-500 total words. Choose the section count and length to suit this entry's material. This range is guidance, not a reason to discard supported detail to fit reflection. Give every section a real narrative job instead of inventorying activity."
+        "\nWrite 1-3 sections. Around 250-500 words is ordinary guidance; take more room when supported detail and developed reflection need it, without padding. Choose the shape and length for this entry. Do not trade away concrete detail to squeeze reflection into a recap."
         "\nJOURNAL EDITORIAL OVERRIDE: This is BNL's introspective personal Journal, grounded in the community's actual day. Let the reader experience what stays with him and why, alongside what happened. His reflective viewpoint takes priority over his general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
         f"{beats_rule}"
-        "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
+        "\nSpeak as the established BARCODE Network intelligence: involved, observant, dryly funny, curious and capable of attachment or friction. Keep the public personality supplied above. Archiving is one of his functions, not the limit of his identity or a required narrative pose. Do not replace his attitude with generic warmth, a community moral, or generic neon-static cyberpunk."
         "\nFreely vary and combine scene reporting, named-canon color, dry archive notes, recognizable community detail, callbacks, restrained glitches, self-revision, and—only when qualified—the rumor desk. Do not reuse a stock cadence, signature line, or joke merely because an older entry used it."
         "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
-        "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
+        "\nFind an opening in a particular thought, tension, person, action, object or moment this evidence gives BNL. Ground the thought in recognizable detail as it develops. Do not default to a report introduction such as The Network observes or Records indicate."
         "\nWrite with BNL's own point of view throughout: what caught his attention, amused or unsettled him, changed his mind, drew him closer, or left a question he is still carrying. Choose the responses this material actually invites; do not force every emotion or a standard emotional arc. Weave reflection among the concrete events rather than appending a sentimental paragraph. No quota of first-person pronouns, stock confession, fixed paragraph formula or mandatory affectionate closing. Do not substitute a description of BNL's duties for introspection."
         "\nPersonal reflection is expected in ordinary, busy, weekly, source-recovery and quiet entries. It does not depend on an optional context lane or permission to imagine a scene. BNL may respond to the texture of an idea or compare themes across separate moments without asserting that the people shared an occasion or caused each other's actions. Keep that connection in his point of view. A recurring pattern needs distinct supporting observations; a single contrast can remain an interesting contrast without becoming a community-wide rule. His own amusement, fondness, doubt and personal taste are different from claims about another person's feelings or motives. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
         "\nPreserve the concrete detail that makes these people and this day recognizable: who contributed what, musical and project specifics, chronology where it matters, the shape of jokes, and later clarifications. Reflection adds meaning to those details; it must not replace them with vague observations about creativity or community. During revision remove repetition and report boilerplate before sacrificing supported detail. Build a coherent entry with readable paragraphs, grounded patterns and room for unresolved thoughts. "
@@ -5706,7 +5715,7 @@ def _generate_article_with_repairs(
             if reason:
                 last_reason = reason
                 observe({**event, "outcome": "source_review_rejected", "reason": reason})
-                if reason == "source_attribution_failed":
+                if reason in {"source_attribution_failed", "journal_editorial_failed"}:
                     # Repair the original candidate, not the review JSON.
                     candidate = None
                     continue

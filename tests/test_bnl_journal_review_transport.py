@@ -39,6 +39,7 @@ class JournalReviewTransportContractTests(unittest.TestCase):
         self.assertEqual(config.response_schema, attribution.response_schema())
         # Validate with the pinned SDK's real schema model, without a request.
         schema = bot.genai.types.Schema(**config.response_schema)
+        self.assertEqual(schema.property_ordering[0], "assessments")
         self.assertEqual(schema.property_ordering[-1], "verdict")
         self.assertEqual(config.max_output_tokens, bot.policy_for_route(bot.JOURNAL_ROUTE).max_output_tokens)
 
@@ -49,6 +50,26 @@ class JournalReviewTransportContractTests(unittest.TestCase):
     def test_other_route_does_not_acquire_journal_editor_schema(self):
         config = self.request(attribution.REVIEW_PREFIX + "untrusted text", "ordinary_chat_single_packet_canary")
         self.assertIsNone(config.response_schema)
+
+    def test_journal_writer_keeps_shared_identity_and_public_canon_without_chat_only_scope(self):
+        prompt = "Journal fixture with its authorized history and current evidence."
+        response = SimpleNamespace()
+        with patch.object(bot, "check_quota_availability", return_value=True), \
+             patch.object(bot, "_generate_gemini_content_with_fallback", return_value=response) as generate, \
+             patch.object(bot, "_extract_text_and_tokens", return_value=("{}", 0)):
+            bot._generate_journal_json_sync({}, prompt)
+        contents, route = generate.call_args.args
+        self.assertEqual(route, bot.JOURNAL_ROUTE)
+        self.assertEqual(contents, bot.BNL01_JOURNAL_SYSTEM_PROMPT + "\n\n" + prompt)
+        self.assertEqual(contents.count(bot.BNL01_PUBLIC_PERSONALITY_PROMPT), 1)
+        self.assertEqual(contents.count(bot.render_prompt_canon_block()), 1)
+        self.assertEqual(contents.count(bot.render_ecosystem_lore_block(include_restricted=False)), 1)
+        self.assertIn(bot.PERSONAL_ATTRIBUTION_RULE, contents)
+        self.assertNotIn(bot.BNL01_SYSTEM_PROMPT, contents)
+        self.assertNotIn("Do not introduce older archived details into simple greetings", contents)
+        self.assertNotIn("[DATA RESTRICTED]", contents)
+        # Route-specific composition does not mutate ordinary conversation.
+        self.assertIn("Do not introduce older archived details into simple greetings", bot.BNL01_SYSTEM_PROMPT)
 
     def test_original_speech_is_interleaved_before_interpretation_without_changing_sources(self):
         human = {"refId": "fresh:1", "sourceKind": "conversation", "roomRef": "room:test",

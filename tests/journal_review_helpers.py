@@ -7,7 +7,7 @@ Production code must never import this module.
 from functools import wraps
 import json
 
-from bnl_journal_attribution import REVIEW_PREFIX
+from bnl_journal_attribution import ASSESSMENT_CHECKS, REVIEW_PREFIX
 
 
 def is_source_review(prompt):
@@ -38,7 +38,12 @@ def supported_review(prompt):
             break
     if not anchor:
         raise AssertionError("Mock review needs an actual supplied original source")
-    return json.dumps({"units": [
+    return json.dumps({"assessments": [
+        {"check": check, "unitIds": [unit["unitId"] for unit in units],
+         "sourceRefIds": [anchor["refId"]],
+         "explanation": "This controlled fixture supplies a passing " + check + " verdict; not model-quality evidence.",
+         "issues": [], "verdict": "supported"} for check in ASSESSMENT_CHECKS
+    ], "units": [
         {"unitId": unit["unitId"], "spans": [
             {"text": unit["text"], "kind": "factual", "evidence": [anchor],
              "issues": [], "verdict": "supported"}]} for unit in units

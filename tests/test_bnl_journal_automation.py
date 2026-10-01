@@ -319,7 +319,7 @@ class JournalAutomationTests(unittest.TestCase):
         self.assertEqual(4, len(calls))
         self.assertTrue(
             all(
-                "Write 1-3 sections and 250-500 total words."
+                "Around 250-500 words is ordinary guidance; take more room when supported detail and developed reflection need it"
                 in prompt
                 for prompt in calls if not is_source_review(prompt)
             )

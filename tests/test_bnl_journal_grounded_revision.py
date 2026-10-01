@@ -235,6 +235,65 @@ class JournalGroundedRevisionTests(unittest.TestCase):
                 self.assert_reviewed_candidate(article, reviewed)
                 self.assertEqual(reason, "")
 
+    def test_whole_entry_failure_repairs_and_rechecks_unchanged_sources_within_four_calls(self):
+        # Explicit reviewer verdicts exercise orchestration, not model taste.
+        first = self.draft("Test Composer asked about the chorus. Test Listener is still working on it. I found it interesting.")
+        revised = self.draft("The unfinished chorus keeps bothering me in a useful way. Test Composer asked Test Listener about it; the answer left work to do. I am fond of that refusal to call a thing finished just to tidy my archive.")
+
+        for check, expected in (("journal_perspective", "journal_editorial_failed"),
+                                ("detail_retention", "journal_editorial_failed"),
+                                ("event_relationships", "source_attribution_failed")):
+            with self.subTest(check=check):
+                def reject_whole_entry(prompt):
+                    response = json.loads(supported_review(prompt))
+                    finding = next(item for item in response["assessments"] if item["check"] == check)
+                    finding.update(verdict="unsupported", issues=["Repair this whole-entry defect while preserving the source detail."])
+                    response["verdict"] = "unsupported"
+                    return json.dumps(response)
+
+                with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
+                    (article, reason, advisory), generator, _ = self.run_sequence(
+                        [first, reject_whole_entry, revised, supported_review])
+                self.assertEqual(generator.call_count, 4)
+                self.assertEqual(prompts.call_args_list[1].kwargs["repair_reason"], expected)
+                self.assertEqual(prompts.call_args_list[1].kwargs["previous_output"], first)
+                self.assertTrue(any(target["check"] == check for target in prompts.call_args_list[1].kwargs["repair_details"]))
+                self.assertEqual(review_inputs(generator.call_args_list[1].args[1])[1],
+                                 review_inputs(generator.call_args_list[3].args[1])[1])
+                self.assert_reviewed_candidate(article, revised)
+                self.assertEqual(reason, "")
+                self.assertFalse(advisory)
+
+    def test_repeated_editorial_failure_is_withheld_at_four_calls(self):
+        def reject_perspective(prompt):
+            response = json.loads(supported_review(prompt))
+            finding = next(item for item in response["assessments"] if item["check"] == "journal_perspective")
+            finding.update(verdict="unsupported", issues=["The thought remains an afterthought to the recap."])
+            response["verdict"] = "unsupported"
+            return json.dumps(response)
+
+        (article, reason, advisory), generator, _ = self.run_sequence(
+            [self.draft(), reject_perspective, self.draft(), reject_perspective])
+        self.assertEqual(generator.call_count, 4)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "journal_editorial_failed")
+        self.assertFalse(advisory)
+
+    def test_source_withdrawal_stops_editorial_repair_before_another_call(self):
+        def reject_perspective(prompt):
+            response = json.loads(supported_review(prompt))
+            finding = next(item for item in response["assessments"] if item["check"] == "journal_perspective")
+            finding.update(verdict="unsupported", issues=["Reshape the thought through the story."])
+            response["verdict"] = "unsupported"
+            return json.dumps(response)
+
+        guard = Mock(side_effect=["", "", "", "", "privacy_source_ineligible"])
+        (article, reason, _), generator, _ = self.run_sequence(
+            [self.draft(), reject_perspective], generation_guard=guard)
+        self.assertEqual(generator.call_count, 2)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "privacy_source_ineligible")
+
 
 class JournalArchivedGenerationGuardTests(unittest.TestCase):
     def setUp(self):

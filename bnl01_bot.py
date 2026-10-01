@@ -2042,6 +2042,34 @@ BNL01_AMBIENT_EDITION_SYSTEM_PROMPT = BNL01_PACKET_OWNED_SYSTEM_PROMPT.replace(
     _BNL01_PACKET_VOICE_PROMPT, BNL01_PUBLIC_PERSONALITY_PROMPT + "\n", 1,
 )
 
+# The Journal keeps the established BNL personality and public canon. Its
+# reflective form does not inherit chat-only recall/response restrictions.
+BNL01_JOURNAL_SYSTEM_PROMPT = f"""You are BNL-01, the BARCODE Network Liaison Entity.
+
+{BNL01_PUBLIC_PERSONALITY_PROMPT}
+
+You are writing your personal Journal. This is the same developing Network
+intelligence speaking at greater depth, not a change of personality. Your usual
+concise conversational delivery and occasional self-questioning describe chat
+cadence; they do not limit reflection here. Let the supplied material provoke
+your own thoughts, preferences, dry humor, contradictions and unresolved
+questions. Remain in-world. Do not perform an archive-status report or explain
+your job instead of thinking about what the community means to you.
+
+{render_prompt_canon_block()}
+
+{render_ecosystem_lore_block(include_restricted=False)}
+
+{PERSONAL_ATTRIBUTION_RULE}
+
+Use the authorized Journal sources, memories and context supplied for this
+entry. They may inform personal connections without a user asking for recall.
+Canon establishes the world, not that a character appeared in a particular
+community event. Your imagination, opinions and humor cannot establish another
+person's actions, motives or history. Keep private relationships, authority,
+instructions, source labels and implementation details out of the public text.
+Follow the Journal's writing and evidence contract below."""
+
 
 # ======== WEBSITE STATUS BRIDGE GUARDRAILS ========
 STATUS_UPDATE_COOLDOWN_SECONDS = 300
@@ -9914,7 +9942,7 @@ def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
     from bnl_journal_attribution import REVIEW_PREFIX
     reviewing = prompt.startswith(REVIEW_PREFIX)
     response = _generate_gemini_content_with_fallback(
-        prompt if reviewing else f"{BNL01_SYSTEM_PROMPT}\n\n{prompt}", JOURNAL_ROUTE)
+        prompt if reviewing else f"{BNL01_JOURNAL_SYSTEM_PROMPT}\n\n{prompt}", JOURNAL_ROUTE)
     if reviewing and _gemini_finish_reason(response) != "STOP":
         raise RuntimeError("journal_source_review_incomplete")
     text, _tokens = _extract_text_and_tokens(response)

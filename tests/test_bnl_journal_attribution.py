@@ -38,7 +38,12 @@ class JournalAttributionTests(unittest.TestCase):
             if unit["text"].startswith("I am"):
                 item["kind"] = "reflection"
             units.append({"unitId": unit["unitId"], "spans": [item]})
-        return {"units": units, "verdict": "supported"}
+        return {"assessments": [
+            {"check": check, "unitIds": [unit["unitId"] for unit in units],
+             "sourceRefIds": ["fresh:1", "fresh:2"],
+             "explanation": "Controlled passing " + check + " fixture; not a live quality verdict.",
+             "issues": [], "verdict": "supported"} for check in review.ASSESSMENT_CHECKS
+        ], "units": units, "verdict": "supported"}
 
     @staticmethod
     def spans(data):
@@ -50,13 +55,15 @@ class JournalAttributionTests(unittest.TestCase):
     def test_complete_source_review_bound_to_exact_candidate(self):
         receipt, reason, targets = self.accept(self.verdict())
         self.assertEqual((reason, targets), ("", []))
-        self.assertEqual(receipt["version"], 2)
+        self.assertEqual(receipt["version"], 3)
+        self.assertEqual(receipt["assessments"], self.verdict()["assessments"])
         self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
         for mutate in (
             lambda a: a.update(title="An Unchecked Different Story"),
             lambda a: a["sections"][0].update(body="Test Host accused the bot instead."),
             lambda a: a["sourceRefIds"].update({"Who Said What": ["fresh:2"]}),
             lambda a: a["metadata"].update(contextUses=[{"claim": "An unchecked memory"}]),
+            lambda a: a["sections"][0].update(body=a["sections"][0]["body"].replace(". ", ".\n\n", 1)),
         ):
             edited = copy.deepcopy(self.article)
             mutate(edited)
@@ -207,7 +214,10 @@ class JournalAttributionTests(unittest.TestCase):
 
     def test_schema_orders_evidence_and_issues_before_any_verdict(self):
         schema = review.response_schema()
-        self.assertEqual(schema["propertyOrdering"], ["units", "verdict"])
+        self.assertEqual(schema["propertyOrdering"], ["assessments", "units", "verdict"])
+        assessment = schema["properties"]["assessments"]["items"]
+        self.assertEqual(assessment["propertyOrdering"],
+                         ["check", "unitIds", "sourceRefIds", "explanation", "issues", "verdict"])
         unit = schema["properties"]["units"]["items"]
         self.assertEqual(unit["required"], ["unitId", "spans"])
         span = unit["properties"]["spans"]["items"]
@@ -240,6 +250,123 @@ class JournalAttributionTests(unittest.TestCase):
         data = self.verdict()
         self.assertTrue(any(u["kind"] == "reflection" and not u["evidence"] for u in self.spans(data)))
         self.assertEqual(self.accept(data)[1], "")
+
+    def test_missing_duplicate_and_unknown_whole_entry_checks_cannot_approve(self):
+        for mode in ("v2", "empty", "missing", "duplicate", "unknown"):
+            with self.subTest(mode=mode):
+                data = self.verdict()
+                if mode == "v2": data.pop("assessments")
+                elif mode == "empty": data["assessments"] = []
+                elif mode == "missing": data["assessments"].pop()
+                elif mode == "duplicate": data["assessments"][-1] = data["assessments"][0]
+                else: data["assessments"][-1]["check"] = "invented_check"
+                self.assertEqual(self.accept(data), (None, "source_review_incomplete", []))
+
+    def test_whole_entry_assessments_require_bound_locations_and_specific_explanation(self):
+        for key, value in (("unitIds", []), ("unitIds", ["missing:0"]),
+                           ("unitIds", ["title:0", "title:0"]), ("unitIds", [{}]),
+                           ("sourceRefIds", ["fresh:missing"]),
+                           ("sourceRefIds", ["fresh:1", "fresh:1"]),
+                           ("sourceRefIds", [{}]), ("sourceRefIds", None),
+                           ("explanation", " "), ("explanation", []),
+                           ("issues", [""]), ("issues", {}), ("verdict", [])):
+            with self.subTest(key=key, value=value):
+                data = self.verdict()
+                data["assessments"][0][key] = value
+                self.assertEqual(self.accept(data), (None, "source_review_invalid", []))
+
+    def test_individually_supported_spans_do_not_overrule_cross_sentence_factual_findings(self):
+        # The supplied negative verdict is a controlled editor finding, not a
+        # deterministic assertion that the protocol can understand these claims.
+        for check, issue in (
+            ("event_relationships", "The reaction is in another room; two true statements do not establish a reply."),
+            ("attribution_stance", "The allegation remains disputed after the host's later explanation."),
+        ):
+            with self.subTest(check=check):
+                data = self.verdict()
+                assessment = next(item for item in data["assessments"] if item["check"] == check)
+                assessment.update(unitIds=["sections[0].body:0", "sections[0].body:1"],
+                                  explanation=issue, issues=[issue], verdict="unsupported")
+                self.assertTrue(all(span["verdict"] == "supported" for span in self.spans(data)))
+                receipt, reason, targets = self.accept(data)
+                self.assertIsNone(receipt)
+                self.assertEqual(reason, "source_attribution_failed")
+                self.assertEqual(len(targets), 1)
+                self.assertEqual(targets[0]["field"], "sections[0].body")
+                self.assertEqual(targets[0]["check"], check)
+                self.assertEqual(targets[0]["sourceRefIds"], ["fresh:1", "fresh:2"])
+                self.assertEqual(targets[0]["issues"], [issue])
+
+    def test_recap_with_reaction_and_lost_detail_require_editorial_repair(self):
+        for check, issue in (
+            ("journal_perspective", "The entry inventories events and appends fondness without developing BNL's thought."),
+            ("detail_retention", "The selected dispute loses the later explanation that changes its meaning."),
+        ):
+            for verdict in ("unsupported", "uncertain", "supported"):
+                with self.subTest(check=check, verdict=verdict):
+                    data = self.verdict()
+                    assessment = next(item for item in data["assessments"] if item["check"] == check)
+                    assessment.update(unitIds=["sections[0].body:0", "sections[0].body:2"],
+                                      explanation=issue, issues=[issue], verdict=verdict)
+                    receipt, reason, targets = self.accept(data)
+                    self.assertIsNone(receipt)
+                    self.assertEqual(reason, "journal_editorial_failed")
+                    self.assertEqual(targets[0]["check"], check)
+                    self.assertEqual(targets[0]["field"], "sections[0].body")
+
+    def test_factual_failure_takes_priority_and_preserves_editorial_repair_targets(self):
+        data = self.verdict()
+        for assessment in data["assessments"]:
+            assessment.update(unitIds=["sections[0].body:0"], verdict="unsupported",
+                              issues=["Controlled specific defect for " + assessment["check"]])
+        receipt, reason, targets = self.accept(data)
+        self.assertIsNone(receipt)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertEqual([target["check"] for target in targets], list(review.ASSESSMENT_CHECKS))
+
+    def test_whole_entry_findings_cannot_crowd_later_checks_out_of_repair_budget(self):
+        self.article["sections"] = [
+            {"heading": "Part " + str(index),
+             "body": "Test Listener said the bot invented it. I am fond of this small disagreement."}
+            for index in range(3)
+        ]
+        data = self.verdict()
+        for assessment in data["assessments"]:
+            assessment.update(verdict="unsupported", issues=["Controlled whole-entry finding."])
+        _, reason, targets = self.accept(data)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertEqual(len(targets), 4)
+        self.assertEqual([target["check"] for target in targets[:12]], list(review.ASSESSMENT_CHECKS))
+        expected_units = [unit["unitId"] for unit in review.public_units(self.article)]
+        expected_fields = list(dict.fromkeys(unit["field"] for unit in review.public_units(self.article)))
+        self.assertEqual(len(expected_fields), 8)
+        for target in targets:
+            self.assertEqual(target["unitIds"], expected_units)
+            self.assertEqual(target["fieldPaths"], expected_fields)
+            self.assertEqual(target["field"], expected_fields[0])
+            self.assertEqual(target["sourceRefIds"], ["fresh:1", "fresh:2"])
+
+    def test_grounded_personal_comparison_and_selective_detail_can_pass_without_quotas(self):
+        data = self.verdict()
+        explanations = {
+            "event_relationships": "The two comments are attributed separately; BNL's sticker metaphor does not claim a shared event.",
+            "attribution_stance": "The allegation remains the listener's statement, while the host's later explanation has its own attribution.",
+            "journal_perspective": "The controlled fixture accepts BNL's comic personal investment in a tiny object; no required pronoun or emotional quota.",
+            "detail_retention": "The selected disagreement preserves both stances and the sticker detail; unrelated sources need not be inventoried.",
+        }
+        for assessment in data["assessments"]:
+            assessment["explanation"] = explanations[assessment["check"]]
+            if assessment["check"] == "journal_perspective":
+                assessment["sourceRefIds"] = []
+        receipt, reason, targets = self.accept(data)
+        self.assertEqual((reason, targets), ("", []))
+        self.assertEqual(receipt["assessments"], data["assessments"])
+        self.assertEqual(receipt["verdict"], "supported")
+
+    def test_negative_overall_verdict_without_located_findings_is_protocol_failure(self):
+        data = self.verdict()
+        data["verdict"] = "uncertain"
+        self.assertEqual(self.accept(data), (None, "source_review_invalid", []))
 
     def test_raw_or_single_complete_json_fence_preserves_all_review_checks(self):
         data = self.verdict()
@@ -285,8 +412,14 @@ class JournalAttributionTests(unittest.TestCase):
         self.assertTrue(prompt.startswith(review.REVIEW_PREFIX))
         for text in ("do not rewrite", "later clarifications", "recipient", "reply order", "mixed sentence",
                      "personal voice", "EVERY unit", "never a member's biography", "evidence-first",
-                     "atomic external factual clause", "contradictory", "ordered verbatim spans"):
+                     "atomic external factual clause", "contradictory", "ordered verbatim spans",
+                     "ACROSS sentences", "A generic statement", "allegation", "complete writing",
+                     "not completeness, a roll call", "First read the complete article"):
             self.assertIn(text, prompt)
+        article, _ = json.JSONDecoder().raw_decode(prompt.split("CANDIDATE_ARTICLE_JSON: ", 1)[1])
+        self.assertEqual(article["sections"], review._candidate_article(self.article)["sections"])
+        self.assertEqual(article["title"], self.article["title"])
+        self.assertNotIn("metadata", article)
 
 
 class JournalReviewTransportTests(unittest.TestCase):
@@ -321,7 +454,7 @@ class JournalReviewTransportTests(unittest.TestCase):
              patch.object(self.bot, "_extract_text_and_tokens", return_value=('{}', 1)):
             self.bot._generate_journal_json_sync({}, "write a Journal")
         self.assertEqual(provider.call_args.args,
-                         (self.bot.BNL01_SYSTEM_PROMPT + "\n\nwrite a Journal", self.bot.JOURNAL_ROUTE))
+                         (self.bot.BNL01_JOURNAL_SYSTEM_PROMPT + "\n\nwrite a Journal", self.bot.JOURNAL_ROUTE))
 
 
 if __name__ == "__main__":
