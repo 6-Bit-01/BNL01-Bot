@@ -568,6 +568,11 @@ pilot does not automatically replay old generations or backfill history.
 The enabled Journal path can explore selected experiences instead of meeting
 person/time-segment coverage quotas. It preserves original grounding, the
 four-attempt limit, and existing preparation, approval and delivery owners.
+Older lore and experiences remain available as explicitly remembered callbacks.
+A present association does not establish a character's return or involvement;
+the date of a retained source is not evidence of a person's last appearance.
+Journal inputs distinguish a Relay's public observation from its invitation or
+suggested follow-up, which cannot establish that a community member acted.
 Relays, Ambient, artwork, Ballads, dossiers, memory-tier promotion, and
 Relationship activation remain outside this pilot.
 

@@ -3139,7 +3139,11 @@ def render_packet_context(
         "inform his attitude, questions or changing mind, but cannot establish another person's "
         "traits, feelings, motives or actions. Original evidence and current corrections prevail. "
         "Keep a present reaction distinct from what BNL thought then, and never use his old "
-        "interpretation to corroborate a fact, quotation, recurring pattern or canon.\n"
+        "interpretation to corroborate a fact, quotation, recurring pattern or canon. An older "
+        "memory or piece of lore may enrich the answer: make the callback and your personal "
+        "association clear, rather than implying a new appearance or present involvement. "
+        "A thematic resemblance is not evidence that the remembered person caused today's event. "
+        "The supplied date locates the remembered exchange, not the person's last appearance.\n"
         if lane_counts["bnl_impression"] else ""
     )
     profile = getattr(packet, "profile_sufficiency", None)
