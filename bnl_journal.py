@@ -394,8 +394,6 @@ def _context_claim_clauses(text: str) -> list[str]:
 
 def _creative_reflection_clause(clause: str, packet: dict[str, Any]) -> bool:
     """Allow this clause's framed imagination/opinion, not adjacent assertions."""
-    if not packet.get("creativeReflectionAllowed") and not _has_moment_impressions(packet):
-        return False
     frame = _IMAGINED_SCENE_RE.search(clause) if packet.get("creativeReflectionAllowed") else None
     if frame:
         return not (
@@ -4501,15 +4499,15 @@ def build_packet_from_sources(
         })
     if relay_provenance:
         packet.setdefault("privateReflectionBasisProvenance", {}).setdefault("historicalSourceEvents", []).extend(relay_provenance)
+    # The same evidence remains available. A Journal selects the experiences
+    # that matter to BNL whether or not an earlier impression was retained.
+    packet["evidenceCoverageContract"] = {
+        **packet["evidenceCoverageContract"], "minimumDistinctFreshSources": 0,
+        "requiredSourceKinds": [], "minimumDistinctFreshSourcesByKind": {},
+        "minimumDistinctParticipants": 0, "minimumDistinctWindowSegments": 0,
+        "subjectiveSelectionMode": True,
+    }
     if _has_moment_impressions(packet):
-        # The same evidence remains available. The Journal may select the
-        # experiences that matter to this reflection without staging a roll call.
-        packet["evidenceCoverageContract"] = {
-            **packet["evidenceCoverageContract"], "minimumDistinctFreshSources": 0,
-            "requiredSourceKinds": [], "minimumDistinctFreshSourcesByKind": {},
-            "minimumDistinctParticipants": 0, "minimumDistinctWindowSegments": 0,
-            "subjectiveSelectionMode": True,
-        }
         packet["reflectionBasisContract"]["basisKinds"] = sorted(
             JOURNAL_REFLECTION_BASIS_KINDS | {"moment_impression"})
     packet["generationContextLanes"] = context_lanes
@@ -4996,7 +4994,7 @@ def build_generation_prompt(
         cadence_rule = (
             "\nThis is a weekly synthesis. Connect patterns across the six supplied Tuesday-Sunday Daily-period contexts, the fresh final Sunday-to-Monday period, and the full current source evidence. A source-only period context is not a hidden Daily article. Do not list period recaps."
             if entry_kind == "weekly"
-            else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
+            else "\nThe supplied daily source window bounds claims about current activity. It does not require covering every event."
         )
     repair = ""
     if repair_reason == "published_correction":
@@ -5118,37 +5116,37 @@ def build_generation_prompt(
             else ""
         )
     )
+    safe_packet["editorialContract"].update({
+        "personalReflectionExpected": True, "preserveGroundedDetail": True,
+        "selectMeaningfulExperiences": True,
+        "historyRole": "prior_bnl_expression_for_continuity_not_evidence_or_style_template",
+    })
+    beats_rule = (
+        "\nChoose the experience or tension that matters to BNL and develop his perspective through it. "
+        "Let his attitude, taste, doubts, humor and evolving understanding shape the entry; "
+        "the events are its grounding, not a play-by-play outline. Keep the concrete details "
+        "that make the chosen experiences recognizable. Do not force a lesson or emotion."
+    )
+    daily_spine_rule = (
+        "\nOriginal contributions establish what happened. Select meaningful experiences rather than "
+        "reporting every person or interval. A thematic connection belongs to his viewpoint, not to "
+        "an invented causal link or shared occasion between separate conversations."
+    )
+    window_rule = "\nThe source window limits current-event claims; its segments and counts are not an outline to cover."
+    cadence_rule += (
+        "\nThis is BNL's personal Network Journal, a sustained reflection grounded in eligible "
+        "experiences. It is not the community recap or a complete record of this window."
+    )
+    coverage_rule = (
+        "\nCite the original evidence behind factual claims and eligible sources behind a remembered "
+        "perspective. Source breadth is available context, not a quota of names, events or time segments."
+    )
     if _has_moment_impressions(packet):
-        safe_packet["editorialContract"].update({
-            "personalReflectionExpected": True, "preserveGroundedDetail": True,
-            "selectMeaningfulExperiences": True,
-            "historyRole": "prior_bnl_expression_for_continuity_not_evidence_or_style_template",
-        })
-        beats_rule = (
-            "\nChoose the experience or tension that matters to BNL and develop his perspective through it. "
-            "Let his attitude, taste, doubts, humor and evolving understanding shape the entry; "
-            "the events are its grounding, not a play-by-play outline. Keep the concrete details "
-            "that make the chosen experiences recognizable. Do not force a lesson or emotion."
-        )
-        daily_spine_rule = (
-            "\nOriginal contributions establish what happened; a saved impression establishes only "
-            "BNL's revisable response to it. Select meaningful experiences rather than reporting "
-            "every person or interval. A thematic connection belongs to his viewpoint, not to "
-            "an invented causal link or shared occasion between separate conversations."
-        )
-        window_rule = "\nThe source window limits current-event claims; its segments and counts are not an outline to cover."
-        cadence_rule = (
-            "\nThis is BNL's personal Network Journal, a sustained reflection grounded in eligible "
-            "experiences. It is not the community recap or a complete record of this window."
-        )
-        coverage_rule = (
-            "\nCite the original evidence behind factual claims and the impression behind a remembered "
-            "perspective. Source breadth is available context, not a quota of names, events or time segments."
-        )
         section_source_rule = (
-            "\nEvery section needs an eligible source reference. A purely reflective section may cite "
-            "a moment_impression alone. Claims that people acted in the current window still require "
-            "fresh evidence in that section; impressions never count as fresh activity or corroboration."
+            "\nEvery section must cite at least one eligible supplied sourceRefId. "
+            "A purely reflective section may cite a supplied moment_impression alone. Claims that "
+            "people acted in the current window still require fresh evidence in that section; "
+            "impressions never count as fresh activity or corroboration."
         )
         reflection_rule += (
             "\nShared Moment impressions are BNL's own earlier, revisable perspective, not objective "
@@ -5159,20 +5157,12 @@ def build_generation_prompt(
             "inference lane; a new claim about another person still does. No obligatory warm closing, "
             "recap structure, fixed emotional arc or description of his archival duties."
         )
-    reality_rule = (
-        "Claims about real events, people, times, places, actions, motives, outcomes, relationships, dialogue and emotional states must follow the cited evidence. Clearly imagined scene details and BNL's personal reflections are creative expression, not claims of real events."
-        if packet.get("creativeReflectionAllowed")
-        else "Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
-    )
-    editorial_override = "\nJOURNAL EDITORIAL OVERRIDE: For this route, a lived community chronicle takes priority over BNL's general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
-    identity_rule = "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
-    reaction_rule = "\nBNL's personality can live in the selection, phrasing, dry humor, and point of view. A first-person reaction is welcome when it adds something, but is not required. Avoid repeating a stock confession or affectionate closing. Reserve I suspect, I think, and I wonder about external facts for a properly declared bnl_inference context use."
+    editorial_override = "\nJOURNAL PURPOSE: This is BNL's introspective personal Journal, not a community report. His developing perspective should organize the concrete material, without flattening his established Network personality."
+    identity_rule = "\nRemain the same BNL-01 Network intelligence who experienced these exchanges. Let his established attitude, curiosity, dry humor and contradictions carry into the Journal; do not substitute a generic warm narrator or describe his job."
+    reaction_rule = "\nDevelop what stays with BNL and why, what he questions or connects, and what the experience means to him. Let that thinking unfold alongside the relevant details rather than adding a reaction after a recap. No quota of pronouns, forced emotion, stock confession or required moral."
+    reaction_rule += " Prior Journals preserve BNL's earlier perspective and continuity, not independent proof or a writing template. A small greeting need not be included merely because it is supplied; choose the experiences that resonate rather than touring every source."
+    reality_rule = "Never invent another person's actions, motives, history, feelings or circumstances. BNL's own present tastes, feelings and questions are subjective expression and need not have appeared in a source. Keep them distinct from external claims and preserve uncertainty, joking intent and later corrections in the original evidence."
     if _has_moment_impressions(packet):
-        editorial_override = "\nJOURNAL PURPOSE: This is BNL's introspective personal Journal, not a community report. His developing perspective should organize the concrete material, without flattening his established Network personality."
-        identity_rule = "\nRemain the same BNL-01 Network intelligence who experienced these exchanges. Let his established attitude, curiosity, dry humor and contradictions carry into the Journal; do not substitute a generic warm narrator or describe his job."
-        reaction_rule = "\nDevelop what stays with BNL and why, what he questions or connects, and what the experience means to him. Let that thinking unfold alongside the relevant details rather than adding a reaction after a recap. No quota of pronouns, forced emotion, stock confession or required moral."
-        reaction_rule += " Prior Journals preserve BNL's earlier perspective and continuity, not independent proof or a writing template. A small greeting need not be included merely because it is supplied; choose the experiences that resonate rather than touring every source."
-        reality_rule = "Never invent another person's actions, motives, history, feelings or circumstances. BNL's own present tastes, feelings and questions are subjective expression and need not have appeared in a source. Keep them distinct from external claims and preserve uncertainty, joking intent and later corrections in the original evidence."
         quote_rule += " BNL may quote his own saved impression as an earlier personal thought, citing its impression ref; this does not make it evidence about anyone else."
     # Keep originals first while making nested records byte-stable after the
     # existing frozen-packet JSON round trip used by preparation retries.

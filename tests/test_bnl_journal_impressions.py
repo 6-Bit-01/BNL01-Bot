@@ -94,7 +94,7 @@ class JournalMomentImpressionTests(unittest.TestCase):
         self.assertEqual(off, baseline)
         self.assertEqual(journal.build_generation_prompt(off), journal.build_generation_prompt(baseline))
         self.assertFalse(journal._has_moment_impressions(off))
-        self.assertNotIn("subjectiveSelectionMode", off["evidenceCoverageContract"])
+        self.assertTrue(off["evidenceCoverageContract"]["subjectiveSelectionMode"])
 
     def test_reflective_section_needs_no_new_event_or_participant_roll_call(self):
         packet = self.packet()
@@ -213,7 +213,7 @@ class JournalMomentImpressionTests(unittest.TestCase):
         self.assertEqual(reason, "privacy_source_ineligible")
         self.assertFalse(advisory)
 
-    def test_real_bot_writer_keeps_legacy_off_path_and_shared_personality_when_on(self):
+    def test_real_bot_writer_has_one_personality_with_conditional_retained_impressions(self):
         import bnl01_bot as bot
         for packet, enabled in (({}, False), (self.packet(), True)):
             with self.subTest(enabled=enabled), mock.patch.object(bot, "check_quota_availability", return_value=True), \
@@ -223,14 +223,30 @@ class JournalMomentImpressionTests(unittest.TestCase):
                 provider.assert_called_once()
                 prompt, route = provider.call_args.args
                 self.assertEqual(route, bot.JOURNAL_ROUTE)
-                if not enabled:
-                    self.assertEqual(prompt, bot.BNL01_SYSTEM_PROMPT + "\n\nJOURNAL PAYLOAD")
-                else:
-                    self.assertIn(bot.BNL01_PUBLIC_PERSONALITY_PROMPT, prompt)
-                    self.assertIn("Your conversational brevity does not limit this reflection", prompt)
-                    self.assertNotIn(bot.BNL01_SYSTEM_PROMPT, prompt)
-                    self.assertNotIn("only when the user is explicitly asking for recall", prompt)
-                    self.assertTrue(prompt.endswith("\n\nJOURNAL PAYLOAD"))
+                self.assertIn(bot.BNL01_PUBLIC_PERSONALITY_PROMPT, prompt)
+                self.assertIn("Your conversational brevity does not limit this reflection", prompt)
+                self.assertNotIn(bot.BNL01_SYSTEM_PROMPT, prompt)
+                self.assertNotIn("only when the user is explicitly asking for recall", prompt)
+                self.assertEqual("The supplied retained impressions" in prompt, enabled)
+                self.assertTrue(prompt.endswith("\n\nJOURNAL PAYLOAD"))
+
+    def test_real_source_reviewer_stays_personality_free_with_or_without_impressions(self):
+        from types import SimpleNamespace
+        import bnl01_bot as bot
+        import bnl_journal_attribution as attribution
+        prompt = attribution.REVIEW_PREFIX + "REVIEW PAYLOAD"
+        for packet in ({}, self.packet()):
+            with self.subTest(impressions=journal._has_moment_impressions(packet)), \
+                    mock.patch.object(bot, "check_quota_availability", return_value=True), \
+                    mock.patch.object(bot, "_generate_gemini_content_with_fallback",
+                                      return_value=SimpleNamespace(candidates=[SimpleNamespace(finish_reason="STOP")])) as provider, \
+                    mock.patch.object(bot, "_extract_text_and_tokens", return_value=("{}", 0)), \
+                    mock.patch.object(bot, "render_prompt_canon_block") as canon, \
+                    mock.patch.object(bot, "render_ecosystem_lore_block") as lore:
+                self.assertEqual(bot._generate_journal_json_sync(packet, prompt), "{}")
+                provider.assert_called_once_with(prompt, bot.JOURNAL_ROUTE)
+                canon.assert_not_called()
+                lore.assert_not_called()
 
     def test_uncited_impression_is_fenced_before_approval_and_delivery(self):
         packet = self.packet()

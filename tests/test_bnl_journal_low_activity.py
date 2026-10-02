@@ -215,7 +215,8 @@ class JournalLowActivityTests(unittest.TestCase):
         self.assertNotIn("LOW-ACTIVITY EVIDENCE RULE", prompt)
         self.assertEqual(journal.JOURNAL_EDITORIAL_VERSION, packet["editorialVersion"])
         self.assertNotIn("prefer 2 sections", prompt)
-        self.assertIn("evidenceCoverageContract is mandatory", prompt)
+        self.assertIn("Cite the original evidence behind factual claims", prompt)
+        self.assertIn("Source breadth is available context, not a quota", prompt)
 
     def test_historical_projection_excludes_private_and_test_lanes_and_rechecks_deletion(self):
         public_seq = self.record(

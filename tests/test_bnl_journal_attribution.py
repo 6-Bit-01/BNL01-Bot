@@ -240,8 +240,11 @@ class JournalReviewTransportTests(unittest.TestCase):
              patch.object(self.bot, "_generate_gemini_content_with_fallback", return_value=response) as provider, \
              patch.object(self.bot, "_extract_text_and_tokens", return_value=('{}', 1)):
             self.bot._generate_journal_json_sync({}, "write a Journal")
-        self.assertEqual(provider.call_args.args,
-                         (self.bot.BNL01_SYSTEM_PROMPT + "\n\nwrite a Journal", self.bot.JOURNAL_ROUTE))
+        actual, route = provider.call_args.args
+        self.assertEqual(route, self.bot.JOURNAL_ROUTE)
+        self.assertIn(self.bot.BNL01_PUBLIC_PERSONALITY_PROMPT, actual)
+        self.assertNotIn(self.bot.BNL01_SYSTEM_PROMPT, actual)
+        self.assertTrue(actual.endswith("\n\nwrite a Journal"))
 
 
 if __name__ == "__main__":
