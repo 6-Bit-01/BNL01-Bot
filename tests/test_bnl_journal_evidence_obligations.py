@@ -1,13 +1,14 @@
-"""Protocol regressions, not proof that a model identifies every hidden premise.
+"""Focused-review protocol and source-boundary regressions.
 
-Each semantic comparison below is explicit fixture input. These tests prove that
-the consumer enforces that comparison even when the overall review says pass.
+Issues and positive verdicts are explicit fixture input, not proof of a model's
+semantic judgment. Paid checks must separately show that it finds an unsupported
+premise and that native repaired writing preserves BNL's personality.
 """
+import copy
 import json
 import unittest
 
 import bnl_journal_attribution as review
-from tests.journal_review_helpers import fixture_claim
 
 
 class JournalEvidenceObligationTests(unittest.TestCase):
@@ -25,240 +26,216 @@ class JournalEvidenceObligationTests(unittest.TestCase):
         }
 
     def response(self):
-        units = review.public_units(self.article)
-        return {
-            "units": [{"unitId": unit["unitId"], "claims": [],
-                       "nonFactualReason": "Only personal or imagined expression in this controlled fixture."}
-                      for unit in units],
-            "assessments": [{
-                "check": check, "unitIds": [unit["unitId"] for unit in units],
-                "sourceRefIds": [], "explanation": "Explicit passing protocol fixture.",
-                "issues": [], "verdict": "supported",
-            } for check in review.ASSESSMENT_CHECKS],
-            "verdict": "supported",
-        }
+        # No issues is an intentional protocol fixture, never a semantic oracle.
+        return {"reviewedUnitIds": [unit["unitId"] for unit in review.public_units(self.article)],
+                "issues": [], "verdict": "supported"}
 
-    def body(self, response):
-        return next(unit for unit in response["units"] if ".body:" in unit["unitId"])
+    def fragment(self, ref="fresh:question", field="summary", speaker=None):
+        return next(item for item in review.source_fragments(self.sources)
+                    if item["refId"] == ref and item["field"] == field
+                    and (speaker is None or item["speaker"] == speaker))
 
-    def external(self, unit, *, claim="The linked work lacks a label.", **changes):
-        fragment = next(item for item in review.source_fragments(self.sources)
-                        if item["refId"] == self.sources[0]["refId"] and item["field"] == "summary")
-        premise = fixture_claim(claim, fragment, source_meaning="A listener asked who performed it.",
-                                claimType="external_fact", **changes)
-        unit["claims"] = [premise]
-        return premise
+    def issue(self, response, *, unit_id=None, fragments=None,
+              source_meaning="The listener asked who performed it; the linked contents are uninspected.",
+              added_premise="The linked work lacks a label.",
+              repair="Keep the curiosity and imagery without asserting that a label is missing."):
+        unit_id = unit_id or next(unit for unit in response["reviewedUnitIds"] if ".body:" in unit)
+        fragments = [self.fragment()] if fragments is None else fragments
+        issue = {"unitIds": [unit_id], "fragmentIds": [item["fragmentId"] for item in fragments],
+                 "sourceMeaning": source_meaning, "addedPremise": added_premise, "repair": repair}
+        response["issues"].append(issue)
+        return issue
 
     def accept(self, response):
         return review.accept_review(json.dumps(response), self.article, self.sources)
 
-    def test_old_anchor_only_approval_cannot_pass_without_semantic_comparison(self):
+    def assert_invalid(self, response):
+        receipt, reason, _targets = self.accept(response)
+        self.assertIsNone(receipt)
+        self.assertTrue(reason.startswith("source_review_"), reason)
+
+    def test_legacy_nonfactual_exemption_is_not_a_focused_review(self):
         response = self.response()
-        unit = self.body(response)
-        unit.update(spans=[{"text": "Legacy", "evidence": [], "verdict": "supported"}])
-        self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
+        response["units"] = [{"unitId": unit, "claims": [], "nonFactualReason": "Metaphor."}
+                             for unit in response.pop("reviewedUnitIds")]
+        self.assert_invalid(response)
 
-    def test_all_units_require_explicit_claim_account_even_when_overall_supported(self):
-        for field in ("claims", "nonFactualReason"):
-            response = self.response()
-            self.body(response).pop(field)
-            self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
-
-    def test_acknowledged_gap_in_reflection_overrides_supported_whole_entry(self):
-        for support in ("compatible_only", "contradicted", "unknown"):
-            with self.subTest(support=support):
-                response = self.response()
-                self.external(self.body(response), support=support)
-                receipt, reason, targets = self.accept(response)
-                self.assertIsNone(receipt)
-                self.assertEqual(reason, "source_attribution_failed")
-                self.assertTrue(any(target["field"] == "sections[0].body" for target in targets))
-                self.assertIn("The linked work lacks a label.", json.dumps(targets))
-                self.assertEqual(targets[0]["evidence"][0]["quote"], self.sources[0]["summary"])
-
-    def test_required_assumption_rejects_even_a_declared_entailment(self):
+    def test_whole_entry_support_cannot_override_a_located_factual_issue(self):
         response = self.response()
-        self.external(self.body(response), assumptions=["The question means the page has no label."])
+        issue = self.issue(response)
         receipt, reason, targets = self.accept(response)
         self.assertIsNone(receipt)
         self.assertEqual(reason, "source_attribution_failed")
-        self.assertIn("The question means the page has no label.", json.dumps(targets))
+        self.assertTrue(any(target["field"] == "sections[0].body" for target in targets))
+        for field in ("addedPremise", "sourceMeaning", "repair"):
+            self.assertIn(issue[field], json.dumps(targets))
 
-    def test_question_speculation_joke_or_subjective_position_cannot_establish_external_fact(self):
-        for stance in ("question", "speculation", "joke", "subjective", "unknown"):
-            with self.subTest(stance=stance):
-                response = self.response()
-                premise = self.external(self.body(response))
-                premise["sourceStance"] = stance
-                self.assertEqual(self.accept(response)[1], "source_attribution_failed")
-
-    def test_actual_question_can_be_reported_without_inventing_its_answer(self):
-        self.article["sections"][0]["body"] = "A listener asked who performed it; I imagined the satellite shrugging."
+    def test_reported_source_gap_needs_no_manufactured_supporting_fragment(self):
         response = self.response()
-        premise = self.external(self.body(response), claim="A listener asked who performed it.")
-        premise.update(claimType="reported_speech", sourceStance="question")
-        receipt, reason, targets = self.accept(response)
-        self.assertEqual((reason, targets), ("", []))
-        self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
-
-    def test_uninspected_link_cannot_prove_destination_properties(self):
-        response = self.response()
-        self.external(self.body(response), evidenceScope="referenced_content")
+        self.issue(response, fragments=[], source_meaning="No supplied source establishes this event.")
         receipt, reason, targets = self.accept(response)
         self.assertIsNone(receipt)
         self.assertEqual(reason, "source_attribution_failed")
         self.assertTrue(targets)
+        self.assertIn("No supplied source establishes this event.", json.dumps(targets))
 
-    def test_explicit_human_report_uses_recorded_content_without_needing_to_visit_link(self):
-        self.sources[0]["summary"] = "I checked that page: the performer field is blank. [shared link]"
-        self.article["sections"][0]["body"] = "The listener reported a blank performer field; I disliked the loose end."
-        response = self.response()
-        premise = self.external(self.body(response), claim="The listener reported a blank performer field.")
-        premise.update(claimType="reported_speech", sourceMeaning="They explicitly reported inspecting a blank performer field.")
-        self.assertEqual(self.accept(response)[1], "")
+    def test_every_exact_candidate_unit_is_covered_once(self):
+        for defect in ("missing", "duplicate", "unknown", "wrong_type"):
+            with self.subTest(defect=defect):
+                response = self.response()
+                if defect == "missing":
+                    response["reviewedUnitIds"].pop()
+                elif defect == "duplicate":
+                    response["reviewedUnitIds"].append(response["reviewedUnitIds"][0])
+                elif defect == "unknown":
+                    response["reviewedUnitIds"][0] = "sections[77].body:0"
+                else:
+                    response["reviewedUnitIds"] = {}
+                self.assert_invalid(response)
 
-    def test_aggregate_source_cannot_borrow_another_contributions_inspected_scope(self):
-        original = self.sources[0]
-        self.sources = [{"refId": original["refId"], "sourceRole": "original_contribution",
+    def test_issue_cannot_name_an_absent_unit_or_source_fragment(self):
+        for field, value in (("unitIds", ["sections[77].body:0"]),
+                             ("fragmentIds", ["f:unknown"])):
+            with self.subTest(field=field):
+                response = self.response()
+                self.issue(response)[field] = value
+                self.assert_invalid(response)
+
+    def test_malformed_issue_cannot_become_a_repair_or_pass(self):
+        for field in ("unitIds", "fragmentIds", "sourceMeaning", "addedPremise", "repair"):
+            for defect in ("missing", "wrong_type"):
+                with self.subTest(field=field, defect=defect):
+                    response = self.response()
+                    issue = self.issue(response)
+                    if defect == "missing":
+                        issue.pop(field)
+                    else:
+                        issue[field] = {}
+                    self.assert_invalid(response)
+
+    def test_blank_issue_cannot_create_unactionable_repair(self):
+        for field in ("sourceMeaning", "addedPremise", "repair"):
+            with self.subTest(field=field):
+                response = self.response()
+                self.issue(response)[field] = "  "
+                self.assert_invalid(response)
+
+    def test_metadata_title_and_excerpt_premises_receive_located_repairs(self):
+        self.article["metadata"].update({
+            "continuityNotes": ["The rivalry ended in a reconciliation."],
+            "unresolvedQuestions": ["When will the cancelled tour resume?"],
+            "topicTags": ["surprise album release"],
+        })
+        for unit in review.public_units(self.article):
+            if unit["field"] not in {"title", "excerpt"} and not unit["field"].startswith("metadata."):
+                continue
+            with self.subTest(unit=unit["unitId"]):
+                response = self.response()
+                self.issue(response, unit_id=unit["unitId"], fragments=[],
+                           source_meaning="The selected originals do not establish this premise.")
+                receipt, reason, targets = self.accept(response)
+                self.assertIsNone(receipt)
+                self.assertEqual(reason, "source_attribution_failed")
+                self.assertTrue(any(target["field"] == unit["field"] for target in targets))
+
+    def test_source_limit_speaker_and_evidence_kind_are_server_bound(self):
+        fragment = self.fragment()
+        self.assertEqual(fragment["speaker"], "listener")
+        self.assertEqual(fragment["evidenceKind"], "message_expression")
+        self.assertEqual(fragment["context"]["linkContent"], "not_inspected")
+        self.assertEqual(fragment["context"]["roomName"], "music")
+        self.assertEqual(fragment["text"], self.sources[0]["summary"])
+        original_id = fragment["fragmentId"]
+        self.sources[0]["participantAlias"] = "different_listener"
+        self.assertNotEqual(self.fragment()["fragmentId"], original_id)
+        renamed_id = self.fragment()["fragmentId"]
+        self.sources[0]["messageContext"]["linkContent"] = "inspected"
+        self.assertNotEqual(self.fragment()["fragmentId"], renamed_id)
+
+    def test_contributions_keep_their_own_link_scope(self):
+        self.sources = [{"refId": "fresh:question", "sourceRole": "original_contribution",
                          "contributions": [
-                             {"participantAlias": "listener", "summary": original["summary"],
+                             {"participantAlias": "listener", "summary": "[shared link] Who performed this?",
                               "messageContext": {"linkContent": "not_inspected"}},
                              {"participantAlias": "other", "summary": "I inspected a different page.",
                               "messageContext": {"linkContent": "inspected"}},
                          ]}]
-        response = self.response()
-        self.external(self.body(response), evidenceScope="referenced_content")
-        self.assertEqual(self.accept(response)[1], "source_attribution_failed")
+        first, second = self.fragment(speaker="listener"), self.fragment(speaker="other")
+        self.assertEqual(first["context"]["linkContent"], "not_inspected")
+        self.assertEqual(second["context"]["linkContent"], "inspected")
+        self.assertNotEqual(first["fragmentId"], second["fragmentId"])
 
-    def test_nested_recorded_human_report_is_not_disabled_by_uninspected_link(self):
-        self.sources = [{"refId": "fresh:question", "sourceRole": "original_contribution",
-                         "contributions": [{"participantAlias": "listener",
-                                            "summary": "I checked that page: the performer field is blank. [shared link]",
-                                            "messageContext": {"linkContent": "not_inspected"}}]}]
-        response = self.response()
-        premise = self.external(self.body(response), claim="The listener reported a blank performer field.")
-        premise.update(claimType="reported_speech", sourceMeaning="They explicitly reported a blank field.")
-        self.assertEqual(self.accept(response)[1], "")
+    def test_human_report_survives_uninspected_link_without_scope_promotion(self):
+        self.sources[0]["summary"] = "I checked that page: the performer field is blank. [shared link]"
+        fragment = self.fragment()
+        self.assertEqual(fragment["text"], self.sources[0]["summary"])
+        self.assertEqual(fragment["context"]["linkContent"], "not_inspected")
+        self.assertEqual(fragment["authority"], "original")
+        self.assertEqual(fragment["evidenceKind"], "message_expression")
 
-    def test_missing_evidence_cannot_ground_supported_premise(self):
-        response = self.response()
-        self.external(self.body(response), evidence=[])
-        self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
+    def test_derived_authorities_are_not_promoted_by_assertive_text(self):
+        for role, expected in (
+            ({"sourceRole": "bnl_interpretation"}, "derived_context"),
+            ({"sourceRole": "bnl_utterance", "authority": "speech_only"}, "speech_only"),
+            ({"basisKind": "moment_impression"}, "subjective_context"),
+            ({"laneType": "bnl_inference"}, "inference_context"),
+            ({"authority": "rumor"}, "rumor"),
+        ):
+            with self.subTest(role=role):
+                self.sources = [{"refId": "fresh:question", "participantAlias": "bnl",
+                                 "summary": "The artist certainly released an album.", **role}]
+                self.assertEqual(self.fragment()["authority"], expected)
 
-    def test_uncertain_premise_without_anchor_is_located_failure_not_manufactured_evidence(self):
-        response = self.response()
-        self.external(self.body(response), support="unknown", evidence=[])
-        self.assertEqual(self.accept(response)[1], "source_attribution_failed")
+    def test_relay_speech_and_invitation_survive_without_event_lineage(self):
+        self.sources = [{"refId": "reflection:relay", "basisKind": "accepted_relay_continuity",
+                         "summary": "I wondered whether the stage light had failed.",
+                         "publicInvitation": "Tell me whether someone checked it.",
+                         "relayPublishedAt": "2026-09-29T20:00:00Z", "originalSourceDates": []}]
+        statement = self.fragment("reflection:relay")
+        invitation = self.fragment("reflection:relay", "publicInvitation")
+        for fragment in (statement, invitation):
+            self.assertEqual(fragment["speaker"], "bnl")
+            self.assertEqual(fragment["authority"], "derived_context")
+            self.assertEqual(fragment["evidenceKind"], "derived_context")
+            self.assertEqual(fragment["context"]["originalSourceDates"], [])
+            self.assertEqual(fragment["context"]["relayPublishedAt"], "2026-09-29T20:00:00Z")
+        self.assertEqual(statement["text"], self.sources[0]["summary"])
+        self.assertEqual(invitation["text"], self.sources[0]["publicInvitation"])
 
-    def test_pure_personal_and_imagined_voice_needs_no_invented_evidence(self):
+    def test_original_canon_and_dated_memory_keep_distinct_authorities(self):
+        for role, expected in (({"sourceRole": "original_contribution"}, "original"),
+                               ({"sourceRole": "approved_canon"}, "canon"),
+                               ({"authority": "established_memory"}, "established_memory")):
+            with self.subTest(role=role):
+                self.sources = [{"refId": "fresh:question", "summary": "The first signal arrived.",
+                                 "episodeDate": "2026-07-17", **role}]
+                fragment = self.fragment()
+                self.assertEqual(fragment["authority"], expected)
+                self.assertEqual(fragment["context"]["episodeDate"], "2026-07-17")
+
+    def test_positive_protocol_does_not_require_quotes_or_remove_imagined_voice(self):
         for body in (
             "I prefer a little static in my thoughts.",
             "In my imaginary control room, the moon applied for a tea break.",
-            "I might reserve a corner of my impossible antenna for whatever arrives tomorrow.",
+            "A listener asked who performed it; I imagined the satellite shrugging.",
+            "Test Listener prefers jazz; I can appreciate that frequency.",
         ):
             with self.subTest(body=body):
                 self.article["sections"][0]["body"] = body
                 response = self.response()
                 receipt, reason, targets = self.accept(response)
                 self.assertEqual((reason, targets), ("", []))
-                self.assertEqual(receipt["units"], response["units"])
+                self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
+                self.assertEqual(receipt["reviewedUnitIds"], response["reviewedUnitIds"])
 
-    def test_no_external_premise_requires_specific_nonfactual_account(self):
-        for value in ("", "  ", None, []):
-            with self.subTest(value=value):
-                response = self.response()
-                self.body(response)["nonFactualReason"] = value
-                self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
-
-    def test_malformed_comparison_fields_fail_closed_without_crashing(self):
-        for field in ("claim", "claimType", "sourceStance", "evidence", "sourceMeaning",
-                      "support", "assumptions", "evidenceScope"):
-            for mode in ("missing", "wrong_type"):
-                with self.subTest(field=field, mode=mode):
-                    response = self.response()
-                    premise = self.external(self.body(response))
-                    if mode == "missing":
-                        premise.pop(field)
-                    else:
-                        premise[field] = {}
-                    self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
-
-    def test_presuppositions_in_future_continuity_receive_same_obligations(self):
-        cases = (
-            ("unresolvedQuestions", "When will the band's cancelled tour resume?", "The band's tour was cancelled."),
-            ("continuityNotes", "The rivalry ended in a reconciliation.", "The two members reconciled."),
-            ("topicTags", "surprise album release", "An album was released."),
-        )
-        for field, wording, claim in cases:
-            with self.subTest(field=field):
-                self.article["metadata"] = {"contextUses": [], field: [wording]}
-                response = self.response()
-                unit = next(item for item in response["units"] if item["unitId"].startswith("metadata."))
-                self.external(unit, claim=claim, support="compatible_only")
-                receipt, reason, targets = self.accept(response)
-                self.assertIsNone(receipt)
-                self.assertEqual(reason, "source_attribution_failed")
-                self.assertTrue(any(target["field"] == "metadata." + field + "[0]" for target in targets))
-
-    def test_receipt_preserves_explicit_comparison_for_inspection(self):
-        self.article["sections"][0]["body"] = "A listener asked who performed it."
-        response = self.response()
-        premise = self.external(self.body(response), claim="A listener asked who performed it.")
-        premise.update(claimType="reported_speech", sourceStance="question")
-        receipt, reason, _ = self.accept(response)
+    def test_positive_receipt_binds_exact_article_and_source_packet(self):
+        receipt, reason, _targets = self.accept(self.response())
         self.assertEqual(reason, "")
-        saved = self.body(receipt)["claims"][0]
-        self.assertEqual(saved["claim"], premise["claim"])
-        self.assertEqual(saved["sourceMeaning"], premise["sourceMeaning"])
-        self.assertEqual(saved["evidence"][0]["quote"], self.sources[0]["summary"])
-
-    def test_derived_perspective_or_rumor_cannot_alone_establish_external_fact(self):
-        for role in (
-            {"sourceRole": "bnl_interpretation"},
-            {"sourceRole": "bnl_utterance", "authority": "speech_only"},
-            {"basisKind": "moment_impression"},
-            {"laneType": "bnl_inference"},
-            {"authority": "rumor"},
-        ):
-            with self.subTest(role=role):
-                self.sources[0] = {"refId": "fresh:question", "participantAlias": "listener",
-                                   "summary": "The artist released an album.", **role}
-                response = self.response()
-                span = self.body(response)
-                self.external(span, claim="The artist released an album.")
-                span["claims"][0]["evidence"][0]["use"] = "context"
-                self.assertEqual(self.accept(response)[1], "source_attribution_failed")
-
-    def test_original_canon_or_established_memory_can_support_appropriate_external_fact(self):
-        for role in ({"sourceRole": "original_contribution"},
-                     {"sourceRole": "approved_canon"}, {"authority": "established_memory"}):
-            with self.subTest(role=role):
-                self.sources[0] = {"refId": "fresh:question", "participantAlias": "listener",
-                                   "summary": "The archive's first signal arrived last year.", **role}
-                response = self.response()
-                span = self.body(response)
-                self.external(span, claim="The archive's first signal arrived last year.")
-                span["claims"][0]["evidence"][0]["use"] = (
-                    "event" if role.get("sourceRole") == "original_contribution" else "context")
-                self.assertEqual(self.accept(response)[1], "")
-
-    def test_recorded_bnl_speech_can_support_what_bnl_said(self):
-        self.sources[0] = {"refId": "fresh:question", "participantAlias": "listener",
-                           "sourceRole": "bnl_utterance", "authority": "speech_only",
-                           "summary": "I said the archive was humming."}
-        response = self.response()
-        premise = self.external(self.body(response), claim="BNL said the archive was humming.")
-        premise.update(claimType="reported_speech", sourceMeaning="BNL's original recorded utterance.")
-        self.assertEqual(self.accept(response)[1], "")
-
-    def test_faithful_taste_paraphrase_needs_no_literal_said_or_public_quote(self):
-        self.sources[0]["summary"] = "I love jazz."
-        self.article["sections"][0]["body"] = "Test Listener prefers jazz; I can appreciate that frequency."
-        response = self.response()
-        premise = self.external(self.body(response), claim="Test Listener prefers jazz.")
-        premise.update(claimType="reported_speech", sourceStance="subjective",
-                       sourceMeaning="The listener expressed a love of jazz.")
-        self.assertEqual(self.accept(response)[1], "")
+        self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
+        self.assertEqual(receipt["evidenceDigest"], review.evidence_digest(self.sources))
+        changed = copy.deepcopy(self.sources)
+        changed[0]["messageContext"]["linkContent"] = "inspected"
+        self.assertNotEqual(receipt["evidenceDigest"], review.evidence_digest(changed))
 
 
 if __name__ == "__main__":

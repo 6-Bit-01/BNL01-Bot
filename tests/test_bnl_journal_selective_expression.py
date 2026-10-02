@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import bnl_journal as journal
 import bnl_journal_attribution as attribution
-from tests.journal_review_helpers import fixture_claim, review_inputs, supported_review
+from tests.journal_review_helpers import fixture_issue, review_inputs, supported_review
 
 
 class JournalSelectiveOmissionTests(unittest.TestCase):
@@ -80,13 +80,35 @@ class JournalSelectiveOmissionTests(unittest.TestCase):
                         if fragment["refId"] == "fresh:2" and fragment["field"] == "summary")
         target = next(unit for unit in units
                       if unit["field"] == "sections[1].body" and "released" in unit["text"])
-        review = next(unit for unit in response["units"] if unit["unitId"] == target["unitId"])
-        review["claims"] = [fixture_claim(
-            "Two members released a collaboration.", original,
-            claimType="external_fact", sourceStance="question", support="unknown",
-            assumptions=["A proposed collaboration occurred and was released."],
+        response["issues"] = [fixture_issue(
+            [target["unitId"]], [original],
+            source_meaning="A member asked about a possible collaboration.",
+            added_premise="Two members released a collaboration.",
         )]
         return json.dumps(response)
+
+    def test_uncertain_framing_does_not_bypass_the_source_reviewer(self):
+        raw = json.loads(self.draft(include_unsupported_story=True))
+        raw["sections"][1]["body"] = "Apparently " + raw["sections"][1]["body"]
+        outputs = iter([json.dumps(raw), self.rejected_optional_story])
+
+        def generate(_packet, prompt):
+            output = next(outputs)
+            return output(prompt) if callable(output) else output
+
+        generator = Mock(side_effect=generate)
+        guard = Mock(return_value="")
+        packet_before = copy.deepcopy(self.packet)
+        article, reason, advisory = journal._generate_article_with_repairs(
+            self.packet, generator, [], max_attempts=2, generation_guard=guard,
+        )
+        self.assertEqual(generator.call_count, 2)
+        self.assertEqual(guard.call_count, 4)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertFalse(advisory)
+        self.assertTrue(generator.call_args_list[1].args[1].startswith(attribution.REVIEW_PREFIX))
+        self.assertEqual(self.packet, packet_before)
 
     def test_unsupported_selected_story_can_be_omitted_and_exact_remainder_is_reviewed(self):
         first = self.draft(include_unsupported_story=True)

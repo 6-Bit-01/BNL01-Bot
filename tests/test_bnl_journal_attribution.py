@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import bnl_journal_attribution as review
-from tests.journal_review_helpers import fixture_claim, review_inputs
+from tests.journal_review_helpers import fixture_issue, review_inputs
 
 
 class JournalAttributionTests(unittest.TestCase):
@@ -27,90 +27,42 @@ class JournalAttributionTests(unittest.TestCase):
              "authority": "speech_only", "sourceRole": "bnl_utterance"},
         ]
 
-    def fragment(self, ref, field="summary", sources=None):
-        return next(item for item in review.source_fragments(sources or self.sources)
+    def fragment(self, ref, field="summary"):
+        return next(item for item in review.source_fragments(self.sources)
                     if item["refId"] == ref and item["field"] == field)
 
     def verdict(self):
-        units = []
-        for unit in review.public_units(self.article):
-            claims = []
-            if unit["text"].startswith("Test "):
-                ref = "fresh:1" if unit["text"].startswith("Test Listener") else "fresh:2"
-                claims = [fixture_claim(unit["text"], self.fragment(ref))]
-            units.append({"unitId": unit["unitId"], "claims": claims,
-                          "nonFactualReason": "A personal title or imaginative reaction in this controlled fixture." if not claims else ""})
-        return {"assessments": [
-            {"check": check, "unitIds": [unit["unitId"] for unit in units],
-             "sourceRefIds": ["fresh:1", "fresh:2"],
-             "explanation": "Controlled passing " + check + " fixture; not a live quality verdict.",
-             "issues": [], "verdict": "supported"} for check in review.ASSESSMENT_CHECKS
-        ], "units": units, "verdict": "supported"}
-
-    @staticmethod
-    def claims(data):
-        return [claim for unit in data["units"] for claim in unit["claims"]]
+        return {"reviewedUnitIds": [unit["unitId"] for unit in review.public_units(self.article)],
+                "issues": [], "verdict": "supported"}
 
     def accept(self, value):
         return review.accept_review(json.dumps(value), self.article, self.sources)
 
-    def test_complete_review_binds_prose_paragraphs_citations_and_continuity(self):
-        receipt, reason, targets = self.accept(self.verdict())
-        self.assertEqual((reason, targets), ("", []))
-        self.assertEqual(receipt["version"], review.REVIEW_VERSION)
-        self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
-        for mutate in (
-            lambda a: a.update(title="An Unchecked Different Story"),
-            lambda a: a["sections"][0].update(body="Test Host accused the bot instead."),
-            lambda a: a["sourceRefIds"].update({"Who Said What": ["fresh:2"]}),
-            lambda a: a["metadata"].update(contextUses=[{"claim": "An unchecked memory"}]),
-            lambda a: a["sections"][0].update(body=a["sections"][0]["body"].replace(". ", ".\n\n", 1)),
-        ):
-            changed = copy.deepcopy(self.article)
-            mutate(changed)
-            self.assertNotEqual(receipt["articleDigest"], review.article_digest(changed))
+    def issue(self, fragment, units=None):
+        return fixture_issue(units or ["sections[0].body:0"], [fragment],
+                             source_meaning=fragment["text"],
+                             added_premise="The candidate assigns this statement to the wrong speaker.")
 
-    def test_empty_duplicate_missing_and_unknown_units_cannot_pass(self):
-        for mode in ("empty", "duplicate", "missing", "unknown"):
-            data = self.verdict()
-            if mode == "empty": data["units"] = []
-            elif mode == "duplicate": data["units"][-1] = data["units"][0]
-            elif mode == "missing": data["units"].pop()
-            else: data["units"][-1]["unitId"] = "not-a-candidate-unit"
-            self.assertEqual(self.accept(data)[1], "source_review_incomplete", mode)
-
-    def test_canonical_speaker_and_quote_come_only_from_selected_fragment(self):
-        receipt, reason, _ = self.accept(self.verdict())
-        self.assertEqual(reason, "")
-        anchors = [claim["evidence"][0] for claim in self.claims(receipt)]
+    def test_canonical_speaker_quote_and_kind_come_only_from_selected_fragment(self):
+        data = self.verdict()
+        data["issues"] = [self.issue(self.fragment(ref)) for ref in ("fresh:1", "fresh:2")]
+        receipt, reason, targets = self.accept(data)
+        self.assertIsNone(receipt)
+        self.assertEqual(reason, "source_attribution_failed")
+        anchors = [target["evidence"][0] for target in targets]
         self.assertEqual([item["speaker"] for item in anchors], ["listener", "host"])
         self.assertEqual([item["quote"] for item in anchors], [source["summary"] for source in self.sources[:2]])
-        for key, wrong in (("speaker", "host"), ("quote", "An invented action."),
-                           ("refId", "fresh:2"), ("field", "reason")):
-            data = self.verdict()
-            self.claims(data)[0]["evidence"][0][key] = wrong
-            self.assertEqual(self.accept(data)[1], "source_review_invalid_anchor", key)
-
-    def test_unknown_changed_or_duplicate_fragment_cannot_pass(self):
-        for fragment_id in ("f:missing", {}, None, 42):
-            data = self.verdict()
-            self.claims(data)[0]["evidence"][0]["fragmentId"] = fragment_id
-            self.assertEqual(self.accept(data)[1], "source_review_invalid_anchor")
-        data = self.verdict()
-        self.claims(data)[0]["evidence"] *= 2
-        self.assertEqual(self.accept(data)[1], "source_review_invalid_anchor")
-        data = self.verdict()
-        self.sources[0]["summary"] = "An updated original."
-        self.assertEqual(self.accept(data)[1], "source_review_invalid_anchor")
+        self.assertTrue(all(item["evidenceKind"] == "message_expression" for item in anchors))
+        for key in ("speaker", "quote", "refId", "field", "use", "evidenceKind"):
+            altered = copy.deepcopy(data)
+            altered["issues"][0][key] = "invented"
+            self.assertEqual(self.accept(altered)[1], "source_review_invalid_grounding")
 
     def test_fragment_identity_is_stable_across_source_order_but_keeps_people_distinct(self):
         first = review.source_fragments(self.sources)
         self.assertEqual(first, review.source_fragments(list(reversed(self.sources))))
-        same_words = {**self.sources[0], "refId": "fresh:other", "participantAlias": "other"}
-        self.sources.append(same_words)
+        self.sources.append({**self.sources[0], "refId": "fresh:other", "participantAlias": "other"})
         self.assertNotEqual(self.fragment("fresh:1")["fragmentId"], self.fragment("fresh:other")["fragmentId"])
-        # Public name collision cannot change a server-bound original author.
-        self.sources[-1]["publicSpeakerName"] = "Test Listener"
         self.assertEqual(self.fragment("fresh:1")["speaker"], "listener")
         self.assertEqual(self.fragment("fresh:other")["speaker"], "other")
 
@@ -121,92 +73,70 @@ class JournalAttributionTests(unittest.TestCase):
             {"participantAlias": "b", "summary": "A reply.", "observedAt": "2026-01-01T11:00:00Z",
              "messageContext": {"roomName": "second", "linkContent": "inspected"}},
         ]}]
-        fragments = review.source_fragments(self.sources)
-        for fragment in fragments:
+        for fragment in review.source_fragments(self.sources):
             expected = self.sources[0]["contributions"][fragment["speaker"] == "b"]
             self.assertEqual(fragment["context"]["observedAt"], expected["observedAt"])
             self.assertEqual(fragment["context"]["roomName"], expected["messageContext"]["roomName"])
             self.assertEqual(fragment["context"]["linkContent"], expected["messageContext"]["linkContent"])
 
-    def test_metadata_and_impression_reason_are_distinct_exact_fragments(self):
-        self.sources[0].update(observedAtPacific="2026-06-09T19:30:00-07:00", roomRef="room:a")
+    def test_original_envelope_message_expression_and_recorded_event_are_distinct(self):
+        self.sources[0].update(observedAt="2026-01-01T10:00:00Z", roomRef="room:a")
+        self.sources.append({"refId": "show:1", "sourceKind": "finalized_show",
+                             "summary": "Forty tracks played.", "episodeDate": "2026-01-01"})
+        self.assertEqual(self.fragment("fresh:1")["evidenceKind"], "message_expression")
+        for field in ("observedAt", "roomRef"):
+            self.assertEqual(self.fragment("fresh:1", field)["evidenceKind"], "message_envelope")
+        self.assertEqual(self.fragment("show:1")["evidenceKind"], "recorded_event")
+        self.assertEqual(self.fragment("show:1", "episodeDate")["evidenceKind"], "recorded_event_context")
+        self.assertEqual(self.fragment("speech:3")["evidenceKind"], "message_expression")
+        self.assertEqual(self.fragment("speech:3")["authority"], "speech_only")
+
+    def test_impression_reason_is_not_replaced_by_impression_or_contributor_gist(self):
         self.sources.append({"refId": "impression:1", "basisKind": "moment_impression",
                              "impression": "I enjoy their friction.", "reason": "The later joke made me reconsider.",
                              "contributions": [{"participantAlias": "listener", "summary": "Their derived gist."}]})
-        for field in ("observedAtPacific", "roomRef"):
-            self.assertEqual(self.fragment("fresh:1", field)["text"], self.sources[0][field])
-        for field in ("impression", "reason"):
-            fragment = self.fragment("impression:1", field)
-            self.assertEqual(fragment["text"], self.sources[-1][field])
-            self.assertEqual(fragment["speaker"], "bnl")
-        self.assertNotEqual(self.fragment("impression:1", "reason")["fragmentId"],
-                            self.fragment("impression:1", "impression")["fragmentId"])
-
-    def test_r6_reason_selection_cannot_accidentally_bind_to_impression(self):
-        # Synthetic analogue of the saved R6 field-copy failure; not a semantic oracle.
-        self.sources.append({"refId": "impression:1", "basisKind": "moment_impression",
-                             "impression": "I enjoy their friction.", "reason": "The later joke made me reconsider."})
-        data = self.verdict()
         fragment = self.fragment("impression:1", "reason")
-        self.claims(data)[0]["evidence"] = [{"fragmentId": fragment["fragmentId"], "use": "context"}]
-        receipt, reason, _ = self.accept(data)
-        self.assertEqual(reason, "")
-        anchor = self.claims(receipt)[0]["evidence"][0]
-        self.assertEqual((anchor["field"], anchor["quote"], anchor["speaker"]),
-                         ("reason", "The later joke made me reconsider.", "bnl"))
-
-    def test_missing_claim_account_or_legacy_spans_cannot_approve(self):
-        for mode in ("missing", "empty_reason", "legacy", "extra_copied_text"):
-            data = self.verdict()
-            unit = data["units"][0]
-            if mode == "missing": unit.pop("claims")
-            elif mode == "empty_reason": unit["nonFactualReason"] = " "
-            elif mode == "legacy": unit.update(spans=[{"text": "Old protocol", "verdict": "supported"}])
-            else: unit["text"] = "A made-up replacement"
-            self.assertEqual(self.accept(data)[1], "source_review_invalid_grounding", mode)
-
-    def test_bnl_speech_and_derived_contributions_cannot_masquerade_as_events(self):
         data = self.verdict()
-        self.claims(data)[0]["evidence"] = [{"fragmentId": self.fragment("speech:3")["fragmentId"], "use": "event"}]
-        self.assertEqual(self.accept(data)[1], "source_review_derived_as_fact")
-        self.claims(data)[0]["evidence"][0]["use"] = "speech"
-        self.assertEqual(self.accept(data)[1], "")
-        for kind in ("public_moment", "published_journal", "published_ballad", "accepted_relay_continuity"):
-            source = {"refId": "reflection:" + kind, "basisKind": kind,
+        data["issues"] = [self.issue(fragment)]
+        _, reason, targets = self.accept(data)
+        self.assertEqual(reason, "source_attribution_failed")
+        anchor = targets[0]["evidence"][0]
+        self.assertEqual((anchor["field"], anchor["quote"], anchor["speaker"], anchor["evidenceKind"]),
+                         ("reason", "The later joke made me reconsider.", "bnl", "subjective_context"))
+        self.assertNotEqual(fragment["fragmentId"], self.fragment("impression:1", "impression")["fragmentId"])
+
+    def test_derived_contributions_keep_their_origin_without_becoming_originals(self):
+        for basis in ("public_moment", "published_journal", "published_ballad", "accepted_relay_continuity"):
+            source = {"refId": "reflection:" + basis, "basisKind": basis,
+                      "sourceRole": "original_contribution", "authority": "original",
                       "contributions": [copy.deepcopy(self.sources[0])]}
             self.sources.append(source)
-            data = self.verdict()
-            anchor = {"fragmentId": self.fragment(source["refId"])["fragmentId"], "use": "speech"}
-            self.claims(data)[0]["evidence"] = [anchor]
-            for use in ("speech", "event"):
-                anchor["use"] = use
-                self.assertEqual(self.accept(data)[1], "source_review_derived_as_fact")
-            anchor["use"] = "context"
-            self.assertEqual(self.accept(data)[1], "")
+            fragment = self.fragment(source["refId"])
+            self.assertEqual(fragment["speaker"], "listener")
+            self.assertEqual(fragment["authority"], "derived_context")
+            self.assertEqual(fragment["evidenceKind"], "derived_context")
 
-    def test_memory_and_rumor_require_matching_body_section_declaration(self):
-        for lane_type, role in (("established_broadcast_memory", "established_memory"), ("community_rumor", "rumor")):
-            source = {"refId": "lane:test", "summary": "An earlier sticker discussion.", "authority": role}
-            sources = [*self.sources, source]
-            contract = {"lane:test": {"laneType": lane_type}}
-            data = self.verdict()
-            self.claims(data)[0]["evidence"] = [{"fragmentId": self.fragment("lane:test", sources=sources)["fragmentId"], "use": "context"}]
-            declaration = {"laneRefId": "lane:test", "laneType": lane_type, "sectionHeading": "Who Said What"}
-            for wrong in ([], [{**declaration, "sectionHeading": "Another Section"}],
-                          [{**declaration, "laneRefId": "lane:other"}], [{**declaration, "laneType": "bnl_inference"}]):
-                self.article["metadata"]["contextUses"] = wrong
-                _, reason, targets = review.accept_review(json.dumps(data), self.article, sources, context_contract=contract)
-                self.assertEqual(reason, "source_attribution_failed")
-                self.assertEqual(targets[0]["check"], "missing_context_declaration")
-            self.article["metadata"]["contextUses"] = [declaration]
-            self.assertEqual(review.accept_review(json.dumps(data), self.article, sources, context_contract=contract)[1], "")
+    def test_relay_owned_expression_and_member_contribution_keep_distinct_speakers(self):
+        self.sources.append({"refId": "relay:1", "basisKind": "accepted_relay_continuity",
+                             "summary": "I wondered about that question.", "publicInvitation": "Who has a theory?",
+                             "contributions": [copy.deepcopy(self.sources[0])],
+                             "relayPublishedAt": "2026-02-01", "originalSourceDates": []})
+        fragments = [item for item in review.source_fragments(self.sources) if item["refId"] == "relay:1"]
+        own = [item for item in fragments if item["text"] in {"I wondered about that question.", "Who has a theory?"}]
+        self.assertEqual(len(own), 2)
+        self.assertTrue(all(item["speaker"] == "bnl" and item["authority"] == "derived_context" for item in own))
+        member = next(item for item in fragments if item["text"] == "The bot invented it.")
+        self.assertEqual(member["speaker"], "listener")
+        self.assertEqual(member["publicSpeakerName"], "Test Listener")
 
-    def test_same_fresh_wording_does_not_imply_use_of_unrelated_memory(self):
-        self.sources.append({"refId": "memory:old", "summary": "The bot invented it during an older unrelated joke.",
-                             "epistemicStatus": "established_network_record"})
-        contract = {"memory:old": {"laneType": "established_broadcast_memory"}}
-        self.assertEqual(review.accept_review(json.dumps(self.verdict()), self.article, self.sources,
-                                             context_contract=contract)[1], "")
+    def test_bnl_owned_expression_cannot_inherit_a_human_display_name(self):
+        source = {"refId": "relay:conflict", "basisKind": "accepted_relay_continuity",
+                  "summary": "I wondered about the recording.", "participantAlias": "listener",
+                  "publicSpeakerName": "Test Listener"}
+        fragments = review.source_fragments([source])
+        self.assertTrue(fragments)
+        self.assertTrue(all(item["speaker"] == "bnl" and item["publicSpeakerName"] == "BNL"
+                            and item["authority"] == "derived_context" for item in fragments))
 
     def test_source_authority_uses_owner_role_not_confident_wording(self):
         for source, expected in ((self.sources[0], "original"), (self.sources[2], "speech_only"),
@@ -219,7 +149,7 @@ class JournalAttributionTests(unittest.TestCase):
                                  ({"sourceRole": "bnl_interpretation", "authority": "original"}, "derived_context")):
             self.assertEqual(review.source_authority(source), expected)
 
-    def test_prompt_has_one_ordered_candidate_and_no_private_metadata_or_duplicate_article(self):
+    def test_prompt_orders_originals_before_candidate_and_does_not_grade_voice(self):
         self.article["sections"][0]["body"] += "\n\nI imagined a singing satellite."
         self.article["metadata"].update(privateFixture="never project this", contextUses=[{
             "laneRefId": "memory:1", "laneType": "established_broadcast_memory", "sectionHeading": "Who Said What",
@@ -231,130 +161,31 @@ class JournalAttributionTests(unittest.TestCase):
         units, projected = review_inputs(prompt)
         self.assertEqual(evidence, original)
         self.assertEqual(projected["experienceGroups"], evidence["experienceGroups"])
-        self.assertEqual(projected["fragments"], review.source_fragments(self.sources))
         self.assertNotIn("CANDIDATE_ARTICLE_JSON", prompt)
-        self.assertNotIn("CANDIDATE_CONTEXT_USES_JSON", prompt)
         self.assertNotIn("never project", prompt)
+        self.assertIn("Do not grade style", prompt)
+        self.assertIn("faithful everyday paraphrases", prompt)
+        self.assertIn("Avoid literalizing obvious banter", prompt)
+        self.assertLess(prompt.index("ORIGINAL_EVIDENCE_JSON:"), prompt.index("CANDIDATE_UNITS_JSON:"))
+        declarations, _ = json.JSONDecoder().raw_decode(prompt.split("CANDIDATE_CONTEXT_USES_JSON: ")[1])
+        self.assertEqual(declarations[0]["basisRefIds"], ["fresh:1"])
+        self.assertNotIn("privateFixture", declarations[0])
         self.assertEqual(next(item for item in units if item["text"] == "I imagined a singing satellite.")["paragraphIndex"], 1)
-        self.assertTrue(any(item.get("contextUses") for item in units if item["field"] == "sections[0].body"))
-        self.assertFalse(any(item.get("contextUses") for item in units if item["field"] in {"title", "excerpt"}))
+        self.assertTrue(projected["evidenceGroups"]["originalRecords"])
 
-    def test_missing_duplicate_and_unknown_whole_entry_checks_cannot_approve(self):
-        for mode in ("v2", "empty", "missing", "duplicate", "unknown"):
-            with self.subTest(mode=mode):
-                data = self.verdict()
-                if mode == "v2": data.pop("assessments")
-                elif mode == "empty": data["assessments"] = []
-                elif mode == "missing": data["assessments"].pop()
-                elif mode == "duplicate": data["assessments"][-1] = data["assessments"][0]
-                else: data["assessments"][-1]["check"] = "invented_check"
-                self.assertEqual(self.accept(data), (None, "source_review_incomplete", []))
-
-    def test_whole_entry_assessments_require_bound_locations_and_specific_explanation(self):
-        for key, value in (("unitIds", []), ("unitIds", ["missing:0"]),
-                           ("unitIds", ["title:0", "title:0"]), ("unitIds", [{}]),
-                           ("sourceRefIds", ["fresh:missing"]),
-                           ("sourceRefIds", ["fresh:1", "fresh:1"]),
-                           ("sourceRefIds", [{}]), ("sourceRefIds", None),
-                           ("explanation", " "), ("explanation", []),
-                           ("issues", [""]), ("issues", {}), ("verdict", [])):
-            with self.subTest(key=key, value=value):
-                data = self.verdict()
-                data["assessments"][0][key] = value
-                self.assertEqual(self.accept(data), (None, "source_review_invalid", []))
-
-    def test_individually_supported_spans_do_not_overrule_cross_sentence_factual_findings(self):
-        # The supplied negative verdict is a controlled editor finding, not a
-        # deterministic assertion that the protocol can understand these claims.
-        for check, issue in (
-            ("event_relationships", "The reaction is in another room; two true statements do not establish a reply."),
-            ("attribution_stance", "The allegation remains disputed after the host's later explanation."),
-        ):
-            with self.subTest(check=check):
-                data = self.verdict()
-                assessment = next(item for item in data["assessments"] if item["check"] == check)
-                assessment.update(unitIds=["sections[0].body:0", "sections[0].body:1"],
-                                  explanation=issue, issues=[issue], verdict="unsupported")
-                self.assertTrue(all(claim["support"] == "entails" for claim in self.claims(data)))
-                receipt, reason, targets = self.accept(data)
-                self.assertIsNone(receipt)
-                self.assertEqual(reason, "source_attribution_failed")
-                self.assertEqual(len(targets), 1)
-                self.assertEqual(targets[0]["field"], "sections[0].body")
-                self.assertEqual(targets[0]["check"], check)
-                self.assertEqual(targets[0]["sourceRefIds"], ["fresh:1", "fresh:2"])
-                self.assertEqual(targets[0]["issues"], [issue])
-
-    def test_recap_with_reaction_and_lost_detail_require_editorial_repair(self):
-        for check, issue in (
-            ("journal_perspective", "The entry inventories events and appends fondness without developing BNL's thought."),
-            ("detail_retention", "The selected dispute loses the later explanation that changes its meaning."),
-        ):
-            for verdict in ("unsupported", "uncertain", "supported"):
-                with self.subTest(check=check, verdict=verdict):
-                    data = self.verdict()
-                    assessment = next(item for item in data["assessments"] if item["check"] == check)
-                    assessment.update(unitIds=["sections[0].body:0", "sections[0].body:2"],
-                                      explanation=issue, issues=[issue], verdict=verdict)
-                    receipt, reason, targets = self.accept(data)
-                    self.assertIsNone(receipt)
-                    self.assertEqual(reason, "journal_editorial_failed")
-                    self.assertEqual(targets[0]["check"], check)
-                    self.assertEqual(targets[0]["field"], "sections[0].body")
-
-    def test_factual_failure_takes_priority_and_preserves_editorial_repair_targets(self):
+    def test_cross_sentence_issue_preserves_all_locations_and_originals(self):
+        # A controlled discrepancy tests transport only, not semantic accuracy.
         data = self.verdict()
-        for assessment in data["assessments"]:
-            assessment.update(unitIds=["sections[0].body:0"], verdict="unsupported",
-                              issues=["Controlled specific defect for " + assessment["check"]])
-        receipt, reason, targets = self.accept(data)
-        self.assertIsNone(receipt)
-        self.assertEqual(reason, "source_attribution_failed")
-        self.assertEqual([target["check"] for target in targets], list(review.ASSESSMENT_CHECKS))
-
-    def test_whole_entry_findings_cannot_crowd_later_checks_out_of_repair_budget(self):
-        self.article["sections"] = [
-            {"heading": "Part " + str(index),
-             "body": "Test Listener said the bot invented it. I am fond of this small disagreement."}
-            for index in range(3)
-        ]
-        data = self.verdict()
-        for assessment in data["assessments"]:
-            assessment.update(verdict="unsupported", issues=["Controlled whole-entry finding."])
+        issue = fixture_issue(["sections[0].body:0", "sections[0].body:1"],
+                              [self.fragment("fresh:1"), self.fragment("fresh:2")],
+                              source_meaning="The statements were made in separate rooms.",
+                              added_premise="The first statement directly prompted the second.")
+        data["issues"] = [issue]
         _, reason, targets = self.accept(data)
         self.assertEqual(reason, "source_attribution_failed")
-        self.assertEqual(len(targets), 4)
-        self.assertEqual([target["check"] for target in targets[:12]], list(review.ASSESSMENT_CHECKS))
-        expected_units = [unit["unitId"] for unit in review.public_units(self.article)]
-        expected_fields = list(dict.fromkeys(unit["field"] for unit in review.public_units(self.article)))
-        self.assertEqual(len(expected_fields), 8)
-        for target in targets:
-            self.assertEqual(target["unitIds"], expected_units)
-            self.assertEqual(target["fieldPaths"], expected_fields)
-            self.assertEqual(target["field"], expected_fields[0])
-            self.assertEqual(target["sourceRefIds"], ["fresh:1", "fresh:2"])
-
-    def test_grounded_personal_comparison_and_selective_detail_can_pass_without_quotas(self):
-        data = self.verdict()
-        explanations = {
-            "event_relationships": "The two comments are attributed separately; BNL's sticker metaphor does not claim a shared event.",
-            "attribution_stance": "The allegation remains the listener's statement, while the host's later explanation has its own attribution.",
-            "journal_perspective": "The controlled fixture accepts BNL's comic personal investment in a tiny object; no required pronoun or emotional quota.",
-            "detail_retention": "The selected disagreement preserves both stances and the sticker detail; unrelated sources need not be inventoried.",
-        }
-        for assessment in data["assessments"]:
-            assessment["explanation"] = explanations[assessment["check"]]
-            if assessment["check"] == "journal_perspective":
-                assessment["sourceRefIds"] = []
-        receipt, reason, targets = self.accept(data)
-        self.assertEqual((reason, targets), ("", []))
-        self.assertEqual(receipt["assessments"], data["assessments"])
-        self.assertEqual(receipt["verdict"], "supported")
-
-    def test_negative_overall_verdict_without_located_findings_is_protocol_failure(self):
-        data = self.verdict()
-        data["verdict"] = "uncertain"
-        self.assertEqual(self.accept(data), (None, "source_review_invalid", []))
+        self.assertEqual(targets[0]["unitIds"], issue["unitIds"])
+        self.assertEqual(targets[0]["sourceRefIds"], ["fresh:1", "fresh:2"])
+        self.assertEqual(targets[0]["fieldPaths"], ["sections[0].body"])
 
     def test_raw_or_single_complete_json_fence_preserves_review_checks(self):
         raw = json.dumps(self.verdict())
@@ -367,24 +198,15 @@ class JournalAttributionTests(unittest.TestCase):
                       raw + "\n```", "```python\n" + raw + "\n```", '[]', 'null'):
             self.assertEqual(review.accept_review(value, self.article, self.sources)[1], "source_review_invalid")
 
-    def test_malformed_enum_values_fail_closed_instead_of_crashing(self):
+    def test_malformed_verdict_and_issue_containers_fail_closed(self):
         for bad in ([], {}, None, 42):
             data = self.verdict()
             data["verdict"] = bad
             self.assertEqual(self.accept(data)[1], "source_review_invalid")
+        for bad in ({}, None, 42, "none"):
             data = self.verdict()
-            self.claims(data)[0]["evidence"][0]["use"] = bad
-            self.assertEqual(self.accept(data)[1], "source_review_invalid_anchor")
-
-    def test_compact_response_schema_names_claims_and_server_bound_fragments(self):
-        schema = review.response_schema()
-        self.assertEqual(schema["propertyOrdering"], ["units", "assessments", "verdict"])
-        unit = schema["properties"]["units"]["items"]
-        self.assertEqual(unit["propertyOrdering"], ["unitId", "claims", "nonFactualReason"])
-        claim = unit["properties"]["claims"]["items"]
-        anchor = claim["properties"]["evidence"]["items"]
-        self.assertEqual(set(anchor["properties"]), {"fragmentId", "use"})
-        self.assertLess(claim["propertyOrdering"].index("evidence"), claim["propertyOrdering"].index("support"))
+            data["issues"] = bad
+            self.assertEqual(self.accept(data)[1], "source_review_invalid")
 
 
 class JournalReviewTransportTests(unittest.TestCase):

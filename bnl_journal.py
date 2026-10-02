@@ -125,9 +125,16 @@ _RUMOR_SENSITIVE_RE = re.compile(
     r"moderation|password|payment|phone|private|relationship|secret|sexual|staff|suicid|therapy|workplace)\b",
     re.IGNORECASE,
 )
-_EXPLICIT_RUMOR_RE = re.compile(
+# Framing an already-declared rumor and asserting that a rumor exists are
+# different checks. Ordinary reported uncertainty can use these stance words
+# without drawing on a community-rumor lane; source review still checks it.
+_RUMOR_FRAMING_RE = re.compile(
     r"\b(?:apparently|rumou?r|some regulars (?:say|suspect|wonder)|speculat(?:e|ed|ing|ion)|unconfirmed|"
     r"word around|word is)\b",
+    re.IGNORECASE,
+)
+_RUMOR_ATTRIBUTION_RE = re.compile(
+    r"\b(?:rumou?r|some regulars (?:say|suspect|wonder)|word around|word is)\b",
     re.IGNORECASE,
 )
 _EXPLICIT_BNL_INFERENCE_RE = re.compile(
@@ -4694,7 +4701,11 @@ def _journal_prompt_projection(packet: dict[str, Any]) -> dict[str, Any]:
             if (item.get("basisKind") == "accepted_relay_continuity" and isinstance(speech, dict)
                     and speech.get("partition") == "matched_public_relay_fields"
                     and isinstance(speech.get("publicMessage"), str) and speech["publicMessage"].strip()):
+                # Exact Relay wording is still BNL's prior expression, not an
+                # additional witness or an event caused by its invitation.
                 value["summary"] = speech["publicMessage"]
+                value["participantAlias"] = "bnl"
+                value["publicSpeakerName"] = "BNL"
                 if isinstance(speech.get("publicInvitation"), str) and speech["publicInvitation"].strip():
                     value["publicInvitation"] = speech["publicInvitation"]
             projected.append(value)
@@ -4869,7 +4880,7 @@ def build_generation_prompt(
     )
     people_rule = (
         "\nUse the supplied publicPeople names and publicSpeakerName when they make an action clearer. These are public Discord names or confirmed chosen nicknames, linked to distinct participant aliases. Do not invent nicknames or resolve identities by similar names, topics, writing styles, or proximity. Never call people entities or organisms."
-        "\nKeep each person's contributions attached to that person's source refs. The speaker authored a message; they are not automatically the person described in it. Distinguish who proposed, made, tested, replied to, or merely mentioned something. An unresolved someone or they stays unresolved. A quoted joke or roleplay claim remains attributed banter, not verified conduct or a real policy violation."
+        "\nKeep each person's contributions attached to that person's source refs. The speaker authored a message; they are not automatically the person described in it. Distinguish who proposed, made, tested, replied to, or merely mentioned something. Introducing a topic does not make someone the author of another participant's later question or elaboration. You may reflect on the combined discussion naturally without assigning its whole meaning to one person; when naming who asked or expressed something, preserve that person's actual proposition. An unresolved someone or they stays unresolved. A quoted joke or roleplay claim remains attributed banter, not verified conduct or a real policy violation."
         "\nOnly the supplied public name may identify a member. Historical anonymous memories do not inherit a current person's name merely because the subject matches. Do not force a roll call; preserve the people who actually matter to this story."
         if packet.get("editorialVersion") == JOURNAL_EDITORIAL_VERSION
         else (
@@ -5462,7 +5473,7 @@ def validate_article(
         target_claim_sentences = _claim_matching_sentences(claim, section_text[heading])
         if lane_type == "community_rumor" and (
             not target_claim_sentences
-            or any(not _EXPLICIT_RUMOR_RE.search(sentence) for sentence in target_claim_sentences)
+            or any(not _RUMOR_FRAMING_RE.search(sentence) for sentence in target_claim_sentences)
         ):
             return "rumor_not_explicitly_framed"
         if lane_type == "bnl_inference" and (
@@ -5477,12 +5488,12 @@ def validate_article(
     }
     for field in ("title", "excerpt"):
         text = str(article.get(field) or "")
-        if _EXPLICIT_RUMOR_RE.search(text) or _has_external_inference_claim(text, packet):
+        if _RUMOR_ATTRIBUTION_RE.search(text) or _has_external_inference_claim(text, packet):
             undeclared = True
             report(field, "context_claim_outside_body")
     for heading, text in section_text.items():
         declared_types = declared_types_by_heading.get(heading, set())
-        if _EXPLICIT_RUMOR_RE.search(text) and "community_rumor" not in declared_types:
+        if _RUMOR_ATTRIBUTION_RE.search(text) and "community_rumor" not in declared_types:
             undeclared = True
             report(body_fields[heading], "missing_context_declaration", laneType="community_rumor")
         original_refs = {str(source.get("refId")) for source in packet.get("safeSources", [])
