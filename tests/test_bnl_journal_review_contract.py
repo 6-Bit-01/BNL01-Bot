@@ -65,6 +65,66 @@ class JournalReviewContractTests(unittest.TestCase):
         self.assertEqual(reason, "source_attribution_failed")
         self.assertEqual(targets[0]["field"], "metadata.continuityNotes[0]")
 
+    def test_speech_only_support_cannot_certify_external_property_despite_positive_verdict(self):
+        data = self.response()
+        unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
+        unit["claims"] = [fixture_claim(
+            "The shared recording has no credited creator.", self.fragment(self.sources[0]),
+            claimType="external_fact", sourceStance="assertion", support="entails",
+            source_meaning="A member posted a link and asked who made it.")]
+        unit["nonFactualReason"] = ""
+        receipt, reason, targets = self.accept(data)
+        self.assertIsNone(receipt)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertEqual(targets[0]["field"], "excerpt")
+
+    def test_faithful_report_of_question_remains_allowed_without_verifying_its_answer(self):
+        data = self.response()
+        unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
+        unit["claims"] = [fixture_claim(
+            "Test Listener asked who made the recording.", self.fragment(self.sources[0]),
+            sourceStance="question")]
+        unit["nonFactualReason"] = ""
+        self.assertEqual(self.accept(data)[1], "")
+
+    def test_adding_derived_context_cannot_upgrade_a_speech_only_fact_claim(self):
+        derived = {"refId": "reflection:relay", "sourceRole": "bnl_interpretation",
+                   "summary": "BNL wondered about the recording's origin."}
+        self.sources.append(derived)
+        data = self.response()
+        unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
+        unit["claims"] = [fixture_claim(
+            "The recording has no credited creator.", self.fragment(self.sources[0]),
+            claimType="external_fact", evidence=[
+                {"fragmentId": self.fragment(self.sources[0])["fragmentId"], "use": "speech"},
+                {"fragmentId": self.fragment(derived)["fragmentId"], "use": "context"}])]
+        unit["nonFactualReason"] = ""
+        self.assertEqual(self.accept(data)[1], "source_attribution_failed")
+
+    def test_original_used_as_background_context_is_not_event_evidence(self):
+        data = self.response()
+        fragment = self.fragment(self.sources[0])
+        unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
+        unit["claims"] = [fixture_claim(
+            "The recording is anonymous.", fragment, claimType="external_fact",
+            evidence=[{"fragmentId": fragment["fragmentId"], "use": "context"}])]
+        unit["nonFactualReason"] = ""
+        self.assertEqual(self.accept(data)[1], "source_attribution_failed")
+
+    def test_original_event_evidence_and_canon_keep_their_factual_scope(self):
+        for source, use in (({**self.sources[0], "summary": "Test Listener posted a recording."}, "event"),
+                            ({"refId": "canon:radio", "authority": "canon", "summary": "The show begins Friday."}, "context")):
+            with self.subTest(use=use):
+                self.sources = [source]
+                data = self.response()
+                fragment = self.fragment(source)
+                unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
+                unit["claims"] = [fixture_claim(
+                    source["summary"], fragment, claimType="external_fact",
+                    evidence=[{"fragmentId": fragment["fragmentId"], "use": use}])]
+                unit["nonFactualReason"] = ""
+                self.assertEqual(self.accept(data)[1], "")
+
     def test_receipt_binds_generated_continuity_but_not_governed_subject_refs(self):
         receipt, reason, _ = self.accept()
         self.assertEqual(reason, "")

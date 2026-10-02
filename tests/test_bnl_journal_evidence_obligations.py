@@ -238,7 +238,8 @@ class JournalEvidenceObligationTests(unittest.TestCase):
                 response = self.response()
                 span = self.body(response)
                 self.external(span, claim="The archive's first signal arrived last year.")
-                span["claims"][0]["evidence"][0]["use"] = "context"
+                span["claims"][0]["evidence"][0]["use"] = (
+                    "event" if role.get("sourceRole") == "original_contribution" else "context")
                 self.assertEqual(self.accept(response)[1], "")
 
     def test_recorded_bnl_speech_can_support_what_bnl_said(self):
