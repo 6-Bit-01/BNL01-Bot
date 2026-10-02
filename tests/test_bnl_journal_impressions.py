@@ -102,6 +102,23 @@ class JournalMomentImpressionTests(unittest.TestCase):
         self.assertEqual(journal.validate_article(self.reflective_article(packet), packet), "")
 
     def test_retained_impression_preserves_previous_journal_body_as_continuity(self):
+        body = "I remember the reporters joke: earnest approval met dry skepticism, and I preferred that playful authority."
+        history = {"previousEntry": {
+            "entry_id": "old-journal", "revision": 1, "published_at": "2026-08-20T12:00:00Z",
+            "title": "An Earlier Thought", "excerpt": "An earlier perspective worth remembering.",
+            "sections_json": json.dumps([{"heading": "A callback", "body": body}]),
+        }}
+        with mock.patch.object(journal, "retrieve_history", return_value=history):
+            packet = self.packet()
+        prompt = journal.build_generation_prompt(packet)
+        safe = json.loads(prompt.split("Generation-safe packet:\n", 1)[1])
+        self.assertEqual(body,
+                         safe["history"]["previousEntry"]["sectionSnapshots"][0]["bodyExcerpt"])
+        self.assertEqual("prior_bnl_expression_for_continuity_not_evidence_or_style_template",
+                         safe["editorialContract"]["historyRole"])
+        self.assertIn("not independent proof or a writing template", prompt)
+
+    def test_retained_impression_keeps_unrelated_previous_journal_as_dated_card(self):
         history = {"previousEntry": {
             "entry_id": "old-journal", "revision": 1, "published_at": "2026-08-20T12:00:00Z",
             "title": "An Earlier Thought", "excerpt": "An earlier perspective worth remembering.",
@@ -109,13 +126,12 @@ class JournalMomentImpressionTests(unittest.TestCase):
         }}
         with mock.patch.object(journal, "retrieve_history", return_value=history):
             packet = self.packet()
-        prompt = journal.build_generation_prompt(packet)
-        safe = json.loads(prompt.split("Generation-safe packet:\n", 1)[1])
-        self.assertEqual("The room once left me with a different question.",
-                         safe["history"]["previousEntry"]["sectionSnapshots"][0]["bodyExcerpt"])
-        self.assertEqual("prior_bnl_expression_for_continuity_not_evidence_or_style_template",
-                         safe["editorialContract"]["historyRole"])
-        self.assertIn("not independent proof or a writing template", prompt)
+        safe = journal._journal_prompt_projection(packet)
+        card = safe["history"]["previousEntry"]
+        self.assertEqual("old-journal", card["entryId"])
+        self.assertEqual("2026-08-20T12:00:00Z", card["publishedAt"])
+        self.assertEqual("An earlier perspective worth remembering.", card["excerpt"])
+        self.assertEqual("", card["sectionSnapshots"][0]["bodyExcerpt"])
 
     def test_saved_subjective_thought_may_be_quoted_without_becoming_current_activity(self):
         packet = self.packet()

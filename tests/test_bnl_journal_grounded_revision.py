@@ -86,9 +86,12 @@ class JournalGroundedRevisionTests(unittest.TestCase):
             generator.call_args_list[0].args[1].split("Generation-safe packet:\n", 1)[1])
         units, evidence = review_inputs(generator.call_args_list[1].args[1])
         self.assertEqual(units, attribution.public_units(journal.parse_generated_json(first)))
-        self.assertEqual(first_packet["freshSources"], [source for source in evidence["sources"]
-                                                       if source["refId"].startswith("fresh:")])
-        self.assertTrue(any(source.get("sourceRole") == "approved_canon" for source in evidence["sources"]))
+        self.assertEqual(attribution.source_fragments(first_packet["freshSources"]),
+                         [fragment for fragment in evidence["fragments"]
+                          if fragment["refId"].startswith("fresh:")])
+        self.assertEqual(evidence["fragments"], attribution.source_fragments(
+            journal._source_review_evidence(self.packet)["sources"]))
+        self.assertTrue(any(fragment["authority"] == "canon" for fragment in evidence["fragments"]))
         self.assertNotIn("Generation-safe packet:", generator.call_args_list[1].args[1])
         self.assert_reviewed_candidate(article, first)
         self.assertEqual(reason, "")
@@ -405,14 +408,16 @@ class JournalGroundedRevisionTests(unittest.TestCase):
 
         def admitted_gap(prompt):
             response = json.loads(supported_review(prompt))
-            span = next(unit for unit in response["units"]
-                        if any("completed release" in item["text"] for item in unit["spans"]))["spans"][0]
-            span.update(kind="reflection", evidence=[{
-                "refId": "fresh:2", "quote": "I am still working on that chorus.",
-                "speaker": "participant-22222222", "use": "speech",
-            }])
-            span["grounding"]["externalPremises"][0].update(
+            units, evidence = review_inputs(prompt)
+            target_id = next(unit["unitId"] for unit in units if "completed release" in unit["text"])
+            claim = next(unit for unit in response["units"] if unit["unitId"] == target_id)["claims"][0]
+            original = next(fragment for fragment in evidence["fragments"]
+                            if fragment["refId"] == "fresh:2" and fragment["field"] == "summary")
+            self.assertEqual(original["text"], "I am still working on that chorus.")
+            self.assertEqual(original["speaker"], "participant-22222222")
+            claim.update(
                 claim="Test Listener completed and released the chorus.", claimType="external_fact",
+                evidence=[{"fragmentId": original["fragmentId"], "use": "speech"}],
                 sourceMeaning="Test Listener said the chorus was still in progress.",
                 support="contradicted", assumptions=["Unrecorded completion and release occurred afterward."],
             )

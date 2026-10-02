@@ -7,7 +7,7 @@ Production code must never import this module.
 from functools import wraps
 import json
 
-from bnl_journal_attribution import ASSESSMENT_CHECKS, REVIEW_PREFIX, source_authority
+from bnl_journal_attribution import ASSESSMENT_CHECKS, REVIEW_PREFIX
 
 
 def is_source_review(prompt):
@@ -20,47 +20,46 @@ def review_inputs(prompt):
     decoder = json.JSONDecoder()
     units, _ = decoder.raw_decode(prompt.split("CANDIDATE_UNITS_JSON: ", 1)[1])
     evidence, _ = decoder.raw_decode(prompt.split("ORIGINAL_EVIDENCE_JSON: ", 1)[1])
+    # Rehydrate the compact prompt catalog for fixture authors. The provider
+    # sees each source-owned context once and only chooses the stable fragment ID.
+    fragments = []
+    for item in evidence["fragments"]:
+        context = evidence["contexts"][item["contextRef"]]
+        identity = {key: context[key] for key in ("refId", "speaker", "authority", "publicSpeakerName") if key in context}
+        metadata = {key: value for key, value in context.items() if key not in identity}
+        fragments.append({key: value for key, value in item.items() if key != "contextRef"}
+                         | identity | {"context": metadata})
+    evidence["fragments"] = fragments
     return units, evidence
 
 
-def fixture_grounding(text, *, factual=True, source_meaning="Controlled source meaning."):
+def fixture_claim(text, fragment, *, source_meaning=None, **changes):
     """Explicit protocol fixture, never a semantic judgment about test prose."""
-    return {
-        "externalPremises": [{
-            "claim": text, "claimType": "reported_speech", "sourceStance": "assertion",
-            "evidenceIndexes": [0], "sourceMeaning": source_meaning, "support": "entails",
-            "assumptions": [], "evidenceScope": "recorded_content",
-        }] if factual else [],
-        "nonFactualReason": "Controlled fixture has only personal or imagined expression." if not factual else "",
+    claim = {
+        "claim": text, "claimType": "reported_speech", "sourceStance": "assertion",
+        "evidence": [{"fragmentId": fragment["fragmentId"],
+                      "use": "speech" if fragment["authority"] in {"original", "speech_only"} else "context"}],
+        "sourceMeaning": source_meaning or fragment["text"], "support": "entails",
+        "assumptions": [], "evidenceScope": "recorded_content",
     }
+    claim.update(changes)
+    return claim
 
 
 def supported_review(prompt):
     """Supply a test-approved verdict with structurally genuine source anchors."""
     units, evidence = review_inputs(prompt)
-    sources = evidence["sources"]
-    anchor = None
-    for source in sources:
-        for contribution in source.get("contributions") or [source]:
-            if contribution.get("summary"):
-                anchor = {"refId": source["refId"], "quote": contribution["summary"],
-                          "speaker": str(contribution.get("participantAlias") or ""),
-                          "use": "speech" if source_authority(source) in {"original", "speech_only"} else "context"}
-                break
-        if anchor:
-            break
-    if not anchor:
+    fragment = next((item for item in evidence["fragments"] if item["field"] == "summary"), None)
+    if fragment is None:
         raise AssertionError("Mock review needs an actual supplied original source")
     return json.dumps({"assessments": [
         {"check": check, "unitIds": [unit["unitId"] for unit in units],
-         "sourceRefIds": [anchor["refId"]],
+         "sourceRefIds": [fragment["refId"]],
          "explanation": "This controlled fixture supplies a passing " + check + " verdict; not model-quality evidence.",
          "issues": [], "verdict": "supported"} for check in ASSESSMENT_CHECKS
     ], "units": [
-        {"unitId": unit["unitId"], "spans": [
-            {"text": unit["text"], "kind": "factual", "evidence": [anchor],
-             "grounding": fixture_grounding(unit["text"], source_meaning=anchor["quote"]),
-             "issues": [], "verdict": "supported"}]} for unit in units
+        {"unitId": unit["unitId"], "claims": [fixture_claim(unit["text"], fragment)],
+         "nonFactualReason": ""} for unit in units
     ], "verdict": "supported"})
 
 
@@ -68,9 +67,7 @@ def rejected_review(prompt, *, issue="The candidate reverses the original attrib
     response = json.loads(supported_review(prompt))
     response["verdict"] = "unsupported"
     target = next(unit for unit in response["units"] if ".body:" in unit["unitId"])
-    target["spans"][0].update(verdict="unsupported", evidence=[], issues=[issue])
-    target["spans"][0]["grounding"]["externalPremises"][0].update(
-        evidenceIndexes=[], support="unknown", assumptions=[issue])
+    target["claims"][0].update(evidence=[], support="unknown", assumptions=[issue])
     return json.dumps(response)
 
 
@@ -78,14 +75,10 @@ def supported_review_with_anchor(prompt, *, unit_id, source_ref):
     """Choose one exact evidence dependency, not a semantic support judgment."""
     response = json.loads(supported_review(prompt))
     _, evidence = review_inputs(prompt)
-    source = next(source for source in evidence["sources"] if source["refId"] == source_ref)
-    contribution = next(item for item in source.get("contributions") or [source] if item.get("summary"))
+    fragment = next(item for item in evidence["fragments"]
+                    if item["refId"] == source_ref and item["field"] == "summary")
     unit = next(unit for unit in response["units"] if unit["unitId"] == unit_id)
-    unit["spans"][0]["evidence"] = [{
-        "refId": source_ref, "quote": contribution["summary"],
-        "speaker": str(contribution.get("participantAlias") or ""),
-        "use": "speech" if source_authority(source) in {"original", "speech_only"} else "context",
-    }]
+    unit["claims"][0] = fixture_claim(unit["claims"][0]["claim"], fragment)
     return json.dumps(response)
 
 

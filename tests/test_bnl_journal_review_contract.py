@@ -4,7 +4,7 @@ import json
 import unittest
 
 import bnl_journal_attribution as review
-from tests.journal_review_helpers import fixture_grounding
+from tests.journal_review_helpers import fixture_claim
 
 
 class JournalReviewContractTests(unittest.TestCase):
@@ -29,21 +29,22 @@ class JournalReviewContractTests(unittest.TestCase):
                                   "sourceRefIds": [], "explanation": "Controlled editorial fixture.",
                                   "issues": [], "verdict": "supported"}
                                  for check in review.ASSESSMENT_CHECKS],
-                "units": [{"unitId": unit["unitId"], "spans": [{"text": unit["text"],
-                            "grounding": fixture_grounding(unit["text"], factual=False),
-                            "kind": "creative", "evidence": [], "issues": [], "verdict": "supported"}]}
+                "units": [{"unitId": unit["unitId"], "claims": [],
+                           "nonFactualReason": "This controlled fixture contains only imagined or personal expression."}
                           for unit in units], "verdict": "supported"}
 
     def accept(self, response=None, **kwargs):
         return review.accept_review(json.dumps(response or self.response()),
                                     self.article, self.sources, **kwargs)
 
-    def anchor(self, source, **updates):
-        anchor = {"refId": source["refId"], "field": "summary", "quote": source["summary"],
-                  "speaker": source.get("participantAlias", ""), "use": "speech"}
-        anchor.update(updates)
-        aliases, names = review._speaker_bindings(self.sources)
-        return review._bind_anchor(anchor, {s["refId"]: s for s in self.sources}, aliases, names)
+    def fragment(self, source, field="summary"):
+        return next(item for item in review.source_fragments(self.sources)
+                    if item["refId"] == source["refId"] and item["field"] == field)
+
+    def anchor(self, source, *, field="summary", use="speech"):
+        fragments = {item["fragmentId"]: item for item in review.source_fragments(self.sources)}
+        fragment = self.fragment(source, field)
+        return review._bind_fragment({"fragmentId": fragment["fragmentId"], "use": use}, fragments)
 
     def test_continuity_and_question_premises_cannot_escape_review(self):
         fields = {unit["field"] for unit in review.public_units(self.article)}
@@ -56,11 +57,8 @@ class JournalReviewContractTests(unittest.TestCase):
     def test_failed_continuity_is_a_located_factual_repair(self):
         data = self.response()
         unit = next(item for item in data["units"] if item["unitId"].startswith("metadata.continuityNotes"))
-        unit["spans"][0].update(kind="factual", verdict="unsupported",
-                                issues=["An authorship question does not prove missing credits."])
-        unit["spans"][0]["grounding"] = fixture_grounding(unit["spans"][0]["text"])
-        unit["spans"][0]["grounding"]["externalPremises"][0].update(
-            evidenceIndexes=[], support="unknown")
+        unit["claims"] = [fixture_claim("The posted work had no credits.", self.fragment(self.sources[0]),
+                                         support="unknown", source_meaning="An authorship question establishes only the question.")]
         data["verdict"] = "unsupported"
         receipt, reason, targets = self.accept(data)
         self.assertIsNone(receipt)
@@ -107,13 +105,47 @@ class JournalReviewContractTests(unittest.TestCase):
         self.sources[-1].pop("refId")
         self.assertEqual(self.accept()[1], "source_review_invalid")
 
-    def test_current_packet_time_and_nested_room_anchors_bind_exactly(self):
+    def test_current_packet_time_and_nested_room_fragments_bind_exactly(self):
         for field, value in (("observedAt", self.sources[0]["observedAt"]),
                              ("messageContext.roomRef", "room-a"),
                              ("messageContext.roomName", "finished-tracks")):
-            self.assertEqual(self.anchor(self.sources[0], field=field, quote=value)[1], "", field)
-            self.assertEqual(self.anchor(self.sources[0], field=field, quote=value[:-1])[1],
-                             "source_review_invalid_anchor", field)
+            bound, reason = self.anchor(self.sources[0], field=field)
+            self.assertEqual(reason, "", field)
+            self.assertEqual(bound["quote"], value)
+            self.assertEqual(bound["speaker"], "member-a")
+
+    def test_dated_memory_retains_temporal_boundary_and_context_is_supplied_once(self):
+        memory = {"refId": "memory:earlier", "authority": "established_memory",
+                  "summary": "Test Listener shared an album.", "episodeDate": "2025-08-12",
+                  "recordedAt": "2025-08-13T10:00:00Z", "temporalScope": "remembered_history_not_current_activity",
+                  "matchAuthority": "topic_similarity_only", "matchedFreshSourceRefIds": ["fresh:1"]}
+        self.sources.append(memory)
+        prompt = review.review_prompt(self.article, {"sources": self.sources})
+        evidence, _ = json.JSONDecoder().raw_decode(prompt.split("ORIGINAL_EVIDENCE_JSON: ", 1)[1])
+        fragments = [item for item in evidence["fragments"] if evidence["contexts"][item["contextRef"]]["refId"] == memory["refId"]]
+        self.assertEqual(len({item["contextRef"] for item in fragments}), 1)
+        context = evidence["contexts"][fragments[0]["contextRef"]]
+        for key in ("episodeDate", "recordedAt", "temporalScope", "matchAuthority", "matchedFreshSourceRefIds"):
+            self.assertEqual(context[key], memory[key])
+        summary_id = self.fragment(memory)["fragmentId"]
+        memory["episodeDate"] = "2026-08-12"
+        self.assertNotEqual(summary_id, self.fragment(memory)["fragmentId"])
+
+    def test_relay_public_speech_invitation_and_publication_details_survive_contributors(self):
+        relay = {"refId": "relay:1", "basisKind": "accepted_relay_continuity",
+                 "summary": "I wondered about the unfinished chorus.", "publicInvitation": "Tell me what you hear.",
+                 "relayPublishedAt": "2026-01-02T02:00:00Z", "originalSourceDates": [{"observedAt": "2026-01-01T23:00:00Z"}],
+                 "publication_card": {"title": "A published title", "mentions": ["Test Listener"]},
+                 "contributions": [{"participantAlias": "member-a", "summary": "A derived contributor description."}]}
+        self.sources.append(relay)
+        for field in ("summary", "publicInvitation", "relayPublishedAt", "originalSourceDates", "publication_card"):
+            fragments = [item for item in review.source_fragments(self.sources)
+                         if item["refId"] == relay["refId"] and item["field"] == field]
+            self.assertTrue(fragments, field)
+            self.assertTrue(all(item["authority"] == "derived_context" for item in fragments))
+        fragment = self.fragment(relay, "publicInvitation")
+        self.assertEqual(fragment["text"], relay["publicInvitation"])
+        self.assertEqual(self.anchor(relay, field="publicInvitation", use="event")[1], "source_review_derived_as_fact")
 
     def test_impression_has_own_speaker_and_cannot_become_event_evidence(self):
         impression = {"refId": "reflection:impression:1", "basisKind": "moment_impression",
@@ -124,12 +156,10 @@ class JournalReviewContractTests(unittest.TestCase):
         self.sources.append(impression)
         self.assertEqual(review.source_authority(impression), "subjective_context")
         for field in ("impression", "reason"):
-            self.assertEqual(self.anchor(impression, field=field, quote=impression[field],
-                                         speaker="BNL", use="context")[1], "")
-            self.assertEqual(self.anchor(impression, field=field, quote=impression[field],
-                                         speaker="member-a", use="context")[1], "source_review_invalid_anchor")
-            self.assertEqual(self.anchor(impression, field=field, quote=impression[field],
-                                         speaker="BNL", use="event")[1], "source_review_derived_as_fact")
+            bound, reason = self.anchor(impression, field=field, use="context")
+            self.assertEqual(reason, "")
+            self.assertEqual((bound["speaker"], bound["quote"]), ("bnl", impression[field]))
+            self.assertEqual(self.anchor(impression, field=field, use="event")[1], "source_review_derived_as_fact")
 
     def test_inference_and_derived_roles_cannot_be_promoted_by_original_marker(self):
         for extra in ({"laneType": "bnl_inference"}, {"basisKind": "moment_impression"},
@@ -147,7 +177,7 @@ class JournalReviewContractTests(unittest.TestCase):
     def test_humor_and_personal_reflection_need_no_fabricated_event_anchors(self):
         receipt, reason, targets = self.accept()
         self.assertEqual((reason, targets), ("", []))
-        self.assertTrue(all(not span["evidence"] for unit in receipt["units"] for span in unit["spans"]))
+        self.assertTrue(all(not unit["claims"] for unit in receipt["units"]))
 
     def test_whole_entry_chronology_failure_is_not_hidden_by_valid_sentence_anchors(self):
         data = self.response()
@@ -168,10 +198,7 @@ class JournalReviewContractTests(unittest.TestCase):
         self.article["metadata"]["contextUses"] = [declaration]
         data = self.response()
         unit = next(item for item in data["units"] if item["unitId"].startswith("metadata.continuityNotes"))
-        unit["spans"][0].update(kind="factual", evidence=[{"refId": "memory:1", "speaker": "",
-                                        "quote": memory["summary"], "use": "context"}])
-        unit["spans"][0]["grounding"] = fixture_grounding(unit["spans"][0]["text"],
-                                                        source_meaning=memory["summary"])
+        unit["claims"] = [fixture_claim("Test Listener shared an album last year.", self.fragment(memory))]
         contract = {"memory:1": {"laneType": "established_broadcast_memory"}}
         self.assertEqual(self.accept(data, context_contract=contract)[1], "")
         declaration["sectionHeading"] = "A nonexistent section"
@@ -180,7 +207,7 @@ class JournalReviewContractTests(unittest.TestCase):
         self.assertEqual(self.accept(data, context_contract=contract)[1], "source_attribution_failed")
         self.article["metadata"]["contextUses"] = [{**declaration, "sectionHeading": "Unfinished thoughts"}]
         title = next(item for item in data["units"] if item["unitId"].startswith("title:"))
-        title["spans"][0]["evidence"] = copy.deepcopy(unit["spans"][0]["evidence"])
+        title["claims"] = copy.deepcopy(unit["claims"])
         self.assertEqual(self.accept(data, context_contract=contract)[1], "source_attribution_failed")
 
 

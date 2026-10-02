@@ -584,6 +584,13 @@ its topic counts and continuity notes. A later publication cannot become prior
 history during a replay or recovery. Entries with withdrawn private metadata
 are excluded from every history lane. Eligible older prose remains dated BNL
 expression, not independent event evidence or a writing template.
+The writer and reviewer use one read-only projection of that governed packet.
+Exact original lineage groups related interpretations; identical repeated gists
+do not become additional witnesses, while distinct later reactions remain.
+Original exchanges and retained impressions precede secondary retellings.
+Historical prose is selected by a meaningful content connection, not overlap
+with serialized field names or generic source metadata. Dated history remains
+available for quiet reflection; this changes presentation, not stored memory.
 Personal reactions and clearly conditional imagined responses may use a cited,
 eligible impression, or current originals when the impression pilot is in use,
 without an unrelated factual-inference declaration. This
@@ -595,8 +602,11 @@ source review, and, when needed, revision and another review. The source editor
 checks the exact prose and proposed continuity metadata against the same
 governed originals, including the original exchanges accompanying impressions.
 It retains BNL's subjective perspective without granting it event authority.
-Every reviewed span separates any external premise from personal reaction or
-imagery. Each premise records what its anchors establish, their stance, and
+Each ordered prose or continuity unit separates any external premise from
+personal reaction or imagery. The server supplies stable source-fragment IDs
+bound to the original speaker, field, time, room and authority. The reviewer
+selects those IDs instead of copying prose and retyping quotation bindings.
+Each premise records what its anchors establish, their stance, and
 whether they entail the claim or only fit it. Unverified assumptions block
 acceptance even inside reflection, questions, headings, or continuity notes.
 A valid quotation alone is not a support judgment. Pure personal voice needs
@@ -617,6 +627,12 @@ Acceptance requires separately approved, bounded real-source previews showing
 that untouched conversation and Journal outputs use the same retained
 perspective usefully and accurately. Controlled tests prove boundaries and
 transport, not model judgment or natural production reliability.
+
+Private database copies use the capacity-checked helper documented in
+[the backup and rehearsal workflow](docs/BNL01_V2_SHADOW_ACCEPTANCE_AND_ROLLBACK.md#deployment-and-data-safety-preflight).
+It preserves a 5 GiB service reserve, permits one active managed rehearsal,
+and archives completed copies with verified hashes before removing raw files.
+Deployment rollback copies and community-memory retention remain separate.
 
 Before merging a runtime change:
 

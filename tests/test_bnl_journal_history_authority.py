@@ -273,6 +273,84 @@ class JournalHistoryAuthorityTests(unittest.TestCase):
                 **metadata, "reflectionVersion": journal.JOURNAL_REFLECTION_VERSION,
             }))
 
+    def test_same_member_tags_and_json_fields_do_not_make_an_unrelated_old_story_relevant(self):
+        self.add_entry("unrelated-older", body="I watched a vintage keyboard collect dust in the attic.")
+        self.add_entry("related-latest", published="2026-09-30T02:00:00Z")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE bnl_journal_entries SET title='Attic instruments',excerpt='Dust on old keys.' "
+                         "WHERE entry_id='unrelated-older'")
+        history = self.history()
+        self.assertEqual("related-latest", history["previousEntry"]["entry_id"])
+        bounded = journal._bounded_history_for_prompt(history, as_of=END,
+            current_sources=self.packet["safeSources"], current_topics={"chorus"}, current_subjects={"discord_user:71"})
+        card = next(item for item in bounded["relevantOlderEntries"] if item["entryId"] == "unrelated-older")
+        self.assertEqual("Attic instruments", card["title"])
+        self.assertTrue(all(not section["bodyExcerpt"] for section in card["sectionSnapshots"]))
+        self.assertNotIn("continuity-unrelated-older", history["matchingContinuityNotes"])
+        # Retrieval does not delete or rewrite the old memory.
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(2, conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0])
+
+    def test_generic_words_scattered_across_history_cannot_supply_substantial_prompt_prose(self):
+        self.add_entry("older-report", body="The studio welcomed a visitor. A signal arrived. Music continued.")
+        self.add_entry("previous-report", published="2026-09-30T02:00:00Z",
+                       body="Someone offered music. The studio closed later. We preserved the signal.")
+        history = self.history()
+        # Simulate a cached older packet that selected these with generic overlap.
+        with sqlite3.connect(self.db) as conn:
+            conn.row_factory = sqlite3.Row
+            history["relevantOlderEntries"] = [dict(row) for row in conn.execute(
+                "SELECT * FROM bnl_journal_entries WHERE entry_id='older-report'")]
+        bounded = journal._bounded_history_for_prompt(history, as_of=END,
+            current_sources=[{"summary": "Music carried a jagged melody through the studio signal."}])
+        self.assertEqual(["older-report"], [item["entryId"] for item in bounded["relevantOlderEntries"]])
+        self.assertTrue(all(not section["bodyExcerpt"] for item in bounded["relevantOlderEntries"]
+                            for section in item["sectionSnapshots"]))
+        self.assertEqual("previous-report", bounded["previousEntry"]["entryId"])
+        self.assertTrue(all(not section["bodyExcerpt"] for section in bounded["previousEntry"]["sectionSnapshots"]))
+        self.assertLessEqual(len(bounded["previousEntry"]["excerpt"]), 120)
+
+    def test_meaningful_old_lore_callback_and_quiet_day_history_remain_available(self):
+        self.add_entry("remembered-antenna", body="I remember the bronze antenna above the corridor.")
+        history = self.history()
+        for sources in ([{"summary": "That bronze antenna still catches my attention."}], []):
+            with self.subTest(sources=sources):
+                bounded = journal._bounded_history_for_prompt(history, as_of=END, current_sources=sources)
+                previous = bounded["previousEntry"]
+                self.assertIn("bronze antenna", previous["sectionSnapshots"][0]["bodyExcerpt"])
+                self.assertEqual("2026-09-28T23:00:00Z", previous["sourceWindowEnd"])
+                self.assertEqual("prior_bnl_expression_not_event_evidence", previous["authority"])
+
+    def test_writer_and_reviewer_have_the_same_relevant_history_prose(self):
+        self.add_entry("unrelated-history", body="An elaborate attic inventory stayed with me.")
+        self.packet["safeSources"] = [{"refId": "conversation:7", "summary": "A detuned bronze antenna hummed."}]
+        self.packet["candidateTopicTags"] = ["antenna"]
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE bnl_journal_entries SET title='Attic instruments',excerpt='Dust on old keys.'")
+        self.packet["history"] = self.history()
+        writer = json.loads(journal.build_generation_prompt(self.packet).split("Generation-safe packet:\n", 1)[1])
+        evidence = journal._source_review_evidence(self.packet)
+        prior = next(source for source in evidence["sources"] if source["refId"] == "history:unrelated-history")
+        self.assertEqual(writer["history"]["previousEntry"], json.loads(prior["summary"]))
+        self.assertNotIn("elaborate attic inventory", prior["summary"])
+
+    def test_structured_topic_can_expand_paraphrased_history_without_a_shared_phrase(self):
+        self.add_entry("tape-memory", body="I remember how tape hiss made the chord feel weathered.")
+        with sqlite3.connect(self.db) as conn:
+            metadata = json.loads(conn.execute("SELECT metadata_json FROM bnl_journal_private_metadata").fetchone()[0])
+            metadata["topicTags"] = ["analogue_texture"]
+            conn.execute("UPDATE bnl_journal_private_metadata SET metadata_json=?", (json.dumps(metadata),))
+        self.packet["safeSources"] = [{"refId": "conversation:7", "summary": "A cassette's noise gives the melody warmth."}]
+        self.packet["candidateTopicTags"] = ["analogue_texture"]
+        history = self.history()
+        terms = journal._history_content_terms(self.packet["safeSources"])
+        overlap = terms & journal._history_entry_terms(history["previousEntry"])
+        self.assertFalse(any(" " in term for term in overlap))
+        bounded = journal._bounded_history_for_prompt(history, as_of=END,
+            current_sources=self.packet["safeSources"], current_topics={"analogue_texture"},
+            current_subjects={"discord_user:71"})
+        self.assertIn("tape hiss", bounded["previousEntry"]["sectionSnapshots"][0]["bodyExcerpt"])
+
 
 if __name__ == "__main__":
     unittest.main()

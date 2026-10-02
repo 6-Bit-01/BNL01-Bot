@@ -33,17 +33,25 @@ class JournalReviewTransportContractTests(unittest.TestCase):
         self.assertIsNone(config.response_mime_type)
         self.assertIsNone(config.response_schema)
 
-    def test_review_has_ordered_span_schema_in_existing_route(self):
+    def test_review_has_ordered_compact_claim_schema_in_existing_route(self):
         config = self.request(attribution.REVIEW_PREFIX + "review fixture")
         self.assertEqual(config.response_mime_type, "application/json")
         self.assertEqual(config.response_schema, attribution.response_schema())
         # Validate with the pinned SDK's real schema model, without a request.
         schema = bot.genai.types.Schema(**config.response_schema)
         self.assertEqual(schema.property_ordering, ["units", "assessments", "verdict"])
-        span = schema.properties["units"].items.properties["spans"].items
-        self.assertLess(span.property_ordering.index("evidence"), span.property_ordering.index("grounding"))
-        self.assertLess(span.property_ordering.index("grounding"), span.property_ordering.index("verdict"))
-        self.assertIn("grounding", span.required)
+        unit = schema.properties["units"].items
+        self.assertEqual(unit.required, ["unitId", "claims", "nonFactualReason"])
+        self.assertNotIn("spans", unit.properties)
+        self.assertNotIn("text", unit.properties)
+        claim = unit.properties["claims"].items
+        self.assertLess(claim.property_ordering.index("evidence"), claim.property_ordering.index("sourceMeaning"))
+        self.assertLess(claim.property_ordering.index("sourceMeaning"), claim.property_ordering.index("support"))
+        self.assertIn("sourceMeaning", claim.required)
+        self.assertIn("assumptions", claim.required)
+        anchor = claim.properties["evidence"].items
+        self.assertEqual(anchor.required, ["fragmentId", "use"])
+        self.assertEqual(set(anchor.properties), {"fragmentId", "use"})
         self.assertEqual(config.max_output_tokens, bot.policy_for_route(bot.JOURNAL_ROUTE).max_output_tokens)
 
     def test_prefix_inside_normal_writer_text_does_not_select_editor(self):

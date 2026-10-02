@@ -7,7 +7,7 @@ import json
 import unittest
 
 import bnl_journal_attribution as review
-from tests.journal_review_helpers import fixture_grounding
+from tests.journal_review_helpers import fixture_claim
 
 
 class JournalEvidenceObligationTests(unittest.TestCase):
@@ -27,11 +27,9 @@ class JournalEvidenceObligationTests(unittest.TestCase):
     def response(self):
         units = review.public_units(self.article)
         return {
-            "units": [{"unitId": unit["unitId"], "spans": [{
-                "text": unit["text"], "kind": "creative", "evidence": [],
-                "grounding": fixture_grounding(unit["text"], factual=False),
-                "issues": [], "verdict": "supported",
-            }]} for unit in units],
+            "units": [{"unitId": unit["unitId"], "claims": [],
+                       "nonFactualReason": "Only personal or imagined expression in this controlled fixture."}
+                      for unit in units],
             "assessments": [{
                 "check": check, "unitIds": [unit["unitId"] for unit in units],
                 "sourceRefIds": [], "explanation": "Explicit passing protocol fixture.",
@@ -41,16 +39,14 @@ class JournalEvidenceObligationTests(unittest.TestCase):
         }
 
     def body(self, response):
-        return next(unit for unit in response["units"] if ".body:" in unit["unitId"])["spans"][0]
+        return next(unit for unit in response["units"] if ".body:" in unit["unitId"])
 
-    def external(self, span, *, claim="The linked work lacks a label.", **changes):
-        span.update(kind="reflection", evidence=[{
-            "refId": self.sources[0]["refId"], "quote": self.sources[0]["summary"],
-            "speaker": "listener", "use": "speech",
-        }])
-        span["grounding"] = fixture_grounding(claim, source_meaning="A listener asked who performed it.")
-        premise = span["grounding"]["externalPremises"][0]
-        premise.update(claimType="external_fact", sourceStance="assertion", **changes)
+    def external(self, unit, *, claim="The linked work lacks a label.", **changes):
+        fragment = next(item for item in review.source_fragments(self.sources)
+                        if item["refId"] == self.sources[0]["refId"] and item["field"] == "summary")
+        premise = fixture_claim(claim, fragment, source_meaning="A listener asked who performed it.",
+                                claimType="external_fact", **changes)
+        unit["claims"] = [premise]
         return premise
 
     def accept(self, response):
@@ -58,35 +54,27 @@ class JournalEvidenceObligationTests(unittest.TestCase):
 
     def test_old_anchor_only_approval_cannot_pass_without_semantic_comparison(self):
         response = self.response()
-        self.external(self.body(response))
-        for unit in response["units"]:
-            for span in unit["spans"]:
-                span.pop("grounding")
+        unit = self.body(response)
+        unit.update(spans=[{"text": "Legacy", "evidence": [], "verdict": "supported"}])
         self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
 
-    def test_every_span_kind_requires_grounding_even_when_reviewer_says_supported(self):
-        for kind in ("factual", "reflection", "creative"):
-            with self.subTest(kind=kind):
-                response = self.response()
-                span = self.body(response)
-                self.external(span)
-                span["kind"] = kind
-                span.pop("grounding")
-                self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
+    def test_all_units_require_explicit_claim_account_even_when_overall_supported(self):
+        for field in ("claims", "nonFactualReason"):
+            response = self.response()
+            self.body(response).pop(field)
+            self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
 
-    def test_acknowledged_semantic_gap_overrides_supported_span_and_whole_entry(self):
+    def test_acknowledged_gap_in_reflection_overrides_supported_whole_entry(self):
         for support in ("compatible_only", "contradicted", "unknown"):
-            for kind in ("factual", "reflection", "creative"):
-                with self.subTest(support=support, kind=kind):
-                    response = self.response()
-                    span = self.body(response)
-                    self.external(span, support=support)
-                    span["kind"] = kind
-                    receipt, reason, targets = self.accept(response)
-                    self.assertIsNone(receipt)
-                    self.assertEqual(reason, "source_attribution_failed")
-                    self.assertTrue(any(target["field"] == "sections[0].body" for target in targets))
-                    self.assertIn("The linked work lacks a label.", json.dumps(targets))
+            with self.subTest(support=support):
+                response = self.response()
+                self.external(self.body(response), support=support)
+                receipt, reason, targets = self.accept(response)
+                self.assertIsNone(receipt)
+                self.assertEqual(reason, "source_attribution_failed")
+                self.assertTrue(any(target["field"] == "sections[0].body" for target in targets))
+                self.assertIn("The linked work lacks a label.", json.dumps(targets))
+                self.assertEqual(targets[0]["evidence"][0]["quote"], self.sources[0]["summary"])
 
     def test_required_assumption_rejects_even_a_declared_entailment(self):
         response = self.response()
@@ -130,8 +118,6 @@ class JournalEvidenceObligationTests(unittest.TestCase):
         self.assertEqual(self.accept(response)[1], "")
 
     def test_aggregate_source_cannot_borrow_another_contributions_inspected_scope(self):
-        response = self.response()
-        self.external(self.body(response), evidenceScope="referenced_content")
         original = self.sources[0]
         self.sources = [{"refId": original["refId"], "sourceRole": "original_contribution",
                          "contributions": [
@@ -140,40 +126,29 @@ class JournalEvidenceObligationTests(unittest.TestCase):
                              {"participantAlias": "other", "summary": "I inspected a different page.",
                               "messageContext": {"linkContent": "inspected"}},
                          ]}]
+        response = self.response()
+        self.external(self.body(response), evidenceScope="referenced_content")
         self.assertEqual(self.accept(response)[1], "source_attribution_failed")
 
     def test_nested_recorded_human_report_is_not_disabled_by_uninspected_link(self):
-        self.sources[0]["summary"] = "I checked that page: the performer field is blank. [shared link]"
+        self.sources = [{"refId": "fresh:question", "sourceRole": "original_contribution",
+                         "contributions": [{"participantAlias": "listener",
+                                            "summary": "I checked that page: the performer field is blank. [shared link]",
+                                            "messageContext": {"linkContent": "not_inspected"}}]}]
         response = self.response()
         premise = self.external(self.body(response), claim="The listener reported a blank performer field.")
         premise.update(claimType="reported_speech", sourceMeaning="They explicitly reported a blank field.")
-        original = self.sources[0]
-        self.sources = [{"refId": original["refId"], "sourceRole": "original_contribution",
-                         "contributions": [{"participantAlias": "listener", "summary": original["summary"],
-                                            "messageContext": {"linkContent": "not_inspected"}}]}]
         self.assertEqual(self.accept(response)[1], "")
 
-    def test_missing_anchors_or_invalid_indexes_cannot_ground_supported_premise(self):
-        for indexes in ([], [-1], [1], [True], ["0"], [0, 0], None):
-            with self.subTest(indexes=indexes):
-                response = self.response()
-                self.external(self.body(response), evidenceIndexes=indexes)
-                self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
+    def test_missing_evidence_cannot_ground_supported_premise(self):
+        response = self.response()
+        self.external(self.body(response), evidence=[])
+        self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
 
     def test_uncertain_premise_without_anchor_is_located_failure_not_manufactured_evidence(self):
         response = self.response()
-        span = self.body(response)
-        self.external(span, support="unknown", evidenceIndexes=[])
-        span["evidence"] = []
+        self.external(self.body(response), support="unknown", evidence=[])
         self.assertEqual(self.accept(response)[1], "source_attribution_failed")
-
-    def test_factual_kind_cannot_claim_it_has_no_external_premises(self):
-        response = self.response()
-        span = self.body(response)
-        self.external(span)
-        span["kind"] = "factual"
-        span["grounding"] = fixture_grounding(span["text"], factual=False)
-        self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
 
     def test_pure_personal_and_imagined_voice_needs_no_invented_evidence(self):
         for body in (
@@ -184,7 +159,6 @@ class JournalEvidenceObligationTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.article["sections"][0]["body"] = body
                 response = self.response()
-                self.body(response)["kind"] = "reflection"
                 receipt, reason, targets = self.accept(response)
                 self.assertEqual((reason, targets), ("", []))
                 self.assertEqual(receipt["units"], response["units"])
@@ -193,11 +167,11 @@ class JournalEvidenceObligationTests(unittest.TestCase):
         for value in ("", "  ", None, []):
             with self.subTest(value=value):
                 response = self.response()
-                self.body(response)["grounding"]["nonFactualReason"] = value
+                self.body(response)["nonFactualReason"] = value
                 self.assertEqual(self.accept(response)[1], "source_review_invalid_grounding")
 
     def test_malformed_comparison_fields_fail_closed_without_crashing(self):
-        for field in ("claim", "claimType", "sourceStance", "evidenceIndexes", "sourceMeaning",
+        for field in ("claim", "claimType", "sourceStance", "evidence", "sourceMeaning",
                       "support", "assumptions", "evidenceScope"):
             for mode in ("missing", "wrong_type"):
                 with self.subTest(field=field, mode=mode):
@@ -220,7 +194,7 @@ class JournalEvidenceObligationTests(unittest.TestCase):
                 self.article["metadata"] = {"contextUses": [], field: [wording]}
                 response = self.response()
                 unit = next(item for item in response["units"] if item["unitId"].startswith("metadata."))
-                self.external(unit["spans"][0], claim=claim, support="compatible_only")
+                self.external(unit, claim=claim, support="compatible_only")
                 receipt, reason, targets = self.accept(response)
                 self.assertIsNone(receipt)
                 self.assertEqual(reason, "source_attribution_failed")
@@ -233,7 +207,10 @@ class JournalEvidenceObligationTests(unittest.TestCase):
         premise.update(claimType="reported_speech", sourceStance="question")
         receipt, reason, _ = self.accept(response)
         self.assertEqual(reason, "")
-        self.assertEqual(self.body(receipt)["grounding"], self.body(response)["grounding"])
+        saved = self.body(receipt)["claims"][0]
+        self.assertEqual(saved["claim"], premise["claim"])
+        self.assertEqual(saved["sourceMeaning"], premise["sourceMeaning"])
+        self.assertEqual(saved["evidence"][0]["quote"], self.sources[0]["summary"])
 
     def test_derived_perspective_or_rumor_cannot_alone_establish_external_fact(self):
         for role in (
@@ -249,7 +226,7 @@ class JournalEvidenceObligationTests(unittest.TestCase):
                 response = self.response()
                 span = self.body(response)
                 self.external(span, claim="The artist released an album.")
-                span["evidence"][0]["use"] = "context"
+                span["claims"][0]["evidence"][0]["use"] = "context"
                 self.assertEqual(self.accept(response)[1], "source_attribution_failed")
 
     def test_original_canon_or_established_memory_can_support_appropriate_external_fact(self):
@@ -261,7 +238,7 @@ class JournalEvidenceObligationTests(unittest.TestCase):
                 response = self.response()
                 span = self.body(response)
                 self.external(span, claim="The archive's first signal arrived last year.")
-                span["evidence"][0]["use"] = "context"
+                span["claims"][0]["evidence"][0]["use"] = "context"
                 self.assertEqual(self.accept(response)[1], "")
 
     def test_recorded_bnl_speech_can_support_what_bnl_said(self):
