@@ -23,6 +23,18 @@ def review_inputs(prompt):
     return units, evidence
 
 
+def fixture_grounding(text, *, factual=True, source_meaning="Controlled source meaning."):
+    """Explicit protocol fixture, never a semantic judgment about test prose."""
+    return {
+        "externalPremises": [{
+            "claim": text, "claimType": "reported_speech", "sourceStance": "assertion",
+            "evidenceIndexes": [0], "sourceMeaning": source_meaning, "support": "entails",
+            "assumptions": [], "evidenceScope": "recorded_content",
+        }] if factual else [],
+        "nonFactualReason": "Controlled fixture has only personal or imagined expression." if not factual else "",
+    }
+
+
 def supported_review(prompt):
     """Supply a test-approved verdict with structurally genuine source anchors."""
     units, evidence = review_inputs(prompt)
@@ -47,6 +59,7 @@ def supported_review(prompt):
     ], "units": [
         {"unitId": unit["unitId"], "spans": [
             {"text": unit["text"], "kind": "factual", "evidence": [anchor],
+             "grounding": fixture_grounding(unit["text"], source_meaning=anchor["quote"]),
              "issues": [], "verdict": "supported"}]} for unit in units
     ], "verdict": "supported"})
 
@@ -56,6 +69,8 @@ def rejected_review(prompt, *, issue="The candidate reverses the original attrib
     response["verdict"] = "unsupported"
     target = next(unit for unit in response["units"] if ".body:" in unit["unitId"])
     target["spans"][0].update(verdict="unsupported", evidence=[], issues=[issue])
+    target["spans"][0]["grounding"]["externalPremises"][0].update(
+        evidenceIndexes=[], support="unknown", assumptions=[issue])
     return json.dumps(response)
 
 

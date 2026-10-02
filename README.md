@@ -595,6 +595,14 @@ source review, and, when needed, revision and another review. The source editor
 checks the exact prose and proposed continuity metadata against the same
 governed originals, including the original exchanges accompanying impressions.
 It retains BNL's subjective perspective without granting it event authority.
+Every reviewed span separates any external premise from personal reaction or
+imagery. Each premise records what its anchors establish, their stance, and
+whether they entail the claim or only fit it. Unverified assumptions block
+acceptance even inside reflection, questions, headings, or continuity notes.
+A valid quotation alone is not a support judgment. Pure personal voice needs
+no invented factual premise; referenced material marked uninspected cannot
+serve as inspected evidence. These checks enforce the reviewer's declared
+reasoning, but cannot guarantee that it identifies every premise correctly.
 Review receipts bind the article, notes, evidence and source window; an edited
 or unreviewed candidate cannot enter storage as reviewed. Saved new candidates
 are checked again before approval and delivery. Legacy owed payloads retain

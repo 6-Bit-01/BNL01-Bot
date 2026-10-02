@@ -9,8 +9,8 @@ import hashlib
 import json
 import re
 
-REVIEW_PREFIX = "JOURNAL_SOURCE_REVIEW_V4\n"
-REVIEW_VERSION = 4
+REVIEW_PREFIX = "JOURNAL_SOURCE_REVIEW_V5\n"
+REVIEW_VERSION = 5
 REVIEWED_METADATA_FIELDS = (
     "topicTags", "continuityNotes", "unresolvedQuestions", "confidenceFlags", "safetyFlags",
 )
@@ -77,9 +77,20 @@ def response_schema():
         "quote": {"type": "string"}, "speaker": {"type": "string"},
         "use": enum("speech", "event", "context"),
     }, ["refId", "quote", "speaker", "use"])
+    premise = obj({
+        "claim": {"type": "string"}, "claimType": enum("reported_speech", "external_fact"),
+        "sourceStance": enum("assertion", "question", "speculation", "joke", "subjective", "unknown"),
+        "evidenceIndexes": {"type": "array", "items": {"type": "integer"}},
+        "sourceMeaning": {"type": "string"},
+        "support": enum("entails", "compatible_only", "contradicted", "unknown"),
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+        "evidenceScope": enum("recorded_content", "referenced_content"),
+    })
     span = obj({
-        "text": {"type": "string"}, "kind": enum("factual", "reflection", "creative"),
-        "evidence": {"type": "array", "items": anchor},
+        "text": {"type": "string"}, "evidence": {"type": "array", "items": anchor},
+        "grounding": obj({"externalPremises": {"type": "array", "items": premise},
+                          "nonFactualReason": {"type": "string"}}),
+        "kind": enum("factual", "reflection", "creative"),
         "issues": {"type": "array", "items": {"type": "string"}}, "verdict": verdict,
     })
     unit = obj({"unitId": {"type": "string"}, "spans": {"type": "array", "items": span}})
@@ -91,8 +102,8 @@ def response_schema():
         "issues": {"type": "array", "items": {"type": "string"}},
         "verdict": verdict,
     })
-    return obj({"assessments": {"type": "array", "items": assessment},
-                "units": {"type": "array", "items": unit}, "verdict": verdict})
+    return obj({"units": {"type": "array", "items": unit},
+                "assessments": {"type": "array", "items": assessment}, "verdict": verdict})
 
 
 def public_units(article):
@@ -212,7 +223,7 @@ def review_prompt(article, evidence):
         "Check both its premise and whether supplied later evidence resolves it. These fields feed "
         "future continuity; accepting correct public paragraphs does not excuse incorrect metadata.",
         "First read the complete article with its real paragraphs and section order, then inspect the "
-        "original exchanges as a whole. Before reviewing spans, return exactly four whole-entry assessments: "
+        "original exchanges as a whole. Review the units and their premises FIRST. Then return four whole-entry assessments: "
         "event_relationships, attribution_stance, journal_perspective, detail_retention. Each assessment "
         "must cite the affected candidate unitIds and relevant original sourceRefIds and explain the actual "
         "evidence or writing choices behind its verdict. A generic statement that the draft follows the "
@@ -252,33 +263,35 @@ def review_prompt(article, evidence):
         "Omitting an unrelated check-in or entire separate event is fine. Dropping a clarification that "
         "changes the meaning of a retained story is not. Do not require a mention from each participant, "
         "source kind, day or window segment, and do not infer popularity from the number of retellings.",
-        "Work evidence-first. For EVERY unit, including title/excerpt/headings and metadata, divide its exact text "
-        "into ordered verbatim spans covering the whole unit without omitting, adding or rearranging words. "
-        "Separate each atomic external factual clause from its surrounding reflection or metaphor. "
-        "For example, 'I love that Test Member released an album' has a reflection span 'I love that ' "
-        "and a factual span 'Test Member released an album'. A feeling does not shelter its embedded "
-        "claim. Pure personal reactions or imagined BARCODE constructs may have no factual spans. "
-        "For each factual span first find original evidence, inspect related sources for contradictory "
-        "details and later clarification, record discrepancies, and only then decide its verdict. "
-        "An exact quote from a related subject is not enough: its meaning must support this exact "
-        "clause's speaker, action, certainty, time and relationship to other events. If another source "
-        "changes that reading, record the conflict and mark the claim unsupported or uncertain.",
-        "Return JSON only: {\"assessments\":[{\"check\":\"one of the four required checks\","
-        "\"unitIds\":[\"affected supplied unit ID\"],\"sourceRefIds\":[\"relevant supplied ref\"],"
-        "\"explanation\":\"specific reasoning from this article and original exchange\","
-        "\"issues\":[\"specific defect when present\"],\"verdict\":\"supported|unsupported|uncertain\"}],"
-        "\"units\":[{\"unitId\":\"the supplied ID\",\"spans\":["
-        "{\"text\":\"verbatim span of this unit\",\"kind\":\"factual|reflection|creative\","
-        "\"evidence\":[{\"refId\":\"supplied ref\",\"field\":\"one of the schema anchor fields\","
-        "\"quote\":\"verbatim source excerpt or exact metadata value\","
-        "\"speaker\":\"exact original speaker alias or unique supplied public name; empty for a non-speaker record\","
-        "\"use\":\"speech|event|context\"}],"
-        "\"issues\":[\"specific discrepancy or missing support\"],"
-        "\"verdict\":\"supported|unsupported|uncertain\"}]}],"
-        "\"verdict\":\"supported|unsupported|uncertain\"}. "
-        "Return exactly one review for EVERY unit. Each factual span needs anchors for its external "
-        "claim. The evidence speaker must be the original "
-        "author, not the addressee, someone mentioned, or the candidate's mistaken attribution. "
+        "SPAN GROUNDING: Return JSON in the supplied schema, with units before assessments and verdict. "
+        "For EVERY unit, including title, excerpt, headings and metadata, provide ordered verbatim spans "
+        "covering all its words. EVERY span requires grounding, including reflection and creative spans; "
+        "kind describes the writing and never exempts its factual premises. Identify explicit claims "
+        "and assumptions hidden in adjectives, comparisons, questions or personal reactions. Each "
+        "grounding.externalPremises item states the claim, claimType, sourceStance, evidenceIndexes, "
+        "sourceMeaning, support, assumptions and evidenceScope. evidenceIndexes are zero-based indexes "
+        "into that span's evidence anchors. Explain what those originals actually establish in sourceMeaning, "
+        "preserving their speaker, uncertainty, time and object. Do not paraphrase the candidate as evidence.",
+        "ENTAILMENT: reported_speech covers what someone expressed, including faithful paraphrase of "
+        "their self-reported taste, doubt or feeling; it needs neither quotation marks nor the word 'said'. "
+        "A listener's expressed love of jazz can support describing their preference without making "
+        "their opinion objectively true. external_fact asserts the described event or property itself. "
+        "A question, speculation, joke or subjective view may "
+        "entail its attributed utterance without entailing the external fact. support=entails means the "
+        "originals establish the entire premise without extra assumptions. compatible_only means it could "
+        "fit but the evidence does not establish it; contradicted and unknown retain their ordinary meanings. "
+        "List every needed factual assumption. Any extra assumption or support other than entails requires "
+        "repair, even inside an otherwise excellent reflection. An exact related quote alone is not entailment.",
+        "SCOPE: recorded_content concerns what the supplied record actually says or records; "
+        "referenced_content claims a property of an external item mentioned or linked but not itself supplied. "
+        "An explicit human statement about an item can support its attributed account as recorded_content; "
+        "a link's presence cannot substitute for inspecting its target. A factual span needs at least one "
+        "external premise. If a span has none, supply nonFactualReason explaining its pure personal reaction, "
+        "clearly imagined scene or other nonfactual purpose. Do not invent factual premises merely to review "
+        "humor or metaphor. An openly speculative question need not assert its proposed answer, though "
+        "its factual premises still need support. With no supporting anchor, describe the actual evidence "
+        "limit and mark support unknown.",
+        "ANCHORS: The speaker is the original author, not the addressee or someone mentioned. "
         "The field defaults to summary; summary quotes are exact original excerpts. To support a "
         "claim use the shortest exact excerpt that preserves its relevant meaning and attribution, "
         "rather than quoting an entire long source. Do not cut away a material qualifier. To support a "
@@ -410,6 +423,92 @@ def _spans_cover_unit(spans, text):
     return offset == len(text)
 
 
+def _anchor_references_uninspected_content(anchor, source):
+    """Use the original contribution that supplied this bound anchor's words."""
+    matches = []
+    field, quote = anchor.get("field", "summary"), anchor["quote"]
+    for contribution in source.get("contributions") or [source]:
+        if (not isinstance(contribution, dict)
+                or anchor["speaker"] != str(contribution.get("participantAlias") or "")):
+            continue
+        context = contribution.get("messageContext")
+        if context is None:
+            context = source.get("messageContext")
+        context = context if isinstance(context, dict) else {}
+        value = (context.get(field.split(".", 1)[1]) if field.startswith("messageContext.")
+                 else contribution.get(field))
+        if isinstance(value, str) and value and (
+                _normal(quote) in _normal(value) if field == "summary" else quote == value):
+            matches.append(context.get("linkContent") == "not_inspected")
+    return bool(matches) and all(matches)
+
+
+def _grounding_findings(span, anchors, by_ref):
+    """Enforce the review's explicit premises, not an inferred text classifier.
+
+    The reviewer must still identify premises and interpret original language.
+    Local checks prevent its verdict or stylistic label from overriding an
+    acknowledged gap, incompatible stance, or unavailable evidence scope.
+    They do not infer a claim from keywords, prohibit hypothetical imagery,
+    or treat an uninspected link as invalidating an explicit human statement.
+    Metadata uses this same contract; its topic label or question can carry
+    a premise, but merely naming a theme does not automatically assert one.
+    """
+    grounding = span.get("grounding")
+    if not isinstance(grounding, dict):
+        return "source_review_invalid_grounding", []
+    premises, nonfactual = grounding.get("externalPremises"), grounding.get("nonFactualReason")
+    if (not isinstance(premises, list) or not isinstance(nonfactual, str)
+            or (not premises and (span.get("kind") == "factual" or not nonfactual.strip()))):
+        return "source_review_invalid_grounding", []
+    findings = []
+    for index, premise in enumerate(premises):
+        if not isinstance(premise, dict):
+            return "source_review_invalid_grounding", []
+        claim, claim_type = premise.get("claim"), premise.get("claimType")
+        stance, meaning = premise.get("sourceStance"), premise.get("sourceMeaning")
+        indexes, support = premise.get("evidenceIndexes"), premise.get("support")
+        assumptions, scope = premise.get("assumptions"), premise.get("evidenceScope")
+        if (not isinstance(claim, str) or not claim.strip()
+                or not isinstance(claim_type, str) or claim_type not in {"reported_speech", "external_fact"}
+                or not isinstance(stance, str)
+                or stance not in {"assertion", "question", "speculation", "joke", "subjective", "unknown"}
+                or not isinstance(meaning, str) or not meaning.strip()
+                or not isinstance(indexes, list)
+                or any(type(item) is not int or not 0 <= item < len(anchors) for item in indexes)
+                or len(set(indexes)) != len(indexes)
+                or not isinstance(support, str) or support not in {"entails", "compatible_only", "contradicted", "unknown"}
+                or (support == "entails" and not indexes)
+                or not isinstance(assumptions, list)
+                or any(not isinstance(item, str) or not item.strip() for item in assumptions)
+                or not isinstance(scope, str) or scope not in {"recorded_content", "referenced_content"}):
+            return "source_review_invalid_grounding", []
+        issues = []
+        if support != "entails":
+            issues.append("The original evidence does not entail this premise: " + support + ".")
+        if assumptions:
+            issues.extend("The premise requires an additional assumption: " + assumption for assumption in assumptions)
+        if claim_type == "external_fact" and stance != "assertion":
+            issues.append("A " + stance + " can establish its utterance, not this external fact.")
+        selected = [anchors[item] for item in indexes]
+        # A correctly quoted interpretation can support remembered perspective
+        # or its attributed speech, but cannot corroborate an external event.
+        if claim_type == "external_fact" and not any(
+                source_authority(by_ref[anchor["refId"]]) in {"original", "canon", "established_memory"}
+                for anchor in selected):
+            issues.append("This external fact needs original, approved canon or established memory evidence; "
+                          "derived interpretation, BNL speech and rumor cannot establish it themselves.")
+        if (scope == "referenced_content" and selected and all(
+                _anchor_references_uninspected_content(anchor, by_ref[anchor["refId"]])
+                for anchor in selected)):
+            issues.append("The referenced item's contents were not inspected; its link is not evidence of this property.")
+        if issues:
+            findings.append({"premiseIndex": index, "claim": claim, "sourceMeaning": meaning,
+                             "sourceRefIds": list(dict.fromkeys(anchors[item]["refId"] for item in indexes)),
+                             "issues": issues})
+    return "", findings
+
+
 def accept_review(raw, article, sources, *, context_contract=None):
     """Return a locally bound receipt, or located repair targets; never prose."""
     units = {unit["unitId"]: unit for unit in public_units(article)}
@@ -502,6 +601,13 @@ def accept_review(raw, article, sources, *, context_contract=None):
                     return None, reason, []
                 bound.append(normalized)
             span["evidence"] = bound
+            grounding_reason, grounding_findings = _grounding_findings(span, bound, by_ref)
+            if grounding_reason:
+                return None, grounding_reason, []
+            for finding in grounding_findings:
+                factual_failure = True
+                targets.append({"field": units[unit_id]["field"], "check": "source_entailment",
+                                "unitId": unit_id, "spanIndex": index, **finding})
             if verdict == "supported":
                 section_match = re.fullmatch(r"sections\[(\d+)\]\.(?:body|heading)", units[unit_id]["field"])
                 heading = article["sections"][int(section_match.group(1))]["heading"] if section_match else None

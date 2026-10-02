@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import bnl_journal as journal
+import bnl_journal_attribution as attribution
 from tests.journal_review_helpers import reviewed_article
 from tests import test_bnl_journal_grounded_revision as fixtures
 
@@ -70,3 +71,28 @@ class JournalReviewLifecycleTests(unittest.TestCase):
             approved = journal.approve_draft(db, 1, result.entry_id, result.content_hash)
             self.assertFalse(approved.ok)
             self.assertEqual(approved.reason, "source_review_required")
+
+    def test_prior_review_contract_cannot_authorize_new_storage(self):
+        article = reviewed_article(journal.parse_generated_json(self.draft()), self.packet)
+        article["metadata"]["sourceReview"]["version"] = attribution.REVIEW_VERSION - 1
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "test.db")
+            result = journal.store_validated_draft(db, 1, self.packet, article)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason, "source_review_candidate_changed")
+            self.assertFalse(Path(db).exists())
+
+    def test_saved_candidate_retains_current_contract_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "test.db")
+            result = self.stored(db)
+            self.assertTrue(result.ok, result.reason)
+            with sqlite3.connect(db) as conn:
+                metadata = json.loads(conn.execute(
+                    "SELECT metadata_json FROM bnl_journal_private_metadata").fetchone()[0])
+            self.assertEqual(metadata["sourceReviewRequiredVersion"], attribution.REVIEW_VERSION)
+            self.edit_metadata(db, lambda meta: meta["sourceReview"].update(
+                version=attribution.REVIEW_VERSION - 1))
+            approved = journal.approve_draft(db, 1, result.entry_id, result.content_hash)
+            self.assertFalse(approved.ok)
+            self.assertEqual(approved.reason, "source_review_candidate_changed")

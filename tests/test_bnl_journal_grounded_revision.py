@@ -395,6 +395,57 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         self.assertEqual(reason, "journal_editorial_failed")
         self.assertFalse(advisory)
 
+    def test_embedded_premise_repair_preserves_voice_and_requires_exact_recheck(self):
+        # A declared evidence gap is fixture input. This tests enforcement and
+        # writer/reviewer integration, not whether Gemini notices the gap.
+        voice_before = "My imaginary antenna has been leaning toward the chorus all afternoon. "
+        voice_after = " I prefer a loose end to a neatly labelled silence."
+        first = self.draft(voice_before + "I admired Test Listener's completed release." + voice_after)
+        revised = self.draft(voice_before + "Test Listener said the chorus was still in progress." + voice_after)
+
+        def admitted_gap(prompt):
+            response = json.loads(supported_review(prompt))
+            span = next(unit for unit in response["units"]
+                        if any("completed release" in item["text"] for item in unit["spans"]))["spans"][0]
+            span.update(kind="reflection", evidence=[{
+                "refId": "fresh:2", "quote": "I am still working on that chorus.",
+                "speaker": "participant-22222222", "use": "speech",
+            }])
+            span["grounding"]["externalPremises"][0].update(
+                claim="Test Listener completed and released the chorus.", claimType="external_fact",
+                sourceMeaning="Test Listener said the chorus was still in progress.",
+                support="contradicted", assumptions=["Unrecorded completion and release occurred afterward."],
+            )
+            # Leave all top-level verdicts supported to reproduce the protocol
+            # problem: a passing label cannot erase the acknowledged gap.
+            return json.dumps(response)
+
+        with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
+            (article, reason, advisory), generator, _ = self.run_sequence(
+                [first, admitted_gap, revised, supported_review])
+        self.assertEqual(generator.call_count, 4)
+        self.assertEqual(reason, "")
+        self.assertFalse(advisory)
+        self.assert_reviewed_candidate(article, revised)
+        repair = prompts.call_args_list[1].kwargs
+        self.assertEqual(repair["repair_reason"], "source_attribution_failed")
+        self.assertEqual(repair["previous_output"], first)
+        finding = next(target for target in repair["repair_details"] if target["check"] == "source_entailment")
+        self.assertEqual(finding["claim"], "Test Listener completed and released the chorus.")
+        self.assertEqual(finding["sourceMeaning"], "Test Listener said the chorus was still in progress.")
+        self.assertIn("preserving the grounded prose, voice", generator.call_args_list[2].args[1])
+        self.assertEqual(review_inputs(generator.call_args_list[1].args[1])[1],
+                         review_inputs(generator.call_args_list[3].args[1])[1])
+        self.assertIn(voice_before, article["sections"][0]["body"])
+        self.assertIn(voice_after, article["sections"][0]["body"])
+
+        (article, reason, advisory), generator, _ = self.run_sequence(
+            [first, admitted_gap, first, admitted_gap])
+        self.assertEqual(generator.call_count, 4)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertFalse(advisory)
+
     def test_source_withdrawal_stops_editorial_repair_before_another_call(self):
         def reject_perspective(prompt):
             response = json.loads(supported_review(prompt))

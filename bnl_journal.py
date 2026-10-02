@@ -5548,7 +5548,7 @@ def _draft_records(
     meta = dict(article.get("metadata") or {})
     meta.pop("subjectRefs", None)
     if meta.get("sourceReview"):
-        meta["sourceReviewRequiredVersion"] = 4
+        meta["sourceReviewRequiredVersion"] = attribution.REVIEW_VERSION
     context_uses = [item for item in meta.get("contextUses", []) if isinstance(item, dict)]
     used_context_lanes, used_context_provenance = _used_context_lane_metadata(packet, context_uses)
     used_reflection_basis, used_reflection_provenance = (
@@ -5732,7 +5732,7 @@ def _source_review_reason(article: dict[str, Any], packet: dict[str, Any], *, re
     receipt = (article.get("metadata") or {}).get("sourceReview")
     if receipt is None:
         return "source_review_required" if required else ""
-    if (not isinstance(receipt, dict) or receipt.get("version") != 4
+    if (not isinstance(receipt, dict) or receipt.get("version") != attribution.REVIEW_VERSION
             or receipt.get("verdict") != "supported"
             or receipt.get("articleDigest") != attribution.article_digest(article)):
         return "source_review_candidate_changed"
@@ -5755,7 +5755,7 @@ def _stored_source_review_reason(canonical: bytes, metadata: dict[str, Any]) -> 
         entry = json.loads(canonical.decode("utf-8"))["entry"]
         article = {key: entry[key] for key in ("title", "excerpt", "sections")}
         article.update(metadata=metadata, sourceRefIds=metadata.get("sourceRefIds", {}))
-        if (isinstance(receipt, dict) and receipt.get("version") == 4
+        if (isinstance(receipt, dict) and receipt.get("version") == attribution.REVIEW_VERSION
                 and receipt.get("verdict") == "supported"
                 and receipt.get("articleDigest") == attribution.article_digest(article)):
             return ""

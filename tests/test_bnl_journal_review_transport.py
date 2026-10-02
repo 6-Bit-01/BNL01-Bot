@@ -39,8 +39,11 @@ class JournalReviewTransportContractTests(unittest.TestCase):
         self.assertEqual(config.response_schema, attribution.response_schema())
         # Validate with the pinned SDK's real schema model, without a request.
         schema = bot.genai.types.Schema(**config.response_schema)
-        self.assertEqual(schema.property_ordering[0], "assessments")
-        self.assertEqual(schema.property_ordering[-1], "verdict")
+        self.assertEqual(schema.property_ordering, ["units", "assessments", "verdict"])
+        span = schema.properties["units"].items.properties["spans"].items
+        self.assertLess(span.property_ordering.index("evidence"), span.property_ordering.index("grounding"))
+        self.assertLess(span.property_ordering.index("grounding"), span.property_ordering.index("verdict"))
+        self.assertIn("grounding", span.required)
         self.assertEqual(config.max_output_tokens, bot.policy_for_route(bot.JOURNAL_ROUTE).max_output_tokens)
 
     def test_prefix_inside_normal_writer_text_does_not_select_editor(self):

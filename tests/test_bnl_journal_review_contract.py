@@ -4,6 +4,7 @@ import json
 import unittest
 
 import bnl_journal_attribution as review
+from tests.journal_review_helpers import fixture_grounding
 
 
 class JournalReviewContractTests(unittest.TestCase):
@@ -29,6 +30,7 @@ class JournalReviewContractTests(unittest.TestCase):
                                   "issues": [], "verdict": "supported"}
                                  for check in review.ASSESSMENT_CHECKS],
                 "units": [{"unitId": unit["unitId"], "spans": [{"text": unit["text"],
+                            "grounding": fixture_grounding(unit["text"], factual=False),
                             "kind": "creative", "evidence": [], "issues": [], "verdict": "supported"}]}
                           for unit in units], "verdict": "supported"}
 
@@ -56,6 +58,9 @@ class JournalReviewContractTests(unittest.TestCase):
         unit = next(item for item in data["units"] if item["unitId"].startswith("metadata.continuityNotes"))
         unit["spans"][0].update(kind="factual", verdict="unsupported",
                                 issues=["An authorship question does not prove missing credits."])
+        unit["spans"][0]["grounding"] = fixture_grounding(unit["spans"][0]["text"])
+        unit["spans"][0]["grounding"]["externalPremises"][0].update(
+            evidenceIndexes=[], support="unknown")
         data["verdict"] = "unsupported"
         receipt, reason, targets = self.accept(data)
         self.assertIsNone(receipt)
@@ -165,6 +170,8 @@ class JournalReviewContractTests(unittest.TestCase):
         unit = next(item for item in data["units"] if item["unitId"].startswith("metadata.continuityNotes"))
         unit["spans"][0].update(kind="factual", evidence=[{"refId": "memory:1", "speaker": "",
                                         "quote": memory["summary"], "use": "context"}])
+        unit["spans"][0]["grounding"] = fixture_grounding(unit["spans"][0]["text"],
+                                                        source_meaning=memory["summary"])
         contract = {"memory:1": {"laneType": "established_broadcast_memory"}}
         self.assertEqual(self.accept(data, context_contract=contract)[1], "")
         declaration["sectionHeading"] = "A nonexistent section"

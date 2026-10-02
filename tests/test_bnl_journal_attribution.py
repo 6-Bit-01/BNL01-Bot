@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import bnl_journal_attribution as review
+from tests.journal_review_helpers import fixture_grounding
 
 
 class JournalAttributionTests(unittest.TestCase):
@@ -37,6 +38,9 @@ class JournalAttributionTests(unittest.TestCase):
                     "quote": source["summary"], "speaker": source["participantAlias"], "use": "speech"}])
             if unit["text"].startswith("I am"):
                 item["kind"] = "reflection"
+            item["grounding"] = fixture_grounding(
+                item["text"], factual=item["kind"] == "factual",
+                source_meaning=item["evidence"][0]["quote"] if item["evidence"] else "")
             units.append({"unitId": unit["unitId"], "spans": [item]})
         return {"assessments": [
             {"check": check, "unitIds": [unit["unitId"] for unit in units],
@@ -148,12 +152,16 @@ class JournalAttributionTests(unittest.TestCase):
         body = next(u for u in data["units"] if ".body:" in u["unitId"])
         body["spans"] = [
             {"text": "I liked that ", "kind": "reflection", "evidence": [],
+             "grounding": fixture_grounding("I liked that ", factual=False),
              "issues": [], "verdict": "supported"},
             {"text": "Test Listener called the bridge unfinished", "kind": "factual",
              "evidence": [{"refId": "fresh:1", "quote": "The bridge is unfinished.",
                            "speaker": "Test Listener", "use": "speech"}],
+             "grounding": fixture_grounding("Test Listener called the bridge unfinished",
+                                             source_meaning="The bridge is unfinished."),
              "issues": [], "verdict": "supported"},
             {"text": ", though I imagined the ceiling applauding.", "kind": "creative",
+             "grounding": fixture_grounding(", though I imagined the ceiling applauding.", factual=False),
              "evidence": [], "issues": [], "verdict": "supported"},
         ]
         self.assertEqual(self.accept(data)[1], "")
@@ -161,10 +169,12 @@ class JournalAttributionTests(unittest.TestCase):
         claim["evidence"] = []
         self.assertEqual(self.accept(data)[1], "source_review_missing_evidence")
         claim.update(verdict="unsupported", issues=["The later original clarifies a different subject."])
+        claim["grounding"]["externalPremises"][0].update(evidenceIndexes=[], support="unknown")
         receipt, reason, targets = self.accept(data)
         self.assertIsNone(receipt)
         self.assertEqual(reason, "source_attribution_failed")
-        self.assertEqual(targets, [{"field": "sections[0].body", "check": "source_attribution",
+        self.assertEqual([target for target in targets if target["check"] == "source_attribution"],
+                         [{"field": "sections[0].body", "check": "source_attribution",
                                   "unitId": body["unitId"], "spanIndex": 1,
                                   "claim": claim["text"], "issues": claim["issues"]}])
 
@@ -215,14 +225,14 @@ class JournalAttributionTests(unittest.TestCase):
 
     def test_schema_orders_evidence_and_issues_before_any_verdict(self):
         schema = review.response_schema()
-        self.assertEqual(schema["propertyOrdering"], ["assessments", "units", "verdict"])
+        self.assertEqual(schema["propertyOrdering"], ["units", "assessments", "verdict"])
         assessment = schema["properties"]["assessments"]["items"]
         self.assertEqual(assessment["propertyOrdering"],
                          ["check", "unitIds", "sourceRefIds", "explanation", "issues", "verdict"])
         unit = schema["properties"]["units"]["items"]
         self.assertEqual(unit["required"], ["unitId", "spans"])
         span = unit["properties"]["spans"]["items"]
-        self.assertEqual(span["propertyOrdering"], ["text", "kind", "evidence", "issues", "verdict"])
+        self.assertEqual(span["propertyOrdering"], ["text", "evidence", "grounding", "kind", "issues", "verdict"])
         anchor = span["properties"]["evidence"]["items"]
         self.assertNotIn("field", anchor["required"])
         self.assertEqual(anchor["properties"]["field"]["enum"], list(review.ANCHOR_FIELDS))
@@ -491,6 +501,7 @@ class JournalAttributionTests(unittest.TestCase):
             self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
         factual = next(u for u in self.spans(data) if u["kind"] == "factual")
         factual.update(verdict="unsupported", evidence=[], issues=["The original says otherwise."])
+        factual["grounding"]["externalPremises"][0].update(evidenceIndexes=[], support="unknown")
         self.assertEqual(review.accept_review("```json\n" + json.dumps(data) + "\n```",
                                             self.article, self.sources)[1], "source_attribution_failed")
 
@@ -524,8 +535,8 @@ class JournalAttributionTests(unittest.TestCase):
         prompt = review.review_prompt(self.article, {"sources": self.sources})
         self.assertTrue(prompt.startswith(review.REVIEW_PREFIX))
         for text in ("do not rewrite", "later clarifications", "recipient", "reply order", "mixed sentence",
-                     "personal voice", "EVERY unit", "never a member's biography", "evidence-first",
-                     "atomic external factual clause", "contradictory", "ordered verbatim spans",
+                     "personal voice", "EVERY unit", "never a member's biography", "sourceMeaning",
+                     "externalPremises", "compatible_only", "ordered verbatim spans",
                      "ACROSS sentences", "A generic statement", "allegation", "complete writing",
                      "not completeness, a roll call", "First read the complete article"):
             self.assertIn(text, prompt)
