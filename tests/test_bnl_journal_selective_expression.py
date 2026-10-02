@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import bnl_journal as journal
 import bnl_journal_attribution as attribution
-from tests.journal_review_helpers import fixture_claim, review_inputs, supported_review
+from tests.journal_review_helpers import fixture_issue, review_inputs, supported_review
 
 
 class JournalSelectiveOmissionTests(unittest.TestCase):
@@ -80,11 +80,10 @@ class JournalSelectiveOmissionTests(unittest.TestCase):
                         if fragment["refId"] == "fresh:2" and fragment["field"] == "summary")
         target = next(unit for unit in units
                       if unit["field"] == "sections[1].body" and "released" in unit["text"])
-        review = next(unit for unit in response["units"] if unit["unitId"] == target["unitId"])
-        review["claims"] = [fixture_claim(
-            "Two members released a collaboration.", original,
-            claimType="external_fact", sourceStance="question", support="unknown",
-            assumptions=["A proposed collaboration occurred and was released."],
+        response["issues"] = [fixture_issue(
+            [target["unitId"]], [original],
+            source_meaning="A member asked about a possible collaboration.",
+            added_premise="Two members released a collaboration.",
         )]
         return json.dumps(response)
 

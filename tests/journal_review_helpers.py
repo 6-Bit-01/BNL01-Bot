@@ -7,7 +7,7 @@ Production code must never import this module.
 from functools import wraps
 import json
 
-from bnl_journal_attribution import ASSESSMENT_CHECKS, REVIEW_PREFIX
+from bnl_journal_attribution import REVIEW_PREFIX
 
 
 def is_source_review(prompt):
@@ -25,7 +25,7 @@ def review_inputs(prompt):
     fragments = []
     for item in evidence["fragments"]:
         context = evidence["contexts"][item["contextRef"]]
-        identity = {key: context[key] for key in ("refId", "speaker", "authority", "publicSpeakerName") if key in context}
+        identity = {key: context[key] for key in ("refId", "speaker", "authority", "publicSpeakerName", "evidenceKind") if key in context}
         metadata = {key: value for key, value in context.items() if key not in identity}
         fragments.append({key: value for key, value in item.items() if key != "contextRef"}
                          | identity | {"context": metadata})
@@ -33,52 +33,27 @@ def review_inputs(prompt):
     return units, evidence
 
 
-def fixture_claim(text, fragment, *, source_meaning=None, **changes):
-    """Explicit protocol fixture, never a semantic judgment about test prose."""
-    claim = {
-        "claim": text, "claimType": "reported_speech", "sourceStance": "assertion",
-        "evidence": [{"fragmentId": fragment["fragmentId"],
-                      "use": "speech" if fragment["authority"] in {"original", "speech_only"} else "context"}],
-        "sourceMeaning": source_meaning or fragment["text"], "support": "entails",
-        "assumptions": [], "evidenceScope": "recorded_content",
-    }
-    claim.update(changes)
-    return claim
+def fixture_issue(unit_ids, fragments, *, source_meaning, added_premise,
+                  repair="Preserve the expression but correct the unsupported premise."):
+    """Explicit negative semantic judgment supplied by a test, never an oracle."""
+    return {"unitIds": list(unit_ids), "fragmentIds": [item["fragmentId"] for item in fragments],
+            "sourceMeaning": source_meaning, "addedPremise": added_premise, "repair": repair}
 
 
 def supported_review(prompt):
-    """Supply a test-approved verdict with structurally genuine source anchors."""
-    units, evidence = review_inputs(prompt)
-    fragment = next((item for item in evidence["fragments"] if item["field"] == "summary"), None)
-    if fragment is None:
-        raise AssertionError("Mock review needs an actual supplied original source")
-    return json.dumps({"assessments": [
-        {"check": check, "unitIds": [unit["unitId"] for unit in units],
-         "sourceRefIds": [fragment["refId"]],
-         "explanation": "This controlled fixture supplies a passing " + check + " verdict; not model-quality evidence.",
-         "issues": [], "verdict": "supported"} for check in ASSESSMENT_CHECKS
-    ], "units": [
-        {"unitId": unit["unitId"], "claims": [fixture_claim(unit["text"], fragment)],
-         "nonFactualReason": ""} for unit in units
-    ], "verdict": "supported"})
+    """Supply a test-chosen judgment covering the complete immutable candidate."""
+    units, _evidence = review_inputs(prompt)
+    return json.dumps({"reviewedUnitIds": [unit["unitId"] for unit in units],
+                       "issues": [], "verdict": "supported"})
 
 
 def rejected_review(prompt, *, issue="The candidate reverses the original attribution."):
     response = json.loads(supported_review(prompt))
-    response["verdict"] = "unsupported"
-    target = next(unit for unit in response["units"] if ".body:" in unit["unitId"])
-    target["claims"][0].update(evidence=[], support="unknown", assumptions=[issue])
-    return json.dumps(response)
-
-
-def supported_review_with_anchor(prompt, *, unit_id, source_ref):
-    """Choose one exact evidence dependency, not a semantic support judgment."""
-    response = json.loads(supported_review(prompt))
-    _, evidence = review_inputs(prompt)
-    fragment = next(item for item in evidence["fragments"]
-                    if item["refId"] == source_ref and item["field"] == "summary")
-    unit = next(unit for unit in response["units"] if unit["unitId"] == unit_id)
-    unit["claims"][0] = fixture_claim(unit["claims"][0]["claim"], fragment)
+    units, evidence = review_inputs(prompt)
+    target = next(unit for unit in units if ".body:" in unit["unitId"])
+    fragment = next(item for item in evidence["fragments"] if item["field"] == "summary")
+    response.update(verdict="unsupported", issues=[fixture_issue(
+        [target["unitId"]], [fragment], source_meaning=fragment["text"], added_premise=issue)])
     return json.dumps(response)
 
 

@@ -4701,7 +4701,11 @@ def _journal_prompt_projection(packet: dict[str, Any]) -> dict[str, Any]:
             if (item.get("basisKind") == "accepted_relay_continuity" and isinstance(speech, dict)
                     and speech.get("partition") == "matched_public_relay_fields"
                     and isinstance(speech.get("publicMessage"), str) and speech["publicMessage"].strip()):
+                # Exact Relay wording is still BNL's prior expression, not an
+                # additional witness or an event caused by its invitation.
                 value["summary"] = speech["publicMessage"]
+                value["participantAlias"] = "bnl"
+                value["publicSpeakerName"] = "BNL"
                 if isinstance(speech.get("publicInvitation"), str) and speech["publicInvitation"].strip():
                     value["publicInvitation"] = speech["publicInvitation"]
             projected.append(value)

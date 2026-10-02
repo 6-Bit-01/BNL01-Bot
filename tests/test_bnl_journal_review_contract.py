@@ -1,10 +1,10 @@
-"""Private review protocol checks, not claims of model semantic accuracy."""
+"""Focused audit protocol regressions, not semantic model-quality assertions."""
 import copy
 import json
 import unittest
 
 import bnl_journal_attribution as review
-from tests.journal_review_helpers import fixture_claim
+from tests.journal_review_helpers import fixture_issue
 
 
 class JournalReviewContractTests(unittest.TestCase):
@@ -24,251 +24,189 @@ class JournalReviewContractTests(unittest.TestCase):
                              "linkContent": "not_inspected", "textTruncated": False}}]
 
     def response(self):
-        units = review.public_units(self.article)
-        return {"assessments": [{"check": check, "unitIds": [units[0]["unitId"]],
-                                  "sourceRefIds": [], "explanation": "Controlled editorial fixture.",
-                                  "issues": [], "verdict": "supported"}
-                                 for check in review.ASSESSMENT_CHECKS],
-                "units": [{"unitId": unit["unitId"], "claims": [],
-                           "nonFactualReason": "This controlled fixture contains only imagined or personal expression."}
-                          for unit in units], "verdict": "supported"}
+        return {"reviewedUnitIds": [unit["unitId"] for unit in review.public_units(self.article)],
+                "issues": [], "verdict": "supported"}
 
     def accept(self, response=None, **kwargs):
-        return review.accept_review(json.dumps(response or self.response()),
+        return review.accept_review(json.dumps(self.response() if response is None else response),
                                     self.article, self.sources, **kwargs)
 
-    def fragment(self, source, field="summary"):
-        return next(item for item in review.source_fragments(self.sources)
-                    if item["refId"] == source["refId"] and item["field"] == field)
+    def fragment(self):
+        return next(item for item in review.source_fragments(self.sources) if item["field"] == "summary")
 
-    def anchor(self, source, *, field="summary", use="speech"):
-        fragments = {item["fragmentId"]: item for item in review.source_fragments(self.sources)}
-        fragment = self.fragment(source, field)
-        return review._bind_fragment({"fragmentId": fragment["fragmentId"], "use": use}, fragments)
+    def issue(self, unit_ids=None, fragments=None):
+        return fixture_issue(unit_ids or ["sections[0].body:0"],
+                             [self.fragment()] if fragments is None else fragments,
+                             source_meaning="The member asked who made the recording.",
+                             added_premise="The linked recording has no creator credit.",
+                             repair="Keep the curiosity without asserting unseen page contents.")
 
-    def test_continuity_and_question_premises_cannot_escape_review(self):
-        fields = {unit["field"] for unit in review.public_units(self.article)}
-        self.assertTrue({"metadata.topicTags[0]", "metadata.continuityNotes[0]",
-                         "metadata.unresolvedQuestions[0]"}.issubset(fields))
-        data = self.response()
-        data["units"] = [unit for unit in data["units"] if not unit["unitId"].startswith("metadata.")]
-        self.assertEqual(self.accept(data)[1], "source_review_incomplete")
-
-    def test_failed_continuity_is_a_located_factual_repair(self):
-        data = self.response()
-        unit = next(item for item in data["units"] if item["unitId"].startswith("metadata.continuityNotes"))
-        unit["claims"] = [fixture_claim("The posted work had no credits.", self.fragment(self.sources[0]),
-                                         support="unknown", source_meaning="An authorship question establishes only the question.")]
-        data["verdict"] = "unsupported"
-        receipt, reason, targets = self.accept(data)
-        self.assertIsNone(receipt)
-        self.assertEqual(reason, "source_attribution_failed")
-        self.assertEqual(targets[0]["field"], "metadata.continuityNotes[0]")
-
-    def test_speech_only_support_cannot_certify_external_property_despite_positive_verdict(self):
-        data = self.response()
-        unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
-        unit["claims"] = [fixture_claim(
-            "The shared recording has no credited creator.", self.fragment(self.sources[0]),
-            claimType="external_fact", sourceStance="assertion", support="entails",
-            source_meaning="A member posted a link and asked who made it.")]
-        unit["nonFactualReason"] = ""
-        receipt, reason, targets = self.accept(data)
-        self.assertIsNone(receipt)
-        self.assertEqual(reason, "source_attribution_failed")
-        self.assertEqual(targets[0]["field"], "excerpt")
-
-    def test_faithful_report_of_question_remains_allowed_without_verifying_its_answer(self):
-        data = self.response()
-        unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
-        unit["claims"] = [fixture_claim(
-            "Test Listener asked who made the recording.", self.fragment(self.sources[0]),
-            sourceStance="question")]
-        unit["nonFactualReason"] = ""
-        self.assertEqual(self.accept(data)[1], "")
-
-    def test_adding_derived_context_cannot_upgrade_a_speech_only_fact_claim(self):
-        derived = {"refId": "reflection:relay", "sourceRole": "bnl_interpretation",
-                   "summary": "BNL wondered about the recording's origin."}
-        self.sources.append(derived)
-        data = self.response()
-        unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
-        unit["claims"] = [fixture_claim(
-            "The recording has no credited creator.", self.fragment(self.sources[0]),
-            claimType="external_fact", evidence=[
-                {"fragmentId": self.fragment(self.sources[0])["fragmentId"], "use": "speech"},
-                {"fragmentId": self.fragment(derived)["fragmentId"], "use": "context"}])]
-        unit["nonFactualReason"] = ""
-        self.assertEqual(self.accept(data)[1], "source_attribution_failed")
-
-    def test_original_used_as_background_context_is_not_event_evidence(self):
-        data = self.response()
-        fragment = self.fragment(self.sources[0])
-        unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
-        unit["claims"] = [fixture_claim(
-            "The recording is anonymous.", fragment, claimType="external_fact",
-            evidence=[{"fragmentId": fragment["fragmentId"], "use": "context"}])]
-        unit["nonFactualReason"] = ""
-        self.assertEqual(self.accept(data)[1], "source_attribution_failed")
-
-    def test_original_event_evidence_and_canon_keep_their_factual_scope(self):
-        for source, use in (({**self.sources[0], "summary": "Test Listener posted a recording."}, "event"),
-                            ({"refId": "canon:radio", "authority": "canon", "summary": "The show begins Friday."}, "context")):
-            with self.subTest(use=use):
-                self.sources = [source]
-                data = self.response()
-                fragment = self.fragment(source)
-                unit = next(item for item in data["units"] if item["unitId"] == "excerpt:0")
-                unit["claims"] = [fixture_claim(
-                    source["summary"], fragment, claimType="external_fact",
-                    evidence=[{"fragmentId": fragment["fragmentId"], "use": use}])]
-                unit["nonFactualReason"] = ""
-                self.assertEqual(self.accept(data)[1], "")
-
-    def test_receipt_binds_generated_continuity_but_not_governed_subject_refs(self):
-        receipt, reason, _ = self.accept()
-        self.assertEqual(reason, "")
-        self.assertEqual(receipt["version"], review.REVIEW_VERSION)
-        for key in (*review.REVIEWED_METADATA_FIELDS, "contextUses"):
-            changed = copy.deepcopy(self.article)
-            changed["metadata"][key] = ["different"]
-            self.assertNotEqual(receipt["articleDigest"], review.article_digest(changed), key)
-        self.article["metadata"]["sourceReview"] = receipt
-        self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
-        self.article["metadata"]["subjectRefs"] = ["governed-opaque-root"]
-        self.assertEqual(receipt["articleDigest"], review.article_digest(self.article))
-
-    def test_evidence_digest_handles_existing_set_valued_lane_contract(self):
-        first = {"memory:1": {"claimTerms": {"music", "joke"}, "distinctiveClaimTerms": frozenset({"echo"})}}
-        second = {"memory:1": {"claimTerms": {"joke", "music"}, "distinctiveClaimTerms": {"echo"}}}
-        self.assertEqual(review.evidence_digest(self.sources, context_contract=first),
-                         review.evidence_digest(self.sources, context_contract=second))
-        receipt, reason, _ = self.accept(context_contract=first)
-        self.assertEqual(reason, "")
-        self.assertEqual(receipt["evidenceDigest"], review.evidence_digest(self.sources, context_contract=first))
-
-    def test_evidence_receipt_invalidates_on_source_or_authority_change(self):
-        receipt, _, _ = self.accept(context_contract={"memory:1": {"laneType": "community_rumor"}})
-        for key, value in (("summary", "The creator identified themself."),
-                           ("observedAt", "2026-01-03T01:00:00Z"),
-                           ("authority", "speech_only"),
-                           ("messageContext", {"roomRef": "room-b"})):
-            changed = copy.deepcopy(self.sources)
-            changed[0][key] = value
-            self.assertNotEqual(receipt["evidenceDigest"], review.evidence_digest(changed,
-                                context_contract={"memory:1": {"laneType": "community_rumor"}}), key)
-        self.assertNotEqual(receipt["evidenceDigest"], review.evidence_digest(self.sources))
-
-    def test_duplicate_or_missing_source_refs_fail_closed(self):
-        self.sources.append(dict(self.sources[0], summary="A conflicting record."))
-        self.assertEqual(self.accept()[1], "source_review_invalid")
-        self.sources[-1].pop("refId")
-        self.assertEqual(self.accept()[1], "source_review_invalid")
-
-    def test_current_packet_time_and_nested_room_fragments_bind_exactly(self):
-        for field, value in (("observedAt", self.sources[0]["observedAt"]),
-                             ("messageContext.roomRef", "room-a"),
-                             ("messageContext.roomName", "finished-tracks")):
-            bound, reason = self.anchor(self.sources[0], field=field)
-            self.assertEqual(reason, "", field)
-            self.assertEqual(bound["quote"], value)
-            self.assertEqual(bound["speaker"], "member-a")
-
-    def test_dated_memory_retains_temporal_boundary_and_context_is_supplied_once(self):
-        memory = {"refId": "memory:earlier", "authority": "established_memory",
-                  "summary": "Test Listener shared an album.", "episodeDate": "2025-08-12",
-                  "recordedAt": "2025-08-13T10:00:00Z", "temporalScope": "remembered_history_not_current_activity",
-                  "matchAuthority": "topic_similarity_only", "matchedFreshSourceRefIds": ["fresh:1"]}
-        self.sources.append(memory)
-        prompt = review.review_prompt(self.article, {"sources": self.sources})
-        evidence, _ = json.JSONDecoder().raw_decode(prompt.split("ORIGINAL_EVIDENCE_JSON: ", 1)[1])
-        fragments = [item for item in evidence["fragments"] if evidence["contexts"][item["contextRef"]]["refId"] == memory["refId"]]
-        self.assertEqual(len({item["contextRef"] for item in fragments}), 1)
-        context = evidence["contexts"][fragments[0]["contextRef"]]
-        for key in ("episodeDate", "recordedAt", "temporalScope", "matchAuthority", "matchedFreshSourceRefIds"):
-            self.assertEqual(context[key], memory[key])
-        summary_id = self.fragment(memory)["fragmentId"]
-        memory["episodeDate"] = "2026-08-12"
-        self.assertNotEqual(summary_id, self.fragment(memory)["fragmentId"])
-
-    def test_relay_public_speech_invitation_and_publication_details_survive_contributors(self):
-        relay = {"refId": "relay:1", "basisKind": "accepted_relay_continuity",
-                 "summary": "I wondered about the unfinished chorus.", "publicInvitation": "Tell me what you hear.",
-                 "relayPublishedAt": "2026-01-02T02:00:00Z", "originalSourceDates": [{"observedAt": "2026-01-01T23:00:00Z"}],
-                 "publication_card": {"title": "A published title", "mentions": ["Test Listener"]},
-                 "contributions": [{"participantAlias": "member-a", "summary": "A derived contributor description."}]}
-        self.sources.append(relay)
-        for field in ("summary", "publicInvitation", "relayPublishedAt", "originalSourceDates", "publication_card"):
-            fragments = [item for item in review.source_fragments(self.sources)
-                         if item["refId"] == relay["refId"] and item["field"] == field]
-            self.assertTrue(fragments, field)
-            self.assertTrue(all(item["authority"] == "derived_context" for item in fragments))
-        fragment = self.fragment(relay, "publicInvitation")
-        self.assertEqual(fragment["text"], relay["publicInvitation"])
-        self.assertEqual(self.anchor(relay, field="publicInvitation", use="event")[1], "source_review_derived_as_fact")
-
-    def test_impression_has_own_speaker_and_cannot_become_event_evidence(self):
-        impression = {"refId": "reflection:impression:1", "basisKind": "moment_impression",
-                      "authority": "bnl_subjective_perspective_not_event_evidence",
-                      "summary": "The exchange was playful.", "impression": "I enjoy that friction.",
-                      "reason": "The joke leaves room for affection.",
-                      "contributions": [{"participantAlias": "member-a", "summary": "I enjoy that friction."}]}
-        self.sources.append(impression)
-        self.assertEqual(review.source_authority(impression), "subjective_context")
-        for field in ("impression", "reason"):
-            bound, reason = self.anchor(impression, field=field, use="context")
-            self.assertEqual(reason, "")
-            self.assertEqual((bound["speaker"], bound["quote"]), ("bnl", impression[field]))
-            self.assertEqual(self.anchor(impression, field=field, use="event")[1], "source_review_derived_as_fact")
-
-    def test_inference_and_derived_roles_cannot_be_promoted_by_original_marker(self):
-        for extra in ({"laneType": "bnl_inference"}, {"basisKind": "moment_impression"},
-                      {"sourceRole": "bnl_interpretation"}):
-            source = {**self.sources[0], **extra}
-            self.sources = [source]
-            self.assertNotEqual(review.source_authority(source), "original")
-            self.assertEqual(self.anchor(source, use="event")[1], "source_review_derived_as_fact")
-
-    def test_original_impression_evidence_keeps_its_separate_original_authority(self):
-        self.sources[0].pop("sourceKind")
-        self.assertEqual(review.source_authority(self.sources[0]), "original")
-        self.assertEqual(self.anchor(self.sources[0])[1], "")
-
-    def test_humor_and_personal_reflection_need_no_fabricated_event_anchors(self):
+    def test_receipt_covers_prose_and_future_continuity_without_sentence_exemptions(self):
         receipt, reason, targets = self.accept()
         self.assertEqual((reason, targets), ("", []))
-        self.assertTrue(all(not unit["claims"] for unit in receipt["units"]))
+        self.assertEqual(receipt["version"], 8)
+        self.assertEqual(receipt["reviewedUnitIds"], self.response()["reviewedUnitIds"])
+        self.assertEqual(receipt["issues"], [])
+        self.assertEqual(receipt["assessments"], [])
+        self.assertNotIn("units", receipt)
+        fields = {unit["field"] for unit in review.public_units(self.article)}
+        self.assertTrue({"title", "excerpt", "sections[0].body", "metadata.topicTags[0]",
+                         "metadata.continuityNotes[0]", "metadata.unresolvedQuestions[0]"}.issubset(fields))
 
-    def test_whole_entry_chronology_failure_is_not_hidden_by_valid_sentence_anchors(self):
-        data = self.response()
-        assessment = next(item for item in data["assessments"] if item["check"] == "event_relationships")
-        assessment.update(verdict="unsupported", sourceRefIds=["fresh:1"],
-                          issues=["The narrative reverses the supplied message order."])
-        self.assertEqual(self.accept(data)[1], "source_attribution_failed")
+    def test_blank_partial_duplicate_unknown_or_nonstring_coverage_fails_closed(self):
+        complete = self.response()["reviewedUnitIds"]
+        for coverage in (None, "all", [], [""], complete[:-1], complete + [complete[0]],
+                         [*complete[:-1], complete[0]], [*complete[:-1], "unknown"],
+                         [*complete[:-1], {}], [*complete[:-1], None]):
+            with self.subTest(coverage=coverage):
+                data = self.response()
+                data["reviewedUnitIds"] = coverage
+                self.assertEqual(self.accept(data), (None, "source_review_incomplete", []))
 
-    def test_continuity_can_reuse_only_an_existing_body_context_lane_declaration(self):
-        memory = {"refId": "memory:1", "authority": "established_memory",
-                  "summary": "Test Listener shared an album last year."}
-        self.sources.append(memory)
-        self.article["sections"][0]["body"] = "I remembered Test Listener's album from last year."
-        self.article["metadata"]["continuityNotes"] = ["Test Listener shared an album last year."]
-        declaration = {"laneRefId": "memory:1", "laneType": "established_broadcast_memory",
-                       "sectionHeading": "Unfinished thoughts", "claim": self.article["sections"][0]["body"],
-                       "basisRefIds": ["memory:1", "fresh:1"]}
-        self.article["metadata"]["contextUses"] = [declaration]
+    def test_coverage_requires_continuity_and_questions_too(self):
         data = self.response()
-        unit = next(item for item in data["units"] if item["unitId"].startswith("metadata.continuityNotes"))
-        unit["claims"] = [fixture_claim("Test Listener shared an album last year.", self.fragment(memory))]
+        data["reviewedUnitIds"] = [unit for unit in data["reviewedUnitIds"] if not unit.startswith("metadata.")]
+        self.assertEqual(self.accept(data)[1], "source_review_incomplete")
+
+    def test_valid_issue_beats_every_global_verdict_even_for_reflective_prose(self):
+        # The issue is a test-supplied semantic finding, not an automated oracle.
+        for verdict in ("supported", "unsupported", "uncertain"):
+            data = self.response()
+            data.update(verdict=verdict, issues=[self.issue()])
+            receipt, reason, targets = self.accept(data)
+            self.assertIsNone(receipt)
+            self.assertEqual(reason, "source_attribution_failed")
+            self.assertEqual(targets[0]["check"], "source_entailment")
+            self.assertEqual(targets[0]["claim"], data["issues"][0]["addedPremise"])
+            self.assertEqual(targets[0]["sourceMeaning"], data["issues"][0]["sourceMeaning"])
+            self.assertEqual(targets[0]["explanation"], data["issues"][0]["repair"])
+
+    def test_metaphor_label_cannot_remove_a_located_external_premise(self):
+        data = self.response()
+        data["issues"] = [self.issue()]
+        for key in ("nonFactualReason", "claimType", "use", "authority", "evidenceKind"):
+            altered = copy.deepcopy(data)
+            altered["issues"][0][key] = "metaphor"
+            self.assertEqual(self.accept(altered), (None, "source_review_invalid_grounding", []))
+        data["nonFactualReason"] = "Everything is figurative."
+        self.assertEqual(self.accept(data), (None, "source_review_invalid", []))
+
+    def test_legacy_per_unit_certificates_cannot_approve_any_candidate(self):
+        for old in ({"units": [], "assessments": [], "verdict": "supported"},
+                    {**self.response(), "units": [{"unitId": "title:0", "claims": [],
+                      "nonFactualReason": "A title cannot have a factual premise."}]}):
+            self.assertEqual(self.accept(old), (None, "source_review_invalid", []))
+
+    def test_issue_locations_cover_exact_fields_including_private_continuity(self):
+        units = ["excerpt:0", "sections[0].body:0", "metadata.continuityNotes[0]:0"]
+        data = self.response()
+        data["issues"] = [self.issue(units)]
+        _, reason, targets = self.accept(data)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertEqual(targets[0]["unitIds"], units)
+        self.assertEqual(targets[0]["fieldPaths"], ["excerpt", "sections[0].body", "metadata.continuityNotes[0]"])
+        self.assertEqual(targets[0]["field"], "excerpt")
+
+    def test_issue_requires_specific_source_meaning_addition_and_repair(self):
+        for field in ("sourceMeaning", "addedPremise", "repair"):
+            for value in ("", " ", [], {}, None, 3):
+                with self.subTest(field=field, value=value):
+                    data = self.response()
+                    data["issues"] = [{**self.issue(), field: value}]
+                    self.assertEqual(self.accept(data)[1], "source_review_invalid_grounding")
+        data = self.response()
+        data["issues"] = [self.issue()]
+        del data["issues"][0]["repair"]
+        self.assertEqual(self.accept(data)[1], "source_review_invalid_grounding")
+
+    def test_issue_locations_are_nonempty_valid_and_unique(self):
+        for unit_ids in ([], None, {}, ["unknown"], ["title:0", "title:0"], [{}]):
+            data = self.response()
+            data["issues"] = [{**self.issue(), "unitIds": unit_ids}]
+            self.assertEqual(self.accept(data), (None, "source_review_incomplete", []))
+
+    def test_missing_evidence_can_be_located_without_inventing_an_anchor(self):
+        data = self.response()
+        data["issues"] = [self.issue(fragments=[])]
+        data["issues"][0]["sourceMeaning"] = "No queue event is supplied."
+        _, reason, targets = self.accept(data)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertEqual(targets[0]["evidence"], [])
+        self.assertEqual(targets[0]["sourceRefIds"], [])
+
+    def test_negative_global_verdict_needs_a_concrete_located_issue(self):
+        for verdict in ("unsupported", "uncertain"):
+            data = self.response()
+            data["verdict"] = verdict
+            self.assertEqual(self.accept(data), (None, "source_review_invalid", []))
+
+    def test_fragment_ids_cannot_be_forged_retyped_or_duplicated(self):
+        fragment_id = self.fragment()["fragmentId"]
+        for ids in (["f:unknown"], [fragment_id, fragment_id], [None], [{}], [1], None, "all"):
+            data = self.response()
+            data["issues"] = [{**self.issue(), "fragmentIds": ids}]
+            self.assertEqual(self.accept(data), (None, "source_review_invalid_anchor", []))
+
+    def test_source_edits_invalidate_selected_fragment_identity(self):
+        data = self.response()
+        data["issues"] = [self.issue()]
+        original = copy.deepcopy(self.sources)
+        for mutate in (
+            lambda s: s.update(summary="A different original."),
+            lambda s: s.update(participantAlias="another-member"),
+            lambda s: s.update(observedAt="2026-01-03T01:00:00Z"),
+            lambda s: s["messageContext"].update(linkContent="inspected"),
+            lambda s: s.update(sourceRole="bnl_interpretation"),
+        ):
+            self.sources = copy.deepcopy(original)
+            mutate(self.sources[0])
+            self.assertEqual(self.accept(data)[1], "source_review_invalid_anchor")
+
+    def test_evidence_digest_binds_roles_dates_privacy_limits_and_context_contract(self):
         contract = {"memory:1": {"laneType": "established_broadcast_memory"}}
-        self.assertEqual(self.accept(data, context_contract=contract)[1], "")
-        declaration["sectionHeading"] = "A nonexistent section"
-        self.assertEqual(self.accept(data, context_contract=contract)[1], "source_attribution_failed")
-        self.article["metadata"]["contextUses"] = []
-        self.assertEqual(self.accept(data, context_contract=contract)[1], "source_attribution_failed")
-        self.article["metadata"]["contextUses"] = [{**declaration, "sectionHeading": "Unfinished thoughts"}]
-        title = next(item for item in data["units"] if item["unitId"].startswith("title:"))
-        title["claims"] = copy.deepcopy(unit["claims"])
-        self.assertEqual(self.accept(data, context_contract=contract)[1], "source_attribution_failed")
+        receipt, _, _ = self.accept(context_contract=contract)
+        self.assertEqual(receipt["evidenceDigest"], review.evidence_digest(self.sources, context_contract=contract))
+        for update in ({"sourceRole": "bnl_interpretation"}, {"observedAt": "2025-01-01"},
+                       {"messageContext": {"linkContent": "inspected"}}, {"eligible": False}):
+            changed = copy.deepcopy(self.sources)
+            changed[0].update(update)
+            self.assertNotEqual(receipt["evidenceDigest"], review.evidence_digest(changed, context_contract=contract))
+        self.assertNotEqual(receipt["evidenceDigest"], review.evidence_digest(self.sources))
+
+    def test_exact_candidate_receipt_changes_with_prose_citations_and_context_uses(self):
+        receipt, _, _ = self.accept()
+        for mutate in (
+            lambda a: a.update(title="Another title"),
+            lambda a: a["sections"][0].update(body="Another thought."),
+            lambda a: a["sections"][0].update(sourceRefIds=["another"]),
+            lambda a: a["sourceRefIds"].update({"Unfinished thoughts": ["another"]}),
+            lambda a: a["metadata"].update(continuityNotes=["Another conclusion."]),
+            lambda a: a["metadata"].update(contextUses=[{"laneRefId": "memory:1"}]),
+        ):
+            changed = copy.deepcopy(self.article)
+            mutate(changed)
+            self.assertNotEqual(receipt["articleDigest"], review.article_digest(changed))
+
+    def test_duplicate_missing_or_invalid_source_refs_and_contract_fail_closed(self):
+        for sources in (None, {}, [{}], [{"refId": ""}], [{"refId": None}], self.sources * 2):
+            self.assertEqual(review.accept_review(json.dumps(self.response()), self.article, sources)[1],
+                             "source_review_invalid")
+        self.assertEqual(self.accept(context_contract=[])[1], "source_review_invalid")
+
+    def test_success_fixture_does_not_claim_to_verify_actual_model_semantics(self):
+        # No deterministic pronoun or sentiment quota: this semantic judgment is
+        # supplied by a fixture. Live evaluations must establish writing quality.
+        self.article["sections"][0]["body"] = "That question amused me. What if satellites argued over stickers?"
+        self.assertEqual(self.accept()[1], "")
+
+    def test_schema_has_no_pass_certificates_or_model_assigned_source_permissions(self):
+        schema = review.response_schema()
+        self.assertEqual(schema["required"], ["reviewedUnitIds", "issues", "verdict"])
+        self.assertEqual(schema["propertyOrdering"], schema["required"])
+        issue = schema["properties"]["issues"]["items"]
+        self.assertEqual(issue["required"], ["unitIds", "fragmentIds", "sourceMeaning", "addedPremise", "repair"])
+        for obsolete in ("nonFactualReason", "claimType", "sourceStance", '"use"', "assessments"):
+            self.assertNotIn(obsolete, json.dumps(schema))
 
 
 if __name__ == "__main__":

@@ -55,6 +55,8 @@ class JournalPromptProjectionTests(unittest.TestCase):
         self.assertEqual("I kept thinking about that question.", by_ref["reflection:event:2"]["summary"])
         self.assertEqual("Tell me what you hear.", by_ref["reflection:event:2"]["publicInvitation"])
         self.assertEqual("derived_context", by_ref["reflection:event:2"]["authority"])
+        self.assertEqual("bnl", by_ref["reflection:event:2"]["participantAlias"])
+        self.assertEqual("BNL", by_ref["reflection:event:2"]["publicSpeakerName"])
         self.assertEqual(1, len(result["experienceGroups"]))
         self.assertEqual(["original:question"], result["experienceGroups"][0]["originalMessageRefIds"])
         self.assertFalse(result["experienceGroups"][0]["interpretationsAreIndependentEvidence"])
@@ -71,6 +73,10 @@ class JournalPromptProjectionTests(unittest.TestCase):
                            if "reflection:event:2" in group["reflectionRefIds"])
         self.assertEqual([], relay_group["originalMessageRefIds"])
         self.assertFalse(relay_group["originalMessagesSupplied"])
+        relay = next(item for item in result["reflectionBasis"] if item["refId"] == "reflection:event:2")
+        self.assertEqual(relay["authority"], "derived_context")
+        self.assertEqual(relay["publicSpeakerName"], "BNL")
+        self.assertEqual(relay["publicInvitation"], "Tell me what you hear.")
 
     def test_same_summary_does_not_erase_distinct_participant_interpretation(self):
         self.packet["reflectionBasis"][0]["contributions"] = [
