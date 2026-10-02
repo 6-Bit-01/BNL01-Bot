@@ -9904,11 +9904,33 @@ def _journal_website_base_url() -> str:
 
 
 def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
+    from bnl_journal import _has_moment_impressions
+
     if not check_quota_availability(JOURNAL_ROUTE):
         raise LocalModelBudgetExhausted(
             "local_model_budget_exhausted"
         )
-    response = _generate_gemini_content_with_fallback(f"{BNL01_SYSTEM_PROMPT}\n\n{prompt}", JOURNAL_ROUTE)
+    personality = BNL01_SYSTEM_PROMPT
+    if _has_moment_impressions(_packet):
+        personality = (
+            "You are BNL-01, the BARCODE Network Liaison Entity, writing your personal Journal.\n"
+            + BNL01_PUBLIC_PERSONALITY_PROMPT
+            + "\nYour conversational brevity does not limit this reflection. Let the supplied "
+              "experiences and retained impressions inform your thoughts, humor, doubts and "
+              "connections. Keep their concrete detail and your own developing perspective. "
+              "Stay in-world; do not describe prompts or archival procedures.\n"
+            + render_prompt_canon_block() + "\n"
+            + render_ecosystem_lore_block(include_restricted=False) + "\n"
+            + PERSONAL_ATTRIBUTION_RULE
+            + "\nYour interpretation cannot establish another person's actions, motives or history. "
+              "Keep source evidence, earlier reactions and new reflection distinct."
+        )
+    from bnl_journal_attribution import REVIEW_PREFIX
+    reviewing = prompt.startswith(REVIEW_PREFIX)
+    response = _generate_gemini_content_with_fallback(
+        prompt if reviewing else f"{personality}\n\n{prompt}", JOURNAL_ROUTE)
+    if reviewing and _gemini_finish_reason(response) != "STOP":
+        raise RuntimeError("journal_source_review_incomplete")
     text, _tokens = _extract_text_and_tokens(response)
     return text or ""
 
@@ -10459,8 +10481,8 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
         else:
             article = result["article"]
             publication_check = result.get("publicationCheck") or {}
-            review_note = ""
-            if publication_check.get("reason"):
+            review_note = "This one-call draft has not had a factual source review and is not approved for publication. Nothing was saved or published.\n\n"
+            if publication_check.get("reason") and publication_check["reason"] != "source_review_required":
                 locations = list(dict.fromkeys(
                     str(item["field"]) for item in publication_check.get("locations", []) if item.get("field")
                 ))
@@ -10470,7 +10492,7 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
                     + ".\nThe writing is included below for inspection. This test is not approved for publication.\n\n"
                 )
             text = (
-                "**Private Journal test — not saved or published**\n"
+                "**Private Journal first draft — unreviewed**\n"
                 f"Preview version: `{result.get('previewVersion', 'unknown')}`\n"
                 f"Writing version: `{result['editorialVersion']}`\n"
                 f"Window: {result['sourceWindowStart']} to {result['sourceWindowEnd']}\n\n"
@@ -32500,6 +32522,11 @@ def _generate_model_with_retry(
             model_name,
             route,
         )
+        if route == JOURNAL_ROUTE and isinstance(contents, str):
+            from bnl_journal_attribution import REVIEW_PREFIX, response_schema
+            if contents.startswith(REVIEW_PREFIX):
+                generation_config.response_mime_type = "application/json"
+                generation_config.response_schema = response_schema()
         if attempt_counter is not None:
             attempt_counter.mark_started()
         try:
@@ -36387,8 +36414,14 @@ async def _process_one_moment_meaning() -> None:
             return
         attempts = ProviderAttemptCounter()
         logging.info('moment_meaning_started moment_id=%s route=moment_meaning_background', request.moment_id)
+        meaning_prompt = request.prompt
+        if request.impression_requested:
+            meaning_prompt = (
+                "You are BNL-01, the BARCODE Network Liaison Entity.\n"
+                + BNL01_PUBLIC_PERSONALITY_PROMPT + "\n\n" + meaning_prompt
+            )
         result = await _generate_gemini_content_result_async(
-            request.prompt, 'moment_meaning_background', attempt_counter=attempts,
+            meaning_prompt, 'moment_meaning_background', attempt_counter=attempts,
         )
         budget_deferred = (not result.success and attempts.count == 0
                            and result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET)

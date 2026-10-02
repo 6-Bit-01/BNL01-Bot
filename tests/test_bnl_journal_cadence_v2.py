@@ -14,6 +14,7 @@ import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
 from tests.test_bnl_journal_prepared_release import AcceptedResponse, article_json
+from tests.journal_review_helpers import is_source_review, supported_review
 
 
 class JournalCadenceV2Tests(unittest.TestCase):
@@ -106,7 +107,7 @@ class JournalCadenceV2Tests(unittest.TestCase):
 
     @staticmethod
     def generator(packet, _prompt):
-        return article_json(packet)
+        return supported_review(_prompt) if is_source_review(_prompt) else article_json(packet)
 
     @staticmethod
     def opener(posts):
@@ -440,6 +441,8 @@ class JournalCadenceV2Tests(unittest.TestCase):
             generator_calls.append(
                 (packet["entryKind"], packet["sourceWindowStart"], prompt)
             )
+            if is_source_review(prompt):
+                return supported_review(prompt)
             return article_json(packet)
 
         for target_day in (

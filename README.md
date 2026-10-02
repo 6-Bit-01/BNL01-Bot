@@ -546,6 +546,94 @@ still remains.
 
 ## Release baseline
 
+### Shared impression pilot (disabled by default)
+
+The existing Moment meaning call can retain an optional, source-linked BNL
+reaction alongside its separate summary and human contributions. This pilot
+does not add a scheduler, model call, memory store, relationship score, or
+automatic promotion to durable belief/canon. Formation requires
+`BNL_IMPRESSIONS_FORMATION_ENABLED` and an explicit `BNL_IMPRESSIONS_GUILD_IDS`
+allowlist. Reading independently requires `BNL_IMPRESSIONS_USE_ENABLED` and the
+same allowlist. All are off/unscoped by default; deployment is not activation.
+
+One Moment-owned reader supplies conversation and Journal context. A reaction
+has zero factual/profile/recurrence authority. Its original human anchors,
+complete exchange, and current privacy/source state must still match before
+use. Public reads exclude sealed conversations; a sealed room can read eligible
+public experience and only its own private impressions. Existing forgetting
+and deletion erase affected impression payloads. Gate withdrawal invalidates
+prepared packets. Ordinary source changes withdraw stale impressions; this
+pilot does not automatically replay old generations or backfill history.
+
+The enabled Journal path can explore selected experiences instead of meeting
+person/time-segment coverage quotas. It preserves original grounding, the
+four-attempt limit, and existing preparation, approval and delivery owners.
+Older lore and experiences remain available as explicitly remembered callbacks.
+A present association does not establish a character's return or involvement;
+the date of a retained source is not evidence of a person's last appearance.
+Journal inputs preserve each original message's recorded room, quotation
+marks, link placement (without addresses or fetched contents), and whether
+text was truncated. Room policy alone is not room identity. All selected
+Relay prose stays available through the existing reflection lane as BNL's
+published expression; invitations cannot establish completed human actions,
+and Relay repetition cannot inflate the day's activity. Older unsent packets
+with the former Relay authority use the existing refresh fence. These source
+projection corrections also apply with impression formation/use disabled.
+Prior Journal history is bounded by the requested source-window end, including
+its topic counts and continuity notes. A later publication cannot become prior
+history during a replay or recovery. Entries with withdrawn private metadata
+are excluded from every history lane. Eligible older prose remains dated BNL
+expression, not independent event evidence or a writing template.
+The writer and reviewer use one read-only projection of that governed packet.
+Exact original lineage groups related interpretations; identical repeated gists
+do not become additional witnesses, while distinct later reactions remain.
+Original exchanges and retained impressions precede secondary retellings.
+Historical prose is selected by a meaningful content connection, not overlap
+with serialized field names or generic source metadata. Dated history remains
+available for quiet reflection; this changes presentation, not stored memory.
+Personal reactions and clearly conditional imagined responses may use a cited,
+eligible impression, or current originals when the impression pilot is in use,
+without an unrelated factual-inference declaration. This
+does not grant factual authority over another person's actions or motives;
+those claims retain the existing evidence and inference rules. The grammatical
+guard is conservative and does not replace semantic source review.
+New Journal generation uses the existing four-attempt allowance for writing,
+source review, and, when needed, revision and another review. The source editor
+checks the exact prose and proposed continuity metadata against the same
+governed originals, including the original exchanges accompanying impressions.
+It retains BNL's subjective perspective without granting it event authority.
+Each ordered prose or continuity unit separates any external premise from
+personal reaction or imagery. The server supplies stable source-fragment IDs
+bound to the original speaker, field, time, room and authority. The reviewer
+selects those IDs instead of copying prose and retyping quotation bindings.
+Each premise records what its anchors establish, their stance, and
+whether they entail the claim or only fit it. Unverified assumptions block
+acceptance even inside reflection, questions, headings, or continuity notes.
+A valid quotation alone is not a support judgment. Pure personal voice needs
+no invented factual premise; referenced material marked uninspected cannot
+serve as inspected evidence. These checks enforce the reviewer's declared
+reasoning, but cannot guarantee that it identifies every premise correctly.
+Review receipts bind the article, notes, evidence and source window; an edited
+or unreviewed candidate cannot enter storage as reviewed. Saved new candidates
+are checked again before approval and delivery. Legacy owed payloads retain
+their existing release path. The one-call private preview remains an unreviewed
+first draft and cannot report factual publication acceptance. A model reviewer
+can still make semantic mistakes; offline flow tests do not establish its
+judgment, and real-source acceptance remains a separate rehearsal decision.
+Relays, Ambient, artwork, Ballads, dossiers, memory-tier promotion, and
+Relationship activation remain outside this pilot.
+
+Acceptance requires separately approved, bounded real-source previews showing
+that untouched conversation and Journal outputs use the same retained
+perspective usefully and accurately. Controlled tests prove boundaries and
+transport, not model judgment or natural production reliability.
+
+Private database copies use the capacity-checked helper documented in
+[the backup and rehearsal workflow](docs/BNL01_V2_SHADOW_ACCEPTANCE_AND_ROLLBACK.md#deployment-and-data-safety-preflight).
+It preserves a 5 GiB service reserve, permits one active managed rehearsal,
+and archives completed copies with verified hashes before removing raw files.
+Deployment rollback copies and community-memory retention remain separate.
+
 Before merging a runtime change:
 
 1. Install the committed dependency versions.

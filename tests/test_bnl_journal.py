@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 import io
 import os
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
@@ -10,6 +11,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import bnl_journal as j
+from tests.journal_review_helpers import is_source_review, review_inputs, supported_review, with_supported_review
 
 
 def article_json(packet, title="A New Coil in the BARCODE Room", leak=""):
@@ -78,7 +80,8 @@ class JournalTests(unittest.TestCase):
         def gen(packet, prompt):
             calls.append(prompt); return 'not-json'
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
-        self.assertFalse(res.ok); self.assertEqual(len(calls), j.JOURNAL_GENERATION_ATTEMPTS)
+        self.assertFalse(res.ok); self.assertEqual(len(calls), j.JOURNAL_GENERATION_ATTEMPTS - 1)
+        self.assertEqual(res.reason, 'malformed_json')
         with sqlite3.connect(self.db) as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
 
@@ -88,6 +91,8 @@ class JournalTests(unittest.TestCase):
 
         def gen(packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             return article_json(packet, title='Public Wording Pass', leak=copied)
 
         packet = self.packet()
@@ -96,7 +101,7 @@ class JournalTests(unittest.TestCase):
 
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(res.ok, res.reason)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertIn('Use a direct quote only rarely', calls[0])
         with sqlite3.connect(self.db) as c:
             self.assertEqual(
@@ -119,9 +124,16 @@ class JournalTests(unittest.TestCase):
 
         def generator(_packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                self.assertEqual(3, len(calls))
+                units, _ = review_inputs(prompt)
+                self.assertIn(json.loads(article_json(_packet))['sections'][0]['body'],
+                              ' '.join(unit['text'] for unit in units))
+                return supported_review(prompt)
             if len(calls) == 1:
                 return raw
             previous = json.loads(prompt.split('Complete previous draft (not evidence):\n', 1)[1])
+            self.assertEqual(2, len(calls))
             self.assertEqual(original, previous)
             self.assertIn('"field":"excerpt","check":"mention"', prompt)
             self.assertIn('"field":"sections[0].body","check":"url"', prompt)
@@ -131,7 +143,7 @@ class JournalTests(unittest.TestCase):
         with self.assertLogs(level='INFO') as captured:
             result = j.generate_and_store_packet_draft(self.db, 1, packet, generator)
         self.assertTrue(result.ok, result.reason)
-        self.assertEqual(2, len(calls))
+        self.assertEqual(3, len(calls))
         logs = '\n'.join(captured.output)
         self.assertIn('journal_repair_requested', logs)
         self.assertIn('targets=excerpt:mention,sections[0].body:url', logs)
@@ -168,21 +180,32 @@ class JournalTests(unittest.TestCase):
         calls = []
         def gen(packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             if len(calls) == 1:
                 return article_json(packet, title='Clinical First Pass', leak=' Records indicate continuous effort across entities.')
             return article_json(packet, title='Lively Rewritten Pass')
 
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(res.ok, res.reason)
-        self.assertEqual(2, len(calls))
-        self.assertIn('overly_clinical_voice', calls[1])
-        self.assertIn('lively, concrete community chronicle', calls[1])
+        self.assertEqual(4, len(calls))
+        self.assertTrue(is_source_review(calls[1]))
+        self.assertTrue(is_source_review(calls[3]))
+        self.assertIn('overly_clinical_voice', calls[2])
+        previous = json.loads(calls[2].split('Complete previous draft (not evidence):\n', 1)[1])
+        self.assertIn('Records indicate continuous effort across entities.', previous['sections'][0]['body'])
+        with sqlite3.connect(self.db) as conn:
+            title, sections = conn.execute("SELECT title,sections_json FROM bnl_journal_entries").fetchone()
+        self.assertEqual(title, 'Lively Rewritten Pass')
+        self.assertNotIn('Records indicate', sections)
 
     def test_editorial_polish_cannot_cancel_a_blocking_clean_entry(self):
         calls = []
 
         def gen(packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             return article_json(
                 packet,
                 title='Persistent Clinical Voice',
@@ -205,7 +228,9 @@ class JournalTests(unittest.TestCase):
 
         def gen(packet, prompt):
             calls.append(prompt)
-            if len(calls) == 1:
+            if is_source_review(prompt):
+                return supported_review(prompt)
+            if len(calls) <= 2:
                 return article_json(
                     packet,
                     title='Retained Safe Candidate',
@@ -215,7 +240,30 @@ class JournalTests(unittest.TestCase):
 
         result = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(result.ok, result.reason)
+        self.assertEqual(3, len(calls))
+        self.assertTrue(is_source_review(calls[1]))
+        self.assertIn('overly_clinical_voice', calls[2])
+
+    def test_unreviewed_advisory_is_not_stored_after_revision_provider_failure(self):
+        calls = []
+
+        def gen(packet, prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return article_json(
+                    packet, title='Unreviewed Safe Candidate',
+                    leak=' Records indicate continuous effort across entities.',
+                )
+            raise RuntimeError('provider down before source revision')
+
+        result = j.generate_and_store_draft(self.db, 1, 24, gen)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, 'provider_failure')
         self.assertEqual(2, len(calls))
+        self.assertTrue(is_source_review(calls[1]))
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM bnl_journal_private_metadata").fetchone()[0], 0)
 
     def test_advisory_style_never_hides_a_blocking_context_failure(self):
         def gen(packet, prompt):
@@ -240,7 +288,7 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0])
 
     def test_source_specific_generated_json_creates_draft(self):
-        def gen(packet, prompt): return article_json(packet)
+        def gen(packet, prompt): return supported_review(prompt) if is_source_review(prompt) else article_json(packet)
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(res.ok, res.reason)
         with sqlite3.connect(self.db) as c:
@@ -278,16 +326,18 @@ class JournalTests(unittest.TestCase):
 
         def gen(source_packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             return article_json(source_packet, title='The Room’s Quoted Line', leak=f' {quote}')
 
         result = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(result.ok, result.reason)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertIn('Use a direct quote only rarely', calls[0])
         self.assertNotIn('Do not include direct quotes', calls[0])
 
     def test_approved_entry_cannot_be_rejected_and_tables_remain_approved(self):
-        res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p)); self.assertTrue(res.ok)
+        res = j.generate_and_store_draft(self.db, 1, 24, with_supported_review(lambda p, pr: article_json(p))); self.assertTrue(res.ok)
         self.assertTrue(j.approve_draft(self.db, 1, res.entry_id, res.content_hash).ok)
         rej = j.reject_draft(self.db, 1, res.entry_id, 'no')
         self.assertFalse(rej.ok); self.assertEqual(rej.reason, 'not_draft')
@@ -296,8 +346,8 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(c.execute("SELECT lifecycle_state FROM bnl_journal_private_metadata WHERE entry_id=?", (res.entry_id,)).fetchone()[0], 'approved_pending_delivery')
 
     def test_regeneration_next_revision_preserves_previous_content_and_syncs_tables(self):
-        res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p, 'First Title')); self.assertTrue(res.ok)
-        regen = j.regenerate_draft(self.db, 1, res.entry_id, 24, lambda p, pr: article_json(p, 'Second Title'))
+        res = j.generate_and_store_draft(self.db, 1, 24, with_supported_review(lambda p, pr: article_json(p, 'First Title'))); self.assertTrue(res.ok)
+        regen = j.regenerate_draft(self.db, 1, res.entry_id, 24, with_supported_review(lambda p, pr: article_json(p, 'Second Title')))
         self.assertTrue(regen.ok, regen.reason); self.assertEqual(regen.revision, 2)
         with sqlite3.connect(self.db) as c:
             rows = c.execute("SELECT revision,lifecycle_state,title FROM bnl_journal_entries WHERE entry_id=? ORDER BY revision", (res.entry_id,)).fetchall()
@@ -310,13 +360,15 @@ class JournalTests(unittest.TestCase):
             self.db,
             1,
             24,
-            lambda packet, prompt: article_json(packet, 'First Draft'),
+            with_supported_review(lambda packet, prompt: article_json(packet, 'First Draft')),
         )
         self.assertTrue(first.ok, first.reason)
         calls = []
 
         def clinical_regeneration(packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             return article_json(
                 packet,
                 'Regenerated Clinical Draft',
@@ -351,7 +403,7 @@ class JournalTests(unittest.TestCase):
         self.assertFalse(res.ok); self.assertEqual(res.reason, 'provider_failure')
         with sqlite3.connect(self.db) as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
-        old = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p, 'Old Draft')); self.assertTrue(old.ok)
+        old = j.generate_and_store_draft(self.db, 1, 24, with_supported_review(lambda p, pr: article_json(p, 'Old Draft'))); self.assertTrue(old.ok)
         regen = j.regenerate_draft(self.db, 1, old.entry_id, 24, down)
         self.assertFalse(regen.ok); self.assertEqual(regen.reason, 'provider_failure')
         with sqlite3.connect(self.db) as c:
@@ -360,8 +412,22 @@ class JournalTests(unittest.TestCase):
     def test_cited_sources_only_private_metadata(self):
         packet = self.packet()
         relay_article = j.parse_generated_json(article_json(packet, 'Relay Only'))
-        relay_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': ['fresh:1']}
-        res = j.store_validated_draft(self.db, 1, packet, relay_article); self.assertTrue(res.ok, res.reason)
+        relay_ref = next(
+            source['refId'] for source in packet['reflectionBasis']
+            if source.get('basisKind') == 'accepted_relay_continuity'
+        )
+        relay_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': [relay_ref]}
+        self.assertEqual('insufficient_source_breadth', j.validate_article(relay_article, packet, []))
+        # Isolate cited-metadata selection while retaining every uncited private
+        # candidate. The ordinary packet above still requires original evidence.
+        relay_packet = {
+            **packet,
+            'evidenceCoverageContract': {
+                **packet['evidenceCoverageContract'],
+                'minimumDistinctFreshSources': 0,
+            },
+        }
+        res = j.store_validated_draft(self.db, 1, relay_packet, reviewed_article(relay_article, relay_packet)); self.assertTrue(res.ok, res.reason)
         with sqlite3.connect(self.db) as c:
             meta = json.loads(c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?", (res.entry_id,)).fetchone()[0])
         self.assertEqual(meta['supportingRelayIds'], ['r1'])
@@ -370,7 +436,7 @@ class JournalTests(unittest.TestCase):
         conv = next(src for src in packet['privateSources'] if src.get('displayName') == 'KnownUser')
         conv_article = j.parse_generated_json(article_json(packet, 'One Person Only'))
         conv_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': [conv['refId']]}
-        res2 = j.store_validated_draft(self.db, 1, packet, conv_article); self.assertTrue(res2.ok, res2.reason)
+        res2 = j.store_validated_draft(self.db, 1, packet, reviewed_article(conv_article, packet)); self.assertTrue(res2.ok, res2.reason)
         with sqlite3.connect(self.db) as c:
             meta2 = json.loads(c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?", (res2.entry_id,)).fetchone()[0])
         self.assertEqual(meta2['supportingRelayIds'], [])
@@ -378,11 +444,11 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(meta2['subjectRefs'], ['discord_user:7'])
 
     def test_regeneration_transaction_rollback_on_insert_failure(self):
-        res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p, 'Atomic Old')); self.assertTrue(res.ok)
+        res = j.generate_and_store_draft(self.db, 1, 24, with_supported_review(lambda p, pr: article_json(p, 'Atomic Old'))); self.assertTrue(res.ok)
         with sqlite3.connect(self.db) as c:
             c.execute("CREATE TRIGGER fail_journal_revision_two BEFORE INSERT ON bnl_journal_entries WHEN NEW.revision=2 BEGIN SELECT RAISE(ABORT, 'forced'); END;")
         with self.assertRaises(sqlite3.IntegrityError):
-            j.regenerate_draft(self.db, 1, res.entry_id, 24, lambda p, pr: article_json(p, 'Atomic New'))
+            j.regenerate_draft(self.db, 1, res.entry_id, 24, with_supported_review(lambda p, pr: article_json(p, 'Atomic New')))
         with sqlite3.connect(self.db) as c:
             self.assertEqual(c.execute("SELECT revision,lifecycle_state,title FROM bnl_journal_entries WHERE entry_id=?", (res.entry_id,)).fetchall(), [(1, 'draft', 'Atomic Old')])
             self.assertEqual(c.execute("SELECT revision,lifecycle_state FROM bnl_journal_private_metadata WHERE entry_id=?", (res.entry_id,)).fetchall(), [(1, 'draft')])
@@ -395,7 +461,7 @@ class JournalTests(unittest.TestCase):
         bad = j.parse_generated_json(article_json(packet, 'Fresh Leak', ' fresh:999')); self.assertEqual('source_ref_leak', j.validate_article(bad, packet, []))
 
     def test_public_payload_private_metadata_exact_bytes_idempotency_and_404(self):
-        res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p)); self.assertTrue(res.ok)
+        res = j.generate_and_store_draft(self.db, 1, 24, with_supported_review(lambda p, pr: article_json(p))); self.assertTrue(res.ok)
         with sqlite3.connect(self.db) as c:
             payload = json.loads(c.execute("SELECT public_payload_json FROM bnl_journal_entries").fetchone()[0]); meta = c.execute("SELECT metadata_json FROM bnl_journal_private_metadata").fetchone()[0]
         self.assertNotIn('supportingConversationRefs', json.dumps(payload)); self.assertIn('supportingConversationRefs', meta)
@@ -411,13 +477,13 @@ class JournalTests(unittest.TestCase):
             c.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='delivery_failed' WHERE entry_id=?", (res.entry_id,))
         j.deliver_approved(self.db, 1, res.entry_id, 'https://site.example', 'k', opener)
         self.assertEqual(captured[0], captured[1])
-        res2 = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p, '404 Title')); j.approve_draft(self.db, 1, res2.entry_id, res2.content_hash)
+        res2 = j.generate_and_store_draft(self.db, 1, 24, with_supported_review(lambda p, pr: article_json(p, '404 Title'))); j.approve_draft(self.db, 1, res2.entry_id, res2.content_hash)
         def missing(req, timeout=10): raise urllib.error.HTTPError(req.full_url, 404, 'not found', {}, io.BytesIO())
         d2 = j.deliver_approved(self.db, 1, res2.entry_id, 'https://site.example', 'k', missing)
         self.assertFalse(d2.ok); self.assertEqual(d2.reason, 'endpoint_not_found')
 
     def test_rehydrate_replays_exact_published_payload_without_regeneration(self):
-        res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p, 'Restore Me')); self.assertTrue(res.ok)
+        res = j.generate_and_store_draft(self.db, 1, 24, with_supported_review(lambda p, pr: article_json(p, 'Restore Me'))); self.assertTrue(res.ok)
         self.assertTrue(j.approve_draft(self.db, 1, res.entry_id, res.content_hash).ok)
         payloads = []
         def opener(req, timeout=10):
@@ -466,9 +532,12 @@ class BotJournalCommandTests(unittest.IsolatedAsyncioTestCase):
         old = bnl01_bot.DB_FILE; bnl01_bot.DB_FILE = self._make_db()
         try:
             packet = j.build_source_packet(bnl01_bot.DB_FILE, 1, 24, '2026-07-18T01:00:00Z')
-            response = Mock(candidates=[Mock(content=Mock(parts=[Mock(text=article_json(packet))]))], usage_metadata=Mock(total_token_count=None))
+            def provider(prompt, route):
+                text = supported_review(prompt) if is_source_review(prompt) else article_json(packet)
+                return Mock(candidates=[Mock(finish_reason='STOP', content=Mock(parts=[Mock(text=text)]))],
+                            usage_metadata=Mock(total_token_count=None))
             msg = Mock(); msg.guild = Mock(id=1, get_member=Mock(return_value=Mock())); msg.author = Mock(id=1); msg.channel = Mock(name='research-and-development'); msg.reply = AsyncMock()
-            with patch.object(j, 'utc_now_iso', return_value='2026-07-18T01:00:00Z'), patch.object(bnl01_bot, 'BNL_OWNER_USER_ID', 1), patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, 'check_quota_availability', return_value=True), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback', return_value=response):
+            with patch.object(j, 'utc_now_iso', return_value='2026-07-18T01:00:00Z'), patch.object(bnl01_bot, 'BNL_OWNER_USER_ID', 1), patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, 'check_quota_availability', return_value=True), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback', side_effect=provider):
                 handled = await bnl01_bot.maybe_handle_journal_command(msg, '!bnl journal create | hours=bad')
             self.assertTrue(handled)
             with sqlite3.connect(bnl01_bot.DB_FILE) as c:

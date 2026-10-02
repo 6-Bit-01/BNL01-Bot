@@ -16,6 +16,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 
 
 TARGET_DAY = date(2026, 7, 20)
@@ -168,7 +169,7 @@ class PreparedReleaseTests(unittest.TestCase):
         return automation.prepare_daily(
             self.db,
             1,
-            generator or (lambda packet, _prompt: article_json(packet)),
+            with_supported_review(generator or (lambda packet, _prompt: article_json(packet))),
             target_day=TARGET_DAY,
             force=True,
         )
@@ -249,6 +250,74 @@ class PreparedReleaseTests(unittest.TestCase):
                 (TARGET_DAY.isoformat(),),
             ).fetchone()
         self.assertEqual(("prepared", prepared.entry_id, prepared.revision), observation)
+
+    def test_source_withdrawal_during_first_draft_stops_before_revision_and_preparation(self):
+        calls = []
+        removed = []
+
+        def generate(packet, _prompt):
+            calls.append(packet)
+            subject = next(source["subjectRef"] for source in packet["privateSources"]
+                           if source.get("sourceKind") == "conversation")
+            removed.append(source_store.purge_user_discord_sources(
+                self.db, 1, int(subject.split(":", 1)[1])))
+            return article_json(packet)
+
+        result = self.prepare(generate)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(removed, [1])
+        self.assertEqual(result.reason, "privacy_source_ineligible")
+        self.assert_owed_occurrence_has_no_revision_link(result)
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM bnl_journal_private_metadata").fetchone()[0], 0)
+        self.assertFalse(self.run_row()["prepared_payload_hash"])
+
+    def test_withdrawal_during_failed_polish_cannot_retain_reviewed_advisory(self):
+        calls = []
+        removed = []
+
+        def generate(packet, _prompt):
+            calls.append(packet)
+            if len(calls) == 2:
+                subject = next(source["subjectRef"] for source in packet["privateSources"]
+                               if source.get("sourceKind") == "conversation")
+                removed.append(source_store.purge_user_discord_sources(
+                    self.db, 1, int(subject.split(":", 1)[1])))
+                raise RuntimeError("provider failed after source withdrawal")
+            value = json.loads(article_json(packet))
+            value["sections"][0]["body"] += " Records indicate continuous effort across entities."
+            return json.dumps(value)
+
+        result = self.prepare(generate)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(removed, [1])
+        self.assertEqual(result.reason, "privacy_source_ineligible")
+        self.assert_owed_occurrence_has_no_revision_link(result)
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
+            outcomes = [row[0] for row in conn.execute(
+                "SELECT outcome FROM bnl_journal_generation_attempts ORDER BY generation_attempt")]
+        self.assertIn("advisory_publishable", outcomes)
+        self.assertEqual(outcomes[-1], "source_invalidated")
+        self.assertFalse(self.run_row()["prepared_payload_hash"])
+
+    def test_lease_loss_during_first_draft_stops_before_revision(self):
+        calls = []
+
+        def generate(packet, _prompt):
+            calls.append(packet)
+            with sqlite3.connect(self.db) as conn:
+                conn.execute("UPDATE bnl_journal_automation_runs SET lease_expires_at=? WHERE cadence='daily'",
+                             ("2000-01-01T00:00:00Z",))
+            return article_json(packet)
+
+        result = self.prepare(generate)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.reason, "preparation_epoch_superseded")
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
+        self.assertFalse(self.run_row()["prepared_payload_hash"])
 
     def test_deletion_after_atomic_prepare_cannot_remark_observation_prepared(self):
         real_prepare = automation._prepare_packet_safely
@@ -695,7 +764,7 @@ class PreparedReleaseTests(unittest.TestCase):
 
         def full_quality_generator(packet, prompt):
             generation_calls.append((packet, prompt))
-            return article_json(packet)
+            return supported_review(prompt) if is_source_review(prompt) else article_json(packet)
 
         with sqlite3.connect(self.db) as conn:
             conn.execute(
@@ -735,8 +804,10 @@ class PreparedReleaseTests(unittest.TestCase):
             force=False,
         )
         self.assertEqual("prepared", recovered.status, recovered)
-        self.assertEqual(1, len(generation_calls))
+        self.assertEqual(2, len(generation_calls))
         self.assertEqual(first_attempt[0], generation_calls[0])
+        self.assertEqual(generation_calls[0][0], generation_calls[1][0])
+        self.assertTrue(is_source_review(generation_calls[1][1]))
 
     def test_automatic_generation_cycles_are_bounded_but_occurrence_stays_owed(self):
         generation_calls = []
@@ -834,7 +905,7 @@ class PreparedReleaseTests(unittest.TestCase):
         recovered = automation.prepare_daily(
             self.db,
             1,
-            lambda packet, _prompt: article_json(packet),
+            with_supported_review(lambda packet, _prompt: article_json(packet)),
             target_day=TARGET_DAY,
             force=False,
         )
@@ -1079,7 +1150,7 @@ class PreparedReleaseTests(unittest.TestCase):
 
         result = self.prepare(malformed)
         self.assertEqual("held", result.status, result)
-        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS - 1, len(calls))
         self.assertEqual("malformed_json", result.reason)
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0])
@@ -1132,7 +1203,8 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertEqual(
             [
                 (1, "parse_rejected", "malformed_json"),
-                (2, "accepted", ""),
+                (2, "source_revision_required", "source_grounded_revision"),
+                (3, "accepted", ""),
             ],
             [
                 (
@@ -1158,12 +1230,12 @@ class PreparedReleaseTests(unittest.TestCase):
                 "id INTEGER PRIMARY KEY AUTOINCREMENT)"
             )
 
-        def accounted(packet, _prompt):
+        def accounted(packet, prompt):
             with sqlite3.connect(self.db) as conn:
                 conn.execute("INSERT INTO token_usage_events DEFAULT VALUES")
-            return article_json(packet)
+            return supported_review(prompt) if is_source_review(prompt) else article_json(packet)
 
-        result = self.prepare(accounted)
+        result = automation.prepare_daily(self.db, 1, accounted, target_day=TARGET_DAY, force=True)
         self.assertEqual("prepared", result.status, result)
         with sqlite3.connect(self.db) as conn:
             preparation = conn.execute(
@@ -1171,13 +1243,14 @@ class PreparedReleaseTests(unittest.TestCase):
                 "model_attempt_start_id,model_attempt_end_id "
                 "FROM bnl_journal_preparation_attempts"
             ).fetchone()
-            generation = conn.execute(
+            generations = conn.execute(
                 "SELECT token_event_start_id,token_event_end_id,"
                 "model_attempt_start_id,model_attempt_end_id "
-                "FROM bnl_journal_generation_attempts"
-            ).fetchone()
-        self.assertEqual((0, 1, 0, 0), preparation)
-        self.assertEqual((0, 1, 0, 0), generation)
+                "FROM bnl_journal_generation_attempts "
+                "ORDER BY generation_attempt"
+            ).fetchall()
+        self.assertEqual((0, 2, 0, 0), preparation)
+        self.assertEqual([(0, 1, 0, 0), (1, 2, 0, 0)], generations)
 
     def test_local_budget_refusal_is_typed_and_retained_for_retry(self):
         result = self.prepare(

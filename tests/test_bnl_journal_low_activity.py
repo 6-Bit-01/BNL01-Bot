@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 import hashlib
 import json
 import sqlite3
@@ -6,6 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
@@ -191,7 +193,7 @@ class JournalLowActivityTests(unittest.TestCase):
                 "displayName": f"Member{index}",
                 "channelPolicy": "public_home",
             }
-            for index in range(1, 4)
+            for index in range(1, 6)
         ]
         packet = journal.build_packet_from_sources(
             self.db,
@@ -205,7 +207,11 @@ class JournalLowActivityTests(unittest.TestCase):
         prompt = journal.build_generation_prompt(packet)
 
         self.assertNotIn("lowActivityMode", packet)
-        self.assertNotIn("reflectionBasis", packet)
+        self.assertEqual(5, len(packet["safeSources"]))
+        self.assertTrue(all(source["sourceKind"] == "conversation" for source in packet["safeSources"]))
+        self.assertEqual(3, len(packet["reflectionBasis"]))
+        self.assertTrue(all(source["basisKind"] == "accepted_relay_continuity"
+                            for source in packet["reflectionBasis"]))
         self.assertNotIn("LOW-ACTIVITY EVIDENCE RULE", prompt)
         self.assertEqual(journal.JOURNAL_EDITORIAL_VERSION, packet["editorialVersion"])
         self.assertNotIn("prefer 2 sections", prompt)
@@ -285,7 +291,7 @@ class JournalLowActivityTests(unittest.TestCase):
             ),
             refs=[f"reflection:event:{public_seq}"],
         )
-        draft = journal.store_validated_draft(self.db, 1, packet, article)
+        draft = journal.store_validated_draft(self.db, 1, packet, reviewed_article(article, packet))
         self.assertTrue(draft.ok, draft.reason)
         with sqlite3.connect(self.db) as conn:
             metadata = json.loads(
@@ -449,7 +455,7 @@ class JournalLowActivityTests(unittest.TestCase):
         self.assertEqual("insufficient_grounded_material", result.reason)
         self.assertEqual([], calls)
 
-    def test_blocking_low_activity_output_uses_all_four_repairs_and_no_fallback(self):
+    def test_blocking_low_activity_output_reserves_review_slot_and_has_no_fallback(self):
         packet = self.packet()
         calls = []
 
@@ -468,7 +474,7 @@ class JournalLowActivityTests(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual("current_activity_without_fresh_source", result.reason)
-        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS - 1, len(calls))
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(
                 0,
@@ -481,6 +487,8 @@ class JournalLowActivityTests(unittest.TestCase):
 
         def generator(source_packet, _prompt):
             calls.append(1)
+            if is_source_review(_prompt):
+                return supported_review(_prompt)
             return generated_reflection_json(source_packet)
 
         with patch.object(
@@ -508,7 +516,7 @@ class JournalLowActivityTests(unittest.TestCase):
 
         self.assertEqual("prepared", first.status, first)
         self.assertEqual("prepared", second.status, second)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         with sqlite3.connect(self.db) as conn:
             lifecycle, reason = conn.execute(
                 "SELECT lifecycle_state,reason FROM bnl_journal_automation_runs"

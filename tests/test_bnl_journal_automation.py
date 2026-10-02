@@ -12,6 +12,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 
 
 def article_json(packet):
@@ -240,7 +241,7 @@ class JournalAutomationTests(unittest.TestCase):
         first = automation.run_daily(
             self.db,
             1,
-            lambda packet, prompt: article_json(packet),
+            with_supported_review(lambda packet, prompt: article_json(packet)),
             "https://site.example",
             "key",
             now_utc=now,
@@ -273,6 +274,8 @@ class JournalAutomationTests(unittest.TestCase):
 
         def outside_target(packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             article = json.loads(article_json(packet))
             if packet["sourceWindowStart"].startswith("2026-07-21"):
                 article["sections"][0]["body"] = (
@@ -313,14 +316,15 @@ class JournalAutomationTests(unittest.TestCase):
         )
 
         self.assertEqual(("published", "published"), (short_result.status, long_result.status))
-        self.assertEqual(2, len(calls))
+        self.assertEqual(4, len(calls))
         self.assertTrue(
             all(
                 "Write 1-3 sections and 250-500 total words."
                 in prompt
-                for prompt in calls
+                for prompt in calls if not is_source_review(prompt)
             )
         )
+        self.assertEqual(2, sum(is_source_review(prompt) for prompt in calls))
         with sqlite3.connect(self.db) as conn:
             word_counts = {
                 entry_id: json.loads(metadata_json)["publicWordCount"]
@@ -337,6 +341,8 @@ class JournalAutomationTests(unittest.TestCase):
 
         def persistent_clinical_style(packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             article = json.loads(article_json(packet))
             article["title"] = "Persistent Clinical Daily"
             article["sections"][0]["body"] += (
@@ -407,7 +413,7 @@ class JournalAutomationTests(unittest.TestCase):
         results = automation.run_scheduled(
             self.db,
             1,
-            lambda packet, prompt: article_json(packet),
+            with_supported_review(lambda packet, prompt: article_json(packet)),
             "https://site.example",
             "key",
             {
@@ -470,7 +476,7 @@ class JournalAutomationTests(unittest.TestCase):
         results = automation.run_scheduled(
             self.db,
             1,
-            lambda packet, _prompt: article_json(packet),
+            with_supported_review(lambda packet, _prompt: article_json(packet)),
             "https://site.example",
             "key",
             {
@@ -596,7 +602,7 @@ class JournalAutomationTests(unittest.TestCase):
         results = automation.run_scheduled(
             self.db,
             1,
-            lambda packet, _prompt: article_json(packet),
+            with_supported_review(lambda packet, _prompt: article_json(packet)),
             "https://site.example",
             "key",
             {
@@ -650,7 +656,7 @@ class JournalAutomationTests(unittest.TestCase):
         prepared = automation.prepare_daily(
             self.db,
             1,
-            lambda packet, _prompt: article_json(packet),
+            with_supported_review(lambda packet, _prompt: article_json(packet)),
             target_day=date(2026, 7, 20),
             now_utc=datetime(2026, 7, 22, 1, 45, tzinfo=timezone.utc),
             force=True,
@@ -724,7 +730,13 @@ class JournalAutomationTests(unittest.TestCase):
             entry_kind="daily",
         )
         self.assertEqual(90, packet["aggregateCounts"]["eligibleRelays"])
-        self.assertEqual(90, len(packet["safeSources"]))
+        self.assertEqual([], packet["safeSources"])
+        reflection_relays = [source for source in packet["reflectionBasis"]
+                             if source["basisKind"] == "accepted_relay_continuity"]
+        self.assertEqual(90, len(reflection_relays))
+        self.assertEqual(90, packet["aggregateCounts"]["reflectionRelays"])
+        self.assertEqual("2026-07-20T01:30:00Z", reflection_relays[0]["relayPublishedAt"])
+        self.assertEqual("2026-07-20T16:20:00Z", reflection_relays[-1]["relayPublishedAt"])
         self.assertFalse(any(source.get("relayId") == "boundary" for source in packet["privateSources"]))
 
     def test_scheduler_publishes_newest_day_then_catches_up_older_day(self):
@@ -741,7 +753,7 @@ class JournalAutomationTests(unittest.TestCase):
         now = datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc)
 
         first = automation.run_scheduled(
-            self.db, 1, lambda packet, prompt: article_json(packet),
+            self.db, 1, with_supported_review(lambda packet, prompt: article_json(packet)),
             "https://site.example", "key",
             {
                 "journalAutoPublishEnabled": True,
@@ -751,7 +763,7 @@ class JournalAutomationTests(unittest.TestCase):
             now_utc=now, opener=self.opener,
         )
         second = automation.run_scheduled(
-            self.db, 1, lambda packet, prompt: article_json(packet),
+            self.db, 1, with_supported_review(lambda packet, prompt: article_json(packet)),
             "https://site.example", "key",
             {
                 "journalAutoPublishEnabled": True,
@@ -784,7 +796,7 @@ class JournalAutomationTests(unittest.TestCase):
             result = automation.run_daily(
                 self.db,
                 1,
-                lambda packet, prompt: article_json(packet),
+                with_supported_review(lambda packet, prompt: article_json(packet)),
                 "https://site.example",
                 "key",
                 target_day=date.fromisoformat(day),
@@ -794,7 +806,7 @@ class JournalAutomationTests(unittest.TestCase):
             self.assertEqual("published", result.status, result)
         self.set_archive_activation("2026-07-12T19:00:00Z")
         scheduled = automation.run_scheduled(
-            self.db, 1, lambda packet, prompt: article_json(packet),
+            self.db, 1, with_supported_review(lambda packet, prompt: article_json(packet)),
             "https://site.example", "key",
             now_utc=datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc),
             opener=self.opener,
@@ -928,6 +940,8 @@ class JournalAutomationTests(unittest.TestCase):
 
         def generate(packet, _prompt):
             calls.append(packet)
+            if is_source_review(_prompt):
+                return supported_review(_prompt)
             return article_json(packet)
 
         first = automation.run_weekly(
@@ -940,7 +954,7 @@ class JournalAutomationTests(unittest.TestCase):
         )
         self.assertEqual("published", first.status)
         self.assertEqual("published", second.status)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertTrue(calls[0]["lowActivityMode"])
         self.assertTrue(calls[0]["reflectionBasis"])
         self.assertTrue(
