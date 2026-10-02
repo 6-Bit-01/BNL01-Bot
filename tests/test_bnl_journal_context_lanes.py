@@ -5,9 +5,7 @@ import unittest
 from unittest import mock
 
 import bnl_journal as journal
-from tests.journal_review_helpers import (
-    is_source_review, review_inputs, supported_review_with_anchor, with_supported_review,
-)
+from tests.journal_review_helpers import reviewed_article, with_supported_review
 
 
 def _long_body(opening: str) -> str:
@@ -167,36 +165,6 @@ class JournalContextLaneTests(unittest.TestCase):
             },
         }
 
-    def review_with_anchor(self, article, packet, source_ref, *, unit_id="sections[0].body:0"):
-        evidence = journal._source_review_evidence(packet)
-        prompt = journal.attribution.review_prompt(article, evidence)
-        verdict = supported_review_with_anchor(prompt, unit_id=unit_id, source_ref=source_ref)
-        return journal.attribution.accept_review(
-            verdict, article, evidence["sources"], context_contract=journal._context_lane_ref_contract(packet))
-
-    def test_memory_retrieval_requires_content_not_grammatical_overlap(self):
-        with sqlite3.connect(self.db) as conn:
-            conn.execute("INSERT INTO broadcast_memory VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-                6, 1, "2026-07-17", "Someone said that the orbital tower will remain the same.",
-                "notable_moment", "medium", 1, "ambient,direct", None, 0, "active", None,
-                "2026-07-17T12:00:00Z", "PRIVATE FIXTURE NOTE",
-            ))
-            unrelated, unrelated_provenance = journal._approved_journal_broadcast_memory(
-                conn, 1, [{"refId": "fresh:unrelated", "summary": "Someone said that these wooden doors will look the same."}],
-                "2026-07-20T07:00:00Z")
-            matching, provenance = journal._approved_journal_broadcast_memory(
-                conn, 1, [{"refId": "fresh:music", "summary": "We are returning to that silver synth chorus."}],
-                "2026-07-20T07:00:00Z")
-        self.assertEqual((unrelated, unrelated_provenance), ([], []))
-        self.assertEqual(len(matching), 1)
-        self.assertEqual(matching[0]["matchedFreshSourceRefIds"], ["fresh:music"])
-        self.assertEqual(provenance[0]["rowId"], 1)
-        self.assertEqual(provenance[0]["sourceTable"], "broadcast_memory")
-        self.assertTrue(provenance[0]["eligibilityHash"])
-        self.assertNotIn("DJ Waffles", json.dumps(matching))
-        self.assertNotIn("RAW MOD NOTE", json.dumps(matching))
-        self.assertNotIn("PRIVATE FIXTURE NOTE", json.dumps(matching))
-
     def test_context_lanes_are_separate_conservative_and_public_safe(self):
         packet = self.packet()
         lanes = packet["generationContextLanes"]
@@ -300,6 +268,26 @@ class JournalContextLaneTests(unittest.TestCase):
         self.assertIn("No optional context lane qualified", prompt)
         self.assertIn("contextUses as an empty list", prompt)
 
+    def test_uncertain_framing_keeps_declared_rumor_provenance_required(self):
+        packet = self.packet()
+        rumor = packet["generationContextLanes"]["communityRumors"][0]
+        fresh_ref = rumor["evidence"][0]["sourceRefId"]
+        for opening in (
+            "Apparently a hidden synth set is planned for the Friday show.",
+            "The hidden synth set for the Friday show remains unconfirmed.",
+            "There is speculation about a hidden synth set for the Friday show.",
+        ):
+            with self.subTest(opening=opening):
+                article = self.article(
+                    packet, opening, lane_type="community_rumor", lane_ref=rumor["laneRefId"],
+                    basis=[rumor["laneRefId"], fresh_ref],
+                )
+                self.assertEqual("", journal.validate_article(article, packet, []))
+                article["metadata"]["contextUses"] = []
+                # Matching the actual supplied rumor still requires its lane;
+                # merely replacing the wording cannot launder it into fact.
+                self.assertEqual("undeclared_context_use", journal.validate_article(article, packet, []))
+
     def test_rumor_cannot_be_promoted_to_fact_or_used_without_provenance(self):
         packet = self.packet()
         rumor = packet["generationContextLanes"]["communityRumors"][0]
@@ -318,9 +306,7 @@ class JournalContextLaneTests(unittest.TestCase):
             packet,
             "The hidden synth set will appear during the Friday show.",
         )
-        self.assertEqual("", journal.validate_article(undeclared_fact, packet, []))
-        self.assertEqual("source_attribution_failed", self.review_with_anchor(
-            undeclared_fact, packet, rumor["laneRefId"])[1])
+        self.assertEqual("undeclared_context_use", journal.validate_article(undeclared_fact, packet, []))
 
         hedged_only = self.article(
             packet,
@@ -403,30 +389,7 @@ class JournalContextLaneTests(unittest.TestCase):
             packet,
             "A silver synth chorus was recorded during the Friday broadcast.",
         )
-        self.assertEqual("", journal.validate_article(undeclared, packet, []))
-        memory_ref = packet["generationContextLanes"]["establishedBroadcastMemory"][0]["laneRefId"]
-        self.assertEqual("source_attribution_failed", self.review_with_anchor(undeclared, packet, memory_ref)[1])
-
-    def test_memory_declaration_does_not_authorize_another_section_or_title(self):
-        packet = self.packet()
-        memory = packet["generationContextLanes"]["establishedBroadcastMemory"][0]
-        claim = "A silver synth chorus was recorded during the Friday broadcast."
-        article = self.article(packet, claim, lane_type="established_broadcast_memory",
-                               lane_ref=memory["laneRefId"],
-                               basis=[memory["laneRefId"], memory["matchedFreshSourceRefIds"][0]], sections=2)
-        self.assertEqual("", journal.validate_article(article, packet, []))
-        self.assertEqual("", self.review_with_anchor(article, packet, memory["laneRefId"])[1])
-        receipt, reason, targets = self.review_with_anchor(
-            article, packet, memory["laneRefId"], unit_id="sections[1].body:0")
-        self.assertIsNone(receipt)
-        self.assertEqual(reason, "source_attribution_failed")
-        self.assertEqual(targets[0]["field"], "sections[1].body")
-        article["title"] = "The Silver Synth Chorus"
-        receipt, reason, targets = self.review_with_anchor(
-            article, packet, memory["laneRefId"], unit_id="title:0")
-        self.assertIsNone(receipt)
-        self.assertEqual(reason, "source_attribution_failed")
-        self.assertEqual(targets[0]["field"], "title")
+        self.assertEqual("undeclared_context_use", journal.validate_article(undeclared, packet, []))
 
     def test_context_repair_identifies_all_affected_fields_and_supplied_lanes(self):
         packet = self.packet()
@@ -436,25 +399,20 @@ class JournalContextLaneTests(unittest.TestCase):
             "A silver synth chorus was recorded during the Friday broadcast.",
         )
         article["title"] = "A Rumor Finds Its Rhythm"
-        article["excerpt"] = "I think the rhythm deserves a second listen."
+        article["excerpt"] = "I think the producers discussed a hidden synth set during the Friday show."
         details = []
         self.assertEqual("undeclared_context_use", journal.validate_article(
             article, packet, [], blocking_only=True, repair_details=details,
         ))
         self.assertIn({"field": "title", "check": "context_claim_outside_body"}, details)
         self.assertIn({"field": "excerpt", "check": "context_claim_outside_body"}, details)
-        self.assertNotIn("silver synth chorus", json.dumps(details))
-        article["title"] = "Another Reflection"
-        article["excerpt"] = "A little room to listen."
-        receipt, reason, details = self.review_with_anchor(article, packet, memory_ref)
-        self.assertIsNone(receipt)
-        self.assertEqual(reason, "source_attribution_failed")
         self.assertTrue(any(
             issue["field"] == "sections[0].body"
             and issue.get("laneRefId") == memory_ref
-            and issue.get("unitId") == "sections[0].body:0"
+            and issue.get("sentenceIndex") == 0
             for issue in details
         ), details)
+        self.assertNotIn("silver synth chorus", json.dumps(details))
 
     def test_context_repair_round_trip_keeps_metadata_and_still_requires_grounded_declaration(self):
         packet = self.packet()
@@ -472,36 +430,27 @@ class JournalContextLaneTests(unittest.TestCase):
         raw = json.dumps(candidate)
         self.assertGreater(raw.index('"contextUses"'), 6000)
         calls = []
-        corrected = json.loads(raw)
-        corrected["metadata"]["contextUses"] = [{
-            "laneType": "established_broadcast_memory",
-            "laneRefId": memory["laneRefId"],
-            "sectionHeading": candidate["sections"][0]["heading"],
-            "claim": claim,
-            "basisRefIds": [memory["laneRefId"], fresh_ref],
-        }]
 
         def generator(_packet, prompt):
             calls.append(prompt)
-            if is_source_review(prompt):
-                self.assertIn(len(calls), (2, 4))
-                units, evidence = review_inputs(prompt)
-                self.assertIn(claim, " ".join(unit["text"] for unit in units))
-                self.assertIn(memory["laneRefId"], {source["refId"] for source in evidence["sources"]})
-                return supported_review_with_anchor(
-                    prompt, unit_id="sections[0].body:0", source_ref=memory["laneRefId"])
             if len(calls) == 1:
                 return raw
             previous = json.loads(prompt.split("Complete previous draft (not evidence):\n", 1)[1])
-            self.assertEqual(3, len(calls))
             self.assertEqual(candidate, previous)
             self.assertIn(memory["laneRefId"], prompt.split("Validation targets", 1)[1])
-            return json.dumps(corrected)
+            previous["metadata"]["contextUses"] = [{
+                "laneType": "established_broadcast_memory",
+                "laneRefId": memory["laneRefId"],
+                "sectionHeading": candidate["sections"][0]["heading"],
+                "claim": claim,
+                "basisRefIds": [memory["laneRefId"], fresh_ref],
+            }]
+            return json.dumps(previous)
 
-        article, reason, advisory = journal._generate_article_with_repairs(packet, generator, [])
+        article, reason, advisory = journal._generate_article_with_repairs(packet, with_supported_review(generator), [])
         self.assertEqual("", reason)
         self.assertFalse(advisory)
-        self.assertEqual(4, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertEqual(candidate["sections"][0]["body"].strip(), article["sections"][0]["body"])
         self.assertEqual("", journal.validate_article(article, packet, []))
 
@@ -553,12 +502,7 @@ class JournalContextLaneTests(unittest.TestCase):
 
         title_claim = self.article(packet, "The room kept making music.")
         title_claim["title"] = "The Hidden Synth Set Arrives Friday"
-        self.assertEqual("", journal.validate_article(title_claim, packet, []))
-        receipt, reason, targets = self.review_with_anchor(
-            title_claim, packet, rumor["laneRefId"], unit_id="title:0")
-        self.assertIsNone(receipt)
-        self.assertEqual(reason, "source_attribution_failed")
-        self.assertEqual(targets[0]["field"], "title")
+        self.assertEqual("undeclared_context_use", journal.validate_article(title_claim, packet, []))
 
     def test_strong_unframed_inference_cue_requires_declaration(self):
         packet = self.packet()
@@ -623,7 +567,8 @@ class JournalContextLaneTests(unittest.TestCase):
         )
         self.assertEqual("invalid_context_use", journal.validate_article(laundering, packet, []))
 
-        memory_fresh_ref = "fresh:1"
+        memory_fresh_ref = memory["matchedFreshSourceRefIds"][0]
+        self.assertIn(memory_fresh_ref, {source["refId"] for source in packet["safeSources"]})
         synonymized_claim = "BNL suspects the Friday synth activity may point toward a surprise performance."
         memory_claim = "An established Network record says a silver synth chorus was recorded during the Friday broadcast."
         parent_laundering = self.article(
@@ -684,7 +629,7 @@ class JournalContextLaneTests(unittest.TestCase):
             lane_ref=rumor["laneRefId"],
             basis=[rumor["laneRefId"], fresh_ref],
         )
-        result = journal.store_validated_draft(self.db, 1, packet, article)
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(article, packet))
         self.assertTrue(result.ok, result.reason)
         with sqlite3.connect(self.db) as conn:
             metadata = json.loads(conn.execute(
@@ -745,7 +690,7 @@ class JournalContextLaneTests(unittest.TestCase):
                 self.db,
                 1,
                 packet,
-                initial_article,
+                reviewed_article(initial_article, packet),
                 entry_id=entry_id,
             )
             self.assertTrue(stored.ok, stored.reason)

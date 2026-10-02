@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as sources
+from tests.journal_review_helpers import reviewed_article
 
 
 START = "2026-09-30T01:30:00Z"
@@ -89,7 +90,8 @@ class JournalExchangeContextTests(unittest.TestCase):
                              "publicSpeakerName", "participantAlias", "sourceRole", "authority")))
         self.assertEqual(REPLIED, context[0]["observedAt"])
         self.assertEqual("2026-09-30T09:26:00-07:00", context[0]["observedAtPacific"])
-        self.assertEqual(self.packet["safeSources"][0]["roomRef"], context[0]["roomRef"])
+        self.assertEqual(self.packet["safeSources"][0]["messageContext"]["roomRef"],
+                         context[0]["messageContext"]["roomRef"])
         self.assertEqual([f"fresh:{self.event.event_seq}"], context[0]["nearbySourceRefIds"])
         self.assertNotIn("subjectRef", context[0])
         self.assertNotIn("recipient", json.dumps(context))
@@ -184,6 +186,23 @@ class JournalExchangeContextTests(unittest.TestCase):
         self.attach()
         self.packet["privateExchangeContextProvenance"] = []
         self.assertEqual("journal_exchange_controls_unavailable", self.guard()())
+
+    def test_current_review_binds_recorded_bnl_speech_without_human_attribution(self):
+        self.attach()
+        exchange = self.packet["exchangeContext"][0]
+        evidence = journal._source_review_evidence(self.packet)
+        source = next(item for item in evidence["sources"] if item["refId"] == exchange["refId"])
+        self.assertEqual((source["publicSpeakerName"], source["authority"]), ("BNL", "speech_only"))
+        article = journal.parse_generated_json(json.dumps({
+            "title": "The Sticker Question", "excerpt": "A question worth considering.",
+            "sections": [{"heading": "Stickers", "body": "Test Listener asked about a sticker.",
+                          "sourceRefIds": [self.packet["safeSources"][0]["refId"]]}],
+            "metadata": {"contextUses": [], "topicTags": []},
+        }))
+        article = reviewed_article(article, self.packet)
+        self.assertEqual(journal._source_review_reason(article, self.packet, required=True), "")
+        exchange["summary"] = "A different BNL utterance."
+        self.assertEqual(journal._source_review_reason(article, self.packet, required=True), "source_review_evidence_changed")
 
 
 if __name__ == "__main__":

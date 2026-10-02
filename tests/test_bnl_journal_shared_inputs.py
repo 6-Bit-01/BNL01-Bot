@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 """Journal consumes the existing public owners and rechecks saved source bases."""
 import json
 import os
@@ -203,7 +204,7 @@ class JournalSharedInputsTests(unittest.TestCase):
 
     def test_saved_moment_lineage_survives_reopen_and_retraction_blocks_manual_delivery(self):
         packet = self.packet()
-        result = journal.store_validated_draft(self.db, 1, packet, self.article_with_moment(packet))
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(self.article_with_moment(packet), packet))
         self.assertTrue(result.ok, result)
         self.assertTrue(journal.approve_draft(self.db, 1, result.entry_id, result.content_hash).ok)
         with sqlite3.connect(self.db) as conn:
@@ -222,7 +223,7 @@ class JournalSharedInputsTests(unittest.TestCase):
     def test_uncited_candidate_is_still_revalidated_and_forget_scrubs_published_private_basis(self):
         packet = self.packet()
         article = journal.parse_generated_json(article_json(packet))
-        result = journal.store_validated_draft(self.db, 1, packet, article)
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(article, packet))
         self.assertTrue(result.ok, result)
         with sqlite3.connect(self.db) as conn:
             meta = json.loads(conn.execute("SELECT metadata_json FROM bnl_journal_private_metadata").fetchone()[0])

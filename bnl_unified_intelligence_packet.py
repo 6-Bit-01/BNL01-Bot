@@ -166,6 +166,7 @@ _CONFIDENCE_RANK = {
     Confidence.APPROVED.value: 4,
 }
 _LANE_CAPS = {
+    "bnl_impression": 2,
     "current_intent": 8,
     "conversation_context": 6,
     "assessment_observation": 4,
@@ -262,6 +263,7 @@ _IDENTITY_COMPARISON_REQUEST_RE = re.compile(
     re.I,
 )
 _ASSESSMENT_LANE_MAP = {
+    "bnl_impression": "bnl_impression",
     "current_intent": "current_exchange",
     "conversation_context": "conversation_context",
     "assessment_observation": "governed_memory",
@@ -1836,6 +1838,9 @@ def _profile_member_item(
     request: IntelligencePacketRequest,
     item: IntelligencePacketItem,
 ) -> bool:
+    if item.source_type == "impression_moment_context":
+        # A whole exchange explains a reaction; it is not an atomic member fact.
+        return False
     base = bool(
         item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
         and item.subject_key == _request_subject_key(request)
@@ -1994,6 +1999,8 @@ def _route_allows_item(
     request: IntelligencePacketRequest,
     item: IntelligencePacketItem,
 ) -> bool:
+    if item.source_type in {"bnl_retained_impression", "impression_moment_context"} and item.visibility == "sealed_test":
+        return request.channel_policy == "sealed_test" and request.channel_id > 0
     if item.source_type in {'sealed_memory_tier', 'sealed_member_fact', 'sealed_moment'}:
         return bool(request.channel_policy == 'sealed_test' and request.channel_id > 0
                     and item.visibility == 'sealed_test')
@@ -2439,6 +2446,105 @@ def _conversation_items(
             continue
         items.append(item)
     return items
+
+
+def _impression_text(basis: Mapping[str, Any], lane: str, subject: str = "") -> str:
+    if lane == "bnl_impression":
+        return "%s\nWhy it stayed with me: %s" % (
+            basis["impression"], basis["reason"],
+        )
+    if subject.startswith("discord_user:"):
+        contribution = next((value for value in basis.get("contributions", ())
+                             if value.get("subjectRef") == subject), None)
+        if not contribution:
+            return ""
+        return "%s: %s" % (contribution.get("displayName") or "The participant",
+                            contribution["summary"])
+    return str(basis.get("summary") or "")
+
+
+def _impression_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> list[IntelligencePacketItem]:
+    """Read one shared owner; an impression never supplies factual authority."""
+    from bnl_moment_engine import select_moment_impressions
+
+    if (request.immediate_recap or request.route_mode != "normal_chat"
+            or request.channel_policy not in {"public_home", "public_context", "sealed_test"}):
+        return []
+    subject = _request_subject_key(request) if (
+        request.frame_subject_requirement == "required"
+        or not request.frame_revision and request.subject_user_id > 0
+    ) else ""
+    rows = select_moment_impressions(
+        conn, guild_id=request.guild_id, topic_text=request.user_text,
+        subject_key=subject, channel_policy=request.channel_policy,
+        channel_id=request.channel_id, observed_before=request.now or _now(),
+        max_results=2, environ=environ,
+    )
+    items: list[IntelligencePacketItem] = []
+    for row in rows:
+        mid = str(row["momentId"])
+        roots, occurrences = (
+            _moment_root_metadata(conn, moment_id=mid, subject_key=subject)
+            if subject else _moment_all_root_metadata(conn, moment_id=mid)
+        )
+        context_text = _impression_text(row, "moment", subject)
+        if not roots or not occurrences or not context_text:
+            continue
+        lineage = tuple(str(source["ledgerEntryId"]) for source in row["originalSourceRefs"])
+        common = dict(
+            visibility=row["visibility"], participants=tuple(row["subjectRefs"]),
+            lineage=lineage, observed_at=row["observedAt"],
+            revalidation_kind="impression", revalidation_key=mid, event_ref=mid,
+        )
+        # Keep the existing source-grounded recollection distinct from BNL's reaction.
+        items.append(IntelligencePacketItem(
+            lane="moment", source_class="moment_gist",
+            source_type="impression_moment_context", source_ref="impression-basis:" + mid,
+            source_digest=_digest("moment_impression", row["sourceVersion"], "moment"),
+            subject_key=subject or "moment:" + mid, predicate_key="shared_moment",
+            text=context_text, confidence="low", lifecycle="review_only",
+            authority=_AUTHORITY_RANK["moment_gist"], usage="episode_paraphrase", score=87.0,
+            root_identities=roots, occurrence_identities=occurrences, **common,
+        ))
+        items.append(IntelligencePacketItem(
+            lane="bnl_impression", source_class=SourceClass.DERIVED_SUMMARY.value,
+            source_type="bnl_retained_impression", source_ref="impression:" + mid,
+            source_digest=_digest("moment_impression", row["sourceVersion"], "bnl_impression"),
+            subject_key="bnl_01", predicate_key="revisable_impression",
+            text=_impression_text(row, "bnl_impression"), confidence="low", lifecycle="review_only",
+            authority=0, usage="subjective_perspective", score=86.0,
+            attribution_mode="bnl_subjective",
+            uncertainty_status="revisable_impression_zero_fact_weight", **common,
+        ))
+    if items:
+        diagnostics.candidates_by_lane["bnl_impression"] = len(items) // 2
+    return items
+
+
+def _impression_version(
+    conn: sqlite3.Connection, packet: UnifiedIntelligencePacket,
+    item: IntelligencePacketItem, *, environ: Mapping[str, str] | None = None,
+) -> str:
+    from bnl_moment_engine import read_moment_impression
+
+    row = read_moment_impression(
+        conn, guild_id=packet.request.guild_id, moment_id=item.revalidation_key,
+        channel_policy=packet.request.channel_policy, channel_id=packet.request.channel_id,
+        environ=environ,
+    )
+    if (row is None or item.text != _impression_text(row, item.lane, item.subject_key)
+            or item.participants != tuple(row["subjectRefs"])
+            or item.visibility != row["visibility"]
+            or item.observed_at != row["observedAt"]
+            or item.lineage != tuple(str(source["ledgerEntryId"]) for source in row["originalSourceRefs"])):
+        return ""
+    return _digest("moment_impression", row["sourceVersion"], item.lane)
 
 
 def _ledger_entry_digest(
@@ -5814,6 +5920,16 @@ def _select_items(
             diagnostics.selected_atomic_states[item.lifecycle] = (
                 diagnostics.selected_atomic_states.get(item.lifecycle, 0) + 1
             )
+    # A source budget must not leave a reaction without its separate recollection.
+    companion_moments = {item.event_ref for item in selected
+                         if item.source_type == "impression_moment_context"}
+    for item in tuple(selected):
+        if item.lane == "bnl_impression" and item.event_ref not in companion_moments:
+            selected.remove(item)
+            diagnostics.selected_by_lane[item.lane] -= 1
+            diagnostics.selected_by_source_class[item.source_class] -= 1
+            _add_exclusion(diagnostics, exclusions, lane=item.lane,
+                           reason="impression_basis_not_selected", source_class=item.source_class)
     for lane, count in diagnostics.candidates_by_lane.items():
         if int(count or 0) and not diagnostics.selected_by_lane.get(lane):
             diagnostics.missing_lanes.append(lane)
@@ -6702,6 +6818,8 @@ def _revalidate_packet_in_snapshot(
                     )
                 )
                 current = state.source_digest if state_matches else ""
+            elif item.revalidation_kind == "impression":
+                current = _impression_version(conn, packet, item, environ=environ)
             elif item.revalidation_kind == "ledger":
                 current = _ledger_entry_digest(conn, item.revalidation_key)
             elif item.revalidation_kind == "sealed_memory":
@@ -6983,6 +7101,17 @@ def _packet_invariants(
             invalid.append("selected_subject_violation")
         if item.lane == "relationship_posture" and item.usage != "tone_only":
             invalid.append("relationship_fact_authority_violation")
+        if item.lane == "bnl_impression" and not (
+            item.usage == "subjective_perspective" and item.authority == 0
+            and item.subject_key == "bnl_01" and item.attribution_mode == "bnl_subjective"
+            and item.revalidation_kind == "impression" and item.lineage
+            and not item.root_identities and not item.occurrence_identities
+            and not item.point_identity and not item.canon_status
+            and not item.canon_domain and not item.canon_claim_kind
+            and any(companion.source_type == "impression_moment_context"
+                    and companion.event_ref == item.event_ref for companion in packet.items)
+        ):
+            invalid.append("impression_fact_authority_violation")
         if item.lane in {"journal_publication", "relay_publication"} and not (
             item.usage == "publication_projection"
             and item.lifecycle == "published"
@@ -7059,6 +7188,7 @@ def _packet_invariants(
             broad
             and item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
             and item.lane != "conversation_context"
+            and item.source_type != "impression_moment_context"
             and (
                 not item.root_identities
                 or not item.occurrence_identities
@@ -7225,6 +7355,7 @@ def _packet_invariants(
             broad
             and item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
             and item.lane != "conversation_context"
+            and item.source_type != "impression_moment_context"
             and (
                 not item.root_identities
                 or not item.occurrence_identities
@@ -7801,6 +7932,7 @@ def build_packet(
                 environ=environ,
             )
         )
+        candidates.extend(_impression_items(conn, request, diagnostics, environ=environ))
     except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
         diagnostics.processing_errors.append(type(exc).__name__)
     for item in candidates:

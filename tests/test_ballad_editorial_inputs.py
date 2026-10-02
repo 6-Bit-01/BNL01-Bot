@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 """Published selection, immutable versions, and saved editorial delivery fences."""
 import asyncio
 import copy
@@ -228,7 +229,7 @@ class BalladJournalInputsTests(unittest.TestCase):
 
     def draft(self):
         packet = self.fixture.packet()
-        result = journal.store_validated_draft(self.db, 1, packet, journal.parse_generated_json(article_json(packet)))
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(journal.parse_generated_json(article_json(packet)), packet))
         self.assertTrue(result.ok, result)
         return result
 

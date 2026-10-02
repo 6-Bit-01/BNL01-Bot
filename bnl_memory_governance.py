@@ -2108,6 +2108,25 @@ def _moment_contribution_scope_ready(conn: sqlite3.Connection) -> bool:
     )
 
 
+def _scrub_moment_impressions(conn: sqlite3.Connection, *, guild_id: int,
+                              moment_ids: Iterable[str]) -> None:
+    """Erase optional subjective derivatives whenever their existing owner is scrubbed."""
+    if not _table_exists(conn, "memory_moment_windows"):
+        return
+    cols = _cols(conn, "memory_moment_windows")
+    fields = [name for name in ("impression_payload", "impression_source_digest",
+                                "impression_projection_digest") if name in cols]
+    if not fields or not {"guild_id", "moment_id"}.issubset(cols):
+        return
+    for chunk in _bounded_chunks(moment_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        conn.execute(
+            "UPDATE memory_moment_windows SET " + ",".join(name + "=''" for name in fields)
+            + " WHERE guild_id=? AND moment_id IN (" + placeholders + ")",
+            tuple([int(guild_id)] + chunk),
+        )
+
+
 def _scrub_contribution_pairs(
     conn: sqlite3.Connection,
     *,
@@ -2115,6 +2134,9 @@ def _scrub_contribution_pairs(
     pairs: Iterable[Tuple[str, str]],
     lifecycle: str,
 ) -> int:
+    pairs = set(pairs)
+    _scrub_moment_impressions(conn, guild_id=guild_id,
+                              moment_ids={moment_id for moment_id, _subject in pairs})
     if not _table_exists(conn, "memory_moment_contributions"):
         return 0
     cols = _cols(conn, "memory_moment_contributions")
@@ -2265,6 +2287,7 @@ def _invalidate_contributions_for_moments(
         )
     if not scoped:
         return counts
+    _scrub_moment_impressions(conn, guild_id=guild_id, moment_ids=scoped)
     if not delete_rows and _table_exists(conn, "memory_moment_contributions"):
         contribution_cols = _cols(conn, "memory_moment_contributions")
         if {"moment_id", "participant_key"}.issubset(contribution_cols):

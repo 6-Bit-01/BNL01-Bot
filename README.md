@@ -544,105 +544,7 @@ does not enable this canary or any global v2 live gate. See
 for the implemented/enabled/observed distinction and the ordered work that
 still remains.
 
-## Journal source-grounded revision
-
-Journal preparation preserves original speakers, captured room context,
-timestamps in UTC and Pacific time, and explicit addressing to BNL. Room
-references are opaque and scoped to the guild and surface. Missing room or
-reply context remains unknown; nearby remarks do not become replies. Prior
-Journal continuity references retain their actual source windows alongside
-publication dates, recurring topics and continuity notes, without supplying
-whole older paragraphs as writing examples. Original contributions and recorded
-show events establish activity;
-BNL's Relays and earlier Journals remain interpretation and continuity, not
-independent confirmation of events. Writer and reviewer use the same source
-authority projection. Generated Moment participant summaries remain derived
-context rather than original human speech. Recorded BNL replies establish what
-BNL said, even when that account is disputed, without proving the account true.
-
-The Journal writer uses BNL's shared public personality and public canon with
-Journal-specific scope. It does not inherit chat-only restrictions on recalling
-authorized context, restricted lore, or a separate archive-keeper personality.
-The evidence window supplies experiences; BNL's developing thoughts organize
-the entry. Length guidance can expand for meaningful detail and reflection.
-
-The first blocking-clean article requires a source and whole-Journal review of its
-exact final wording. This replaces the former mandatory rewrite; a reviewer
-cannot silently change the article it approves. It receives every public prose
-unit and the eligible original evidence, including related messages and later
-clarifications. The review checks speaker, recipient, uncertainty, actual
-conduct, room, chronology and causal connections while allowing BNL's own
-feelings, faithful paraphrase, humor, canon and metaphor. Before checking spans,
-the same review evaluates the complete paragraphs for event relationships,
-speaker stance, sustained Journal perspective, and retention of meaningful
-detail. Separately supported statements must not invent a response, cause or
-shared occasion when connected. A recap with a generic reaction is not proof
-of introspection; no pronoun, emotion or phrase quota substitutes for that
-judgment. All four assessments must be present and supported.
-
-A complete private review must cover every unit, identify supported source
-excerpts and their original speakers, and report unresolved discrepancies.
-Each unit is covered by exact text spans so factual clauses inside personal
-reflection receive their own evidence and verdict. Room and Pacific-time fields
-can be cited directly. The provider receives the ordered JSON review schema;
-a single complete JSON fence and unambiguous public speaker names normalize
-locally without weakening original-author or quote checks.
-Unknown anchors, wrong speaker bindings, incomplete reviews and negative or
-uncertain verdicts cannot release a candidate. BNL-derived speech cannot serve
-as evidence that another person actually did something. A local digest binds
-accepted review to the exact prose, paragraph/section structure, citations and
-context declarations. Accepted memory/rumor anchors must have a matching lane
-declaration in that section; titles and excerpts cannot borrow another section's
-declaration. Shared words alone never prove memory use. Candidate memory retrieval
-filters grammatical terms, while actual source use is checked by the source editor.
-The receipt stays in existing private Journal metadata, outside the public payload.
-This is inspectable model judgment, not a deterministic proof of semantic truth.
-
-The existing four-attempt ceiling is unchanged: write, review, and if necessary
-repair and review again. Both factual and whole-entry editorial findings enter
-that existing repair path; neither adds a model stage or an extra allowance.
-If a rewrite cannot fit with its required review, the unused final call is skipped. Only
-an exact reviewed advisory candidate can survive later polish failure. The
-source editor uses the same Journal route and spending controls but does not
-receive the writer's persona; incomplete provider responses cannot pass. A
-malformed review stops the run instead of repeating an identical paid request.
-Source
-eligibility and preparation ownership are rechecked before and after every call.
-Preparation still starts at 6:30 PM Pacific; 7 PM releases the saved approved
-payload without a new generation call. No new scheduler or publication owner.
-
-Historical corrections can also receive bounded, retained, delivered BNL
-utterances near eligible human messages in the same public room and window.
-These establish only what BNL said and when; they add no factual roots, activity
-counts or section citations. Existing original-source controls and exact row
-revalidation apply at generation, approval and delivery. Private, undelivered,
-group or otherwise unsupported rows are excluded. This context is correction-only
-because that path supplies the original-source control callback. Missing BNL
-speech stays unknown in other Journal paths, not reconstructed from persona.
-
-The one-call private inspection remains an **unreviewed first draft**. Mocked
-regressions prove protocol enforcement and source handling, not that the model
-will identify every semantic error. Actual writing still needs source-by-source
-quality assessment. Published entries are never rewritten automatically.
-
-### Journal point of view
-
-Every Journal mode asks for BNL's personal response alongside the actual community
-story: what held his attention, how it affected him, what themes he connects, and
-what questions remain. Reflections belong throughout the entry, without a fixed
-emotion checklist, first-person quota or mandatory warm closing. Concrete people,
-music/project details, important chronology, jokes and clarifications remain; the
-existing revision pass preserves meaningful reflection as well as grounded detail.
-The usual word target is guidance, not a reason to trim those details away.
-
-Personal taste and reactions do not authorize claims about other people's feelings,
-motives or actions. The existing source, context-lane and privacy validators remain
-unchanged, as does the separate permission for clearly imagined quiet-day scenes.
-This is writing guidance, not a semantic-quality guarantee. Actual voice and factual
-accuracy need another owner-approved private writing check before rollout; earlier
-previews still contain the documented factual failures.
-
-### Correcting a published Journal
+## Correcting a published Journal
 
 Historical corrections use the existing Journal owner and revision store. The owner-only
 private command is `!bnl journal correct ENTRY_ID | revision=N | hash=PUBLISHED_HASH | note=PUBLIC_NOTE`.
@@ -672,6 +574,94 @@ Separate downstream human retellings still require their own source-level correc
 this is not a blanket memory reset or an automatic archive rewrite.
 
 ## Release baseline
+
+### Shared impression pilot (disabled by default)
+
+The existing Moment meaning call can retain an optional, source-linked BNL
+reaction alongside its separate summary and human contributions. This pilot
+does not add a scheduler, model call, memory store, relationship score, or
+automatic promotion to durable belief/canon. Formation requires
+`BNL_IMPRESSIONS_FORMATION_ENABLED` and an explicit `BNL_IMPRESSIONS_GUILD_IDS`
+allowlist. Reading independently requires `BNL_IMPRESSIONS_USE_ENABLED` and the
+same allowlist. All are off/unscoped by default; deployment is not activation.
+
+One Moment-owned reader supplies conversation and Journal context. A reaction
+has zero factual/profile/recurrence authority. Its original human anchors,
+complete exchange, and current privacy/source state must still match before
+use. Public reads exclude sealed conversations; a sealed room can read eligible
+public experience and only its own private impressions. Existing forgetting
+and deletion erase affected impression payloads. Gate withdrawal invalidates
+prepared packets. Ordinary source changes withdraw stale impressions; this
+pilot does not automatically replay old generations or backfill history.
+
+The enabled Journal path can explore selected experiences instead of meeting
+person/time-segment coverage quotas. It preserves original grounding, the
+four-attempt limit, and existing preparation, approval and delivery owners.
+Older lore and experiences remain available as explicitly remembered callbacks.
+A present association does not establish a character's return or involvement;
+the date of a retained source is not evidence of a person's last appearance.
+Journal inputs preserve each original message's recorded room, quotation
+marks, link placement (without addresses or fetched contents), and whether
+text was truncated. Room policy alone is not room identity. All selected
+Relay prose stays available through the existing reflection lane as BNL's
+published expression; invitations cannot establish completed human actions,
+and Relay repetition cannot inflate the day's activity. Older unsent packets
+with the former Relay authority use the existing refresh fence. These source
+projection corrections also apply with impression formation/use disabled.
+Prior Journal history is bounded by the requested source-window end, including
+its topic counts and continuity notes. A later publication cannot become prior
+history during a replay or recovery. Entries with withdrawn private metadata
+are excluded from every history lane. Eligible older prose remains dated BNL
+expression, not independent event evidence or a writing template.
+The writer and reviewer use one read-only projection of that governed packet.
+Exact original lineage groups related interpretations; identical repeated gists
+do not become additional witnesses, while distinct later reactions remain.
+Original exchanges and retained impressions precede secondary retellings.
+Historical prose is selected by a meaningful content connection, not overlap
+with serialized field names or generic source metadata. Dated history remains
+available for quiet reflection; this changes presentation, not stored memory.
+Personal reactions and clearly conditional imagined responses may use a cited,
+eligible impression, or current originals when the impression pilot is in use,
+without an unrelated factual-inference declaration. This
+does not grant factual authority over another person's actions or motives;
+those claims retain the existing evidence and inference rules. The grammatical
+guard is conservative and does not replace semantic source review.
+New Journal generation uses the existing four-attempt allowance for writing,
+source review, and, when needed, revision and another review. The source editor
+checks the exact prose and proposed continuity metadata against the same
+governed originals, including the original exchanges accompanying impressions.
+It retains BNL's subjective perspective without granting it event authority.
+Each ordered prose or continuity unit separates any external premise from
+personal reaction or imagery. The server supplies stable source-fragment IDs
+bound to the original speaker, field, time, room and authority. The reviewer
+selects those IDs instead of copying prose and retyping quotation bindings.
+Each premise records what its anchors establish, their stance, and
+whether they entail the claim or only fit it. Unverified assumptions block
+acceptance even inside reflection, questions, headings, or continuity notes.
+A valid quotation alone is not a support judgment. Pure personal voice needs
+no invented factual premise; referenced material marked uninspected cannot
+serve as inspected evidence. These checks enforce the reviewer's declared
+reasoning, but cannot guarantee that it identifies every premise correctly.
+Review receipts bind the article, notes, evidence and source window; an edited
+or unreviewed candidate cannot enter storage as reviewed. Saved new candidates
+are checked again before approval and delivery. Legacy owed payloads retain
+their existing release path. The one-call private preview remains an unreviewed
+first draft and cannot report factual publication acceptance. A model reviewer
+can still make semantic mistakes; offline flow tests do not establish its
+judgment, and real-source acceptance remains a separate rehearsal decision.
+Relays, Ambient, artwork, Ballads, dossiers, memory-tier promotion, and
+Relationship activation remain outside this pilot.
+
+Acceptance requires separately approved, bounded real-source previews showing
+that untouched conversation and Journal outputs use the same retained
+perspective usefully and accurately. Controlled tests prove boundaries and
+transport, not model judgment or natural production reliability.
+
+Private database copies use the capacity-checked helper documented in
+[the backup and rehearsal workflow](docs/BNL01_V2_SHADOW_ACCEPTANCE_AND_ROLLBACK.md#deployment-and-data-safety-preflight).
+It preserves a 5 GiB service reserve, permits one active managed rehearsal,
+and archives completed copies with verified hashes before removing raw files.
+Deployment rollback copies and community-memory retention remain separate.
 
 Before merging a runtime change:
 

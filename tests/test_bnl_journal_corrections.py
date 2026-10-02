@@ -9,7 +9,9 @@ from unittest.mock import Mock, patch
 
 import bnl_journal as journal
 import bnl_journal_source_store as store
-from tests.journal_review_helpers import is_source_review, review_inputs, with_supported_review
+from tests.journal_review_helpers import (
+    is_source_review, rejected_review, review_inputs, supported_review, with_supported_review,
+)
 
 
 START = "2026-09-28T00:00:00Z"
@@ -81,8 +83,8 @@ class JournalCorrectionTests(unittest.TestCase):
         row, meta, result = journal._draft_records(1, packet, article, entry_id=entry_id, revision=revision)
         with sqlite3.connect(self.db) as conn:
             journal._insert_draft_rows(conn, row, meta)
-            conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='published',published_at=? WHERE entry_id=? AND revision=?",
-                         (published, entry_id, revision))
+            conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='published',published_at=?,created_at=? WHERE entry_id=? AND revision=?",
+                         (published, published, entry_id, revision))
             conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='published' WHERE entry_id=? AND revision=?",
                          (entry_id, revision))
         return result
@@ -133,7 +135,7 @@ class JournalCorrectionTests(unittest.TestCase):
         self.assertIn("Reconstruct this historical Journal", writing_prompt)
         projected, _ = json.JSONDecoder().raw_decode(writing_prompt.split("Generation-safe packet:\n", 1)[1])
         self.assertEqual(projected["freshSources"],
-                         [journal._journal_prompt_source(source) for source in result["packet"]["safeSources"]])
+                         journal._journal_prompt_projection(result["packet"])["freshSources"])
         self.assertEqual((projected["sourceWindowStart"], projected["sourceWindowEnd"]), (START, END))
         self.assertEqual(prompts.call_count, 1)
         self.assertTrue(is_source_review(generator.call_args_list[1].args[1]))
@@ -315,11 +317,95 @@ class JournalCorrectionTests(unittest.TestCase):
 
     def test_history_uses_current_published_revision_once_including_recurrence_metadata(self):
         self.publish_fixture(self.entry_id, 2, "The Corrected Chorus", "A revised account.", tag="revised")
-        history = journal.retrieve_history(self.db, 1, self.packet, prepare_schema=False)
+        history = journal.retrieve_history(self.db, 1, {**self.packet, "sourceWindowEnd": CORRECTED}, prepare_schema=False)
         self.assertEqual(history["previousEntry"]["revision"], 2)
         self.assertEqual(history["recurringTopicCounts"], {"revised": 1})
         self.assertNotIn("chorus continuity", history["matchingContinuityNotes"])
         self.assertFalse(history["relevantOlderEntries"])
+
+    def test_later_correction_is_not_backdated_expression_or_old_revision_fallback(self):
+        self.publish_fixture(self.entry_id, 2, "The Corrected Chorus", "A revised account.", tag="revised")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE bnl_journal_entries SET created_at=? WHERE entry_id=? AND revision=2",
+                         (CORRECTED, self.entry_id))
+        history = journal.retrieve_history(
+            self.db, 1, {**self.packet, "sourceWindowEnd": "2026-09-30T00:00:00Z"}, prepare_schema=False)
+        self.assertIsNone(history["previousEntry"])
+        self.assertEqual(history["recurringTopicCounts"], {})
+
+    def test_correction_uses_current_four_call_review_repair_path(self):
+        # These fixture judgments test control flow, not model interpretation.
+        calls = []
+        def generate(packet, prompt):
+            calls.append(prompt)
+            if not is_source_review(prompt):
+                return self.article(packet, title="A Chorus Corrected" if len(calls) == 1 else "A Chorus Reconsidered")
+            return rejected_review(prompt) if len(calls) == 2 else supported_review(prompt)
+        result, _ = self.generate(preview=True, generator=Mock(side_effect=generate))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(result["article"]["metadata"]["sourceReview"]["version"], 8)
+        self.assertEqual(result["article"]["title"], "A Chorus Reconsidered")
+        self.assertEqual(journal._source_review_reason(result["article"], result["packet"], required=True), "")
+
+    def test_correction_draft_cannot_store_unreviewed_preview(self):
+        preview, _ = self.generate(preview=True)
+        self.assertTrue(preview["ok"], preview)
+        preview["article"]["metadata"].pop("sourceReview")
+        with patch.object(journal, "generate_published_correction_preview", return_value=preview):
+            result, generator = self.generate()
+        self.assertEqual(result.reason, "source_review_required")
+        self.assertIsNone(self.stored())
+        generator.assert_not_called()
+
+    def test_saved_correction_receipt_binds_exact_source_packet_at_later_gates(self):
+        result, _ = self.generate()
+        self.assertTrue(result.ok, result.reason)
+        row = self.stored()
+        original_meta = json.loads(row["metadata_json"])
+        for gate in ("approve", "deliver"):
+            with self.subTest(gate=gate):
+                metadata = json.loads(row["metadata_json"])
+                metadata["publishedCorrection"]["sourcePacket"]["safeSources"][0]["summary"] = "Altered factual basis."
+                with sqlite3.connect(self.db) as conn:
+                    conn.execute("UPDATE bnl_journal_private_metadata SET metadata_json=? WHERE entry_id=? AND revision=2",
+                                 (json.dumps(metadata), self.entry_id))
+                    if gate == "deliver":
+                        conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='approved_pending_delivery' WHERE entry_id=? AND revision=2", (self.entry_id,))
+                        conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='approved_pending_delivery' WHERE entry_id=? AND revision=2", (self.entry_id,))
+                opener = Mock()
+                blocked = self.approve(result) if gate == "approve" else journal.deliver_approved(
+                    self.db, 1, self.entry_id, "https://example.test", "test-key", opener=opener,
+                    revision=2, correction_guard=self.controls)
+                self.assertEqual(blocked.reason, "source_review_evidence_changed")
+                opener.assert_not_called()
+        self.assertEqual(original_meta["sourceReview"]["version"], 8)
+
+    def test_published_correction_scrubs_frozen_packet_for_uncited_deleted_member(self):
+        result, _ = self.generate()
+        self.assertTrue(result.ok, result.reason)
+        row = self.stored()
+        context = json.loads(row["metadata_json"])["publishedCorrection"]
+        context["sourcePacket"]["privateSources"].append({
+            "subjectRef": "discord_user:11", "summary": "Uncited Test Member's retained original.",
+        })
+        # Isolate the new retention path: the member occurs only in the saved
+        # packet, not in public prose, citation metadata or older known fields.
+        metadata = {"publishedCorrection": context}
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='published',published_at=? WHERE entry_id=? AND revision=2",
+                         (PUBLISHED, self.entry_id))
+            conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='published',metadata_json=? WHERE entry_id=? AND revision=2",
+                         (json.dumps(metadata), self.entry_id))
+            counts = journal.purge_user_journal_derivatives_on_connection(conn, 1, 11)
+        after = self.stored()
+        scrubbed = json.loads(after["metadata_json"])
+        self.assertEqual(counts["bnl_journal_published_metadata_scrubbed"], 1)
+        self.assertNotIn("sourcePacket", scrubbed["publishedCorrection"])
+        self.assertNotIn("Uncited Test Member", after["metadata_json"])
+        self.assertNotIn("discord_user:11", after["metadata_json"])
+        self.assertEqual(scrubbed["publishedCorrection"]["correction"], context["correction"])
+        self.assertEqual(after["canonical_payload_bytes"], row["canonical_payload_bytes"])
 
     def test_historical_history_excludes_target_future_and_old_revision_metadata(self):
         old_packet = {**self.packet, "sourceWindowStart": "2026-09-26T00:00:00Z", "sourceWindowEnd": "2026-09-27T00:00:00Z"}

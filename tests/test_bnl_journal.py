@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 import io
 import os
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
@@ -69,7 +70,7 @@ class JournalTests(unittest.TestCase):
         self.assertNotIn('discord_user:7', prompt)
         self.assertNotIn('relationship_journal', json.dumps(packet))
         self.assertNotIn('secret internal', json.dumps(packet))
-        self.assertIn("BNL's introspective personal Journal", prompt)
+        self.assertIn('community chronicle', prompt)
         self.assertIn('Never call people entities or organisms', prompt)
         self.assertIn('Do not invent nicknames', prompt)
         self.assertIn('Juicy means lively pattern recognition', prompt)
@@ -411,8 +412,22 @@ class JournalTests(unittest.TestCase):
     def test_cited_sources_only_private_metadata(self):
         packet = self.packet()
         relay_article = j.parse_generated_json(article_json(packet, 'Relay Only'))
-        relay_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': ['fresh:1']}
-        res = j.store_validated_draft(self.db, 1, packet, relay_article); self.assertTrue(res.ok, res.reason)
+        relay_ref = next(
+            source['refId'] for source in packet['reflectionBasis']
+            if source.get('basisKind') == 'accepted_relay_continuity'
+        )
+        relay_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': [relay_ref]}
+        self.assertEqual('insufficient_source_breadth', j.validate_article(relay_article, packet, []))
+        # Isolate cited-metadata selection while retaining every uncited private
+        # candidate. The ordinary packet above still requires original evidence.
+        relay_packet = {
+            **packet,
+            'evidenceCoverageContract': {
+                **packet['evidenceCoverageContract'],
+                'minimumDistinctFreshSources': 0,
+            },
+        }
+        res = j.store_validated_draft(self.db, 1, relay_packet, reviewed_article(relay_article, relay_packet)); self.assertTrue(res.ok, res.reason)
         with sqlite3.connect(self.db) as c:
             meta = json.loads(c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?", (res.entry_id,)).fetchone()[0])
         self.assertEqual(meta['supportingRelayIds'], ['r1'])
@@ -421,7 +436,7 @@ class JournalTests(unittest.TestCase):
         conv = next(src for src in packet['privateSources'] if src.get('displayName') == 'KnownUser')
         conv_article = j.parse_generated_json(article_json(packet, 'One Person Only'))
         conv_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': [conv['refId']]}
-        res2 = j.store_validated_draft(self.db, 1, packet, conv_article); self.assertTrue(res2.ok, res2.reason)
+        res2 = j.store_validated_draft(self.db, 1, packet, reviewed_article(conv_article, packet)); self.assertTrue(res2.ok, res2.reason)
         with sqlite3.connect(self.db) as c:
             meta2 = json.loads(c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?", (res2.entry_id,)).fetchone()[0])
         self.assertEqual(meta2['supportingRelayIds'], [])

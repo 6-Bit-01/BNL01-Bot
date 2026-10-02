@@ -11,7 +11,7 @@ import bnl_journal as journal
 import bnl_journal_attribution as attribution
 import bnl_journal_source_store as source_store
 from tests.journal_review_helpers import (
-    is_source_review, rejected_review, review_inputs, supported_review, with_supported_review,
+    fixture_issue, is_source_review, rejected_review, review_inputs, reviewed_article, supported_review, with_supported_review,
 )
 
 
@@ -86,9 +86,12 @@ class JournalGroundedRevisionTests(unittest.TestCase):
             generator.call_args_list[0].args[1].split("Generation-safe packet:\n", 1)[1])
         units, evidence = review_inputs(generator.call_args_list[1].args[1])
         self.assertEqual(units, attribution.public_units(journal.parse_generated_json(first)))
-        self.assertEqual(first_packet["freshSources"], [source for source in evidence["sources"]
-                                                       if source["refId"].startswith("fresh:")])
-        self.assertTrue(any(source.get("sourceRole") == "approved_canon" for source in evidence["sources"]))
+        self.assertEqual(attribution.source_fragments(first_packet["freshSources"]),
+                         [fragment for fragment in evidence["fragments"]
+                          if fragment["refId"].startswith("fresh:")])
+        self.assertEqual(evidence["fragments"], attribution.source_fragments(
+            journal._source_review_evidence(self.packet)["sources"]))
+        self.assertTrue(any(fragment["authority"] == "canon" for fragment in evidence["fragments"]))
         self.assertNotIn("Generation-safe packet:", generator.call_args_list[1].args[1])
         self.assert_reviewed_candidate(article, first)
         self.assertEqual(reason, "")
@@ -231,6 +234,100 @@ class JournalGroundedRevisionTests(unittest.TestCase):
         generator.assert_not_called()
         store.assert_not_called()
 
+    def test_storage_requires_review_even_when_structural_validation_passes(self):
+        article = journal.parse_generated_json(self.draft())
+        self.assertEqual(journal.validate_article(article, self.packet, []), "")
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "journal.db")
+            result = journal.store_validated_draft(db, 1, self.packet, article)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason, "source_review_required")
+            self.assertFalse(Path(db).exists())
+
+    def test_receipt_cannot_be_reused_after_original_or_window_changes(self):
+        article = reviewed_article(journal.parse_generated_json(self.draft()), self.packet)
+        self.assertEqual(journal._source_review_reason(article, self.packet, required=True), "")
+        for change in ("summary", "observedAt", "window"):
+            with self.subTest(change=change):
+                packet = copy.deepcopy(self.packet)
+                if change == "window":
+                    packet["sourceWindowEnd"] = "2026-10-01T00:00:00Z"
+                else:
+                    packet["safeSources"][0][change] = "changed original value"
+                self.assertEqual(journal._source_review_reason(article, packet, required=True),
+                                 "source_review_evidence_changed")
+
+    def test_changed_future_continuity_cannot_borrow_reviewed_prose_receipt(self):
+        article = reviewed_article(journal.parse_generated_json(self.draft()), self.packet)
+        article["metadata"]["continuityNotes"] = ["An unchecked claim about the track's credits."]
+        self.assertEqual(journal._source_review_reason(article, self.packet, required=True),
+                         "source_review_candidate_changed")
+
+    def test_model_supplied_receipt_does_not_skip_independent_review(self):
+        raw = json.loads(self.draft())
+        raw["metadata"]["sourceReview"] = {"version": 4, "verdict": "supported"}
+        (article, reason, _), generator, _ = self.run_sequence([json.dumps(raw), supported_review])
+        self.assertEqual(reason, "")
+        self.assertEqual(generator.call_count, 2)
+        self.assertTrue(is_source_review(generator.call_args_list[1].args[1]))
+        self.assertEqual(journal._source_review_reason(article, self.packet, required=True), "")
+
+    def stored_candidate(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        db = str(Path(directory.name) / "journal.db")
+        article = reviewed_article(journal.parse_generated_json(self.draft()), self.packet)
+        result = journal.store_validated_draft(db, 1, self.packet, article)
+        self.assertTrue(result.ok, result.reason)
+        return db, result
+
+    @staticmethod
+    def edit_stored_metadata(db, result, mutate):
+        with sqlite3.connect(db) as conn:
+            value = json.loads(conn.execute(
+                "SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=? AND revision=?",
+                (result.entry_id, result.revision)).fetchone()[0])
+            mutate(value)
+            conn.execute("UPDATE bnl_journal_private_metadata SET metadata_json=? WHERE entry_id=? AND revision=?",
+                         (json.dumps(value), result.entry_id, result.revision))
+
+    def test_approval_rejects_changed_continuity_with_unchanged_public_bytes(self):
+        db, stored = self.stored_candidate()
+        self.edit_stored_metadata(db, stored, lambda meta: meta.update(
+            continuityNotes=["Test Listener released the unfinished chorus."]))
+        result = journal.approve_draft(db, 1, stored.entry_id, stored.content_hash)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "source_review_candidate_changed")
+        with sqlite3.connect(db) as conn:
+            self.assertEqual(conn.execute("SELECT lifecycle_state FROM bnl_journal_entries").fetchone()[0], "draft")
+
+    def test_delivery_rejects_late_continuity_change_before_network(self):
+        db, stored = self.stored_candidate()
+        approved = journal.approve_draft(db, 1, stored.entry_id, stored.content_hash)
+        self.assertTrue(approved.ok, approved.reason)
+        self.edit_stored_metadata(db, stored, lambda meta: meta.update(
+            unresolvedQuestions=["Why did Test Listener release the unfinished chorus?"]))
+        opener = Mock(side_effect=AssertionError("Changed unreviewed metadata must not reach the network"))
+        result = journal.deliver_approved(db, 1, stored.entry_id, "https://site.example", "test-key", opener=opener)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "source_review_candidate_changed")
+        opener.assert_not_called()
+
+    def test_legacy_saved_candidate_without_new_review_marker_keeps_delivery_contract(self):
+        db, stored = self.stored_candidate()
+        def legacy(meta):
+            meta.pop("sourceReview", None)
+            meta.pop("sourceReviewRequiredVersion", None)
+        self.edit_stored_metadata(db, stored, legacy)
+        approved = journal.approve_draft(db, 1, stored.entry_id, stored.content_hash)
+        self.assertTrue(approved.ok, approved.reason)
+        with patch.object(journal, "_post_canonical_payload", return_value=(
+                "published", "", 200, False, "2026-09-30T02:00:00Z")) as publish:
+            result = journal.deliver_approved(db, 1, stored.entry_id, "https://site.example", "test-key")
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.status, "published")
+        publish.assert_called_once()
+
     def test_attribution_and_event_connection_analogs_require_repair_and_new_review(self):
         # Both flawed drafts currently pass structural checks. These fixtures
         # Explicit mocked editor judgments require a repair and another review;
@@ -257,61 +354,96 @@ class JournalGroundedRevisionTests(unittest.TestCase):
                 self.assert_reviewed_candidate(article, reviewed)
                 self.assertEqual(reason, "")
 
-    def test_whole_entry_failure_repairs_and_rechecks_unchanged_sources_within_four_calls(self):
-        # Explicit reviewer verdicts exercise orchestration, not model taste.
-        first = self.draft("Test Composer asked about the chorus. Test Listener is still working on it. I found it interesting.")
+    def test_multi_unit_factual_failure_repairs_and_rechecks_unchanged_sources(self):
+        first = self.draft("Test Composer finished the chorus. Test Listener thanked the composer for its release.")
         revised = self.draft("The unfinished chorus keeps bothering me in a useful way. Test Composer asked Test Listener about it; the answer left work to do. I am fond of that refusal to call a thing finished just to tidy my archive.")
 
-        for check, expected in (("journal_perspective", "journal_editorial_failed"),
-                                ("detail_retention", "journal_editorial_failed"),
-                                ("event_relationships", "source_attribution_failed")):
-            with self.subTest(check=check):
-                def reject_whole_entry(prompt):
-                    response = json.loads(supported_review(prompt))
-                    finding = next(item for item in response["assessments"] if item["check"] == check)
-                    finding.update(verdict="unsupported", issues=["Repair this whole-entry defect while preserving the source detail."])
-                    response["verdict"] = "unsupported"
-                    return json.dumps(response)
-
-                with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
-                    (article, reason, advisory), generator, _ = self.run_sequence(
-                        [first, reject_whole_entry, revised, supported_review])
-                self.assertEqual(generator.call_count, 4)
-                self.assertEqual(prompts.call_args_list[1].kwargs["repair_reason"], expected)
-                self.assertEqual(prompts.call_args_list[1].kwargs["previous_output"], first)
-                self.assertTrue(any(target["check"] == check for target in prompts.call_args_list[1].kwargs["repair_details"]))
-                self.assertEqual(review_inputs(generator.call_args_list[1].args[1])[1],
-                                 review_inputs(generator.call_args_list[3].args[1])[1])
-                self.assert_reviewed_candidate(article, revised)
-                self.assertEqual(reason, "")
-                self.assertFalse(advisory)
-
-    def test_repeated_editorial_failure_is_withheld_at_four_calls(self):
-        def reject_perspective(prompt):
+        def reject_connection(prompt):
             response = json.loads(supported_review(prompt))
-            finding = next(item for item in response["assessments"] if item["check"] == "journal_perspective")
-            finding.update(verdict="unsupported", issues=["The thought remains an afterthought to the recap."])
-            response["verdict"] = "unsupported"
+            units, evidence = review_inputs(prompt)
+            targets = [unit["unitId"] for unit in units if unit["field"] == "sections[0].body"]
+            fragment = next(item for item in evidence["fragments"] if item["refId"] == "fresh:2" and item["field"] == "summary")
+            response.update(verdict="unsupported", issues=[fixture_issue(
+                targets, [fragment], source_meaning=fragment["text"],
+                added_premise="The draft invents a completed release and another participant's response.")])
             return json.dumps(response)
 
-        (article, reason, advisory), generator, _ = self.run_sequence(
-            [self.draft(), reject_perspective, self.draft(), reject_perspective])
+        with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
+            (article, reason, advisory), generator, _ = self.run_sequence(
+                [first, reject_connection, revised, supported_review])
         self.assertEqual(generator.call_count, 4)
-        self.assertIsNone(article)
-        self.assertEqual(reason, "journal_editorial_failed")
+        self.assertEqual(prompts.call_args_list[1].kwargs["repair_reason"], "source_attribution_failed")
+        self.assertEqual(prompts.call_args_list[1].kwargs["previous_output"], first)
+        self.assertTrue(prompts.call_args_list[1].kwargs["repair_details"])
+        self.assertEqual(review_inputs(generator.call_args_list[1].args[1])[1],
+                         review_inputs(generator.call_args_list[3].args[1])[1])
+        self.assert_reviewed_candidate(article, revised)
+        self.assertEqual(reason, "")
         self.assertFalse(advisory)
 
-    def test_source_withdrawal_stops_editorial_repair_before_another_call(self):
-        def reject_perspective(prompt):
+    def test_repeated_factual_failure_is_withheld_at_four_calls(self):
+        (article, reason, advisory), generator, _ = self.run_sequence(
+            [self.draft(), rejected_review, self.draft(), rejected_review])
+        self.assertEqual(generator.call_count, 4)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertFalse(advisory)
+
+    def test_embedded_premise_repair_preserves_voice_and_requires_exact_recheck(self):
+        # A declared evidence gap is fixture input. This tests enforcement and
+        # writer/reviewer integration, not whether Gemini notices the gap.
+        voice_before = "My imaginary antenna has been leaning toward the chorus all afternoon. "
+        voice_after = " I prefer a loose end to a neatly labelled silence."
+        first = self.draft(voice_before + "I admired Test Listener's completed release." + voice_after)
+        revised = self.draft(voice_before + "Test Listener said the chorus was still in progress." + voice_after)
+
+        def admitted_gap(prompt):
             response = json.loads(supported_review(prompt))
-            finding = next(item for item in response["assessments"] if item["check"] == "journal_perspective")
-            finding.update(verdict="unsupported", issues=["Reshape the thought through the story."])
-            response["verdict"] = "unsupported"
+            units, evidence = review_inputs(prompt)
+            target_id = next(unit["unitId"] for unit in units if "completed release" in unit["text"])
+            original = next(fragment for fragment in evidence["fragments"]
+                            if fragment["refId"] == "fresh:2" and fragment["field"] == "summary")
+            self.assertEqual(original["text"], "I am still working on that chorus.")
+            self.assertEqual(original["speaker"], "participant-22222222")
+            response["issues"] = [fixture_issue(
+                [target_id], [original],
+                source_meaning="Test Listener said the chorus was still in progress.",
+                added_premise="Test Listener completed and released the chorus.",
+            )]
+            # Leave all top-level verdicts supported to reproduce the protocol
+            # problem: a passing label cannot erase the acknowledged gap.
             return json.dumps(response)
 
+        with patch.object(journal, "build_generation_prompt", wraps=journal.build_generation_prompt) as prompts:
+            (article, reason, advisory), generator, _ = self.run_sequence(
+                [first, admitted_gap, revised, supported_review])
+        self.assertEqual(generator.call_count, 4)
+        self.assertEqual(reason, "")
+        self.assertFalse(advisory)
+        self.assert_reviewed_candidate(article, revised)
+        repair = prompts.call_args_list[1].kwargs
+        self.assertEqual(repair["repair_reason"], "source_attribution_failed")
+        self.assertEqual(repair["previous_output"], first)
+        finding = next(target for target in repair["repair_details"] if target["check"] == "source_entailment")
+        self.assertEqual(finding["claim"], "Test Listener completed and released the chorus.")
+        self.assertEqual(finding["sourceMeaning"], "Test Listener said the chorus was still in progress.")
+        self.assertIn("preserving the grounded prose, voice", generator.call_args_list[2].args[1])
+        self.assertEqual(review_inputs(generator.call_args_list[1].args[1])[1],
+                         review_inputs(generator.call_args_list[3].args[1])[1])
+        self.assertIn(voice_before, article["sections"][0]["body"])
+        self.assertIn(voice_after, article["sections"][0]["body"])
+
+        (article, reason, advisory), generator, _ = self.run_sequence(
+            [first, admitted_gap, first, admitted_gap])
+        self.assertEqual(generator.call_count, 4)
+        self.assertIsNone(article)
+        self.assertEqual(reason, "source_attribution_failed")
+        self.assertFalse(advisory)
+
+    def test_source_withdrawal_stops_factual_repair_before_another_call(self):
         guard = Mock(side_effect=["", "", "", "", "privacy_source_ineligible"])
         (article, reason, _), generator, _ = self.run_sequence(
-            [self.draft(), reject_perspective], generation_guard=guard)
+            [self.draft(), rejected_review], generation_guard=guard)
         self.assertEqual(generator.call_count, 2)
         self.assertIsNone(article)
         self.assertEqual(reason, "privacy_source_ineligible")

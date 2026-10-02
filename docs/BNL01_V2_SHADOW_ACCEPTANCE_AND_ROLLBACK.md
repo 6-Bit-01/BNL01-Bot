@@ -40,32 +40,84 @@ From `/home/ubuntu/bnl01`, before restarting into the new revision:
 mkdir -p backups/pre-memory
 backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_path="backups/pre-memory/bnl01_conversations-${backup_stamp}.db"
-python3 - "${backup_path}" <<'PY'
-import sqlite3
-import sys
-
-source = sqlite3.connect(
-    "file:bnl01_conversations.db?mode=ro",
-    uri=True,
-    timeout=5,
-)
-backup = sqlite3.connect(sys.argv[1])
-try:
-    source.backup(backup)
-    result = backup.execute("PRAGMA quick_check").fetchone()[0]
-    if result != "ok":
-        raise SystemExit("backup quick_check failed: " + str(result))
-finally:
-    backup.close()
-    source.close()
-PY
-sha256sum "${backup_path}" > "${backup_path}.sha256"
+ionice -c 3 nice -n 10 python3 scripts/sqlite_snapshot.py backup \
+  --source bnl01_conversations.db --destination "${backup_path}"
 ```
 
-Record the backup path, checksum, pre-deploy Git SHA, and intended new Git SHA.
+The helper opens production read-only and creates an exclusive `.partial`
+through SQLite's backup API. It requires the expected database allocation,
+a **5 GiB service reserve**, and safety overhead before writing. During copying
+it rechecks free space and aborts if headroom falls; a failed copy removes only
+its own incomplete file. Successful copies pass `quick_check` and receive a
+durable `.snapshot.json` receipt with SHA256. Existing copies, compressed
+archives, and receipts are never overwritten or silently reused.
+
+Record the backup path, receipt/checksum, pre-deploy Git SHA, and intended new Git SHA.
 Do not reuse the Relay-only export as the database backup; it intentionally
 contains only accepted Relay history. Do not copy the database into the
 repository or commit it.
+
+Keep the latest verified deployment rollback uncompressed and immediately usable.
+Preserve older rollback copies compressed until the owner accepts their observation
+period; do not auto-delete archive history. Older backups may be compressed only
+when explicitly selected for archival; do not apply age-based deletion. Pass
+both production and the retained rollback as `--protect` paths to the archive
+command. It refuses protected files, symlinks, hard links, same-user open files,
+nonprivate files, and SQLite sidecars. Linux `/proc` must be readable for the
+open-file checks. For an approved older copy, run:
+
+```bash
+ionice -c 3 nice -n 10 python3 scripts/sqlite_snapshot.py archive \
+  --path /absolute/path/to/approved-older-copy.sqlite \
+  --protect /home/ubuntu/bnl01/bnl01_conversations.db \
+  --protect /absolute/path/to/latest-retained-rollback.db
+```
+
+If the service account cannot inspect an existing process, the default fails
+closed and retains the raw copy. On a host with approved noninteractive sudo,
+explicitly add `--privileged-inspection`. Only the helper's read-only `inspect`
+subcommand runs as root to check open file handles across users; copying,
+compression and removal remain under the original account. The caller checks
+the returned file identity and owner before proceeding. Do not run the entire
+rehearsal as root or silently fall back after an inspection failure.
+
+Archival checks its own capacity, writes gzip to an exclusive partial file,
+fully rehashes the decompressed bytes, and durably saves the archive and
+`.archive.json` receipt **before** removing the raw copy. If interrupted after
+archive creation, the same explicit command can reverify the archive and
+resume cleanup; mismatches retain the raw copy and fail. Inspect any abandoned
+partial from a killed process before removing it; partials are never adopted
+as completed evidence. All source/output JSON and receipts remain in place.
+
+Private rehearsal scripts must use the same helper, enclosing the full run:
+
+```python
+from scripts.sqlite_snapshot import rehearsal_snapshot
+
+with rehearsal_snapshot(production_db_path, private_db_path) as snapshot_path:
+    # Existing authorized rehearsal; close all DB handles before context exit.
+    run_private_rehearsal(snapshot_path)
+```
+
+For that explicitly approved Linux inspection mode, pass
+`privileged_inspection=True` to `rehearsal_snapshot` in the parent process.
+
+This permits one active raw rehearsal snapshot on the host, reserves headroom
+for both copying and archival, and archives the closed copy on success or error.
+Completed copies retain their compressed bytes and receipts; raw copies are
+removed only after verified archival. A parent process may own the context while
+the existing rehearsal runs in a child process; wait for that child to exit
+before leaving the context so all its SQLite handles are closed. An archive failure
+retains the raw evidence and raises; another run must not ignore that failure.
+The lock releases when the process exits, including crashes; a leftover raw
+file is evidence to inspect, not an active-process marker. This adds no bot
+task, production gate, scheduler, or automatic retention policy. The 5 GiB
+reserve is the operational default; the Python parameter exists for tiny
+isolated tests, not as an instruction to bypass a live capacity failure.
+Retained archives can still eventually exhaust capacity: the space guard is
+the hard stop, requiring an owner storage/retention decision, not automatic
+deletion or an invented offsite destination. Log retention is configured
+separately. This policy governs full operational copies, not BNL's memories.
 
 After deployment, confirm:
 

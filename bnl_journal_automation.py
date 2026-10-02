@@ -2659,9 +2659,6 @@ def _prepare_packet(
         revision=revision,
         attempt_fence=(run_id, preparation_epoch),
         source_hash=source_hash,
-        generation_guard=_generation_guard_for_packet(
-            db_path, guild_id, packet, attempt_fence=(run_id, preparation_epoch),
-        ),
         attempt_observer=lambda event: _record_generation_attempt_event(
             db_path,
             run_id,
