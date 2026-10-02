@@ -8,7 +8,7 @@ import re
 import sqlite3
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -158,6 +158,19 @@ _PUBLIC_LEAK_RE = re.compile(
 )
 
 _REPAIR_GUIDANCE = {
+    "published_correction": (
+        "Reconstruct this historical Journal from the eligible original-window sources. "
+        "The earlier article is deliberately not supplied as a writing template. Let the "
+        "originals determine the title, organization and selected experiences. Preserve "
+        "the concrete detail, named contributions, jokes, chronology and later clarifications "
+        "of the stories BNL chooses to explore; do not recount everything. Keep questions, "
+        "accusations and subsequent explanations attached to their actual speakers, without "
+        "turning a disputed interpretation into a settled event. Weave BNL's personal reactions "
+        "and thematic connections through that grounded account. Omit or narrow a claim when "
+        "its original support is unavailable. Cover the same historical window, not a "
+        "present-day recap. The public correction note is supplied separately by the owner; "
+        "do not announce this reconstruction process in the article. Return the complete Journal JSON."
+    ),
     'source_grounded_revision': "Review the complete draft against the ORIGINAL generation-safe packet before approving its writing. "
         "A valid name or citation does not establish who an action concerns, its recipient, time, room, cause or outcome. "
         "Correct unsupported connections and invented specifics while preserving the supported story and BNL's own reactions, questions and thematic connections. "
@@ -864,7 +877,12 @@ def _journal_publication_from_row(
         json.JSONDecodeError,
     ):
         return None
+    correction = canonical_entry.get("correction") if isinstance(canonical_entry, dict) else None
+    if correction is not None and not _valid_public_correction(correction, canonical_revision):
+        return None
     expected_content_hash = _hash(title, excerpt, _json(sections))
+    if correction is not None:
+        expected_content_hash = _hash(title, excerpt, _json(sections), _json(correction))
     if (
         not _JOURNAL_CONTROL_ENTRY_ID_RE.fullmatch(entry_id)
         or not title
@@ -1388,6 +1406,12 @@ def purge_user_journal_derivatives_on_connection(
                     "usedContextLaneProvenance",
                     "usedReflectionBasisProvenance",
                 } else []
+            correction = metadata.get("publishedCorrection")
+            if isinstance(correction, dict):
+                # Every supplied original could influence a correction, even
+                # when uncited. Its frozen review packet cannot be selectively
+                # retained after a participant's evidence is deleted.
+                correction.pop("sourcePacket", None)
             metadata["privacyScrubbed"] = True
             conn.execute(
                 """UPDATE bnl_journal_private_metadata SET metadata_json=?,updated_at=?
@@ -3147,6 +3171,171 @@ def accepted_relays(conn: sqlite3.Connection, guild_id: int, start: str, end: st
     return out
 
 
+def _journal_exchange_row_fields(conn: sqlite3.Connection) -> list[str]:
+    columns = _cols(conn, "conversations")
+    required = {"id", "guild_id", "user_id", "role", "content", "channel_id",
+                "channel_policy", "message_id", "timestamp"}
+    if not required <= columns:
+        return []
+    return sorted(required | ({"public_usable", "visibility", "route_mode"} & columns))
+
+
+def _journal_exchange_row_eligible(row: dict[str, Any], guild_id: int) -> bool:
+    return (
+        int(row.get("guild_id") or 0) == guild_id
+        and row.get("role") == "model"
+        # This column binds existing member controls, not the speaker or a
+        # proved addressee. Group replies need their separate participant proof.
+        and int(row.get("user_id") or 0) > 0
+        and int(row.get("channel_id") or 0) > 0
+        and int(row.get("message_id") or 0) > 0
+        and row.get("channel_policy") in PUBLIC_POLICIES
+        and row.get("public_usable", 1) == 1
+        and row.get("visibility", "public") in {"public", "public_safe"}
+        and row.get("route_mode", "normal_chat") == "normal_chat"
+    )
+
+
+def add_journal_correction_exchange_context(
+    conn: sqlite3.Connection, guild_id: int, packet: dict[str, Any], *,
+    original_source_controls: Optional[Callable[..., Any]],
+) -> None:
+    """Add bounded delivered BNL speech, without creating factual source roots.
+
+    Historical corrections alone have the existing recall-control callback at
+    generation, approval and delivery. Ordinary Journals do not gain an unsafe
+    ungoverned side read. Missing retained speech remains unknown.
+    """
+    from zoneinfo import ZoneInfo
+
+    if original_source_controls is None or not packet.get("sourceArchiveAvailable"):
+        return
+    fields = _journal_exchange_row_fields(conn)
+    if not fields:
+        return
+    candidates: dict[int, tuple[dict[str, Any], set[str]]] = {}
+    for source in packet.get("privateSources", []):
+        if (source.get("sourceKind") != "conversation"
+                or source.get("conversationSurface") != "discord"
+                or source.get("channelPolicy") not in PUBLIC_POLICIES
+                or not (source.get("messageContext") or {}).get("roomRef")
+                or not source.get("observedAt")):
+            continue
+        match = re.fullmatch(r"fresh:([1-9]\d*)", str(source.get("refId") or ""))
+        if match is None:
+            continue
+        anchor = conn.execute(
+            "SELECT channel_id FROM bnl_journal_source_events WHERE guild_id=? "
+            "AND event_seq=? AND source_kind='discord_message' AND public_usable=1",
+            (guild_id, int(match.group(1))),
+        ).fetchone()
+        if not anchor or not anchor[0]:
+            continue
+        rows = conn.execute(
+            "SELECT %s FROM conversations WHERE guild_id=? AND channel_id=? AND role='model' "
+            "AND julianday(timestamp)>=julianday(?) AND julianday(timestamp)<julianday(?) "
+            "AND ABS(julianday(timestamp)-julianday(?))<=3.0/1440 "
+            "ORDER BY ABS(julianday(timestamp)-julianday(?)),id LIMIT 3" % ",".join(fields),
+            (guild_id, anchor[0], packet["sourceWindowStart"], packet["sourceWindowEnd"],
+             source["observedAt"], source["observedAt"]),
+        ).fetchall()
+        for raw in rows:
+            row = dict(zip(fields, raw))
+            if not _journal_exchange_row_eligible(row, guild_id):
+                continue
+            # Do not truncate a long utterance and turn omitted qualification
+            # into evidence of absence. Neighbor selection never recurses.
+            if not 1 <= len(str(row.get("content") or "").strip()) <= 4000:
+                continue
+            candidates.setdefault(int(row["id"]), (row, set()))[1].add(str(source["refId"]))
+    ordered = sorted(candidates.values(), key=lambda item: (str(item[0]["timestamp"]), item[0]["id"]))[:24]
+    if not ordered:
+        return
+    _digest, blocked = original_source_controls(
+        conn, guild_id=guild_id, source_table="conversations",
+        source_users={int(row["id"]): int(row["user_id"]) for row, _refs in ordered},
+    )
+    people = {str(person["subjectRef"]): person for person in packet.get("privatePublicPeople", [])}
+    names = _journal_identity_tokens(conn, guild_id)
+    replacements: dict[str, set[str]] = {}
+    for source in packet.get("privateSources", []):
+        name = str(source.get("displayName") or "").strip()
+        if name:
+            replacements.setdefault(name.casefold(), set()).add(
+                people.get(str(source.get("subjectRef")), {}).get("publicName", "someone"))
+    for person in people.values():
+        replacements.setdefault(person["publicName"].casefold(), set()).add(person["publicName"])
+    patterns = [_identity_literal_pattern(name) for name in names if name not in {"BNL", "BNL-01"}]
+    identity_pattern = re.compile("|".join(p.pattern for p in patterns if p), re.I) if patterns else None
+    context, provenance = [], []
+    for row, anchor_refs in ordered:
+        if row["id"] in blocked:
+            continue
+        text = str(row["content"])
+        if identity_pattern:
+            def replace_name(match: re.Match[str]) -> str:
+                choices = replacements.get(match.group().casefold(), set())
+                return next(iter(choices)) if len(choices) == 1 else "someone"
+            text = identity_pattern.sub(replace_name, text)
+        text = re.sub(r"<@!?(\d+)>", lambda m: people.get(
+            "discord_user:" + m.group(1), {}).get("publicName", "someone"), text)
+        text = sanitize_source_summary(text, limit=4000)
+        if (not text or _PUBLIC_LEAK_RE.search(text)
+                or any(re.search(pattern, text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS)):
+            continue
+        ref = "exchange:" + _hash("journal-bnl-speech", guild_id, row["id"])[:24]
+        context.append({
+            "refId": ref, "summary": text, "participantAlias": "bnl", "publicSpeakerName": "BNL",
+            "sourceRole": "bnl_utterance", "authority": "speech_only", "observedAt": row["timestamp"],
+            "observedAtPacific": _parse_context_datetime(row["timestamp"]).astimezone(ZoneInfo("America/Los_Angeles")).isoformat(),
+            "messageContext": {"authority": "recorded_bnl_utterance_not_event_confirmation",
+                               "roomRef": "room-" + _hash("journal-room", guild_id, row["channel_id"])[:16]},
+            "nearbySourceRefIds": sorted(anchor_refs),
+        })
+        provenance.append({"refId": ref, "rowId": row["id"], "controlUserId": row["user_id"],
+                           "sourceDigest": _hash("journal-bnl-speech-row", _json(row))})
+    if context:
+        packet["exchangeContext"] = context
+        packet["privateExchangeContextProvenance"] = provenance
+
+
+def journal_exchange_context_invalidation_reason(
+    conn: sqlite3.Connection, guild_id: int, packet: dict[str, Any], *,
+    original_source_controls: Optional[Callable[..., Any]],
+) -> str:
+    """The same existing source owner fences saved speech at every later gate."""
+    context = packet.get("exchangeContext", [])
+    proof = packet.get("privateExchangeContextProvenance", [])
+    if not context and not proof:
+        return ""
+    try:
+        fields = _journal_exchange_row_fields(conn)
+        if (original_source_controls is None or not fields or not isinstance(proof, list)
+                or not 1 <= len(proof) <= 24 or len(proof) != len(context)
+                or {item["refId"] for item in proof} != {item["refId"] for item in context}):
+            return "journal_exchange_controls_unavailable"
+        users = {}
+        for item in proof:
+            raw = conn.execute("SELECT %s FROM conversations WHERE id=?" % ",".join(fields),
+                               (item["rowId"],)).fetchone()
+            if raw is None:
+                return "journal_exchange_source_changed"
+            row = dict(zip(fields, raw))
+            if not _journal_exchange_row_eligible(row, guild_id):
+                return "privacy_source_ineligible"
+            if (row["user_id"] != item["controlUserId"]
+                    or _hash("journal-bnl-speech-row", _json(row)) != item["sourceDigest"]):
+                return "journal_exchange_source_changed"
+            users[int(row["id"])] = int(row["user_id"])
+        _digest, blocked = original_source_controls(
+            conn, guild_id=guild_id, source_table="conversations", source_users=users,
+        )
+        return "privacy_source_ineligible" if set(users) & set(blocked) else ""
+    except (sqlite3.Error, TypeError, ValueError, KeyError, OverflowError):
+        return "journal_exchange_controls_unavailable"
+
+
+
 def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, end: str, limit: int = MAX_CONVERSATION_SOURCES_PER_WINDOW) -> list[dict[str, Any]]:
     if not table_exists(conn, "conversations"):
         return []
@@ -3720,13 +3909,14 @@ def retrieve_history(
     *,
     excluded_entry_ids: Optional[set[str]] = None,
     prepare_schema: bool = True,
+    published_before: Optional[str] = None,
 ) -> dict[str, Any]:
     if prepare_schema:
         ensure_schema(db_path)
     excluded = {str(entry_id) for entry_id in (excluded_entry_ids or set()) if str(entry_id)}
     current_subjects = _subject_refs(current_packet)
     current_topics = set(current_packet.get("candidateTopicTags", []))
-    as_of = current_packet.get("sourceWindowEnd")
+    as_of = published_before or current_packet.get("sourceWindowEnd")
     terms = _history_content_terms(_history_context_sources(current_packet))
     with _read_source_database(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -3734,7 +3924,10 @@ def retrieve_history(
                 e.published_at,e.created_at,e.source_window_start,e.source_window_end,m.metadata_json
             FROM bnl_journal_entries e JOIN bnl_journal_private_metadata m
               ON m.entry_id=e.entry_id AND m.revision=e.revision AND m.guild_id=e.guild_id
-            WHERE e.guild_id=? AND e.lifecycle_state='published' AND m.lifecycle_state='published'""", (guild_id,)).fetchall()
+            WHERE e.guild_id=? AND e.lifecycle_state='published' AND m.lifecycle_state='published'
+              AND NOT EXISTS (SELECT 1 FROM bnl_journal_entries newer
+                  WHERE newer.guild_id=e.guild_id AND newer.entry_id=e.entry_id
+                  AND newer.lifecycle_state='published' AND newer.revision>e.revision)""", (guild_id,)).fetchall()
     eligible = [dict(row) for row in rows if str(row["entry_id"]) not in excluded
                 and _history_entry_is_as_of(dict(row), as_of)]
     eligible.sort(key=lambda row: (
@@ -4748,6 +4941,7 @@ def build_generation_prompt(
         "sourceWindowEnd": packet.get("sourceWindowEnd"),
         "creativeReflectionAllowed": bool(packet.get("creativeReflectionAllowed")),
         "freshSources": safe_sources,
+        "exchangeContext": [_journal_prompt_source(source) for source in packet.get("exchangeContext", [])],
         **({"reflectionBasis": reflection_basis} if reflection_basis else {}),
         "experienceGroups": projection["experienceGroups"],
         "evidenceCoverageContract": coverage_contract,
@@ -4805,7 +4999,9 @@ def build_generation_prompt(
             else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
         )
     repair = ""
-    if repair_reason:
+    if repair_reason == "published_correction":
+        repair = "\nHistorical reconstruction required because: published_correction. " + _REPAIR_GUIDANCE[repair_reason]
+    elif repair_reason:
         guidance = _REPAIR_GUIDANCE.get(
             repair_reason,
             "Correct the named validation failure and return the complete JSON response.",
@@ -5010,6 +5206,7 @@ def build_generation_prompt(
         "\nHistory is continuity evidence, not a prose template. Check its recent titles, openings, section shapes, and endings before writing; choose a different approach when they repeat. Avoid defaulting to a title listing three topics, two equal recap sections, and a warm moral at the end. These are creative directions, not quotas: do not manufacture events or discard good material to appear different."
         f"{people_rule}"
         "\nStable participant aliases and roomRef values in the packet are private context aids. Never reproduce them in public prose."
+        "\nOptional exchangeContext records establish only what BNL actually said and when, not whether his description of a person was true. They add no fresh-source or participant breadth and are not section citations. If the relevant BNL reply is absent, its wording, reaction and timing are unknown; do not reconstruct them from his persona or from another person's interpretation."
         "\nPublic Moment reflection records preserve earlier exchanges and each original participant's contribution. Use their source dates, preserve banter, uncertainty and unanswered questions, and paraphrase rather than inventing quotations. A matching topic never makes today's speaker a participant in an earlier exchange. Cite the reflection ref when using it; it does not increase fresh-source, current-participant or recurrence counts."
         "\nFinalized-show sources report recorded public operations in a completed show. Their date and timeline control the tense; they never establish that a show is live now. Chat, a Moment, a Relay and a Journal retelling of the same occurrence are not independent witnesses or additional occurrences. A show record establishes playback only where playback is recorded."
         "\nPublished Ballad reflection records establish only the released song and its approved creative metadata. Discuss the song as a song. Liner notes are creative interpretation, never proof that a person acted, a quoted event happened, or new canon was established. Their release date is distinct from the linked show's date. Drafts and lyrics are not supplied as evidence."
@@ -5551,11 +5748,14 @@ def _prior_titles(conn: sqlite3.Connection, guild_id: int) -> list[str]:
     return [r[0] for r in conn.execute("SELECT title FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published'", (guild_id,)).fetchall()]
 
 
-def build_public_payload(entry_id: str, revision: int, article: dict[str, Any], packet: dict[str, Any], content_hash: str, authored_at: str) -> dict[str, Any]:
+def build_public_payload(entry_id: str, revision: int, article: dict[str, Any], packet: dict[str, Any], content_hash: str, authored_at: str, *, correction: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     entry_kind = str(packet.get("entryKind") or "manual")
     if entry_kind not in {"daily", "weekly", "manual"}:
         entry_kind = "manual"
-    return {"contractVersion": 1, "kind": "journal_entry", "entry": {"entryId": entry_id, "revision": revision, "entryKind": entry_kind, "title": article["title"], "excerpt": article["excerpt"], "sections": [{"heading": s["heading"], "body": s["body"]} for s in article["sections"]], "authoredAt": authored_at, "sourceWindowStart": packet["sourceWindowStart"], "sourceWindowEnd": packet["sourceWindowEnd"], "contentHash": content_hash}}
+    payload = {"contractVersion": 1, "kind": "journal_entry", "entry": {"entryId": entry_id, "revision": revision, "entryKind": entry_kind, "title": article["title"], "excerpt": article["excerpt"], "sections": [{"heading": s["heading"], "body": s["body"]} for s in article["sections"]], "authoredAt": authored_at, "sourceWindowStart": packet["sourceWindowStart"], "sourceWindowEnd": packet["sourceWindowEnd"], "contentHash": content_hash}}
+    if correction is not None:
+        payload["entry"]["correction"] = dict(correction)
+    return payload
 
 
 
@@ -5724,11 +5924,15 @@ def _draft_records(
     entry_id: str = "",
     revision: int = 1,
     automation_context: Optional[dict[str, Any]] = None,
+    correction_context: Optional[dict[str, Any]] = None,
 ) -> tuple[tuple[Any, ...], tuple[Any, ...], JournalResult]:
     authored = utc_now_iso()
     entry_id = entry_id or "journal_" + _hash(guild_id, authored, article["title"])[:16]
     content_hash = _hash(article["title"], article["excerpt"], _json(article["sections"]))
-    payload = build_public_payload(entry_id, revision, article, packet, content_hash, authored)
+    correction = correction_context["correction"] if correction_context else None
+    if correction is not None:
+        content_hash = _hash(article["title"], article["excerpt"], _json(article["sections"]), _json(correction))
+    payload = build_public_payload(entry_id, revision, article, packet, content_hash, authored, correction=correction)
     canonical = _json(payload).encode("utf-8")
     request_hash = canonical_payload_hash(canonical)
     source_ref_ids = article.get("sourceRefIds", {})
@@ -5817,6 +6021,8 @@ def _draft_records(
             "automationPreparationEpoch": int(automation_context.get("preparationEpoch") or 0),
             "frozenSourceHash": str(automation_context.get("sourceHash") or ""),
         })
+    if correction_context:
+        meta["publishedCorrection"] = dict(correction_context)
     now = utc_now_iso()
     entry_row = (entry_id, revision, guild_id, "draft", article["title"], article["excerpt"], _json(article["sections"]), _json(payload), canonical, content_hash, packet["sourceWindowStart"], packet["sourceWindowEnd"], authored, None, None, None, None, 0, now, now)
     meta_row = (entry_id, revision, guild_id, _json(meta), content_hash, "draft", now, now)
@@ -5872,7 +6078,7 @@ def _source_review_evidence(packet: dict[str, Any]) -> dict[str, Any]:
     """Review the existing governed packet; never fetch a new source or private row."""
     projection = _journal_prompt_projection(packet)
     reflections = projection["reflectionBasis"]
-    sources = [*projection["freshSources"], *reflections]
+    sources = [*projection["freshSources"], *reflections, *packet.get("exchangeContext", [])]
     for impression in reflections:
         if impression.get("basisKind") == "moment_impression":
             # These are separately revalidated originals from the shared reader,
@@ -5950,6 +6156,12 @@ def _stored_source_review_reason(canonical: bytes, metadata: dict[str, Any]) -> 
         if (isinstance(receipt, dict) and receipt.get("version") == attribution.REVIEW_VERSION
                 and receipt.get("verdict") == "supported"
                 and receipt.get("articleDigest") == attribution.article_digest(article)):
+            correction = metadata.get("publishedCorrection")
+            if isinstance(correction, dict):
+                packet = correction.get("sourcePacket")
+                if not isinstance(packet, dict):
+                    return "source_review_evidence_changed"
+                return _source_review_reason(article, packet, required=True)
             return ""
     except (ValueError, TypeError, KeyError, AttributeError):
         pass
@@ -6310,6 +6522,8 @@ def approve_draft(
     *,
     attempt_fence: Optional[tuple[str, int]] = None,
     source_hash: str = "",
+    correction_guard: Optional[Callable[[dict[str, Any]], str]] = None,
+    original_source_controls: Optional[Callable[..., Any]] = None,
 ) -> JournalResult:
     ensure_schema(db_path)
     now = utc_now_iso()
@@ -6350,6 +6564,15 @@ def approve_draft(
         if review_reason:
             conn.rollback()
             return JournalResult(False, "draft", review_reason, entry_id, rev, stored_hash)
+        correction_context = metadata.get("publishedCorrection")
+        if isinstance(correction_context, dict):
+            correction_reason = _published_correction_current_reason(
+                conn, guild_id, entry_id, correction_context, rev,
+                correction_guard=correction_guard, original_source_controls=original_source_controls,
+            )
+            if correction_reason:
+                conn.rollback()
+                return JournalResult(False, "draft", correction_reason, entry_id, rev, stored_hash)
         publication_failure = ballads.publication_source_failure(metadata.get("sharedInputSourceProvenance", []), publication_snapshot)
         if publication_failure:
             conn.rollback()
@@ -6408,6 +6631,262 @@ def reject_draft(db_path: str, guild_id: int, entry_id: str, reason: str = "", r
 
 
 
+def _published_correction_base_reason(
+    conn: sqlite3.Connection, guild_id: int, entry_id: str,
+    context: dict[str, Any], *, candidate_revision: Optional[int] = None,
+) -> str:
+    correction = context.get("correction") or {}
+    row = conn.execute(
+        "SELECT revision,content_hash,source_window_start,source_window_end,published_at,public_payload_json "
+        "FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND lifecycle_state='published' "
+        "ORDER BY revision DESC LIMIT 1", (guild_id, entry_id),
+    ).fetchone()
+    if (not row or int(row[0]) != correction.get("previousRevision")
+            or row[1] != correction.get("previousContentHash")):
+        return "correction_base_changed"
+    if (row[2] != context.get("sourceWindowStart") or row[3] != context.get("sourceWindowEnd")
+            or row[4] != context.get("originalPublishedAt")
+            or (_json_object(row[5]).get("entry") or {}).get("entryKind", "manual") != context.get("entryKind")):
+        return "correction_base_changed"
+    if candidate_revision is not None and candidate_revision != int(row[0]) + 1:
+        return "correction_revision_invalid"
+    occupied = conn.execute(
+        "SELECT revision,lifecycle_state,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND revision>?",
+        (guild_id, entry_id, int(row[0])),
+    ).fetchall()
+    replaceable = context.get("replacedRejectedCorrection")
+    for item in occupied:
+        if int(item[0]) == candidate_revision:
+            continue
+        if (candidate_revision is None and isinstance(replaceable, dict)
+                and int(item[0]) == int(row[0]) + 1 == replaceable.get("revision")
+                and item[1] == "rejected" and item[2] == replaceable.get("contentHash")):
+            continue
+        return "correction_revision_in_progress"
+    if candidate_revision is None and replaceable and not occupied:
+        return "correction_revision_in_progress"
+    return ""
+
+
+def _valid_public_correction(correction: Any, revision: int) -> bool:
+    if not isinstance(correction, dict) or set(correction) != {"previousRevision", "previousContentHash", "note"}:
+        return False
+    previous = correction.get("previousRevision")
+    note = correction.get("note")
+    return (type(previous) is int and 0 < previous < 2 ** 53 - 1 and revision == previous + 1
+            and isinstance(correction.get("previousContentHash"), str)
+            and re.fullmatch(r"[a-f0-9]{64}", correction["previousContentHash"]) is not None
+            and isinstance(note, str) and 1 <= len(note.strip().encode("utf-16-le", errors="surrogatepass")) // 2 <= 600
+            and not _PUBLIC_LEAK_RE.search(note)
+            and not re.search(r"(?:\b(?:fresh|reflection|room):|\bparticipant-[a-f0-9]{8}\b)", note, re.I)
+            and not any(re.search(pattern, note, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS))
+
+
+def _published_correction_current_reason(
+    conn: sqlite3.Connection, guild_id: int, entry_id: str,
+    context: dict[str, Any], revision: int, *,
+    correction_guard: Optional[Callable[[dict[str, Any]], str]],
+    original_source_controls: Optional[Callable[..., Any]],
+) -> str:
+    from bnl_journal_automation import _frozen_packet_invalidation_reason
+
+    packet = context.get("sourcePacket")
+    if not isinstance(packet, dict) or correction_guard is None:
+        return "correction_controls_unavailable"
+    try:
+        control_reason = str(correction_guard(context) or "")
+    except Exception:
+        return "correction_controls_unavailable"
+    return (control_reason
+            or _published_correction_base_reason(conn, guild_id, entry_id, context, candidate_revision=revision)
+            or _frozen_packet_invalidation_reason(
+                conn, guild_id, packet, validate_original_sources=True,
+                original_source_controls=original_source_controls))
+
+
+def generate_published_correction_preview(
+    db_path: str, guild_id: int, entry_id: str,
+    generator: Callable[[dict[str, Any], str], str], *,
+    previous_revision: int, previous_content_hash: str, note: str,
+    attempt_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+    excluded_history_entry_ids: Optional[set[str]] = None,
+    generation_guard: Optional[Callable[[], str]] = None,
+    original_source_controls: Optional[Callable[..., Any]] = None,
+    control_authority_identity: Any = None,
+) -> dict[str, Any]:
+    """Inspect a historical correction without writing, approving, or publishing it."""
+    from bnl_journal_automation import _generation_guard_for_packet
+
+    result: dict[str, Any] = {"ok": False, "reason": "", "entryId": entry_id}
+    correction = {"previousRevision": previous_revision,
+                  "previousContentHash": previous_content_hash, "note": note.strip() if isinstance(note, str) else note}
+    if type(previous_revision) is not int or not _valid_public_correction(correction, previous_revision + 1):
+        return {**result, "reason": "invalid_correction_request"}
+    try:
+        with _read_source_database(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT e.*,m.metadata_json FROM bnl_journal_entries e "
+                "JOIN bnl_journal_private_metadata m ON m.guild_id=e.guild_id "
+                "AND m.entry_id=e.entry_id AND m.revision=e.revision "
+                "WHERE e.guild_id=? AND e.entry_id=? AND e.revision=? "
+                "AND e.lifecycle_state='published' AND m.lifecycle_state='published'",
+                (guild_id, entry_id, previous_revision),
+            ).fetchone()
+            if not row or row["content_hash"] != previous_content_hash:
+                return {**result, "reason": "correction_base_changed"}
+            original = dict(row)
+            metadata = _json_object(row["metadata_json"])
+            kind = str(metadata.get("entryKind") or
+                       (_json_object(row["public_payload_json"]).get("entry") or {}).get("entryKind") or "manual")
+            context = {"entryId": entry_id, "correction": correction, "originalPublishedAt": row["published_at"],
+                       "sourceWindowStart": row["source_window_start"], "sourceWindowEnd": row["source_window_end"],
+                       "entryKind": kind, "controlAuthorityIdentity": json.loads(_json(control_authority_identity))}
+            rejected = conn.execute(
+                "SELECT e.revision,e.content_hash,e.canonical_payload_bytes FROM bnl_journal_entries e "
+                "JOIN bnl_journal_private_metadata m ON m.guild_id=e.guild_id AND m.entry_id=e.entry_id AND m.revision=e.revision "
+                "WHERE e.guild_id=? AND e.entry_id=? AND e.revision=? "
+                "AND e.lifecycle_state='rejected' AND m.lifecycle_state='rejected'",
+                (guild_id, entry_id, previous_revision + 1),
+            ).fetchone()
+            if rejected:
+                context["replacedRejectedCorrection"] = {
+                    "revision": int(rejected[0]), "contentHash": rejected[1],
+                    "canonicalPayloadHash": canonical_payload_hash(bytes(rejected[2] or b"")),
+                }
+            reason = _published_correction_base_reason(conn, guild_id, entry_id, context)
+            if reason:
+                return {**result, "reason": reason}
+        start, end = _publication_utc(context["sourceWindowStart"]), _publication_utc(context["sourceWindowEnd"])
+        if (not start or not end or start >= end
+                or not _publication_utc(context["originalPublishedAt"])
+                or kind not in {"daily", "weekly", "manual"}):
+            return {**result, "reason": "correction_original_window_invalid"}
+        excluded = set(excluded_history_entry_ids or ()) | {entry_id}
+        packet = build_source_packet_between(
+            db_path, guild_id, context["sourceWindowStart"], context["sourceWindowEnd"],
+            entry_kind=kind, excluded_history_entry_ids=excluded, prepare_schema=False,
+        )
+        with _read_source_database(db_path) as conn:
+            add_journal_correction_exchange_context(
+                conn, guild_id, packet, original_source_controls=original_source_controls,
+            )
+        packet["history"] = retrieve_history(
+            db_path, guild_id, packet, excluded_entry_ids=excluded, prepare_schema=False,
+            published_before=context["sourceWindowEnd"],
+        )
+        if not packet.get("sourceArchiveAvailable"):
+            return {**result, "reason": "correction_original_sources_unavailable"}
+        if not packet.get("coverageComplete", True):
+            return {**result, "reason": "incomplete_source_window"}
+        if not packet.get("safeSources") and not _eligible_reflection_basis(packet):
+            return {**result, "reason": "insufficient_grounded_material"}
+        note_article = {"title": note.strip(), "excerpt": "", "sections": []}
+        if _article_privacy_reason(note_article, packet):
+            return {**result, "reason": "invalid_correction_note"}
+        source_guard = _generation_guard_for_packet(
+            db_path, guild_id, packet, validate_original_sources=True,
+            original_source_controls=original_source_controls,
+        )
+
+        def current() -> str:
+            if generation_guard is not None:
+                control_reason = str(generation_guard() or "")
+                if control_reason:
+                    return control_reason
+            with _read_source_database(db_path) as conn:
+                base_reason = _published_correction_base_reason(conn, guild_id, entry_id, context)
+            return base_reason or source_guard()
+
+        # Reconstruct from the original evidence. Supplying the old prose as an
+        # editable draft would anchor the writer to the very account at issue.
+        # The original still controls lineage, revision and publication checks.
+        article, reason, advisory = _generate_article_with_repairs(
+            packet, generator, [], attempt_observer, generation_guard=current,
+            initial_repair_reason="published_correction",
+        )
+        if article is None:
+            return {**result, "reason": reason}
+        # Reuse this exact input proof at delayed approval and delivery. It is
+        # private review metadata, never public payload or publication evidence.
+        context["sourcePacket"] = packet
+        return {**result, "ok": True, "revision": previous_revision + 1,
+                "article": article, "packet": packet, "allowAdvisory": advisory,
+                "correctionContext": context, "correction": correction,
+                "originalPublishedAt": original["published_at"]}
+    except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
+        return {**result, "reason": "correction_sources_unavailable"}
+
+
+def generate_published_correction_draft(
+    db_path: str, guild_id: int, entry_id: str,
+    generator: Callable[[dict[str, Any], str], str], *,
+    previous_revision: int, previous_content_hash: str, note: str,
+    attempt_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+    excluded_history_entry_ids: Optional[set[str]] = None,
+    generation_guard: Optional[Callable[[], str]] = None,
+    original_source_controls: Optional[Callable[..., Any]] = None,
+    control_authority_identity: Any = None,
+) -> JournalResult:
+    """Store one reviewed correction draft; publication remains a separate action."""
+    from bnl_journal_automation import _frozen_packet_invalidation_reason
+
+    preview = generate_published_correction_preview(
+        db_path, guild_id, entry_id, generator, previous_revision=previous_revision,
+        previous_content_hash=previous_content_hash, note=note,
+        attempt_observer=attempt_observer, excluded_history_entry_ids=excluded_history_entry_ids,
+        generation_guard=generation_guard,
+        original_source_controls=original_source_controls,
+        control_authority_identity=control_authority_identity,
+    )
+    if not preview["ok"]:
+        return JournalResult(False, "no_draft", preview["reason"], entry_id, previous_revision)
+    if generation_guard is not None:
+        try:
+            control_reason = str(generation_guard() or "")
+        except Exception:
+            control_reason = "generation_guard_unavailable"
+        if control_reason:
+            return JournalResult(False, "no_draft", control_reason, entry_id, previous_revision)
+    packet, article = preview["packet"], preview["article"]
+    basis = packet.get("privateSharedSourceProvenance", [])
+    publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis))
+    if publication_failure:
+        return JournalResult(False, "no_draft", publication_failure, entry_id, previous_revision)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        reason = (_source_review_reason(article, packet, required=True)
+                  or _published_correction_base_reason(conn, guild_id, entry_id, preview["correctionContext"])
+                  or _frozen_packet_invalidation_reason(conn, guild_id, packet, validate_original_sources=True,
+                                                       original_source_controls=original_source_controls)
+                  or validate_article(article, packet, [], blocking_only=preview["allowAdvisory"]))
+        if reason:
+            conn.rollback()
+            return JournalResult(False, "no_draft", reason, entry_id, previous_revision)
+        entry_row, meta_row, result = _draft_records(
+            guild_id, packet, article, entry_id=entry_id, revision=preview["revision"],
+            correction_context=preview["correctionContext"],
+        )
+        rejected = preview["correctionContext"].get("replacedRejectedCorrection")
+        if isinstance(rejected, dict):
+            deleted_meta = conn.execute(
+                "DELETE FROM bnl_journal_private_metadata WHERE guild_id=? AND entry_id=? AND revision=? "
+                "AND lifecycle_state='rejected' AND content_hash=?",
+                (guild_id, entry_id, rejected["revision"], rejected["contentHash"]),
+            )
+            deleted_entry = conn.execute(
+                "DELETE FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND revision=? "
+                "AND lifecycle_state='rejected' AND content_hash=?",
+                (guild_id, entry_id, rejected["revision"], rejected["contentHash"]),
+            )
+            if deleted_meta.rowcount != 1 or deleted_entry.rowcount != 1:
+                conn.rollback()
+                return JournalResult(False, "no_draft", "correction_revision_in_progress", entry_id, previous_revision)
+        _insert_draft_rows(conn, entry_row, meta_row)
+        conn.commit()
+    return result
+
+
 def regenerate_draft(
     db_path: str,
     guild_id: int,
@@ -6433,6 +6912,8 @@ def regenerate_draft(
     old_revision, state = int(row[0]), row[1]
     if state != "draft":
         return JournalResult(False, state, "not_draft", entry_id, old_revision)
+    if isinstance(_json_object(row[2]).get("publishedCorrection"), dict):
+        return JournalResult(False, state, "correction_requires_original_window", entry_id, old_revision)
     original_entry_kind: Optional[str] = None
     try:
         stored_metadata = json.loads(str(row[2] or "{}"))
@@ -6493,7 +6974,10 @@ def regenerate_draft(
     return result
 
 
-def _post_canonical_payload(canonical: bytes, base_url: str, api_key: str, opener, timeout: int) -> tuple[str, str, int, bool, str]:
+def _post_canonical_payload(
+    canonical: bytes, base_url: str, api_key: str, opener, timeout: int, *,
+    expected_published_at: str = "", correction_receipt: Optional[dict[str, Any]] = None,
+) -> tuple[str, str, int, bool, str]:
     opener = opener or urllib.request.urlopen
     req = urllib.request.Request(base_url.rstrip("/") + "/api/bnl/journal", data=canonical, method="POST", headers={"Content-Type": "application/json", "x-api-key": api_key})
     status = "delivery_failed"; reason = "retryable_delivery_failure"; http = 0; idem = False; published = ""
@@ -6504,7 +6988,16 @@ def _post_canonical_payload(canonical: bytes, base_url: str, api_key: str, opene
         if 200 <= http < 300 and data.get("ok") is True and data.get("persisted") is True:
             ack = data.get("entry") or {}
             if ack.get("entryId") == submitted["entryId"] and ack.get("revision") == submitted["revision"] and ack.get("contentHash") == submitted["contentHash"]:
-                status = "published"; reason = ""; idem = bool(data.get("idempotent")); published = ack.get("publishedAt") or utc_now_iso()
+                if submitted.get("correction") and (
+                    not _publication_utc(str(ack.get("publishedAt") or ""))
+                    or not _publication_utc(str(ack.get("correctedAt") or ""))
+                    or (expected_published_at and ack.get("publishedAt") != expected_published_at)
+                ):
+                    reason = "correction_receipt_mismatch"
+                else:
+                    status = "published"; reason = ""; idem = bool(data.get("idempotent")); published = ack.get("publishedAt") or utc_now_iso()
+                    if submitted.get("correction") and correction_receipt is not None:
+                        correction_receipt.update({"publishedAt": published, "correctedAt": ack["correctedAt"]})
             elif ack.get("entryId") == submitted["entryId"] and ack.get("revision") == submitted["revision"]:
                 reason = "journal_id_conflict"
             else:
@@ -6542,6 +7035,8 @@ def deliver_approved(
     *,
     delivery_fence: Optional[tuple[str, int]] = None,
     delivery_preflight: Optional[Callable[[sqlite3.Connection], str]] = None,
+    correction_guard: Optional[Callable[[dict[str, Any]], str]] = None,
+    original_source_controls: Optional[Callable[..., Any]] = None,
 ) -> JournalResult:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -6551,6 +7046,16 @@ def deliver_approved(
             (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id),
         ).fetchone()
         identity_meta = json.loads(identity_row[0] or "{}") if identity_row else {}
+        correction_context = identity_meta.get("publishedCorrection")
+        if isinstance(correction_context, dict):
+            correction_revision = int((correction_context.get("correction") or {}).get("previousRevision") or 0) + 1
+            correction_reason = _published_correction_current_reason(
+                conn, guild_id, entry_id, correction_context,
+                revision if revision is not None else correction_revision,
+                correction_guard=correction_guard, original_source_controls=original_source_controls,
+            )
+            if correction_reason:
+                return JournalResult(False, "not_deliverable", correction_reason, entry_id, correction_revision)
         if not journal_public_people_are_current(conn, guild_id, identity_meta.get("publicPeople", [])):
             return JournalResult(False, "not_deliverable", "privacy_memory_ineligible", entry_id, int(revision or 0))
         if not journal_shared_source_provenance_is_current(conn, guild_id, identity_meta.get("sharedInputSourceProvenance", [])):
@@ -6683,14 +7188,32 @@ def deliver_approved(
     publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis, base_url))
     if publication_failure:
         return JournalResult(False, "not_deliverable", publication_failure, entry_id, rev)
-    status, reason, http, idem, published = _post_canonical_payload(canonical, base_url, api_key, opener, timeout)
-    now = utc_now_iso()
-    with sqlite3.connect(db_path) as conn:
-        with conn:
-            cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state=?,delivery_status=?,delivery_http_status=?,published_at=COALESCE(?,published_at),updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')", (status, reason, http, published or None, now, guild_id, entry_id, rev))
-            cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=?", (status, now, guild_id, entry_id, rev))
-            if cur1.rowcount != 1 or cur2.rowcount != 1:
-                raise sqlite3.IntegrityError("journal_delivery_sync_failed")
+    receipt: dict[str, Any] = {}
+    with journal_release_privacy_fence(db_path) if isinstance(correction_context, dict) else nullcontext():
+        if isinstance(correction_context, dict):
+            with sqlite3.connect(db_path) as conn:
+                reason = _published_correction_current_reason(
+                    conn, guild_id, entry_id, correction_context, rev,
+                    correction_guard=correction_guard, original_source_controls=original_source_controls,
+                )
+                if reason:
+                    return JournalResult(False, "not_deliverable", reason, entry_id, rev, content_hash)
+        status, reason, http, idem, published = _post_canonical_payload(
+            canonical, base_url, api_key, opener, timeout,
+            expected_published_at=str(correction_context.get("originalPublishedAt") or "") if isinstance(correction_context, dict) else "",
+            correction_receipt=receipt,
+        )
+        now = utc_now_iso()
+        with sqlite3.connect(db_path) as conn:
+            with conn:
+                cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state=?,delivery_status=?,delivery_http_status=?,published_at=COALESCE(?,published_at),updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')", (status, reason, http, published or None, now, guild_id, entry_id, rev))
+                cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=?", (status, now, guild_id, entry_id, rev))
+                if cur1.rowcount != 1 or cur2.rowcount != 1:
+                    raise sqlite3.IntegrityError("journal_delivery_sync_failed")
+                if receipt:
+                    identity_meta["correctionReceipt"] = receipt
+                    conn.execute("UPDATE bnl_journal_private_metadata SET metadata_json=? WHERE guild_id=? AND entry_id=? AND revision=?",
+                                 (_json(identity_meta), guild_id, entry_id, rev))
     return JournalResult(status == "published", status, reason, entry_id, rev, content_hash, http, idem)
 
 

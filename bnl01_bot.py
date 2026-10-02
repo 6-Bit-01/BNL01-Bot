@@ -302,6 +302,7 @@ from bnl_journal import (
     approve_draft as approve_journal_draft,
     deliver_approved as deliver_approved_journal,
     generate_and_store_draft as generate_and_store_journal_draft,
+    generate_published_correction_draft as generate_journal_correction_draft,
     generate_test_preview as generate_journal_test_preview,
     preview as preview_journal_draft,
     purge_guild_journal_derivatives_on_connection,
@@ -9848,7 +9849,7 @@ def _format_rd_entity_context_response(subject: str, context: dict) -> str:
 
 def _parse_journal_command(text: str) -> tuple[bool, dict, str]:
     m = re.match(
-        r"(?is)^\s*!bnl\s+journal\s+(test|create|preview|regenerate|reject|approve|retry|status|run-daily|run-weekly|rehydrate)\b(.*)$",
+        r"(?is)^\s*!bnl\s+journal\s+(test|create|correct|preview|regenerate|reject|approve|retry|status|run-daily|run-weekly|rehydrate)\b(.*)$",
         text or "",
     )
     if not m:
@@ -10042,6 +10043,32 @@ def _journal_publication_control_snapshot_sync(
     if snapshot is None:
         return None, parse_reason or "control_snapshot_invalid"
     return snapshot, "valid"
+
+
+def _journal_saved_correction_control_guard(context: dict) -> str:
+    """Recheck the same visibility/reuse authority used to prepare a correction."""
+    identity = context.get("controlAuthorityIdentity")
+    entry_id = str(context.get("entryId") or (context.get("sourcePacket") or {}).get("correctionEntryId") or "")
+    if not identity or not entry_id:
+        return "correction_controls_unavailable"
+    current, _reason = _journal_publication_control_snapshot_sync()
+    if current is None or journal_control_snapshot_status(current) != "valid":
+        return "correction_controls_unavailable"
+    if entry_id in current.public_excluded_entry_ids:
+        return "correction_publication_hidden"
+    if json.dumps(current.authority_identity, sort_keys=True) != json.dumps(identity, sort_keys=True):
+        return "correction_controls_changed"
+    return ""
+
+
+def _journal_correction_control_guard(entry_id: str, snapshot: JournalControlSnapshot):
+    """Bind a historical correction to current visibility and reuse controls."""
+    def guard() -> str:
+        return _journal_saved_correction_control_guard({
+            "entryId": entry_id, "controlAuthorityIdentity": snapshot.authority_identity,
+        })
+    return guard
+
 
 
 def _journal_control_flags(control: dict | None, fallback: dict) -> dict:
@@ -10631,6 +10658,45 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
                 return True
             await message.reply(f"Journal draft `{result.entry_id}` r{result.revision} ready for private review. content_hash=`{result.content_hash}`")
             return True
+        if action == "correct":
+            entry_id = str(options.get("entry_id") or "").strip()
+            revision_text = str(options.get("revision") or "").strip()
+            previous_hash = str(options.get("hash") or "").strip()
+            note = str(options.get("note") or "").strip()
+            if (not entry_id or not revision_text.isdigit() or int(revision_text) < 1
+                    or not re.fullmatch(r"[a-f0-9]{64}", previous_hash) or not note
+                    or options.get("hours") or options.get("window")):
+                await message.reply(
+                    "Journal correction requires an entry ID, its published revision and hash, "
+                    "and a public correction note. It uses that entry's original source window."
+                )
+                return True
+            snapshot, _ = await asyncio.to_thread(_journal_publication_control_snapshot_sync)
+            if snapshot is None or journal_control_snapshot_status(snapshot) != "valid":
+                await message.reply("Journal correction held: current publication controls are unavailable.")
+                return True
+            if entry_id in snapshot.public_excluded_entry_ids:
+                await message.reply("Journal correction held: this publication is currently hidden.")
+                return True
+            result = await asyncio.to_thread(
+                generate_journal_correction_draft,
+                DB_FILE, guild_id, entry_id, _bounded_journal_preparation_generator(),
+                previous_revision=int(revision_text), previous_content_hash=previous_hash, note=note,
+                excluded_history_entry_ids=set(snapshot.public_excluded_entry_ids)
+                | set(snapshot.memory_excluded_entry_ids),
+                generation_guard=_journal_correction_control_guard(entry_id, snapshot),
+                control_authority_identity=snapshot.authority_identity,
+                original_source_controls=_public_conversation_recall_controls,
+            )
+            if not result.ok:
+                await message.reply(f"Journal correction draft not created: `{result.reason}`")
+                return True
+            await message.reply(
+                f"Journal correction draft `{result.entry_id}` r{result.revision} is ready for private review. "
+                f"content_hash=`{result.content_hash}`. The published entry is unchanged; "
+                "approval and delivery remain separate steps."
+            )
+            return True
         if action == "regenerate":
             entry_id = options.get("entry_id") or ""
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
@@ -10672,7 +10738,11 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         if action == "approve":
             entry_id = options.get("entry_id") or ""
             content_hash = options.get("hash") or options.get("content_hash") or ""
-            result = await asyncio.to_thread(approve_journal_draft, DB_FILE, guild_id, entry_id, content_hash)
+            result = await asyncio.to_thread(
+                approve_journal_draft, DB_FILE, guild_id, entry_id, content_hash,
+                correction_guard=_journal_saved_correction_control_guard,
+                original_source_controls=_public_conversation_recall_controls,
+            )
             if not result.ok:
                 await message.reply(f"Journal approval failed: `{result.reason}`")
                 return True
@@ -10711,6 +10781,8 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
                     entry_id,
                     _journal_website_base_url(),
                     BNL_API_KEY,
+                    correction_guard=_journal_saved_correction_control_guard,
+                    original_source_controls=_public_conversation_recall_controls,
                 )
             await message.reply(
                 f"Journal delivery result: state=`{result.status}` reason=`{result.reason}` "
