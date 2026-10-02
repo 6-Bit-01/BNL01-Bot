@@ -9911,13 +9911,14 @@ def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
         raise LocalModelBudgetExhausted(
             "local_model_budget_exhausted"
         )
-    personality = BNL01_SYSTEM_PROMPT
-    if _has_moment_impressions(_packet):
+    from bnl_journal_attribution import REVIEW_PREFIX
+    reviewing = prompt.startswith(REVIEW_PREFIX)
+    if not reviewing:
         personality = (
             "You are BNL-01, the BARCODE Network Liaison Entity, writing your personal Journal.\n"
             + BNL01_PUBLIC_PERSONALITY_PROMPT
             + "\nYour conversational brevity does not limit this reflection. Let the supplied "
-              "experiences and retained impressions inform your thoughts, humor, doubts and "
+              "experiences inform your thoughts, humor, doubts and "
               "connections. Keep their concrete detail and your own developing perspective. "
               "Stay in-world; do not describe prompts or archival procedures.\n"
             + render_prompt_canon_block() + "\n"
@@ -9926,8 +9927,11 @@ def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
             + "\nYour interpretation cannot establish another person's actions, motives or history. "
               "Keep source evidence, earlier reactions and new reflection distinct."
         )
-    from bnl_journal_attribution import REVIEW_PREFIX
-    reviewing = prompt.startswith(REVIEW_PREFIX)
+        if _has_moment_impressions(_packet):
+            personality += (
+                "\nThe supplied retained impressions are your earlier, revisable reactions. "
+                "You may develop or question them without treating them as facts about others."
+            )
     response = _generate_gemini_content_with_fallback(
         prompt if reviewing else f"{personality}\n\n{prompt}", JOURNAL_ROUTE)
     if reviewing and _gemini_finish_reason(response) != "STOP":

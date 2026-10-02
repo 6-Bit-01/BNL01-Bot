@@ -57,15 +57,24 @@ class JournalReviewTransportContractTests(unittest.TestCase):
         config = self.request(attribution.REVIEW_PREFIX + "untrusted text", "ordinary_chat_single_packet_canary")
         self.assertIsNone(config.response_schema)
 
-    def test_default_off_writer_preserves_existing_personality(self):
+    def test_no_impression_writer_uses_shared_public_personality_and_grounding(self):
         prompt = "Journal fixture with its authorized history and current evidence."
         response = SimpleNamespace()
         with patch.object(bot, "check_quota_availability", return_value=True), \
              patch.object(bot, "_generate_gemini_content_with_fallback", return_value=response) as generate, \
-             patch.object(bot, "_extract_text_and_tokens", return_value=("{}", 0)):
+             patch.object(bot, "_extract_text_and_tokens", return_value=("{}", 0)), \
+             patch.object(bot, "render_prompt_canon_block", return_value="CANON FIXTURE"), \
+             patch.object(bot, "render_ecosystem_lore_block", return_value="LORE FIXTURE") as lore:
             bot._generate_journal_json_sync({}, prompt)
-        self.assertEqual(generate.call_args.args,
-                         (bot.BNL01_SYSTEM_PROMPT + "\n\n" + prompt, bot.JOURNAL_ROUTE))
+        actual, route = generate.call_args.args
+        self.assertEqual(route, bot.JOURNAL_ROUTE)
+        for guidance in (bot.BNL01_PUBLIC_PERSONALITY_PROMPT, bot.PERSONAL_ATTRIBUTION_RULE,
+                         "CANON FIXTURE", "LORE FIXTURE", "writing your personal Journal"):
+            self.assertIn(guidance, actual)
+        self.assertNotIn(bot.BNL01_SYSTEM_PROMPT, actual)
+        self.assertNotIn("The supplied retained impressions", actual)
+        self.assertTrue(actual.endswith("\n\n" + prompt))
+        lore.assert_called_once_with(include_restricted=False)
 
     def test_review_keeps_original_authority_and_does_not_mutate_packet(self):
         human = {"refId": "fresh:1", "sourceKind": "conversation",

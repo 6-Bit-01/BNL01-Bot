@@ -142,7 +142,7 @@ class JournalOpinionContractTests(unittest.TestCase):
             with self.subTest(source_kind=source_kind):
                 self.assertEqual(journal.validate_article(article, packet), "")
 
-    def test_unrelated_relay_cannot_supply_the_subjective_perspective_permission(self):
+    def test_relay_can_inspire_own_taste_without_licensing_external_facts(self):
         packet = self.packet()
         packet["reflectionBasis"].append({
             "refId": "reflection:relay:other", "basisKind": "accepted_relay_continuity",
@@ -152,6 +152,8 @@ class JournalOpinionContractTests(unittest.TestCase):
         packet["evidenceCoverageContract"] = {"minimumDistinctFreshSources": 0}
         article = self.article("I suspect he would miss the noise if the corridor fell silent.")
         article["sections"][0]["sourceRefIds"] = ["reflection:relay:other"]
+        self.assertEqual(journal.validate_article(article, packet), "")
+        article["sections"][0]["body"] = "I think Test Member secretly wants the host to leave."
         self.assertEqual(journal.validate_article(article, packet), "undeclared_context_use")
 
     def test_impression_must_still_be_eligible(self):
@@ -173,16 +175,21 @@ class JournalOpinionContractTests(unittest.TestCase):
                 article["sections"][0]["sourceRefIds"] = ["reflection:impression:exchange"]
                 self.assertEqual(journal.validate_article(article, packet), "current_activity_without_fresh_source")
 
-    def test_use_off_does_not_create_permission_or_a_new_inference_lane(self):
+    def test_use_off_preserves_own_perspective_without_a_new_inference_lane(self):
         packet = self.packet()
         packet["reflectionBasis"] = []
         article = self.article("I suspect he would miss the noise if the corridor fell silent.")
         article["sections"][0]["sourceRefIds"] = ["fresh:exchange"]
-        self.assertEqual(journal.validate_article(article, packet), "undeclared_context_use")
-        self.assertEqual(packet["generationContextLanes"], {})
-        # Quiet-day creative freedom is an existing independent permission.
-        packet["creativeReflectionAllowed"] = True
         self.assertEqual(journal.validate_article(article, packet), "")
+        self.assertEqual(packet["generationContextLanes"], {})
+        for creative_allowed in (False, True):
+            packet["creativeReflectionAllowed"] = creative_allowed
+            for claim in ("I suspect the shared audio link has no artist credits.",
+                          "I think Test Member is secretly angry with the room.",
+                          "I suspect Test Member actually released an unannounced album."):
+                with self.subTest(creative_allowed=creative_allowed, claim=claim):
+                    article["sections"][0]["body"] = claim
+                    self.assertEqual(journal.validate_article(article, packet), "undeclared_context_use")
 
     def test_real_inference_keeps_its_existing_declaration_contract(self):
         packet = self.packet()

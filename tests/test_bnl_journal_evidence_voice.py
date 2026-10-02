@@ -83,40 +83,47 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             entry_kind="daily",
         )
 
-    def test_daily_contract_requires_breadth_not_merely_a_large_input(self):
+    def test_daily_contract_keeps_evidence_breadth_available_without_coverage_quota(self):
         contract = self.packet["evidenceCoverageContract"]
-        self.assertEqual(3, contract["minimumDistinctFreshSources"])
-        self.assertEqual(["conversation"], contract["requiredSourceKinds"])
-        self.assertNotIn("minimumDistinctFreshSourcesByKind", contract)
-        self.assertEqual(2, contract["minimumDistinctParticipants"])
-        self.assertEqual(2, contract["minimumDistinctWindowSegments"])
+        self.assertEqual(0, contract["minimumDistinctFreshSources"])
+        self.assertEqual([], contract["requiredSourceKinds"])
+        self.assertEqual({}, contract["minimumDistinctFreshSourcesByKind"])
+        self.assertEqual(0, contract["minimumDistinctParticipants"])
+        self.assertEqual(0, contract["minimumDistinctWindowSegments"])
+        self.assertTrue(contract["subjectiveSelectionMode"])
         self.assertEqual(6, len(self.packet["safeSources"]))
         self.assertTrue(all(source["sourceKind"] == "conversation" for source in self.packet["safeSources"]))
 
         self.assertEqual("", journal.validate_article(_article(self.packet), self.packet, []))
         one_ref = _article(self.packet, refs=[self.packet["safeSources"][0]["refId"]])
-        self.assertEqual("insufficient_source_breadth", journal.validate_article(one_ref, self.packet, []))
+        self.assertEqual("", journal.validate_article(one_ref, self.packet, []))
+        # Explicit caller-supplied contracts still retain their validator. The
+        # current Journal owner chooses selection, not a global bypass.
+        explicit = {**self.packet, "evidenceCoverageContract": {
+            **contract, "minimumDistinctFreshSources": 3,
+        }}
+        self.assertEqual("insufficient_source_breadth", journal.validate_article(one_ref, explicit, []))
 
     def test_prompt_uses_mixed_voice_without_a_fixed_style_template(self):
         prompt = journal.build_generation_prompt(self.packet)
-        self.assertIn("JOURNAL EDITORIAL OVERRIDE", prompt)
-        self.assertIn("no required sequence", prompt)
-        self.assertIn("Let the evidence determine its shape", prompt)
+        self.assertIn("JOURNAL PURPOSE", prompt)
+        self.assertIn("Do not force a lesson or emotion", prompt)
+        self.assertIn("Choose the experience or tension that matters to BNL", prompt)
         self.assertIn("fixedSectionTemplate", prompt)
         self.assertIn("evidenceCoverageContract", prompt)
-        self.assertIn("concrete current-window evidence", prompt)
-        self.assertIn("Never invent a time, place, object, action", prompt)
+        self.assertIn("original evidence before developing BNL's response", prompt)
+        self.assertIn("Never invent another person's actions, motives, history", prompt)
         self.assertIn("Use a direct quote only rarely", prompt)
         self.assertNotIn("relay stream is the primary chronology and narrative spine", prompt)
         self.assertNotIn("Conversation sources are supporting public context", prompt)
         self.assertIn("Fresh sources are original messages or direct completed-show records", prompt)
-        self.assertIn("never as a substitute for the original event or a compulsory outline", prompt)
-        self.assertIn("Keep the whole daily source window in view", prompt)
-        self.assertIn("counts original messages and Relay publications separately", prompt)
+        self.assertIn("Original contributions establish what happened", prompt)
+        self.assertIn("The source window limits current-event claims", prompt)
+        self.assertIn("its segments and counts are not an outline to cover", prompt)
         self.assertIn("windowSegmentActivity", prompt)
         self.assertNotIn("Do not include direct quotes", prompt)
 
-    def test_degraded_relay_window_enters_source_recovery_and_rejects_thin_citations(self):
+    def test_degraded_relay_window_keeps_source_recovery_without_story_quota(self):
         source_store.ensure_schema(self.db)
         current_start = datetime(2026, 7, 23, 7, tzinfo=timezone.utc)
         current_end = current_start + timedelta(days=1)
@@ -231,9 +238,9 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             packet["sourceHealth"]["minimumHealthyRelaySources"],
         )
         contract = packet["evidenceCoverageContract"]
-        self.assertEqual(16, contract["minimumDistinctFreshSources"])
+        self.assertEqual(0, contract["minimumDistinctFreshSources"])
         self.assertEqual(
-            {"conversation": 16},
+            {},
             contract["minimumDistinctFreshSourcesByKind"],
         )
 
@@ -254,7 +261,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            "insufficient_source_breadth",
+            "",
             journal.validate_article(thin, packet, []),
         )
         self.assertEqual(

@@ -70,7 +70,7 @@ class JournalTests(unittest.TestCase):
         self.assertNotIn('discord_user:7', prompt)
         self.assertNotIn('relationship_journal', json.dumps(packet))
         self.assertNotIn('secret internal', json.dumps(packet))
-        self.assertIn('community chronicle', prompt)
+        self.assertIn('introspective personal Journal', prompt)
         self.assertIn('Never call people entities or organisms', prompt)
         self.assertIn('Do not invent nicknames', prompt)
         self.assertIn('Juicy means lively pattern recognition', prompt)
@@ -417,17 +417,10 @@ class JournalTests(unittest.TestCase):
             if source.get('basisKind') == 'accepted_relay_continuity'
         )
         relay_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': [relay_ref]}
-        self.assertEqual('insufficient_source_breadth', j.validate_article(relay_article, packet, []))
-        # Isolate cited-metadata selection while retaining every uncited private
-        # candidate. The ordinary packet above still requires original evidence.
-        relay_packet = {
-            **packet,
-            'evidenceCoverageContract': {
-                **packet['evidenceCoverageContract'],
-                'minimumDistinctFreshSources': 0,
-            },
-        }
-        res = j.store_validated_draft(self.db, 1, relay_packet, reviewed_article(relay_article, relay_packet)); self.assertTrue(res.ok, res.reason)
+        self.assertEqual('', j.validate_article(relay_article, packet, []))
+        # Selective citation preserves every uncited private candidate without
+        # making those candidates supporting evidence for the published prose.
+        res = j.store_validated_draft(self.db, 1, packet, reviewed_article(relay_article, packet)); self.assertTrue(res.ok, res.reason)
         with sqlite3.connect(self.db) as c:
             meta = json.loads(c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?", (res.entry_id,)).fetchone()[0])
         self.assertEqual(meta['supportingRelayIds'], ['r1'])
