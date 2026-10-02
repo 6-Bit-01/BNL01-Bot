@@ -23,24 +23,24 @@ The transport and weekly supervisor:
 - treat TikTok gift diamonds only as platform-provided engagement units, not
   BARCODE payment truth and not a cash value;
 - do not write BNL's database directly;
-- append accepted public comments/questions to a bounded mode-`0600` handoff
-  spool so the main bot can archive them through BNL's existing owners;
+- append accepted public text and anonymous engagement/lifecycle observations
+  to the existing bounded mode-`0600` handoff spool for the main bot's source owner;
 - do not call Gemini, Discord, the website, Relay, Journal, Moments,
   Relationship, Source Files, dossiers, queue actions, or payment owners.
 
 The supervisor additionally publishes one bounded, atomically replaced JSON
-snapshot at `/run/bnl-tiktok-chat-shadow/live-context.json` and appends public
-comments/questions to
+snapshot at `/run/bnl-tiktok-chat-shadow/live-context.json` and appends accepted
+text and anonymous measurements to
 `/run/bnl-tiktok-chat-shadow/public-conversation.ndjson`. Both handoff files are
 mode `0600` and disappear with the systemd runtime directory. The main bot
 cannot use the live snapshot unless
 `BNL_TIKTOK_LIVE_CONTEXT_ENABLED=true`; even then, BNL loads it only for an
 explicit current-show or TikTok-reaction question whose website queue scope is
-authorized in that exact Discord channel. The bot independently ingests the text
+authorized in that exact Discord channel. The bot independently ingests the
 spool when `BNL_TIKTOK_LIVE_MEMORY_ENABLED=true`; that memory gate defaults to
 the context gate's value.
 
-Every accepted event is hard-coded as:
+The transport's current-show observation envelope remains:
 
 ```text
 source=tiktok_live_webcast
@@ -52,6 +52,11 @@ metric_memory=current_show_only
 memory_placement=above_community_canon
 identity_default=handle_display_correlated_v1
 ```
+
+The existing spool writer produces a separate archive projection. Public text
+uses `durable_public_conversation`; measurements and safe lifecycle fields use
+`durable_public_engagement` with no participant identity. This projection does
+not grant personal memory, canon, public output or queue authority.
 
 Authority varies by event type:
 
@@ -130,18 +135,33 @@ that window it:
 - keeps watching after a LIVE ends in case the stream restarts;
 - prints comments, batched tap events, changed viewer counts, shares, follows,
   completed gifts, and TikTok Q&A questions;
-- appends every accepted public comment/question to the bounded bot handoff
-  spool before snapshot throttling;
+- appends accepted public text, taps, completed gifts, viewer snapshots,
+  shares, follows, joins and connection evidence to the existing bounded
+  handoff spool before snapshot throttling or terminal display filters;
 - counts joins without printing every join line;
 - prints a bounded end-of-window telemetry summary;
 - stops and destroys its terminal scrollback at 2:00 AM;
 - restarts the tmux terminal if the supervisor process crashes.
 
-Raw engagement observations remain only in a dedicated tmux terminal and the
-bounded volatile runtime snapshot. Public comments/questions also enter the
-volatile handoff spool and are then stored by the main bot in BNL's append-only
-Journal source archive and Unified Memory Ledger. Routine systemd logs contain
-scheduler health, not the transcript or telemetry stream.
+The main bot stores validated engagement in the existing append-only Journal
+source archive as `tiktok_live_engagement`. It retains both platform and receipt
+clocks, the first receipt on replay, and anonymous measurement fields. Text
+keeps its existing conversation/Memory Ledger path. Engagement does not create
+participants, identity bindings, Moments, impressions or personal memory.
+
+The show evidence owner supplies separate measured views to conversation,
+Journal, Relay, Ambient and Broadcast Ballad inputs. Publication views use the
+original source period; show-linked views use existing authorized chronology.
+Each view retains original references and versions and is rebuilt before use.
+Tap increments are summed once; cumulative totals remain per-room snapshots.
+Gifts count completed streaks and platform units, not currency. Viewers and
+joins do not establish unique attendance. Minute bins retain timing without
+inventing an engagement score or audience endorsement.
+
+The 64 MiB handoff remains volatile until ingestion. Missing signals, collection
+interruptions, rejected records, and scan limits cannot certify complete platform
+coverage or a final total. Collector stop markers are distinct from a platform
+LIVE end. Routine systemd logs contain scheduler health, not raw evidence.
 
 After the unit files are installed and enabled, attach with:
 
@@ -161,10 +181,11 @@ systemctl list-timers bnl-tiktok-chat-shadow.timer --no-pager
 
 The service/timer alone do not authorize BNL consumption. The bot context gate
 and website queue access scope must both authorize a live-reaction response.
-The separate memory gate authorizes only public text archival and the normal
-conversation-memory path described above. Neither gate permits TikTok output,
-queue mutation, automatic canon/relationship promotion, Source Files, dossiers,
-or recaps.
+The existing memory-ingestion gate also controls the anonymous engagement
+archive handoff. Text alone retains the conversation-memory path. Existing
+shared readers can use measurements as factual inputs under their own controls;
+neither ingestion nor read access permits TikTok output, queue mutation,
+automatic canon/Relationship promotion, or a new publication path.
 
 ## NDJSON contract
 
@@ -208,7 +229,7 @@ transport_error
 `transport_error` carries only a bounded error class/code. Raw exception text,
 URLs, cookies, and request headers are not emitted.
 
-## Current production boundary
+## Evidence and runtime boundary
 
 The direct connection has been observed receiving real public LIVE comments,
 moderator status, and the LIVE-end event. The live snapshot makes recent
@@ -221,7 +242,10 @@ Every accepted public comment/question becomes source-linked conversation
 evidence when the memory gate is enabled. It can feed normal continuity, the
 Journal, and bounded surface lore immediately above Community Canon, but one
 utterance cannot establish canon, a relationship, a submitter/artist identity,
-or verified external fact. Aggregate room metrics remain current-show-only.
+or verified external fact. Captured anonymous metrics use the separate original
+source archive and governed shared readers described above; the live snapshot
+remains a bounded current-show view. Code and tests do not prove that a running
+collector or bot has loaded this archival extension.
 Disabling the context gate returns BNL to queue-only live awareness; disabling
-the memory gate stops new text ingestion without deleting previously governed
+the memory gate stops new spool ingestion without deleting previously governed
 source history.

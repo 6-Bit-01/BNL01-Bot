@@ -323,6 +323,7 @@ from bnl_journal_source_store import (
     purge_guild_discord_sources_on_connection,
     purge_user_discord_sources_on_connection,
     record_source_event as record_journal_source_event,
+    record_tiktok_engagement_event,
     sanitize_summary as sanitize_journal_source_summary,
     timestamp_to_epoch_ms as journal_timestamp_to_epoch_ms,
 )
@@ -36153,6 +36154,8 @@ def iter_managed_guilds():
 
 _tiktok_live_memory_runtime = {
     "offset": 0,
+    "spool_identity": "",
+    "last_invalid_lines": 0,
     "last_reason": "never",
     "last_ingested": 0,
     "total_ingested": 0,
@@ -36304,11 +36307,14 @@ def ingest_tiktok_live_memory_once(
     *,
     path: str = "",
     offset: int = 0,
+    spool_identity: str = "",
 ) -> dict[str, Any]:
     """Ingest one bounded spool batch; advance only after the full batch lands."""
 
     spool_path = str(path or BNL_TIKTOK_LIVE_ARCHIVE_SPOOL_PATH)
-    batch = read_public_conversation_spool(spool_path, offset=int(offset or 0))
+    batch = read_public_conversation_spool(
+        spool_path, offset=int(offset or 0), expected_spool_identity=spool_identity,
+    )
     if batch.reason not in {"ok", "spool_missing", "partial_line_waiting"}:
         return {
             "ok": False,
@@ -36316,6 +36322,8 @@ def ingest_tiktok_live_memory_once(
             "offset": int(offset or 0),
             "ingested": 0,
             "reset": batch.reset,
+            "spoolIdentity": batch.spool_identity,
+            "invalidLines": batch.invalid_lines,
         }
     if not batch.records:
         return {
@@ -36324,17 +36332,26 @@ def ingest_tiktok_live_memory_once(
             "offset": batch.next_offset,
             "ingested": 0,
             "reset": batch.reset,
+            "spoolIdentity": batch.spool_identity,
+            "invalidLines": batch.invalid_lines,
         }
-    known_identities = _known_discord_identities_for_tiktok(int(guild_id))
+    known_identities = (
+        _known_discord_identities_for_tiktok(int(guild_id))
+        if any(record.get("event_type") in {"comment", "question"} for record in batch.records)
+        else {}
+    )
     ingested = 0
     try:
         for record in batch.records:
-            if _archive_one_tiktok_live_conversation(
-                int(guild_id),
-                record,
-                known_identities,
-            ):
-                ingested += 1
+            if record.get("event_type") in {"comment", "question"}:
+                landed = _archive_one_tiktok_live_conversation(int(guild_id), record, known_identities)
+            else:
+                landed = record_tiktok_engagement_event(
+                    DB_FILE, guild_id=int(guild_id), record=record,
+                ).ok
+            if not landed:
+                raise ValueError("immutable_source_conflict")
+            ingested += 1
     except Exception as exc:
         logging.exception(
             "tiktok_live_memory_ingest_failed error_type=%s",
@@ -36347,6 +36364,7 @@ def ingest_tiktok_live_memory_once(
             "ingested": ingested,
             "reset": batch.reset,
             "errorType": type(exc).__name__,
+            "invalidLines": batch.invalid_lines,
         }
     return {
         "ok": True,
@@ -36354,6 +36372,8 @@ def ingest_tiktok_live_memory_once(
         "offset": batch.next_offset,
         "ingested": ingested,
         "reset": batch.reset,
+        "spoolIdentity": batch.spool_identity,
+        "invalidLines": batch.invalid_lines,
     }
 
 
@@ -36372,6 +36392,7 @@ async def tiktok_live_memory_ingest_task():
         ingest_tiktok_live_memory_once,
         guild_id,
         offset=int(_tiktok_live_memory_runtime.get("offset") or 0),
+        spool_identity=str(_tiktok_live_memory_runtime.get("spool_identity") or ""),
     )
     _tiktok_live_memory_runtime["last_reason"] = str(
         result.get("reason") or "unknown"
@@ -36382,10 +36403,12 @@ async def tiktok_live_memory_ingest_task():
     _tiktok_live_memory_runtime["last_error_type"] = str(
         result.get("errorType") or ""
     )
+    _tiktok_live_memory_runtime["last_invalid_lines"] = int(result.get("invalidLines") or 0)
     if result.get("ok"):
         _tiktok_live_memory_runtime["offset"] = int(
             result.get("offset") or 0
         )
+        _tiktok_live_memory_runtime["spool_identity"] = str(result.get("spoolIdentity") or "")
         _tiktok_live_memory_runtime["total_ingested"] = int(
             _tiktok_live_memory_runtime.get("total_ingested") or 0
         ) + int(result.get("ingested") or 0)

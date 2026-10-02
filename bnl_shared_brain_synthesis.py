@@ -180,7 +180,7 @@ _LANE_LABELS = {
     "moment": "episode gist",
     "bnl_impression": "BNL's retained impression",
     "episode": "frame-bound episode",
-    "show_episode": "finalized BARCODE Radio evidence",
+    "show_episode": "BARCODE Radio and captured TikTok evidence",
     "atomic_knowledge": "durable observation",
     "recurring_theme": "recurring-theme evidence",
     "open_loop": "unresolved thread",
@@ -2951,7 +2951,7 @@ def render_packet_context(
     # memory-synopsis allowance must not silently reduce it to 700 characters.
     # Its source owner bounds size and reports any omission before this point.
     interval_items = tuple(item for item in ordered_items
-                           if item.lane == "show_episode" and item.usage in {"scoped_show_conversation", "show_linked_preparation", "authoritative_show_chronology"})
+                           if item.lane == "show_episode" and item.usage in {"scoped_show_conversation", "show_linked_preparation", "authoritative_show_chronology", "measured_show_engagement"})
     if interval_items:
         max_chars += sum(len(item.text) + 240 for item in interval_items)
         ordered_items = interval_items + tuple(item for item in ordered_items if item not in interval_items)
@@ -3318,6 +3318,12 @@ def render_packet_context(
         "observations on the same show clock. Name who said what when it "
         "matters, and distinguish one person's remark from a room-wide "
         "pattern. Queue knowledge does not imply queue control.\n"
+        "- Captured platform engagement is a separate measured projection. "
+        "Use its stated collection window and coverage. Tap increments differ "
+        "from cumulative counters; a last observed counter is not a guaranteed "
+        "final total. Gifts report platform units, and joins/viewer snapshots "
+        "do not count unique people. A standalone collection window establishes "
+        "no show chronology, audience opinion, personal trait or canon.\n"
         "- Underlying attributed show-chat utterances sit in Community Canon "
         "at Open Signal. A single utterance or episode may support a bounded "
         "observation or revisable BNL opinion; only independently recurring "

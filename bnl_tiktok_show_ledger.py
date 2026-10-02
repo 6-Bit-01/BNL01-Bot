@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections import Counter
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import hashlib
 import json
 import logging
@@ -64,6 +65,7 @@ from bnl_tiktok_live_context import (
 from bnl_unified_response_assessment import (
     situation_subject_label_spans, self_public_activity_requested,
 )
+from bnl_tiktok_live_memory import archive_record, ENGAGEMENT_EVENT_TYPES
 
 
 TIKTOK_SHOW_EVIDENCE_TABLE = "tiktok_show_evidence_ledgers"
@@ -75,6 +77,11 @@ TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT = 2
 TIKTOK_SHOW_EVIDENCE_RECALL_MESSAGE_LIMIT = 10
 SHOW_EPISODE_CONTEXT_VERSION = "barcode_show_episode_context_v1"
 SHOW_PREPARATION_CONTEXT_VERSION = "barcode_show_preparation_v1"
+ENGAGEMENT_CONTEXT_VERSION = "tiktok_captured_engagement_v1"
+_ENGAGEMENT_QUERY_RE = re.compile(
+    r"\b(?:engagement|metrics?|statistics?|stats|taps?|likes|gifts?|diamonds?|"
+    r"viewers?|shares?|follows?|joins?)\b", re.I,
+)
 
 
 def show_preparation_requested(text: str) -> bool:
@@ -224,6 +231,9 @@ class TikTokShowEpisodeContextItem:
     score: float
     usage: str
     uncertainty_status: str
+    original_source_refs: tuple[tuple[str, str], ...] = ()
+    lifecycle: str = "finalized"
+    phase: str = "historical"
 
 
 def _utc_iso_from_ms(value: Any) -> str:
@@ -456,6 +466,299 @@ def select_finalized_show_operations(
     return tuple(item for row in rows
                  for item in [_operational_episode_context_item(row, user_text="show recap")]
                  if item is not None)
+
+
+def read_tiktok_engagement_evidence(
+    conn: sqlite3.Connection, *, guild_id: int,
+    source_window_ms: tuple[int, int],
+    limit: int = TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS,
+) -> dict[str, Any]:
+    """Aggregate fresh eligible originals, never cached counters or human chat.
+
+    The half-open source window belongs to the caller. Absence of a metric is
+    unavailable, not zero. Even collector boundaries describe captured spans,
+    not proof that every platform event was received.
+    """
+    start, end = source_window_ms
+    result: dict[str, Any] = {
+        "schemaVersion": ENGAGEMENT_CONTEXT_VERSION,
+        "windowStartMs": start, "windowEndMs": end,
+        "status": "unavailable", "reason": "no_archived_observations",
+        "originalSourceRefs": [], "rooms": [], "metrics": {},
+        "coverage": {"basis": "captured_observations_only", "fullPlatformCoverage": False,
+                     "unobservedPeriodsAreZero": False},
+    }
+
+    def seal():
+        result["sourceDigest"] = _context_digest(result)
+        return result
+
+    if int(guild_id or 0) <= 0 or start <= 0 or end <= start:
+        result["reason"] = "invalid_source_window"
+        return seal()
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bnl_journal_source_events'").fetchone():
+        result["reason"] = "archive_unavailable"
+        return seal()
+    bounded_limit = max(1, min(int(limit or 1), TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS))
+    rows = conn.execute(
+        "SELECT source_key,occurred_at_ms,raw_text,metadata_json,content_hash,"
+        "channel_policy,subject_ref,private_display_name,event_seq "
+        "FROM bnl_journal_source_events WHERE guild_id=? "
+        "AND source_kind='tiktok_live_engagement' AND public_usable=1 "
+        "AND occurred_at_ms>=? AND occurred_at_ms<? ORDER BY occurred_at_ms,event_seq LIMIT ?",
+        (int(guild_id), start, end, bounded_limit + 1),
+    ).fetchall()
+    if len(rows) > bounded_limit:
+        result.update(status="partial", reason="source_scan_limit_exceeded")
+        result["coverage"]["scannedLimit"] = bounded_limit
+        return seal()
+    records = []
+    rejected = 0
+    for key, occurred, raw, metadata_json, content_hash, policy, subject, name, _seq in rows:
+        try:
+            metadata = json.loads(metadata_json or "{}")
+            record = archive_record(metadata.get("engagement")) if isinstance(metadata, dict) else None
+        except (ValueError, TypeError):
+            record = None
+        if (record is None or record.get("archive_policy") != "durable_public_engagement"
+                or policy not in {"public_home", "public_context"} or subject or name
+                or record["event_id"] != key
+                or int(float(record.get("source_at") or record["observed_at"]) * 1000) != occurred
+                or _canonical_json(record) != raw
+                or hashlib.sha256(str(raw).encode("utf-8")).hexdigest() != content_hash):
+            rejected += 1
+            continue
+        records.append((int(occurred), record))
+        result["originalSourceRefs"].append({"sourceKind": "tiktok_live_engagement",
+            "sourceKey": str(key), "contentHash": str(content_hash), "occurredAtMs": int(occurred)})
+    result["coverage"].update(eligibleOriginalCount=len(records), rejectedOriginalCount=rejected)
+    if rejected:
+        # A corrupt projection cannot certify a complete aggregate of its range.
+        result.update(status="partial", reason="invalid_original_evidence")
+        return seal()
+    if not records:
+        return seal()
+    result.update(status="captured", reason="captured_observations_only")
+    result["rooms"] = sorted({record["room_id"] for _at, record in records if record["room_id"]})
+    result["coverage"].update(firstObservedAtMs=records[0][0], lastObservedAtMs=records[-1][0])
+    grouped = {kind: [(at, record) for at, record in records if record["event_type"] == kind]
+               for kind in ENGAGEMENT_EVENT_TYPES}
+    metrics = result["metrics"]
+    likes = grouped["like"]
+    if likes:
+        # Cumulative platform totals are snapshots; summing them doubles counts.
+        # Zero is the upstream missing-total sentinel, not an observed total.
+        room_totals: dict[str, list[tuple[int, int]]] = {}
+        for at, record in likes:
+            if record["like_total"] > 0:
+                room_totals.setdefault(record["room_id"], []).append((at, record["like_total"]))
+        snapshots = [{"roomId": room, "lastObservedPlatformTotal": values[-1][1],
+            "lastObservedAtMs": values[-1][0],
+            "cumulativeCounterDecreased": any(b[1] < a[1] for a, b in zip(values, values[1:]))}
+            for room, values in sorted(room_totals.items())]
+        metrics["likes"] = {"capturedTapIncrements": sum(record["like_count"] for _at, record in likes),
+            "roomSnapshots": snapshots,
+            "lastObservedPlatformTotal": snapshots[0]["lastObservedPlatformTotal"] if len(snapshots) == 1 else None,
+            "lastObservedAtMs": snapshots[0]["lastObservedAtMs"] if len(snapshots) == 1 else None,
+            "cumulativeCounterDecreased": any(row["cumulativeCounterDecreased"] for row in snapshots)}
+    viewers = grouped["viewer_snapshot"]
+    if viewers:
+        metrics["viewers"] = {"sampleCount": len(viewers),
+            "lastObservedViewers": viewers[-1][1]["viewer_count"], "lastObservedAtMs": viewers[-1][0],
+            "peakObservedViewers": max(record["viewer_count"] for _at, record in viewers)}
+    for kind in ("share", "follow"):
+        if grouped[kind]:
+            metrics[kind] = {"capturedEventCount": len(grouped[kind])}
+    if grouped["join"]:
+        metrics["join"] = {"capturedJoinCount": sum(record["join_count"] for _at, record in grouped["join"])}
+    if grouped["gift"]:
+        metrics["gifts"] = {"capturedFinalGiftEvents": len(grouped["gift"]),
+            "capturedGiftUnits": sum(record["gift_count"] for _at, record in grouped["gift"]),
+            "capturedDiamondTotal": sum(record["diamond_total"] for _at, record in grouped["gift"])}
+    spans, boundaries, opened = [], [], {}
+    for at, record in records:
+        kind, room = record["event_type"], record["room_id"]
+        boundary = record.get("boundary", "")
+        if kind not in ENGAGEMENT_EVENT_TYPES:
+            boundaries.append({"eventType": kind, "boundary": boundary, "occurredAtMs": at, "roomId": room})
+        if kind == "connected":
+            opened.setdefault(room, at)
+        elif kind in {"reconnecting", "disconnected", "transport_error", "live_ended"} or (
+                kind == "collector_boundary" and boundary in {"window_stopped", "cycle_stopped"}):
+            closing_rooms = list(opened) if not room else [room]
+            for closing_room in closing_rooms:
+                if closing_room in opened:
+                    spans.append({"roomId": closing_room, "startedAtMs": opened.pop(closing_room), "endedAtMs": at})
+    result["coverage"].update(connectionSpans=spans, openConnections=[
+        {"roomId": room, "startedAtMs": at, "observedThroughMs": records[-1][0]}
+        for room, at in sorted(opened.items())], collectorBoundaries=boundaries,
+        connectionCoverageAvailable=bool(spans or opened))
+    # Timing bins remain captured events, not an inferred engagement score.
+    minute_counts: dict[int, Counter] = {}
+    for at, record in records:
+        kind = record["event_type"]
+        if kind not in ENGAGEMENT_EVENT_TYPES:
+            continue
+        bucket = (at - start) // 60_000
+        counts = minute_counts.setdefault(bucket, Counter())
+        counts[kind + "Events"] += 1
+        if kind == "like":
+            counts["capturedTapIncrements"] += record["like_count"]
+        if kind == "gift":
+            counts["capturedGiftUnits"] += record["gift_count"]
+    result["minuteWindows"] = [{"startedAtMs": start + minute * 60_000,
+        "endedAtMs": min(end, start + (minute + 1) * 60_000), **dict(counts)}
+        for minute, counts in sorted(minute_counts.items())]
+    return seal()
+
+
+def _engagement_text(evidence: Mapping[str, Any], *, label: str) -> str:
+    lines = [f"Captured TikTok platform engagement for {label}; collection window "
+             f"{_utc_iso_from_ms(evidence['windowStartMs'])} through {_utc_iso_from_ms(evidence['windowEndMs'])} (end exclusive)."]
+    metrics = evidence.get("metrics") or {}
+    if evidence.get("status") != "captured":
+        lines.append("Metric totals unavailable: " + str(evidence.get("reason") or "unknown coverage") + ".")
+    else:
+        likes = metrics.get("likes")
+        if likes:
+            lines.append("Captured tap increments: %s." % likes["capturedTapIncrements"])
+            snapshots = likes["roomSnapshots"]
+            for snapshot in snapshots[:4]:
+                lines.append("Last observed platform tap total in room %s: %s at %s%s." % (
+                    json.dumps(snapshot["roomId"]), snapshot["lastObservedPlatformTotal"],
+                    _utc_iso_from_ms(snapshot["lastObservedAtMs"]),
+                    "; counter decreased/reset, do not infer a show total" if snapshot["cumulativeCounterDecreased"] else ""))
+            if not snapshots:
+                lines.append("Cumulative platform tap total unavailable.")
+            if len(snapshots) > 4:
+                lines.append("Additional captured rooms omitted from this bounded summary.")
+        else:
+            lines.append("Tap measurements unavailable in this window.")
+        viewers = metrics.get("viewers")
+        lines.append(("Viewer snapshots: %s; peak observed: %s; last observed: %s."
+            % (viewers["sampleCount"], viewers["peakObservedViewers"], viewers["lastObservedViewers"]))
+            if viewers else "Viewer measurements unavailable in this window.")
+        gifts = metrics.get("gifts")
+        lines.append(("Captured finalized gifts: %s events, %s units, %s reported diamonds."
+            % (gifts["capturedFinalGiftEvents"], gifts["capturedGiftUnits"], gifts["capturedDiamondTotal"]))
+            if gifts else "Gift measurements unavailable in this window.")
+        for kind in ("share", "follow", "join"):
+            value = metrics.get(kind)
+            if value:
+                lines.append("Captured %s: %s." % (kind, next(iter(value.values()))))
+        rooms = evidence.get("rooms") or []
+        if rooms:
+            lines.append("Captured room IDs: " + ", ".join(json.dumps(room) for room in rooms[:4]) + ".")
+    coverage = evidence.get("coverage") or {}
+    lines.append("Coverage: captured observations only; %s originals; %s connection spans, %s open connections. "
+                 "Unobserved periods and uncaptured metric types are unavailable. Last observed totals "
+                 "are not guaranteed final show totals; viewers/joins are not unique attendees."
+                 % (coverage.get("eligibleOriginalCount", 0), len(coverage.get("connectionSpans") or []),
+                    len(coverage.get("openConnections") or [])))
+    return "\n".join(lines)
+
+
+def _engagement_context_item(
+    evidence: Mapping[str, Any], *, guild_id: int, row: Mapping[str, Any] | None = None,
+) -> TikTokShowEpisodeContextItem:
+    original_refs = tuple((str(ref["sourceKey"]), str(ref["contentHash"]))
+                         for ref in evidence.get("originalSourceRefs") or [])
+    if row is not None:
+        label = "recorded BARCODE Radio show " + str(row["ledger"].get("showDate") or row["showKey"])
+        item = _show_context_item(kind="engagement", loaded_rows=({**row, "sourceDigest": evidence["sourceDigest"]},),
+            source_class=SourceClass.EVIDENCE_PROJECTION.value, confidence=Confidence.HIGH.value,
+            subject_key="barcode_radio", text=_engagement_text(evidence, label=label), participants=(),
+            score=198.0, usage="measured_show_engagement", uncertainty_status="captured_platform_metrics_only")
+        return replace(item, original_source_refs=original_refs)
+    start, end = int(evidence["windowStartMs"]), int(evidence["windowEndMs"])
+    return TikTokShowEpisodeContextItem(kind="engagement",
+        source_ref=f"show_episode:engagement_window:{int(guild_id)}:{start}:{end}",
+        source_digest=str(evidence["sourceDigest"]), source_class=SourceClass.EVIDENCE_PROJECTION.value,
+        confidence=Confidence.HIGH.value, show_keys=(), show_dates=(), subject_key="barcode_radio",
+        text=_engagement_text(evidence, label="the platform collection window (show linkage unavailable)"),
+        participants=(), observed_at=_utc_iso_from_ms((evidence.get("coverage") or {}).get("lastObservedAtMs") or end),
+        score=198.0, usage="measured_show_engagement", uncertainty_status="captured_platform_metrics_only",
+        original_source_refs=original_refs, lifecycle="observed", phase="historical")
+
+
+def select_shared_show_evidence(
+    conn: sqlite3.Connection, *, guild_id: int, source_window_ms: tuple[int, int],
+) -> tuple[TikTokShowEpisodeContextItem, ...]:
+    """One shared period view: completed operations and separate measurements.
+
+    Measurements use the publication's original period, independent of queue
+    availability. They cannot count as another completed show or human witness.
+    """
+    items = list(select_finalized_show_operations(conn, guild_id=guild_id, source_window_ms=source_window_ms))
+    evidence = read_tiktok_engagement_evidence(conn, guild_id=guild_id, source_window_ms=source_window_ms)
+    if evidence.get("metrics"):
+        items = items[:7]  # preserve the publication owner's eight-source bound
+        items.append(_engagement_context_item(evidence, guild_id=guild_id))
+    return tuple(items)
+
+
+def tiktok_engagement_window_version(conn: sqlite3.Connection, *, guild_id: int, source_ref: str) -> str:
+    match = re.fullmatch(r"show_episode:engagement_window:(\d+):(\d+):(\d+)", str(source_ref or ""))
+    if match is None or int(match[1]) != int(guild_id):
+        return ""
+    evidence = read_tiktok_engagement_evidence(conn, guild_id=guild_id, source_window_ms=(int(match[2]), int(match[3])))
+    return str(evidence["sourceDigest"])
+
+
+def tiktok_engagement_requested(user_text: str) -> bool:
+    text = str(user_text or "")
+    text = re.sub(r"^\s*show\s+(?:me|us)\b", "", text, flags=re.I)
+    return bool(_ENGAGEMENT_QUERY_RE.search(text) and (
+        re.search(r"\b(?:tiktok|tik tok|barcode radio|broadcast|shows?|episodes?|streams?|live)\b", text, re.I)
+        or re.search(r"\b(?:taps?|diamonds?)\b", text, re.I)))
+
+
+def recorded_show_engagement_bounds(ledger: Mapping[str, Any]) -> tuple[int, int]:
+    """Use recorded session/intake boundaries when present, never a guessed lead-in."""
+    starts = [int(ledger.get("startedAtMs") or 0)]
+    starts.extend(int(event.get("occurredAtMs") or 0)
+                  for event in ledger.get("operationalEvents") or []
+                  if isinstance(event, Mapping) and event.get("eventType") in {"session_created", "submissions_opened"}
+                  and int(event.get("occurredAtMs") or 0) > 0)
+    return min(starts), int(ledger.get("endedAtMs") or 0) + 1
+
+
+def select_tiktok_engagement_context_items(
+    conn: sqlite3.Connection, *, guild_id: int, user_text: str,
+    now: Any = None, allow_show_linkage: bool = True,
+) -> tuple[TikTokShowEpisodeContextItem, ...]:
+    """Measured answers use originals even while native queue gates are off.
+
+    A collection period has no fabricated episode, show date or attendance.
+    Authorized historical show windows can supply exact linkage when available.
+    """
+    if not tiktok_engagement_requested(user_text) or int(guild_id or 0) <= 0:
+        return ()
+    current = bool(re.search(
+        r"\b(?:now|currently|right now|tonight|today|this (?:show|broadcast|live|stream)|current (?:show|broadcast|live|stream))\b",
+        user_text, re.I))
+    if allow_show_linkage and not current:
+        rows = _load_finalized_show_ledgers(conn, guild_id=guild_id, limit=200)
+        ranked = _ranked_show_ledgers(rows, user_text=user_text, subject_ref="", now=now)
+        if ranked:
+            selected = ranked[:2 if broad_show_history_requested(user_text, now=now) else 1]
+            return tuple(_engagement_context_item(read_tiktok_engagement_evidence(
+                conn, guild_id=guild_id, source_window_ms=recorded_show_engagement_bounds(row["ledger"])),
+                guild_id=guild_id, row=row) for _score, _rank, row, _matches in selected)
+    dates = requested_show_dates(user_text, now=now)
+    if has_explicit_show_date(user_text) and not dates:
+        return ()
+    if dates:
+        zone = ZoneInfo("America/Los_Angeles")
+        start = int(datetime.fromisoformat(min(dates)).replace(tzinfo=zone).timestamp() * 1000)
+        last = datetime.fromisoformat(max(dates)).replace(tzinfo=zone)
+        from datetime import timedelta
+        end = int((last + timedelta(days=1)).timestamp() * 1000)
+    else:
+        end = _timestamp_epoch_ms(now) or int(datetime.now(timezone.utc).timestamp() * 1000)
+        start = end - 24 * 60 * 60 * 1000
+    evidence = read_tiktok_engagement_evidence(conn, guild_id=guild_id, source_window_ms=(start, end))
+    return (_engagement_context_item(evidence, guild_id=guild_id),)
 
 
 def ensure_tiktok_show_evidence_schema(conn: sqlite3.Connection) -> None:
@@ -1950,6 +2253,11 @@ def sync_tiktok_show_evidence_ledgers(
                 same_date_show_count=sum(1 for candidate in shows
                     if candidate.get("showDate") == show.get("showDate")),
             )
+            # Stored for show scanning, but never inserted as an authored
+            # message, participant, canon candidate or Relationship signal.
+            base_ledger["engagement"] = read_tiktok_engagement_evidence(
+                conn, guild_id=int(guild_id), source_window_ms=recorded_show_engagement_bounds(base_ledger),
+            )
             ledger = _seal_authorized_show_ledger(base_ledger, authorization_receipt)
             if ledger is None:
                 continue
@@ -3241,7 +3549,7 @@ def _show_context_item(
         show_keys=tuple(key for key, _digest in sources),
         show_dates=show_dates,
         subject_key=str(subject_key or "barcode_radio"),
-        text=text if usage in {"scoped_show_conversation", "show_linked_preparation", "authoritative_show_chronology"} else _safe_label(
+        text=text if usage in {"scoped_show_conversation", "show_linked_preparation", "authoritative_show_chronology", "measured_show_engagement"} else _safe_label(
             text,
             950 if kind in {"operations", "dialogue"} else 840,
         ),
@@ -3846,6 +4154,12 @@ def select_tiktok_show_episode_context_items(
                 uncertainty_status="speaker_attributed_timing_correlation",
             )
     items: list[TikTokShowEpisodeContextItem] = list(preparation_items)
+    if _show_episode_scope_requested(user_text) or tiktok_engagement_requested(user_text):
+        for row in selected_rows[:2 if multi_show else 1]:
+            evidence = read_tiktok_engagement_evidence(conn, guild_id=guild_id,
+                source_window_ms=recorded_show_engagement_bounds(row["ledger"]))
+            if evidence.get("metrics") or tiktok_engagement_requested(user_text):
+                items.append(_engagement_context_item(evidence, guild_id=guild_id, row=row))
     if authored_rows and (
         _show_episode_scope_requested(user_text) or participant_matches
     ) and not (
@@ -4508,6 +4822,14 @@ def build_tiktok_show_evidence_context(
         "- Keep source scopes independent: a current queue snapshot cannot establish historical participation or whether retained TikTok/Discord history exists. An absent track in a bounded roster selection is not proof that someone never submitted. Queue submission attribution is not proof of artist authorship or actual playback.",
     ]
     query_terms = _query_terms(selection_query if candidate_context else user_text)
+    if _show_episode_scope_requested(user_text) or tiktok_engagement_requested(user_text):
+        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as metrics_conn:
+            for _score, _recency, selected_ledger, _matches in selected[:2]:
+                evidence = read_tiktok_engagement_evidence(metrics_conn, guild_id=guild_id,
+                    source_window_ms=recorded_show_engagement_bounds(selected_ledger))
+                if evidence.get("metrics") or tiktok_engagement_requested(user_text):
+                    lines.append(_engagement_text(evidence, label="recorded BARCODE Radio show "
+                        + str(selected_ledger.get("showDate") or selected_ledger.get("showKey") or "")))
     wants_tracks = bool(_TRACK_QUERY_RE.search(user_text or ""))
     wants_topics = bool(_TOPIC_QUERY_RE.search(user_text or ""))
     bounded_message_limit = max(1, min(int(message_limit or 1), 16))
@@ -5025,6 +5347,9 @@ def build_broadcast_ballad_evidence(db_file: str, guild_id: int, show_id: str) -
         current = {**ledger, "messages": messages}
         authored = _show_recall_messages(conn, guild_id=guild_id, ledger=current,
                                         diagnostics_out=diagnostics)
+        engagement = read_tiktok_engagement_evidence(
+            conn, guild_id=guild_id, source_window_ms=recorded_show_engagement_bounds(ledger),
+        )
 
     roster = list(ledger.get("trackRoster") or ())
     track_ids = {str(t.get("trackKey") or ""): f"T{i + 1}" for i, t in enumerate(roster)}
@@ -5069,9 +5394,11 @@ def build_broadcast_ballad_evidence(db_file: str, guild_id: int, show_id: str) -
         "discovery, community and feelings can lead the song; operational mishaps have no priority.",
         "SHOW FACTS: " + compact(facts),
         "STATISTIC BOUNDARY: These are roster submissions and final recorded outcomes, not a count of full "
-        "plays. A finished flag does not certify a full listen; active does not prove unplayed. Tap total is "
-        "unavailable in this durable source: omit a numeric tap claim. Never turn a mid-show count, a chat "
-        "claim, prior BNL commentary or a lyric into a final statistic. Do not sum repeated playback events.",
+        "plays. A finished flag does not certify a full listen; active does not prove unplayed. A guaranteed "
+        "final tap total is unavailable. Use captured measurements only with their stated period and limits. "
+        "Never turn a mid-show count, a chat claim, prior BNL commentary or a lyric into a final statistic. "
+        "Do not sum repeated playback events.",
+        "CAPTURED PLATFORM MEASUREMENTS:\n" + _engagement_text(engagement, label="the recorded episode"),
         "TRACK DIRECTORY (source labels; association is timing, not an audience endorsement): " + compact({
             track_ids[str(t.get("trackKey") or "")]: {"artist": t.get("projectLabel"), "title": t.get("title"),
                 "outcome": t.get("outcome"), "lane": t.get("lane")} for t in roster}),
@@ -5087,4 +5414,4 @@ def build_broadcast_ballad_evidence(db_file: str, guild_id: int, show_id: str) -
     ])
     # Includes fresh source/correction state and the rendered evidence. A
     # withdrawal during the writing call must invalidate the pending draft.
-    return text, _context_digest(row["sourceDigest"], events, authored, text)
+    return text, _context_digest(row["sourceDigest"], events, authored, engagement["sourceDigest"], text)

@@ -1,4 +1,5 @@
 """Ballads read the whole authorized episode through current source owners."""
+import gc
 import json
 import sqlite3
 import tempfile
@@ -6,7 +7,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from bnl_journal_source_store import record_source_event, purge_user_bound_conversation_sources_on_connection
+from bnl_journal_source_store import (
+    record_source_event, record_tiktok_engagement_event,
+    purge_user_bound_conversation_sources_on_connection,
+)
 from bnl_tiktok_show_ledger import build_broadcast_ballad_evidence, sync_tiktok_show_evidence_ledgers
 from tests import test_tiktok_show_evidence_ledger as fixture
 
@@ -15,6 +19,7 @@ class BalladEpisodeCoverageTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(gc.collect)
         self.db = str(Path(self.tmp.name) / "episode.db")
         fixture.TikTokShowEvidenceLedgerTests().seed_source_and_memory(self.db)
         self.show = fixture.archived_show()
@@ -57,6 +62,26 @@ class BalladEpisodeCoverageTests(unittest.TestCase):
         self.assertIn('"finished":2', text)
         self.assertIn("First Signal", text)
         self.assertIn("Queue Light", text)
+
+    def test_captured_metrics_are_fresh_and_withdrawal_invalidates_ballad_evidence(self):
+        _, original = self.read()
+        at = fixture.stamp("2026-08-29T00:02:00Z") / 1000.0
+        record_tiktok_engagement_event(self.db, guild_id=77, record={
+            "event_type": "like", "event_id": "ballad-taps", "room_id": "test-room",
+            "observed_at": at, "source_at": at, "like_count": 23, "like_total": 700,
+        })
+        text, measured = self.read()
+        self.assertIn("Captured tap increments: 23", text)
+        self.assertIn("700", text)
+        self.assertIn('"finalTapTotal":null', text)
+        self.assertNotEqual(original, measured)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("DROP TRIGGER trg_bnl_journal_sources_no_update")
+            conn.execute("UPDATE bnl_journal_source_events SET public_usable=0 "
+                         "WHERE source_kind='tiktok_live_engagement'")
+        text, withdrawn = self.read()
+        self.assertNotIn("Captured tap increments: 23", text)
+        self.assertNotEqual(measured, withdrawn)
 
     def test_current_withdrawal_and_new_sources_override_cached_episode(self):
         text, before = self.read()

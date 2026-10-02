@@ -1,9 +1,9 @@
-"""Durable handoff contract for public TikTok LIVE conversation events.
+"""Durable handoff contract for public TikTok LIVE evidence.
 
 The isolated collector cannot write BNL's database.  It appends accepted public
-comments and TikTok Q&A questions to a mode-0600 spool in the systemd runtime
-directory.  The main bot tails that spool and writes the events through BNL's
-existing Journal source archive and Memory Ledger owners.
+comments, questions, aggregate engagement and collector lifecycle evidence to
+the existing mode-0600 spool. The main bot tails it through the existing source
+archive owner. Only conversational text may enter the Memory Ledger.
 
 This module is deliberately standard-library only so the collector's isolated
 Python 3.11 environment can use it without importing the Discord bot.
@@ -26,6 +26,17 @@ SOURCE = "tiktok_live_webcast"
 ARCHIVE_POLICY = "durable_public_conversation"
 MEMORY_PLACEMENT = "above_community_canon"
 IDENTITY_POLICY = "handle_display_correlated_v1"
+ENGAGEMENT_ARCHIVE_POLICY = "durable_public_engagement"
+ENGAGEMENT_MEMORY_PLACEMENT = "noncanonical_show_evidence"
+ENGAGEMENT_EVENT_TYPES = frozenset({
+    "like", "viewer_snapshot", "share", "follow", "gift", "join",
+})
+ARCHIVE_LIFECYCLE_TYPES = frozenset({
+    "connected", "reconnecting", "disconnected", "live_ended", "transport_error",
+    "collector_boundary",
+})
+_COLLECTOR_BOUNDARIES = frozenset({"window_started", "window_stopped", "cycle_stopped"})
+_COLLECTOR_REASONS = frozenset({"process_exit", "window_closed", "stop_requested", "live_ended"})
 
 DEFAULT_ARCHIVE_SPOOL_PATH = (
     "/run/bnl-tiktok-chat-shadow/public-conversation.ndjson"
@@ -40,6 +51,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SPACE_RE = re.compile(r"\s+")
 _HANDLE_RE = re.compile(r"^[A-Za-z0-9._]+$")
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,240}$")
+_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _TRAILING_DIGITS_RE = re.compile(r"\d{1,4}$")
 _LEET_TRANSLATION = str.maketrans({"0": "o", "3": "e", "4": "a", "5": "s", "7": "t"})
@@ -51,6 +63,8 @@ class SpoolReadResult:
     next_offset: int = 0
     reason: str = "ok"
     reset: bool = False
+    invalid_lines: int = 0
+    spool_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -175,6 +189,123 @@ def public_conversation_record(value: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _archive_integer(value: Any, maximum: int, *, minimum: int = 0) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if minimum <= value <= maximum else None
+
+
+def archive_record(value: Any) -> Optional[Dict[str, Any]]:
+    """Allowlist one text, aggregate engagement or lifecycle spool record.
+
+    Metric records have no participant identifiers or name-derived bindings.
+    A source timestamp is optional; when supplied it must be within one day of
+    receipt, matching the existing transport parser's source-clock boundary.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    event_type = str(value.get("event_type") or "").strip().lower()
+    if event_type not in _PUBLIC_TEXT_TYPES | ENGAGEMENT_EVENT_TYPES | ARCHIVE_LIFECYCLE_TYPES:
+        return None
+    event_id = value.get("event_id")
+    if not isinstance(event_id, str) or not _EVENT_ID_RE.fullmatch(event_id):
+        return None
+    if isinstance(value.get("observed_at"), bool):
+        return None
+    observed_at = _finite_timestamp(value.get("observed_at"))
+    if observed_at is None:
+        return None
+    source_raw = value.get("source_at")
+    if isinstance(source_raw, bool):
+        return None
+    source_at = None
+    if source_raw not in (None, "", 0, 0.0):
+        source_at = _finite_timestamp(source_raw)
+        if source_at is None or abs(source_at - observed_at) > 24 * 60 * 60:
+            return None
+    if event_type in _PUBLIC_TEXT_TYPES:
+        return public_conversation_record(value)
+    record: Dict[str, Any] = {
+        "archive_schema_version": ARCHIVE_SCHEMA_VERSION,
+        "source": SOURCE,
+        "archive_policy": ENGAGEMENT_ARCHIVE_POLICY,
+        "memory_placement": ENGAGEMENT_MEMORY_PLACEMENT,
+        "identity_policy": "aggregate_event_only",
+        "event_type": event_type,
+        "event_id": event_id,
+        "room_id": _bounded_text(value.get("room_id"), 160),
+        "observed_at": observed_at,
+        "source_at": source_at,
+    }
+    fields = {
+        "like": {"like_count": 10**9, "like_total": 10**12},
+        "viewer_snapshot": {"viewer_count": 10**9},
+        "share": {"share_type": 1000},
+        "follow": {},
+        "gift": {"gift_id": 10**12, "gift_count": 10**9,
+                 "diamond_count": 10**9, "diamond_total": 10**12},
+        "join": {"join_count": 10**9},
+    }.get(event_type, {})
+    for key, maximum in fields.items():
+        numeric = _archive_integer(value.get(key), maximum)
+        if numeric is None:
+            return None
+        record[key] = numeric
+    if event_type == "like" and record["like_count"] <= 0 and record["like_total"] <= 0:
+        return None
+    if event_type == "join" and record["join_count"] <= 0:
+        return None
+    if event_type == "gift":
+        combo = value.get("combo")
+        streak_over = value.get("streak_over")
+        if not isinstance(combo, bool) or not isinstance(streak_over, bool):
+            return None
+        if not streak_over or record["gift_count"] <= 0:
+            return None
+        record.update({"gift_name": _bounded_text(value.get("gift_name"), 160),
+                       "combo": combo, "streak_over": streak_over})
+    if event_type == "transport_error":
+        error_code = value.get("error_code", "transport_error")
+        if not isinstance(error_code, str) or not _ERROR_CODE_RE.fullmatch(error_code):
+            return None
+        record["error_code"] = error_code
+    if event_type == "collector_boundary":
+        boundary = value.get("boundary")
+        reason = value.get("reason", "")
+        if (not isinstance(boundary, str) or not isinstance(reason, str)
+                or boundary not in _COLLECTOR_BOUNDARIES
+                or reason not in _COLLECTOR_REASONS | {""}):
+            return None
+        if boundary != "window_started" and not reason:
+            return None
+        record.update(boundary=boundary, reason=reason)
+        if "return_code" in value:
+            return_code = _archive_integer(value.get("return_code"), 10**6, minimum=-(10**6))
+            if return_code is None:
+                return None
+            record["return_code"] = return_code
+    return record
+
+
+def collector_boundary_record(
+    boundary: str, observed_at: float, *, room_id: str = "", reason: str = "",
+    return_code: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create an archive-only collection boundary, never a platform LIVE end."""
+    value: Dict[str, Any] = {
+        "event_type": "collector_boundary",
+        "event_id": "collector:%s:%s" % (boundary, int(observed_at * 1_000_000)),
+        "observed_at": observed_at, "room_id": room_id,
+        "boundary": boundary, "reason": reason,
+    }
+    if return_code is not None:
+        value["return_code"] = return_code
+    record = archive_record(value)
+    if record is None:
+        raise ValueError("invalid collector boundary")
+    return record
+
+
 def resolve_tiktok_identity(
     record: Mapping[str, Any],
     *,
@@ -260,7 +391,7 @@ def resolve_tiktok_identity(
 
 
 class TikTokPublicConversationSpoolWriter:
-    """Append every accepted public text event to a bounded volatile spool."""
+    """Append accepted evidence to the existing bounded volatile handoff."""
 
     def __init__(self, path: str) -> None:
         if not str(path or "").strip():
@@ -268,7 +399,7 @@ class TikTokPublicConversationSpoolWriter:
         self.path = Path(path)
 
     def append(self, value: Any) -> bool:
-        record = public_conversation_record(value)
+        record = archive_record(value)
         if record is None:
             return False
         encoded = (
@@ -308,6 +439,7 @@ def read_public_conversation_spool(
     offset: int = 0,
     max_bytes: int = DEFAULT_MAX_READ_BYTES,
     max_records: int = DEFAULT_MAX_RECORDS,
+    expected_spool_identity: str = "",
 ) -> SpoolReadResult:
     """Read complete validated lines without consuming or mutating the spool."""
 
@@ -330,7 +462,10 @@ def read_public_conversation_spool(
                 next_offset=requested_offset,
                 reason="spool_not_regular",
             )
-        reset = metadata.st_size < requested_offset
+        spool_identity = "%s:%s" % (metadata.st_dev, metadata.st_ino)
+        reset = metadata.st_size < requested_offset or bool(
+            expected_spool_identity and spool_identity != expected_spool_identity
+        )
         start = 0 if reset else requested_offset
         os.lseek(descriptor, start, os.SEEK_SET)
         raw = os.read(descriptor, bounded_bytes)
@@ -340,33 +475,42 @@ def read_public_conversation_spool(
         os.close(descriptor)
 
     if not raw:
-        return SpoolReadResult(next_offset=start, reason="ok", reset=reset)
+        return SpoolReadResult(next_offset=start, reason="ok", reset=reset,
+                               spool_identity=spool_identity)
     last_newline = raw.rfind(b"\n")
     if last_newline < 0:
         return SpoolReadResult(
             next_offset=start,
             reason="partial_line_waiting",
             reset=reset,
+            spool_identity=spool_identity,
         )
     complete = raw[: last_newline + 1]
     next_offset = start
     records = []
+    invalid_lines = 0
     for raw_line in complete.splitlines(keepends=True):
         if len(records) >= bounded_records:
             break
         next_offset += len(raw_line)
         if len(raw_line) > MAX_EVENT_LINE_BYTES:
+            invalid_lines += 1
             continue
         try:
             value = json.loads(raw_line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            invalid_lines += 1
             continue
-        record = public_conversation_record(value)
+        record = archive_record(value)
         if record is not None:
             records.append(record)
+        else:
+            invalid_lines += 1
     return SpoolReadResult(
         records=tuple(records),
         next_offset=next_offset,
         reason="ok",
         reset=reset,
+        invalid_lines=invalid_lines,
+        spool_identity=spool_identity,
     )
