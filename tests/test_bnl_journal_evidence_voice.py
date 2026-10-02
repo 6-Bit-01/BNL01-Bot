@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import bnl_journal as journal
 import bnl_journal_source_store as source_store
@@ -605,7 +606,8 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertLess(packet["candidateTopicTags"].index("zebra"), packet["candidateTopicTags"].index("alpha"))
 
     def test_memory_ineligible_entries_are_absent_from_all_history_lanes(self):
-        first = journal.store_validated_draft(self.db, 1, self.packet, _article(self.packet))
+        with mock.patch.object(journal, "utc_now_iso", return_value="2026-07-20T07:30:00Z"):
+            first = journal.store_validated_draft(self.db, 1, self.packet, _article(self.packet))
         self.assertTrue(first.ok, first.reason)
         with journal.sqlite3.connect(self.db) as conn:
             conn.execute(
@@ -617,14 +619,17 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
                 (first.entry_id,),
             )
 
-        included = journal.retrieve_history(self.db, 1, self.packet)
+        # The completed entry is prior history for the next window, not for
+        # the period that ended before this entry was written and published.
+        next_packet = {**self.packet, "sourceWindowEnd": "2026-07-21T07:00:00Z"}
+        included = journal.retrieve_history(self.db, 1, next_packet)
         self.assertEqual(first.entry_id, included["previousEntry"]["entry_id"])
         self.assertTrue(included["recurringTopicCounts"])
 
         excluded = journal.retrieve_history(
             self.db,
             1,
-            self.packet,
+            next_packet,
             excluded_entry_ids={first.entry_id},
         )
         self.assertIsNone(excluded["previousEntry"])

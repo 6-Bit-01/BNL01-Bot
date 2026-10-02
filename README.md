@@ -579,6 +579,17 @@ published expression; invitations cannot establish completed human actions,
 and Relay repetition cannot inflate the day's activity. Older unsent packets
 with the former Relay authority use the existing refresh fence. These source
 projection corrections also apply with impression formation/use disabled.
+Prior Journal history is bounded by the requested source-window end, including
+its topic counts and continuity notes. A later publication cannot become prior
+history during a replay or recovery. Entries with withdrawn private metadata
+are excluded from every history lane. Eligible older prose remains dated BNL
+expression, not independent event evidence or a writing template.
+Personal reactions and clearly conditional imagined responses may use a cited,
+eligible impression, or current originals when the impression pilot is in use,
+without an unrelated factual-inference declaration. This
+does not grant factual authority over another person's actions or motives;
+those claims retain the existing evidence and inference rules. The grammatical
+guard is conservative and does not replace semantic source review.
 Relays, Ambient, artwork, Ballads, dossiers, memory-tier promotion, and
 Relationship activation remain outside this pilot.
 

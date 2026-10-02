@@ -42,7 +42,7 @@ JOURNAL_GENERATION_ATTEMPTS = 4
 JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
 JOURNAL_EDITORIAL_VERSION = "journal-public-voices-1"
 JOURNAL_SHARED_INPUT_VERSION = "journal-shared-inputs-2"
-JOURNAL_REFLECTION_VERSION = "journal-dated-reflection-2"
+JOURNAL_REFLECTION_VERSION = "journal-dated-reflection-3"
 JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-2"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
@@ -169,8 +169,9 @@ _REPAIR_GUIDANCE = {
     "missing_bnl_reaction": (
         "Add one brief first-person BNL reaction that expresses curiosity, amusement, attachment, uncertainty, or mild "
         "unease without asserting a new external fact. Natural openings include I admit, I noticed, I found myself, "
-        "I smiled, I laughed, I remain curious, I am fond of, and I felt. Do not use I suspect, I think, or I wonder "
-        "unless a valid bnl_inference context lane supports it."
+        "I smiled, I laughed, I remain curious, I am fond of, and I felt. The words I suspect, I think, and I wonder "
+        "do not themselves make a reaction factual: own tastes and clearly conditional imagined reactions are "
+        "personal perspective. Actual external claims still need a valid bnl_inference context lane."
     ),
     "sensitive_personal_detail": (
         "Remove personal or domestic details that are unnecessary to the public community story, including details "
@@ -283,6 +284,51 @@ _EXTERNAL_ACTIVITY_VERB_RE = re.compile(
     r"upload(?:s|ed|ing)?|start(?:s|ed|ing)?|end(?:s|ed|ing)?|skip(?:s|ped|ping)?(?!\s+wheel)|"
     r"won|wins?|paid|pay(?:s|ing)?|purchas(?:e[ds]?|ing)|vot(?:e[ds]?|ing)|request(?:s|ed|ing)?)\b", re.I,
 )
+_ACTUALITY_CUE_RE = re.compile(r"\b(?:actually|in\s+reality|in\s+fact)\b", re.I)
+_CONDITIONAL_REACTION_RE = re.compile(
+    r"\b(?:would|could|might)\s+(?:not\s+)?(?:be|feel|find|miss|prefer|welcome)\b", re.I,
+)
+_EXTERNAL_PERSON_SUBJECT_RE = re.compile(
+    r"^(?:(?:that|whether|if)\s+)?(?:he|she|they|you|his|her|their|someone|somebody|"
+    r"everyone|everybody|nobody|no\s+one|(?:a|an|the|some|this|that|our)\s+"
+    r"(?:(?:other|regular|new|fellow)\s+)?(?:person|member|artist|producer|listener|host|friend))\b", re.I,
+)
+
+
+def _framed_conditional_reaction(clause: str) -> bool:
+    """Recognize a hypothetical reaction, never a claim that an event occurred.
+
+    This is a conservative grammar boundary, not a factuality classifier. The
+    consequence must be modal and the condition explicit in the same clause.
+    Past-event conjecture and factual continuations remain inference-governed.
+    """
+    frame = _EXPLICIT_BNL_INFERENCE_RE.search(clause) or _PERSONAL_REFLECTION_RE.search(clause)
+    if not frame or _ACTUALITY_CUE_RE.search(clause) or _EXTERNAL_ACTIVITY_VERB_RE.search(clause[:frame.start()]):
+        return False
+    conditional = re.split(r"\s+if\s+", clause[frame.end():], maxsplit=1, flags=re.I)
+    if len(conditional) != 2:
+        return False
+    consequence, condition = conditional
+    return bool(
+        condition.strip()
+        and _CONDITIONAL_REACTION_RE.search(consequence)
+        and not _EXTERNAL_ACTIVITY_VERB_RE.search(consequence)
+        and not re.search(r"\b(?:would|could|might)\s+(?:not\s+)?have\b", consequence, re.I)
+    )
+
+
+def _reflection_targets_person(clause: str, packet: dict[str, Any]) -> bool:
+    """A person's actual state/motive is not licensed by 'I think' alone."""
+    frame = _EXPLICIT_BNL_INFERENCE_RE.search(clause)
+    if not frame:
+        return False
+    target = re.sub(r"^(?:\s+|(?:that|whether|if)\s+)+", "", clause[frame.end():], flags=re.I)
+    if _EXTERNAL_PERSON_SUBJECT_RE.search(target):
+        return True
+    # Use existing governed identity projection, never retrieve another record.
+    names = [str(person.get("publicName") or "") for person in packet.get("privatePublicPeople", [])]
+    return any(name and target.casefold().startswith(name.casefold())
+               and _contains_identity_literal(target, name) for name in names)
 
 
 def _context_claim_clauses(text: str) -> list[str]:
@@ -311,11 +357,18 @@ def _creative_reflection_clause(clause: str, packet: dict[str, Any]) -> bool:
     if frame:
         return not (
             _EXTERNAL_ACTIVITY_VERB_RE.search(clause[:frame.start()])
-            or re.search(r"\b(?:actually|in\s+reality|in\s+fact)\b", clause, re.I)
+            or _ACTUALITY_CUE_RE.search(clause)
         )
+    if _framed_conditional_reaction(clause):
+        return True
+    inference_frame = _EXPLICIT_BNL_INFERENCE_RE.search(clause)
+    own_reaction = bool(inference_frame and _BNL_REACTION_RE.match(clause[inference_frame.end():].strip()))
     return bool(
-        _PERSONAL_REFLECTION_RE.search(clause)
+        (_PERSONAL_REFLECTION_RE.search(clause) or own_reaction)
         and not _EXTERNAL_ACTIVITY_VERB_RE.search(clause)
+        and not _ACTUALITY_CUE_RE.search(clause)
+        and not _STRONG_INFERENCE_CUE_RE.search(clause)
+        and not _reflection_targets_person(clause, packet)
     )
 
 
@@ -2385,10 +2438,13 @@ def _is_retrospective_relay(source: dict[str, Any]) -> bool:
 
 
 def journal_packet_needs_reflection_refresh(packet: dict[str, Any]) -> bool:
-    """Rebuild unsent old packets that gave BNL speech fresh-event authority."""
+    """Rebuild unsent packets with obsolete Relay or Journal-history authority."""
     return (
         packet.get("reflectionVersion") != JOURNAL_REFLECTION_VERSION
-        and any(source.get("sourceKind") == "relay" for source in packet.get("safeSources", []))
+        and (any(source.get("sourceKind") == "relay" for source in packet.get("safeSources", []))
+             or any(packet.get("history", {}).get(key) for key in (
+                 "previousEntry", "relevantOlderEntries", "recurringTopicCounts",
+                 "matchingContinuityNotes", "matchingUnresolvedQuestions")))
     )
 
 
@@ -2397,6 +2453,8 @@ def journal_metadata_needs_reflection_refresh(
 ) -> bool:
     if metadata.get("reflectionVersion") == JOURNAL_REFLECTION_VERSION:
         return False
+    if metadata.get("relatedPriorJournalEntryIds") or metadata.get("recurringTopicCounts"):
+        return True
     relay_ids = [str(value) for value in metadata.get("supportingRelayIds", []) if value]
     if not relay_ids or not {"guild_id", "relay_id", "event_type"} <= _cols(conn, "website_relay_history"):
         return False
@@ -3544,6 +3602,22 @@ def _subject_refs(packet: dict[str, Any]) -> set[str]:
     return {str(s.get("subjectRef")) for s in packet.get("privateSources", []) if s.get("subjectRef")}
 
 
+def _history_entry_is_as_of(entry: dict[str, Any], as_of: Optional[str]) -> bool:
+    """Prior BNL expression must have existed by this source-window boundary."""
+    if as_of is None:
+        return True  # Backwards-compatible direct history reads without a window.
+    cutoff = _parse_context_datetime(as_of)
+    published = _parse_context_datetime(entry.get("published_at"))
+    if cutoff is None or published is None or published >= cutoff:
+        return False
+    for key in ("created_at", "source_window_start", "source_window_end"):
+        if entry.get(key):
+            observed = _parse_context_datetime(entry[key])
+            if observed is None or observed > cutoff:
+                return False
+    return True
+
+
 def retrieve_history(
     db_path: str,
     guild_id: int,
@@ -3558,25 +3632,28 @@ def retrieve_history(
     excluded = {str(entry_id) for entry_id in (excluded_entry_ids or set()) if str(entry_id)}
     current_subjects = _subject_refs(current_packet)
     current_topics = set(current_packet.get("candidateTopicTags", []))
+    as_of = current_packet.get("sourceWindowEnd")
     terms = set(_norm(_json(current_packet.get("safeSources", []))).split())
     with _read_source_database(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        prev_rows = conn.execute("""SELECT entry_id,revision,title,excerpt,sections_json,published_at,created_at
-            FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published'
-            ORDER BY published_at DESC, created_at DESC""", (guild_id,)).fetchall()
-        rows = conn.execute("""SELECT e.entry_id,e.revision,e.title,e.excerpt,e.sections_json,e.published_at,e.created_at,m.metadata_json
+        rows = conn.execute("""SELECT e.entry_id,e.revision,e.title,e.excerpt,e.sections_json,
+                e.published_at,e.created_at,e.source_window_start,e.source_window_end,m.metadata_json
             FROM bnl_journal_entries e JOIN bnl_journal_private_metadata m
-              ON m.entry_id=e.entry_id AND m.revision=e.revision
+              ON m.entry_id=e.entry_id AND m.revision=e.revision AND m.guild_id=e.guild_id
             WHERE e.guild_id=? AND e.lifecycle_state='published' AND m.lifecycle_state='published'""", (guild_id,)).fetchall()
-    prev = next((row for row in prev_rows if str(row["entry_id"]) not in excluded), None)
+    eligible = [dict(row) for row in rows if str(row["entry_id"]) not in excluded
+                and _history_entry_is_as_of(dict(row), as_of)]
+    eligible.sort(key=lambda row: (
+        _parse_context_datetime(row.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        _parse_context_datetime(row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        str(row["entry_id"]), int(row["revision"])), reverse=True)
+    prev = eligible[0] if eligible else None
     recurring: dict[str, int] = {}
     scored = []
     notes = []
     unresolved = []
     prev_key = (prev["entry_id"], int(prev["revision"])) if prev else None
-    for row in rows:
-        if str(row["entry_id"]) in excluded:
-            continue
+    for row in eligible:
         meta = json.loads(row["metadata_json"] or "{}")
         tags = {str(t) for t in meta.get("topicTags", [])}
         subjects = {str(s) for s in meta.get("subjectRefs", [])}
@@ -3595,8 +3672,11 @@ def retrieve_history(
             notes.extend(str(n)[:240] for n in meta.get("continuityNotes", [])[:3])
             unresolved.extend(str(n)[:240] for n in meta.get("unresolvedQuestions", [])[:3])
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    previous = {key: value for key, value in prev.items() if key != "metadata_json"} if prev else None
     return {
-        "previousEntry": dict(prev) if prev else None,
+        "authority": "prior_bnl_expression_not_event_evidence",
+        "asOf": as_of,
+        "previousEntry": previous,
         "relevantOlderEntries": [item for _, _, item in scored[:limit]],
         "recurringTopicCounts": recurring,
         "matchingContinuityNotes": notes[:10],
@@ -4359,15 +4439,26 @@ def build_source_packet(
     )
 
 
-def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
+def _bounded_history_for_prompt(
+    history: dict[str, Any], *, as_of: Optional[str] = None,
+) -> dict[str, Any]:
+    # Aggregate text has no per-entry dates. An old frozen aggregate cannot be
+    # filtered safely here; the existing refresh path rebuilds it from sources.
+    aggregates_current = as_of is None or (
+        _parse_context_datetime(as_of) is not None
+        and _parse_context_datetime(history.get("asOf")) == _parse_context_datetime(as_of))
     def compact(entry: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-        if not entry:
+        if not entry or not _history_entry_is_as_of(entry, as_of):
             return None
         sections = json.loads(entry.get("sections_json") or "[]") if isinstance(entry.get("sections_json"), str) else []
         return {
             "entryId": entry.get("entry_id"),
             "revision": entry.get("revision"),
+            "speaker": "BNL",
+            "authority": "prior_bnl_expression_not_event_evidence",
             "publishedAt": entry.get("published_at") or entry.get("created_at"),
+            "sourceWindowStart": entry.get("source_window_start"),
+            "sourceWindowEnd": entry.get("source_window_end"),
             "title": entry.get("title"),
             "excerpt": entry.get("excerpt"),
             "sectionSnapshots": [
@@ -4380,10 +4471,14 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
             ],
         }
     return {
+        "speaker": "BNL",
+        "authority": "prior_bnl_expression_not_event_evidence",
+        "asOf": as_of,
         "previousEntry": compact(history.get("previousEntry")),
-        "relevantOlderEntries": [compact(e) for e in history.get("relevantOlderEntries", [])[:6]],
-        "recurringTopicCounts": dict(sorted((history.get("recurringTopicCounts") or {}).items(), key=lambda kv: (-kv[1], kv[0]))[:12]),
-        "matchingContinuityNotes": [str(n)[:240] for n in history.get("matchingContinuityNotes", [])[:8]],
+        "relevantOlderEntries": [item for e in history.get("relevantOlderEntries", [])[:6]
+                                 if (item := compact(e)) is not None],
+        "recurringTopicCounts": dict(sorted((history.get("recurringTopicCounts") or {}).items(), key=lambda kv: (-kv[1], kv[0]))[:12]) if aggregates_current else {},
+        "matchingContinuityNotes": [str(n)[:240] for n in history.get("matchingContinuityNotes", [])[:8]] if aggregates_current else [],
     }
 
 
@@ -4459,12 +4554,14 @@ def build_generation_prompt(
             "requiresFirstPersonReaction": False,
             "requiredBeatsAcrossEntry": [],
             "fixedSectionTemplate": False,
+            "historyRole": "prior_bnl_expression_for_continuity_not_evidence_or_style_template",
         },
         "publicPeople": [
             {key: person[key] for key in ("participantAlias", "publicName", "sourceRefIds")}
             for person in packet.get("privatePublicPeople", [])
         ],
-        "history": _bounded_history_for_prompt(packet.get("history", {})),
+        "history": _bounded_history_for_prompt(
+            packet.get("history", {}), as_of=packet.get("sourceWindowEnd")),
         "aggregateCounts": packet.get("aggregateCounts", {}),
         "dailyObservations": packet.get("weeklyDailyPeriodContexts", packet.get("observationContext", []))[:6],
         "weeklyFinalPeriod": packet.get("weeklyFinalPeriodContext"),
@@ -4699,7 +4796,7 @@ def build_generation_prompt(
         "\nPublic Moment reflection records preserve earlier exchanges and each original participant's contribution. Use their source dates, preserve banter, uncertainty and unanswered questions, and paraphrase rather than inventing quotations. A matching topic never makes today's speaker a participant in an earlier exchange. Cite the reflection ref when using it; it does not increase fresh-source, current-participant or recurrence counts."
         "\nFinalized-show sources report recorded public operations in a completed show. Their date and timeline control the tense; they never establish that a show is live now. Chat, a Moment, a Relay and a Journal retelling of the same occurrence are not independent witnesses or additional occurrences. A show record establishes playback only where playback is recorded."
         "\nPublished Ballad reflection records establish only the released song and its approved creative metadata. Discuss the song as a song. Liner notes are creative interpretation, never proof that a person acted, a quoted event happened, or new canon was established. Their release date is distinct from the linked show's date. Drafts and lyrics are not supplied as evidence."
-        "\nRelay reflection records preserve BNL's published thoughts and invitations, including ones published during this window. They are not original evidence that a human acted, a check was performed or a property was measured. relayPublishedAt/sourceObservedAt dates the Relay publication only. originalSourceDates preserves known origin dates; absent origin dates are unknown, not today. A prior Journal's source window dates its underlying activity; its publication date does not re-date that activity. Never interpret a show's selector lookback as the show's date."
+        "\nRelay reflection records preserve BNL's published thoughts and invitations, including ones published during this window. They are not original evidence that a human acted, a check was performed or a property was measured. relayPublishedAt/sourceObservedAt dates the Relay publication only. originalSourceDates preserves known origin dates; absent origin dates are unknown, not today. History contains what BNL previously wrote, not independent proof or a writing template. Its titles, excerpts, section snapshots and continuity notes can recall his earlier perspective, but cannot establish or corroborate events, missing information or completed actions. Use the eligible original evidence when revisiting those facts, including when earlier BNL writing stated something confidently. A prior Journal's source window dates its underlying activity; its publication date does not re-date that activity. Never interpret a show's selector lookback as the show's date."
         f"{coverage_rule}"
         f"{section_source_rule}"
         f"{quote_rule}"
@@ -5178,7 +5275,15 @@ def validate_article(
         if _EXPLICIT_RUMOR_RE.search(text) and "community_rumor" not in declared_types:
             undeclared = True
             report(body_fields[heading], "missing_context_declaration", laneType="community_rumor")
-        if _has_external_inference_claim(text, packet) and "bnl_inference" not in declared_types:
+        original_refs = {str(source.get("refId")) for source in packet.get("safeSources", [])
+                         if source.get("sourceKind") in {"conversation", "finalized_show"}}
+        cites_original = bool(original_refs & section_refs.get(heading, set()))
+        perspective_packet = {
+            **packet,
+            "reflectionBasis": [source for source in _eligible_reflection_basis(packet)
+                                if cites_original or str(source.get("refId")) in section_refs.get(heading, set())],
+        }
+        if _has_external_inference_claim(text, perspective_packet) and "bnl_inference" not in declared_types:
             undeclared = True
             report(body_fields[heading], "missing_context_declaration", laneType="bnl_inference")
     public_locations: list[tuple[Optional[str], str, str]] = [
