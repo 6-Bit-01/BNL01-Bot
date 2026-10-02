@@ -9925,7 +9925,12 @@ def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
             + "\nYour interpretation cannot establish another person's actions, motives or history. "
               "Keep source evidence, earlier reactions and new reflection distinct."
         )
-    response = _generate_gemini_content_with_fallback(f"{personality}\n\n{prompt}", JOURNAL_ROUTE)
+    from bnl_journal_attribution import REVIEW_PREFIX
+    reviewing = prompt.startswith(REVIEW_PREFIX)
+    response = _generate_gemini_content_with_fallback(
+        prompt if reviewing else f"{personality}\n\n{prompt}", JOURNAL_ROUTE)
+    if reviewing and _gemini_finish_reason(response) != "STOP":
+        raise RuntimeError("journal_source_review_incomplete")
     text, _tokens = _extract_text_and_tokens(response)
     return text or ""
 
@@ -10476,8 +10481,8 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
         else:
             article = result["article"]
             publication_check = result.get("publicationCheck") or {}
-            review_note = ""
-            if publication_check.get("reason"):
+            review_note = "This one-call draft has not had a factual source review and is not approved for publication. Nothing was saved or published.\n\n"
+            if publication_check.get("reason") and publication_check["reason"] != "source_review_required":
                 locations = list(dict.fromkeys(
                     str(item["field"]) for item in publication_check.get("locations", []) if item.get("field")
                 ))
@@ -10487,7 +10492,7 @@ async def _send_private_journal_test(message: discord.Message, options: dict) ->
                     + ".\nThe writing is included below for inspection. This test is not approved for publication.\n\n"
                 )
             text = (
-                "**Private Journal test — not saved or published**\n"
+                "**Private Journal first draft — unreviewed**\n"
                 f"Preview version: `{result.get('previewVersion', 'unknown')}`\n"
                 f"Writing version: `{result['editorialVersion']}`\n"
                 f"Window: {result['sourceWindowStart']} to {result['sourceWindowEnd']}\n\n"
@@ -32517,6 +32522,11 @@ def _generate_model_with_retry(
             model_name,
             route,
         )
+        if route == JOURNAL_ROUTE and isinstance(contents, str):
+            from bnl_journal_attribution import REVIEW_PREFIX, response_schema
+            if contents.startswith(REVIEW_PREFIX):
+                generation_config.response_mime_type = "application/json"
+                generation_config.response_schema = response_schema()
         if attempt_counter is not None:
             attempt_counter.mark_started()
         try:

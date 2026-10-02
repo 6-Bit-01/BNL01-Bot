@@ -14,6 +14,7 @@ import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
 from tests.test_bnl_journal_prepared_release import AcceptedResponse, article_json
+from tests.journal_review_helpers import with_supported_review
 
 
 TARGET_DAY = date(2026, 7, 20)
@@ -110,7 +111,7 @@ class JournalLifecycleMigrationTests(unittest.TestCase):
         return automation.prepare_daily(
             self.db,
             1,
-            generator or (lambda packet, _prompt: article_json(packet)),
+            generator or (with_supported_review(lambda packet, _prompt: article_json(packet))),
             target_day=TARGET_DAY,
             force=True,
         )
@@ -153,7 +154,7 @@ class JournalLifecycleMigrationTests(unittest.TestCase):
             self.db,
             1,
             packet,
-            lambda current, _prompt: article_json(current),
+            with_supported_review(lambda current, _prompt: article_json(current)),
             entry_id=entry_id,
         )
         self.assertTrue(generated.ok, generated)
@@ -296,7 +297,7 @@ class JournalLifecycleMigrationTests(unittest.TestCase):
             self.db,
             1,
             packet,
-            lambda current, _prompt: article_json(current),
+            with_supported_review(lambda current, _prompt: article_json(current)),
             entry_id=entry_id,
             attempt_fence=(run_id, epoch),
             source_hash=source_hash,
@@ -348,7 +349,7 @@ class JournalLifecycleMigrationTests(unittest.TestCase):
             self.db,
             1,
             packet,
-            lambda current, _prompt: article_json(current),
+            with_supported_review(lambda current, _prompt: article_json(current)),
             entry_id=entry_id,
         )
         approved = journal.approve_draft(

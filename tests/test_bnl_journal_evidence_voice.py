@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 import json
 import sqlite3
 import tempfile
@@ -607,7 +608,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
 
     def test_memory_ineligible_entries_are_absent_from_all_history_lanes(self):
         with mock.patch.object(journal, "utc_now_iso", return_value="2026-07-20T07:30:00Z"):
-            first = journal.store_validated_draft(self.db, 1, self.packet, _article(self.packet))
+            first = journal.store_validated_draft(self.db, 1, self.packet, reviewed_article(_article(self.packet), self.packet))
         self.assertTrue(first.ok, first.reason)
         with journal.sqlite3.connect(self.db) as conn:
             conn.execute(

@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 """Journal consumes the existing public owners and rechecks saved source bases."""
 import json
 import os
@@ -8,6 +9,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
@@ -182,6 +184,7 @@ class JournalSharedInputsTests(unittest.TestCase):
 
     def test_correction_during_generation_cannot_become_a_saved_draft(self):
         packet = self.packet()
+        @with_supported_review
         def generator(value, _prompt):
             with sqlite3.connect(self.db) as conn:
                 conn.execute("UPDATE memory_ledger_entries SET normalized_value='The earlier source was corrected.' WHERE entry_id=?", (self.roots[0],))
@@ -201,7 +204,7 @@ class JournalSharedInputsTests(unittest.TestCase):
 
     def test_saved_moment_lineage_survives_reopen_and_retraction_blocks_manual_delivery(self):
         packet = self.packet()
-        result = journal.store_validated_draft(self.db, 1, packet, self.article_with_moment(packet))
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(self.article_with_moment(packet), packet))
         self.assertTrue(result.ok, result)
         self.assertTrue(journal.approve_draft(self.db, 1, result.entry_id, result.content_hash).ok)
         with sqlite3.connect(self.db) as conn:
@@ -220,7 +223,7 @@ class JournalSharedInputsTests(unittest.TestCase):
     def test_uncited_candidate_is_still_revalidated_and_forget_scrubs_published_private_basis(self):
         packet = self.packet()
         article = journal.parse_generated_json(article_json(packet))
-        result = journal.store_validated_draft(self.db, 1, packet, article)
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(article, packet))
         self.assertTrue(result.ok, result)
         with sqlite3.connect(self.db) as conn:
             meta = json.loads(conn.execute("SELECT metadata_json FROM bnl_journal_private_metadata").fetchone()[0])
@@ -239,7 +242,7 @@ class JournalSharedInputsTests(unittest.TestCase):
 
     def test_scheduled_show_revision_survives_restart_and_posts_exact_bytes_once(self):
         self.add_show()
-        prepared = automation.prepare_daily(self.db, 1, lambda packet, prompt: article_json(packet),
+        prepared = automation.prepare_daily(self.db, 1, with_supported_review(lambda packet, prompt: article_json(packet)),
             target_day=date(2026, 8, 27), force=True)
         self.assertEqual(prepared.status, "prepared", prepared)
         with sqlite3.connect(self.db) as conn:
@@ -271,7 +274,7 @@ class JournalSharedInputsTests(unittest.TestCase):
 
     def test_show_revised_after_prepare_retires_packet_and_keeps_occurrence_owed(self):
         self.add_show()
-        prepared = automation.prepare_daily(self.db, 1, lambda packet, prompt: article_json(packet),
+        prepared = automation.prepare_daily(self.db, 1, with_supported_review(lambda packet, prompt: article_json(packet)),
             target_day=date(2026, 8, 27), force=True)
         self.assertEqual(prepared.status, "prepared", prepared)
         revised = show_fixture.archived_show()

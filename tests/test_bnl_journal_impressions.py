@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 """The Journal reads shared Moment opinions, retaining original evidence and fences."""
 import json
 import os
@@ -190,7 +191,7 @@ class JournalMomentImpressionTests(unittest.TestCase):
                 conn.execute("UPDATE memory_moment_windows SET impression_payload='' WHERE moment_id=?", (self.mid,))
             raise RuntimeError("provider unavailable")
         article, reason, advisory = journal._generate_article_with_repairs(
-            packet, generate, [], generation_guard=journal._moment_impression_generation_guard(self.db, 1, packet))
+            packet, generate, [], generation_guard=journal._journal_generation_guard(self.db, 1, packet))
         self.assertEqual(len(calls), 2)
         self.assertIsNone(article)
         self.assertEqual(reason, "privacy_source_ineligible")
@@ -218,7 +219,7 @@ class JournalMomentImpressionTests(unittest.TestCase):
     def test_uncited_impression_is_fenced_before_approval_and_delivery(self):
         packet = self.packet()
         article = journal.parse_generated_json(article_json(packet))
-        result = journal.store_validated_draft(self.db, 1, packet, article)
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(article, packet))
         self.assertTrue(result.ok, result)
         with sqlite3.connect(self.db) as conn:
             metadata = json.loads(conn.execute("SELECT metadata_json FROM bnl_journal_private_metadata").fetchone()[0])

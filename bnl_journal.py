@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import bnl_broadcast_ballads as ballads
+import bnl_journal_attribution as attribution
 from bnl_canon_source_contract import (
     CANON_FACTS,
     CANON_SOURCE_CONTRACT_VERSION,
@@ -43,7 +44,7 @@ JOURNAL_REPAIR_VERSION = "journal-targeted-repair-1"
 JOURNAL_EDITORIAL_VERSION = "journal-public-voices-1"
 JOURNAL_SHARED_INPUT_VERSION = "journal-shared-inputs-2"
 JOURNAL_REFLECTION_VERSION = "journal-dated-reflection-3"
-JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-2"
+JOURNAL_TEST_PREVIEW_VERSION = "journal-private-test-3"
 JOURNAL_CONTROL_SNAPSHOT_VERSION = 1
 JOURNAL_PUBLICATION_READ_VERSION = "canonical_journal_publication_read_v1"
 JOURNAL_PUBLICATION_TOPIC_SCAN_LIMIT = 200
@@ -150,6 +151,24 @@ _PUBLIC_LEAK_RE = re.compile(
 )
 
 _REPAIR_GUIDANCE = {
+    'source_grounded_revision': "Review the complete draft against the ORIGINAL generation-safe packet before approving its writing. "
+        "A valid name or citation does not establish who an action concerns, its recipient, time, room, cause or outcome. "
+        "Correct unsupported connections and invented specifics while preserving the supported story and BNL's own reactions, questions and thematic connections. "
+        "A fact check must not flatten the entry into a report: keep the concrete details and the reflection they inspire. "
+        "Return the complete revised article with accurate citations and metadata.",
+    'source_attribution_failed': "The source editor found attribution or factual support failures in this exact candidate. "
+        "Resolve every supplied issue against original evidence. Preserve distinct speakers' positions, "
+        "recipients, reply order, uncertainty and later clarifications. Do not erase the exchange "
+        "or a qualifying clarification to evade review. Unrelated stories may be omitted; keep "
+        "the meaning and concrete detail of the stories retained. Keep BNL's personal reflection and return the "
+        "complete corrected article; a separate source check will review that exact wording.",
+    'journal_editorial_failed': "The Journal editor found a whole-entry writing or detail-retention problem. "
+        "Use the supplied assessment to revise the actual narrative, not merely add a reaction "
+        "or replace a few report words. Let BNL's particular thoughts and attitude organize the "
+        "entry while retaining the grounded people, music, lore, jokes and clarifications that "
+        "give those thoughts substance. Personal reflection needs no invented community event. "
+        "Keep already-correct factual relationships and return the complete revised article; "
+        "the same editor will review its facts and writing again.",
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
@@ -4482,6 +4501,15 @@ def _bounded_history_for_prompt(
     }
 
 
+def _journal_prompt_source(source: dict[str, Any]) -> dict[str, Any]:
+    """One authority label at the existing writer/reviewer read boundary."""
+    projected = dict(source)
+    projected["authority"] = attribution.source_authority(source)
+    if projected["authority"] == "derived_context":
+        projected["sourceRole"] = "bnl_interpretation"
+    return projected
+
+
 def _eligible_reflection_basis(packet: dict[str, Any]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     seen_refs: set[str] = set()
@@ -4532,8 +4560,8 @@ def build_generation_prompt(
     source_recovery = bool(packet.get("sourceRecoveryMode"))
     historical_basis_mode = low_activity or source_recovery
     context_lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
-    safe_sources = packet.get("safeSources", [])[:MAX_PROMPT_SOURCES]
-    reflection_basis = _eligible_reflection_basis(packet)
+    safe_sources = [_journal_prompt_source(s) for s in packet.get("safeSources", [])[:MAX_PROMPT_SOURCES]]
+    reflection_basis = [_journal_prompt_source(s) for s in _eligible_reflection_basis(packet)]
     coverage_contract = packet.get("evidenceCoverageContract")
     if not isinstance(coverage_contract, dict):
         coverage_contract = build_evidence_coverage_contract(
@@ -5080,6 +5108,9 @@ def validate_article(
         if repair_details is not None and len(repair_details) < 12:
             repair_details.append({"field": field, "check": check, **detail})
 
+    receipt_reason = _source_review_reason(article, packet)
+    if receipt_reason:
+        return receipt_reason
     low_activity = bool(packet.get("lowActivityMode"))
     source_recovery = bool(packet.get("sourceRecoveryMode"))
     historical_basis_mode = low_activity or source_recovery
@@ -5516,6 +5547,8 @@ def _draft_records(
                               if source.get("refId") in _article_cited_refs(article)]
     meta = dict(article.get("metadata") or {})
     meta.pop("subjectRefs", None)
+    if meta.get("sourceReview"):
+        meta["sourceReviewRequiredVersion"] = 4
     context_uses = [item for item in meta.get("contextUses", []) if isinstance(item, dict)]
     used_context_lanes, used_context_provenance = _used_context_lane_metadata(packet, context_uses)
     used_reflection_basis, used_reflection_provenance = (
@@ -5616,22 +5649,119 @@ def _generation_error_details(exc: Exception) -> tuple[str, str]:
     return "provider_failure", "provider_failure"
 
 
-def _moment_impression_generation_guard(db_path: str, guild_id: int, packet: dict[str, Any]):
-    """Recheck every supplied impression, including one the writer never cites."""
+def _journal_generation_guard(
+    db_path: str, guild_id: int, packet: dict[str, Any], *,
+    attempt_fence: Optional[tuple[str, int]] = None,
+):
+    """Use existing source/lease owners before and after every writer/editor call."""
     provenance = [item for item in packet.get("privateSharedSourceProvenance", [])
                   if isinstance(item, dict) and item.get("sourceKind") == "moment_impression"]
-    if not provenance:
+    archived = bool(packet.get("sourceArchiveAvailable"))
+    if not archived and not provenance and attempt_fence is None:
         return None
 
     def current() -> str:
         try:
             with _read_source_database(db_path) as conn:
+                if not _attempt_fence_owned(conn, attempt_fence):
+                    return "preparation_epoch_lost"
+                if archived:
+                    # Manual and scheduled generation share the existing frozen
+                    # source checker, including unselected-but-supplied roots.
+                    from bnl_journal_automation import _frozen_packet_invalidation_reason
+                    return _frozen_packet_invalidation_reason(conn, guild_id, packet)
                 if journal_shared_source_provenance_is_current(conn, guild_id, provenance):
                     return ""
         except sqlite3.Error:
             pass
         return "privacy_source_ineligible"
     return current
+
+
+def _source_review_evidence(packet: dict[str, Any]) -> dict[str, Any]:
+    """Review the existing governed packet; never fetch a new source or private row."""
+    reflections = _eligible_reflection_basis(packet)
+    sources = [*packet.get("safeSources", []), *reflections]
+    for impression in reflections:
+        if impression.get("basisKind") == "moment_impression":
+            # These are separately revalidated originals from the shared reader,
+            # unlike the derived contribution summaries on ordinary Moments.
+            sources.extend(impression.get("evidence", []))
+    lanes = packet.get("generationContextLanes") or {}
+    for item in lanes.get("establishedBroadcastMemory", []):
+        sources.append({**item, "refId": item["laneRefId"]})
+    for item in lanes.get("communityRumors", []):
+        sources.append({**item, "refId": item["laneRefId"], "sourceRole": "unconfirmed_rumor",
+                        "summary": " ".join(str(e.get("summary") or "") for e in item.get("evidence", []))})
+    inference = lanes.get("bnlInference")
+    if isinstance(inference, dict) and inference.get("laneRefId"):
+        sources.append({**inference, "refId": inference["laneRefId"], "sourceRole": "bnl_inference",
+                        "summary": str(inference.get("summary") or inference.get("candidateThemes") or "")})
+    sources.extend({"refId": f"canon:{fact.subject.key}:{fact.predicate}",
+                    "sourceRole": "approved_canon",
+                    "summary": json.dumps(asdict(fact), ensure_ascii=False, default=str)}
+                   for fact in CANON_FACTS if fact.visibility == Visibility.PUBLIC_SAFE)
+    history = _bounded_history_for_prompt(packet.get("history", {}), as_of=packet.get("sourceWindowEnd"))
+    for entry in [history.get("previousEntry"), *history.get("relevantOlderEntries", [])]:
+        if isinstance(entry, dict) and entry.get("entryId"):
+            sources.append({"refId": "history:" + str(entry["entryId"]), "sourceRole": "bnl_interpretation",
+                            "summary": _json(entry), "observedAt": entry.get("publishedAt")})
+    # Duplicate originals can support several impressions but never count as
+    # independent witnesses. Conflicting projections must not pick a winner.
+    by_ref = {}
+    for source in sources:
+        projected = _journal_prompt_source(source)
+        ref = str(projected.get("refId") or "")
+        if not ref or (ref in by_ref and by_ref[ref] != projected):
+            raise ValueError("source_review_conflicting_evidence")
+        by_ref[ref] = projected
+    return {"sources": list(by_ref.values()), "contextLanes": lanes,
+            "sourceWindowStart": packet.get("sourceWindowStart"),
+            "sourceWindowEnd": packet.get("sourceWindowEnd"),
+            "communityTimeZone": "America/Los_Angeles"}
+
+
+def _source_review_context_contract(packet: dict[str, Any]) -> dict[str, Any]:
+    return {**_context_lane_ref_contract(packet), "__journal_window__": {
+        "sourceWindowStart": packet.get("sourceWindowStart"),
+        "sourceWindowEnd": packet.get("sourceWindowEnd"),
+    }}
+
+
+def _source_review_reason(article: dict[str, Any], packet: dict[str, Any], *, required: bool = False) -> str:
+    receipt = (article.get("metadata") or {}).get("sourceReview")
+    if receipt is None:
+        return "source_review_required" if required else ""
+    if (not isinstance(receipt, dict) or receipt.get("version") != 4
+            or receipt.get("verdict") != "supported"
+            or receipt.get("articleDigest") != attribution.article_digest(article)):
+        return "source_review_candidate_changed"
+    try:
+        evidence = _source_review_evidence(packet)
+        expected = attribution.evidence_digest(evidence["sources"], context_contract=_source_review_context_contract(packet))
+    except (TypeError, ValueError, KeyError):
+        return "source_review_evidence_changed"
+    return "" if receipt.get("evidenceDigest") == expected else "source_review_evidence_changed"
+
+
+def _stored_source_review_reason(canonical: bytes, metadata: dict[str, Any]) -> str:
+    # Legacy saved/owed occurrences remain deliverable through their existing
+    # controls. Every newly stored candidate records this requirement locally.
+    required = bool(metadata.get("sourceReviewRequiredVersion"))
+    receipt = metadata.get("sourceReview")
+    if receipt is None:
+        return "source_review_required" if required else ""
+    try:
+        entry = json.loads(canonical.decode("utf-8"))["entry"]
+        article = {key: entry[key] for key in ("title", "excerpt", "sections")}
+        article.update(metadata=metadata, sourceRefIds=metadata.get("sourceRefIds", {}))
+        if (isinstance(receipt, dict) and receipt.get("version") == 4
+                and receipt.get("verdict") == "supported"
+                and receipt.get("articleDigest") == attribution.article_digest(article)):
+            return ""
+    except (ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return "source_review_candidate_changed"
 
 
 def _generate_article_with_repairs(
@@ -5642,154 +5772,121 @@ def _generate_article_with_repairs(
     *,
     max_attempts: Optional[int] = None,
     generation_guard: Optional[Callable[[], str]] = None,
+    initial_output: str = "",
+    initial_repair_reason: str = "",
 ) -> tuple[Optional[dict[str, Any]], str, bool]:
-    """Return the best blocking-clean article without letting polish cancel publication."""
-    def observe(event: dict[str, Any]) -> None:
-        if attempt_observer is None:
-            return
-        try:
-            attempt_observer(event)
-        except Exception:
-            # Diagnostics must never become a new publication dependency.
-            return
+    """Write/review/repair/review within the existing four total calls.
 
-    last_reason = ""
-    previous_output = ""
-    last_repair_details: list[dict[str, Any]] = []
-    retained_publishable: Optional[dict[str, Any]] = None
-    attempt_limit = JOURNAL_GENERATION_ATTEMPTS if max_attempts is None else max(1, min(int(max_attempts), JOURNAL_GENERATION_ATTEMPTS))
-    for attempt in range(attempt_limit):
-        attempt_number = attempt + 1
-        if generation_guard:
-            guard_reason = generation_guard()
-            if guard_reason:
-                return None, guard_reason, False
-        observe({
-            "generationAttempt": attempt_number,
-            "phase": "started",
-            "repairReason": last_reason,
-        })
+    A review never rewrites the candidate it authorizes. All subsequent edits
+    require another review; source IDs alone never establish semantic support.
+    """
+    def observe(event: dict[str, Any]) -> None:
+        if attempt_observer is not None:
+            try:
+                attempt_observer(event)
+            except Exception:
+                pass
+
+    def guard_reason() -> str:
         try:
-            if attempt:
-                logging.info(
-                    "journal_repair_requested version=%s attempt=%s reason=%s targets=%s",
-                    JOURNAL_REPAIR_VERSION,
-                    attempt_number,
-                    last_reason,
-                    ",".join(
-                        str(item["field"]) + ":" + str(item["check"])
-                        for item in last_repair_details
-                    ) or "structure",
-                )
-            raw = generator(
-                packet,
-                build_generation_prompt(
-                    packet,
-                    repair_reason=last_reason,
-                    previous_output=previous_output,
-                    repair_details=last_repair_details,
-                ) if attempt else build_generation_prompt(packet),
-            )
-            if generation_guard:
-                guard_reason = generation_guard()
-                if guard_reason:
-                    return None, guard_reason, False
+            return str(generation_guard() or "") if generation_guard else ""
+        except Exception:
+            return "generation_guard_unavailable"
+
+    last_reason, previous_output = initial_repair_reason, initial_output
+    targets: list[dict[str, Any]] = []
+    retained: Optional[dict[str, Any]] = None
+    candidate: Optional[dict[str, Any]] = None
+    candidate_validation = ""
+    try:
+        evidence = _source_review_evidence(packet)
+    except (ValueError, TypeError, KeyError):
+        return None, "source_review_conflicting_evidence", False
+    limit = JOURNAL_GENERATION_ATTEMPTS if max_attempts is None else max(1, min(int(max_attempts), JOURNAL_GENERATION_ATTEMPTS))
+    for attempt in range(limit):
+        invalidation = guard_reason()
+        if invalidation:
+            return None, invalidation, False
+        reviewing = candidate is not None
+        if attempt and not reviewing and limit - attempt < 2:
+            # A rewrite cannot be released without another review. Preserve an
+            # earlier reviewed candidate or the actual failure instead of
+            # spending the final call on output that must be discarded.
+            return (retained, "", True) if retained else (None, last_reason or "generation_failed", False)
+        observe({"generationAttempt": attempt + 1, "phase": "started", "repairReason": last_reason})
+        if attempt:
+            logging.info("journal_repair_requested version=%s attempt=%s reason=%s targets=%s",
+                         JOURNAL_REPAIR_VERSION, attempt + 1, last_reason,
+                         ",".join(str(x["field"]) + ":" + str(x["check"]) for x in targets) or "structure")
+        prompt = (attribution.review_prompt(candidate, evidence) if reviewing else
+                  build_generation_prompt(packet, repair_reason=last_reason,
+                                          previous_output=previous_output, repair_details=targets)
+                  if attempt or initial_repair_reason else build_generation_prompt(packet))
+        try:
+            raw = generator(packet, prompt)
         except Exception as exc:
-            if generation_guard:
-                guard_reason = generation_guard()
-                if guard_reason:
-                    return None, guard_reason, False
-            if retained_publishable is not None:
-                observe({
-                    "generationAttempt": attempt_number,
-                    "phase": "finished",
-                    "outcome": "provider_failure",
-                    "reason": "provider_failure_after_publishable_advisory",
-                    "retainedPublishable": True,
-                })
-                return retained_publishable, "", True
+            invalidation = guard_reason()
+            if invalidation:
+                observe({"generationAttempt": attempt + 1, "phase": "finished",
+                         "outcome": "source_invalidated", "reason": invalidation})
+                return None, invalidation, False
             reason, outcome = _generation_error_details(exc)
-            observe({
-                "generationAttempt": attempt_number,
-                "phase": "finished",
-                "outcome": outcome,
-                "reason": reason,
-            })
-            return None, reason, False
+            observe({"generationAttempt": attempt + 1, "phase": "finished", "outcome": outcome,
+                     "reason": reason, **({"retainedPublishable": True} if retained else {})})
+            return (retained, "", True) if retained else (None, reason, False)
+        invalidation = guard_reason()
+        if invalidation:
+            observe({"generationAttempt": attempt + 1, "phase": "finished",
+                     "outcome": "source_invalidated", "reason": invalidation})
+            return None, invalidation, False
+        event = {"generationAttempt": attempt + 1, "phase": "finished",
+                 "responseBytes": len(str(raw).encode("utf-8", errors="replace"))}
+        if reviewing:
+            receipt, reason, targets = attribution.accept_review(
+                raw, candidate, evidence["sources"],
+                context_contract=_source_review_context_contract(packet),
+            )
+            if reason:
+                last_reason = reason
+                observe({**event, "outcome": "source_review_rejected", "reason": reason})
+                if reason in {"source_attribution_failed", "journal_editorial_failed"}:
+                    # Repair the original candidate, not the review JSON.
+                    candidate = None
+                    continue
+                # A protocol failure needs a code/input fix, not another
+                # identical paid request. Never return an unreviewed draft.
+                return (retained, "", True) if retained else (None, reason, False)
+            candidate["metadata"]["sourceReview"] = receipt
+            if not candidate_validation:
+                observe({**event, "outcome": "accepted", "reason": ""})
+                return candidate, "", False
+            retained = candidate
+            candidate = None
+            last_reason = candidate_validation
+            targets = []
+            observe({**event, "outcome": "advisory_publishable", "reason": last_reason,
+                     "retainedPublishable": True})
+            continue
         previous_output = raw
-        last_repair_details = []
-        response_bytes = len(
-            str(raw).encode("utf-8", errors="replace")
-        )
+        targets = []
         try:
             article = parse_generated_json(raw)
         except ValueError as exc:
             last_reason = str(exc)
-            observe({
-                "generationAttempt": attempt_number,
-                "phase": "finished",
-                "outcome": "parse_rejected",
-                "reason": last_reason,
-                "responseBytes": response_bytes,
-            })
+            observe({**event, "outcome": "parse_rejected", "reason": last_reason})
             continue
-
-        blocking_reason = validate_article(
-            article,
-            packet,
-            prior_titles,
-            blocking_only=True,
-            repair_details=last_repair_details,
-        )
-        if blocking_reason:
-            last_reason = blocking_reason
-            observe({
-                "generationAttempt": attempt_number,
-                "phase": "finished",
-                "outcome": "validation_rejected",
-                "reason": last_reason,
-                "responseBytes": response_bytes,
-            })
+        reason = validate_article(article, packet, prior_titles, blocking_only=True, repair_details=targets)
+        if not reason:
+            reason = validate_article(article, packet, prior_titles, repair_details=targets)
+        if reason and reason not in ADVISORY_VALIDATION_REASONS:
+            last_reason = reason
+            observe({**event, "outcome": "validation_rejected", "reason": reason})
             continue
-
-        validation = validate_article(
-            article, packet, prior_titles, repair_details=last_repair_details
-        )
-        if not validation:
-            observe({
-                "generationAttempt": attempt_number,
-                "phase": "finished",
-                "outcome": "accepted",
-                "reason": "",
-                "responseBytes": response_bytes,
-            })
-            return article, "", False
-        if validation not in ADVISORY_VALIDATION_REASONS:
-            # Future validation reasons remain blocking unless explicitly
-            # classified as editorial guidance above.
-            last_reason = validation
-            observe({
-                "generationAttempt": attempt_number,
-                "phase": "finished",
-                "outcome": "validation_rejected",
-                "reason": last_reason,
-                "responseBytes": response_bytes,
-            })
-            continue
-        retained_publishable = article
-        last_reason = validation
-        observe({
-            "generationAttempt": attempt_number,
-            "phase": "finished",
-            "outcome": "advisory_publishable",
-            "reason": last_reason,
-            "responseBytes": response_bytes,
-            "retainedPublishable": True,
-        })
-
-    if retained_publishable is not None:
-        return retained_publishable, "", True
-    return None, last_reason or "generation_failed", False
+        candidate, candidate_validation = article, reason
+        last_reason = "source_grounded_revision"
+        targets = []
+        observe({**event, "outcome": "source_revision_required", "reason": last_reason})
+    return (retained, "", True) if retained else (None, last_reason or "generation_failed", False)
 
 
 def store_validated_draft(
@@ -5804,6 +5901,9 @@ def store_validated_draft(
     attempt_fence: Optional[tuple[str, int]] = None,
     source_hash: str = "",
 ) -> JournalResult:
+    review_reason = _source_review_reason(article, packet, required=True)
+    if review_reason:
+        return JournalResult(False, "no_draft", review_reason, entry_id=entry_id, revision=revision)
     ensure_schema(db_path)
     basis = packet.get("privateSharedSourceProvenance", [])
     publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis))
@@ -5869,7 +5969,7 @@ def generate_and_store_packet_draft(
         generator,
         prior_titles,
         attempt_observer,
-        generation_guard=_moment_impression_generation_guard(db_path, guild_id, packet),
+        generation_guard=_journal_generation_guard(db_path, guild_id, packet, attempt_fence=attempt_fence),
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id=entry_id)
@@ -5917,7 +6017,7 @@ def generate_test_preview(
     now: Optional[str] = None,
     excluded_history_entry_ids: Optional[set[str]] = None,
 ) -> dict[str, Any]:
-    """One in-memory daily-style preview; never create a draft or a run.
+    """One unreviewed in-memory first draft; never create a draft or a run.
 
     Source readers skip schema preparation/backfill and open SQLite read-only.
     The caller's normal provider accounting remains active, but generated prose
@@ -5953,7 +6053,7 @@ def generate_test_preview(
     # parseable, privacy-clean result even when attribution or coverage needs
     # attention. Never enter the production repair or storage lifecycle.
     try:
-        guard = _moment_impression_generation_guard(db_path, guild_id, packet)
+        guard = _journal_generation_guard(db_path, guild_id, packet)
         if guard and guard():
             result["reason"] = "privacy_source_ineligible"
             return result
@@ -5981,9 +6081,11 @@ def generate_test_preview(
     result.update({
         "ok": True,
         "editorialAdvisory": bool(advisory_reason),
+        "sourceReviewStatus": "not_run",
+        "deterministicCheck": {"ok": not bool(publication_reason), "reason": publication_reason},
         "publicationCheck": {
-            "ok": not bool(publication_reason),
-            "reason": publication_reason,
+            "ok": False,
+            "reason": publication_reason or "source_review_required",
             # Only structural pointers; no private claims, IDs, or lane refs.
             "locations": [{k: v for k, v in item.items() if k in {"field", "check", "sentenceIndex"}}
                           for item in details],
@@ -6052,6 +6154,10 @@ def approve_draft(
             return JournalResult(False, "draft", "request_body_too_large", entry_id, rev, stored_hash)
         request_hash = canonical_payload_hash(canonical)
         metadata = _json_object(row[4])
+        review_reason = _stored_source_review_reason(canonical, metadata)
+        if review_reason:
+            conn.rollback()
+            return JournalResult(False, "draft", review_reason, entry_id, rev, stored_hash)
         publication_failure = ballads.publication_source_failure(metadata.get("sharedInputSourceProvenance", []), publication_snapshot)
         if publication_failure:
             conn.rollback()
@@ -6162,7 +6268,7 @@ def regenerate_draft(
         packet,
         generator,
         prior_titles,
-        generation_guard=_moment_impression_generation_guard(db_path, guild_id, packet),
+        generation_guard=_journal_generation_guard(db_path, guild_id, packet),
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id, old_revision)
@@ -6291,6 +6397,10 @@ def deliver_approved(
                     conn.rollback()
                     return JournalResult(False, "not_deliverable", "not_approved", entry_id, int(revision or 0))
                 rev, canonical, content_hash = int(row[0]), bytes(row[1] or b""), row[2]
+                review_reason = _stored_source_review_reason(canonical, identity_meta)
+                if review_reason:
+                    conn.rollback()
+                    return JournalResult(False, "not_deliverable", review_reason, entry_id, rev)
                 if delivery_preflight is not None:
                     preflight_reason = str(delivery_preflight(conn) or "")
                     if preflight_reason:
@@ -6375,6 +6485,9 @@ def deliver_approved(
     if not row:
         return JournalResult(False, "not_deliverable", "not_approved", entry_id)
     rev, canonical, content_hash = int(row[0]), row[1], row[2]
+    review_reason = _stored_source_review_reason(canonical, identity_meta)
+    if review_reason:
+        return JournalResult(False, "not_deliverable", review_reason, entry_id, rev)
     publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis, base_url))
     if publication_failure:
         return JournalResult(False, "not_deliverable", publication_failure, entry_id, rev)

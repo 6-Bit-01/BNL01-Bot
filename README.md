@@ -590,6 +590,18 @@ without an unrelated factual-inference declaration. This
 does not grant factual authority over another person's actions or motives;
 those claims retain the existing evidence and inference rules. The grammatical
 guard is conservative and does not replace semantic source review.
+New Journal generation uses the existing four-attempt allowance for writing,
+source review, and, when needed, revision and another review. The source editor
+checks the exact prose and proposed continuity metadata against the same
+governed originals, including the original exchanges accompanying impressions.
+It retains BNL's subjective perspective without granting it event authority.
+Review receipts bind the article, notes, evidence and source window; an edited
+or unreviewed candidate cannot enter storage as reviewed. Saved new candidates
+are checked again before approval and delivery. Legacy owed payloads retain
+their existing release path. The one-call private preview remains an unreviewed
+first draft and cannot report factual publication acceptance. A model reviewer
+can still make semantic mistakes; offline flow tests do not establish its
+judgment, and real-source acceptance remains a separate rehearsal decision.
 Relays, Ambient, artwork, Ballads, dossiers, memory-tier promotion, and
 Relationship activation remain outside this pilot.
 

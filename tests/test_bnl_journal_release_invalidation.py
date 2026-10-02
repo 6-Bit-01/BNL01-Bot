@@ -13,6 +13,7 @@ import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
 from tests.test_bnl_journal_prepared_release import AcceptedResponse, article_json
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 
 
 TARGET_DAY = date(2026, 7, 20)
@@ -133,6 +134,8 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
 
     @staticmethod
     def memory_generator(packet, _prompt):
+        if is_source_review(_prompt):
+            return supported_review(_prompt)
         memory = packet["generationContextLanes"]["establishedBroadcastMemory"][0]
         fresh_ref = memory["matchedFreshSourceRefIds"][0]
         claim = (
@@ -157,7 +160,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
         return automation.prepare_daily(
             self.db,
             1,
-            generator or (lambda packet, _prompt: article_json(packet)),
+            generator or (with_supported_review(lambda packet, _prompt: article_json(packet))),
             target_day=TARGET_DAY,
             force=True,
         )
@@ -308,7 +311,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
             published = automation.run_daily(
                 self.db,
                 1,
-                lambda packet, _prompt: article_json(packet),
+                with_supported_review(lambda packet, _prompt: article_json(packet)),
                 "https://site.example",
                 "key",
                 target_day=day,
@@ -320,7 +323,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
         prepared = automation.prepare_weekly(
             self.db,
             1,
-            lambda packet, _prompt: article_json(packet),
+            with_supported_review(lambda packet, _prompt: article_json(packet)),
             target_monday=WEEK_START,
             force=True,
         )

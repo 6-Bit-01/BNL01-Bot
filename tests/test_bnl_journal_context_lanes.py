@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import bnl_journal as journal
+from tests.journal_review_helpers import reviewed_article, with_supported_review
 
 
 def _long_body(opening: str) -> str:
@@ -426,7 +427,7 @@ class JournalContextLaneTests(unittest.TestCase):
             }]
             return json.dumps(previous)
 
-        article, reason, advisory = journal._generate_article_with_repairs(packet, generator, [])
+        article, reason, advisory = journal._generate_article_with_repairs(packet, with_supported_review(generator), [])
         self.assertEqual("", reason)
         self.assertFalse(advisory)
         self.assertEqual(2, len(calls))
@@ -608,7 +609,7 @@ class JournalContextLaneTests(unittest.TestCase):
             lane_ref=rumor["laneRefId"],
             basis=[rumor["laneRefId"], fresh_ref],
         )
-        result = journal.store_validated_draft(self.db, 1, packet, article)
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(article, packet))
         self.assertTrue(result.ok, result.reason)
         with sqlite3.connect(self.db) as conn:
             metadata = json.loads(conn.execute(
@@ -669,7 +670,7 @@ class JournalContextLaneTests(unittest.TestCase):
                 self.db,
                 1,
                 packet,
-                initial_article,
+                reviewed_article(initial_article, packet),
                 entry_id=entry_id,
             )
             self.assertTrue(stored.ok, stored.reason)
@@ -705,7 +706,7 @@ class JournalContextLaneTests(unittest.TestCase):
                     1,
                     entry_id,
                     72,
-                    lambda *_args: json.dumps(generated),
+                    with_supported_review(lambda *_args: json.dumps(generated)),
                 )
             self.assertTrue(result.ok, result.reason)
             build_packet.assert_called_once_with(self.db, 1, 72, entry_kind=kind)

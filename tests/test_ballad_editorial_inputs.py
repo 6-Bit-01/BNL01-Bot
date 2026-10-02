@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 """Published selection, immutable versions, and saved editorial delivery fences."""
 import asyncio
 import copy
@@ -20,6 +21,7 @@ import bnl_website_relay_state as relay
 from tests import test_bnl_journal_shared_inputs as journal_fixture
 from tests import test_relay_shared_inputs as relay_fixture
 from tests.test_bnl_journal_prepared_release import article_json, AcceptedResponse
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 
 
 class CatalogResponse:
@@ -216,6 +218,8 @@ class BalladJournalInputsTests(unittest.TestCase):
     def test_withdrawal_during_generation_prevents_even_uncited_draft_storage(self):
         packet = self.fixture.packet()
         def generate(value, prompt):
+            if is_source_review(prompt):
+                return supported_review(prompt)
             self.catalog.clear()
             return article_json(value)
         result = journal.generate_and_store_packet_draft(self.db, 1, packet, generate)
@@ -225,7 +229,7 @@ class BalladJournalInputsTests(unittest.TestCase):
 
     def draft(self):
         packet = self.fixture.packet()
-        result = journal.store_validated_draft(self.db, 1, packet, journal.parse_generated_json(article_json(packet)))
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(journal.parse_generated_json(article_json(packet)), packet))
         self.assertTrue(result.ok, result)
         return result
 
@@ -270,7 +274,7 @@ class BalladJournalInputsTests(unittest.TestCase):
 
     def prepared(self):
         self.fixture.add_show()
-        result = automation.prepare_daily(self.db, 1, lambda packet, prompt: article_json(packet), target_day=date(2026, 8, 27), force=True)
+        result = automation.prepare_daily(self.db, 1, with_supported_review(lambda packet, prompt: article_json(packet)), target_day=date(2026, 8, 27), force=True)
         self.assertEqual(result.status, "prepared", result)
         return result
 

@@ -1,3 +1,4 @@
+from tests.journal_review_helpers import reviewed_article
 import copy
 import json
 import sqlite3
@@ -6,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.journal_review_helpers import is_source_review, supported_review, with_supported_review
 import bnl_journal as journal
 import bnl_journal_automation as automation
 import bnl_journal_source_store as archive
@@ -196,7 +198,7 @@ class QuietJournalTests(unittest.TestCase):
         packet = self.packet()
         source = next(s for s in packet["reflectionBasis"] if s.get("relayTopicKind") == "published_journal")
         article = self.article(packet, "An earlier Journal stays in its own day. Tonight I imagine the archive growing wings.", refs=[source["refId"]])
-        result = journal.store_validated_draft(self.db, 1, packet, article)
+        result = journal.store_validated_draft(self.db, 1, packet, reviewed_article(article, packet))
         self.assertTrue(result.ok, result)
         with sqlite3.connect(self.db) as conn:
             metadata = json.loads(conn.execute("SELECT metadata_json FROM bnl_journal_private_metadata").fetchone()[0])
@@ -214,6 +216,8 @@ class QuietJournalTests(unittest.TestCase):
         calls = []
         def writer(source_packet, prompt):
             calls.append(prompt)
+            if is_source_review(prompt):
+                return supported_review(prompt)
             article = self.article(source_packet, "Tonight I imagine the queue as a hallway of humming doors.")
             for section in article["sections"]:
                 section["sourceRefIds"] = article["sourceRefIds"][section["heading"]]
@@ -223,7 +227,7 @@ class QuietJournalTests(unittest.TestCase):
             second = automation._prepare_daily_window(self.db, 1, writer, START, END, "2026-09-23")
         self.assertEqual(first.status, "prepared", first)
         self.assertEqual(second.status, "prepared", second)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":
