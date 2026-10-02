@@ -268,6 +268,26 @@ class JournalContextLaneTests(unittest.TestCase):
         self.assertIn("No optional context lane qualified", prompt)
         self.assertIn("contextUses as an empty list", prompt)
 
+    def test_uncertain_framing_keeps_declared_rumor_provenance_required(self):
+        packet = self.packet()
+        rumor = packet["generationContextLanes"]["communityRumors"][0]
+        fresh_ref = rumor["evidence"][0]["sourceRefId"]
+        for opening in (
+            "Apparently a hidden synth set is planned for the Friday show.",
+            "The hidden synth set for the Friday show remains unconfirmed.",
+            "There is speculation about a hidden synth set for the Friday show.",
+        ):
+            with self.subTest(opening=opening):
+                article = self.article(
+                    packet, opening, lane_type="community_rumor", lane_ref=rumor["laneRefId"],
+                    basis=[rumor["laneRefId"], fresh_ref],
+                )
+                self.assertEqual("", journal.validate_article(article, packet, []))
+                article["metadata"]["contextUses"] = []
+                # Matching the actual supplied rumor still requires its lane;
+                # merely replacing the wording cannot launder it into fact.
+                self.assertEqual("undeclared_context_use", journal.validate_article(article, packet, []))
+
     def test_rumor_cannot_be_promoted_to_fact_or_used_without_provenance(self):
         packet = self.packet()
         rumor = packet["generationContextLanes"]["communityRumors"][0]

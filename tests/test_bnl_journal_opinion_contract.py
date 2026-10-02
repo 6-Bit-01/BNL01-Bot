@@ -60,6 +60,52 @@ class JournalOpinionContractTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(journal.validate_article(self.article(body), packet), "")
 
+    def test_reported_uncertainty_does_not_create_a_community_rumor(self):
+        for body in (
+            "Test Member asked why the reply was so gentle, apparently surprised by its tone.",
+            "Test Member speculated that a quieter arrangement could leave room for the chorus.",
+            "Test Member described the arrangement as unconfirmed and asked us to wait.",
+            "Apparently, I prefer the rough demo to the polished one.",
+        ):
+            for with_impression in (False, True):
+                with self.subTest(body=body, with_impression=with_impression):
+                    packet = self.packet()
+                    packet["safeSources"][0]["summary"] = body
+                    if not with_impression:
+                        packet["reflectionBasis"] = []
+                    article = self.article(body)
+                    article["sections"][0]["sourceRefIds"] = ["fresh:exchange"]
+                    self.assertEqual(journal.validate_article(article, packet), "")
+                    self.assertEqual(packet["generationContextLanes"], {})
+                    self.assertEqual(article["metadata"]["contextUses"], [])
+
+    def test_uncertain_title_and_excerpt_still_reach_source_review(self):
+        packet = self.packet()
+        for field, text in (("title", "Apparently I Enjoy the Rough Edges"),
+                            ("excerpt", "Test Member offered an unconfirmed idea for the next chorus.")):
+            with self.subTest(field=field):
+                article = self.article("Test Member teased BNL about the familiar disagreement.")
+                article[field] = text
+                self.assertEqual(journal.validate_article(article, packet), "")
+                self.assertEqual(journal._source_review_reason(article, packet, required=True),
+                                 "source_review_required")
+
+    def test_explicit_rumor_attribution_still_requires_its_lane(self):
+        for body in (
+            "A rumor suggests another performance is coming.",
+            "Some regulars wonder whether another performance is coming.",
+            "Word around the room is that another performance is coming.",
+        ):
+            for field in ("title", "excerpt", "body"):
+                with self.subTest(body=body, field=field):
+                    article = self.article("Test Member teased BNL about the familiar disagreement.")
+                    if field == "body":
+                        article["sections"][0]["body"] = body
+                    else:
+                        article[field] = body
+                    self.assertEqual(journal.validate_article(article, self.packet()),
+                                     "undeclared_context_use")
+
     def test_actual_external_action_state_and_motive_are_not_personal_taste(self):
         packet = self.packet()
         for body in (
@@ -161,7 +207,7 @@ class JournalOpinionContractTests(unittest.TestCase):
     def test_rumor_and_privacy_rules_still_apply_to_a_reflective_section(self):
         packet = self.packet()
         self.assertEqual(journal.validate_article(self.article(
-            "I suspect he would miss the noise if the room fell silent. Apparently a hidden set is coming."
+            "I suspect he would miss the noise if the room fell silent. A rumor says a hidden set is coming."
         ), packet), "undeclared_context_use")
         self.assertEqual(journal.validate_article(self.article(
             "I suspect he would miss the noise if the room fell silent. Contact <@123456789012345678>."

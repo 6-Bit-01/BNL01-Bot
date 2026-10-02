@@ -125,9 +125,16 @@ _RUMOR_SENSITIVE_RE = re.compile(
     r"moderation|password|payment|phone|private|relationship|secret|sexual|staff|suicid|therapy|workplace)\b",
     re.IGNORECASE,
 )
-_EXPLICIT_RUMOR_RE = re.compile(
+# Framing an already-declared rumor and asserting that a rumor exists are
+# different checks. Ordinary reported uncertainty can use these stance words
+# without drawing on a community-rumor lane; source review still checks it.
+_RUMOR_FRAMING_RE = re.compile(
     r"\b(?:apparently|rumou?r|some regulars (?:say|suspect|wonder)|speculat(?:e|ed|ing|ion)|unconfirmed|"
     r"word around|word is)\b",
+    re.IGNORECASE,
+)
+_RUMOR_ATTRIBUTION_RE = re.compile(
+    r"\b(?:rumou?r|some regulars (?:say|suspect|wonder)|word around|word is)\b",
     re.IGNORECASE,
 )
 _EXPLICIT_BNL_INFERENCE_RE = re.compile(
@@ -5462,7 +5469,7 @@ def validate_article(
         target_claim_sentences = _claim_matching_sentences(claim, section_text[heading])
         if lane_type == "community_rumor" and (
             not target_claim_sentences
-            or any(not _EXPLICIT_RUMOR_RE.search(sentence) for sentence in target_claim_sentences)
+            or any(not _RUMOR_FRAMING_RE.search(sentence) for sentence in target_claim_sentences)
         ):
             return "rumor_not_explicitly_framed"
         if lane_type == "bnl_inference" and (
@@ -5477,12 +5484,12 @@ def validate_article(
     }
     for field in ("title", "excerpt"):
         text = str(article.get(field) or "")
-        if _EXPLICIT_RUMOR_RE.search(text) or _has_external_inference_claim(text, packet):
+        if _RUMOR_ATTRIBUTION_RE.search(text) or _has_external_inference_claim(text, packet):
             undeclared = True
             report(field, "context_claim_outside_body")
     for heading, text in section_text.items():
         declared_types = declared_types_by_heading.get(heading, set())
-        if _EXPLICIT_RUMOR_RE.search(text) and "community_rumor" not in declared_types:
+        if _RUMOR_ATTRIBUTION_RE.search(text) and "community_rumor" not in declared_types:
             undeclared = True
             report(body_fields[heading], "missing_context_declaration", laneType="community_rumor")
         original_refs = {str(source.get("refId")) for source in packet.get("safeSources", [])
