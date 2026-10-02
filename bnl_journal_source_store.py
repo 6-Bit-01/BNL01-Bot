@@ -13,7 +13,7 @@ import re
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -399,6 +399,82 @@ def record_source_event(
             public_usable=public_usable,
             metadata=metadata,
             ingested_at_ms=ingested_at_ms,
+        )
+
+
+def record_tiktok_engagement_event(
+    db_path: str,
+    *,
+    guild_id: int,
+    record: Mapping[str, Any],
+) -> SourceRecordResult:
+    """Land measured public engagement in the existing immutable source owner.
+
+    Replay uses the original event identity and preserves its first receipt.
+    Only a changed receipt clock is ignored; changed measurements or platform
+    time are conflicts. These anonymous show observations never write personal
+    memory, a Moment, an impression, or a platform/account binding.
+    """
+    from bnl_tiktok_live_memory import archive_record
+
+    normalized = archive_record(record)
+    if normalized is None or normalized.get("archive_policy") != "durable_public_engagement":
+        return SourceRecordResult(False, "rejected", reason="invalid_engagement_record")
+    guild, kind, key, occurred = _validate_identity(
+        guild_id,
+        "tiktok_live_engagement",
+        str(normalized["event_id"]),
+        int(float(normalized.get("source_at") or normalized["observed_at"]) * 1000),
+    )
+    raw = _canonical_json(normalized)
+    event_type = str(normalized["event_type"])
+    summary = "TikTok captured public engagement: " + event_type + "."
+    ensure_schema(db_path)
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT event_seq,raw_text,content_hash FROM bnl_journal_source_events "
+            "WHERE guild_id=? AND source_kind=? AND source_key=?",
+            (guild, kind, key),
+        ).fetchone()
+        if existing:
+            try:
+                original = json.loads(str(existing[1]))
+            except (ValueError, TypeError):
+                original = None
+            if isinstance(original, dict) and str(existing[2]) == _content_hash(str(existing[1])):
+                previous = dict(original)
+                current = dict(normalized)
+                previous.pop("observed_at", None)
+                current.pop("observed_at", None)
+                if previous == current:
+                    return SourceRecordResult(True, "idempotent", int(existing[0]), str(existing[2]))
+            return SourceRecordResult(False, "conflict", int(existing[0]), str(existing[2]),
+                                      "immutable_source_conflict")
+        now_ms = _now_ms()
+        conn.execute(
+            "INSERT OR IGNORE INTO bnl_journal_source_archive_state"
+            "(guild_id,activated_at_ms,created_at_ms) VALUES(?,?,?)",
+            (guild, now_ms, now_ms),
+        )
+        return _record_on_connection(
+            conn,
+            guild_id=guild,
+            source_kind=kind,
+            source_key=key,
+            occurred_at_ms=occurred,
+            raw_text=raw,
+            sanitized_summary=summary,
+            channel_policy="public_context",
+            public_usable=True,
+            metadata={
+                "platform": "tiktok",
+                "eventType": event_type,
+                "roomId": normalized["room_id"],
+                "sourceAuthority": "captured_platform_engagement",
+                "memoryPlacement": "noncanonical_show_evidence",
+                "engagement": normalized,
+            },
         )
 
 

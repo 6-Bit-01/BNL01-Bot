@@ -90,7 +90,7 @@ JOURNAL_REFLECTION_SCOPE = "historical_or_canon"
 # separately through the governed show reader, using their completion time.
 RETROSPECTIVE_RELAY_TYPES = frozenset({
     "conversation_continuity", "broadcast_memory", "canon", "reflection",
-    "public_moment", "finalized_show", "published_journal", "published_ballad",
+    "public_moment", "finalized_show", "tiktok_live_engagement", "published_journal", "published_ballad",
     "quiet", "quiet_source", "non_event_stock", "heartbeat", "hydrated",
 })
 JOURNAL_TOPIC_STOPWORDS = {
@@ -3380,6 +3380,7 @@ def _source_for_prompt(source: dict[str, Any]) -> dict[str, Any]:
         "conversationSurface",
         "publicSpeakerName",
         "sourceClass",
+        "sourceType",
         "showDates",
         "relaySpeech",
         "messageContext",
@@ -4092,22 +4093,25 @@ def _journal_shared_inputs(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Project bounded existing owners; never create or re-enrich memory here."""
     from bnl_moment_engine import public_moment_source_basis, select_public_situation_moment_gists
-    from bnl_tiktok_show_ledger import select_finalized_show_operations
+    from bnl_tiktok_show_ledger import select_shared_show_evidence
 
     start_ms, end_ms = timestamp_to_epoch_ms(start), timestamp_to_epoch_ms(end)
     if start_ms is None or end_ms is None or start_ms >= end_ms:
         return [], [], []
     operations, continuity, provenance = [], [], []
-    for item in select_finalized_show_operations(conn, guild_id=guild_id, source_window_ms=(start_ms, end_ms)):
+    for item in select_shared_show_evidence(conn, guild_id=guild_id, source_window_ms=(start_ms, end_ms)):
+        kind = "tiktok_live_engagement" if item.kind == "engagement" else "finalized_show"
         operations.append({
-            "refId": item.source_ref, "sourceKind": "finalized_show",
+            "refId": item.source_ref, "sourceKind": kind, "sourceType": item.kind,
             "summary": item.text, "observedAt": item.observed_at,
             "sourceClass": item.source_class, "showDates": list(item.show_dates),
         })
         provenance.append({
-            "refId": item.source_ref, "sourceKind": "finalized_show",
-            "sourceId": item.show_keys[0], "sourceVersion": item.source_digest,
+            "refId": item.source_ref, "sourceKind": kind,
+            "sourceId": item.show_keys[0] if item.show_keys else item.source_ref, "sourceVersion": item.source_digest,
             "sourceWindowStart": start, "sourceWindowEnd": end,
+            "originalSourceRefs": [{"sourceKind": "tiktok_live_engagement", "sourceKey": key, "contentHash": digest}
+                                   for key, digest in item.original_source_refs],
         })
     topic = " ".join(journal_topic_counts([*sources, *operations], limit=30))
     selected = select_public_situation_moment_gists(
@@ -4143,7 +4147,7 @@ def journal_shared_source_provenance_is_current(
 ) -> bool:
     """Revalidate exact saved bases in the caller's snapshot, without writes."""
     from bnl_moment_engine import public_moment_source_basis, read_moment_impression
-    from bnl_tiktok_show_ledger import select_finalized_show_operations
+    from bnl_tiktok_show_ledger import select_finalized_show_operations, tiktok_engagement_window_version
 
     if not isinstance(provenance, list):
         return False
@@ -4173,7 +4177,14 @@ def journal_shared_source_provenance_is_current(
                 items = select_finalized_show_operations(
                     conn, guild_id=guild_id, source_window_ms=(start, end), show_keys=(source["sourceId"],),
                 )
-                if len(items) != 1 or items[0].source_digest != source["sourceVersion"]:
+                # Older saved Relay operations did not retain a typed ref.
+                matching = [item for item in items if not source.get("refId") or item.source_ref == source["refId"]]
+                if len(matching) != 1 or matching[0].source_digest != source["sourceVersion"]:
+                    return False
+            elif source.get("sourceKind") == "tiktok_live_engagement":
+                if source.get("refId") != source["sourceId"]:
+                    return False
+                if tiktok_engagement_window_version(conn, guild_id=guild_id, source_ref=source["refId"]) != source["sourceVersion"]:
                     return False
             elif source.get("sourceKind") == "published_ballad":
                 if not ballads.local_publication_basis_is_current(conn, guild_id, source):
@@ -4343,7 +4354,7 @@ def build_packet_from_sources(
         raw = source.pop("rawSummary", None)
         original = str(raw if raw is not None else source.get("summary") or "")
         is_message = source.get("sourceKind") == "conversation"
-        projected = project_summary(original, limit=4000 if source.get("sourceKind") == "finalized_show" else (1001 if is_message else 1000),
+        projected = project_summary(original, limit=4000 if source.get("sourceKind") in {"finalized_show", "tiktok_live_engagement"} else (1001 if is_message else 1000),
                                     original_message=is_message)
         source["summary"] = projected[:1000] if is_message else projected
         if is_message:
@@ -4841,6 +4852,13 @@ def _journal_occurrence_roots(provenance: dict[str, Any]) -> tuple[tuple[str, ..
         roots = [_journal_occurrence_roots(item) if isinstance(item, dict) else () for item in origins]
         return tuple(sorted({root for group in roots for root in group})) if all(roots) else ()
     kind = provenance.get("sourceKind")
+    if kind == "tiktok_live_engagement":
+        originals = provenance.get("originalSourceRefs")
+        if not isinstance(originals, list) or not originals or not all(
+                isinstance(ref, dict) and ref.get("sourceKind") == kind
+                and ref.get("sourceKey") and ref.get("contentHash") for ref in originals):
+            return ()
+        return tuple(sorted({(kind, str(ref["sourceKey"]), str(ref["contentHash"])) for ref in originals}))
     if kind in {"published_ballad", "published_journal", "finalized_show"} and all(
             provenance.get(key) for key in ("sourceId", "sourceVersion")):
         return ((str(kind), str(provenance["sourceId"]), str(provenance["sourceVersion"])),)

@@ -133,6 +133,14 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             )
 
         common_patches = (
+            # Compare identical inputs even when prompt builds cross a second.
+            mock.patch.object(
+                bnl01_bot,
+                "get_temporal_context",
+                return_value=bnl01_bot.get_temporal_context(
+                    bnl01_bot.datetime(2026, 10, 2, 14, 42, 46)
+                ),
+            ),
             mock.patch.object(
                 bnl01_bot,
                 "get_user_profile",

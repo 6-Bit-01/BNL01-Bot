@@ -40,7 +40,7 @@ def evidence_role(item):
         return "original_contribution"
     if kind == "public_source_history" and str(item.get("source_type") or "") in {"discord_message", "tiktok_live_chat"}:
         return "original_contribution"
-    if kind == "finalized_show":
+    if kind in {"finalized_show", "tiktok_live_engagement"}:
         return "recorded_event"
     if kind in {"approved_canon", "established_broadcast_memory"}:
         return "established_context"
@@ -206,7 +206,7 @@ def _packet_items(bot, packet, start, end, guild_id):
         kind = str(source.get("sourceKind") or "community_activity")
         item = {
             "ref": str(source["refId"]), "kind": kind,
-            "text": str(source["summary"])[:4000 if kind == "finalized_show" else 1000],
+            "text": str(source["summary"])[:4000 if kind in {"finalized_show", "tiktok_live_engagement"} else 1000],
             "label": str(source.get("publicSpeakerName") or source.get("conversationSurface") or kind),
             "url": episode_links.get(str(source["refId"]), ""), "occurred_at": _iso(observed), "published_at": "",
             "subject_refs": subjects, "subject_labels": labels, "scope": "window_activity",

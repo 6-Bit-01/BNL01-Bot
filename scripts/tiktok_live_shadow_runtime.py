@@ -12,7 +12,9 @@ from zoneinfo import ZoneInfo
 
 from bnl_tiktok_live_chat import JOIN, VIEWER_SNAPSHOT, LiveChatAdapter
 from bnl_tiktok_live_context import LiveContextSnapshotWriter
-from bnl_tiktok_live_memory import TikTokPublicConversationSpoolWriter
+from bnl_tiktok_live_memory import (
+    TikTokPublicConversationSpoolWriter, collector_boundary_record,
+)
 from scripts.tiktok_live_shadow_model import (
     REPO_ROOT,
     CycleResult,
@@ -47,12 +49,16 @@ async def _consume_stdout(
         duplicates_before = adapter.buffer.duplicates
         invalid_before = int(adapter.health["invalid_lines"])
         event = adapter.ingest_line(raw)
-        if archive_writer is not None and event is not None and event.event_type in {
-            "comment",
-            "question",
-        }:
+        if archive_writer is not None and event is not None:
             try:
-                archive_writer.append(event.telemetry_record())
+                record = event.telemetry_record() if event.is_observation else {
+                    "event_type": event.event_type, "event_id": event.event_id,
+                    "room_id": event.room_id, "observed_at": event.observed_at,
+                    "source_at": event.source_at or None,
+                    **({"error_code": event.error_code} if event.event_type == "transport_error" else {}),
+                }
+                if not archive_writer.append(record):
+                    print("[archive] record_rejected", flush=True)
             except Exception as exc:
                 print(
                     "[archive] append_failed {}".format(
@@ -216,6 +222,19 @@ async def run_transport_cycle(
 
     return_code = await process.wait()
     await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    # A child exit or collection stop is not evidence that the LIVE ended.
+    # Archive the collector's own boundary even when the transport emits none.
+    if archive_writer is not None:
+        try:
+            archive_writer.append(collector_boundary_record(
+                "cycle_stopped", datetime.now(timezone).timestamp(),
+                room_id=str(adapter.health.get("room_id") or ""),
+                reason="live_ended" if state.saw_live_end else stop_reason,
+                return_code=return_code,
+            ))
+        except Exception as exc:
+            print("[archive] boundary_failed {}".format(
+                _safe_code(exc.__class__.__name__)), flush=True)
     if context_writer is not None:
         try:
             context_writer.publish(adapter, force=True)

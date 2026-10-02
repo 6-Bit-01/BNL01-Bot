@@ -1851,7 +1851,7 @@ class TikTokShowEvidenceLedgerTests(unittest.TestCase):
                     max_chars=6000,
                 )
             )
-            self.assertIn("finalized BARCODE Radio evidence", rendered)
+            self.assertIn("BARCODE Radio and captured TikTok evidence", rendered)
             self.assertIn("Queue knowledge does not imply queue control", rendered)
             self.assertIn("Community Canon at Open Signal", rendered)
             self.assertIn("nothing automatically becomes Legacy/Core", rendered)

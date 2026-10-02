@@ -94,7 +94,9 @@ from bnl_moment_engine import (
 from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import proactive_consent_decision, shadow_packet_posture
 from bnl_tiktok_show_ledger import (
+    select_tiktok_engagement_context_items,
     select_tiktok_show_episode_context_items,
+    tiktok_engagement_window_version,
     tiktok_show_episode_context_item_versions,
 )
 from bnl_website_relay_state import (
@@ -3322,16 +3324,16 @@ def _show_episode_items(
     attributed Community Canon / Open Signal utterances.
     """
 
-    if not env_queue_production_enabled(
+    queue_enabled = env_queue_production_enabled(
         dict(environ) if environ is not None else None
-    ):
+    )
+    if not queue_enabled:
         _add_exclusion(
             diagnostics,
             exclusions,
             lane="show_episode",
             reason="show_queue_evidence_local_gate_disabled",
         )
-        return []
 
     requested_subject_user_id = int(request.subject_user_id or 0)
     subject_user_id = requested_subject_user_id
@@ -3359,29 +3361,41 @@ def _show_episode_items(
         and str(request.frame_subject_requirement or "").strip().lower()
         == "required"
     )
-    selected = select_tiktok_show_episode_context_items(
+    selected = list(select_tiktok_show_episode_context_items(
         conn,
         guild_id=int(request.guild_id or 0),
         user_text=_show_episode_query(request),
         subject_user_id=subject_user_id,
         allow_subject_continuity=allow_subject_continuity,
         now=request.now or None,
+    )) if queue_enabled else []
+    measurements = select_tiktok_engagement_context_items(
+        conn, guild_id=int(request.guild_id or 0), user_text=_show_episode_query(request),
+        now=request.now or None, allow_show_linkage=queue_enabled,
     )
+    if measurements and (not queue_enabled or measurements[0].lifecycle == "observed"):
+        selected = [item for item in selected if item.kind != "engagement"]
+        selected.extend(measurements)
+    elif measurements and not any(item.kind == "engagement" for item in selected):
+        selected.extend(measurements)
     items: list[IntelligencePacketItem] = []
     source_types = {
         "operations": "barcode_show_operations",
         "community": "barcode_show_community_projection",
         "dialogue": "barcode_show_dialogue_projection",
+        "engagement": "barcode_show_engagement_projection",
     }
     predicates = {
         "operations": "barcode_radio.show_operations",
         "community": "barcode_radio.show_community",
         "dialogue": "barcode_radio.show_dialogue",
+        "engagement": "barcode_radio.show_engagement",
     }
     attribution_modes = {
         "operations": "first_party_record",
         "community": "aggregate_projection",
         "dialogue": "speaker_attributed_projection",
+        "engagement": "measured_platform_projection",
     }
     for selected_item in selected:
         source_class = str(selected_item.source_class or "")
@@ -3402,13 +3416,15 @@ def _show_episode_items(
             text=selected_item.text,
             visibility=Visibility.PUBLIC_SAFE.value,
             confidence=selected_item.confidence,
-            lifecycle="finalized",
+            lifecycle=selected_item.lifecycle,
             authority=_AUTHORITY_RANK.get(source_class, 0),
             participants=selected_item.participants,
             lineage=tuple(
                 "tiktok_show_evidence:%s" % show_key
                 for show_key in selected_item.show_keys
-            ),
+            ) + tuple("tiktok_live_engagement:%s:%s" % ref for ref in selected_item.original_source_refs)
+            + (("tiktok_engagement_window:" + selected_item.source_ref,)
+               if selected_item.kind == "engagement" and not selected_item.show_keys else ()),
             observed_at=selected_item.observed_at,
             usage=selected_item.usage,
             score=selected_item.score,
@@ -3428,7 +3444,7 @@ def _show_episode_items(
                 if len(selected_item.show_keys) == 1
                 else "multi_show"
             ),
-            phase="historical",
+            phase=selected_item.phase,
             uncertainty_status=selected_item.uncertainty_status,
         )
         if not _route_allows_item(request, item):
@@ -6301,10 +6317,17 @@ def _show_episode_versions(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
+    measured_windows = {
+        item.source_ref: tiktok_engagement_window_version(
+            conn, guild_id=int(packet.request.guild_id or 0), source_ref=item.source_ref,
+        ) for item in packet.items if item.lane == "show_episode"
+        and item.source_type == "barcode_show_engagement_projection"
+        and item.source_ref.startswith("show_episode:engagement_window:")
+    }
     if not env_queue_production_enabled(
         dict(environ) if environ is not None else None
     ):
-        return {}
+        return measured_windows
 
     requested_subject_user_id = int(packet.request.subject_user_id or 0)
     subject_user_id = requested_subject_user_id
@@ -6317,7 +6340,7 @@ def _show_episode_versions(
         )
         if not consent_allowed:
             subject_user_id = 0
-    return tiktok_show_episode_context_item_versions(
+    return {**tiktok_show_episode_context_item_versions(
         conn,
         guild_id=int(packet.request.guild_id or 0),
         user_text=_show_episode_query(packet.request),
@@ -6331,7 +6354,7 @@ def _show_episode_versions(
             == "required"
         ),
         now=packet.request.now or None,
-    )
+    ), **measured_windows}
 
 
 def _canon_version(item: IntelligencePacketItem) -> str:
@@ -7268,7 +7291,8 @@ def _packet_invariants(
         if item.lane == "show_episode" and not (
             item.revalidation_kind == "show_episode"
             and item.source_ref.startswith("show_episode:")
-            and item.lifecycle == "finalized"
+            and (item.lifecycle == "finalized" or
+                 item.source_type == "barcode_show_engagement_projection" and item.lifecycle == "observed")
             and item.visibility in _PUBLIC_VISIBILITIES
             and bool(item.lineage)
             and not item.root_identities
@@ -7285,6 +7309,12 @@ def _packet_invariants(
                 and item.usage == "authoritative_show_chronology"
                 and item.uncertainty_status
                 == "recorded_public_operations_only"
+                or item.source_type == "barcode_show_engagement_projection"
+                and item.source_class == SourceClass.EVIDENCE_PROJECTION.value
+                and item.attribution_mode == "measured_platform_projection"
+                and item.usage == "measured_show_engagement"
+                and item.uncertainty_status == "captured_platform_metrics_only"
+                and not item.participants
                 or item.source_type
                 in {
                     "barcode_show_community_projection",

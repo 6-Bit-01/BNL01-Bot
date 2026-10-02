@@ -17,7 +17,7 @@ MAX_SCHEDULE_CLAIMS_PER_GUILD = 4096
 RELAY_PUBLICATION_READ_VERSION = "accepted_relay_publication_read_v1"
 RELAY_PUBLICATION_TOPIC_SCAN_LIMIT = 200
 RELAY_PUBLICATION_RESULT_LIMIT = 4
-RELAY_SHARED_SOURCE_CLASSES = ("public_moment", "finalized_show", "published_journal", "published_ballad")
+RELAY_SHARED_SOURCE_CLASSES = ("public_moment", "finalized_show", "tiktok_live_engagement", "published_journal", "published_ballad")
 RELAY_SHARED_LOOKBACK_DAYS = 30
 STOCK_FAMILIES = {
     "waiting_standby": (
@@ -77,7 +77,7 @@ def select_shared_relay_sources_on_connection(
     """
     from bnl_journal import journal_topic_counts, render_journal_publication, select_published_journal_entries_on_connection
     from bnl_moment_engine import public_moment_source_basis, select_public_situation_moment_gists
-    from bnl_tiktok_show_ledger import select_finalized_show_operations
+    from bnl_tiktok_show_ledger import select_shared_show_evidence
     from bnl_broadcast_ballads import select_editorial_publications
 
     end = now or utc_now_iso()
@@ -126,16 +126,24 @@ def select_shared_relay_sources_on_connection(
         })
 
     terms = set(journal_topic_counts([{"summary": topic_text}], limit=20))
-    operations = select_finalized_show_operations(conn, guild_id=guild_id, source_window_ms=(start_ms, end_ms))
-    for item in operations:
+    evidence = select_shared_show_evidence(conn, guild_id=guild_id, source_window_ms=(start_ms, end_ms))
+    offered = set()
+    for item in evidence:
+        kind = "tiktok_live_engagement" if item.kind == "engagement" else "finalized_show"
+        if kind in offered:
+            continue
         if terms and not terms.intersection(journal_topic_counts([{"summary": item.text}], limit=80)):
             continue
-        append("finalized_show", "Recorded, completed show operations; historical evidence only:\n" + item.text[:2200], {
-            "sourceKind": "finalized_show", "sourceId": item.show_keys[0],
+        heading = "Captured platform measurements; original collection period only:\n" if item.kind == "engagement" else "Recorded, completed show operations; historical evidence only:\n"
+        append(kind, heading + item.text[:2200], {
+            "refId": item.source_ref, "sourceKind": kind,
+            "sourceId": item.show_keys[0] if item.show_keys else item.source_ref,
             "observedAt": item.observed_at, "showDates": list(item.show_dates),
             "sourceVersion": item.source_digest, "sourceWindowStart": start, "sourceWindowEnd": end,
+            "originalSourceRefs": [{"sourceKind": "tiktok_live_engagement", "sourceKey": key, "contentHash": digest}
+                                   for key, digest in item.original_source_refs],
         })
-        break
+        offered.add(kind)
 
     query = topic_text.strip() or "latest Journal"
     publications = select_published_journal_entries_on_connection(

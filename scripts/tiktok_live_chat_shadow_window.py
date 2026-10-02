@@ -26,6 +26,7 @@ from bnl_tiktok_live_chat import LiveChatAdapter, LiveChatBuffer  # noqa: E402
 from bnl_tiktok_live_context import LiveContextSnapshotWriter  # noqa: E402
 from bnl_tiktok_live_memory import (  # noqa: E402
     TikTokPublicConversationSpoolWriter,
+    collector_boundary_record,
 )
 from scripts.tiktok_live_shadow_model import (
     DEFAULT_BUFFER_EVENTS,
@@ -39,6 +40,7 @@ from scripts.tiktok_live_shadow_model import (
     ActiveWindow,
     CycleResult,
     CycleState,
+    _safe_code,
     build_transport_command,
     format_event,
     normalize_username,
@@ -97,6 +99,14 @@ async def run_window(args: argparse.Namespace) -> int:
         if args.archive_spool_path is not None
         else None
     )
+    if archive_writer is not None:
+        try:
+            archive_writer.append(collector_boundary_record(
+                "window_started", datetime.now(timezone).timestamp(),
+            ))
+        except Exception as exc:
+            print("[archive] boundary_failed {}".format(
+                _safe_code(exc.__class__.__name__)), flush=True)
     if context_writer is not None:
         context_writer.publish(adapter, force=True)
     ended_rooms: Set[str] = set()
@@ -174,6 +184,16 @@ async def run_window(args: argparse.Namespace) -> int:
         )
 
     health = adapter.health_snapshot()
+    if archive_writer is not None:
+        try:
+            archive_writer.append(collector_boundary_record(
+                "window_stopped", datetime.now(timezone).timestamp(),
+                room_id=str(health.get("room_id") or ""),
+                reason="stop_requested" if stop_event.is_set() else "window_closed",
+            ))
+        except Exception as exc:
+            print("[archive] boundary_failed {}".format(
+                _safe_code(exc.__class__.__name__)), flush=True)
     if context_writer is not None:
         context_writer.publish(adapter, force=True)
     print(flush=True)
