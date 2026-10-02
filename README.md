@@ -571,8 +571,14 @@ four-attempt limit, and existing preparation, approval and delivery owners.
 Older lore and experiences remain available as explicitly remembered callbacks.
 A present association does not establish a character's return or involvement;
 the date of a retained source is not evidence of a person's last appearance.
-Journal inputs distinguish a Relay's public observation from its invitation or
-suggested follow-up, which cannot establish that a community member acted.
+Journal inputs preserve each original message's recorded room, quotation
+marks, link placement (without addresses or fetched contents), and whether
+text was truncated. Room policy alone is not room identity. All selected
+Relay prose stays available through the existing reflection lane as BNL's
+published expression; invitations cannot establish completed human actions,
+and Relay repetition cannot inflate the day's activity. Older unsent packets
+with the former Relay authority use the existing refresh fence. These source
+projection corrections also apply with impression formation/use disabled.
 Relays, Ambient, artwork, Ballads, dossiers, memory-tier promotion, and
 Relationship activation remain outside this pilot.
 

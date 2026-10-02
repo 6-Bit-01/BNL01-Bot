@@ -360,8 +360,22 @@ class JournalTests(unittest.TestCase):
     def test_cited_sources_only_private_metadata(self):
         packet = self.packet()
         relay_article = j.parse_generated_json(article_json(packet, 'Relay Only'))
-        relay_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': ['fresh:1']}
-        res = j.store_validated_draft(self.db, 1, packet, relay_article); self.assertTrue(res.ok, res.reason)
+        relay_ref = next(
+            source['refId'] for source in packet['reflectionBasis']
+            if source.get('basisKind') == 'accepted_relay_continuity'
+        )
+        relay_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': [relay_ref]}
+        self.assertEqual('insufficient_source_breadth', j.validate_article(relay_article, packet, []))
+        # Isolate cited-metadata selection while retaining every uncited private
+        # candidate. The ordinary packet above still requires original evidence.
+        relay_packet = {
+            **packet,
+            'evidenceCoverageContract': {
+                **packet['evidenceCoverageContract'],
+                'minimumDistinctFreshSources': 0,
+            },
+        }
+        res = j.store_validated_draft(self.db, 1, relay_packet, relay_article); self.assertTrue(res.ok, res.reason)
         with sqlite3.connect(self.db) as c:
             meta = json.loads(c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?", (res.entry_id,)).fetchone()[0])
         self.assertEqual(meta['supportingRelayIds'], ['r1'])

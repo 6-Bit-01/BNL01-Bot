@@ -378,7 +378,7 @@ class JournalContextLaneTests(unittest.TestCase):
             "A silver synth chorus was recorded during the Friday broadcast.",
         )
         article["title"] = "A Rumor Finds Its Rhythm"
-        article["excerpt"] = "I think the rhythm deserves a second listen."
+        article["excerpt"] = "I think the producers discussed a hidden synth set during the Friday show."
         details = []
         self.assertEqual("undeclared_context_use", journal.validate_article(
             article, packet, [], blocking_only=True, repair_details=details,
@@ -546,7 +546,8 @@ class JournalContextLaneTests(unittest.TestCase):
         )
         self.assertEqual("invalid_context_use", journal.validate_article(laundering, packet, []))
 
-        memory_fresh_ref = "fresh:1"
+        memory_fresh_ref = memory["matchedFreshSourceRefIds"][0]
+        self.assertIn(memory_fresh_ref, {source["refId"] for source in packet["safeSources"]})
         synonymized_claim = "BNL suspects the Friday synth activity may point toward a surprise performance."
         memory_claim = "An established Network record says a silver synth chorus was recorded during the Friday broadcast."
         parent_laundering = self.article(

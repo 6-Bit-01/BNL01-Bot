@@ -161,15 +161,35 @@ class QuietJournalTests(unittest.TestCase):
             with self.subTest(creative_body=body):
                 self.assertEqual(journal.validate_article(self.article(packet, body), packet), "")
 
-    def test_legacy_callback_packet_is_retired_but_current_packet_and_real_activity_are_retained(self):
+    def test_legacy_relay_authority_is_retired_but_original_activity_and_current_packet_remain(self):
         old = {"safeSources":[{"refId":"fresh:1","sourceKind":"relay","eventType":"published_journal"}]}
         self.assertTrue(journal.journal_packet_needs_reflection_refresh(old))
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(automation._frozen_packet_invalidation_reason(conn, 1, old), "journal_reflection_contract_changed")
         live = copy.deepcopy(old)
         live["safeSources"][0]["eventType"] = "fresh_public_discord_activity"
-        self.assertFalse(journal.journal_packet_needs_reflection_refresh(live))
+        live["reflectionVersion"] = "journal-dated-reflection-1"
+        self.assertTrue(journal.journal_packet_needs_reflection_refresh(live))
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(automation._frozen_packet_invalidation_reason(conn, 1, live), "journal_reflection_contract_changed")
+        original = {"safeSources": [{"refId": "fresh:2", "sourceKind": "conversation"}]}
+        self.assertFalse(journal.journal_packet_needs_reflection_refresh(original))
         self.assertFalse(journal.journal_packet_needs_reflection_refresh(self.packet()))
+
+    def test_prepared_version_one_fresh_relay_metadata_requires_authority_refresh(self):
+        relay.record_publication(
+            self.db, 1, message="A question about a public audio link reached the channel.",
+            directive="Consider who created the sound before making a claim.", mode="OBSERVATION",
+            relay_lane="current_signal", event_type="fresh_public_discord_activity", source_cursor=0,
+            published_timestamp="2026-09-24T12:10:00Z", relay_id="fresh-speech",
+        )
+        old = {"reflectionVersion": "journal-dated-reflection-1", "supportingRelayIds": ["fresh-speech"]}
+        with sqlite3.connect(self.db) as conn:
+            self.assertTrue(journal.journal_metadata_needs_reflection_refresh(conn, 1, old))
+            self.assertEqual(automation._prepared_invalidation_reason(conn, 1, old, set()),
+                             "journal_reflection_contract_changed")
+            self.assertFalse(journal.journal_metadata_needs_reflection_refresh(
+                conn, 1, {**old, "reflectionVersion": journal.JOURNAL_REFLECTION_VERSION}))
 
     def test_saved_metadata_preserves_reflection_dates_and_stale_prepared_work_is_detected(self):
         self.callbacks()

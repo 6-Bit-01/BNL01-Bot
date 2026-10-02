@@ -79,7 +79,8 @@ class JournalTestPreviewTests(unittest.TestCase):
             self.assertEqual("daily", packet["entryKind"])
             self.assertIn("Test Composer", prompt)
             self.assertIn("Test Listener", prompt)
-            self.assertIn('"sourceKind": "relay"', prompt)
+            self.assertIn('"basisKind": "accepted_relay_continuity"', prompt)
+            self.assertNotIn('"sourceKind": "relay"', prompt)
             calls.append(prompt)
             return article_for(packet)
 

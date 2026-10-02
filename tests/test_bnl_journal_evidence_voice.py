@@ -83,11 +83,13 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
 
     def test_daily_contract_requires_breadth_not_merely_a_large_input(self):
         contract = self.packet["evidenceCoverageContract"]
-        self.assertEqual(5, contract["minimumDistinctFreshSources"])
-        self.assertEqual(["conversation", "relay"], contract["requiredSourceKinds"])
+        self.assertEqual(3, contract["minimumDistinctFreshSources"])
+        self.assertEqual(["conversation"], contract["requiredSourceKinds"])
         self.assertNotIn("minimumDistinctFreshSourcesByKind", contract)
-        self.assertEqual(3, contract["minimumDistinctParticipants"])
-        self.assertEqual(3, contract["minimumDistinctWindowSegments"])
+        self.assertEqual(2, contract["minimumDistinctParticipants"])
+        self.assertEqual(2, contract["minimumDistinctWindowSegments"])
+        self.assertEqual(6, len(self.packet["safeSources"]))
+        self.assertTrue(all(source["sourceKind"] == "conversation" for source in self.packet["safeSources"]))
 
         self.assertEqual("", journal.validate_article(_article(self.packet), self.packet, []))
         one_ref = _article(self.packet, refs=[self.packet["safeSources"][0]["refId"]])
@@ -103,11 +105,12 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertIn("concrete current-window evidence", prompt)
         self.assertIn("Never invent a time, place, object, action", prompt)
         self.assertIn("Use a direct quote only rarely", prompt)
-        self.assertIn("relay stream is the primary chronology and narrative spine", prompt)
-        self.assertIn("Conversation sources are supporting public context", prompt)
-        self.assertIn("do not turn the Journal into a Discord digest", prompt)
+        self.assertNotIn("relay stream is the primary chronology and narrative spine", prompt)
+        self.assertNotIn("Conversation sources are supporting public context", prompt)
+        self.assertIn("Fresh sources are original messages or direct completed-show records", prompt)
+        self.assertIn("never as a substitute for the original event or a compulsory outline", prompt)
         self.assertIn("Keep the whole daily source window in view", prompt)
-        self.assertIn("Use both relaySources and conversationSources", prompt)
+        self.assertIn("counts original messages and Relay publications separately", prompt)
         self.assertIn("windowSegmentActivity", prompt)
         self.assertNotIn("Do not include direct quotes", prompt)
 
@@ -226,15 +229,16 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             packet["sourceHealth"]["minimumHealthyRelaySources"],
         )
         contract = packet["evidenceCoverageContract"]
-        self.assertEqual(18, contract["minimumDistinctFreshSources"])
+        self.assertEqual(16, contract["minimumDistinctFreshSources"])
         self.assertEqual(
-            {"conversation": 16, "relay": 3},
+            {"conversation": 16},
             contract["minimumDistinctFreshSourcesByKind"],
         )
 
         prompt = journal.build_generation_prompt(packet)
         self.assertIn("SOURCE-RECOVERY EVIDENCE RULE", prompt)
-        self.assertIn("coequal fresh evidence", prompt)
+        self.assertNotIn("coequal fresh evidence", prompt)
+        self.assertIn("Fresh sources are original messages or direct completed-show records", prompt)
         self.assertNotIn(
             "relay stream is the primary chronology and narrative spine",
             prompt,
@@ -244,7 +248,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             packet,
             refs=[
                 source["refId"]
-                for source in packet["safeSources"][:17]
+                for source in packet["safeSources"][:15]
             ],
         )
         self.assertEqual(
@@ -260,7 +264,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             ),
         )
 
-    def test_daily_packet_keeps_relay_spine_and_balances_conversation_context(self):
+    def test_daily_packet_keeps_relay_continuity_and_balances_original_conversations(self):
         start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
 
         def stamp(segment, index, count):
@@ -309,13 +313,17 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         prompt_conversations = [source for source in packet["privateSources"] if source["sourceKind"] == "conversation"]
         safe_relays = [source for source in packet["safeSources"] if source["sourceKind"] == "relay"]
         safe_conversations = [source for source in packet["safeSources"] if source["sourceKind"] == "conversation"]
+        reflection_relays = [source for source in packet["reflectionBasis"]
+                             if source["basisKind"] == "accepted_relay_continuity"]
         self.assertEqual(sum(relay_counts), len(prompt_relays))
         self.assertEqual(journal.MAX_PROMPT_SOURCES - sum(relay_counts), len(prompt_conversations))
-        self.assertEqual(71, len(safe_relays))
+        self.assertEqual(0, len(safe_relays))
+        self.assertEqual(71, len(reflection_relays))
         self.assertEqual(109, len(safe_conversations))
         self.assertEqual(71, packet["aggregateCounts"]["eligibleRelays"])
         self.assertEqual(138, packet["aggregateCounts"]["eligibleConversations"])
-        self.assertEqual(71, packet["aggregateCounts"]["promptRelays"])
+        self.assertEqual(0, packet["aggregateCounts"]["promptRelays"])
+        self.assertEqual(71, packet["aggregateCounts"]["reflectionRelays"])
         self.assertEqual(109, packet["aggregateCounts"]["promptConversations"])
         self.assertEqual(
             [
@@ -577,9 +585,10 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         sources = [
             {
                 "refId": f"fresh:{index}",
-                "sourceKind": "relay",
+                "sourceKind": "conversation",
                 "summary": "zebra rhythm returned" if index < 5 else "alpha rhythm appeared",
                 "observedAt": f"2026-07-19T{8 + index:02d}:00:00Z",
+                "channelPolicy": "public_home",
             }
             for index in range(6)
         ]
@@ -588,8 +597,8 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             1,
             "2026-07-19T07:00:00Z",
             "2026-07-20T07:00:00Z",
-            sources,
             [],
+            sources,
             entry_kind="daily",
         )
         self.assertEqual("rhythm", packet["candidateTopicTags"][0])

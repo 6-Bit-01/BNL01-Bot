@@ -44,13 +44,23 @@ class JournalSourceRoleTests(unittest.TestCase):
             entry_kind="daily", prepare_schema=False,
         )
 
+    def relay_source(self, packet, ref_id=None):
+        self.assertFalse(any(source.get("sourceKind") == "relay" for source in packet["safeSources"]))
+        return next(source for source in packet["reflectionBasis"]
+                    if source.get("basisKind") == "accepted_relay_continuity"
+                    and (ref_id is None or source["refId"] == ref_id))
+
     def test_archive_path_preserves_text_and_lineage_but_separates_speech_roles(self):
         before = hashlib.sha256(Path(self.db).read_bytes()).hexdigest()
         packet = self.packet()
         self.assertTrue(packet["sourceArchiveAvailable"])
-        source = packet["safeSources"][0]
+        source = self.relay_source(packet)
         self.assertEqual(self.original, source["summary"])
-        self.assertTrue(source["refId"].startswith("fresh:"))
+        self.assertTrue(source["refId"].startswith("reflection:event:"))
+        lineage = next(item for item in packet["privateReflectionBasisProvenance"]["historicalSourceEvents"]
+                       if item["refId"] == source["refId"])
+        self.assertEqual("relay-1", lineage["sourceKey"])
+        self.assertEqual(f"fresh:{lineage['eventSeq']}", lineage["originalRefId"])
         speech = source["relaySpeech"]
         self.assertEqual(self.message, speech["publicMessage"])
         self.assertEqual(self.invitation, speech["publicInvitation"])
@@ -65,7 +75,7 @@ class JournalSourceRoleTests(unittest.TestCase):
         packet = journal.build_packet_from_sources(
             self.db, 1, "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", relays, [], prepare_schema=False,
         )
-        source = packet["safeSources"][0]
+        source = self.relay_source(packet)
         self.assertEqual(relays[0]["summary"], source["summary"])
         self.assertEqual(self.invitation, source["relaySpeech"]["publicInvitation"])
 
@@ -77,7 +87,7 @@ class JournalSourceRoleTests(unittest.TestCase):
                 else:
                     conn.execute("UPDATE website_relay_history SET public_message=? WHERE relay_id='relay-1'", (replacement,))
             packet = self.packet()
-            source = packet["safeSources"][0]
+            source = self.relay_source(packet)
             self.assertEqual(self.original, source["summary"])
             self.assertEqual("unavailable_in_archive", source["relaySpeech"]["partition"])
             self.assertNotIn("publicInvitation", source["relaySpeech"])
@@ -111,8 +121,7 @@ class JournalSourceRoleTests(unittest.TestCase):
         )
         self.assertTrue(recorded.ok, recorded.reason)
         self.assertEqual("inserted", recorded.status)
-        source = next(item for item in self.packet()["safeSources"]
-                      if item["refId"] == f"fresh:{recorded.event_seq}")
+        source = self.relay_source(self.packet(), f"reflection:event:{recorded.event_seq}")
         self.assertNotIn("Private Name", json.dumps(source))
         self.assertIn("someone", source["relaySpeech"]["publicMessage"])
 
@@ -124,7 +133,7 @@ class JournalSourceRoleTests(unittest.TestCase):
         packet = journal.build_packet_from_sources(
             self.db, 1, "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", relays, [], prepare_schema=False,
         )
-        basis = next(item for item in packet["reflectionBasis"] if item["basisKind"] == "accepted_relay_continuity")
+        basis = self.relay_source(packet)
         self.assertEqual(original["sourceVersion"], basis["sourceVersion"])
         self.assertEqual(original["summary"], basis["summary"])
         self.assertEqual(self.invitation, basis["relaySpeech"]["publicInvitation"])
@@ -137,13 +146,25 @@ class JournalSourceRoleTests(unittest.TestCase):
                 1, 1, "2026-05-29", "The silver antenna dossier describes a Network anomaly of unknown origin.",
                 "active", 1, "ambient", "2026-05-30T10:00:00Z",
             ))
+        # The current human contribution supplies the present association;
+        # BNL's Relay retelling cannot create fresh evidence by keyword overlap.
+        contribution = sources.record_source_event(
+            self.db, guild_id=1, source_kind="discord_message", source_key="message-1",
+            occurred_at_ms=sources.timestamp_to_epoch_ms("2026-10-01T15:00:00Z"),
+            raw_text="This silver antenna sound sends my mind back to older transmissions.",
+            channel_id=42, channel_policy="public_home", subject_ref="discord_user:10",
+            private_display_name="Test Listener", public_usable=True,
+        )
+        self.assertTrue(contribution.ok, contribution.reason)
+        self.assertEqual("inserted", contribution.status)
         packet = self.packet()
         lane = packet["generationContextLanes"]["establishedBroadcastMemory"][0]
         self.assertEqual("2026-05-29", lane["episodeDate"])
         self.assertEqual("2026-05-30T10:00:00Z", lane["recordedAt"])
         self.assertEqual("remembered_history_not_current_activity", lane["temporalScope"])
         self.assertEqual("topic_similarity_only", lane["matchAuthority"])
-        self.assertTrue(lane["matchedFreshSourceRefIds"])
+        self.assertEqual([f"fresh:{contribution.event_seq}"], lane["matchedFreshSourceRefIds"])
+        self.relay_source(packet)
         self.assertIn("dossier", lane["summary"])
         self.assertIn("naturally locate them in remembered history", journal.build_generation_prompt(packet))
 

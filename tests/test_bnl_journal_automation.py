@@ -724,7 +724,13 @@ class JournalAutomationTests(unittest.TestCase):
             entry_kind="daily",
         )
         self.assertEqual(90, packet["aggregateCounts"]["eligibleRelays"])
-        self.assertEqual(90, len(packet["safeSources"]))
+        self.assertEqual([], packet["safeSources"])
+        reflection_relays = [source for source in packet["reflectionBasis"]
+                             if source["basisKind"] == "accepted_relay_continuity"]
+        self.assertEqual(90, len(reflection_relays))
+        self.assertEqual(90, packet["aggregateCounts"]["reflectionRelays"])
+        self.assertEqual("2026-07-20T01:30:00Z", reflection_relays[0]["relayPublishedAt"])
+        self.assertEqual("2026-07-20T16:20:00Z", reflection_relays[-1]["relayPublishedAt"])
         self.assertFalse(any(source.get("relayId") == "boundary" for source in packet["privateSources"]))
 
     def test_scheduler_publishes_newest_day_then_catches_up_older_day(self):

@@ -50,7 +50,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
         except FileNotFoundError:
             pass
 
-    def add_day(self, day: date) -> None:
+    def add_day(self, day: date, *, recall_broadcast_memory: bool = False) -> None:
         start, _, _ = automation._daily_period_for_day(day)
         start_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
         label = day.isoformat()
@@ -88,6 +88,10 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
                         (
                             f"Member{index} discusses a new mix, bass movement, and "
                             f"community listening plan number {index}."
+                            + (
+                                " I keep coming back to that producer's track activity number four."
+                                if recall_broadcast_memory and index == 4 else ""
+                            )
                         ),
                         stamp,
                         1,
@@ -377,7 +381,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
 
     def test_used_broadcast_memory_becoming_ineligible_blocks_post(self):
         self.add_broadcast_memory()
-        self.add_day(TARGET_DAY)
+        self.add_day(TARGET_DAY, recall_broadcast_memory=True)
         prepared = self.prepare_daily(self.memory_generator)
         self.assertEqual("prepared", prepared.status, prepared)
         with sqlite3.connect(self.db) as conn:
@@ -411,7 +415,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
         # TARGET_DAY ends before this date expires, so the memory may be used
         # during preparation. At the patched release instant it is stale.
         self.add_broadcast_memory(valid_until="2026-07-22")
-        self.add_day(TARGET_DAY)
+        self.add_day(TARGET_DAY, recall_broadcast_memory=True)
         prepared = self.prepare_daily(self.memory_generator)
         self.assertEqual("prepared", prepared.status, prepared)
 

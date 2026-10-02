@@ -191,7 +191,7 @@ class JournalLowActivityTests(unittest.TestCase):
                 "displayName": f"Member{index}",
                 "channelPolicy": "public_home",
             }
-            for index in range(1, 4)
+            for index in range(1, 6)
         ]
         packet = journal.build_packet_from_sources(
             self.db,
@@ -205,7 +205,11 @@ class JournalLowActivityTests(unittest.TestCase):
         prompt = journal.build_generation_prompt(packet)
 
         self.assertNotIn("lowActivityMode", packet)
-        self.assertNotIn("reflectionBasis", packet)
+        self.assertEqual(5, len(packet["safeSources"]))
+        self.assertTrue(all(source["sourceKind"] == "conversation" for source in packet["safeSources"]))
+        self.assertEqual(3, len(packet["reflectionBasis"]))
+        self.assertTrue(all(source["basisKind"] == "accepted_relay_continuity"
+                            for source in packet["reflectionBasis"]))
         self.assertNotIn("LOW-ACTIVITY EVIDENCE RULE", prompt)
         self.assertEqual(journal.JOURNAL_EDITORIAL_VERSION, packet["editorialVersion"])
         self.assertNotIn("prefer 2 sections", prompt)
