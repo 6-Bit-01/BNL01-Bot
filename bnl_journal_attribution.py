@@ -275,6 +275,12 @@ def review_prompt(article, evidence):
         "said or did what, recipient versus speaker, sequence, negation, uncertainty and later clarification. Check "
         "connections across sentences: adjacent events do not establish a reply, cause, shared occasion or queue "
         "submission. Evidence that a message was posted is distinct from evidence that its topic happened.",
+        "Before judging a shared scene, compare each named person's attributed question, position or action "
+        "with that person's originals. Introducing a topic does not make someone the author of another "
+        "participant's later question or elaboration. If an attributed proposition is supported only by a "
+        "different speaker, locate that mismatch even when the combined discussion has the right overall theme. "
+        "Preserve faithful paraphrase and natural synthesis of a shared discussion without assigning its combined "
+        "meaning to one participant; do not require a transcript or a roll call.",
         "The server fixes each fragment's evidenceKind. message_envelope establishes the recorded speaker, time and "
         "room of a communication. message_expression supplies what was expressed, with questions, jokes, reports and "
         "opinions retaining their stance. It is not a sensor measurement or a new operational record. recorded_event "
