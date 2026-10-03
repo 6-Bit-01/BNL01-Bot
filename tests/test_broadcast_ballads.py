@@ -307,7 +307,7 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.run_command(command), result)
             self.assertEqual(self.generate.await_count, calls)
 
-    async def test_rejected_attribution_never_saves_returns_or_retries_the_candidate(self):
+    async def test_unresolved_attribution_never_saves_returns_or_repeats_the_correction(self):
         original = (await self.run_command())["version"]
         output = json.loads(self.generate.return_value)
         output["lyrics"] = "Test Listener handed espresso to the children."
@@ -322,10 +322,130 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("espresso", json.dumps(result))
         self.assertEqual(versions(self.db, 77, "show-1"), [original])
         self.assertEqual(await self.run_command(command), result)
-        self.assertEqual((self.generate.await_count, self.review.await_count), (2, 2))
+        self.assertEqual((self.generate.await_count, self.review.await_count), (3, 3))
         review_prompt = self.review.await_args.args[0]
         self.assertIn(output["lyrics"], review_prompt)
         self.assertIn("Test Host: @Test Listener", review_prompt)
+
+    async def test_one_feedback_guided_correction_keeps_song_and_saves_only_supported_copy(self):
+        original = json.loads(self.generate.return_value)
+        original["lyrics"] = "Test Reporter watched fifty people together at shutdown."
+        original["linerNotes"] = {"inspiration": "Test Reporter watched a simultaneous crowd of fifty."}
+        corrected = {**original, "lyrics": "Test Reporter told us fifty found the song.\nThe chairs stayed warm after the room went quiet.",
+                     "linerNotes": {"inspiration": "Test Reporter reported fifty views; the song imagines their shared warmth."}}
+        issue = "The report gives cumulative views, not a measured simultaneous audience."
+        self.generate.side_effect = [json.dumps(original), json.dumps(corrected)]
+        self.review.side_effect = [
+            BalladGeneration(json.dumps({"verdict": "unsupported", "issues": [issue]}), "STOP"),
+            BalladGeneration('{"verdict":"supported","issues":[]}', "STOP"),
+        ]
+        command = {**self.command, "options": {"direction": "Keep the chamber soul and warm chairs."}}
+        evidence = 'Test Reporter: I saw fifty cumulative views. Captured final concurrent audience: unavailable.'
+        checks = AsyncMock(return_value=(evidence, "c" * 64))
+        result = await execute_command(self.db, 77, command,
+            evidence_reader=lambda _: (evidence, "c" * 64), generate=self.generate,
+            review_attribution=self.review, revalidate_evidence=checks)
+        version = result["version"]
+        self.assertEqual(result["outcome"], "complete")
+        self.assertEqual((self.generate.await_count, self.review.await_count, checks.await_count), (2, 2, 4))
+        self.assertEqual((version["lyrics"], version["style"], version["title"]),
+                         (corrected["lyrics"], original["style"], original["title"]))
+        self.assertEqual(version["rawOutput"], json.dumps(corrected))
+        self.assertTrue(version["attributionReview"]["correctionApplied"])
+        correction_prompt = self.generate.await_args_list[1].args[0]
+        self.assertIn(issue, correction_prompt)
+        self.assertIn(evidence, correction_prompt)
+        self.assertIn(command["options"]["direction"], correction_prompt)
+        self.assertIn(json.dumps(corrected["lyrics"]), self.review.await_args_list[1].args[0])
+        with sqlite3.connect(self.db) as conn:
+            saved_receipt = conn.execute("SELECT receipt FROM bnl_ballad_commands").fetchone()[0]
+        self.assertNotIn(issue, saved_receipt)
+        self.assertNotIn(original["lyrics"], saved_receipt)
+        replay = await execute_command(self.db, 77, command,
+            evidence_reader=lambda _: (evidence, "c" * 64), generate=self.generate,
+            review_attribution=self.review, revalidate_evidence=checks)
+        self.assertEqual(replay, result)
+        self.assertEqual((self.generate.await_count, self.review.await_count), (2, 2))
+
+    async def test_uncertain_review_with_specific_feedback_can_qualify_report_once(self):
+        self.review.side_effect = [
+            BalladGeneration('{"verdict":"uncertain","issues":["Preserve this number as a member report, not a platform measurement."]}', "STOP"),
+            BalladGeneration('{"verdict":"supported","issues":[]}', "STOP"),
+        ]
+        result = await self.run_command()
+        self.assertEqual(result["outcome"], "complete")
+        self.assertTrue(result["version"]["attributionReview"]["correctionApplied"])
+        self.assertEqual((self.generate.await_count, self.review.await_count), (2, 2))
+
+    async def test_missing_or_malformed_feedback_never_starts_a_correction(self):
+        reviews = [
+            BalladGeneration('{"verdict":"unsupported","issues":["Actor mismatch."]}', "MAX_TOKENS"),
+            BalladGeneration('{"verdict":"unsupported"}', "STOP"),
+            BalladGeneration('{"verdict":"unsupported","issues":[null]}', "STOP"),
+            BalladGeneration('{"verdict":"uncertain","issues":[]}', "STOP"),
+            BalladGeneration('{"verdict":"unsupported","issues":["   "]}', "STOP"),
+            BalladGeneration('{"verdict":"supported","issues":["Contradictory feedback."]}', "STOP"),
+        ]
+        for index, review in enumerate(reviews):
+            with self.subTest(index=index):
+                self.review.return_value = review
+                result = await self.run_command({**self.command, "id": "no-feedback-" + str(index)})
+                self.assertEqual(result["outcome"], "failed")
+                self.assertNotIn("version", result)
+        self.assertEqual((self.generate.await_count, self.review.await_count), (len(reviews), len(reviews)))
+        self.assertEqual(versions(self.db, 77, "show-1"), [])
+
+    async def test_source_withdrawal_at_each_correction_boundary_stops_extra_calls_and_save(self):
+        evidence = "Test Observer: They waved off camera. Test Performer: I danced."
+        valid, withdrawn = (evidence, "d" * 64), ("", "")
+        for stage, snapshots, expected_calls in (
+            ("after-first-review", [valid, withdrawn], (1, 1)),
+            ("after-correction", [valid, valid, withdrawn], (2, 1)),
+            ("after-second-review", [valid, valid, valid, withdrawn], (2, 2)),
+        ):
+            with self.subTest(stage=stage):
+                self.generate.reset_mock()
+                self.review.reset_mock()
+                self.review.side_effect = [
+                    BalladGeneration('{"verdict":"unsupported","issues":["The observer is not the actor."]}', "STOP"),
+                    BalladGeneration('{"verdict":"supported","issues":[]}', "STOP"),
+                ]
+                result = await execute_command(self.db, 77, {**self.command, "id": stage},
+                    evidence_reader=lambda _: valid, generate=self.generate,
+                    review_attribution=self.review, revalidate_evidence=AsyncMock(side_effect=snapshots))
+                self.assertEqual(result["error"], "show_sources_changed_try_manually")
+                self.assertNotIn("version", result)
+                self.assertEqual((self.generate.await_count, self.review.await_count), expected_calls)
+                self.assertNotIn("observer", json.dumps(result))
+        self.assertEqual(versions(self.db, 77, "show-1"), [])
+
+    async def test_correction_provider_failure_does_not_retry_or_expose_provider_text(self):
+        self.review.return_value = BalladGeneration('{"verdict":"unsupported","issues":["A source mismatch."]}', "STOP")
+        for index, (failure, safe_error) in enumerate((
+            (ValueError("budget_restricted:monthly_hard_limit"), "budget_restricted:monthly_hard_limit"),
+            (ValueError("local_model_budget_exhausted"), "local_model_budget_exhausted"),
+            (ValueError("Synthetic private provider request detail"), "generation_unavailable_try_manually"),
+            (RuntimeError("Synthetic private provider request detail"), "generation_unavailable_try_manually"),
+            (TimeoutError("Synthetic private provider request detail"), "generation_unavailable_try_manually"),
+        )):
+            with self.subTest(failure=type(failure).__name__, safe_error=safe_error):
+                self.generate.reset_mock()
+                self.review.reset_mock()
+                self.generate.side_effect = [self.generate.return_value, failure]
+                command = {**self.command, "id": f"correction-provider-failure-{index}"}
+                result = await self.run_command(command)
+                self.assertEqual(result["error"], safe_error)
+                self.assertEqual((self.generate.await_count, self.review.await_count), (2, 1))
+                self.assertEqual(await self.run_command(command), result)
+                self.assertEqual((self.generate.await_count, self.review.await_count), (2, 1))
+                self.assertNotIn("version", result)
+                self.assertNotIn("Synthetic private", json.dumps(result))
+                with sqlite3.connect(self.db) as conn:
+                    saved_receipt = conn.execute(
+                        "SELECT receipt FROM bnl_ballad_commands WHERE guild_id=? AND command_id=?",
+                        (77, command["id"])).fetchone()[0]
+                self.assertNotIn("Synthetic private", saved_receipt)
+        self.assertEqual(versions(self.db, 77, "show-1"), [])
 
     async def test_attribution_review_covers_notes_and_preserves_approved_creative_copy(self):
         output = json.loads(self.generate.return_value)
