@@ -287,6 +287,38 @@ def _validate_identity(guild_id: int, source_kind: str, source_key: str, occurre
     return guild, kind, key, occurred
 
 
+def _tiktok_chat_replay_matches(
+    existing: Sequence[Any], immutable_values: Tuple[Any, ...], *, source_key: str,
+    receipt_only: bool,
+) -> bool:
+    """Keep an unchanged chat's original binding and receipt-only clock.
+
+    A replay cannot restore public eligibility or rewrite the first archived
+    identity. Every captured content/platform field still has to match.
+    """
+    # The original row stays untouched, including withdrawn eligibility. A
+    # platform source clock remains strict; only a receipt-only clock may vary.
+    stable_positions = (1, 2, 4, 5, 6, 7) if receipt_only else (0, 1, 2, 4, 5, 6, 7)
+    if any(existing[position + 1] != immutable_values[position]
+           for position in stable_positions):
+        return False
+    try:
+        previous = json.loads(str(existing[10]))
+        current = json.loads(str(immutable_values[9]))
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return False
+    for metadata in (previous, current):
+        if (metadata.get("platform") != "tiktok"
+                or metadata.get("eventId") != source_key
+                or metadata.get("eventType") not in {"comment", "question"}):
+            return False
+        metadata.pop("identityBindingBasis", None)
+        metadata.pop("boundDiscordUserId", None)
+    return previous == current
+
+
 def _record_on_connection(
     conn: sqlite3.Connection,
     *,
@@ -303,6 +335,8 @@ def _record_on_connection(
     public_usable: bool = True,
     metadata: Optional[Mapping[str, Any]] = None,
     ingested_at_ms: Optional[int] = None,
+    tiktok_chat_replay: bool = False,
+    tiktok_receipt_only_replay: bool = False,
 ) -> SourceRecordResult:
     guild, kind, key, occurred = _validate_identity(guild_id, source_kind, source_key, occurred_at_ms)
     raw = str(raw_text or "")
@@ -334,6 +368,12 @@ def _record_on_connection(
     if existing:
         if tuple(existing[1:]) == immutable_values:
             return SourceRecordResult(True, "idempotent", int(existing[0]), digest)
+        if (tiktok_chat_replay and kind == "tiktok_live_chat"
+                and _tiktok_chat_replay_matches(
+                    existing, immutable_values, source_key=key,
+                    receipt_only=tiktok_receipt_only_replay)):
+            return SourceRecordResult(True, "idempotent", int(existing[0]), str(existing[8]),
+                                      "tiktok_original_preserved")
         return SourceRecordResult(False, "conflict", int(existing[0]), str(existing[8]), "immutable_source_conflict")
     cursor = conn.execute(
         """
@@ -371,9 +411,19 @@ def record_source_event(
     public_usable: bool = True,
     metadata: Optional[Mapping[str, Any]] = None,
     ingested_at_ms: Optional[int] = None,
+    prepare_schema: bool = True,
+    tiktok_chat_replay: bool = False,
+    tiktok_receipt_only_replay: bool = False,
 ) -> SourceRecordResult:
-    """Insert one immutable event, returning idempotent for an exact replay."""
-    ensure_schema(db_path)
+    """Insert an immutable source; receipt-only TikTok replay retains its first row.
+
+    ``tiktok_chat_replay`` preserves an unchanged TikTok chat's first binding.
+    Set ``tiktok_receipt_only_replay`` only when that incoming chat has no
+    platform source timestamp. Other source kinds keep exact replay semantics.
+    Batch callers may prepare the schema once, then pass ``prepare_schema=False``.
+    """
+    if prepare_schema:
+        ensure_schema(db_path)
     with sqlite3.connect(db_path, timeout=30) as conn:
         # Serialize the identity check and insert.  Without this write lock, two
         # processes can both observe a missing identity and one can leak a
@@ -399,6 +449,8 @@ def record_source_event(
             public_usable=public_usable,
             metadata=metadata,
             ingested_at_ms=ingested_at_ms,
+            tiktok_chat_replay=tiktok_chat_replay,
+            tiktok_receipt_only_replay=tiktok_receipt_only_replay,
         )
 
 
@@ -407,6 +459,7 @@ def record_tiktok_engagement_event(
     *,
     guild_id: int,
     record: Mapping[str, Any],
+    prepare_schema: bool = True,
 ) -> SourceRecordResult:
     """Land measured public engagement in the existing immutable source owner.
 
@@ -429,7 +482,8 @@ def record_tiktok_engagement_event(
     raw = _canonical_json(normalized)
     event_type = str(normalized["event_type"])
     summary = "TikTok captured public engagement: " + event_type + "."
-    ensure_schema(db_path)
+    if prepare_schema:
+        ensure_schema(db_path)
     with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
