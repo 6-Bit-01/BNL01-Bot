@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from contextlib import AsyncExitStack, closing, nullcontext
+from functools import wraps
 from pathlib import Path
 import sys
 import bnl_ambient_art as ambient_art
@@ -19844,6 +19845,18 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     conn.close()
     return int(row[0] if row else 0) == 0
 
+def _with_source_capture_privacy_fence(writer):
+    @wraps(writer)
+    def fenced(*args, **kwargs):
+        # Acquire the existing privacy fence before any database transaction,
+        # matching clear/forget/release lock order. Post-commit projections
+        # remain inside it so deletion cannot be followed by stale copies.
+        with journal_release_privacy_fence(DB_FILE):
+            return writer(*args, **kwargs)
+    return fenced
+
+
+@_with_source_capture_privacy_fence
 def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, directed_to_bnl: bool = False, reply_to_conversation_row_id: int = 0, source_observed_at: str = "", observation_metadata: dict | None = None):
     capture_started = time.perf_counter()
     decision = decide_memory_write_policy(route_mode, channel_policy, "user", content, False)
@@ -49370,7 +49383,8 @@ async def on_message(message: discord.Message):
 
     exact_name_echo = parse_exact_name_echo_instruction(clean_content)
     if exact_name_echo is not None and message_should_enter_conversation:
-        save_user_message(
+        await asyncio.to_thread(
+            save_user_message,
             message.author.id,
             message.author.display_name,
             message.guild.id,
@@ -49426,7 +49440,8 @@ async def on_message(message: discord.Message):
     # ---------------- PASSIVE SERVER OBSERVATION ----------------
     # BNL silently logs messages across the server so it can recall them later
     # but skips the active channel because those messages are logged below
-    passive_activity_captured = record_passive_user_activity(
+    passive_activity_captured = await asyncio.to_thread(
+        record_passive_user_activity,
         message,
         clean_content,
         channel_policy,
@@ -49442,7 +49457,8 @@ async def on_message(message: discord.Message):
             and conversation_content
             and tag_only_observation_persistence_allowed(channel_policy)
         ):
-            save_user_message(
+            await asyncio.to_thread(
+                save_user_message,
                 message.author.id,
                 message.author.display_name,
                 message.guild.id,
@@ -49490,7 +49506,7 @@ async def on_message(message: discord.Message):
             active_direct_session=active_same_user_session,
             conversation_surface=conversation_surface,
         )
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
+        save_decision = await asyncio.to_thread(save_user_message, message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
 
         if await _maybe_start_deferred_payload_session(
             message,
@@ -50104,7 +50120,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
+        await asyncio.to_thread(save_user_message, message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
 
         self_reflection = (
             ""
@@ -50591,7 +50607,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
+        await asyncio.to_thread(save_user_message, message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
 
         self_reflection = (
             ""

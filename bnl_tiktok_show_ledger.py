@@ -311,6 +311,8 @@ def _safe_document(value: Any) -> Optional[dict[str, Any]]:
 def _seal_authorized_show_ledger(
     ledger: Any,
     authorization_receipt: Mapping[str, Any],
+    *,
+    prior_ledger: Mapping[str, Any] | None = None,
 ) -> Optional[dict[str, Any]]:
     """Bind one public show document to its validated source authorization."""
 
@@ -321,6 +323,26 @@ def _seal_authorized_show_ledger(
         )
     ):
         return None
+    # Archive revisions cover every show (and can advance for private queue
+    # activity). They attest admission, not a change to this show's originals.
+    # Preserve a complete historical seal only after the current authorized
+    # source owner has rebuilt exactly the same payload. All authority fields
+    # other than the archive-wide revision/digest must still agree.
+    prior = _safe_document(prior_ledger)
+    if prior is not None:
+        payload = dict(ledger)
+        previous_payload = dict(prior)
+        for document in (payload, previous_payload):
+            document.pop("sourceDigest", None)
+            document.pop("sourceAuthorization", None)
+        authority = dict(authorization_receipt)
+        previous_authority = dict(prior["sourceAuthorization"])
+        for receipt in (authority, previous_authority):
+            receipt.pop("archiveSourceRevision", None)
+            receipt.pop("archiveSourceDigest", None)
+        if (_canonical_json(payload) == _canonical_json(previous_payload)
+                and authority == previous_authority):
+            return prior
     sealed = dict(ledger)
     sealed.pop("sourceDigest", None)
     sealed["sourceAuthorization"] = dict(authorization_receipt)
@@ -2232,11 +2254,16 @@ def sync_tiktok_show_evidence_ledgers(
     try:
         ensure_tiktok_show_evidence_schema(conn)
         ensure_memory_ledger_schema(conn)
-        related_sources = _load_show_related_sources(conn, guild_id=int(guild_id))
+        conn.commit()
         for show in shows:
             show_key = tiktok_show_evidence_key(show)
             if not show_key:
                 continue
+            # One snapshot owns the fresh sources and one complete show graph.
+            # A later historical show must not extend an earlier write lease
+            # or reuse preparation sources changed since that lease ended.
+            conn.execute("BEGIN")
+            related_sources = _load_show_related_sources(conn, guild_id=int(guild_id))
             existing = conn.execute(
                 f"""
                 SELECT source_digest,lifecycle_status,ledger_json
@@ -2261,6 +2288,7 @@ def sync_tiktok_show_evidence_ledgers(
                 show=show,
             )
             if source_events is None:
+                conn.rollback()
                 continue
             discord_exchanges = _load_show_discord_exchanges(
                 conn,
@@ -2268,6 +2296,7 @@ def sync_tiktok_show_evidence_ledgers(
                 show=show,
             )
             if discord_exchanges is None:
+                conn.rollback()
                 continue
             discord_exchanges = _merge_retained_discord_exchanges(
                 discord_exchanges,
@@ -2278,6 +2307,7 @@ def sync_tiktok_show_evidence_ledgers(
                 discord_exchanges=discord_exchanges,
             )
             if not base_ledger:
+                conn.rollback()
                 continue
             current = archive.get("currentShow") or {}
             if (current.get("sessionId") == show.get("sessionId")
@@ -2298,8 +2328,11 @@ def sync_tiktok_show_evidence_ledgers(
             base_ledger["engagement"] = read_tiktok_engagement_evidence(
                 conn, guild_id=int(guild_id), source_window_ms=recorded_show_engagement_bounds(base_ledger),
             )
-            ledger = _seal_authorized_show_ledger(base_ledger, authorization_receipt)
+            ledger = _seal_authorized_show_ledger(
+                base_ledger, authorization_receipt, prior_ledger=prior_ledger,
+            )
             if ledger is None:
+                conn.rollback()
                 continue
             result["sourceEvents"] += len(ledger.get("messages") or ())
             result["participants"] += int(
@@ -2327,7 +2360,7 @@ def sync_tiktok_show_evidence_ledgers(
             source_digest = str(ledger["sourceDigest"])
             now = datetime.now(timezone.utc).isoformat()
             lifecycle = str(ledger.get("lifecycle") or "provisional")
-            if existing and str(existing[0] or "") == source_digest:
+            if prior_ledger is not None and str(existing[0] or "") == source_digest:
                 result["showsUnchanged"] += 1
             else:
                 conn.execute(
@@ -2478,7 +2511,7 @@ def sync_tiktok_show_evidence_ledgers(
                                 subject_ref,
                                 type(exc).__name__,
                             )
-        conn.commit()
+            conn.commit()
     except Exception:
         conn.rollback()
         raise
