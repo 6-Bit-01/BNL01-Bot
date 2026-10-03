@@ -486,6 +486,39 @@ def _has_eligible_projection_root(conn: sqlite3.Connection, guild_id: int, entry
 def _entry_current(conn: sqlite3.Connection, guild_id: int, entry_id: str) -> bool:
     return not bool(conn.execute("SELECT 1 FROM memory_ledger_lineage WHERE guild_id=? AND target_entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')", (guild_id, entry_id)).fetchone())
 
+
+def _subject_entry_controls(
+    conn: sqlite3.Connection, guild_id: int, rows: List[Dict[str, Any]],
+) -> Tuple[Set[str], Dict[Tuple[Any, Any, Any], Set[str]]]:
+    """Read controls once for this selection, on its caller's snapshot.
+
+    The subject rows already contain its forgotten-source tombstones. Incoming
+    corrections retain the same guild/type scope as ``_entry_current``. Keep
+    these controls local to this call so edits and deletions are read afresh.
+    """
+    forgotten: Dict[Tuple[Any, Any, Any], Set[str]] = {}
+    for row in rows:
+        if row.get("lifecycle_status") != "forgotten":
+            continue
+        key = (row.get("source_table"), row.get("source_row_id"),
+               row.get("predicate_key"))
+        entry_id = row.get("entry_id")
+        # SQL equality/inequality does not match NULL, including NULL IDs.
+        if entry_id is not None and all(value is not None for value in key):
+            forgotten.setdefault(key, set()).add(str(entry_id))
+    incoming: Set[str] = set()
+    entry_ids = tuple(dict.fromkeys(str(row.get("entry_id") or "") for row in rows))
+    for start in range(0, len(entry_ids), 400):
+        chunk = entry_ids[start:start + 400]
+        incoming.update(str(row[0]) for row in conn.execute(
+            """SELECT DISTINCT target_entry_id FROM memory_ledger_lineage
+            WHERE guild_id=? AND target_entry_id IN (%s)
+              AND lineage_type IN ('correction_of','supersedes','retracts')"""
+            % ",".join("?" for _ in chunk),
+            (guild_id, *chunk),
+        ).fetchall())
+    return incoming, forgotten
+
 def _valid_now(d: Dict[str, Any], now_ts: float) -> bool:
     start = _parse_time(str(d.get("valid_from") or "")); end = _parse_time(str(d.get("valid_until") or ""))
     return (not start or start <= now_ts) and (not end or end >= now_ts)
@@ -895,8 +928,19 @@ def build_governed_context(
     public_route = req.visibility_allowance in {"public", "public_safe"}
     try:
         cols = [c[1] for c in conn.execute("PRAGMA table_info(memory_ledger_entries)").fetchall()]
-        for row in conn.execute("SELECT * FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (req.guild_id, subject)).fetchall():
-            d = dict(zip(cols, row))
+        subject_rows = [dict(zip(cols, row)) for row in conn.execute(
+            "SELECT * FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?",
+            (req.guild_id, subject),
+        ).fetchall()]
+        # Batch only within a snapshot the caller already owns. Schema setup
+        # can commit, and unsnapshotted callers must retain their live checks
+        # at the original candidate positions so new controls are observed.
+        controls_snapshot = conn.in_transaction
+        incoming_controls, forgotten_sources = (
+            _subject_entry_controls(conn, req.guild_id, subject_rows)
+            if controls_snapshot else (set(), {})
+        )
+        for d in subject_rows:
             entry_id = str(d.get("entry_id") or "")
             source_class = str(d.get("source_class") or "")
             source_ref = "ledger:%s" % entry_id
@@ -920,9 +964,22 @@ def build_governed_context(
             life = str(d.get("lifecycle_status") or "active").lower()
             if life in BLOCKED_LIFECYCLES:
                 exclude("lifecycle"); diag.correction_supersession_exclusions += 1; continue
-            if not _entry_current(conn, req.guild_id, entry_id):
+            incoming_control = (
+                entry_id in incoming_controls if controls_snapshot
+                else not _entry_current(conn, req.guild_id, entry_id)
+            )
+            if incoming_control:
                 exclude("superseded_or_retracted"); diag.correction_supersession_exclusions += 1; continue
-            if conn.execute("SELECT 1 FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND source_table=? AND source_row_id=? AND predicate_key=? AND lifecycle_status='forgotten' AND entry_id<>?", (req.guild_id, subject, d.get("source_table"), d.get("source_row_id"), d.get("predicate_key"), entry_id)).fetchone():
+            forgotten_control = (
+                any(forgotten_id != entry_id for forgotten_id in forgotten_sources.get(
+                    (d.get("source_table"), d.get("source_row_id"), d.get("predicate_key")),
+                    (),
+                )) if controls_snapshot else bool(conn.execute(
+                    "SELECT 1 FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND source_table=? AND source_row_id=? AND predicate_key=? AND lifecycle_status='forgotten' AND entry_id<>?",
+                    (req.guild_id, subject, d.get("source_table"), d.get("source_row_id"), d.get("predicate_key"), entry_id),
+                ).fetchone())
+            )
+            if forgotten_control:
                 exclude("forgotten_source_tombstone"); continue
             if not _valid_now(d, now_ts):
                 exclude("validity_window"); continue

@@ -561,6 +561,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         direct_target=False,
         reply_to_bot=False,
         followup_candidate=False,
+        profile_update=None,
     ):
         channel = self._channel(channel_id)
         message = FakeMessage(channel, content)
@@ -735,6 +736,10 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 )
                 for patcher in patchers:
                     stack.enter_context(patcher)
+                if profile_update is not None:
+                    stack.enter_context(mock.patch.object(
+                        bnl01_bot, "upsert_user_profile", side_effect=profile_update,
+                    ))
                 await bnl01_bot.on_message(message)
 
         memory_context.assert_called_once()
@@ -748,6 +753,86 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ],
             "prompt": generation.await_args.args[1],
         }
+
+    async def test_busy_profile_commit_keeps_main_and_tagged_reply_paths(self):
+        real_profile = bnl01_bot.upsert_user_profile
+        real_connect = sqlite3.connect
+        reader = real_connect(bnl01_bot.DB_FILE)
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM user_profiles").fetchall()
+
+        def short_connect(*args, **kwargs):
+            kwargs["timeout"] = 0.01
+            return real_connect(*args, **kwargs)
+
+        for active, direct in ((True, False), (False, True)):
+            with self.subTest(active=active, direct=direct), mock.patch.object(
+                bnl01_bot.sqlite3, "connect", side_effect=short_connect,
+            ):
+                await self._capture_prompt_memory_direction(
+                    channel_id=9912 if active else 9913,
+                    active_channel_id=9912 if active else 8000,
+                    channel_policy="public_home" if active else "public_context",
+                    content="What makes Friday's opener work?",
+                    direct_target=direct, profile_update=real_profile,
+                )
+        with real_connect(bnl01_bot.DB_FILE, timeout=0.01) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM user_profiles").fetchone()[0], 0)
+
+    async def test_profile_wait_does_not_block_discord_event_loop(self):
+        started = threading.Event()
+        release = threading.Event()
+        waited = []
+
+        def slow_profile(*_args):
+            started.set()
+            waited.append(release.wait(2))
+            return False
+
+        task = asyncio.create_task(self._capture_prompt_memory_direction(
+            channel_id=9912, active_channel_id=9912,
+            channel_policy="public_home", content="What makes Friday's opener work?",
+            profile_update=slow_profile,
+        ))
+        try:
+            async def let_other_events_run():
+                while not started.is_set():
+                    await asyncio.sleep(0.001)
+                release.set()
+            await asyncio.wait_for(let_other_events_run(), timeout=1)
+            await task
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(waited, [True])
+
+    async def test_busy_profile_keeps_buffered_main_channel_request(self):
+        channel = self._channel(9914)
+        message = FakeMessage(channel, "What makes Friday's opener work?")
+        real_profile = bnl01_bot.upsert_user_profile
+        real_connect = sqlite3.connect
+        reader = real_connect(bnl01_bot.DB_FILE)
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM user_profiles").fetchall()
+
+        def short_connect(*args, **kwargs):
+            kwargs["timeout"] = 0.01
+            return real_connect(*args, **kwargs)
+
+        with (
+            self._on_message_runtime(channel.id, followup_candidate=False),
+            mock.patch.object(bnl01_bot, "resolve_channel_policy", return_value="public_home"),
+            mock.patch.object(bnl01_bot, "upsert_user_profile", side_effect=real_profile),
+            mock.patch.object(bnl01_bot.sqlite3, "connect", side_effect=short_connect),
+            mock.patch.object(bnl01_bot, "_reset_debounce") as schedule,
+        ):
+            await bnl01_bot.on_message(message)
+        self.assertEqual(len(bnl01_bot._channel_buffers[channel.id]), 1)
+        schedule.assert_called_once_with(channel)
 
     def _assert_people_memory_contract(self, prompt):
         self.assertIn(
