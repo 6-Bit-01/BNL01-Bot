@@ -705,13 +705,25 @@ def requested_tiktok_show_word_count(user_text: str) -> str:
     token = r"[^\W_]+(?:['’][^\W_]+)?"
     pattern = r"\bword\s+(?:[\"“'‘](" + token + r")[\"”'’]|(" + token + r")\b)"
     matches = list(re.finditer(pattern, query, re.I))
+    explicit_word_target = bool(matches)
     if not matches:
         pattern = (r"\b(?:say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\s+"
                    r"(?:the\s+word\s+)?(?:[\"“'‘](" + token + r")[\"”'’]|(" + token + r")\b)")
         matches = list(re.finditer(pattern, query, re.I))
     word = (matches[-1].group(1) or matches[-1].group(2)).casefold() if matches else ""
-    return word if len(word) <= 80 and word not in {
-        "", "the", "word", "count", "it", "that", "this", "what", "anything", "something",
+    if not word or len(word) > 80:
+        return ""
+    if explicit_word_target:
+        # A bare "word count" asks for a measure without naming a token.
+        # Quotation or a separate counting cue makes "count" a valid word.
+        if word == "count" and not matches[-1].group(1):
+            outside_target = query[:matches[-1].start()] + query[matches[-1].end():]
+            if not re.search(r"\b(?:how many times|how often|number of times|"
+                             r"occurrences?|word count|count(?:ed)?)\b", outside_target, re.I):
+                return ""
+        return word
+    return word if word not in {
+        "the", "word", "count", "it", "that", "this", "what", "anything", "something",
     } else ""
 
 
@@ -731,7 +743,7 @@ def _tiktok_word_frequency_scope_query(user_text: str) -> str:
         or requested_recent_show_count(current) is not None
         or re.search(
             r"\b(?:now|currently|right now|today|tonight|this evening)\b|"
-            r"\b(?:current|this)\s+(?:(?:private|public)\s+)?"
+            r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
             r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b",
             current, re.I,
         )
@@ -749,7 +761,7 @@ def tiktok_show_word_frequency_current_requested(user_text: str) -> bool:
         return False
     return bool(re.search(
         r"\b(?:now|currently|right now)\b|"
-        r"\b(?:current|this)\s+(?:(?:private|public)\s+)?"
+        r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
         r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b",
         query, re.I,
     ))
@@ -787,7 +799,7 @@ def count_tiktok_show_word_frequency(
         str(user_text or ""), re.I,
     )
     if any(not re.fullmatch(
-        r"(?:the\s+)?(?:tiktok\s+)?(?:they|people|viewers?|audience|chat|room|everyone|anyone)",
+        r"(?:the\s+)?(?:(?:tiktok|tik tok)\s+)?(?:they|people|viewers?|audience|chat|room|everyone|anyone)",
         speaker.group(1).strip(), re.I,
     ) for speaker in speakers_requested):
         result["reason"] = "specific_speaker_scope_not_resolved"
@@ -1143,7 +1155,7 @@ def select_show_for_tiktok_analysis(
                 if _bounded_text(show.get("showDate"), 40) == requested_date:
                     return dict(show), source_key
         return {}, "none"
-    if re.search(r"\b(?:current|this)\s+(?:(?:private|public)\s+)?"
+    if re.search(r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
                  r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b", scope_query, re.I):
         if not any(key == "currentShow" for key, _show in candidates):
             return {}, "none"

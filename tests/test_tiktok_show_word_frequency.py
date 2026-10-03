@@ -85,6 +85,19 @@ class TikTokShowWordFrequencyTests(unittest.TestCase):
         self.assertTrue(is_tiktok_show_analysis_followup("Not now, in the whole stream"))
         self.assertEqual(requested_tiktok_show_word_count("Tell me about pandas"), "")
 
+    def test_explicit_quoted_and_unquoted_stopwords_are_valid_word_targets(self):
+        at = stamp("2026-10-03T03:00:00Z")
+        for word in ("the", "word", "count", "it", "that", "this", "what", "anything", "something"):
+            for literal in (word, '"' + word + '"'):
+                query = "Count the word " + literal + " in TikTok chat tonight"
+                with self.subTest(word=word, literal=literal):
+                    self.assertEqual(requested_tiktok_show_word_count(query), word)
+                    result = count_tiktok_show_word_frequency(
+                        show(), [event(0, word + " " + word, at)], query)
+                    self.assertEqual((result["status"], result["occurrenceCount"]), ("complete", 2))
+        self.assertEqual(requested_tiktok_show_word_count("How many times did they say it?"), "")
+        self.assertEqual(requested_tiktok_show_word_count("What is the word count in TikTok chat?"), "")
+
     def test_current_correction_keeps_target_from_the_human_followup_chain(self):
         query = ('TikTok chat tonight\nPrior follow-up: How many times did they say the word "panda"?'
                  '\nCurrent follow-up: Not now, in the whole stream')
@@ -226,11 +239,12 @@ class TikTokShowWordFrequencyTests(unittest.TestCase):
 
     def test_current_source_aliases_cannot_select_an_older_latest_show(self):
         for alias in ("stream", "live", "episode", "show"):
-            query = "Count word panda in this " + alias
-            with self.subTest(alias=alias):
-                selected, owner = select_show_for_tiktok_analysis(
-                    {"latestShow": show("2026-09-25")}, query)
-                self.assertEqual((selected, owner), ({}, "none"))
+            for modifier in ("", "TikTok ", "Tik Tok ", "public TikTok "):
+                query = "Count word panda in this " + modifier + alias
+                with self.subTest(alias=alias, modifier=modifier):
+                    selected, owner = select_show_for_tiktok_analysis(
+                        {"latestShow": show("2026-09-25")}, query)
+                    self.assertEqual((selected, owner), ({}, "none"))
 
     def test_current_stream_alias_keeps_website_owned_frozen_source(self):
         active = show()
@@ -295,7 +309,7 @@ class TikTokShowWordFrequencyTests(unittest.TestCase):
 
     def test_literal_relative_time_words_do_not_select_a_current_episode(self):
         archive = {"latestShow": show()}
-        for word in ("now", "tonight", "currently"):
+        for word in ("now", "tonight", "currently", "this", "it", "that", "count"):
             query = "Count the word " + word + " in the last stream"
             selected, owner = select_show_for_tiktok_analysis(archive, query)
             with self.subTest(word=word):
@@ -377,7 +391,8 @@ class TikTokArchivedWordFrequencyTests(unittest.TestCase):
 
     def test_current_counts_emit_no_competing_finalized_packet_or_reader_count(self):
         for phrase in ("this stream", "current stream", "this live", "current episode",
-                       "this show", "right now"):
+                       "this show", "right now", "this TikTok live", "current Tik Tok stream",
+                       "this public TikTok live"):
             query = "Count word panda in " + phrase
             with self.subTest(phrase=phrase), closing(sqlite3.connect(self.db)) as conn:
                 self.assertEqual(select_tiktok_show_episode_context_items(
@@ -404,6 +419,29 @@ class TikTokArchivedWordFrequencyTests(unittest.TestCase):
             self.db, guild_id=77, user_text=query,
             selection_user_text="Count word panda during the 2026-09-25 stream",
             pinned_show_keys=(self.older_ledger["showKey"],)), "")
+
+    def test_current_platform_modified_live_overrides_prior_dated_scope(self):
+        active = show()
+        active.update(status="live", milestones=active["milestones"][:1],
+                      _evidenceObservedThroughMs=stamp("2026-10-03T04:18:14Z"))
+        for platform in ("TikTok", "Tik Tok"):
+            query = ("Count word panda during the 2026-09-25 stream"
+                     "\nCurrent follow-up: How many times did " + platform +
+                     " chat say panda in this " + platform + " live?")
+            with self.subTest(platform=platform):
+                self.assertEqual(requested_tiktok_show_word_count(query), "panda")
+                self.assertTrue(is_tiktok_show_analysis_query(query))
+                selected, owner = select_show_for_tiktok_analysis(
+                    {"currentShow": active, "latestShow": show("2026-09-25")}, query)
+                self.assertEqual((selected["showDate"], owner), ("2026-10-02", "currentShow"))
+                result = count_tiktok_show_word_frequency(selected, full_fixture(), query)
+                self.assertEqual((result["status"], result["occurrenceCount"]), ("complete", 38))
+                with closing(sqlite3.connect(self.db)) as conn:
+                    self.assertEqual(select_tiktok_show_episode_context_items(
+                        conn, guild_id=77, user_text=query), ())
+                self.assertEqual(build_tiktok_show_evidence_context(
+                    self.db, guild_id=77, user_text=query,
+                    selection_user_text="Count word panda during the 2026-09-25 stream"), "")
 
     def test_explicit_current_human_past_date_retains_finalized_history(self):
         query = "Count word panda in this stream dated 2026-09-25"
