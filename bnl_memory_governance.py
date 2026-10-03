@@ -2756,6 +2756,7 @@ def reconcile_orphaned_conversation_ledger_sources(
         FROM memory_ledger_entries e
         LEFT JOIN conversations c
           ON c.guild_id=e.guild_id
+         AND c.id=CAST(e.source_row_id AS INTEGER)
          AND CAST(c.id AS TEXT)=e.source_row_id
         WHERE e.source_table='conversations'
           AND %s
