@@ -19803,64 +19803,67 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     if not decision.save_conversation:
         logging.info("memory_write_policy_skip_conversation role=user route_mode=%s reason=%s", route_mode, decision.reason)
         return decision
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    conversation_columns = _conversations_columns()
-    insert_columns = [
-        "user_id",
-        "user_name",
-        "guild_id",
-        "channel_name",
-        "channel_policy",
-        "channel_id",
-    ]
-    insert_values = [
-        user_id,
-        user_name,
-        guild_id,
-        (channel_name or "").lower()[:80],
-        (channel_policy or "unknown")[:40],
-        int(channel_id or 0),
-    ]
-    if "message_id" in conversation_columns:
-        insert_columns.append("message_id")
-        insert_values.append(int(message_id or 0) or None)
-    if "route_mode" in conversation_columns:
-        insert_columns.append("route_mode")
-        insert_values.append(str(route_mode or "unknown")[:80])
-    if source_observed_at:
-        occurred = journal_timestamp_to_epoch_ms(source_observed_at)
-        if occurred is None:
-            conn.close()
-            raise ValueError("invalid_observation_timestamp")
-        insert_columns.append("timestamp")
-        insert_values.append(datetime.fromtimestamp(occurred / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
-    insert_columns.extend(("role", "content"))
-    insert_values.extend(("user", content))
-    cursor.execute(
-        "INSERT INTO conversations (%s) VALUES (%s)"
-        % (
-            ",".join(insert_columns),
-            ",".join("?" for _ in insert_columns),
-        ),
-        tuple(insert_values),
-    )
-    row_id = int(cursor.lastrowid or 0)
-    observed_at = cursor.execute("SELECT timestamp FROM conversations WHERE id=?", (row_id,)).fetchone()
-    observed_at = observed_at[0] if observed_at else ""
-    try:
+    def persist_conversation(conn):
+        cursor = conn.cursor()
+        conversation_columns = {
+            str(row[1]) for row in cursor.execute(
+                "PRAGMA table_info(conversations)"
+            ).fetchall() if len(row) > 1
+        }
+        insert_columns = [
+            "user_id",
+            "user_name",
+            "guild_id",
+            "channel_name",
+            "channel_policy",
+            "channel_id",
+        ]
+        insert_values = [
+            user_id,
+            user_name,
+            guild_id,
+            (channel_name or "").lower()[:80],
+            (channel_policy or "unknown")[:40],
+            int(channel_id or 0),
+        ]
+        if "message_id" in conversation_columns:
+            insert_columns.append("message_id")
+            insert_values.append(int(message_id or 0) or None)
+        if "route_mode" in conversation_columns:
+            insert_columns.append("route_mode")
+            insert_values.append(str(route_mode or "unknown")[:80])
+        if source_observed_at:
+            occurred = journal_timestamp_to_epoch_ms(source_observed_at)
+            if occurred is None:
+                raise ValueError("invalid_observation_timestamp")
+            insert_columns.append("timestamp")
+            insert_values.append(datetime.fromtimestamp(occurred / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+        insert_columns.extend(("role", "content"))
+        insert_values.extend(("user", content))
+        cursor.execute(
+            "INSERT INTO conversations (%s) VALUES (%s)"
+            % (
+                ",".join(insert_columns),
+                ",".join("?" for _ in insert_columns),
+            ),
+            tuple(insert_values),
+        )
+        row_id = int(cursor.lastrowid or 0)
+        observed_at = cursor.execute("SELECT timestamp FROM conversations WHERE id=?", (row_id,)).fetchone()
+        observed_at = observed_at[0] if observed_at else ""
         tier_row_id = maybe_add_memory_trace(
             user_id, guild_id, content, channel_policy=channel_policy,
             role="user", source="conversations", channel_name=channel_name,
             route_mode=route_mode, source_conversation_row_id=row_id,
             connection=conn,
         )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        return row_id, observed_at, tier_row_id
+
+    # The original and its tier lineage commit together before any projection
+    # or learning hook. Each busy retry rolls back and closes that whole attempt.
+    row_id, observed_at, tier_row_id = _persist_reply_transaction(
+        persist_conversation, operation="user_conversation",
+    )
     original_saved_at = time.perf_counter()
     if (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES:
         try:
