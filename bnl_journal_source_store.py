@@ -372,7 +372,8 @@ def _record_on_connection(
                 and _tiktok_chat_replay_matches(
                     existing, immutable_values, source_key=key,
                     receipt_only=tiktok_receipt_only_replay)):
-            return SourceRecordResult(True, "idempotent", int(existing[0]), str(existing[8]))
+            return SourceRecordResult(True, "idempotent", int(existing[0]), str(existing[8]),
+                                      "tiktok_original_preserved")
         return SourceRecordResult(False, "conflict", int(existing[0]), str(existing[8]), "immutable_source_conflict")
     cursor = conn.execute(
         """

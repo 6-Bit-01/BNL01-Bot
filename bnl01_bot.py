@@ -36285,7 +36285,7 @@ def _archive_one_tiktok_live_conversation(
             event_id,
             journal_result.status,
         )
-    if journal_result.ok and journal_result.status == "inserted":
+    if journal_result.ok and journal_result.reason != "tiktok_original_preserved":
         _shadow_memory_ledger_write(
             "tiktok_live_chat",
             lambda ledger_conn: shadow_tiktok_live_chat_event(

@@ -100,6 +100,16 @@ class TikTokIngestionLockRecoveryTests(unittest.TestCase):
         self.assertEqual(self.rows()[0], original)
         self.assertEqual(len(self.rows()), 2)
 
+    def test_exact_replay_retries_failed_best_effort_shadow_without_new_archive_rows(self):
+        self.write(chat())
+        self.memory.side_effect = [False, True]
+        with mock.patch.object(self.bot, "_known_discord_identities_for_tiktok", return_value={}):
+            first = self.bot.ingest_tiktok_live_memory_once(77, path=str(self.spool))
+            replay = self.bot.ingest_tiktok_live_memory_once(77, path=str(self.spool))
+        self.assertTrue(first["ok"] and replay["ok"])
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.memory.call_count, 2)
+
     def test_writer_lock_preserves_cursor_until_release_and_exact_retry(self):
         self.write(tap())
         source_store.ensure_schema(self.db)
