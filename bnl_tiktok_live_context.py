@@ -774,7 +774,22 @@ def count_tiktok_show_word_frequency(
     word = requested_tiktok_show_word_count(user_text)
     if not word:
         return None
-    start_ms, end_ms = show_timeline_bounds_ms(show)
+    finalized = (_show_has_archive_boundary(show)
+                 or str(show.get("lifecycle") or "").casefold() == "finalized")
+    observed_through_ms = None
+    if not finalized:
+        try:
+            observed_value = show.get("_evidenceObservedThroughMs")
+            observed_through_ms = None if isinstance(observed_value, bool) else int(observed_value)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    bounded_show = show
+    if not finalized and observed_through_ms is None:
+        # A malformed/missing active marker must not crash or borrow the last
+        # queue milestone as an observation deadline.
+        bounded_show = {key: value for key, value in show.items()
+                        if key != "_evidenceObservedThroughMs"}
+    start_ms, end_ms = show_timeline_bounds_ms(bounded_show)
     if start_ms is None or end_ms is None:
         try:
             start_ms, end_ms = int(show["startedAtMs"]), int(show["endedAtMs"])
@@ -792,6 +807,11 @@ def count_tiktok_show_word_frequency(
     }
     if start_ms is None or end_ms is None or start_ms < 0 or end_ms < start_ms:
         result["reason"] = "invalid_source_window"
+        return result
+    if not finalized and (observed_through_ms is None
+                          or observed_through_ms < end_ms
+                          or observed_through_ms <= 0):
+        result.update(reason="active_observation_bound_unavailable", windowEndMs=None)
         return result
     speakers_requested = re.finditer(
         r"\b(?:did|does|has|have)\s+(.{1,100}?)\s+"

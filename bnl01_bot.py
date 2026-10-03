@@ -58,6 +58,7 @@ from bnl_tiktok_live_context import (
     requested_show_dates,
     relative_prior_show_requested,
     requested_history_window,
+    requested_tiktok_show_word_count,
     select_show_for_tiktok_analysis,
     show_conversation_interval_requested,
     tiktok_show_evidence_key,
@@ -3136,7 +3137,10 @@ def build_bnl_read_model_context(
 
     queue = _first_mapping(sections.get("queue"), read_model.get("queue"))
     archive = _first_mapping(sections.get("archive"), read_model.get("archive"))
-    if show_conversation_interval_requested(user_text):
+    if (
+        show_conversation_interval_requested(user_text)
+        or requested_tiktok_show_word_count(tiktok_show_analysis_request or user_text)
+    ):
         current_show = _first_mapping(archive.get("currentShow"))
         session = _first_mapping(queue.get("session"), queue.get("currentSession"))
         current_id = str(current_show.get("sessionId") or "")

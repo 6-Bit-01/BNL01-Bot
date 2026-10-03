@@ -135,6 +135,39 @@ class TikTokShowWordFrequencyTests(unittest.TestCase):
         self.assertEqual(result["windowEndMs"], active["_evidenceObservedThroughMs"])
         self.assertEqual((result["occurrenceCount"], result["matchingMessageCount"]), (38, 37))
 
+    def test_active_word_count_requires_owned_observation_bound_not_last_queue_milestone(self):
+        active = show()
+        active["status"] = "live"
+        active["milestones"] = [active["milestones"][0], {
+            "eventType": "track_loaded", "occurredAt": "2026-10-03T03:00:00Z",
+        }]
+        records = [
+            event(0, "Good drums", stamp("2026-10-03T02:30:00Z")),
+            event(1, "panda", stamp("2026-10-03T03:30:00Z")),
+        ]
+        query = "Count word panda in this TikTok live"
+        for marker in (None, False, 0, "unavailable", stamp("2026-10-03T02:45:00Z")):
+            selected = dict(active)
+            if marker is not None:
+                selected["_evidenceObservedThroughMs"] = marker
+            with self.subTest(marker=marker):
+                result = count_tiktok_show_word_frequency(selected, records, query)
+                self.assertEqual((result["status"], result["reason"]),
+                                 ("unavailable", "active_observation_bound_unavailable"))
+                self.assertIsNone(result["occurrenceCount"])
+                self.assertIsNone(result["windowEndMs"])
+                self.assertNotIn("occurrenceCount=0", render_tiktok_show_word_frequency(result))
+        active["_evidenceObservedThroughMs"] = stamp("2026-10-03T04:18:14Z")
+        result = count_tiktok_show_word_frequency(active, records, query)
+        self.assertEqual((result["status"], result["occurrenceCount"]), ("complete", 1))
+        finalized = {
+            "lifecycle": "finalized", "showKey": "anonymous-finalized", "showDate": "2026-10-02",
+            "startedAtMs": stamp("2026-10-03T02:05:35.254Z"),
+            "endedAtMs": stamp("2026-10-03T04:18:14Z"),
+        }
+        result = count_tiktok_show_word_frequency(finalized, records, query)
+        self.assertEqual((result["status"], result["occurrenceCount"]), ("complete", 1))
+
     def test_word_matching_ignores_case_and_counts_repeats_without_substrings(self):
         at = stamp("2026-10-03T03:00:00Z")
         result = count_tiktok_show_word_frequency(show(), [
