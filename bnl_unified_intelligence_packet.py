@@ -87,6 +87,7 @@ from bnl_journal import (
 )
 from bnl_moment_engine import (
     SITUATION_EPISODE_READ_VERSION,
+    ensure_moment_schema,
     resume_date_scope_requested,
     select_public_participant_moment_gists,
     select_situation_aware_episode_gists,
@@ -2826,8 +2827,42 @@ def _governed_items(
     *,
     broad: bool,
 ) -> list[IntelligencePacketItem]:
+    """Keep governed selection and its source fingerprints in one snapshot."""
+
     if int(request.subject_user_id or 0) <= 0:
         return []
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        # These existing schema owners can commit. Prepare them before opening
+        # our read scope; never commit or migrate inside caller-owned work.
+        try:
+            ensure_governance_schema(conn)
+            ensure_moment_schema(conn)
+            conn.execute("BEGIN")
+        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            diagnostics.processing_errors.append("governance:%s" % type(exc).__name__)
+            return []
+    try:
+        return _governed_items_in_snapshot(
+            conn, request, diagnostics, exclusions, broad=broad,
+        )
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            # Only end the scope we opened. Candidate selection and source
+            # fingerprints are reads; the packet receipt remains its owner's.
+            conn.rollback()
+
+
+def _governed_items_in_snapshot(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+    *,
+    broad: bool,
+) -> list[IntelligencePacketItem]:
     gov_request = GovernanceRequest(
         guild_id=int(request.guild_id or 0),
         subject_user_id=int(request.subject_user_id or 0),
@@ -2864,6 +2899,7 @@ def _governed_items(
         legacy_context="",
         include_review_moments=True,
         include_public_moment_gists=True,
+        initialize_schema=False,
     )
     safety = assess_governance_result_safety(result)
     if safety.processing_errors:
