@@ -839,7 +839,11 @@ def count_tiktok_show_word_frequency(
             rejected += 1
             continue
         event_id = safe["event_id"]
-        revision = (safe["occurred_at_ms"], digest, safe["speaker_key"])
+        # The source owner already chose this identity. A handle is a fallback,
+        # not authority to merge distinct archived keys or split one key.
+        source_subject = str(value.get("subject_ref") or "")
+        chat_identity_key = source_subject or safe["speaker_key"]
+        revision = (safe["occurred_at_ms"], digest, source_subject, safe["speaker_key"])
         if event_id in seen:
             if seen[event_id] != revision:
                 rejected += 1
@@ -849,11 +853,11 @@ def count_tiktok_show_word_frequency(
         occurrences += found
         if found:
             matching += 1
-            speakers.add(safe["speaker_key"])
+            speakers.add(chat_identity_key)
         ref = {"sourceKind": "tiktok_live_chat", "sourceKey": event_id,
                "contentHash": digest, "occurredAtMs": safe["occurred_at_ms"]}
         result["originalSourceRefs"].append(ref)
-        roots.append((ref, safe["subject_ref"], safe["speaker_key"]))
+        roots.append((ref, source_subject, safe["speaker_key"]))
     result["capturedMessageCount"] = len(seen)
     result["status"] = "partial" if rejected else "complete" if seen else "unavailable"
     result["reason"] = "invalid_or_truncated_originals" if rejected else (
@@ -888,6 +892,7 @@ def render_tiktok_show_word_frequency(result: Mapping[str, Any]) -> str:
         lines.append("- Word %s: occurrenceCount=%s; matchingMessageCount=%s; matchingSpeakerCount=%s."
                      % (json.dumps(result.get("word")), result["occurrenceCount"],
                         result["matchingMessageCount"], result["matchingSpeakerCount"]))
+        lines.append("- Speaker total measures distinct captured chat identity keys, using the source-owned subject reference and existing speaker-key fallback. This does not infer unique people or merge accounts.")
         lines.append("- Answer with these measured totals for this selected stream. Counts cover captured originals; they do not certify receipt of every platform event.")
     else:
         lines.append("- No exact word total is available for this incomplete source window. Do not report zero or substitute a rolling live buffer, an older show, selected excerpts, or a previous BNL answer.")

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from bnl_canon_source_contract import show_queue_evidence_authorization
 from bnl_journal_source_store import ensure_schema, _record_on_connection
 from bnl_tiktok_live_context import (
     build_durable_show_prompt_context, build_tiktok_show_evidence_ledger,
@@ -18,7 +19,8 @@ from bnl_tiktok_live_context import (
     select_show_for_tiktok_analysis,
 )
 from bnl_tiktok_show_ledger import (
-    _lookup_tiktok_show_word_frequency, build_tiktok_show_evidence_context,
+    _lookup_tiktok_show_word_frequency, _seal_authorized_show_ledger,
+    build_tiktok_show_evidence_context,
     ensure_tiktok_show_evidence_schema, select_tiktok_show_episode_context_items,
     tiktok_show_episode_context_item_version,
 )
@@ -146,6 +148,25 @@ class TikTokShowWordFrequencyTests(unittest.TestCase):
                                                  "Count word panda in this stream")
         self.assertEqual(result["occurrenceCount"], 1)
         self.assertEqual(result["capturedMessageCount"], 1)
+
+    def test_matching_identity_keys_preserve_source_ownership_across_shared_handles(self):
+        at = stamp("2026-10-03T03:00:00Z")
+        first, second = event(0, "panda", at), event(1, "panda", at + 1)
+        first["metadata"]["handle"] = second["metadata"]["handle"] = "shared.handle"
+        self.assertNotEqual(first["subject_ref"], second["subject_ref"])
+        result = count_tiktok_show_word_frequency(
+            show(), [first, second], "Count word panda in this stream")
+        self.assertEqual((result["occurrenceCount"], result["matchingSpeakerCount"]), (2, 2))
+        self.assertIn("distinct captured chat identity keys", render_tiktok_show_word_frequency(result))
+
+    def test_one_source_identity_key_is_not_split_by_a_changed_handle(self):
+        at = stamp("2026-10-03T03:00:00Z")
+        first, second = event(0, "panda", at), event(1, "panda", at + 1)
+        second["subject_ref"] = first["subject_ref"]
+        self.assertNotEqual(first["metadata"]["handle"], second["metadata"]["handle"])
+        result = count_tiktok_show_word_frequency(
+            show(), [first, second], "Count word panda in this stream")
+        self.assertEqual((result["occurrenceCount"], result["matchingSpeakerCount"]), (2, 1))
 
     def test_missing_empty_and_partial_sources_never_produce_an_exact_zero(self):
         at = stamp("2026-10-03T03:00:00Z")
@@ -305,6 +326,28 @@ class TikTokArchivedWordFrequencyTests(unittest.TestCase):
                 subject_ref=original["subject_ref"], private_display_name=original["private_display_name"],
                 metadata=original["metadata"])
         ledger = build_tiktok_show_evidence_ledger(source_show, events)
+        self.assertEqual(ledger["lifecycle"], "finalized")
+        archive = {
+            "available": True, "reason": None,
+            "schemaVersion": "queue_public_history_projection_v1",
+            "source": "queue_bnl_history_projection",
+            "visibility": "public_safe", "accessScope": "public",
+            "historyCoverageStartedAt": "2026-09-25", "sourceRevision": 1,
+            "sourceDigest": hashlib.sha256(json.dumps(
+                source_show, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+            "memoryDefault": "do_not_store", "sourceFileDefault": "review_evidence_only",
+            "publicDossierDefault": "not_automatic", "personalHistory": None,
+            "currentShow": None, "latestShow": source_show, "shows": [],
+        }
+        authorization = show_queue_evidence_authorization({
+            "ok": True, "version": 1, "source": "barcode-network-site",
+            "publicOnly": True, "accessScope": "public",
+            "capabilities": {"queueProduction": True}, "sections": {"archive": archive},
+        }, environ={"BNL_QUEUE_PRODUCTION_ENABLED": "true"})
+        self.assertTrue(authorization["usable"], authorization["reason"])
+        ledger = _seal_authorized_show_ledger(ledger, authorization["receipt"])
+        self.assertIsNotNone(ledger)
         conn.execute(
             "INSERT INTO tiktok_show_evidence_ledgers(guild_id,show_key,schema_version,show_date,"
             "show_title,lifecycle_status,started_at_ms,ended_at_ms,source_digest,ledger_json,"
