@@ -3142,8 +3142,14 @@ def _document_relevance(
         for item in participant_matches
     ):
         return 0, []
-    if (_subject_continuity_requested(query) and not direct_subject_candidates
-            and not participant_matches and not requested_tiktok_show_word_count(query)):
+    # "I meant" corrects the count term, rather than requesting this
+    # speaker's activity. Keep every remaining personal-scope restriction.
+    subject_scope_query = (
+        re.sub(r"\bI\s+meant\b", " ", query, flags=re.I)
+        if requested_tiktok_show_word_count(query) else query
+    )
+    if (_subject_continuity_requested(subject_scope_query)
+            and not direct_subject_candidates and not participant_matches):
         # An absent/ineligible requester is not a request for everybody else's
         # messages. In particular, consent lookup may intentionally remove the
         # subject reference; do not expand that failed personal read into a

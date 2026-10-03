@@ -450,5 +450,29 @@ class ShowWordCountFollowupSourceOwnerTests(unittest.TestCase):
         self.assertEqual(selection["user_text"], kwargs["user_text"])
 
 
+    def test_count_correction_does_not_expand_personal_scope(self):
+        import bnl_tiktok_show_ledger as ledger_owner
+
+        selected = {"showDate": "2026-09-04", "participants": []}
+        cases = (
+            (REQUEST, True),
+            (REQUEST + "\nCurrent follow-up: BNL, I meant goat.", True),
+            ('Count the word "panda" in my TikTok comments during the September 4, 2026 stream.', False),
+            (REQUEST + "\nCurrent follow-up: BNL, I meant goat in my comments.", False),
+            ('How many times did I say the word "panda" during the September 4, 2026 TikTok stream?', False),
+            ("What did I say during the September 4, 2026 TikTok stream?", False),
+        )
+        for query, eligible in cases:
+            with self.subTest(query=query):
+                score, participants = ledger_owner._document_relevance(
+                    selected, user_text=query, subject_ref="",
+                    recency_rank=0, allow_direct_subject=False,
+                    requested_dates=("2026-09-04",),
+                )
+                self.assertEqual(score > 0, eligible)
+                self.assertEqual(participants, [])
+
+
+
 if __name__ == "__main__":
     unittest.main()
