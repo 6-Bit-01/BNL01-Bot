@@ -797,7 +797,7 @@ def count_tiktok_show_word_frequency(
             start_ms, end_ms = None, None
     result: Dict[str, Any] = {
         "word": word, "status": "unavailable", "reason": "source_unavailable",
-        "showKey": str(show.get("showKey") or tiktok_show_evidence_key(show)),
+        "showKey": str(show.get("showKey") or tiktok_show_evidence_key(bounded_show)),
         "sessionId": str(show.get("sessionId") or show.get("showSessionId") or ""),
         "showDate": str(show.get("showDate") or ""),
         "windowStartMs": start_ms, "windowEndMs": end_ms,
