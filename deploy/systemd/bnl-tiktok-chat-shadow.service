@@ -19,7 +19,7 @@ Environment=BNL_TIKTOK_USERNAME=six.bit
 Environment=BNL_TIKTOK_TIMEZONE=America/Los_Angeles
 Environment=BNL_TIKTOK_WEEKDAY=friday
 Environment=BNL_TIKTOK_WINDOW_WEEKDAY_ISO=5
-Environment=BNL_TIKTOK_WINDOW_START=18:50
+Environment=BNL_TIKTOK_WINDOW_START=18:30
 Environment=BNL_TIKTOK_WINDOW_END=02:00
 Environment=BNL_TIKTOK_RETRY_SECONDS=20
 Environment=BNL_TIKTOK_LIVE_CONTEXT_PATH=/run/bnl-tiktok-chat-shadow/live-context.json
