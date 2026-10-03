@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -818,6 +819,7 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
             result = bnl01_bot.record_journal_source_event(
                 self.db_path, guild_id=77, source_kind="tiktok_live_chat",
                 source_key=event_id, occurred_at_ms=self._stamp(instant),
+                ingested_at_ms=self._stamp(instant),
                 raw_text=text, sanitized_summary=text, channel_policy="public_context",
                 subject_ref="tiktok_handle:" + event_id, private_display_name="@" + event_id,
                 public_usable=True, metadata={"eventType": "comment", "handle": event_id},
@@ -858,13 +860,19 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
             }
         return model
 
-    def _context(self, question, *, conversation_context="", include_current=True):
+    def _empty_source_database(self, label):
+        # Each immutable source receipt is created once in a fresh fixture DB.
+        self.db_path = str(Path(self.db_path).with_name("frequency-%s.db" % label))
+        bnl01_bot.ensure_journal_source_schema(self.db_path)
+
+    def _context(self, question, *, conversation_context="", include_current=True, read_model=None):
         with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}, clear=False), \
              mock.patch.object(bnl01_bot, "DB_FILE", self.db_path), \
              mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 77), \
              mock.patch.object(bnl01_bot, "_bnl_read_model_cached_at", self.observed_at), \
              mock.patch.object(bnl01_bot, "BNL_TIKTOK_LIVE_CONTEXT_PATH", "/missing-frequency-live-context"), \
-             mock.patch.object(bnl01_bot, "fetch_bnl_read_model", return_value=self._model(include_current=include_current)), \
+             mock.patch.object(bnl01_bot, "fetch_bnl_read_model",
+                               return_value=read_model if read_model is not None else self._model(include_current=include_current)), \
              mock.patch.object(bnl01_bot, "load_tiktok_show_source_events",
                                wraps=bnl01_bot.load_tiktok_show_source_events) as originals, \
              mock.patch.object(bnl01_bot, "build_durable_show_prompt_context",
@@ -879,6 +887,7 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
         live.assert_not_called()
         self.assertEqual(originals.call_args.args[0], self.db_path)
         self.assertEqual(originals.call_args.kwargs["guild_id"], 77)
+        self.assertTrue(originals.call_args.kwargs["word_frequency"])
         return context, originals.call_args.kwargs["show"], renderer.call_args.args
 
     def _assert_current_originals(self, context, selected_show, rendered_args):
@@ -940,6 +949,191 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
         self.assertNotIn("31 pandas", rendered_args[2])
         self.assertNotIn("guessed 99", rendered_args[2])
 
+
+    def test_bare_count_and_target_corrections_keep_the_actual_human_show_chain(self):
+        conversation = (
+            "User/member: TikTok chat tonight\n"
+            'User/member: How many times did they say the word "panda" in this TikTok live?\n'
+            "BNL-01: A previous show had 31 pandas.\n"
+        )
+        for question, word, count, matching in (
+            ("count panda", "panda", 4, 3),
+            ("count 'panda'", "panda", 4, 3),
+            ("I meant goat", "goat", 0, 0),
+            ("not panda, goat", "goat", 0, 0),
+            ("I meant 'red panda'", "red panda", None, None),
+        ):
+            with self.subTest(question=question):
+                context, selected, rendered = self._context(
+                    question,
+                    conversation_context=conversation + "User/member (current payload fragment): " + question,
+                )
+                self.assertEqual(selected["sessionId"], self.current["sessionId"])
+                self.assertEqual({event["event_id"] for event in rendered[1]}, {
+                    "current-one", "current-neutral", "current-two", "current-three",
+                })
+                if count is None:
+                    self.assertIn("Coverage=unavailable", context)
+                    self.assertIn("unsupported_word_target", context)
+                    self.assertNotIn("occurrenceCount=4", context)
+                    self.assertNotIn("occurrenceCount=0", context)
+                else:
+                    self.assertIn('- Word "%s": occurrenceCount=%s; matchingMessageCount=%s' %
+                                  (word, count, matching), context)
+                self.assertNotIn("occurrenceCount=31", context)
+                self.assertNotIn("31 pandas", rendered[2])
+
+    def test_incoming_active_observation_marker_requires_owned_live_queue(self):
+        cutoff = int(self.observed_at.timestamp() * 1000)
+        for session_id, phase in (
+            ("different-frequency", "live"),
+            (self.current["sessionId"], "ended"),
+            ("different-frequency", "ended"),
+        ):
+            with self.subTest(session_id=session_id, phase=phase):
+                model = self._model()
+                incoming = model["sections"]["archive"]["currentShow"]
+                incoming["_evidenceObservedThroughMs"] = cutoff
+                model["sections"]["queue"]["session"].update(id=session_id, broadcastPhase=phase)
+                context, selected, rendered = self._context(
+                    "Count the word panda in this TikTok live", read_model=model,
+                )
+                self.assertNotIn("_evidenceObservedThroughMs", selected)
+                self.assertIsNone(rendered[1])
+                self.assertIn("Coverage=unavailable", context)
+                self.assertIn("active_observation_bound_unavailable", context)
+                self.assertNotIn("occurrenceCount=4", context)
+                # Cleaning the local read must not mutate the incoming model.
+                self.assertEqual(incoming["_evidenceObservedThroughMs"], cutoff)
+
+    def test_owned_live_queue_replaces_incoming_marker_with_frozen_read_clock(self):
+        model = self._model()
+        model["sections"]["archive"]["currentShow"]["_evidenceObservedThroughMs"] = (
+            int(self.observed_at.timestamp() * 1000) + 60_000
+        )
+        context, selected, rendered = self._context(
+            "Count the word panda in this TikTok live", read_model=model,
+        )
+        self._assert_current_originals(context, selected, rendered)
+
+    def test_first_receipt_after_frozen_cutoff_cannot_create_an_exact_match(self):
+        cutoff = int(self.observed_at.timestamp() * 1000)
+        self._empty_source_database("first-receipt-cutoff")
+        for event_id, occurred, ingested, text in (
+            ("quiet-control", cutoff - 2000, cutoff - 1000, "Good drums"),
+            ("late-first-receipt", cutoff - 1000, cutoff + 60_000, "panda"),
+        ):
+            self.assertTrue(bnl01_bot.record_journal_source_event(
+                self.db_path, guild_id=77, source_kind="tiktok_live_chat",
+                source_key=event_id, occurred_at_ms=occurred, ingested_at_ms=ingested,
+                raw_text=text, channel_policy="public_context",
+                subject_ref="tiktok_handle:test.viewer",
+                metadata={"eventType": "comment", "handle": "test.viewer"},
+            ).ok)
+        context, selected, rendered = self._context(
+            "Count the word panda in this TikTok live",
+        )
+        self.assertEqual([event["event_id"] for event in rendered[1]], ["quiet-control"])
+        self.assertEqual(rendered[1][0]["ingested_at_ms"], cutoff - 1000)
+        self.assertIn("Coverage=complete", context)
+        self.assertIn("occurrenceCount=0; matchingMessageCount=0", context)
+        self.assertIn("eligibleCapturedMessagesChecked=1", context)
+
+    def test_invalid_first_receipt_cannot_certify_an_exact_count(self):
+        cutoff = int(self.observed_at.timestamp() * 1000)
+        for index, receipt in enumerate((0, 1.5, "invalid-receipt")):
+            with self.subTest(receipt=receipt):
+                self._empty_source_database("invalid-receipt-%s" % index)
+                self.assertTrue(bnl01_bot.record_journal_source_event(
+                    self.db_path, guild_id=77, source_kind="tiktok_live_chat",
+                    source_key="quiet-control", occurred_at_ms=cutoff - 2000,
+                    ingested_at_ms=cutoff - 1000, raw_text="Good drums",
+                    channel_policy="public_context", subject_ref="tiktok_handle:test.viewer",
+                    metadata={"eventType": "comment", "handle": "test.viewer"},
+                ).ok)
+                # The normal writer coerces receipt values to integers. Insert
+                # malformed fixture values once under its unchanged SQL schema.
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute(
+                        "INSERT INTO bnl_journal_source_events "
+                        "(guild_id,source_kind,source_key,occurred_at_ms,ingested_at_ms,"
+                        "channel_policy,subject_ref,raw_text,sanitized_summary,content_hash,"
+                        "public_usable,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (77, "tiktok_live_chat", "invalid-receipt", cutoff - 1000, receipt,
+                         "public_context", "tiktok_handle:test.viewer", "panda", "panda",
+                         hashlib.sha256(b"panda").hexdigest(), 1,
+                         json.dumps({"eventType": "comment", "handle": "test.viewer"})),
+                    )
+                context, _selected, rendered = self._context(
+                    "Count the word panda in this TikTok live",
+                )
+                self.assertIn("invalid-receipt", {event["event_id"] for event in rendered[1]})
+                self.assertIn("Coverage=partial", context)
+                self.assertNotIn("occurrenceCount=1", context)
+                self.assertNotIn("occurrenceCount=0", context)
+
+    def test_archived_count_keeps_retained_originals_received_after_show_end(self):
+        self._empty_source_database("archived-late-receipt")
+        self.assertTrue(bnl01_bot.record_journal_source_event(
+            self.db_path, guild_id=77, source_kind="tiktok_live_chat",
+            source_key="latest-one", occurred_at_ms=self._stamp("2026-09-26T03:00:00Z"),
+            ingested_at_ms=int(self.observed_at.timestamp() * 1000),
+            raw_text="panda " * 8, channel_policy="public_context",
+            subject_ref="tiktok_handle:test.viewer",
+            metadata={"eventType": "comment", "handle": "test.viewer"},
+        ).ok)
+        model = self._model(include_current=False)
+        for candidate in (
+            model["sections"]["archive"]["latestShow"],
+            *model["sections"]["archive"]["shows"],
+        ):
+            candidate["_evidenceObservedThroughMs"] = int(self.observed_at.timestamp() * 1000)
+        context, selected, rendered = self._context(
+            "Count the word panda during the last stream", include_current=False, read_model=model,
+        )
+        self.assertNotIn("_evidenceObservedThroughMs", selected)
+        self.assertEqual([event["event_id"] for event in rendered[1]], ["latest-one"])
+        self.assertEqual(rendered[1][0]["ingested_at_ms"], int(self.observed_at.timestamp() * 1000))
+        self.assertIn("occurrenceCount=8; matchingMessageCount=1", context)
+        self.assertIn("2026-09-26T08:08:03.054000+00:00 inclusive", context)
+
+    def test_recorded_intake_extends_only_the_count_window_for_live_show(self):
+        from bnl_tiktok_live_context import show_timeline_bounds_ms
+        self.current["milestones"].insert(0, {
+            "eventType": "submissions_opened", "occurredAt": "2026-10-03T01:41:01.622Z",
+        })
+        context, selected, rendered = self._context(
+            "Count the word panda in this TikTok live",
+        )
+        self.assertEqual(show_timeline_bounds_ms(selected)[0], self._stamp("2026-10-03T02:05:35.254Z"))
+        self.assertEqual({event["event_id"] for event in rendered[1]}, {
+            "current-pre", "current-one", "current-neutral", "current-two", "current-three",
+        })
+        self.assertIn("occurrenceCount=24; matchingMessageCount=4", context)
+        self.assertIn("eligibleCapturedMessagesChecked=5", context)
+        self.assertIn("windowUTC=2026-10-03T01:41:01.622000+00:00", context)
+
+    def test_recorded_intake_extends_only_the_count_window_for_archived_show(self):
+        from bnl_tiktok_live_context import show_timeline_bounds_ms
+        self.latest["milestones"].insert(0, {
+            "eventType": "session_created", "occurredAt": "2026-09-26T01:41:01.622Z",
+        })
+        self.assertTrue(bnl01_bot.record_journal_source_event(
+            self.db_path, guild_id=77, source_kind="tiktok_live_chat",
+            source_key="latest-intake", occurred_at_ms=self._stamp("2026-09-26T02:00:00Z"),
+            ingested_at_ms=self._stamp("2026-09-26T02:00:01Z"),
+            raw_text="Panda panda", channel_policy="public_context",
+            subject_ref="tiktok_handle:test.viewer",
+            metadata={"eventType": "comment", "handle": "test.viewer"},
+        ).ok)
+        context, selected, rendered = self._context(
+            "Count the word panda during the last stream", include_current=False,
+        )
+        self.assertEqual(show_timeline_bounds_ms(selected)[0], self._stamp("2026-09-26T02:05:35.254Z"))
+        self.assertEqual({event["event_id"] for event in rendered[1]}, {"latest-intake", "latest-one"})
+        self.assertIn("occurrenceCount=10; matchingMessageCount=2", context)
+        self.assertIn("windowUTC=2026-09-26T01:41:01.622000+00:00", context)
+
     def test_missing_current_tiktok_live_does_not_count_an_archived_show(self):
         question = "How many times did TikTok chat say panda in this TikTok live?"
         context, selected_show, rendered_args = self._context(question, include_current=False)
@@ -950,6 +1144,68 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
         self.assertIn("no public show timeline was selected", context)
 
 
+
+
+class BnlWordFrequencyRepairBasisTests(unittest.TestCase):
+    @staticmethod
+    def _basis(text, digest, count):
+        return bnl01_bot.FinalizedShowPromptSourceBasis(
+            expected_digest=digest,
+            rendered_context="TikTok show word frequency: occurrenceCount=%s" % count,
+            guild_id=77, user_text=text, selection_user_text=text,
+            subject_user_id=0, show_keys=("test-frequency-show",),
+        )
+
+    def test_corrected_word_basis_is_retained_only_after_stable_revalidation(self):
+        question = "Count the word panda during the last stream"
+        stale = self._basis(question, "stale", 38)
+        fresh = self._basis(question, "fresh", 36)
+        with mock.patch.object(
+            bnl01_bot, "refresh_prompt_source_basis",
+            side_effect=((fresh, True), (fresh, False)),
+        ) as refresh:
+            prompt, bases, source_neutral = bnl01_bot.build_ordinary_chat_response_repair_prompt(
+                stale.rendered_context, reason="show_episode_source_changed",
+                prompt_source_bases=(stale,), current_user_text=question,
+            )
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(bases, (fresh,))
+        self.assertFalse(source_neutral)
+        self.assertIn("occurrenceCount=36", prompt)
+        self.assertNotIn("occurrenceCount=38", prompt)
+
+    def test_corrected_word_basis_that_changes_again_is_not_retained(self):
+        question = "Count the word panda during the last stream"
+        stale = self._basis(question, "stale", 38)
+        fresh = self._basis(question, "fresh", 36)
+        with mock.patch.object(
+            bnl01_bot, "refresh_prompt_source_basis", return_value=(fresh, True),
+        ) as refresh:
+            prompt, bases, source_neutral = bnl01_bot.build_ordinary_chat_response_repair_prompt(
+                stale.rendered_context, reason="show_episode_source_changed",
+                prompt_source_bases=(stale,), current_user_text=question,
+            )
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(bases, ())
+        self.assertTrue(source_neutral)
+        self.assertNotIn("occurrenceCount=36", prompt)
+        self.assertNotIn("occurrenceCount=38", prompt)
+
+    def test_changed_non_count_show_basis_keeps_existing_omission_rule(self):
+        question = "Recap the last stream"
+        stale = self._basis(question, "stale", 38)
+        fresh = self._basis(question, "fresh", 36)
+        with mock.patch.object(
+            bnl01_bot, "refresh_prompt_source_basis", return_value=(fresh, True),
+        ) as refresh:
+            prompt, bases, source_neutral = bnl01_bot.build_ordinary_chat_response_repair_prompt(
+                stale.rendered_context, reason="show_episode_source_changed",
+                prompt_source_bases=(stale,), current_user_text=question,
+            )
+        refresh.assert_called_once()
+        self.assertEqual(bases, ())
+        self.assertTrue(source_neutral)
+        self.assertNotIn("occurrenceCount=36", prompt)
 
 if __name__ == "__main__":
     unittest.main()

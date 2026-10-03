@@ -271,3 +271,37 @@ change provider selection, add dependencies, or migrate the database.
 The [September 10 completion checkpoint](recovery_acceptance_2026-09-10.md)
 records retained live evidence, the bounded recovery-cost correction, and the
 remaining actions under the original acceptance plan.
+
+## Captured TikTok whole-word counts
+
+Word counts use the selected episode's retained public-eligible original chat,
+with occurrences distinguished from matching messages and source-owned chat
+identity keys. They do not certify receipt of every platform event. The count
+window starts at the earliest recorded session/intake boundary when available;
+broadcast and track clocks keep their existing broadcast start. The rendered
+evidence states the actual UTC window and captured-source coverage.
+
+For an active episode, the bot consumer freezes the observation cutoff only
+after validating the current queue session and live phase. An incoming marker
+cannot supply that authority. Both occurrence time and first ingestion receipt
+must fall at or before that cutoff. Archived counts may include valid retained
+receipts received after the archive boundary; that boundary ends occurrences,
+rather than asserting when every event was received.
+
+Missing or invalid source receipts, conflicting room/session aliases, source
+limits, and corrupt or truncated originals cannot certify an exact total or
+zero. A narrower time or speaker request the existing counter cannot resolve
+is unavailable. Unsupported multiword corrections replace the previous target
+with an unavailable result instead of silently counting the old word. Natural
+single-word count requests and human term corrections retain the existing
+TikTok/show conversation scope.
+
+The count-specific reader uses the same bounds as the counter. Its fresh
+original window and rendered count participate in the existing source-basis
+version checks. Direct and grouped delivery tests exercise packet on/off and
+eligibility withdrawal during a mocked provider wait. Packet-selected grouped
+fixtures contain repeated messages from one actor, as required by the existing
+batch owner. Changed evidence replaces
+the stale total before one send. Tests preserve the existing private sealed
+conversation history while excluding source blocks and public-memory promotion.
+These mocked tests verify routing and refresh, not live model factuality.

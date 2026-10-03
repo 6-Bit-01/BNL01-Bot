@@ -49,6 +49,8 @@ from bnl_tiktok_live_context import (
     _public_show_speaker_label,
     build_tiktok_show_evidence_ledger,
     requested_tiktok_show_word_count,
+    tiktok_show_word_frequency_bounds_ms,
+    _show_has_archive_boundary,
     tiktok_show_word_frequency_current_requested,
     _tiktok_word_frequency_scope_query,
     count_tiktok_show_word_frequency,
@@ -807,14 +809,32 @@ def _load_show_source_events(
     show: Mapping[str, Any],
     limit: int = TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS,
     diagnostics_out: Optional[dict] = None,
+    word_frequency: bool = False,
 ) -> Optional[list[dict[str, Any]]]:
     if diagnostics_out is not None:
         diagnostics_out.clear()
         diagnostics_out.update(status="unavailable", reason="invalid_show_window", rows_read=0,
                                truncated_event_ids=())
-    start_ms, end_ms = show_timeline_bounds_ms(show)
+    start_ms, end_ms = (
+        tiktok_show_word_frequency_bounds_ms(show) if word_frequency
+        else show_timeline_bounds_ms(show)
+    )
     if start_ms is None or end_ms is None or end_ms < start_ms:
         return None
+    receipt_cutoff_ms = None
+    if word_frequency and not (
+        _show_has_archive_boundary(show)
+        or str(show.get("lifecycle") or "").casefold() == "finalized"
+    ):
+        try:
+            marker = show.get("_evidenceObservedThroughMs")
+            receipt_cutoff_ms = None if isinstance(marker, bool) else int(marker)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if receipt_cutoff_ms is None or receipt_cutoff_ms <= 0 or receipt_cutoff_ms < end_ms:
+            if diagnostics_out is not None:
+                diagnostics_out["reason"] = "active_observation_bound_unavailable"
+            return None
     exists = conn.execute(
         """
         SELECT 1 FROM sqlite_master
@@ -826,17 +846,27 @@ def _load_show_source_events(
             diagnostics_out["reason"] = "source_table_unavailable"
         return None
     safe_limit = max(1, min(int(limit or 1), TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS))
+    # The frozen active count can use only originals already first received.
+    # Invalid receipts still reach the count owner, so they cannot certify zero.
+    receipt_filter = ""
+    params = [int(guild_id), int(start_ms), int(end_ms)]
+    if receipt_cutoff_ms is not None:
+        receipt_filter = " AND (typeof(ingested_at_ms)!='integer' OR ingested_at_ms<=?)"
+        params.append(receipt_cutoff_ms)
+    params.append(safe_limit + 1)
+    receipt_column = ",ingested_at_ms" if word_frequency else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT source_key,occurred_at_ms,subject_ref,private_display_name,
-               raw_text,metadata_json,content_hash,event_seq
+               raw_text,metadata_json,content_hash,event_seq {receipt_column}
         FROM bnl_journal_source_events
         WHERE guild_id=? AND source_kind='tiktok_live_chat'
           AND public_usable=1 AND occurred_at_ms>=? AND occurred_at_ms<=?
+          {receipt_filter}
         ORDER BY occurred_at_ms,event_seq
         LIMIT ?
         """,
-        (int(guild_id), int(start_ms), int(end_ms), safe_limit + 1),
+        params,
     ).fetchall()
     if len(rows) > safe_limit:
         if diagnostics_out is not None:
@@ -852,16 +882,17 @@ def _load_show_source_events(
         return None
     events = []
     truncated_event_ids = []
-    for (
-        source_key,
-        occurred_at_ms,
-        subject_ref,
-        display_name,
-        raw_text,
-        metadata_json,
-        content_hash,
-        event_seq,
-    ) in rows:
+    for row in rows:
+        (
+            source_key,
+            occurred_at_ms,
+            subject_ref,
+            display_name,
+            raw_text,
+            metadata_json,
+            content_hash,
+            event_seq,
+        ) = row[:8]
         try:
             metadata = json.loads(metadata_json or "{}")
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -881,6 +912,7 @@ def _load_show_source_events(
                 "content_hash": str(content_hash or "")[:64],
                 "event_seq": int(event_seq or 0),
                 "metadata": metadata,
+                **({"ingested_at_ms": row[8]} if word_frequency else {}),
             }
         )
     if diagnostics_out is not None:
@@ -899,8 +931,9 @@ def load_tiktok_show_source_events(
     show: Mapping[str, Any],
     limit: int = TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS,
     diagnostics_out: Optional[dict] = None,
+    word_frequency: bool = False,
 ) -> Optional[list[dict[str, Any]]]:
-    """Read the complete public source window for one show without mutation."""
+    """Read public originals, with a frozen first-receipt boundary for word counts."""
 
     if diagnostics_out is not None:
         diagnostics_out.clear()
@@ -920,6 +953,7 @@ def load_tiktok_show_source_events(
                 show=show,
                 limit=limit,
                 diagnostics_out=diagnostics_out,
+                word_frequency=word_frequency,
             )
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
         if diagnostics_out is not None:
@@ -4417,7 +4451,7 @@ def _lookup_tiktok_show_word_frequency(
     """Reuse the fresh original reader under an already selected episode root."""
     diagnostics: dict[str, Any] = {}
     try:
-        show = {"showDate": ledger.get("showDate"), "milestones": [
+        show = {**ledger, "milestones": [
             {"eventType": "broadcast_started",
              "occurredAt": _utc_iso_from_ms(int(ledger["startedAtMs"]))},
             {"eventType": "session_archived",
@@ -4425,8 +4459,10 @@ def _lookup_tiktok_show_word_frequency(
         ]}
         events = (_load_show_source_events(
             source_conn, guild_id=guild_id, show=show, diagnostics_out=diagnostics,
+            word_frequency=True,
         ) if source_conn is not None else load_tiktok_show_source_events(
             db_file, guild_id=guild_id, show=show, diagnostics_out=diagnostics,
+            word_frequency=True,
         ))
     except (KeyError, OSError, sqlite3.DatabaseError, TypeError, ValueError):
         events = None

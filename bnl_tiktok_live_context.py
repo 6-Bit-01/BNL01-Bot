@@ -696,47 +696,109 @@ def is_live_show_reaction_query(
     return any(re.search(pattern, normalized) for pattern in _LIVE_REACTION_PATTERNS)
 
 
-def requested_tiktok_show_word_count(user_text: str) -> str:
-    """Extract a word-frequency target without choosing its source episode."""
+def _tiktok_show_word_count_targets(user_text: str) -> list[tuple[int, int, str]]:
+    """Read selectors in order; an unsupported later literal cannot revive an old one."""
     query = str(user_text or "")
-    if not re.search(r"\b(?:how many times|how often|number of times|occurrences?|"
-                     r"word count|count(?:ed)?)\b", query, re.I):
-        return ""
+    cue = r"\b(?:how many times|how often|number of times|occurrences?|word count|count(?:ed)?)\b"
+    if not re.search(cue, query, re.I):
+        return []
     token = r"[^\W_]+(?:['’][^\W_]+)?"
-    pattern = r"\bword\s+(?:[\"“'‘](" + token + r")[\"”'’]|(" + token + r")\b)"
-    matches = list(re.finditer(pattern, query, re.I))
-    explicit_word_target = bool(matches)
-    if not matches:
-        pattern = (r"\b(?:say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\s+"
-                   r"(?:the\s+word\s+)?(?:[\"“'‘](" + token + r")[\"”'’]|(" + token + r")\b)")
-        matches = list(re.finditer(pattern, query, re.I))
-    word = (matches[-1].group(1) or matches[-1].group(2)).casefold() if matches else ""
-    if not word or len(word) > 80:
-        return ""
-    if explicit_word_target:
-        # A bare "word count" asks for a measure without naming a token.
-        # Quotation or a separate counting cue makes "count" a valid word.
-        if word == "count" and not matches[-1].group(1):
-            outside_target = query[:matches[-1].start()] + query[matches[-1].end():]
-            if not re.search(r"\b(?:how many times|how often|number of times|"
-                             r"occurrences?|word count|count(?:ed)?)\b", outside_target, re.I):
-                return ""
-        return word
-    return word if word not in {
-        "the", "word", "count", "it", "that", "this", "what", "anything", "something",
-    } else ""
+    literal = (
+        r'(?:["“]([^"”\n]*)["”]|'
+        r"['‘]((?:[^'’\n]|['’](?=\w))*)['’]|(" + token + r")\b)"
+    )
+    quoted_spans = tuple(match.span() for match in re.finditer(
+        r'["“][^"”\n]*["”]|' + r"(?<!\w)['‘](?:[^'’\n]|['’](?=\w))*['’]", query,
+    ))
+    prefixes = (
+        ("word", r"\bword\s+"),
+        ("verb", r"\b(?:say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\s+(?:the\s+word\s+)?"),
+        ("count", r"\bcount(?:ed)?\s+"),
+    )
+    targets = []
+    for kind, prefix in prefixes:
+        for match in re.finditer(prefix + literal, query, re.I):
+            if any(start <= match.start() < end for start, end in quoted_spans):
+                continue
+            if kind == "count" and re.search(r"\bword\s*$", query[:match.start()], re.I):
+                # "word count" names a measure; it is not the verb "count".
+                continue
+            group = next((index for index in (1, 2, 3) if match.group(index) is not None), None)
+            if group is None:
+                continue
+            word = match.group(group).strip().casefold()
+            quoted = group != 3
+            if not word:
+                continue
+            if kind == "word" and word == "count" and not quoted:
+                outside = query[:match.start()] + query[match.end():]
+                if not re.search(cue, outside, re.I):
+                    continue
+            if kind != "word" and not quoted and word in {
+                "the", "word", "count", "it", "that", "this", "what", "anything", "something",
+            }:
+                continue
+            if kind == "count" and not quoted and word in {
+                "comment", "comments", "message", "messages", "viewer", "viewers",
+                "person", "people", "tap", "taps", "like", "likes", "chat",
+                "in", "during", "for", "of", "from",
+                "all", "total", "my", "our", "your", "every", "each", "number",
+                "these", "those", "a", "an",
+                "track", "tracks", "song", "songs", "submission", "submissions",
+                "gift", "gifts", "share", "shares", "follow", "follows",
+                "donation", "donations", "diamond", "diamonds", "wheel", "wheels", "spin", "spins",
+                "join", "joins", "participant", "participants", "artist", "artists",
+            }:
+                continue
+            targets.append((*match.span(group), word))
+    # Corrections acquire a target only after an eligible human count selector.
+    # The bot supplies the bounded human chain; model replies never enter it.
+    for prefix, new_groups in (
+        (r"\bI\s+meant\s+(?:the\s+word\s+)?", (1, 2, 3)),
+        (r"\bnot\s+(?P<discarded>[\"“][^\"”\n]*[\"”]|['‘](?:[^'’\n]|['’](?=\w))*['’]|"
+         + token + r")\s*[,;]\s*", (2, 3, 4)),
+    ):
+        for match in re.finditer(prefix + literal, query, re.I):
+            if any(start <= match.start() < end for start, end in quoted_spans):
+                continue
+            if not any(start < match.start() for start, _end, _word in targets):
+                continue
+            group = next((index for index in new_groups if match.group(index) is not None), None)
+            if group is None:
+                continue
+            word = match.group(group).strip().casefold()
+            if word and (group != new_groups[-1] or word not in {
+                "it", "that", "this", "anything", "something",
+                "in", "during", "for", "of", "from", "through", "until",
+                "before", "after", "at", "on", "with", "the",
+                "whole", "entire", "full", "all", "instead", "rather", "actually",
+            }):
+                if "discarded" in match.re.groupindex:
+                    # OLD and NEW are both literal operands of this eligible
+                    # correction. Neither operand may select an episode.
+                    targets.append((*match.span("discarded"), match.group("discarded").casefold()))
+                targets.append((*match.span(group), word))
+    return sorted(set(targets))
+
+
+def requested_tiktok_show_word_count(user_text: str) -> str:
+    """Extract the latest count selector, including unsupported quoted phrases."""
+    targets = _tiktok_show_word_count_targets(user_text)
+    return targets[-1][2] if targets else ""
+
+
+def _tiktok_word_frequency_target_inert_query(user_text: str) -> str:
+    """Keep literal target words from acting as episode or interval selectors."""
+    query = str(user_text or "")
+    targets = _tiktok_show_word_count_targets(query)
+    for start, end, _word in sorted({(start, end, word) for start, end, word in targets}, reverse=True):
+        query = query[:start] + "queried token" + query[end:]
+    return query
 
 
 def _tiktok_word_frequency_scope_query(user_text: str) -> str:
     """Keep the word inert while the latest explicit human episode scope wins."""
-    word = requested_tiktok_show_word_count(user_text)
-    query = str(user_text or "")
-    if word:
-        query = re.sub(
-            r"\b(?:word|say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\s+"
-            r"(?:the\s+word\s+)?[\"“'‘]?" + re.escape(word) + r"[\"”'’]?(?!\w)",
-            "queried token", query, flags=re.I,
-        )
+    query = _tiktok_word_frequency_target_inert_query(user_text)
     current = re.split(r"(?:^|\n)Current follow-up:\s*", query, flags=re.I)[-1]
     if current != query and (
         has_explicit_show_date(current) or requested_show_date(current)
@@ -750,6 +812,42 @@ def _tiktok_word_frequency_scope_query(user_text: str) -> str:
     ):
         return current
     return query
+
+
+def tiktok_show_word_frequency_bounds_ms(show: Any) -> Tuple[Optional[int], Optional[int]]:
+    """Count within recorded session/intake bounds without moving the broadcast clock."""
+    start_ms, end_ms = show_timeline_bounds_ms(show)
+    if not isinstance(show, Mapping):
+        return start_ms, end_ms
+    if start_ms is None or end_ms is None:
+        try:
+            values = show["startedAtMs"], show["endedAtMs"]
+            if any(isinstance(value, bool) for value in values):
+                return None, None
+            start_ms, end_ms = map(int, values)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None, None
+    recorded_starts = [start_ms]
+    for field in ("milestones", "operationalEvents"):
+        events = show.get(field)
+        if not isinstance(events, (list, tuple)):
+            continue
+        for event in events:
+            if not isinstance(event, Mapping) or event.get("eventType") not in {
+                "session_created", "submissions_opened",
+            }:
+                continue
+            if field == "milestones":
+                timestamp = _iso_epoch_ms(event.get("occurredAt"))
+            else:
+                value = event.get("occurredAtMs")
+                try:
+                    timestamp = None if isinstance(value, bool) else int(value)
+                except (TypeError, ValueError, OverflowError):
+                    timestamp = None
+            if timestamp is not None and 0 < timestamp <= start_ms:
+                recorded_starts.append(timestamp)
+    return min(recorded_starts), end_ms
 
 
 def tiktok_show_word_frequency_current_requested(user_text: str) -> bool:
@@ -789,12 +887,7 @@ def count_tiktok_show_word_frequency(
         # queue milestone as an observation deadline.
         bounded_show = {key: value for key, value in show.items()
                         if key != "_evidenceObservedThroughMs"}
-    start_ms, end_ms = show_timeline_bounds_ms(bounded_show)
-    if start_ms is None or end_ms is None:
-        try:
-            start_ms, end_ms = int(show["startedAtMs"]), int(show["endedAtMs"])
-        except (KeyError, TypeError, ValueError, OverflowError):
-            start_ms, end_ms = None, None
+    start_ms, end_ms = tiktok_show_word_frequency_bounds_ms(bounded_show)
     result: Dict[str, Any] = {
         "word": word, "status": "unavailable", "reason": "source_unavailable",
         "showKey": str(show.get("showKey") or tiktok_show_evidence_key(bounded_show)),
@@ -805,6 +898,9 @@ def count_tiktok_show_word_frequency(
         "matchingMessageCount": None, "matchingSpeakerCount": None,
         "originalSourceRefs": [], "sourceDigest": "",
     }
+    if len(word) > 80 or not re.fullmatch(r"[^\W_]+(?:['’][^\W_]+)?", word):
+        result["reason"] = "unsupported_word_target"
+        return result
     if start_ms is None or end_ms is None or start_ms < 0 or end_ms < start_ms:
         result["reason"] = "invalid_source_window"
         return result
@@ -824,13 +920,9 @@ def count_tiktok_show_word_frequency(
     ) for speaker in speakers_requested):
         result["reason"] = "specific_speaker_scope_not_resolved"
         return result
-    scope_query = re.sub(
-        r"\b(?:word|say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\s+"
-        r"(?:the\s+word\s+)?[\"“'‘]?" + re.escape(word) + r"[\"”'’]?(?!\w)",
-        "queried token", str(user_text or ""), flags=re.I,
-    )
+    scope_query = _tiktok_word_frequency_target_inert_query(user_text)
     if re.search(
-        r"\b(?:track|song|minutes?)\b|t\+\d|"
+        r"\b(?:track|song|minutes?|hours?|seconds?)\b|t\+\d|"
         r"\b(?:before|after|between|from|until|through|as of)\s+\d{1,2}:\d{2}\b",
         scope_query, re.I,
     ):
@@ -863,6 +955,40 @@ def count_tiktok_show_word_frequency(
             rejected += 1
             continue
         if not start_ms <= safe["occurred_at_ms"] <= end_ms:
+            continue
+        first_receipt = value.get("ingested_at_ms")
+        if isinstance(first_receipt, bool) or not isinstance(first_receipt, int) or first_receipt <= 0:
+            rejected += 1
+            continue
+        if not finalized:
+            if first_receipt > observed_through_ms:
+                # This query cannot acquire a record first received after its
+                # frozen observation time, even if its occurrence was earlier.
+                continue
+        ownership = metadata if isinstance(metadata, Mapping) else {}
+        selected_room = str(show.get("roomId") or "").strip()
+        selected_sessions = {
+            str(show.get(alias) or "").strip()
+            for alias in ("sessionId", "showSessionId") if show.get(alias)
+        }
+        if not selected_sessions and result["showKey"] and not result["showKey"].startswith("show:"):
+            # The existing ledger owner uses a raw canonical session key when
+            # available; dated fallback "show:" hashes do not invent a session.
+            selected_sessions = {result["showKey"]}
+        source_sessions = {
+            str(ownership.get(alias) or "").strip()
+            for alias in ("sessionId", "showSessionId") if ownership.get(alias)
+        }
+        source_show_key = str(ownership.get("showKey") or "").strip()
+        if (
+            (selected_room and str(ownership.get("roomId") or "").strip() != selected_room)
+            or len(selected_sessions) > 1 or len(source_sessions) > 1
+            or (selected_sessions and source_sessions and source_sessions != selected_sessions)
+            or (source_show_key and source_show_key != result["showKey"])
+        ):
+            # Optional legacy aliases need not exist. Every supplied alias
+            # still has to agree with the selected source owner.
+            rejected += 1
             continue
         raw = str(value.get("raw_text") or "")
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -973,7 +1099,12 @@ def is_tiktok_show_analysis_followup(text: str) -> bool:
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
         return False
-    return bool(requested_tiktok_show_word_count(normalized)) or is_tiktok_show_analysis_continuation(normalized) or any(
+    return bool(
+        requested_tiktok_show_word_count(normalized)
+        or re.search(r"\bI\s+meant\s+(?:the\s+word\s+)?[\"“'‘]?[^\W_]+|"
+                     r"\bnot\s+[\"“'‘]?[^\W_]+[\"”'’]?\s*[,;]\s*[\"“'‘]?[^\W_]+|"
+                     r"\b(?:actually[, ]+)?(?:the\s+)?word\s+[\"“'‘]", normalized, re.I)
+    ) or is_tiktok_show_analysis_continuation(normalized) or any(
         re.search(pattern, normalized)
         for pattern in _SHOW_ANALYSIS_FOLLOWUP_PATTERNS
     )
