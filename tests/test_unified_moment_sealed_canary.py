@@ -251,8 +251,10 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 bnl01_bot,
-                "build_user_memory_context",
-                return_value="No route-safe durable memory for this mode/channel.",
+                # This fixture tests Moment route wiring without a runtime DB.
+                # Real memory/snapshot integration has separate coverage.
+                "_read_user_memory_snapshot",
+                return_value=("No route-safe durable memory for this mode/channel.", {}),
             ),
             mock.patch.object(
                 bnl01_bot,
