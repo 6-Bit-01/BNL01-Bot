@@ -4213,6 +4213,28 @@ def build_tiktok_show_evidence_context_for_turn(
         guild_id=guild_id, subject_user_id=subject_user_id,
     )
     tiktok_show_evidence_query = str(user_text or "")
+    if (
+        conversation_basis is not None
+        and int(subject_user_id or 0) > 0
+        and conversation_basis.current_user_id == int(subject_user_id)
+        and conversation_basis.guild_id == int(guild_id)
+        and not image_queries
+    ):
+        # Reload originals for a bounded correction from this requester. Prior
+        # BNL replies and other speakers cannot supply the count request.
+        human_count_context = "\n".join(
+            "User/member: " + " ".join(item.text.split())
+            for item in sorted(
+                conversation_basis.evidence_items,
+                key=lambda item: item.source_id,
+            )
+            if item.speaker_user_id == int(subject_user_id)
+        )
+        count_request = resolve_tiktok_show_analysis_request(
+            user_text, human_count_context,
+        )
+        if count_request and requested_tiktok_show_word_count(count_request):
+            tiktok_show_evidence_query = count_request
     request_owns_show_date = bool(
         has_explicit_show_date(tiktok_show_evidence_query)
         or requested_show_date(
@@ -42902,10 +42924,17 @@ def build_user_aware_prompt(
     # memory-policy decisions; this changes only factual prompt composition.
     website_prompt_context = (
         website_read_model_context.for_original_quote_lookup(
-            (lookup["show_key"] for lookup in show_selection.get("original_quote_lookup", ())),
+            (
+                show_basis.show_keys
+                if show_basis is not None and show_selection.get("word_frequency_lookup")
+                else (lookup["show_key"] for lookup in show_selection.get("original_quote_lookup", ()))
+            ),
             current_images=bool(image_queries),
         )
-        if (image_queries or show_selection.get("original_quote_lookup"))
+        if (
+            image_queries or show_selection.get("original_quote_lookup")
+            or (show_basis is not None and show_selection.get("word_frequency_lookup"))
+        )
         and isinstance(website_read_model_context, WebsiteReadModelContext)
         else website_read_model_context
     )

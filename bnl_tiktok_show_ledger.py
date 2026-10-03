@@ -3143,7 +3143,7 @@ def _document_relevance(
     ):
         return 0, []
     if (_subject_continuity_requested(query) and not direct_subject_candidates
-            and not participant_matches):
+            and not participant_matches and not requested_tiktok_show_word_count(query)):
         # An absent/ineligible requester is not a request for everybody else's
         # messages. In particular, consent lookup may intentionally remove the
         # subject reference; do not expand that failed personal read into a
