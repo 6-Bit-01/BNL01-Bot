@@ -18570,20 +18570,34 @@ def prune_conversation_history(user_id: int, guild_id: int, max_rows: int = MAX_
         )
 
 def upsert_user_profile(user_id: int, guild_id: int, display_name: str):
+    """Refresh display metadata without turning a busy commit into a lost turn.
+
+    This does not decide consent, privacy or source authority. Failed attempts
+    roll back and close before retry; later messages can refresh the metadata.
+    """
     now = datetime.now(PACIFIC_TZ).isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO user_profiles (user_id, guild_id, display_name, last_seen)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id, guild_id)
-        DO UPDATE SET display_name=excluded.display_name, last_seen=excluded.last_seen
-        """,
-        (user_id, guild_id, display_name, now),
-    )
-    conn.commit()
-    conn.close()
+    def write(conn):
+        conn.execute(
+            """
+            INSERT INTO user_profiles (user_id, guild_id, display_name, last_seen)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, guild_id)
+            DO UPDATE SET display_name=excluded.display_name, last_seen=excluded.last_seen
+            """,
+            (user_id, guild_id, display_name, now),
+        )
+        return True
+
+    try:
+        return _persist_reply_transaction(write, operation="user_profile", timeout=0.1)
+    except sqlite3.OperationalError as exc:
+        if not _sqlite_busy(exc):
+            raise
+        logging.warning(
+            "user_profile_refresh_deferred guild_id=%s user_id=%s sqlite_busy=1",
+            guild_id, user_id,
+        )
+        return False
 
 def set_preferred_name(user_id: int, guild_id: int, preferred_name: str):
     now = datetime.now(PACIFIC_TZ).isoformat()
@@ -18808,11 +18822,10 @@ def should_allow_greeting(user_id: int, guild_id: int) -> bool:
     return random.random() < GREETING_CHANCE
 
 def get_guild_config(guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT active_channel_id FROM guild_configs WHERE guild_id = ?", (guild_id,))
-    result = cursor.fetchone()
-    conn.close()
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        result = conn.execute(
+            "SELECT active_channel_id FROM guild_configs WHERE guild_id = ?", (guild_id,),
+        ).fetchone()
     return result[0] if result else None
 
 def get_guild_ambient_state(guild_id: int):
@@ -39580,8 +39593,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             # token, interrupt handling, cooldown and finally cleanup.
             response_stage = "source_preparation"
             await _ensure_batch_typing(channel, local_generation_id)
-            style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
-            log_response_style(channel.guild.id, first_uid, style_key)
+            style_key, style_rule = await asyncio.to_thread(
+                choose_response_style, channel.guild.id, first_uid, len(collapsed_items), combined_text,
+            )
+            await asyncio.to_thread(log_response_style, channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(collapsed_items, style_key, style_rule)
             recent_room_prompt = str(
                 orchestration_state.get("recent_room_prompt") or ""
@@ -48571,12 +48586,14 @@ async def on_message(message: discord.Message):
 
     direct_conversation_ingress = _register_direct_conversation_ingress(message)
 
-    active_channel_id = get_guild_config(message.guild.id)
+    active_channel_id = await asyncio.to_thread(get_guild_config, message.guild.id)
 
     is_active_channel = (active_channel_id is not None and message.channel.id == active_channel_id)
     channel_policy = resolve_channel_policy(message.channel)
     if channel_policy != "internal_controlled":
-        upsert_user_profile(message.author.id, message.guild.id, message.author.display_name)
+        await asyncio.to_thread(
+            upsert_user_profile, message.author.id, message.guild.id, message.author.display_name,
+        )
     is_sealed_test_channel = channel_policy == "sealed_test"
     conversation_surface = conversation_surface_for_channel_policy(channel_policy, is_active_channel)
     free_speak_surface = conversation_surface_allows_free_speak(conversation_surface)
@@ -49681,7 +49698,7 @@ async def on_message(message: discord.Message):
             )
             if direct_orchestration_prompt:
                 prompt += "\n\n" + direct_orchestration_prompt
-            log_response_style(message.guild.id, message.author.id, style_key)
+            await asyncio.to_thread(log_response_style, message.guild.id, message.author.id, style_key)
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
             show_state_route = "get_gemini_response"
@@ -50212,7 +50229,7 @@ async def on_message(message: discord.Message):
         )
         if direct_orchestration_prompt:
             prompt += "\n\n" + direct_orchestration_prompt
-        log_response_style(message.guild.id, message.author.id, style_key)
+        await asyncio.to_thread(log_response_style, message.guild.id, message.author.id, style_key)
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         if payload_expected:
@@ -50699,7 +50716,7 @@ async def on_message(message: discord.Message):
         )
         if direct_orchestration_prompt:
             prompt += "\n\n" + direct_orchestration_prompt
-        log_response_style(message.guild.id, message.author.id, style_key)
+        await asyncio.to_thread(log_response_style, message.guild.id, message.author.id, style_key)
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         if payload_expected:

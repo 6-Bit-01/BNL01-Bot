@@ -73,6 +73,40 @@ class ReplySQLiteContentionTests(unittest.TestCase):
         self.assertIs(bot.log_response_style(77, 42, "steady_reply"), True)
         self._assert_readable("response_style_log", 1)
 
+    def test_profile_busy_commit_releases_writer_and_reports_failure(self):
+        reader = self._hold_read("user_profiles")
+        with mock.patch.object(bot.sqlite3, "connect", self._short_connection):
+            self.assertIs(bot.upsert_user_profile(42, 77, "Test Member"), False)
+        self._assert_readable("user_profiles")
+        for conn in self.connections[1:]:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+        reader.rollback()
+        self.assertIs(bot.upsert_user_profile(42, 77, "Test Member"), True)
+        self._assert_readable("user_profiles", 1)
+
+    def test_profile_retry_preserves_preference_and_updates_one_existing_member(self):
+        bot.set_preferred_name(42, 77, "Preferred Test Label")
+        reader = self._hold_read("user_profiles")
+        with (
+            mock.patch.object(bot.sqlite3, "connect", self._short_connection),
+            mock.patch.object(bot.time, "sleep", side_effect=lambda _delay: reader.rollback()) as backoff,
+        ):
+            self.assertIs(bot.upsert_user_profile(42, 77, "New Test Label"), True)
+        backoff.assert_called_once()
+        with self.connect(self.path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT user_id,guild_id,display_name,preferred_name FROM user_profiles"
+            ).fetchall(), [(42, 77, "New Test Label", "Preferred Test Label")])
+
+    def test_profile_non_lock_failure_remains_visible(self):
+        with self.connect(self.path) as conn:
+            conn.execute("DROP TABLE user_profiles")
+        with mock.patch.object(bot.time, "sleep") as backoff:
+            with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+                bot.upsert_user_profile(42, 77, "Test Member")
+        backoff.assert_not_called()
+
     def test_model_commit_failure_closes_connection_without_hiding_failure(self):
         reader = self._hold_read("conversations")
         with mock.patch.object(bot.sqlite3, "connect", self._short_connection):
