@@ -16,7 +16,8 @@ from bnl_tiktok_live_context import (
     count_tiktok_show_word_frequency, is_tiktok_show_analysis_followup,
     is_tiktok_show_analysis_query, render_tiktok_show_word_frequency,
     requested_recent_show_count, requested_tiktok_show_word_count,
-    select_show_for_tiktok_analysis,
+    select_show_for_tiktok_analysis, show_timeline_bounds_ms,
+    tiktok_show_word_frequency_bounds_ms,
 )
 from bnl_tiktok_show_ledger import (
     _lookup_tiktok_show_word_frequency, _seal_authorized_show_ledger,
@@ -44,6 +45,7 @@ def show(day="2026-10-02"):
 def event(index, text, occurred, prefix="current"):
     return {
         "event_id": prefix + "-" + str(index), "occurred_at_ms": occurred,
+        "ingested_at_ms": occurred,
         "subject_ref": "tiktok_user:viewer" + str(index % 11),
         "private_display_name": "Viewer " + str(index % 11),
         "raw_text": text, "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -347,6 +349,238 @@ class TikTokShowWordFrequencyTests(unittest.TestCase):
             selected, owner = select_show_for_tiktok_analysis(archive, query)
             with self.subTest(word=word):
                 self.assertEqual((selected["showDate"], owner), ("2026-10-02", "latestShow"))
+
+
+    def test_bare_count_and_latest_human_term_corrections(self):
+        at = stamp("2026-10-03T03:00:00Z")
+        records = [event(0, "panda panda goat", at)]
+        for query in ("Count panda in the last stream", "Count 'panda' in the last stream"):
+            with self.subTest(query=query):
+                self.assertEqual(requested_tiktok_show_word_count(query), "panda")
+                self.assertEqual(count_tiktok_show_word_frequency(show(), records, query)["occurrenceCount"], 2)
+        for correction in ("I meant goat", "not panda, goat"):
+            query = "Count word panda in the last stream\nCurrent follow-up: " + correction
+            with self.subTest(correction=correction):
+                self.assertTrue(is_tiktok_show_analysis_followup(correction))
+                self.assertEqual(requested_tiktok_show_word_count(query), "goat")
+                self.assertEqual(count_tiktok_show_word_frequency(show(), records, query)["occurrenceCount"], 1)
+        self.assertEqual(requested_tiktok_show_word_count("I meant goat"), "")
+        self.assertEqual(requested_tiktok_show_word_count("not panda, goat"), "")
+        self.assertEqual(requested_tiktok_show_word_count(
+            "Count word panda in tonight's stream\nCurrent follow-up: I meant 'goat'"), "goat")
+        for measure in ("comments", "viewers", "taps", "messages",
+                        "songs", "tracks", "submissions", "gifts", "shares", "follows"):
+            self.assertEqual(requested_tiktok_show_word_count("Count " + measure + " in TikTok chat"), "")
+
+    def test_discarded_correction_operand_cannot_steal_the_historical_episode(self):
+        active = show()
+        active.update(status="live", milestones=active["milestones"][:1],
+                      _evidenceObservedThroughMs=stamp("2026-10-03T04:18:14Z"))
+        older = show("2026-09-25")
+        archive = {"currentShow": active, "latestShow": older}
+        for old_word in ("now", "tonight"):
+            query = "Count word '" + old_word + "' in the last stream\nCurrent follow-up: not " + old_word + ", goat"
+            with self.subTest(old_word=old_word):
+                self.assertEqual(requested_tiktok_show_word_count(query), "goat")
+                selected, owner = select_show_for_tiktok_analysis(archive, query)
+                self.assertEqual((selected["showDate"], owner), ("2026-09-25", "latestShow"))
+                result = count_tiktok_show_word_frequency(selected, [
+                    event(0, "goat goat", stamp("2026-09-26T03:00:00Z")),
+                ], query)
+                self.assertEqual((result["status"], result["occurrenceCount"]), ("complete", 2))
+
+    def test_bare_metric_counts_keep_existing_owners_while_explicit_literals_remain_words(self):
+        at = stamp("2026-10-03T03:00:00Z")
+        for measure in ("songs", "tracks", "submissions", "gifts", "shares", "follows",
+                        "donations", "diamonds", "wheel", "spins", "joins", "participants", "artists"):
+            with self.subTest(measure=measure):
+                self.assertEqual(requested_tiktok_show_word_count("Count " + measure + " in the last stream"), "")
+                verbal_query = "How many times did TikTok chat say " + measure + " in the last stream?"
+                self.assertEqual(requested_tiktok_show_word_count(verbal_query), measure)
+                verbal_result = count_tiktok_show_word_frequency(
+                    show(), [event(0, measure + " " + measure, at)], verbal_query)
+                self.assertEqual((verbal_result["status"], verbal_result["occurrenceCount"]), ("complete", 2))
+                for literal in ("'" + measure + "'", "word " + measure):
+                    query = "Count " + literal + " in the last stream"
+                    self.assertEqual(requested_tiktok_show_word_count(query), measure)
+                    result = count_tiktok_show_word_frequency(show(), [event(0, measure, at)], query)
+                    self.assertEqual((result["status"], result["occurrenceCount"]), ("complete", 1))
+
+    def test_bare_metric_modifiers_do_not_select_chat_words(self):
+        for query in (
+            "Count all comments in TikTok chat",
+            "Count total taps in the last stream",
+            "Count my submissions in this show",
+            "Count number of gifts in the last stream",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(requested_tiktok_show_word_count(query), "")
+        for word in ("all", "total", "my", "our", "your", "every", "each",
+                     "number", "these", "those", "a", "an"):
+            for query in (
+                'Count "' + word + '" in the last stream',
+                "Count word " + word + " in the last stream",
+                "How many times did TikTok chat say " + word + " in the last stream?",
+                "Count panda in the last stream\nCurrent follow-up: I meant "
+                + ("the word all" if word == "all" else word),
+            ):
+                with self.subTest(word=word, query=query):
+                    self.assertEqual(requested_tiktok_show_word_count(query), word)
+
+        # Bare "all" is an existing scope correction; an explicit word cue
+        # distinguishes it from selecting the literal target above.
+        self.assertEqual(requested_tiktok_show_word_count(
+            "Count panda in the last stream\nCurrent follow-up: I meant all"), "panda")
+
+    def test_unsupported_later_selector_cannot_reuse_an_earlier_word(self):
+        query = ('Count the word "panda" in TikTok chat tonight.\n'
+                 'Current follow-up: Actually, the word "red panda".')
+        result = count_tiktok_show_word_frequency(
+            show(), [event(0, "panda panda panda panda panda", stamp("2026-10-03T03:00:00Z"))], query)
+        self.assertEqual(requested_tiktok_show_word_count(query), "red panda")
+        self.assertEqual(result["reason"], "unsupported_word_target")
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["occurrenceCount"])
+        self.assertNotIn("occurrenceCount=5", render_tiktok_show_word_frequency(result))
+        for literal in ('"word panda"', "'red panda'"):
+            query = "Count panda in the last stream\nCurrent follow-up: Count " + literal
+            result = count_tiktok_show_word_frequency(show(), [
+                event(0, "panda", stamp("2026-10-03T03:00:00Z")),
+            ], query)
+            with self.subTest(literal=literal):
+                self.assertEqual(result["reason"], "unsupported_word_target")
+                self.assertIsNone(result["occurrenceCount"])
+
+    def test_first_hour_is_not_widened_to_a_whole_stream_count(self):
+        records = [
+            event(0, "panda panda", stamp("2026-10-03T02:06:00Z")),
+            event(1, "panda panda panda", stamp("2026-10-03T04:10:00Z")),
+        ]
+        result = count_tiktok_show_word_frequency(
+            show(), records, "How many times did they say word panda during the first hour of TikTok?")
+        self.assertEqual(result["reason"], "specific_interval_scope_not_resolved")
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["occurrenceCount"])
+
+    def test_new_target_forms_keep_literal_scope_words_inert(self):
+        archive = {"latestShow": show()}
+        for word in ("now", "tonight", "track", "hour"):
+            records = [event(0, word + " " + word, stamp("2026-10-03T03:00:00Z"))]
+            for query in (
+                "Count '" + word + "' in the last stream",
+                "Count panda in the last stream\nCurrent follow-up: I meant '" + word + "'",
+            ):
+                with self.subTest(word=word, query=query):
+                    selected, owner = select_show_for_tiktok_analysis(archive, query)
+                    self.assertEqual((selected["showDate"], owner), ("2026-10-02", "latestShow"))
+                    result = count_tiktok_show_word_frequency(selected, records, query)
+                    self.assertEqual((result["status"], result["occurrenceCount"]), ("complete", 2))
+
+    def test_recorded_intake_count_window_preserves_broadcast_and_track_clock(self):
+        selected = show()
+        selected["milestones"][:0] = [
+            {"eventType": "session_created", "occurredAt": "2026-10-03T01:30:00Z"},
+            {"eventType": "submissions_opened", "occurredAt": "2026-10-03T01:45:00Z"},
+        ]
+        broadcast_bounds = show_timeline_bounds_ms(selected)
+        result = count_tiktok_show_word_frequency(selected, [
+            event(0, "panda", stamp("2026-10-03T01:29:59Z")),
+            event(1, "panda", stamp("2026-10-03T02:00:00Z")),
+            event(2, "Good drums", stamp("2026-10-03T02:30:00Z")),
+        ], "Count panda in the whole TikTok stream")
+        self.assertEqual((result["occurrenceCount"], result["capturedMessageCount"]), (1, 2))
+        self.assertEqual(result["windowStartMs"], stamp("2026-10-03T01:30:00Z"))
+        self.assertEqual(show_timeline_bounds_ms(selected), broadcast_bounds)
+        ledger = build_tiktok_show_evidence_ledger(selected, [])
+        self.assertEqual(ledger["startedAtMs"], broadcast_bounds[0])
+        self.assertEqual(tiktok_show_word_frequency_bounds_ms(ledger), (
+            stamp("2026-10-03T01:30:00Z"), broadcast_bounds[1]))
+
+    def test_active_first_receipt_cutoff_excludes_future_originals_with_quiet_zero_control(self):
+        cutoff = stamp("2026-10-03T04:18:14Z")
+        selected = show()
+        selected.update(status="live", milestones=selected["milestones"][:1],
+                        _evidenceObservedThroughMs=cutoff)
+        quiet = event(0, "Good drums", cutoff - 2000)
+        future = event(1, "panda", cutoff - 1000)
+        future["ingested_at_ms"] = cutoff + 1
+        result = count_tiktok_show_word_frequency(selected, [quiet, future], "Count panda in this stream")
+        self.assertEqual((result["status"], result["occurrenceCount"], result["capturedMessageCount"]),
+                         ("complete", 0, 1))
+        result = count_tiktok_show_word_frequency(selected, [future], "Count panda in this stream")
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["occurrenceCount"])
+
+    def test_active_missing_or_malformed_receipt_does_not_certify_zero_or_one(self):
+        cutoff = stamp("2026-10-03T04:18:14Z")
+        selected = show()
+        selected.update(status="live", milestones=selected["milestones"][:1],
+                        _evidenceObservedThroughMs=cutoff)
+        for receipt in (None, True, 0, -1, "1790999000000", 1790999000000.5):
+            for text in ("panda", "Good drums"):
+                original = event(0, text, cutoff - 1000)
+                original["ingested_at_ms"] = receipt
+                with self.subTest(receipt=receipt, text=text):
+                    result = count_tiktok_show_word_frequency(selected, [original], "Count panda in this stream")
+                    self.assertEqual(result["status"], "partial")
+                    self.assertIsNone(result["occurrenceCount"])
+
+    def test_known_room_and_supplied_owner_alias_conflicts_cannot_certify_counts(self):
+        cutoff = stamp("2026-10-03T04:18:14Z")
+        selected = show()
+        selected.update(status="live", milestones=selected["milestones"][:1],
+                        roomId="test-room", _evidenceObservedThroughMs=cutoff)
+        changes = (
+            {"roomId": "other-room"}, {"roomId": None},
+            {"sessionId": "other-session"}, {"showSessionId": "other-session"},
+            {"showKey": "other-key"},
+        )
+        for change in changes:
+            for text in ("panda", "Good drums"):
+                original = event(0, text, cutoff - 1000)
+                original["metadata"].update(roomId=selected["roomId"], sessionId=selected["sessionId"])
+                original["metadata"].update(change)
+                with self.subTest(change=change, text=text):
+                    result = count_tiktok_show_word_frequency(selected, [original], "Count panda in this stream")
+                    self.assertEqual(result["status"], "partial")
+                    self.assertIsNone(result["occurrenceCount"])
+        valid = event(0, "panda", cutoff - 1000)
+        valid["metadata"].update(roomId=selected["roomId"], sessionId=selected["sessionId"],
+                                 showSessionId=selected["sessionId"], showKey=selected["sessionId"])
+        self.assertEqual(count_tiktok_show_word_frequency(
+            selected, [valid], "Count panda in this stream")["occurrenceCount"], 1)
+
+    def test_archived_canonical_session_key_validates_each_supplied_source_alias(self):
+        selected = show()
+        ledger = build_tiktok_show_evidence_ledger(selected, [])
+        self.assertNotIn("sessionId", ledger)
+        self.assertEqual(ledger["showKey"], selected["sessionId"])
+        for alias in ("sessionId", "showSessionId"):
+            for alias_value, expected_status in (
+                ("other-session", "partial"), (selected["sessionId"], "complete"),
+            ):
+                original = event(0, "panda", stamp("2026-10-03T03:00:00Z"))
+                original["metadata"][alias] = alias_value
+                with self.subTest(alias=alias, value=alias_value):
+                    result = count_tiktok_show_word_frequency(ledger, [original], "Count panda in the last stream")
+                    self.assertEqual(result["status"], expected_status)
+                    self.assertEqual(result["occurrenceCount"], 1 if expected_status == "complete" else None)
+
+    def test_archived_missing_receipt_cannot_certify_a_count(self):
+        for text in ("panda", "Good drums"):
+            original = event(0, text, stamp("2026-10-03T03:00:00Z"))
+            original.pop("ingested_at_ms")
+            with self.subTest(text=text):
+                result = count_tiktok_show_word_frequency(show(), [original], "Count panda in the last stream")
+                self.assertEqual(result["status"], "partial")
+                self.assertIsNone(result["occurrenceCount"])
+
+    def test_archived_late_receipt_and_optional_legacy_aliases_remain_eligible(self):
+        original = event(0, "panda", stamp("2026-10-03T03:00:00Z"))
+        original["ingested_at_ms"] = stamp("2026-10-04T03:00:00Z")
+        result = count_tiktok_show_word_frequency(show(), [original], "Count panda in the last stream")
+        self.assertEqual((result["status"], result["occurrenceCount"]), ("complete", 1))
+
 
 
 class TikTokArchivedWordFrequencyTests(unittest.TestCase):

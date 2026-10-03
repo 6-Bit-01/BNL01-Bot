@@ -3062,6 +3062,7 @@ def _load_durable_tiktok_show_events(
             guild_id=selected_guild_id,
             show=show,
             limit=max(1, min(50_000, int(limit or 20_000))),
+            word_frequency=bool(requested_tiktok_show_word_count(user_text)),
         )
     except (OSError, sqlite3.DatabaseError, ValueError, TypeError) as exc:
         logging.warning(
@@ -3141,6 +3142,28 @@ def build_bnl_read_model_context(
         show_conversation_interval_requested(user_text)
         or requested_tiktok_show_word_count(tiktok_show_analysis_request or user_text)
     ):
+        if requested_tiktok_show_word_count(tiktok_show_analysis_request or user_text):
+            # Observation bounds belong to this consumer's validated live read.
+            # Discard incoming markers on every selectable archive candidate.
+            def without_incoming_observation_bounds(value):
+                clean = dict(value)
+                for key in ("currentShow", "latestShow"):
+                    if isinstance(clean.get(key), dict):
+                        clean[key] = {
+                            field: item for field, item in clean[key].items()
+                            if field != "_evidenceObservedThroughMs"
+                        }
+                if isinstance(clean.get("shows"), list):
+                    clean["shows"] = [
+                        {field: item for field, item in show.items()
+                         if field != "_evidenceObservedThroughMs"}
+                        if isinstance(show, dict) else show
+                        for show in clean["shows"]
+                    ]
+                return clean
+
+            archive = without_incoming_observation_bounds(archive)
+            public_archive = without_incoming_observation_bounds(public_archive)
         current_show = _first_mapping(archive.get("currentShow"))
         session = _first_mapping(queue.get("session"), queue.get("currentSession"))
         current_id = str(current_show.get("sessionId") or "")
@@ -47141,6 +47164,17 @@ def build_ordinary_chat_response_repair_prompt(
                 fresh, changed = refresh_prompt_source_basis(basis)
             except Exception:
                 continue
+            if (
+                changed
+                and isinstance(basis, FinalizedShowPromptSourceBasis)
+                and isinstance(fresh, FinalizedShowPromptSourceBasis)
+                and requested_tiktok_show_word_count(fresh.user_text)
+                and fresh.show_keys == basis.show_keys
+                and str(fresh.rendered_context or "").strip()
+            ):
+                # A word total can be recomputed from the same pinned originals.
+                # Retain it only if this newly rebuilt source stays valid.
+                changed = bool(prompt_source_basis_failure((fresh,)))
             if not changed and str(getattr(fresh, "rendered_context", "") or "").strip():
                 retained.append(fresh)
         repaired_bases = tuple(retained)
