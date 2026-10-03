@@ -789,5 +789,167 @@ class BNLLiveContextGuardTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+
+class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
+    """The ordinary context builder supplies originals to the frequency owner."""
+
+    def setUp(self):
+        from tests.test_tiktok_show_evidence_ledger import authorized_read_model
+
+        self.authorized_read_model = authorized_read_model
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.db_path = str(Path(directory.name) / "frequency.db")
+        bnl01_bot.ensure_journal_source_schema(self.db_path)
+        self.observed_at = datetime(2026, 10, 3, 4, 18, 14, tzinfo=timezone.utc)
+        self.current = self._show("current-frequency", "2026-10-02", "2026-10-03", active=True)
+        self.latest = self._show("latest-frequency", "2026-09-25", "2026-09-26")
+        self.older = self._show("older-frequency", "2026-09-18", "2026-09-19")
+        for event_id, instant, text in (
+            ("current-pre", "2026-10-03T02:00:00Z", "panda " * 20),
+            ("current-one", "2026-10-03T02:06:00Z", "Panda panda!"),
+            ("current-neutral", "2026-10-03T02:08:00Z", "Good drums"),
+            ("current-two", "2026-10-03T03:40:00Z", "PANDA!"),
+            ("current-three", "2026-10-03T04:05:00Z", "panda"),
+            ("current-after-cutoff", "2026-10-03T04:19:00Z", "panda " * 50),
+            ("latest-one", "2026-09-26T03:00:00Z", "panda " * 8),
+            ("older-one", "2026-09-19T03:00:00Z", "panda " * 31),
+        ):
+            result = bnl01_bot.record_journal_source_event(
+                self.db_path, guild_id=77, source_kind="tiktok_live_chat",
+                source_key=event_id, occurred_at_ms=self._stamp(instant),
+                raw_text=text, sanitized_summary=text, channel_policy="public_context",
+                subject_ref="tiktok_handle:" + event_id, private_display_name="@" + event_id,
+                public_usable=True, metadata={"eventType": "comment", "handle": event_id},
+            )
+            self.assertTrue(result.ok)
+
+    @staticmethod
+    def _stamp(value):
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+
+    @staticmethod
+    def _show(session_id, day, next_day, *, active=False):
+        milestones = [
+            {"eventType": "broadcast_started", "occurredAt": next_day + "T02:05:35.254Z"},
+            {"eventType": "track_loaded", "occurredAt": next_day + "T03:00:00Z"},
+        ]
+        if not active:
+            milestones.append({"eventType": "session_archived", "occurredAt": next_day + "T08:08:03.054Z"})
+        return {
+            "sessionId": session_id, "title": "BARCODE Radio", "showDate": day,
+            "status": "open" if active else "archived", "milestones": milestones,
+        }
+
+    def _model(self, *, include_current=True):
+        archive = {"latestShow": self.latest, "shows": [self.latest, self.older]}
+        if include_current:
+            archive["currentShow"] = self.current
+        model = self.authorized_read_model(archive)
+        if include_current:
+            # The real bot freezes an active window only when the queue and
+            # archive identify the same currently broadcasting session.
+            model["sections"]["queue"] = {
+                "available": True, "accessScope": "public",
+                "session": {
+                    "id": self.current["sessionId"], "showDate": self.current["showDate"],
+                    "title": "BARCODE Radio", "status": "open", "broadcastPhase": "live",
+                },
+            }
+        return model
+
+    def _context(self, question, *, conversation_context="", include_current=True):
+        with mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": "true"}, clear=False), \
+             mock.patch.object(bnl01_bot, "DB_FILE", self.db_path), \
+             mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 77), \
+             mock.patch.object(bnl01_bot, "_bnl_read_model_cached_at", self.observed_at), \
+             mock.patch.object(bnl01_bot, "BNL_TIKTOK_LIVE_CONTEXT_PATH", "/missing-frequency-live-context"), \
+             mock.patch.object(bnl01_bot, "fetch_bnl_read_model", return_value=self._model(include_current=include_current)), \
+             mock.patch.object(bnl01_bot, "load_tiktok_show_source_events",
+                               wraps=bnl01_bot.load_tiktok_show_source_events) as originals, \
+             mock.patch.object(bnl01_bot, "build_durable_show_prompt_context",
+                               wraps=bnl01_bot.build_durable_show_prompt_context) as renderer, \
+             mock.patch.object(bnl01_bot, "build_live_prompt_context",
+                               wraps=bnl01_bot.build_live_prompt_context) as live:
+            context = bnl01_bot.maybe_build_bnl_read_model_context(
+                question, "public_home", conversation_context=conversation_context,
+            )
+        originals.assert_called_once()
+        renderer.assert_called_once()
+        live.assert_not_called()
+        self.assertEqual(originals.call_args.args[0], self.db_path)
+        self.assertEqual(originals.call_args.kwargs["guild_id"], 77)
+        return context, originals.call_args.kwargs["show"], renderer.call_args.args
+
+    def _assert_current_originals(self, context, selected_show, rendered_args):
+        self.assertEqual(selected_show["sessionId"], self.current["sessionId"])
+        self.assertEqual(
+            selected_show["_evidenceObservedThroughMs"],
+            int(self.observed_at.timestamp() * 1000),
+        )
+        self.assertEqual(
+            {event["event_id"] for event in rendered_args[1]},
+            {"current-one", "current-neutral", "current-two", "current-three"},
+        )
+        self.assertIn("occurrenceCount=4; matchingMessageCount=3; matchingSpeakerCount=3", context)
+        self.assertIn("eligibleCapturedMessagesChecked=4", context)
+        self.assertNotIn("occurrenceCount=8", context)
+        self.assertNotIn("occurrenceCount=31", context)
+        self.assertNotIn("snapshot_missing", context)
+
+    def test_current_word_count_receives_the_complete_frozen_original_window(self):
+        for question in (
+            "Count the word panda in TikTok chat tonight",
+            "How many times did TikTok chat say panda in this TikTok live?",
+        ):
+            with self.subTest(question=question):
+                context, selected_show, rendered_args = self._context(question)
+                self._assert_current_originals(context, selected_show, rendered_args)
+                self.assertEqual(rendered_args[2], question)
+
+    def test_last_stream_and_explicit_date_keep_their_own_originals(self):
+        for question, session_id, event_id, count in (
+            ("How many times did people say the word panda during the last stream?",
+             "latest-frequency", "latest-one", 8),
+            ("Count the word panda during the 2026-09-18 stream",
+             "older-frequency", "older-one", 31),
+        ):
+            with self.subTest(question=question):
+                context, selected_show, rendered_args = self._context(question)
+                self.assertEqual(selected_show["sessionId"], session_id)
+                self.assertEqual({event["event_id"] for event in rendered_args[1]}, {event_id})
+                self.assertIn("occurrenceCount=%s; matchingMessageCount=1" % count, context)
+                self.assertNotIn("occurrenceCount=4", context)
+                self.assertEqual(rendered_args[2], question)
+
+    def test_targetless_whole_stream_correction_uses_the_human_count_chain(self):
+        correction = "Not now, in the whole stream"
+        conversation = (
+            "User/member: TikTok chat tonight\n"
+            "BNL-01: A previous show had 31 pandas.\n"
+            'User/member: How many times did they say the word "panda"?\n'
+            "BNL-01: I only checked a rolling buffer and guessed 99.\n"
+            "User/member (current payload fragment): " + correction
+        )
+        context, selected_show, rendered_args = self._context(
+            correction, conversation_context=conversation,
+        )
+        self._assert_current_originals(context, selected_show, rendered_args)
+        self.assertIn('Prior follow-up: How many times did they say the word "panda"?', rendered_args[2])
+        self.assertIn("Current follow-up: " + correction, rendered_args[2])
+        self.assertNotIn("31 pandas", rendered_args[2])
+        self.assertNotIn("guessed 99", rendered_args[2])
+
+    def test_missing_current_tiktok_live_does_not_count_an_archived_show(self):
+        question = "How many times did TikTok chat say panda in this TikTok live?"
+        context, selected_show, rendered_args = self._context(question, include_current=False)
+        self.assertEqual(selected_show, {})
+        self.assertIsNone(rendered_args[1])
+        self.assertNotIn("occurrenceCount=8", context)
+        self.assertNotIn("occurrenceCount=31", context)
+        self.assertIn("no public show timeline was selected", context)
+
+
+
 if __name__ == "__main__":
     unittest.main()

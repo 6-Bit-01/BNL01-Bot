@@ -214,6 +214,7 @@ _SHOW_ANALYSIS_FOLLOWUP_PATTERNS = (
     r"\bdid (?:anyone|they|people|viewers?|chat) "
     r"(?:say|mention|notice|ask|talk about)\b",
     r"\b(?:throughout|during) (?:the )?(?:live|show|stream|broadcast)\b",
+    r"\b(?:whole|entire|full) (?:show|stream|broadcast|live)\b",
     r"\bwhat about\b",
     r"\b(?:why|how so)\b",
 )
@@ -616,7 +617,7 @@ def requested_recent_show_count(user_text: str) -> Optional[int]:
     match = re.search(
         r"\b(?:last|latest|previous|prior|past|most recent)\s+"
         r"(?:(" + "|".join(words) + r"|[1-9]\d{0,2})\s+)?"
-        r"(?:public\s+)?(?:barcode radio\s+)?(shows?|broadcasts?|episodes?|lives?)\b",
+        r"(?:public\s+)?(?:barcode radio\s+)?(shows?|broadcasts?|episodes?|lives?|streams?)\b",
         str(user_text or ""), re.IGNORECASE,
     )
     if not match:
@@ -695,12 +696,251 @@ def is_live_show_reaction_query(
     return any(re.search(pattern, normalized) for pattern in _LIVE_REACTION_PATTERNS)
 
 
+def requested_tiktok_show_word_count(user_text: str) -> str:
+    """Extract a word-frequency target without choosing its source episode."""
+    query = str(user_text or "")
+    if not re.search(r"\b(?:how many times|how often|number of times|occurrences?|"
+                     r"word count|count(?:ed)?)\b", query, re.I):
+        return ""
+    token = r"[^\W_]+(?:['’][^\W_]+)?"
+    pattern = r"\bword\s+(?:[\"“'‘](" + token + r")[\"”'’]|(" + token + r")\b)"
+    matches = list(re.finditer(pattern, query, re.I))
+    explicit_word_target = bool(matches)
+    if not matches:
+        pattern = (r"\b(?:say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\s+"
+                   r"(?:the\s+word\s+)?(?:[\"“'‘](" + token + r")[\"”'’]|(" + token + r")\b)")
+        matches = list(re.finditer(pattern, query, re.I))
+    word = (matches[-1].group(1) or matches[-1].group(2)).casefold() if matches else ""
+    if not word or len(word) > 80:
+        return ""
+    if explicit_word_target:
+        # A bare "word count" asks for a measure without naming a token.
+        # Quotation or a separate counting cue makes "count" a valid word.
+        if word == "count" and not matches[-1].group(1):
+            outside_target = query[:matches[-1].start()] + query[matches[-1].end():]
+            if not re.search(r"\b(?:how many times|how often|number of times|"
+                             r"occurrences?|word count|count(?:ed)?)\b", outside_target, re.I):
+                return ""
+        return word
+    return word if word not in {
+        "the", "word", "count", "it", "that", "this", "what", "anything", "something",
+    } else ""
+
+
+def _tiktok_word_frequency_scope_query(user_text: str) -> str:
+    """Keep the word inert while the latest explicit human episode scope wins."""
+    word = requested_tiktok_show_word_count(user_text)
+    query = str(user_text or "")
+    if word:
+        query = re.sub(
+            r"\b(?:word|say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\s+"
+            r"(?:the\s+word\s+)?[\"“'‘]?" + re.escape(word) + r"[\"”'’]?(?!\w)",
+            "queried token", query, flags=re.I,
+        )
+    current = re.split(r"(?:^|\n)Current follow-up:\s*", query, flags=re.I)[-1]
+    if current != query and (
+        has_explicit_show_date(current) or requested_show_date(current)
+        or requested_recent_show_count(current) is not None
+        or re.search(
+            r"\b(?:now|currently|right now|today|tonight|this evening)\b|"
+            r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
+            r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b",
+            current, re.I,
+        )
+    ):
+        return current
+    return query
+
+
+def tiktok_show_word_frequency_current_requested(user_text: str) -> bool:
+    """An undated current count belongs to the website's current episode."""
+    if not requested_tiktok_show_word_count(user_text):
+        return False
+    query = _tiktok_word_frequency_scope_query(user_text)
+    if has_explicit_show_date(query) or requested_recent_show_count(query) is not None:
+        return False
+    return bool(re.search(
+        r"\b(?:now|currently|right now)\b|"
+        r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
+        r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b",
+        query, re.I,
+    ))
+
+
+def count_tiktok_show_word_frequency(
+    show: Mapping[str, Any], durable_events: Optional[Sequence[Any]], user_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Count whole words in the selected owner's complete captured source window."""
+    word = requested_tiktok_show_word_count(user_text)
+    if not word:
+        return None
+    finalized = (_show_has_archive_boundary(show)
+                 or str(show.get("lifecycle") or "").casefold() == "finalized")
+    observed_through_ms = None
+    if not finalized:
+        try:
+            observed_value = show.get("_evidenceObservedThroughMs")
+            observed_through_ms = None if isinstance(observed_value, bool) else int(observed_value)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    bounded_show = show
+    if not finalized and observed_through_ms is None:
+        # A malformed/missing active marker must not crash or borrow the last
+        # queue milestone as an observation deadline.
+        bounded_show = {key: value for key, value in show.items()
+                        if key != "_evidenceObservedThroughMs"}
+    start_ms, end_ms = show_timeline_bounds_ms(bounded_show)
+    if start_ms is None or end_ms is None:
+        try:
+            start_ms, end_ms = int(show["startedAtMs"]), int(show["endedAtMs"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            start_ms, end_ms = None, None
+    result: Dict[str, Any] = {
+        "word": word, "status": "unavailable", "reason": "source_unavailable",
+        "showKey": str(show.get("showKey") or tiktok_show_evidence_key(bounded_show)),
+        "sessionId": str(show.get("sessionId") or show.get("showSessionId") or ""),
+        "showDate": str(show.get("showDate") or ""),
+        "windowStartMs": start_ms, "windowEndMs": end_ms,
+        "capturedMessageCount": 0, "occurrenceCount": None,
+        "matchingMessageCount": None, "matchingSpeakerCount": None,
+        "originalSourceRefs": [], "sourceDigest": "",
+    }
+    if start_ms is None or end_ms is None or start_ms < 0 or end_ms < start_ms:
+        result["reason"] = "invalid_source_window"
+        return result
+    if not finalized and (observed_through_ms is None
+                          or observed_through_ms < end_ms
+                          or observed_through_ms <= 0):
+        result.update(reason="active_observation_bound_unavailable", windowEndMs=None)
+        return result
+    speakers_requested = re.finditer(
+        r"\b(?:did|does|has|have)\s+(.{1,100}?)\s+"
+        r"(?:say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\b",
+        str(user_text or ""), re.I,
+    )
+    if any(not re.fullmatch(
+        r"(?:the\s+)?(?:(?:tiktok|tik tok)\s+)?(?:they|people|viewers?|audience|chat|room|everyone|anyone)",
+        speaker.group(1).strip(), re.I,
+    ) for speaker in speakers_requested):
+        result["reason"] = "specific_speaker_scope_not_resolved"
+        return result
+    scope_query = re.sub(
+        r"\b(?:word|say|said|mention(?:ed)?|use(?:d)?|write|wrote|type(?:d)?)\s+"
+        r"(?:the\s+word\s+)?[\"“'‘]?" + re.escape(word) + r"[\"”'’]?(?!\w)",
+        "queried token", str(user_text or ""), flags=re.I,
+    )
+    if re.search(
+        r"\b(?:track|song|minutes?)\b|t\+\d|"
+        r"\b(?:before|after|between|from|until|through|as of)\s+\d{1,2}:\d{2}\b",
+        scope_query, re.I,
+    ):
+        result["reason"] = "specific_interval_scope_not_resolved"
+        return result
+    if durable_events is None:
+        return result
+    pattern = re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)", re.I)
+    seen, roots, speakers = {}, [], set()
+    occurrences, matching, rejected = 0, 0, 0
+    for value in durable_events:
+        if not isinstance(value, Mapping):
+            rejected += 1
+            continue
+        if (value.get("public_usable", True) in (False, 0)
+                or value.get("role") == "model"
+                or value.get("source_kind", "tiktok_live_chat") != "tiktok_live_chat"):
+            continue
+        if value.get("channel_policy") and value["channel_policy"] not in {
+            "public_context", "public_home", "public_selective",
+        }:
+            continue
+        metadata = value.get("metadata")
+        if isinstance(metadata, Mapping) and metadata.get("eventType") in {
+            "like", "viewer_snapshot", "gift", "join", "follow", "share",
+        }:
+            continue
+        safe = _safe_durable_event(value)
+        if safe is None:
+            rejected += 1
+            continue
+        if not start_ms <= safe["occurred_at_ms"] <= end_ms:
+            continue
+        raw = str(value.get("raw_text") or "")
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if (value.get("raw_text_truncated") or len(raw) > 1000
+                or (value.get("content_hash") and value["content_hash"] != digest)):
+            rejected += 1
+            continue
+        event_id = safe["event_id"]
+        # The source owner already chose this identity. A handle is a fallback,
+        # not authority to merge distinct archived keys or split one key.
+        source_subject = str(value.get("subject_ref") or "")
+        chat_identity_key = source_subject or safe["speaker_key"]
+        revision = (safe["occurred_at_ms"], digest, source_subject, safe["speaker_key"])
+        if event_id in seen:
+            if seen[event_id] != revision:
+                rejected += 1
+            continue
+        seen[event_id] = revision
+        found = len(pattern.findall(raw))
+        occurrences += found
+        if found:
+            matching += 1
+            speakers.add(chat_identity_key)
+        ref = {"sourceKind": "tiktok_live_chat", "sourceKey": event_id,
+               "contentHash": digest, "occurredAtMs": safe["occurred_at_ms"]}
+        result["originalSourceRefs"].append(ref)
+        roots.append((ref, source_subject, safe["speaker_key"]))
+    result["capturedMessageCount"] = len(seen)
+    result["status"] = "partial" if rejected else "complete" if seen else "unavailable"
+    result["reason"] = "invalid_or_truncated_originals" if rejected else (
+        "captured_originals_checked" if seen else "no_captured_messages")
+    if result["status"] == "complete":
+        result.update(occurrenceCount=occurrences, matchingMessageCount=matching,
+                      matchingSpeakerCount=len(speakers))
+    result["sourceDigest"] = hashlib.sha256(json.dumps(
+        (result["showKey"], start_ms, end_ms, word, roots, result["status"]),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    return result
+
+
+def render_tiktok_show_word_frequency(result: Mapping[str, Any]) -> str:
+    """Render measured totals and their exact source scope, without raw identities."""
+    def clock(value: Any) -> str:
+        return (datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc).isoformat()
+                if value is not None else "unavailable")
+    lines = [
+        "TikTok show word frequency:",
+        "- Selected source: showDate=%s; sessionId=%s; showKey=%s; windowUTC=%s through %s inclusive."
+        % (result.get("showDate"), json.dumps(result.get("sessionId")),
+           json.dumps(result.get("showKey")), clock(result.get("windowStartMs")),
+           clock(result.get("windowEndMs"))),
+        "- Match method: case-insensitive whole-word occurrences in captured, eligible original TikTok chat; repeated words in one message count separately.",
+        "- Coverage=%s; reason=%s; eligibleCapturedMessagesChecked=%s; originalWindowRevision=%s."
+        % (result.get("status"), result.get("reason"), result.get("capturedMessageCount"),
+           result.get("sourceDigest")),
+    ]
+    if result.get("status") == "complete":
+        lines.append("- Word %s: occurrenceCount=%s; matchingMessageCount=%s; matchingSpeakerCount=%s."
+                     % (json.dumps(result.get("word")), result["occurrenceCount"],
+                        result["matchingMessageCount"], result["matchingSpeakerCount"]))
+        lines.append("- Speaker total measures distinct captured chat identity keys, using the source-owned subject reference and existing speaker-key fallback. This does not infer unique people or merge accounts.")
+        lines.append("- Answer with these measured totals for this selected stream. Counts cover captured originals; they do not certify receipt of every platform event.")
+    else:
+        lines.append("- No exact word total is available for this incomplete source window. Do not report zero or substitute a rolling live buffer, an older show, selected excerpts, or a previous BNL answer.")
+    return "\n".join(lines)
+
+
 def is_tiktok_show_analysis_query(text: str) -> bool:
     """Return whether a request needs durable show/timeline correlation."""
 
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
         return False
+    if requested_tiktok_show_word_count(normalized) and (
+        _SHOW_DATE_SCOPE_RE.search(normalized) or _AUDIENCE_SCOPE_RE.search(normalized)
+    ):
+        return True
     if is_tiktok_show_analysis_continuation(normalized):
         return False
     return bool(
@@ -733,7 +973,7 @@ def is_tiktok_show_analysis_followup(text: str) -> bool:
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
         return False
-    return is_tiktok_show_analysis_continuation(normalized) or any(
+    return bool(requested_tiktok_show_word_count(normalized)) or is_tiktok_show_analysis_continuation(normalized) or any(
         re.search(pattern, normalized)
         for pattern in _SHOW_ANALYSIS_FOLLOWUP_PATTERNS
     )
@@ -892,11 +1132,13 @@ def select_show_for_tiktok_analysis(
     candidates = _show_candidates(archive)
     if not candidates:
         return {}, "none"
+    scope_query = (_tiktok_word_frequency_scope_query(user_text)
+                   if requested_tiktok_show_word_count(user_text) else str(user_text or ""))
     # The website owns an ongoing show's date across midnight. A request for
     # "tonight" still refers to that current record, while explicit dates and
     # past calendar days constrain historical selection.
     requested_dates = requested_show_dates(
-        user_text, now=now, include_current_relative=False,
+        scope_query, now=now, include_current_relative=False,
         available_show_dates=tuple(str(show.get("showDate") or "") for _key, show in candidates),
     )
     if requested_dates:
@@ -905,9 +1147,9 @@ def select_show_for_tiktok_analysis(
                 if _bounded_text(show.get("showDate"), 40) == requested_date:
                     return dict(show), source_key
         return {}, "none"
-    if has_explicit_show_date(user_text):
+    if has_explicit_show_date(scope_query):
         return {}, "none"
-    if requested_recent_show_count(user_text) is not None:
+    if requested_recent_show_count(scope_query) is not None:
         completed = [(key, show) for key, show in candidates
                      if show.get("status") == "archived"
                      or (not show.get("status") and key != "currentShow")]
@@ -915,10 +1157,33 @@ def select_show_for_tiktok_analysis(
             return {}, "none"
         source_key, show = max(completed, key=lambda item: str(item[1].get("showDate") or ""))
         return dict(show), source_key
-    if re.search(r"\b(?:current|this)\s+(?:(?:private|public)\s+)?"
-                 r"(?:rehearsal|show|broadcast|session)\b", str(user_text or ""), re.I):
+    if requested_tiktok_show_word_count(user_text) and re.search(
+        r"\b(?:today|tonight|this evening)\b", scope_query, re.I,
+    ):
+        # An active website record owns its date across midnight. With no
+        # current record, an explicit relative night must match a recorded
+        # episode; a past week's latest show is not tonight's source.
+        for source_key, show in candidates:
+            if source_key == "currentShow":
+                return dict(show), source_key
+        night_dates = requested_show_dates(
+            scope_query, now=now,
+            available_show_dates=tuple(str(show.get("showDate") or "") for _key, show in candidates),
+        )
+        for requested_date in night_dates:
+            for source_key, show in candidates:
+                if _bounded_text(show.get("showDate"), 40) == requested_date:
+                    return dict(show), source_key
+        return {}, "none"
+    if re.search(r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
+                 r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b", scope_query, re.I):
         if not any(key == "currentShow" for key, _show in candidates):
             return {}, "none"
+    if tiktok_show_word_frequency_current_requested(user_text):
+        for source_key, show in candidates:
+            if source_key == "currentShow":
+                return dict(show), source_key
+        return {}, "none"
     for preferred_source in ("currentShow", "latestShow", "shows"):
         for source_key, show in candidates:
             if source_key != preferred_source:
@@ -3327,6 +3592,9 @@ def build_durable_show_prompt_context(
             "- Do not invent track-level TikTok engagement or claim the live buffer is the historical source."
         )
     start_ms, end_ms = show_timeline_bounds_ms(show)
+    frequency = count_tiktok_show_word_frequency(show, durable_events, user_text)
+    if frequency is not None:
+        return "Durable TikTok show analysis context:\n" + render_tiktok_show_word_frequency(frequency)
     show_label = _bounded_text(show.get("title"), 160) or "BARCODE Radio"
     show_date = _bounded_text(show.get("showDate"), 40) or "date unavailable"
     status = _bounded_text(show.get("status"), 40) or "unknown"

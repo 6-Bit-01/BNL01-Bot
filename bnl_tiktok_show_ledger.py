@@ -48,6 +48,11 @@ from bnl_tiktok_live_context import (
     _track_windows_from_timeline,
     _public_show_speaker_label,
     build_tiktok_show_evidence_ledger,
+    requested_tiktok_show_word_count,
+    tiktok_show_word_frequency_current_requested,
+    _tiktok_word_frequency_scope_query,
+    count_tiktok_show_word_frequency,
+    render_tiktok_show_word_frequency,
     build_show_interval_conversation,
     show_conversation_interval_requested,
     show_episode_boundary_indexes,
@@ -102,7 +107,7 @@ _SPACE_RE = re.compile(r"\s+")
 _QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’]{2,}", re.IGNORECASE)
 _SHOW_QUERY_RE = re.compile(
     r"\b(?:tiktok|tik tok|barcode radio|broadcast|shows?|episodes?|live|chat|viewers?|"
-    r"audience|track|song|queue|wheel|submissions?|intake|sponsor|break|preparation|preflight|pre-show|"
+    r"audience|streams?|track|song|queue|wheel|submissions?|intake|sponsor|break|preparation|preflight|pre-show|"
     r"signal hold|paused?|stalled?|resumed?|skipped?|removed?|returned?|"
     r"restored?|started?|finished?|timeline|"
     r"last show|previous show|past show|show chat|talked about)\b",
@@ -872,6 +877,7 @@ def _load_show_source_events(
                 "subject_ref": str(subject_ref or "")[:160],
                 "private_display_name": str(display_name or "")[:120],
                 "raw_text": str(raw_text or "")[:1000],
+                "raw_text_truncated": len(str(raw_text or "")) > 1000,
                 "content_hash": str(content_hash or "")[:64],
                 "event_seq": int(event_seq or 0),
                 "metadata": metadata,
@@ -4062,6 +4068,16 @@ def select_tiktok_show_episode_context_items(
         )
     except (sqlite3.DatabaseError, TypeError, ValueError):
         return ()
+    frequency_scope = (_tiktok_word_frequency_scope_query(user_text)
+                       if requested_tiktok_show_word_count(user_text) else user_text)
+    # A finalized-only reader cannot answer an undated active-episode count.
+    # A current human date or exact recorded key can still request that root.
+    if tiktok_show_word_frequency_current_requested(user_text) and not any(
+        row.get("showKey") and re.search(
+            r"(?<![\w-])" + re.escape(str(row["showKey"])) + r"(?![\w-])", frequency_scope,
+        ) for row in loaded
+    ):
+        return ()
     subject_ref = (
         f"discord_user:{int(subject_user_id)}"
         if int(subject_user_id or 0) > 0
@@ -4069,7 +4085,7 @@ def select_tiktok_show_episode_context_items(
     )
     ranked = _ranked_show_ledgers(
         loaded,
-        user_text=user_text,
+        user_text=frequency_scope,
         subject_ref=subject_ref,
         allow_subject_continuity=allow_subject_continuity,
         now=now,
@@ -4102,6 +4118,25 @@ def select_tiktok_show_episode_context_items(
             ))
         if show_preparation_only_requested(user_text):
             return tuple(preparation_items)
+    if requested_tiktok_show_word_count(user_text):
+        frequency_items = []
+        for _score, _rank, row, _matches in selected_ranked[:2 if multi_show else 1]:
+            frequency = _lookup_tiktok_show_word_frequency(
+                "", guild_id=guild_id, ledger=row["ledger"], user_text=user_text,
+                source_conn=conn,
+            )
+            item = _show_context_item(
+                kind="dialogue", loaded_rows=(row,),
+                source_class=SourceClass.EVIDENCE_PROJECTION.value,
+                confidence=Confidence.HIGH.value if frequency.get("status") == "complete" else Confidence.MEDIUM.value,
+                subject_key="barcode_radio", text=render_tiktok_show_word_frequency(frequency),
+                participants=(), score=230.0, usage="scoped_show_conversation",
+                uncertainty_status="captured_original_word_frequency",
+            )
+            frequency_items.append(replace(item, source_digest=_context_digest(
+                item.source_digest, frequency.get("sourceDigest"), frequency.get("status"),
+            )))
+        return tuple(frequency_items)
     quote_literals = _current_show_quote_literals(user_text)
     if quote_literals:
         # Match the ordinary reader's bounded show scope for fresh raw scans.
@@ -4375,6 +4410,35 @@ def _lookup_original_show_quotes(
     return result
 
 
+def _lookup_tiktok_show_word_frequency(
+    db_file: str, *, guild_id: int, ledger: Mapping[str, Any], user_text: str,
+    source_conn: Optional[sqlite3.Connection] = None,
+) -> dict[str, Any]:
+    """Reuse the fresh original reader under an already selected episode root."""
+    diagnostics: dict[str, Any] = {}
+    try:
+        show = {"showDate": ledger.get("showDate"), "milestones": [
+            {"eventType": "broadcast_started",
+             "occurredAt": _utc_iso_from_ms(int(ledger["startedAtMs"]))},
+            {"eventType": "session_archived",
+             "occurredAt": _utc_iso_from_ms(int(ledger["endedAtMs"]))},
+        ]}
+        events = (_load_show_source_events(
+            source_conn, guild_id=guild_id, show=show, diagnostics_out=diagnostics,
+        ) if source_conn is not None else load_tiktok_show_source_events(
+            db_file, guild_id=guild_id, show=show, diagnostics_out=diagnostics,
+        ))
+    except (KeyError, OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        events = None
+        diagnostics.update(status="unavailable", reason="source_read_failed")
+    result = count_tiktok_show_word_frequency(ledger, events, user_text) or {}
+    if diagnostics.get("status") not in (None, "complete"):
+        result.update(status=diagnostics["status"], reason=diagnostics.get("reason"),
+                      occurrenceCount=None, matchingMessageCount=None,
+                      matchingSpeakerCount=None)
+    return result
+
+
 def _original_quote_lookup_lines(result: Mapping[str, Any]) -> list[str]:
     """Describe the performed lookup and its finite coverage, never origin."""
 
@@ -4535,9 +4599,22 @@ def build_tiktok_show_evidence_context(
     # Prior eligible human context may resolve the show referent. It is a
     # retrieval query, never evidence that an audience member said anything.
     selection_query = str(selection_user_text or user_text or "")
+    human_scope_query = str(user_text or "")
+    if requested_tiktok_show_word_count(user_text):
+        selection_query = _tiktok_word_frequency_scope_query(selection_query)
+        human_scope_query = _tiktok_word_frequency_scope_query(user_text)
+        if (has_explicit_show_date(human_scope_query)
+                or _requested_show_date(human_scope_query)
+                or requested_recent_show_count(human_scope_query) is not None
+                or tiktok_show_word_frequency_current_requested(user_text)):
+            # A current human episode selector takes precedence over an
+            # earlier retrieval cue. Pinned roots still freeze this generation.
+            selection_query = human_scope_query
     date_query = (
-        user_text
-        if has_explicit_show_date(user_text) or _requested_show_date(user_text)
+        human_scope_query
+        if (has_explicit_show_date(human_scope_query) or _requested_show_date(human_scope_query)
+            or (requested_tiktok_show_word_count(user_text)
+                and requested_recent_show_count(human_scope_query) is not None))
         else selection_query
     )
     if image_query_lines:
@@ -4604,6 +4681,14 @@ def build_tiktok_show_evidence_context(
             or str(ledger.get("showKey") or "") in pinned_show_keys
         ):
             ledgers.append(ledger)
+    # Earlier retrieval cues and pinned finalized roots do not override a
+    # current human request for the active stream. That source is website-owned.
+    if tiktok_show_word_frequency_current_requested(user_text) and not any(
+        ledger.get("showKey") and re.search(
+            r"(?<![\w-])" + re.escape(str(ledger["showKey"])) + r"(?![\w-])", human_scope_query,
+        ) for ledger in ledgers
+    ):
+        return unavailable_context("the current episode requires its authoritative website record")
     requested_dates = (
         requested_show_dates(date_query, available_show_dates=tuple(
             str(ledger.get("showDate") or "") for ledger in ledgers
@@ -4669,6 +4754,20 @@ def build_tiktok_show_evidence_context(
         else 1
     )
     selected = ranked[:selected_limit]
+    if requested_tiktok_show_word_count(user_text) and not image_queries:
+        frequencies = tuple(_lookup_tiktok_show_word_frequency(
+            db_file, guild_id=guild_id, ledger=ledger, user_text=user_text,
+        ) for _score, _recency, ledger, _matches in selected)
+        if selection_out is not None:
+            selection_out.update(
+                selection_user_text=selection_query, candidate_context=bool(candidate_context),
+                source_refs=tuple((str(ledger.get("showKey") or ""),
+                                   str(ledger.get("sourceDigest") or ""))
+                                  for _score, _recency, ledger, _matches in selected),
+                word_frequency_lookup=frequencies, authored_excerpts=(),
+            )
+        return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join(
+            render_tiktok_show_word_frequency(frequency) for frequency in frequencies)
     if image_scopes:
         selected_dates = {str(item[2].get("showDate") or "") for item in selected}
         for query, scope in image_scopes:
