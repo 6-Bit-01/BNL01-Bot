@@ -474,5 +474,34 @@ class ShowWordCountFollowupSourceOwnerTests(unittest.TestCase):
 
 
 
+    def test_counter_rejects_personal_message_scope_for_eligible_originals(self):
+        import test_tiktok_show_word_frequency as frequency_fixture
+
+        selected = frequency_fixture.show()
+        at = frequency_fixture.stamp("2026-10-03T03:00:00Z")
+        originals = [frequency_fixture.event(0, "Panda panda goat my my.", at)]
+        prior = 'Count the word "panda" in TikTok chat during the October 2, 2026 show.'
+        cases = (
+            (prior, "complete", 2),
+            (prior + "\nCurrent follow-up: BNL, I meant goat.", "complete", 1),
+            ('Count the word "my" in TikTok chat', "complete", 2),
+            ('Count the word "panda" in my TikTok comments', "unavailable", None),
+            (prior + "\nCurrent follow-up: BNL, I meant goat in my comments.", "unavailable", None),
+            ('How many times did I say the word "panda" during the TikTok stream?', "unavailable", None),
+            ('How many times did Test Member say the word "panda" during the TikTok stream?', "unavailable", None),
+        )
+        for query, status, occurrences in cases:
+            with self.subTest(query=query):
+                result = frequency_fixture.count_tiktok_show_word_frequency(
+                    selected, originals, query,
+                )
+                self.assertEqual(result["status"], status)
+                self.assertEqual(result["occurrenceCount"], occurrences)
+                if status == "unavailable":
+                    self.assertEqual(result["reason"], "specific_speaker_scope_not_resolved")
+                    self.assertIsNone(result["matchingMessageCount"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

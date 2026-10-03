@@ -922,6 +922,14 @@ def count_tiktok_show_word_frequency(
         return result
     scope_query = _tiktok_word_frequency_target_inert_query(user_text)
     if re.search(
+        r"\b(?:my|our|your|his|her|their)\s+"
+        r"(?:(?:own|public|discord|tik\s*tok|live|chat)\s+)*"
+        r"(?:comments?|messages?|posts?|questions?|chat|activity)\b",
+        scope_query, re.I,
+    ):
+        result["reason"] = "specific_speaker_scope_not_resolved"
+        return result
+    if re.search(
         r"\b(?:track|song|minutes?|hours?|seconds?)\b|t\+\d|"
         r"\b(?:before|after|between|from|until|through|as of)\s+\d{1,2}:\d{2}\b",
         scope_query, re.I,
