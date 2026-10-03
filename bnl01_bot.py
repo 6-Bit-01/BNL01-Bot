@@ -9514,6 +9514,31 @@ def maybe_record_live_community_presence(message: discord.Message, clean_content
             logging.debug("source_refresh_dirty_hook_failed source=community_presence error=%s", exc)
 
 
+async def maybe_record_live_community_presence_async(
+    message: discord.Message, clean_content: str, channel_policy: str,
+    direct_interaction: bool,
+) -> None:
+    """Keep optional scouting contention outside mandatory message capture."""
+    global _last_community_presence_error_status
+    try:
+        # Subject writes commit separately. Replaying a partly stored event
+        # would count already committed subjects twice, so invoke only once.
+        await asyncio.to_thread(
+            maybe_record_live_community_presence, message, clean_content,
+            channel_policy, direct_interaction,
+        )
+    except sqlite3.OperationalError as exc:
+        if not _sqlite_busy(exc):
+            raise
+        _last_community_presence_error_status = "skipped_sqlite_busy"
+        logging.warning(
+            "community_presence_skipped_sqlite_busy guild_id=%s channel_id=%s message_id=%s",
+            int(getattr(message.guild, "id", 0) or 0),
+            int(getattr(message.channel, "id", 0) or 0),
+            int(getattr(message, "id", 0) or 0),
+        )
+
+
 async def maybe_handle_entity_activity_summary_command(message: discord.Message, clean_content: str) -> bool:
     """Handle operator-only shared entity activity summary readouts."""
 
@@ -27412,6 +27437,19 @@ def _record_source_safe_recall_packet_assembled(
     LAST_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS[key] = diagnostics
 
 
+def _user_memory_skip_reason(route_mode: str, channel_policy: str) -> str:
+    """Keep the existing no-read memory routes consistent for every owner."""
+    if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+        return "simple_greeting"
+    policy = (channel_policy or "unknown").strip().lower() or "unknown"
+    if route_mode in SOURCE_INTERNAL_MODES or policy in {
+        "unknown", "protected_system", "broadcast_memory", "reference_canon",
+        "ai_image_tool",
+    }:
+        return f"route_or_policy_{policy}"
+    return ""
+
+
 def build_user_memory_context(
     user_id: int,
     guild_id: int,
@@ -27466,13 +27504,13 @@ def build_user_memory_context(
                 "memory_context_units": (),
             }
         )
-    if route_mode == ROUTE_MODE_SIMPLE_GREETING:
-        record_prompt_diagnostics({"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}})
-        return "Memory intentionally skipped for simple greeting."
+    skipped_reason = _user_memory_skip_reason(route_mode, channel_policy)
+    if skipped_reason:
+        record_prompt_diagnostics({"skipped_reason": skipped_reason, "included": {"short": 0, "medium": 0, "long": 0}})
+        return ("Memory intentionally skipped for simple greeting."
+                if skipped_reason == "simple_greeting"
+                else "No route-safe durable memory for this mode/channel.")
     policy = (channel_policy or "unknown").strip().lower() or "unknown"
-    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
-        record_prompt_diagnostics({"skipped_reason": f"route_or_policy_{policy}", "included": {"short": 0, "medium": 0, "long": 0}})
-        return "No route-safe durable memory for this mode/channel."
     if policy in PUBLIC_CHAT_POLICIES or policy == "sealed_test":
         is_owner_or_mod = False
 
@@ -31129,19 +31167,42 @@ async def build_user_memory_context_async(
         )
 
 
-def _read_user_memory_snapshot(user_id: int, guild_id: int, **kwargs) -> tuple[str, dict]:
+def _read_user_memory_snapshot(
+    user_id: int, guild_id: int, *, busy_retries: int = 0,
+    skip_read_if_unused: bool = False, **kwargs,
+) -> tuple[str, dict]:
     """Use the same bounded, read-only snapshot for selection and revalidation."""
-    metadata: dict = {}
-    with closing(_open_member_memory_read_connection()) as conn:
-        conn.execute("BEGIN")
-        # A busy database is unavailable, not empty memory. Close the snapshot
-        # before returning so a later writer never waits for garbage collection.
-        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    if skip_read_if_unused and _user_memory_skip_reason(
+        kwargs.get("route_mode", ROUTE_MODE_NORMAL_CHAT),
+        kwargs.get("channel_policy", "unknown"),
+    ):
+        metadata: dict = {}
         context = build_user_memory_context(
-            user_id, guild_id, source_metadata=metadata,
-            connection=conn, read_only=True, **kwargs,
+            user_id, guild_id, source_metadata=metadata, read_only=True, **kwargs,
         )
-    return context, metadata
+        return context, metadata
+    retries = max(0, min(int(busy_retries), 2))
+    for attempt in range(retries + 1):
+        # Failed attempts cannot donate partial context or source metadata to
+        # the next snapshot. Existing batch/presend callers remain one-attempt.
+        metadata: dict = {}
+        try:
+            with closing(_open_member_memory_read_connection()) as conn:
+                conn.execute("BEGIN")
+                # Pin the read before any private Relationship/source work.
+                # A busy database remains an error, never valid empty memory.
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+                context = build_user_memory_context(
+                    user_id, guild_id, source_metadata=metadata,
+                    connection=conn, read_only=True, **kwargs,
+                )
+            return context, metadata
+        except sqlite3.OperationalError as exc:
+            if not _sqlite_busy(exc) or attempt == retries:
+                raise
+            logging.warning("member_memory_snapshot_retry attempt=%s", attempt + 1)
+            # The failed connection is closed before yielding to the writer.
+            time.sleep(0.05 * (attempt + 1))
 
 
 def build_named_public_member_memory_context(
@@ -42676,9 +42737,10 @@ def build_user_aware_prompt(
     prompt_source_bases: list[PromptSourceBasis] = []
     memory_context = ""
     memory_prompt_basis = None
-    memory_context = build_user_memory_context(
+    memory_context, memory_source_metadata = _read_user_memory_snapshot(
         user_id,
         guild_id,
+        busy_retries=2, skip_read_if_unused=True,
         route_mode=route_mode,
         channel_policy=channel_policy,
         user_text=clean_content,
@@ -42689,7 +42751,6 @@ def build_user_aware_prompt(
         moment_attribution_target_user_id=(
             moment_attribution_target_user_id
         ),
-        source_metadata=memory_source_metadata,
     )
     memory_prompt_basis = build_memory_prompt_source_basis(
         memory_context,
@@ -48790,7 +48851,7 @@ async def on_message(message: discord.Message):
     if await maybe_handle_dossier_recommendation_command(message, clean_content):
         return
 
-    maybe_record_live_community_presence(
+    await maybe_record_live_community_presence_async(
         message,
         clean_content,
         channel_policy,

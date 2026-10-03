@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any
 
@@ -126,32 +127,31 @@ def _append_unique(items: list[Any], value: Any, limit: int) -> list[Any]:
 
 
 def ensure_community_presence_schema(db_path: str) -> None:
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS community_presence (
-            guild_id INTEGER NOT NULL,
-            subject_key TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            source_lanes TEXT DEFAULT '["community_presence"]',
-            approved_channel_labels TEXT DEFAULT '[]',
-            mention_count INTEGER DEFAULT 0,
-            direct_interaction_count INTEGER DEFAULT 0,
-            operator_mention_count INTEGER DEFAULT 0,
-            active_windows TEXT DEFAULT '[]',
-            connection_notes TEXT DEFAULT '[]',
-            evidence_snippets TEXT DEFAULT '[]',
-            category TEXT DEFAULT 'community_regular_candidate',
-            last_error_status TEXT DEFAULT 'none',
-            PRIMARY KEY (guild_id, subject_key)
+    with closing(sqlite3.connect(db_path)) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS community_presence (
+                guild_id INTEGER NOT NULL,
+                subject_key TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                source_lanes TEXT DEFAULT '["community_presence"]',
+                approved_channel_labels TEXT DEFAULT '[]',
+                mention_count INTEGER DEFAULT 0,
+                direct_interaction_count INTEGER DEFAULT 0,
+                operator_mention_count INTEGER DEFAULT 0,
+                active_windows TEXT DEFAULT '[]',
+                connection_notes TEXT DEFAULT '[]',
+                evidence_snippets TEXT DEFAULT '[]',
+                category TEXT DEFAULT 'community_regular_candidate',
+                last_error_status TEXT DEFAULT 'none',
+                PRIMARY KEY (guild_id, subject_key)
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
 def _extract_connection_subjects(content: str) -> list[tuple[str, str, str]]:
@@ -227,54 +227,53 @@ def upsert_community_presence_subject(
     day = now_dt.date().isoformat()
     key = subject_key(subject)
     lane = COMMUNITY_PRESENCE_LANE
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM community_presence WHERE guild_id=? AND subject_key=?", (guild_id, key))
-    row = cur.fetchone()
-    columns = [desc[0] for desc in cur.description] if cur.description else []
-    existing = dict(zip(columns, row)) if row else {}
-    if existing:
-        channels = _append_unique(_json_list(existing.get("approved_channel_labels")), channel_label, MAX_CHANNEL_LABELS)
-        windows = _append_unique(_json_list(existing.get("active_windows")), day, 30)
-        notes = _append_unique(_json_list(existing.get("connection_notes")), safe_community_snippet(connection_note, 120), MAX_CONNECTION_NOTES) if connection_note else _json_list(existing.get("connection_notes"))[:MAX_CONNECTION_NOTES]
-        snippets = _append_unique(_json_list(existing.get("evidence_snippets")), safe_community_snippet(evidence_snippet, 160), MAX_COMMUNITY_EVIDENCE_SNIPPETS) if evidence_snippet else _json_list(existing.get("evidence_snippets"))[:MAX_COMMUNITY_EVIDENCE_SNIPPETS]
-        old_category = existing.get("category") or "community_regular_candidate"
-        new_category = category if old_category == "community_regular_candidate" or category != "community_regular_candidate" else old_category
-        cur.execute(
-            """
-            UPDATE community_presence
-            SET display_name=?, last_seen_at=?, source_lanes=?, approved_channel_labels=?,
-                mention_count=mention_count+?, direct_interaction_count=direct_interaction_count+?,
-                operator_mention_count=operator_mention_count+?, active_windows=?, connection_notes=?,
-                evidence_snippets=?, category=?, last_error_status='none'
-            WHERE guild_id=? AND subject_key=?
-            """,
-            (
-                subject, now_text, json.dumps([lane]), json.dumps(channels), int(mention_increment),
-                int(direct_interaction_increment), int(operator_mention_increment), json.dumps(windows),
-                json.dumps(notes), json.dumps(snippets), new_category, guild_id, key,
-            ),
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO community_presence (
-                guild_id, subject_key, display_name, first_seen_at, last_seen_at, source_lanes,
-                approved_channel_labels, mention_count, direct_interaction_count, operator_mention_count,
-                active_windows, connection_notes, evidence_snippets, category, last_error_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none')
-            """,
-            (
-                guild_id, key, subject, now_text, now_text, json.dumps([lane]),
-                json.dumps([channel_label] if channel_label else []), int(mention_increment),
-                int(direct_interaction_increment), int(operator_mention_increment), json.dumps([day]),
-                json.dumps([safe_community_snippet(connection_note, 120)] if connection_note else []),
-                json.dumps([safe_community_snippet(evidence_snippet, 160)] if evidence_snippet else []),
-                category,
-            ),
-        )
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(db_path)) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM community_presence WHERE guild_id=? AND subject_key=?", (guild_id, key))
+        row = cur.fetchone()
+        columns = [desc[0] for desc in cur.description] if cur.description else []
+        existing = dict(zip(columns, row)) if row else {}
+        if existing:
+            channels = _append_unique(_json_list(existing.get("approved_channel_labels")), channel_label, MAX_CHANNEL_LABELS)
+            windows = _append_unique(_json_list(existing.get("active_windows")), day, 30)
+            notes = _append_unique(_json_list(existing.get("connection_notes")), safe_community_snippet(connection_note, 120), MAX_CONNECTION_NOTES) if connection_note else _json_list(existing.get("connection_notes"))[:MAX_CONNECTION_NOTES]
+            snippets = _append_unique(_json_list(existing.get("evidence_snippets")), safe_community_snippet(evidence_snippet, 160), MAX_COMMUNITY_EVIDENCE_SNIPPETS) if evidence_snippet else _json_list(existing.get("evidence_snippets"))[:MAX_COMMUNITY_EVIDENCE_SNIPPETS]
+            old_category = existing.get("category") or "community_regular_candidate"
+            new_category = category if old_category == "community_regular_candidate" or category != "community_regular_candidate" else old_category
+            cur.execute(
+                """
+                UPDATE community_presence
+                SET display_name=?, last_seen_at=?, source_lanes=?, approved_channel_labels=?,
+                    mention_count=mention_count+?, direct_interaction_count=direct_interaction_count+?,
+                    operator_mention_count=operator_mention_count+?, active_windows=?, connection_notes=?,
+                    evidence_snippets=?, category=?, last_error_status='none'
+                WHERE guild_id=? AND subject_key=?
+                """,
+                (
+                    subject, now_text, json.dumps([lane]), json.dumps(channels), int(mention_increment),
+                    int(direct_interaction_increment), int(operator_mention_increment), json.dumps(windows),
+                    json.dumps(notes), json.dumps(snippets), new_category, guild_id, key,
+                ),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO community_presence (
+                    guild_id, subject_key, display_name, first_seen_at, last_seen_at, source_lanes,
+                    approved_channel_labels, mention_count, direct_interaction_count, operator_mention_count,
+                    active_windows, connection_notes, evidence_snippets, category, last_error_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none')
+                """,
+                (
+                    guild_id, key, subject, now_text, now_text, json.dumps([lane]),
+                    json.dumps([channel_label] if channel_label else []), int(mention_increment),
+                    int(direct_interaction_increment), int(operator_mention_increment), json.dumps([day]),
+                    json.dumps([safe_community_snippet(connection_note, 120)] if connection_note else []),
+                    json.dumps([safe_community_snippet(evidence_snippet, 160)] if evidence_snippet else []),
+                    category,
+                ),
+            )
+        conn.commit()
     return True
 
 
