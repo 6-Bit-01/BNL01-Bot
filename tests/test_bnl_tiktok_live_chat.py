@@ -107,6 +107,36 @@ class ParseTests(unittest.TestCase):
             parse_line(json.dumps(payload(unique_id="bad handle;secret")), now=1.0)
         self.assertEqual(handle.exception.code, "invalid_unique_id")
 
+    def test_preserves_event_ids_at_transport_and_archive_limits(self):
+        from bnl_tiktok_live_memory import archive_record
+
+        for length in (208, 240):
+            event_id = "tiktok:" + "x" * (length - len("tiktok:"))
+            with self.subTest(length=length):
+                event = parse_line(
+                    json.dumps(payload(event_id=event_id)),
+                    now=1_700_000_000.0,
+                )
+                self.assertEqual(event.event_id, event_id)
+                self.assertEqual(event.context_record()["event_id"], event_id)
+                record = archive_record(event.telemetry_record())
+                self.assertIsNotNone(record)
+                self.assertEqual(record["event_id"], event_id)
+
+    def test_overlong_event_id_is_rejected_without_exposing_its_value(self):
+        event_id = "private-marker:" + "x" * (241 - len("private-marker:"))
+        with self.assertRaises(ProtocolError) as invalid:
+            parse_line(
+                json.dumps(payload(event_id=event_id)),
+                now=1_700_000_000.0,
+            )
+        self.assertEqual(invalid.exception.code, "event_id_too_long")
+        self.assertNotIn("private-marker", str(invalid.exception))
+        adapter = LiveChatAdapter(time_fn=Clock())
+        self.assertIsNone(adapter.ingest_line(json.dumps(payload(event_id=event_id))))
+        self.assertEqual(adapter.health_snapshot()["invalid_lines"], 1)
+        self.assertEqual(adapter.health_snapshot()["events_accepted"], 0)
+
     def test_missing_id_gets_deterministic_fallback(self):
         value = json.dumps(payload(event_id=""))
         first = parse_line(value, now=1_700_000_000.0)
@@ -158,6 +188,36 @@ class BufferTests(unittest.TestCase):
         self.assertEqual(health["duplicate_count"], 1)
         self.assertEqual(health["overflow_count"], 1)
         self.assertEqual(health["comments_accepted"], 4)
+
+    def test_long_ids_with_the_same_prefix_remain_distinct_and_replays_dedupe(self):
+        from bnl_tiktok_live_memory import archive_record
+
+        prefix = "tiktok:" + "x" * (160 - len("tiktok:"))
+        event_ids = [prefix + "first", prefix + "second"]
+        records = []
+        for event_id in event_ids:
+            event = self.ingest(
+                event_type="like", event_id=event_id, like_count=7, like_total=100
+            )
+            self.assertIsNotNone(event)
+            record = archive_record(event.telemetry_record())
+            self.assertIsNotNone(record)
+            records.append(record)
+        self.assertEqual([record["event_id"] for record in records], event_ids)
+        self.assertIsNone(
+            self.ingest(
+                event_type="like", event_id=event_ids[0],
+                like_count=7, like_total=100
+            )
+        )
+        health = self.adapter.health_snapshot()
+        self.assertEqual(health["events_accepted"], 2)
+        self.assertEqual(health["taps_observed"], 14)
+        self.assertEqual(health["duplicate_count"], 1)
+        self.assertEqual(
+            [record["event_id"] for record in self.adapter.telemetry_snapshot()],
+            event_ids,
+        )
 
     def test_seen_ids_are_bounded_separately_from_event_buffer(self):
         buffer = LiveChatBuffer(2, 300, self.clock, max_seen_events=3)

@@ -36222,6 +36222,8 @@ def _archive_one_tiktok_live_conversation(
     guild_id: int,
     record: Mapping[str, Any],
     known_identities: Mapping[int, tuple[str, ...]],
+    *,
+    prepare_schema: bool = True,
 ) -> bool:
     event_type = str(record.get("event_type") or "").strip().lower()
     text_key = "comment_text" if event_type == "comment" else "question_text"
@@ -36252,6 +36254,9 @@ def _archive_one_tiktok_live_conversation(
         source_kind="tiktok_live_chat",
         source_key=event_id,
         occurred_at_ms=occurred_at_ms,
+        prepare_schema=prepare_schema,
+        tiktok_chat_replay=True,
+        tiktok_receipt_only_replay=not bool(record.get("source_at")),
         raw_text=content,
         sanitized_summary=sanitize_journal_source_summary(
             content,
@@ -36280,25 +36285,26 @@ def _archive_one_tiktok_live_conversation(
             event_id,
             journal_result.status,
         )
-    _shadow_memory_ledger_write(
-        "tiktok_live_chat",
-        lambda ledger_conn: shadow_tiktok_live_chat_event(
-            ledger_conn,
+    if journal_result.ok and journal_result.status == "inserted":
+        _shadow_memory_ledger_write(
+            "tiktok_live_chat",
+            lambda ledger_conn: shadow_tiktok_live_chat_event(
+                ledger_conn,
+                guild_id=int(guild_id),
+                event_id=event_id,
+                subject_key=identity.subject_ref,
+                subject_display_name=display_name or ("@" + handle if handle else ""),
+                content=content,
+                observed_at=observed_at,
+                source_sequence=occurred_at_ms,
+                moderator_flag=bool(record.get("moderator_flag") is True),
+            ),
             guild_id=int(guild_id),
-            event_id=event_id,
-            subject_key=identity.subject_ref,
-            subject_display_name=display_name or ("@" + handle if handle else ""),
-            content=content,
-            observed_at=observed_at,
-            source_sequence=occurred_at_ms,
-            moderator_flag=bool(record.get("moderator_flag") is True),
-        ),
-        guild_id=int(guild_id),
-        source_table="tiktok_live_chat",
-        source_row_id=event_id,
-        source_revision=event_id,
-        source_event_key=event_id,
-    )
+            source_table="tiktok_live_chat",
+            source_row_id=event_id,
+            source_revision=event_id,
+            source_event_key=event_id,
+        )
     return bool(journal_result.ok)
 
 
@@ -36335,19 +36341,22 @@ def ingest_tiktok_live_memory_once(
             "spoolIdentity": batch.spool_identity,
             "invalidLines": batch.invalid_lines,
         }
-    known_identities = (
-        _known_discord_identities_for_tiktok(int(guild_id))
-        if any(record.get("event_type") in {"comment", "question"} for record in batch.records)
-        else {}
-    )
     ingested = 0
     try:
+        ensure_journal_source_schema(DB_FILE)
+        known_identities = (
+            _known_discord_identities_for_tiktok(int(guild_id))
+            if any(record.get("event_type") in {"comment", "question"} for record in batch.records)
+            else {}
+        )
         for record in batch.records:
             if record.get("event_type") in {"comment", "question"}:
-                landed = _archive_one_tiktok_live_conversation(int(guild_id), record, known_identities)
+                landed = _archive_one_tiktok_live_conversation(
+                    int(guild_id), record, known_identities, prepare_schema=False,
+                )
             else:
                 landed = record_tiktok_engagement_event(
-                    DB_FILE, guild_id=int(guild_id), record=record,
+                    DB_FILE, guild_id=int(guild_id), record=record, prepare_schema=False,
                 ).ok
             if not landed:
                 raise ValueError("immutable_source_conflict")
@@ -37259,8 +37268,7 @@ def _scheduled_quiet_relay_due(now_pacific: datetime) -> bool:
     )
 
 
-@tasks.loop(minutes=1)
-async def website_relay_task():
+async def _website_relay_task_once():
     if not BNL_WEBSITE_RELAY_ENABLED:
         return
     flags = get_bnl_control_flags()
@@ -37307,6 +37315,18 @@ async def website_relay_task():
             logging.info("website_relay_no_publish guild=%s reason=%s", guild.id, decision.skipReason)
             continue
         logging.info(f"📤 website_relay_task published mode={decision.mode} preview={decision.message[:120]!r}")
+
+
+@tasks.loop(minutes=1)
+async def website_relay_task():
+    try:
+        await _website_relay_task_once()
+    except sqlite3.OperationalError as exc:
+        if not _sqlite_busy(exc):
+            raise
+        logging.warning(
+            "website_relay_retry_next_tick reason=database_locked"
+        )
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
 

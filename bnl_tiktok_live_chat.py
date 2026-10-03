@@ -58,6 +58,7 @@ MAX_LINE_BYTES = 32 * 1024
 MAX_COMMENT_CHARS = 1000
 MAX_QUESTION_CHARS = 1000
 MAX_TEXT_CHARS = 160
+MAX_EVENT_ID_CHARS = 240
 MAX_CLOCK_SKEW_SECONDS = 5 * 60
 MAX_SOURCE_CLOCK_SKEW_SECONDS = 24 * 60 * 60
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -480,7 +481,10 @@ def parse_line(line: Union[str, bytes], now: Optional[float] = None) -> LiveEven
         payload.get("source_at"), observed_at, MAX_SOURCE_CLOCK_SKEW_SECONDS
     )
     room_id = _text(payload.get("room_id"), 80)
-    event_id = _text(payload.get("event_id"), MAX_TEXT_CHARS)
+    # Replay keys must remain exact across the transport and archive boundaries.
+    event_id = _text(payload.get("event_id"), MAX_EVENT_ID_CHARS + 1)
+    if len(event_id) > MAX_EVENT_ID_CHARS:
+        raise ProtocolError("event_id_too_long")
 
     if event_type in OBSERVATION_EVENTS:
         unique_id, display_name, moderator_flag = _identity_fields(payload)
