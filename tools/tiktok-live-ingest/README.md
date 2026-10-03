@@ -125,7 +125,7 @@ deploy/systemd/bnl-tiktok-chat-shadow.service
 deploy/systemd/bnl-tiktok-chat-shadow.timer
 ```
 
-The timer starts every Friday at **6:50 PM America/Los_Angeles**. The service
+The timer starts every Friday at **6:30 PM America/Los_Angeles**. The service
 runs through **2:00 AM Saturday**, including daylight-saving changes. During
 that window it:
 
