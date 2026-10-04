@@ -34076,7 +34076,19 @@ async def get_gemini_response(
         one_call_packet_route = (
             str(route or "") == ORDINARY_CHAT_SINGLE_PACKET_ROUTE
         )
-        if not await asyncio.to_thread(check_quota_availability, route):
+        for quota_attempt in range(2):
+            try:
+                quota_available = await asyncio.to_thread(check_quota_availability, route)
+                break
+            except sqlite3.DatabaseError as exc:
+                if not _sqlite_busy(exc) or quota_attempt == 1:
+                    raise
+                logging.warning(
+                    "conversation_quota_preflight_retry route=%s attempt=2 reason=sqlite_busy",
+                    route,
+                )
+                await asyncio.sleep(0.1)
+        if not quota_available:
             result = GenerationResult(
                 False,
                 "",

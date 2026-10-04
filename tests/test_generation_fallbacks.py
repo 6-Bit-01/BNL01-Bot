@@ -218,7 +218,9 @@ class GenerationFallbackTests(unittest.TestCase):
                              result.error_category)
             self.assertEqual(bnl01_bot._last_generation_status["provider_error_code"],
                              result.provider_error_code)
-            quota.assert_called_once_with("get_gemini_response")
+            expected_attempts = 2 if bnl01_bot._sqlite_busy(error) else 1
+            self.assertEqual(quota.call_args_list,
+                             [mock.call("get_gemini_response")] * expected_attempts)
             client.assert_not_called()
             provider.assert_not_awaited()
             reserve.assert_not_called()
@@ -265,6 +267,85 @@ class GenerationFallbackTests(unittest.TestCase):
         )
         self.assertEqual(result.error_category, bnl01_bot.GENERATION_ERROR_LOCAL_STORAGE)
         self.assertEqual(result.provider_error_code, "sqlite_busy")
+
+    def test_busy_quota_preflight_recovers_before_one_provider_invocation(self):
+        generated = bnl01_bot.GenerationResult(True, "Hello.")
+        provider = mock.AsyncMock(return_value=generated)
+        with (
+            mock.patch.object(bnl01_bot, "check_quota_availability", side_effect=[
+                sqlite3.OperationalError("database is locked"), True,
+            ]) as quota,
+            mock.patch.object(bnl01_bot, "conversation_context_v2_enabled", return_value=True),
+            mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", provider),
+            mock.patch.object(bnl01_bot.asyncio, "sleep", new_callable=mock.AsyncMock) as pause,
+        ):
+            response = asyncio.run(bnl01_bot.get_gemini_response(
+                "Current user request: Say hello.", 123, 456,
+                allow_style_rewrite=False,
+            ))
+        self.assertEqual(response, "Hello.")
+        self.assertEqual(quota.call_args_list,
+                         [mock.call("get_gemini_response")] * 2)
+        pause.assert_awaited_once_with(0.1)
+        provider.assert_awaited_once()
+
+    def test_real_quota_denial_does_not_retry_or_call_provider(self):
+        output = {}
+        with (
+            mock.patch.dict(bnl01_bot._last_generation_status, {}, clear=True),
+            mock.patch.object(bnl01_bot, "check_quota_availability", return_value=False) as quota,
+            mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", new_callable=mock.AsyncMock) as provider,
+            mock.patch.object(bnl01_bot, "get_gemini_client") as client,
+            mock.patch.object(bnl01_bot, "reserve_local_model_budget") as reserve,
+            mock.patch.object(bnl01_bot, "record_token_usage") as usage,
+            mock.patch.object(bnl01_bot.asyncio, "sleep", new_callable=mock.AsyncMock) as pause,
+        ):
+            response = asyncio.run(bnl01_bot.get_gemini_response(
+                "Test request", 123, 456, generation_result_out=output,
+            ))
+        self.assertEqual(response, "")
+        self.assertEqual(output["result"].error_category,
+                         bnl01_bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET)
+        quota.assert_called_once_with("get_gemini_response")
+        pause.assert_not_awaited()
+        provider.assert_not_awaited()
+        client.assert_not_called()
+        reserve.assert_not_called()
+        usage.assert_not_called()
+
+    def test_cancellation_during_busy_preflight_yield_stops_before_provider(self):
+        async def exercise():
+            paused = asyncio.Event()
+
+            async def hold_yield(delay):
+                self.assertEqual(delay, 0.1)
+                paused.set()
+                await asyncio.Future()
+
+            with (
+                mock.patch.object(bnl01_bot, "check_quota_availability",
+                                  side_effect=sqlite3.OperationalError("database is locked")) as quota,
+                mock.patch.object(bnl01_bot.asyncio, "sleep", side_effect=hold_yield) as pause,
+                mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", new_callable=mock.AsyncMock) as provider,
+                mock.patch.object(bnl01_bot, "get_gemini_client") as client,
+                mock.patch.object(bnl01_bot, "reserve_local_model_budget") as reserve,
+                mock.patch.object(bnl01_bot, "record_token_usage") as usage,
+            ):
+                task = asyncio.create_task(bnl01_bot.get_gemini_response(
+                    "Test request", 123, 456,
+                ))
+                await asyncio.wait_for(paused.wait(), timeout=5)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                quota.assert_called_once_with("get_gemini_response")
+                pause.assert_awaited_once_with(0.1)
+                provider.assert_not_awaited()
+                client.assert_not_called()
+                reserve.assert_not_called()
+                usage.assert_not_called()
+
+        asyncio.run(exercise())
 
 
 if __name__ == "__main__":
