@@ -985,8 +985,13 @@ def _meaning_source(conn: sqlite3.Connection, entry_id: str, *, guild_id: int,
 
     if not _table_exists(conn, "conversations") or not _table_exists(conn, "memory_ledger_entries"):
         return None
-    cursor = conn.execute("SELECT * FROM memory_ledger_entries WHERE entry_id=? AND guild_id=?",
-                          (entry_id, guild_id))
+    # Reopen every field used by the source fence and returned DTO. Unused
+    # archive payloads and identity labels are not needed for that judgment.
+    cursor = conn.execute("""SELECT source_table,source_row_id,channel_policy,channel_id,
+        visibility,public_usable,route_mode,lifecycle_status,source_role,normalized_value,
+        predicate_key,subject_key,derived,projection,source_revision,observed_at
+        FROM memory_ledger_entries WHERE entry_id=? AND guild_id=?""",
+        (entry_id, guild_id))
     row = cursor.fetchone()
     if not row:
         return None
@@ -1003,8 +1008,9 @@ def _meaning_source(conn: sqlite3.Connection, entry_id: str, *, guild_id: int,
                             "AND target_entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')",
                             (guild_id, entry_id)).fetchone()):
         return None
-    cursor = conn.execute("SELECT * FROM conversations WHERE id=? AND guild_id=? AND user_id=?",
-                          (int(entry["source_row_id"]), guild_id, user_id))
+    cursor = conn.execute("""SELECT id,role,content,channel_id,channel_policy,route_mode,timestamp
+        FROM conversations WHERE id=? AND guild_id=? AND user_id=?""",
+        (int(entry["source_row_id"]), guild_id, user_id))
     row = cursor.fetchone()
     if not row:
         return None

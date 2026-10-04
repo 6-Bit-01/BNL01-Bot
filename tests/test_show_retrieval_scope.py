@@ -1,14 +1,21 @@
 """A selected show view must not describe omitted records as absent evidence."""
 
 import json
+import hashlib
 import sqlite3
 import tempfile
 import unittest
+import weakref
+from contextlib import closing
+from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
 import test_tiktok_show_evidence_ledger as fixture
 from bnl_journal_source_store import record_source_event
 from bnl_tiktok_show_ledger import build_tiktok_show_evidence_context
+import bnl_tiktok_show_ledger as shows
+import bnl_canon_source_contract as contracts
 
 
 class ShowRetrievalScopeTests(unittest.TestCase):
@@ -100,3 +107,187 @@ class ShowRetrievalScopeTests(unittest.TestCase):
             )
             self.assertEqual(rerendered, rendered)
             self.assertEqual(refreshed["authored_excerpts"], selection["authored_excerpts"])
+
+
+class ShowReadHydrationTests(unittest.TestCase):
+    def document(self, index=0):
+        receipt = dict(
+            contractVersion=contracts.SHOW_QUEUE_EVIDENCE_AUTHORIZATION_VERSION,
+            readModelSource="barcode-network-site", publicOnly=True,
+            localQueueProduction=True, websiteQueueProduction=True,
+            accessScope="public",
+            archiveSchemaVersion=contracts.SHOW_QUEUE_ARCHIVE_SCHEMA_VERSION,
+            archiveSource=contracts.SHOW_QUEUE_ARCHIVE_SOURCE,
+            archiveVisibility="public_safe", archiveSourceRevision=1,
+            archiveSourceDigest="a" * 64, historyCoverageStartedAt="2026-01-01",
+        )
+        document = dict(
+            schemaVersion=shows.SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
+            showKey="synthetic-show-%s" % index,
+            showDate=(date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+            lifecycle="finalized", startedAtMs=index * 100000,
+            endedAtMs=index * 100000 + 50000, sourceAuthorization=receipt,
+            messages=[dict(
+                eventId="synthetic-message-%s" % index,
+                subjectRef="tiktok_user:fixture", speakerLabel="Fixture Viewer",
+                text="The copper lantern flickers beside the river.",
+                occurredAtMs=index * 100000 + 1000,
+            )],
+            participants=[dict(
+                subjectRef="tiktok_user:fixture", speakerLabel="Fixture Viewer",
+                handle="fixture.viewer",
+            )],
+            topics=[], trackMoments=[], trackRoster=[], operationalEvents=[],
+            discordInteractions=[], discordParticipants=[], showTopics=[],
+            coverage=dict(eligibleMessageCount=1, participantCount=1),
+        )
+        document["sourceDigest"] = hashlib.sha256(
+            shows._canonical_json(document).encode("utf-8")
+        ).hexdigest()
+        return document
+
+    def store(self, conn, document, *, raw_json=None):
+        conn.execute("""INSERT INTO tiktok_show_evidence_ledgers
+            (guild_id,show_key,schema_version,show_date,lifecycle_status,
+             started_at_ms,ended_at_ms,source_digest,ledger_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                77, document["showKey"], document["schemaVersion"],
+                document["showDate"], "finalized", document["startedAtMs"],
+                document["endedAtMs"], document["sourceDigest"],
+                json.dumps(document) if raw_json is None else raw_json,
+                "2026-01-01", "2026-01-01",
+            ))
+
+    def test_casual_request_validates_all_200_documents_without_authored_hydration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "synthetic.db")
+            with closing(sqlite3.connect(db)) as conn, conn:
+                shows.ensure_tiktok_show_evidence_schema(conn)
+                for index in range(200):
+                    self.store(conn, self.document(index))
+            with mock.patch.object(shows, "_safe_document", wraps=shows._safe_document) as validate:
+                with mock.patch.object(shows, "_authored_show_messages",
+                                       side_effect=AssertionError("irrelevant authored hydration")):
+                    selected = {}
+                    self.assertEqual(shows.build_tiktok_show_evidence_context(
+                        db, guild_id=77, user_text="What's up?", selection_out=selected,
+                    ), "")
+                    self.assertEqual(selected, {})
+            self.assertEqual(validate.call_count, 200)
+
+    def test_explicit_subject_date_community_and_topic_scopes_keep_authored_hydration(self):
+        document = self.document()
+        cases = (
+            ("What did Fixture Viewer say?", "", False, ()),
+            ("What did I say?", "tiktok_user:fixture", True, ()),
+            ("Recap the show.", "", False, ()),
+            ("What time did the broadcast start?", "", False, ()),
+            ("Summarize the community.", "", False, ()),
+            ("The copper lantern", "", False, ()),
+            ("What happened on January 1, 2026?", "", False, ("2026-01-01",)),
+        )
+        for query, subject, direct, dates in cases:
+            with self.subTest(query=query):
+                with mock.patch.object(shows, "_authored_show_messages",
+                                       wraps=shows._authored_show_messages) as authored:
+                    score, participants = shows._document_relevance(
+                        document, user_text=query, subject_ref=subject,
+                        recency_rank=0, allow_direct_subject=direct,
+                        requested_dates=dates,
+                    )
+                self.assertGreater(score, 0)
+                self.assertEqual(authored.call_count, 1)
+                if subject or "Fixture Viewer" in query:
+                    self.assertEqual([p["subjectRef"] for p in participants],
+                                     ["tiktok_user:fixture"])
+
+    def test_topic_recall_preserves_full_text_and_exact_root_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "synthetic.db")
+            document = self.document()
+            with closing(sqlite3.connect(db)) as conn, conn:
+                shows.ensure_tiktok_show_evidence_schema(conn)
+                self.store(conn, document)
+            selected = {}
+            text = shows.build_tiktok_show_evidence_context(
+                db, guild_id=77, user_text="The copper lantern", selection_out=selected,
+            )
+            self.assertIn(document["messages"][0]["text"], text)
+            self.assertEqual(selected["source_refs"],
+                             ((document["showKey"], document["sourceDigest"]),))
+            refreshed = {}
+            self.assertEqual(shows.build_tiktok_show_evidence_context(
+                db, guild_id=77, user_text="The copper lantern",
+                pinned_show_keys=(document["showKey"],), selection_out=refreshed,
+            ), text)
+            self.assertEqual(refreshed, selected)
+
+    def test_both_readers_release_consumed_raw_rows_and_keep_validation_order(self):
+        class RawJSON(str):
+            pass
+
+        class Rows:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchone(self):
+                return (1,)
+
+            def fetchall(self):
+                return self.rows
+
+        class Connection:
+            def __init__(self, rows):
+                self.rows = rows
+                self.closed = False
+
+            def execute(self, sql, _params=()):
+                return Rows(self.rows)
+
+            def close(self):
+                self.closed = True
+
+        documents = [self.document(index) for index in range(5)]
+        documents[1]["sourceDigest"] = "0" * 64
+        documents[4]["sourceAuthorization"]["publicOnly"] = False
+        digest_payload = dict(documents[4])
+        digest_payload.pop("sourceDigest")
+        documents[4]["sourceDigest"] = hashlib.sha256(
+            shows._canonical_json(digest_payload).encode("utf-8")
+        ).hexdigest()
+        for reader in ("conversation", "packet"):
+            with self.subTest(reader=reader):
+                rows = [
+                    (RawJSON("{" if index == 2 else json.dumps(document)),)
+                    if reader == "conversation" else
+                    (document["showKey"], document["sourceDigest"],
+                     document["endedAtMs"], RawJSON("{" if index == 2 else json.dumps(document)))
+                    for index, document in enumerate(documents)
+                ]
+                references = [weakref.ref(row[-1]) for row in rows]
+                connection = Connection(rows)
+                original_loads = json.loads
+                decoded = []
+
+                def observe_loads(raw, *args, **kwargs):
+                    position = len(decoded)
+                    self.assertTrue(all(reference() is None
+                                        for reference in references[:position]),
+                                    "Consumed raw JSON remains retained during later hydration")
+                    decoded.append(position)
+                    return original_loads(raw, *args, **kwargs)
+
+                with mock.patch.object(shows.json, "loads", new=observe_loads):
+                    if reader == "packet":
+                        loaded = shows._load_finalized_show_ledgers(connection, guild_id=77)
+                        self.assertEqual([item["showKey"] for item in loaded],
+                                         [documents[0]["showKey"], documents[3]["showKey"]])
+                    else:
+                        with mock.patch.object(shows.os.path, "exists", return_value=True):
+                            with mock.patch.object(shows.sqlite3, "connect", return_value=connection):
+                                self.assertEqual(shows.build_tiktok_show_evidence_context(
+                                    "synthetic-only.db", guild_id=77, user_text="What's up?",
+                                ), "")
+                        self.assertTrue(connection.closed)
+                self.assertEqual(decoded, [0, 1, 2, 3, 4])
+                self.assertTrue(all(reference() is None for reference in references))
