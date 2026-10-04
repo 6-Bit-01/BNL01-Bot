@@ -24805,9 +24805,10 @@ def _dollar_budget_decision(
     if policy.memory_protected:
         return True, "memory_protected"
 
-    if config.monthly_cap_only:
-        # One shared monthly cap replaces optional pace restrictions. The
-        # hard ceiling, billing buffer, unknown-cost checks and reserves above
+    if config.monthly_cap_only and not policy.relay_protected:
+        # One shared monthly cap replaces generic optional pace restrictions.
+        # Relay retains its existing bounded allowance in the branch below.
+        # The hard ceiling, billing buffer, unknown-cost checks and reserves above
         # still apply to every route; this does not disable daily token guards.
         return True, "monthly_cap_available"
 
@@ -24815,7 +24816,8 @@ def _dollar_budget_decision(
         _nanos_to_usd(guarded_month_nanos),
         _nanos_to_usd(guarded_today_nanos),
         config=config,
-        at=now_pacific,
+        at=(budget_month_window(now_pacific, config=config).at_budget.date()
+            if config.monthly_cap_only else now_pacific),
     )
     expected_nanos = _usd_to_nanos(pace.expected_cost_to_date_usd)
     if policy.relay_protected:
@@ -51482,7 +51484,8 @@ async def usage(interaction: discord.Interaction):
     )
     monthly_cap_only = diagnostics.get("monthly_cap_only", False)
     pacing_label = (
-        "Monthly cap mode: pace, daily soft limit and Relay allowance inactive\n"
+        "Monthly cap mode: generic pace and daily soft limit inactive; "
+        f"Relay allowance **${diagnostics['relay_pace_allowance_usd']:.2f}** retained\n"
         f"Month: **{diagnostics['budget_month']}** · reset: "
         f"**{diagnostics['next_monthly_reset_at']}** (fixed PST)\n"
         if monthly_cap_only else

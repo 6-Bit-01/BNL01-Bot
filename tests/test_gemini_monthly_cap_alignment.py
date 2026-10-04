@@ -209,9 +209,10 @@ class MonthlyCapAlignmentTests(unittest.TestCase):
 
     def test_early_month_background_runs_without_legacy_pace_but_safeguards_still_win(self):
         for route in ("ambient_generation", "ambient_generation.community_edition",
-                      "ambient_generation.community_edition_repair", "website_relay_event"):
+                      "ambient_generation.community_edition_repair"):
             with self.subTest(route=route):
                 self.assertEqual(self.decision(route), (True, "monthly_cap_available"))
+        self.assertEqual(self.decision("website_relay_event"), (True, "relay_protected"))
         self.assertEqual(self.decision(month="26.49", active="0", request="0.02"),
                          (False, "interactive_and_journal_reserve"))
         self.assertEqual(self.decision(month="29.49", active="0", request="0.02"),
@@ -227,6 +228,27 @@ class MonthlyCapAlignmentTests(unittest.TestCase):
                          (False, "monthly_hard_limit"))
         with mock.patch.dict(os.environ, {"BNL_GEMINI_MONTHLY_CAP_ONLY": "false"}):
             self.assertEqual(self.decision(), (False, "monthly_target_pace"))
+
+    def test_relay_allowance_and_show_protection_remain_enforced_in_cap_mode(self):
+        # Day-one shared spend exceeds the retained Relay pace+5.50 allowance,
+        # while the shared cap/reserves still admit generic Ambient and shows.
+        self.assertEqual(self.decision("website_relay_event", month="6.45", active="0"),
+                         (False, "relay_pace_allowance"))
+        self.assertEqual(self.decision(month="6.45", active="0"),
+                         (True, "monthly_cap_available"))
+        for route in ("showday_generation", "broadcast_ballad_background"):
+            with self.subTest(route=route):
+                self.assertEqual(self.decision(route, month="6.45", active="0"),
+                                 (True, "showday_protected"))
+                self.assertEqual(self.decision(route, month="26.49", active="0"),
+                                 (False, "interactive_and_journal_reserve"))
+        # At LA November 1, the selected PST month remains October until 08 UTC.
+        self.now = utc("2026-11-01T07:30:00")
+        self.assertEqual(self.decision("website_relay_event", month="10", active="0"),
+                         (True, "relay_protected"))
+        self.now = utc("2026-11-01T08:00:00")
+        self.assertEqual(self.decision("website_relay_event", month="10", active="0"),
+                         (False, "relay_pace_allowance"))
 
     def test_actual_admission_waits_for_pst_reset_even_when_la_daily_month_has_reset(self):
         self.event("2026-10-31T20:00:00", "29.49")

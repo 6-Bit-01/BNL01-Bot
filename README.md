@@ -110,8 +110,9 @@ America/Los_Angeles calendar boundaries, including daylight saving changes.
 To align the local monthly ceiling with a $30 Google project limit, configure
 `BNL_GEMINI_MONTHLY_HARD_LIMIT_USD=30.00` and
 `BNL_GEMINI_MONTHLY_CAP_ONLY=true`. In this mode the target equals the hard
-limit; generic monthly pace, daily dollar soft limits and Relay pace allowance
-are inactive. The month resets at midnight fixed PST (UTC-08:00) on the first,
+limit; generic monthly pace and daily dollar soft limits are inactive.
+The existing Relay pace allowance remains enforced using that selected month.
+The month resets at midnight fixed PST (UTC-08:00) on the first,
 matching [Google's documented calendar budget boundary](https://docs.cloud.google.com/billing/docs/how-to/budgets).
 Monthly costs and reservations use their UTC timestamps, with existing daily indexes bounding
 the read; historical daily records remain unchanged. Daily token quotas still
@@ -132,7 +133,8 @@ minutes.
 
 Relay has no per-model retry and at most one backup call after HTTP 503. Both
 attempts are reserved up front. It may use the small configured pace allowance
-when generic background work is restricted in the default paced mode.
+when generic background work is restricted. This Relay allowance remains
+enforced in monthly-cap mode as well as the default paced mode.
 The allowance never bypasses the effective hard limit or the Journal and
 interactive dollar reserves. Show-day generation remains background-shaped but
 time-sensitive, so the generic monthly/daily pace gate cannot suppress a

@@ -173,7 +173,10 @@ class RehearsalSongFollowthroughTests(unittest.IsolatedAsyncioTestCase):
             "BNL_GEMINI_BILLING_LAG_BUFFER_USD": "0.50", "BNL_GEMINI_JOURNAL_RESERVE_USD": "1",
             "BNL_GEMINI_INTERACTIVE_RESERVE_USD": "2",
         }
-        def usage(_conn, start, _end):
+        def usage(_conn, start, _end, *, month_window=None):
+            if month_window is not None:
+                self.assertEqual(start, month_window.month_start.isoformat())
+                self.assertEqual(_end, month_window.next_month_start.isoformat())
             return dict(estimated_cost_nanos=1_376_212_500 if start == "2026-09-16" else 11_481_236_100,
                         unpriced_calls=0, unpriced_guardrail_nanos=0)
         with mock.patch.dict(os.environ, env, clear=False), \
