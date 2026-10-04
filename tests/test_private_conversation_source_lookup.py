@@ -1,6 +1,5 @@
 """Private source reads must retain exact identity without scanning chat history."""
 import os
-import re
 import sqlite3
 import unittest
 from unittest.mock import patch
@@ -53,31 +52,44 @@ class PrivateConversationSourceLookupTests(unittest.TestCase):
         finally:
             self.conn.set_trace_callback(None)
         return next(sql for sql in statements
-                    if "SELECT e.entry_id FROM memory_ledger_entries e" in sql)
+                    if "SELECT e.entry_id FROM conversations c" in sql)
 
     @staticmethod
-    def original_query(query):
-        return re.sub(r"c\.id=CAST\(e\.source_row_id AS INTEGER\)\s+AND\s+", "", query)
+    def original_query():
+        # Independent original selection oracle for this fixture's scope.
+        return """SELECT e.entry_id FROM memory_ledger_entries e
+            JOIN conversations c ON CAST(c.id AS TEXT)=e.source_row_id
+              AND e.guild_id=c.guild_id
+            WHERE e.source_table='conversations' AND c.guild_id=1 AND c.user_id=2
+              AND c.channel_policy='sealed_test' AND c.channel_id=99
+            ORDER BY c.id,e.entry_id"""
 
-    def test_actual_root_query_uses_primary_key_and_avoids_unrelated_conversations(self):
+    def test_scoped_conversations_lookup_roots_without_revisiting_unrelated_revisions(self):
         self.conn.executemany("INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?)",
             ((row_id, 3, 1, 10, "public_home", "normal_chat", "user", "Other member history.",
               "2026-10-03T00:00:00+00:00") for row_id in range(1, 10001)))
         roots = [self.source(row_id) for row_id in range(10001, 10011)]
+        other_root = self.source(10011, user_id=3, channel_id=10, policy="public_home")
+        cursor = self.conn.execute("SELECT * FROM memory_ledger_entries WHERE entry_id=?", (other_root,))
+        columns = [column[0] for column in cursor.description]
+        original = dict(zip(columns, cursor.fetchone()))
+        self.conn.executemany(
+            "INSERT INTO memory_ledger_entries (" + ",".join(columns) + ") VALUES ("
+            + ",".join("?" for _ in columns) + ")",
+            (tuple(dict(original, entry_id=f"unrelated-revision-{index}",
+                        source_revision=f"revision-{index}")[key] for key in columns)
+             for index in range(20000)),
+        )
         query = self.root_query()
         plan = self.conn.execute("EXPLAIN QUERY PLAN " + query).fetchall()
-        self.assertTrue(any("c USING INTEGER PRIMARY KEY (rowid=?)" in row[3]
-                            for row in plan), plan)
-        original = self.original_query(query)
-        original_plan = self.conn.execute("EXPLAIN QUERY PLAN " + original).fetchall()
-        self.assertFalse(any("c USING INTEGER PRIMARY KEY" in row[3]
-                             for row in original_plan), original_plan)
+        self.assertTrue(any("e USING INDEX idx_mle_source" in row[3]
+                            and "source_row_id=?" in row[3] for row in plan), plan)
         steps = 0
 
         def budget():
             nonlocal steps
             steps += 1000
-            return int(steps > 15000)
+            return int(steps > 60000)
 
         self.conn.set_progress_handler(budget, 1000)
         try:
@@ -93,7 +105,7 @@ class PrivateConversationSourceLookupTests(unittest.TestCase):
         for index, row_id in enumerate(invalid):
             self.clone_root(root, f"invalid-{index}", source_row_id=row_id)
         query = self.root_query()
-        original = self.original_query(query)
+        original = self.original_query()
         self.assertEqual(self.conn.execute(query).fetchall(), self.conn.execute(original).fetchall())
         self.assertEqual([source["entry_id"] for source in self.sources()], [root, largest_root])
 
