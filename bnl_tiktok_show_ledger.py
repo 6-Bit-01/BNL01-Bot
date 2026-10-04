@@ -19,6 +19,7 @@ import math
 import os
 import re
 import sqlite3
+import time
 from typing import Any, Mapping, Optional, Sequence
 
 from bnl_canon_source_contract import (
@@ -82,6 +83,7 @@ TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS = 20_000
 TIKTOK_SHOW_EVIDENCE_RESPONSE_WINDOW_MS = 15 * 60 * 1000
 TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT = 2
 TIKTOK_SHOW_EVIDENCE_RECALL_MESSAGE_LIMIT = 10
+TIKTOK_SHOW_EVIDENCE_SYNC_MAX_SECONDS = 20.0
 SHOW_EPISODE_CONTEXT_VERSION = "barcode_show_episode_context_v1"
 SHOW_PREPARATION_CONTEXT_VERSION = "barcode_show_preparation_v1"
 ENGAGEMENT_CONTEXT_VERSION = "tiktok_captured_engagement_v1"
@@ -2189,6 +2191,11 @@ def _projection_expectations(
     )
 
 
+def _check_show_sync_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("tiktok_show_sync_deadline_exceeded")
+
+
 def sync_tiktok_show_evidence_ledgers(
     db_file: str,
     *,
@@ -2198,8 +2205,13 @@ def sync_tiktok_show_evidence_ledgers(
         Mapping[str, Sequence[Mapping[str, Any]]]
     ] = None,
     environ: Optional[Mapping[str, str]] = None,
+    max_seconds: float = TIKTOK_SHOW_EVIDENCE_SYNC_MAX_SECONDS,
 ) -> dict[str, Any]:
     """Idempotently assemble every authorized public-production show."""
+
+    if not math.isfinite(max_seconds) or max_seconds <= 0:
+        raise ValueError("invalid_show_sync_budget")
+    deadline = time.monotonic() + max_seconds
 
     result = {
         "status": "skipped",
@@ -2250,12 +2262,27 @@ def sync_tiktok_show_evidence_ledgers(
         )
         return result
     result["showsSeen"] = len(shows)
-    conn = sqlite3.connect(db_file, timeout=10.0)
+    _check_show_sync_deadline(deadline)
+    conn = sqlite3.connect(db_file, timeout=min(0.5, max_seconds))
+    deadline_interrupted = False
+
+    def check_sql_deadline() -> int:
+        nonlocal deadline_interrupted
+        if time.monotonic() >= deadline:
+            deadline_interrupted = True
+            return 1
+        return 0
+
+    conn.set_progress_handler(check_sql_deadline, 1000)
+    cached_related_sources = None
+    cached_data_version = None
     try:
         ensure_tiktok_show_evidence_schema(conn)
         ensure_memory_ledger_schema(conn)
+        _check_show_sync_deadline(deadline)
         conn.commit()
         for show in shows:
+            _check_show_sync_deadline(deadline)
             show_key = tiktok_show_evidence_key(show)
             if not show_key:
                 continue
@@ -2263,7 +2290,19 @@ def sync_tiktok_show_evidence_ledgers(
             # A later historical show must not extend an earlier write lease
             # or reuse preparation sources changed since that lease ended.
             conn.execute("BEGIN")
-            related_sources = _load_show_related_sources(conn, guild_id=int(guild_id))
+            # Pin the new main-database snapshot before inspecting this same
+            # connection's change marker. No committed external edit, privacy
+            # withdrawal or correction may reuse an earlier source scan.
+            conn.execute("SELECT 1 FROM main.sqlite_master LIMIT 1").fetchone()
+            data_version = conn.execute("PRAGMA main.data_version").fetchone()[0]
+            own_changes_before = conn.total_changes
+            if cached_related_sources is None or cached_data_version != data_version:
+                cached_related_sources = _load_show_related_sources(
+                    conn, guild_id=int(guild_id), deadline=deadline,
+                )
+                cached_data_version = data_version
+            related_sources = cached_related_sources
+            _check_show_sync_deadline(deadline)
             existing = conn.execute(
                 f"""
                 SELECT source_digest,lifecycle_status,ledger_json
@@ -2287,6 +2326,7 @@ def sync_tiktok_show_evidence_ledgers(
                 guild_id=int(guild_id),
                 show=show,
             )
+            _check_show_sync_deadline(deadline)
             if source_events is None:
                 conn.rollback()
                 continue
@@ -2295,6 +2335,7 @@ def sync_tiktok_show_evidence_ledgers(
                 guild_id=int(guild_id),
                 show=show,
             )
+            _check_show_sync_deadline(deadline)
             if discord_exchanges is None:
                 conn.rollback()
                 continue
@@ -2306,6 +2347,7 @@ def sync_tiktok_show_evidence_ledgers(
                 show, source_events, artist_identity_index=artist_identity_index,
                 discord_exchanges=discord_exchanges,
             )
+            _check_show_sync_deadline(deadline)
             if not base_ledger:
                 conn.rollback()
                 continue
@@ -2323,11 +2365,13 @@ def sync_tiktok_show_evidence_ledgers(
                 same_date_show_count=sum(1 for candidate in shows
                     if candidate.get("showDate") == show.get("showDate")),
             )
+            _check_show_sync_deadline(deadline)
             # Stored for show scanning, but never inserted as an authored
             # message, participant, canon candidate or Relationship signal.
             base_ledger["engagement"] = read_tiktok_engagement_evidence(
                 conn, guild_id=int(guild_id), source_window_ms=recorded_show_engagement_bounds(base_ledger),
             )
+            _check_show_sync_deadline(deadline)
             ledger = _seal_authorized_show_ledger(
                 base_ledger, authorization_receipt, prior_ledger=prior_ledger,
             )
@@ -2491,6 +2535,7 @@ def sync_tiktok_show_evidence_ledgers(
                         subject_refs
                     )
                     for subject_ref in sorted(subject_refs):
+                        _check_show_sync_deadline(deadline)
                         try:
                             refreshed = (
                                 form_atomic_candidates_from_recurring_conversation(
@@ -2511,11 +2556,21 @@ def sync_tiktok_show_evidence_ledgers(
                                 subject_ref,
                                 type(exc).__name__,
                             )
+            _check_show_sync_deadline(deadline)
             conn.commit()
-    except Exception:
+            # data_version deliberately ignores this connection's commits.
+            # A graph repair or its triggers may change reader inputs, so be
+            # conservative after ANY own write; only unchanged shows reuse.
+            if conn.total_changes != own_changes_before:
+                cached_related_sources = None
+    except Exception as exc:
+        conn.set_progress_handler(None, 0)
         conn.rollback()
+        if isinstance(exc, sqlite3.OperationalError) and deadline_interrupted:
+            raise TimeoutError("tiktok_show_sync_deadline_exceeded") from exc
         raise
     finally:
+        conn.set_progress_handler(None, 0)
         conn.close()
     result["status"] = "completed"
     result["reason"] = "eligible"
@@ -2696,6 +2751,7 @@ def _show_recall_messages(
 
 def _load_show_related_sources(
     conn: sqlite3.Connection, *, guild_id: int,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Read original public sources once; no broadcast-only admission rule.
 
@@ -2722,7 +2778,9 @@ def _load_show_related_sources(
         ).fetchall()
         if len(rows) > TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS:
             coverage["limited"].append("discord_conversation_rows")
-        for row in rows[:TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS]:
+        for index, row in enumerate(rows[:TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS]):
+            if index % 256 == 0:
+                _check_show_sync_deadline(deadline)
             occurred = _timestamp_epoch_ms(row[5])
             if occurred is None or not str(row[4] or "").strip():
                 continue
@@ -2747,10 +2805,12 @@ def _load_show_related_sources(
     original_messages: set[int] = set()
     if {"id", "guild_id"}.issubset(columns):
         message_column = "message_id" if "message_id" in columns else "0"
-        for original_id, original_message in conn.execute(
+        for index, (original_id, original_message) in enumerate(conn.execute(
             f"SELECT id,{message_column} FROM conversations WHERE guild_id=?",
             (guild_id,),
-        ):
+        )):
+            if index % 256 == 0:
+                _check_show_sync_deadline(deadline)
             original_rows.add(original_id)
             if original_message:
                 original_messages.add(original_message)
@@ -2767,7 +2827,9 @@ def _load_show_related_sources(
         ).fetchall()
         if len(rows) > TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS:
             coverage["limited"].append("journal_source_rows")
-        for kind, key, occurred, subject, label, raw, meta, digest, channel, policy in rows[:TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS]:
+        for index, (kind, key, occurred, subject, label, raw, meta, digest, channel, policy) in enumerate(rows[:TIKTOK_SHOW_EVIDENCE_MAX_SOURCE_EVENTS]):
+            if index % 256 == 0:
+                _check_show_sync_deadline(deadline)
             try:
                 metadata = json.loads(meta or "{}")
             except (ValueError, TypeError):
@@ -2817,12 +2879,14 @@ def _load_show_related_sources(
         superseded = {str(r[0]) for r in conn.execute(
             """SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=?
                AND lineage_type IN ('correction_of','supersedes','retracts')""", (guild_id,))}
-        for table, row_id, lifecycle, public, text, entry_id in conn.execute(
+        for index, (table, row_id, lifecycle, public, text, entry_id) in enumerate(conn.execute(
             """SELECT source_table,source_row_id,lifecycle_status,public_usable,
                       normalized_value,entry_id FROM memory_ledger_entries
                WHERE guild_id=? AND source_table IN ('conversations','tiktok_live_chat')
                  AND entry_type IN ('observation','derived_summary')""", (guild_id,),
-        ):
+        )):
+            if index % 256 == 0:
+                _check_show_sync_deadline(deadline)
             key = ("discord", str(row_id)) if table == "conversations" else ("tiktok", str(row_id))
             if lifecycle not in {"active", "review_only"} or (not public and records.get(key, {}).get("role") != "model"):
                 rejected.add(key)
@@ -2834,7 +2898,9 @@ def _load_show_related_sources(
         for key in rejected:
             records.pop(key, None)
     values = sorted(records.values(), key=lambda r: (r["occurredAtMs"], r["eventId"]))
-    for record in values:
+    for index, record in enumerate(values):
+        if index % 256 == 0:
+            _check_show_sync_deadline(deadline)
         text = record["text"]
         record["explicitShowDates"] = requested_show_dates(
             text, now=datetime.fromtimestamp(record["occurredAtMs"] / 1000, timezone.utc),

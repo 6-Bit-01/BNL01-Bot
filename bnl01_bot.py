@@ -723,6 +723,7 @@ GENERATION_ERROR_PROVIDER_UNKNOWN = "provider_unknown_error"
 GENERATION_ERROR_PROVIDER_MODEL_UNAVAILABLE = "provider_model_unavailable"
 GENERATION_ERROR_PROVIDER_INVALID_REQUEST = "provider_invalid_request"
 GENERATION_ERROR_LOCAL_MODEL_BUDGET = "local_model_budget_exhausted"
+GENERATION_ERROR_LOCAL_STORAGE = "local_storage_unavailable"
 
 
 class LocalModelBudgetExhausted(RuntimeError):
@@ -11323,6 +11324,22 @@ def _safe_provider_message(exc: Exception) -> str:
 def classify_generation_error(exc: Exception | None = None, *, empty_response: bool = False) -> tuple[str, str, str]:
     if empty_response:
         return GENERATION_ERROR_PROVIDER_EMPTY, "", ""
+    if isinstance(exc, sqlite3.DatabaseError):
+        # Accounting and source storage can fail before or after transport.
+        # Keep those local failures distinct from provider quota/permission
+        # failures, without echoing SQL, source text or database paths.
+        sqlite_code = int(getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF
+        if _sqlite_busy(exc):
+            reason = "sqlite_busy"
+        elif sqlite_code == 13 or str(exc).lower() == "database or disk is full":
+            reason = "sqlite_full"
+        else:
+            reason = "sqlite_error"
+        return (
+            GENERATION_ERROR_LOCAL_STORAGE,
+            reason,
+            "BNL's local storage could not complete this request.",
+        )
     if isinstance(exc, LocalModelBudgetExhausted):
         budget_reason = re.sub(
             r"[^a-z0-9_:-]+",
@@ -18892,12 +18909,26 @@ def should_allow_greeting(user_id: int, guild_id: int) -> bool:
 
     return random.random() < GREETING_CHANCE
 
-def get_guild_config(guild_id: int):
-    with closing(sqlite3.connect(DB_FILE)) as conn:
-        result = conn.execute(
-            "SELECT active_channel_id FROM guild_configs WHERE guild_id = ?", (guild_id,),
-        ).fetchone()
-    return result[0] if result else None
+def get_guild_config(guild_id: int, *, busy_retries: int = 0):
+    retries = max(0, min(int(busy_retries), 2))
+    for attempt in range(retries + 1):
+        try:
+            with closing(sqlite3.connect(
+                DB_FILE, timeout=0.01 if retries else 5,
+            )) as conn:
+                result = conn.execute(
+                    "SELECT active_channel_id FROM guild_configs WHERE guild_id = ?", (guild_id,),
+                ).fetchone()
+            return result[0] if result else None
+        except sqlite3.OperationalError as exc:
+            if not _sqlite_busy(exc) or attempt == retries:
+                raise
+            # Mandatory routing configuration must be fresh. Retry only this
+            # read after closing its failed connection, never message capture
+            # or provider/delivery work and never a cached/default setting.
+            logging.warning("guild_config_read_retry guild_id=%s attempt=%s",
+                            guild_id, attempt + 1)
+            time.sleep(0.05 * (attempt + 1))
 
 def get_guild_ambient_state(guild_id: int):
     conn = sqlite3.connect(DB_FILE)
@@ -48766,7 +48797,9 @@ async def on_message(message: discord.Message):
 
     direct_conversation_ingress = _register_direct_conversation_ingress(message)
 
-    active_channel_id = await asyncio.to_thread(get_guild_config, message.guild.id)
+    active_channel_id = await asyncio.to_thread(
+        get_guild_config, message.guild.id, busy_retries=2,
+    )
 
     is_active_channel = (active_channel_id is not None and message.channel.id == active_channel_id)
     channel_policy = resolve_channel_policy(message.channel)
