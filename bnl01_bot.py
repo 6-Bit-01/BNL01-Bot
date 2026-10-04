@@ -20007,14 +20007,26 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         update_user_habits(user_id, guild_id, content)
     if tier_row_id:
         _shadow_stored_memory_tier(tier_row_id, user_id, guild_id)
-        _consolidate_memory_tiers(
-            user_id, guild_id,
-            limits=calculate_adaptive_memory_limits(
-                user_id, guild_id, channel_policy=channel_policy, user_text=content,
-            ),
-            private_channel_id=int(channel_id or 0) if channel_policy == "sealed_test" else 0,
+    try:
+        if tier_row_id:
+            _consolidate_memory_tiers(
+                user_id, guild_id,
+                limits=calculate_adaptive_memory_limits(
+                    user_id, guild_id, channel_policy=channel_policy, user_text=content,
+                ),
+                private_channel_id=int(channel_id or 0) if channel_policy == "sealed_test" else 0,
+            )
+        prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
+    except sqlite3.OperationalError as exc:
+        if not _sqlite_busy(exc):
+            raise
+        # The original and its lineage are already committed. Retention is
+        # attempted by the same owner on later captures; do not replay that
+        # original or abort its reply because optional maintenance was busy.
+        logging.warning(
+            "conversation_retention_deferred source_row_id=%s sqlite_busy=1",
+            row_id,
         )
-    prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
     if (
         decision.update_profile
         and directed_to_bnl
@@ -23923,11 +23935,28 @@ def _reset_token_counter_if_needed(
 
 def check_and_reset_daily_counters():
     today_pacific = _pacific_usage_date()
+    # Initialized current-day counters are a read, not a new writer lease.
+    # Check the lane table too: an incomplete/bootstrap database still uses
+    # the existing schema owner before quota can be evaluated.
+    try:
+        with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn:
+            row = conn.execute(
+                "SELECT last_reset_date FROM token_usage WHERE id=1 AND EXISTS "
+                "(SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_usage_events')"
+            ).fetchone()
+        if row and str(row[0] or "") == today_pacific:
+            return
+    except sqlite3.OperationalError as exc:
+        if str(exc).lower() != "no such table: token_usage":
+            raise
     reset = False
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         _ensure_token_usage_schema(cursor)
+        # Another owner may have completed rollover and recorded usage while
+        # this owner waited. Recheck both the date and counter under the lock.
+        today_pacific = _pacific_usage_date()
         reset = _reset_token_counter_if_needed(cursor, today_pacific)
         conn.commit()
     if reset:
@@ -23937,17 +23966,25 @@ def check_and_reset_daily_counters():
         )
 
 def check_quota_availability(route: str = ""):
-    check_and_reset_daily_counters()
-    with sqlite3.connect(DB_FILE) as conn:
-        result = conn.execute(
-            "SELECT tokens_used_today FROM token_usage WHERE id = 1"
-        ).fetchone()
-        usage_date = _pacific_usage_date()
-        lane_usage = _generation_lane_usage_on_connection(
-            conn,
-            usage_date,
-        )
-    tokens_used = result[0] if result else 0
+    for attempt in range(2):
+        check_and_reset_daily_counters()
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            conn.execute("BEGIN")
+            result = conn.execute(
+                "SELECT tokens_used_today,last_reset_date FROM token_usage WHERE id = 1"
+            ).fetchone()
+            usage_date = _pacific_usage_date()
+            if not result or str(result[1] or "") != usage_date:
+                # Midnight can fall between initialization and this snapshot.
+                # Close it before reacquiring the existing rollover owner.
+                continue
+            lane_usage = _generation_lane_usage_on_connection(
+                conn, usage_date, ensure_schema=False,
+            )
+        break
+    else:
+        raise RuntimeError("local_model_budget_date_changed_during_quota_read")
+    tokens_used = result[0]
     with _token_budget_reservation_lock:
         journal_used = (
             lane_usage["journal"]
@@ -24370,8 +24407,11 @@ def _protected_usage_lane(route: str) -> str:
 def _generation_lane_usage_on_connection(
     conn: sqlite3.Connection,
     usage_date: str,
+    *,
+    ensure_schema: bool = True,
 ) -> dict[str, int]:
-    _ensure_token_usage_schema(conn.cursor())
+    if ensure_schema:
+        _ensure_token_usage_schema(conn.cursor())
     totals = {"journal": 0, "relay": 0, "ordinary": 0}
     for route, total in conn.execute(
         """
@@ -33935,7 +33975,7 @@ async def get_gemini_response(
         one_call_packet_route = (
             str(route or "") == ORDINARY_CHAT_SINGLE_PACKET_ROUTE
         )
-        if not check_quota_availability(route):
+        if not await asyncio.to_thread(check_quota_availability, route):
             result = GenerationResult(
                 False,
                 "",
