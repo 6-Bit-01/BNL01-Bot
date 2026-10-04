@@ -5,9 +5,11 @@ import hashlib
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import bnl_tiktok_show_ledger as shows
@@ -46,10 +48,11 @@ class ShowSyncTransactionTests(unittest.TestCase):
             "currentShow": None, "latestShow": archived_show(), "shows": [],
         })
 
-    def sync(self, model=None):
+    def sync(self, model=None, **kwargs):
         return shows.sync_tiktok_show_evidence_ledgers(
             self.db, guild_id=77, read_model=model or self.model,
             artist_identity_index=artist_index(), environ=ENABLED_QUEUE_ENV,
+            **kwargs,
         )
 
     def stored(self, key="show-attendance-1"):
@@ -315,6 +318,164 @@ class ShowSyncTransactionTests(unittest.TestCase):
         with mock.patch.object(shows, "_load_show_related_sources", side_effect=inspect_snapshot):
             self.sync(model)
         self.assertEqual(transactions, [True, True])
+
+    def two_shows(self):
+        second = copy.deepcopy(archived_show())
+        second.update(sessionId="second-episode", showDate="2026-08-29")
+        model = copy.deepcopy(self.model)
+        model["sections"]["archive"]["shows"] = [second]
+        return model
+
+    def test_unchanged_shows_share_one_source_scan_but_keep_separate_snapshots(self):
+        model = self.two_shows()
+        self.sync(model)
+        original = shows._load_show_source_events
+        transactions = []
+
+        def inspect_snapshot(conn, **kwargs):
+            transactions.append(conn.in_transaction)
+            return original(conn, **kwargs)
+
+        with mock.patch.object(shows, "_load_show_related_sources",
+                               wraps=shows._load_show_related_sources) as sources, \
+                mock.patch.object(shows, "_load_show_source_events",
+                                  side_effect=inspect_snapshot):
+            result = self.sync(model)
+        self.assertEqual(result["showsUnchanged"], 2)
+        self.assertEqual(transactions, [True, True])
+        self.assertEqual(sources.call_count, 1)
+
+    def test_committed_source_edits_or_privacy_changes_reload_between_show_snapshots(self):
+        model = self.two_shows()
+        self.sync(model)
+        real_connect = sqlite3.connect
+        original = shows._load_show_related_sources
+
+        for column, value in (("content", "A corrected source message"),
+                              ("channel_policy", "sealed_test"),
+                              ("delete_subject", None)):
+            with self.subTest(column=column):
+                captured = []
+
+                class BetweenShowConnection(sqlite3.Connection):
+                    commits = 0
+
+                    def commit(conn):
+                        super().commit()
+                        conn.commits += 1
+                        if conn.commits == 2:
+                            with closing(real_connect(self.db, timeout=0.1)) as writer:
+                                if column == "delete_subject":
+                                    purge_user_bound_conversation_sources_on_connection(writer, 77, 42)
+                                else:
+                                    writer.execute("UPDATE conversations SET " + column + "=? WHERE id=101",
+                                                   (value,))
+                                writer.commit()
+
+                def connect(*args, **kwargs):
+                    return real_connect(*args, **{**kwargs, "factory": BetweenShowConnection})
+
+                def capture_sources(conn, **kwargs):
+                    loaded = original(conn, **kwargs)
+                    captured.append(copy.deepcopy(loaded[0]))
+                    return loaded
+
+                with mock.patch.object(sqlite3, "connect", side_effect=connect), \
+                        mock.patch.object(shows, "_load_show_related_sources", side_effect=capture_sources):
+                    self.sync(model)
+                self.assertEqual(len(captured), 2)
+                current = [record for record in captured[-1]
+                           if record.get("conversationRowId") == 101]
+                if column == "content":
+                    self.assertEqual([record["text"] for record in current], [value])
+                else:
+                    self.assertEqual(current, [])
+                    if column == "delete_subject":
+                        self.assertTrue({"event-alex-1", "event-alex-2"}.isdisjoint(
+                            {record["eventId"] for record in captured[-1]}))
+
+    def test_own_graph_writes_invalidate_the_cycle_source_cache(self):
+        model = self.two_shows()
+        with mock.patch.object(shows, "_load_show_related_sources",
+                               wraps=shows._load_show_related_sources) as sources:
+            result = self.sync(model)
+        self.assertEqual(result["showsWritten"], 2)
+        self.assertEqual(sources.call_count, 2)
+
+    def test_sql_deadline_rolls_back_changed_show_graph_and_releases_writer(self):
+        self.sync()
+        before, counts = self.stored(), self.counts()
+        changed = copy.deepcopy(self.model)
+        changed["sections"]["archive"]["latestShow"]["title"] = "Changed show"
+        original = shows._project_finalized_show
+        graph_started = []
+        clock = [0.0]
+
+        def slow_after_graph(conn, **kwargs):
+            original(conn, **kwargs)
+            graph_started.append(True)
+            # Expire only after real graph writes. The production SQLite
+            # progress callback still interrupts a real long-running query;
+            # fixture setup speed on a loaded host does not choose the stage.
+            clock[0] = 2.0
+            conn.execute("WITH RECURSIVE work(n) AS (SELECT 1 UNION ALL "
+                         "SELECT n+1 FROM work WHERE n<100000000) SELECT SUM(n) FROM work").fetchone()
+
+        with mock.patch.object(shows, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                mock.patch.object(shows, "_project_finalized_show", side_effect=slow_after_graph):
+            with self.assertRaisesRegex(TimeoutError, "tiktok_show_sync_deadline_exceeded"):
+                self.sync(changed, max_seconds=1.0)
+        self.assertTrue(graph_started)
+        self.assertEqual(self.stored(), before)
+        self.assertEqual(self.counts(), counts)
+        # A real independent writer must acquire and commit immediately after
+        # interruption; neither the snapshot nor its partial graph can linger.
+        with closing(sqlite3.connect(self.db, timeout=0.1)) as writer:
+            writer.execute("BEGIN EXCLUSIVE")
+            writer.execute("UPDATE conversations SET content=content WHERE id=101")
+            writer.commit()
+
+    def test_cycle_deadline_preserves_previously_committed_complete_show(self):
+        model = self.two_shows()
+        original = shows._load_show_source_events
+        first_key = []
+        clock = [0.0]
+
+        def slow_second_source(conn, **kwargs):
+            if first_key:
+                # Reaching the next source read proves the preceding show
+                # committed. Expire here, then use real SQL interruption.
+                clock[0] = 2.0
+                conn.execute("WITH RECURSIVE work(n) AS (SELECT 1 UNION ALL "
+                             "SELECT n+1 FROM work WHERE n<100000000) SELECT SUM(n) FROM work").fetchone()
+            first_key.append(kwargs["show"]["sessionId"])
+            return original(conn, **kwargs)
+
+        with mock.patch.object(shows, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                mock.patch.object(shows, "_load_show_source_events", side_effect=slow_second_source):
+            with self.assertRaisesRegex(TimeoutError, "tiktok_show_sync_deadline_exceeded"):
+                self.sync(model, max_seconds=1.0)
+        self.assertEqual(len(first_key), 1)
+        self.assertIsNotNone(self.stored(first_key[0]))
+        with closing(sqlite3.connect(self.db, timeout=0.1)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tiktok_show_evidence_ledgers")
+                             .fetchone()[0], 1)
+            conn.execute("BEGIN EXCLUSIVE")
+            conn.commit()
+
+    def test_existing_busy_writer_has_short_wait_and_keeps_old_ledger(self):
+        self.sync()
+        before, counts = self.stored(), self.counts()
+        with closing(sqlite3.connect(self.db, timeout=0.1)) as writer:
+            writer.execute("BEGIN EXCLUSIVE")
+            started = time.monotonic()
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                self.sync()
+            self.assertEqual(getattr(caught.exception, "sqlite_errorcode", 5) & 0xFF, 5)
+            self.assertLess(time.monotonic() - started, 1.5)
+            writer.rollback()
+        self.assertEqual(self.stored(), before)
+        self.assertEqual(self.counts(), counts)
 
 
 if __name__ == "__main__":

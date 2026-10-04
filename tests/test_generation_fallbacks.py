@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sqlite3
 import unittest
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
@@ -150,6 +151,32 @@ class GenerationFallbackTests(unittest.TestCase):
         ]
         for exc, expected in cases:
             self.assertEqual(bnl01_bot.classify_generation_error(exc)[0], expected)
+
+    def test_local_storage_failures_are_not_provider_or_budget_errors(self):
+        cases = [
+            (sqlite3.OperationalError("database is locked"), "sqlite_busy"),
+            (sqlite3.OperationalError("database table is locked"), "sqlite_busy"),
+            (sqlite3.OperationalError("database or disk is full"), "sqlite_full"),
+            (sqlite3.OperationalError("no such table: private_fixture"), "sqlite_error"),
+            (sqlite3.DatabaseError("malformed: private source quota=429"), "sqlite_error"),
+        ]
+        for error, reason in cases:
+            with self.subTest(reason=reason, error_type=type(error).__name__):
+                category, code, safe_message = bnl01_bot.classify_generation_error(error)
+                self.assertEqual(category, bnl01_bot.GENERATION_ERROR_LOCAL_STORAGE)
+                self.assertEqual(code, reason)
+                self.assertEqual(safe_message, "BNL's local storage could not complete this request.")
+                self.assertNotIn("private", safe_message)
+
+    def test_extended_sqlite_error_codes_keep_local_storage_classification(self):
+        for sqlite_code, reason in ((5 | (2 << 8), "sqlite_busy"),
+                                    (6 | (1 << 8), "sqlite_busy"),
+                                    (13, "sqlite_full")):
+            with self.subTest(sqlite_code=sqlite_code):
+                error = sqlite3.OperationalError("private database detail")
+                error.sqlite_errorcode = sqlite_code
+                self.assertEqual(bnl01_bot.classify_generation_error(error)[:2],
+                                 (bnl01_bot.GENERATION_ERROR_LOCAL_STORAGE, reason))
 
 
 if __name__ == "__main__":
