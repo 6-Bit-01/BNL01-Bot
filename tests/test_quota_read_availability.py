@@ -1,8 +1,8 @@
 """Existing quota rules stay readable while another SQLite writer is reserved.
 
-Load only the actual quota owners and async conversation function, isolating
-Discord/import startup. SQLite schema, counters, lane queries and route ceilings
-remain real; no provider call is made by these availability checks.
+Load the actual quota owners and async conversation/Ballad entry points,
+isolating Discord/import startup. SQLite schema, counters, lane queries and
+route ceilings remain real; provider transport is isolated in these checks.
 """
 
 import ast
@@ -19,6 +19,10 @@ import unittest
 from unittest import mock
 
 from bnl_gemini_routing import budget_ceiling_for_route, policy_for_route
+from bnl_broadcast_ballads import (
+    BalladGeneration, MANUAL_ROUTE, MANUAL_REVIEW_ROUTE, REVIEW_ROUTE, ROUTE,
+    SUNO_LYRIC_PROTOCOL, route_for_command,
+)
 
 
 FUNCTIONS = {
@@ -26,6 +30,7 @@ FUNCTIONS = {
     "_reset_token_counter_if_needed", "check_and_reset_daily_counters",
     "check_quota_availability", "_generation_lane_usage_on_connection",
     "_protected_usage_lane", "_usage_int", "get_gemini_response",
+    "_run_ballad_control_cycle",
 }
 SOURCE = Path(__file__).resolve().parents[1] / "bnl01_bot.py"
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
@@ -229,6 +234,107 @@ class QuotaReadAvailabilityTests(unittest.TestCase):
 
 
 class AsyncQuotaAvailabilityTests(unittest.IsolatedAsyncioTestCase):
+    def ballad_namespace(self, *, callback, automatic):
+        """Run the real nested callbacks with isolated command/source transports.
+
+        These tests own neither a production command nor a provider request.
+        Command persistence/source guards have separate integration tests; here
+        the executor drives the actual writer or review callback in the bot.
+        """
+        ns = quota_namespace("unused.db", sqlite3.connect)
+        command = {"id": "auto-show-1" if automatic else "private-fixture",
+                   "showId": "show-1", "kind": "generate"}
+        receipts = []
+
+        def control(method="GET", payload=None):
+            if method == "POST":
+                receipts.append(payload)
+                return {}
+            return {"contractVersion": 1, "commands": [command]}
+
+        async def execute(_path, _guild, actual_command, **adapters):
+            self.assertEqual(actual_command["showId"], "show-1")
+            self.assertEqual(adapters["evidence_reader"](actual_command),
+                             ("eligible fixture originals", "fixture-digest"))
+            try:
+                result = await adapters[callback]("private fixture prompt")
+            except ValueError as exc:
+                return {"state": "failed", "error": str(exc)}
+            return {"state": "complete", "text": result.text}
+
+        ns.update(
+            _ballad_control_request_sync=control,
+            ballad_route_for_command=route_for_command,
+            BalladGeneration=BalladGeneration,
+            BALLAD_MANUAL_ROUTE=MANUAL_ROUTE,
+            BALLAD_MANUAL_REVIEW_ROUTE=MANUAL_REVIEW_ROUTE,
+            BALLAD_REVIEW_ROUTE=REVIEW_ROUTE,
+            SUNO_LYRIC_PROTOCOL=SUNO_LYRIC_PROTOCOL,
+            BNL01_PACKET_OWNED_SYSTEM_PROMPT="private test system",
+            BNL_PRIMARY_GUILD_ID=77,
+            build_broadcast_ballad_evidence=mock.Mock(return_value=(
+                "eligible fixture originals", "fixture-digest")),
+            execute_ballad_command=mock.AsyncMock(side_effect=execute),
+            _generate_gemini_content_result_async=mock.AsyncMock(return_value=SimpleNamespace(
+                success=True, text="private fixture result", finish_reason="STOP")),
+        )
+        return ns, receipts
+
+    async def test_actual_ballad_callbacks_keep_loop_live_during_quota_wait(self):
+        for automatic in (False, True):
+            for callback in ("generate", "review_attribution"):
+                with self.subTest(automatic=automatic, callback=callback):
+                    ns, receipts = self.ballad_namespace(callback=callback, automatic=automatic)
+                    started, release = threading.Event(), threading.Event()
+                    main_thread = threading.get_ident()
+                    observed = []
+
+                    def blocked_quota(route):
+                        observed.append((threading.get_ident(), route))
+                        started.set()
+                        if not release.wait(5):
+                            raise AssertionError("Ballad quota blocked the Discord event loop")
+                        return True
+
+                    ns["check_quota_availability"] = blocked_quota
+                    task = asyncio.create_task(ns["_run_ballad_control_cycle"]())
+                    try:
+                        async def heartbeat():
+                            while not started.is_set():
+                                await asyncio.sleep(0.001)
+                            self.assertFalse(task.done())
+                            ns["_generate_gemini_content_result_async"].assert_not_awaited()
+                            release.set()
+
+                        await asyncio.wait_for(heartbeat(), timeout=2)
+                        await task
+                    finally:
+                        release.set()
+                        await asyncio.gather(task, return_exceptions=True)
+                    writer_route = ROUTE if automatic else MANUAL_ROUTE
+                    expected_route = (REVIEW_ROUTE if automatic else MANUAL_REVIEW_ROUTE
+                                      ) if callback == "review_attribution" else writer_route
+                    self.assertNotEqual(observed[0][0], main_thread)
+                    self.assertEqual(observed[0][1], expected_route)
+                    ns["_generate_gemini_content_result_async"].assert_awaited_once()
+                    self.assertEqual(ns["_generate_gemini_content_result_async"].await_args.args[1],
+                                     expected_route)
+                    self.assertEqual(receipts, [{"state": "complete", "text": "private fixture result"}])
+
+    async def test_actual_ballad_callbacks_do_not_call_provider_when_quota_denied(self):
+        for automatic in (False, True):
+            for callback in ("generate", "review_attribution"):
+                with self.subTest(automatic=automatic, callback=callback):
+                    ns, receipts = self.ballad_namespace(callback=callback, automatic=automatic)
+                    ns["check_quota_availability"] = mock.Mock(return_value=False)
+                    await ns["_run_ballad_control_cycle"]()
+                    expected_route = (REVIEW_ROUTE if automatic else MANUAL_REVIEW_ROUTE
+                                      ) if callback == "review_attribution" else (
+                                          ROUTE if automatic else MANUAL_ROUTE)
+                    ns["check_quota_availability"].assert_called_once_with(expected_route)
+                    ns["_generate_gemini_content_result_async"].assert_not_awaited()
+                    self.assertEqual(receipts, [{"state": "failed", "error": "local_model_budget_exhausted"}])
+
     async def test_blocked_real_conversation_quota_keeps_event_loop_running(self):
         started, release = threading.Event(), threading.Event()
         main_thread = threading.get_ident()
@@ -260,6 +366,28 @@ class AsyncQuotaAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(observed[0][0], main_thread)
         self.assertEqual(observed[0][1], "get_gemini_response")
         ns["_generate_gemini_content_result_async"].assert_not_awaited()
+
+
+class AsyncQuotaOwnershipTests(unittest.TestCase):
+    def test_async_owners_never_run_quota_directly_on_event_loop(self):
+        direct_calls = []
+        for owner in ast.walk(TREE):
+            if not isinstance(owner, ast.AsyncFunctionDef):
+                continue
+            for call in ast.walk(owner):
+                if (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "check_quota_availability"):
+                    direct_calls.append((owner.name, call.lineno))
+        self.assertEqual(direct_calls, [],
+                         "Async owners must offload the existing synchronous quota owner")
+        # The Journal owner is synchronous and already runs in its worker;
+        # it intentionally retains the same quota check without an await.
+        self.assertTrue(any(isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Name)
+                            and call.func.id == "check_quota_availability"
+                            for owner in TREE.body if isinstance(owner, ast.FunctionDef)
+                            for call in ast.walk(owner)))
 
 
 if __name__ == "__main__":

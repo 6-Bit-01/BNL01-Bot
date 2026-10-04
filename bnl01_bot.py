@@ -6189,7 +6189,7 @@ async def build_low_signal_relay_message(guild_id: int, reason: str, recent_rela
         "Return only the public relay message."
     )
 
-    if GEMINI_API_KEY and check_quota_availability():
+    if GEMINI_API_KEY and await asyncio.to_thread(check_quota_availability):
         try:
             response = await asyncio.to_thread(_generate_gemini_content_with_fallback, prompt, "website_low_signal_relay")
             generated, _tokens = _extract_text_and_tokens(response)
@@ -33714,7 +33714,7 @@ BNL-01 response:"""
             route,
             "conversation_grounding_regeneration",
         )
-        if not check_quota_availability(regeneration_route):
+        if not await asyncio.to_thread(check_quota_availability, regeneration_route):
             result = GenerationResult(
                 False,
                 "",
@@ -33891,7 +33891,7 @@ def _safe_uncertain_response_from_prompt(prompt: str) -> str:
 async def get_gemini_generation_result(prompt: str, user_id: int, guild_id: int, route: str = "get_gemini_response") -> GenerationResult:
     started = time.monotonic()
     try:
-        if not check_quota_availability(route):
+        if not await asyncio.to_thread(check_quota_availability, route):
             result = GenerationResult(
                 False,
                 "",
@@ -37346,7 +37346,7 @@ async def _run_ballad_control_cycle():
             command = {**command, "catalogVersions": control.get("catalogVersions", {})}
             route = ballad_route_for_command(command)
             async def call_ballad_model(prompt, call_route):
-                if not check_quota_availability(call_route):
+                if not await asyncio.to_thread(check_quota_availability, call_route):
                     raise ValueError("local_model_budget_exhausted")
                 result = await asyncio.wait_for(_generate_gemini_content_result_async(
                     prompt, call_route,
@@ -52394,7 +52394,7 @@ async def bnl_memory_preview(
             ephemeral=True,
         )
         return
-    if not check_quota_availability("bnl_memory_preview_candidate"):
+    if not await asyncio.to_thread(check_quota_availability, "bnl_memory_preview_candidate"):
         tokens_used, _last_reset = get_usage_stats()
         await interaction.response.send_message(
             "❌ Preview not run: BNL's local daily model budget is "
