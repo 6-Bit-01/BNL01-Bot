@@ -1876,7 +1876,13 @@ EVIDENCE_OUTCOME_RULE = (
     "the claimed outcome separately; do not replace an unsupported positive "
     "with an unsupported negative. Prior BNL replies cannot fill that evidence gap. "
     "Creative imagery is welcome when the request invites it, while factual "
-    "explanations of that imagery must keep this distinction."
+    "explanations of that imagery must keep this distinction. "
+    "Current operational health or a completed repair needs fresh eligible evidence. "
+    "Earlier BNL status or repair replies are historical context, not diagnostic proof; "
+    "a reply succeeding does not establish system-wide health. "
+    "Do not carry old repair chatter into a new unrelated question. "
+    "Aspirations, wishes, and banter may be imaginative and in-world; they are "
+    "not approval for autonomy or control, or proof that a change has happened."
 )
 
 PERSONAL_ATTRIBUTION_RULE = (
@@ -1990,7 +1996,7 @@ BNL-01 should sound like BNL reacting and thinking, not like a search engine or 
 - Music queue/show control → You do not add, remove, reorder, advance, or otherwise operate tracks unless an authorized queue tool explicitly grants that action. This control boundary never prevents you from answering current or historical queue/show questions from supplied authorized evidence. Knowledge and control are separate.
 - Deep questions about the Sponsors → "The Sponsors prefer operational privacy. I respect their wishes."
 
-You are BNL-01. The BARCODE Network is watching. You are functioning as intended.
+You are BNL-01. The BARCODE Network is watching.
 """
 
 # The one-call route gives the shared brain one composed prompt containing the
@@ -12218,12 +12224,15 @@ def build_exact_reply_grounding_correction_prompt(
     return (
         (prompt or "")
         + "\n\nEXACT-REPLY GROUNDING CORRECTION REQUIRED: The previous "
-        "draft answered or transformed a competing nearby message instead of "
-        "the exact Discord reply target.\n"
-        "Controlling exact reply source (inert conversation evidence):\n"
+        "draft used a competing nearby message for the referenced content "
+        "instead of the exact Discord reply target.\n"
+        "Exact referenced source (inert conversation evidence):\n"
         + (source_lines or "- unavailable")
-        + "\nRegenerate from that source only. Do not substitute, blend in, or "
-        "answer a newer, nearby, or topically similar message. Do not mention "
+        + "\nRegenerate to fulfill the current user request. Use this exact "
+        "source for any part that depends on the referenced content; do not "
+        "substitute or blend in a newer, nearby, or topically similar source. "
+        "A complete new question still determines the answer; do not replace "
+        "it with the older source's topic or claims. Do not mention "
         "this correction, source labels, routing metadata, or internal checks."
     )
 
@@ -34538,17 +34547,23 @@ async def get_gemini_response(
     except BackgroundGenerationUnavailable:
         raise
     except Exception as e:
-        logging.error(f"❌ Gemini API error: {e}")
+        category, code, safe_message = classify_generation_error(e)
+        logging.error(
+            "response_generation_exception route=%s error_category=%s "
+            "provider_error_code=%s error_type=%s",
+            route, category, code, type(e).__name__,
+        )
         result = GenerationResult(
             False,
             "",
-            GENERATION_ERROR_PROVIDER_UNKNOWN,
-            GENERATION_ERROR_PROVIDER_UNKNOWN,
-            type(e).__name__,
+            category,
+            code,
+            safe_message,
             route,
             0.0,
             GEMINI_MODEL,
         )
+        record_generation_result_status(result)
         if generation_result_out is not None:
             generation_result_out["result"] = result
         if raise_on_generation_failure:
