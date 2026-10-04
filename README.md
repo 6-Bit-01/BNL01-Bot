@@ -86,6 +86,7 @@ Dollar-aware budget controls default to:
 - `BNL_GEMINI_MONTHLY_HARD_LIMIT_USD=24.00`
 - `BNL_GEMINI_DAILY_SOFT_LIMIT_USD=0.65`
 - `BNL_GEMINI_BUDGET_ENFORCEMENT_ENABLED=true`
+- `BNL_GEMINI_MONTHLY_CAP_ONLY=false`
 - `BNL_GEMINI_BILLING_LAG_BUFFER_USD=0.50`
 - `BNL_GEMINI_INTERACTIVE_RESERVE_USD=2.00`
 - `BNL_GEMINI_JOURNAL_RESERVE_USD=1.00`
@@ -103,7 +104,21 @@ The conservative historical reserve rate can be raised with
 `BNL_GEMINI_UNPRICED_GUARDRAIL_USD_PER_MILLION` (default 9.00). `/usage`
 reports provider-returned input, visible-output, thinking, cached, and total
 tokens; estimated daily/monthly cost; pace/projection; attempts; and route
-restrictions. Daily and monthly accounting boundaries use Pacific Time.
+restrictions. In the default paced mode, daily and monthly accounting use
+America/Los_Angeles calendar boundaries, including daylight saving changes.
+
+To align the local monthly ceiling with a $30 Google project limit, configure
+`BNL_GEMINI_MONTHLY_HARD_LIMIT_USD=30.00` and
+`BNL_GEMINI_MONTHLY_CAP_ONLY=true`. In this mode the target equals the hard
+limit; generic monthly pace, daily dollar soft limits and Relay pace allowance
+are inactive. The month resets at midnight fixed PST (UTC-08:00) on the first,
+matching [Google's documented calendar budget boundary](https://docs.cloud.google.com/billing/docs/how-to/budgets).
+Monthly costs and reservations use their UTC timestamps, with existing daily indexes bounding
+the read; historical daily records remain unchanged. Daily token quotas still
+reset in America/Los_Angeles. Billing lag buffer, unknown-cost guards, active
+reservations and Journal/interactive reserves remain enforced. `/usage` labels
+the selected month, reset and advisory pace. This aligns policy and calendar,
+not the local estimate with Google's live invoice or other project usage.
 
 The website Relay makes one scheduled decision every
 `BNL_WEBSITE_RELAY_INTERVAL_MINUTES` (default and minimum 60), aligned to
@@ -117,7 +132,7 @@ minutes.
 
 Relay has no per-model retry and at most one backup call after HTTP 503. Both
 attempts are reserved up front. It may use the small configured pace allowance
-when generic background work is restricted.
+when generic background work is restricted in the default paced mode.
 The allowance never bypasses the effective hard limit or the Journal and
 interactive dollar reserves. Show-day generation remains background-shaped but
 time-sensitive, so the generic monthly/daily pace gate cannot suppress a
@@ -137,8 +152,10 @@ privacy, scope, and gates before resuming it. Actual provider failures and
 interrupted calls are not automatically replayed. Historical terminal failures
 require explicit, evidence-backed recovery; they are not blindly requeued.
 
-These are BNL spending safeguards, not Google quotas. Optional Ambient/occasion
-and image work retains pacing to avoid consuming funds needed for core work.
+These are BNL spending safeguards, not Google quotas. In the default paced
+mode, optional Ambient/occasion and image work retains pacing to avoid
+consuming funds needed for core work. Monthly-cap mode uses the shared cap and
+existing essential reserves instead.
 The daily token ceiling bounds a one-day runaway even when monthly funds remain.
 Google's project/model rate limits and actual billing are separate; `/usage`
 remains a local estimate. Image validation rejections from Interactions' string

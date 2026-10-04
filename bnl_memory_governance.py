@@ -573,7 +573,23 @@ def _moment_counts(conn: sqlite3.Connection, req: GovernanceRequest, diag: Gover
         return
     try:
         subject = subject_key_for_user(req.subject_user_id)
-        diag.moment_candidate_count = conn.execute("SELECT COUNT(DISTINCT w.moment_id) FROM memory_moment_windows w LEFT JOIN memory_moment_participants p ON p.moment_id=w.moment_id WHERE w.guild_id=? AND (p.participant_key=? OR w.canonical_ledger_entry_id IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?))", (req.guild_id, subject, req.guild_id, subject)).fetchone()[0]
+        # Start with this member's indexed links, rather than joining every
+        # guild window and participant before applying the subject filter.
+        # UNION retains distinct Moments across roles and canonical overlaps.
+        diag.moment_candidate_count = conn.execute("""
+            SELECT COUNT(moment_id) FROM (
+                SELECT w.moment_id
+                FROM memory_moment_participants p
+                CROSS JOIN memory_moment_windows w ON w.moment_id=p.moment_id
+                WHERE p.participant_key=? AND w.guild_id=?
+                UNION
+                SELECT w.moment_id
+                FROM memory_ledger_entries e
+                CROSS JOIN memory_moment_windows w
+                    ON w.canonical_ledger_entry_id=e.entry_id AND w.guild_id=?
+                WHERE e.guild_id=? AND e.subject_key=?
+            )
+        """, (subject, req.guild_id, req.guild_id, req.guild_id, subject)).fetchone()[0]
         diag.moment_needs_review_excluded = conn.execute("SELECT COUNT(*) FROM memory_moment_windows WHERE guild_id=? AND lifecycle_status='needs_review'", (req.guild_id,)).fetchone()[0]
     except Exception as e:
         diag.processing_errors.append("moment:" + type(e).__name__)
@@ -910,6 +926,52 @@ def sealed_tier_candidates(conn: sqlite3.Connection, req: GovernanceRequest, fac
     return tuple(candidates)
 
 
+def _governed_subject_rows(
+    conn: sqlite3.Connection, guild_id: int, subject: str,
+) -> List[Dict[str, Any]]:
+    """Read every subject row without hydrating text the selector never uses."""
+    available = _cols(conn, "memory_ledger_entries")
+    columns = tuple(column for column in (
+        "entry_id", "guild_id", "subject_key", "entry_type", "predicate_key",
+        "normalized_value", "source_class", "source_table", "source_row_id",
+        "route_mode", "channel_policy", "visibility", "confidence",
+        "public_usable", "derived", "projection", "salience", "observed_at",
+        "valid_from", "valid_until", "lifecycle_status",
+    ) if column in available)
+    skipped_text = []
+    parameters: List[Any] = []
+    if "normalized_value" in available:
+        if "predicate_key" in available:
+            predicates = sorted(NON_LIVE_PREDICATES)
+            skipped_text.append("predicate_key COLLATE BINARY IN (%s)" % ",".join("?" for _ in predicates))
+            parameters.extend(predicates)
+        if "entry_type" in available:
+            skipped_text.append("entry_type COLLATE BINARY='model_output'")
+        for flag in ("derived", "projection"):
+            if flag in available:
+                skipped_text.append(flag + "=1")
+        if "source_class" in available:
+            classes = sorted(PROJECTION_CLASSES)
+            skipped_text.append("source_class COLLATE BINARY IN (%s)" % ",".join("?" for _ in classes))
+            parameters.extend(classes)
+    # Use canonical values only. Other spellings keep their original payload
+    # and still follow the selector's existing Python normalization/error path.
+    # Every matched row continues before reading normalized_value; retain all
+    # its metadata for controls, projection ancestry and exclusion diagnostics.
+    projection = [
+        "CASE WHEN %s THEN NULL ELSE normalized_value END AS normalized_value"
+        % " OR ".join(skipped_text)
+        if column == "normalized_value" and skipped_text else column
+        for column in columns
+    ]
+    rows = conn.execute(
+        "SELECT %s FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?"
+        % ",".join(projection),
+        (*parameters, guild_id, subject),
+    ).fetchall()
+    return [dict(zip(columns, row)) for row in rows]
+
+
 def build_governed_context(
     conn: sqlite3.Connection,
     req: GovernanceRequest,
@@ -939,11 +1001,7 @@ def build_governed_context(
     allowed = set(req.allowed_source_classes or AUTHORITY.keys())
     public_route = req.visibility_allowance in {"public", "public_safe"}
     try:
-        cols = [c[1] for c in conn.execute("PRAGMA table_info(memory_ledger_entries)").fetchall()]
-        subject_rows = [dict(zip(cols, row)) for row in conn.execute(
-            "SELECT * FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?",
-            (req.guild_id, subject),
-        ).fetchall()]
+        subject_rows = _governed_subject_rows(conn, req.guild_id, subject)
         # Batch only within a snapshot the caller already owns. Schema setup
         # can commit, and unsnapshotted callers must retain their live checks
         # at the original candidate positions so new controls are observed.
