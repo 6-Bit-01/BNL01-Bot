@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import calendar
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
 import json
 import os
@@ -34,6 +34,7 @@ from zoneinfo import ZoneInfo
 
 PACIFIC_TIMEZONE_NAME = "America/Los_Angeles"
 PACIFIC_TZ = ZoneInfo(PACIFIC_TIMEZONE_NAME)
+PST_BUDGET_TZ = timezone(timedelta(hours=-8), "PST")
 PRICING_VERSION = "gemini_standard_2026-08-22"
 PRICING_OVERRIDES_ENV = "BNL_GEMINI_PRICING_OVERRIDES_JSON"
 UNPRICED_GUARDRAIL_RATE_ENV = (
@@ -119,6 +120,32 @@ class GeminiBudgetConfig:
     monthly_hard_limit_usd: Decimal
     daily_soft_limit_usd: Decimal
     enforcement_enabled: bool
+    monthly_cap_only: bool = False
+
+
+@dataclass(frozen=True)
+class BudgetMonthWindow:
+    at_budget: datetime
+    month_key: str
+    month_start: date
+    next_month_start: date
+    starts_at_utc: datetime
+    ends_at_utc: datetime
+    monthly_cap_only: bool
+
+    @property
+    def query_start_date(self) -> str:
+        if self.monthly_cap_only:
+            return (self.starts_at_utc.astimezone(PACIFIC_TZ).date()
+                    - timedelta(days=1)).isoformat()
+        return self.month_start.isoformat()
+
+    @property
+    def query_end_date_exclusive(self) -> str:
+        if self.monthly_cap_only:
+            return (self.ends_at_utc.astimezone(PACIFIC_TZ).date()
+                    + timedelta(days=1)).isoformat()
+        return self.next_month_start.isoformat()
 
 
 @dataclass(frozen=True)
@@ -467,6 +494,9 @@ def load_budget_config(
     """Load fail-safe dollar guardrail settings without touching global state."""
 
     source = _environment(environ)
+    monthly_cap_only = _environment_bool(
+        source, "BNL_GEMINI_MONTHLY_CAP_ONLY", False,
+    )
     hard_limit = _budget_decimal(
         source,
         "BNL_GEMINI_MONTHLY_HARD_LIMIT_USD",
@@ -483,7 +513,7 @@ def load_budget_config(
         "0.65",
     )
     # Invalid relationships clamp toward less spend, never above the hard cap.
-    target = min(target, hard_limit)
+    target = hard_limit if monthly_cap_only else min(target, hard_limit)
     daily_soft = min(daily_soft, hard_limit)
     return GeminiBudgetConfig(
         monthly_target_usd=target,
@@ -494,6 +524,39 @@ def load_budget_config(
             "BNL_GEMINI_BUDGET_ENFORCEMENT_ENABLED",
             True,
         ),
+        monthly_cap_only=monthly_cap_only,
+    )
+
+
+def budget_month_window(
+    at: Optional[Union[date, datetime]] = None,
+    *,
+    config: Optional[GeminiBudgetConfig] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> BudgetMonthWindow:
+    """Select a monthly window without rebucketing LA daily usage records.
+
+    Cap-only mode follows Google's documented calendar budget boundary:
+    midnight Pacific Standard Time (fixed UTC-08), including summer months.
+    This is a local accounting window, not a live Google billing balance.
+    """
+    active_config = config or load_budget_config(environ)
+    tz = PST_BUDGET_TZ if active_config.monthly_cap_only else PACIFIC_TZ
+    current = (datetime.combine(at, time.min, tzinfo=tz)
+               if isinstance(at, date) and not isinstance(at, datetime)
+               else _coerce_pacific_datetime(at).astimezone(tz))
+    month_start = current.date().replace(day=1)
+    next_month_start = (date(month_start.year + 1, 1, 1)
+                        if month_start.month == 12
+                        else date(month_start.year, month_start.month + 1, 1))
+    return BudgetMonthWindow(
+        at_budget=current,
+        month_key=month_start.strftime("%Y-%m"),
+        month_start=month_start,
+        next_month_start=next_month_start,
+        starts_at_utc=datetime.combine(month_start, time.min, tzinfo=tz).astimezone(timezone.utc),
+        ends_at_utc=datetime.combine(next_month_start, time.min, tzinfo=tz).astimezone(timezone.utc),
+        monthly_cap_only=active_config.monthly_cap_only,
     )
 
 

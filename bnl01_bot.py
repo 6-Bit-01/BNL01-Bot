@@ -547,6 +547,7 @@ from bnl_gemini_routing import (
 )
 from bnl_gemini_cost import (
     PRICING_VERSION,
+    budget_month_window,
     calculate_monthly_budget_pace,
     conservative_unpriced_guardrail_cost_nanos,
     estimate_gemini_cost,
@@ -24174,10 +24175,16 @@ def record_token_usage(
             today_pacific,
             (cost_clock.usage_date + timedelta(days=1)).isoformat(),
         )
+        cost_config = load_budget_config()
+        month_window = budget_month_window(
+            _pacific_now() if cost_config.monthly_cap_only else cost_clock.usage_date,
+            config=cost_config,
+        )
         monthly_cost_rollup = _event_cost_rollup(
             conn,
-            cost_clock.month_start.isoformat(),
-            cost_clock.next_month_start.isoformat(),
+            month_window.month_start.isoformat(),
+            month_window.next_month_start.isoformat(),
+            month_window=month_window,
         )
         conn.commit()
     if reset:
@@ -24479,22 +24486,88 @@ def _budget_env_usd(name: str, default: str) -> Decimal:
     return value
 
 
+def _budget_month_event_scope(month_window) -> tuple[str, tuple]:
+    # The existing daily index bounds candidate rows. UTC timestamps select
+    # the fixed-PST month without rewriting historical LA usage dates.
+    clause = "usage_date >= ? AND usage_date < ?"
+    params = (month_window.query_start_date, month_window.query_end_date_exclusive)
+    if month_window.monthly_cap_only:
+        clause += " AND recorded_at >= ? AND recorded_at < ?"
+        params += (month_window.starts_at_utc.isoformat(),
+                   month_window.ends_at_utc.isoformat())
+    return clause, params
+
+
+def _budget_reservation_expiry_scope(month_window, now_utc: datetime) -> tuple[str, tuple]:
+    clause = "expires_at>?"
+    params = (now_utc.isoformat(),)
+    if month_window.monthly_cap_only:
+        legacy_end = pacific_budget_clock(month_window.month_start).next_monthly_reset_at
+        # Retained unknown-spend leases written before activation expire at
+        # the old LA midnight. Protect the final PST hour without rewriting
+        # them or confusing their expiry with ordinary past TTLs.
+        clause += """ OR (expires_at=? AND created_at>=? AND created_at<?
+                         AND ?<?)"""
+        params += (legacy_end.astimezone(timezone.utc).isoformat(),
+                   month_window.starts_at_utc.isoformat(),
+                   month_window.ends_at_utc.isoformat(),
+                   now_utc.isoformat(), month_window.ends_at_utc.isoformat())
+    return clause, params
+
+
+def _active_dollar_budget_reservations(
+    conn: sqlite3.Connection,
+    month_window,
+    usage_date: str,
+    now_utc: datetime,
+) -> tuple[int, int]:
+    if month_window.monthly_cap_only:
+        # Adjacent LA month keys include leases written by the legacy owner
+        # during the hour between LA and fixed-PST monthly resets.
+        clause = """usage_month >= ? AND usage_month <= ?
+                    AND created_at >= ? AND created_at < ?"""
+        params = (month_window.query_start_date[:7],
+                  month_window.query_end_date_exclusive[:7],
+                  month_window.starts_at_utc.isoformat(),
+                  month_window.ends_at_utc.isoformat())
+    else:
+        clause = "usage_month=?"
+        params = (month_window.month_key,)
+    expiry_clause, expiry_params = _budget_reservation_expiry_scope(month_window, now_utc)
+    active = conn.execute(
+        f"""SELECT COALESCE(SUM(estimated_cost_nanos), 0),
+                   COALESCE(SUM(CASE WHEN usage_date=?
+                       THEN estimated_cost_nanos ELSE 0 END), 0)
+            FROM gemini_budget_reservations
+            WHERE {clause} AND ({expiry_clause})""",
+        (str(usage_date), *params, *expiry_params),
+    ).fetchone()
+    return (_usage_int(active[0] if active else 0),
+            _usage_int(active[1] if active else 0))
+
+
 def _event_cost_rollup(
     conn: sqlite3.Connection,
     start_date: str,
     end_date_exclusive: str,
+    *,
+    month_window=None,
 ) -> dict:
     """Price ledger events, including rows written before cost columns existed."""
+    clause, params = ("usage_date >= ? AND usage_date < ?",
+                      (start_date, end_date_exclusive))
+    if month_window is not None:
+        clause, params = _budget_month_event_scope(month_window)
     rows = conn.execute(
-        """
+        f"""
         SELECT usage_date, route, model, prompt_tokens, candidate_tokens,
                thought_tokens, cached_tokens, total_tokens,
                estimated_cost_nanos, cost_priced
         FROM token_usage_events
-        WHERE usage_date >= ? AND usage_date < ?
+        WHERE {clause}
         ORDER BY id
         """,
-        (start_date, end_date_exclusive),
+        params,
     ).fetchall()
     total_nanos = 0
     unpriced_calls = 0
@@ -24732,11 +24805,19 @@ def _dollar_budget_decision(
     if policy.memory_protected:
         return True, "memory_protected"
 
+    if config.monthly_cap_only and not policy.relay_protected:
+        # One shared monthly cap replaces generic optional pace restrictions.
+        # Relay retains its existing bounded allowance in the branch below.
+        # The hard ceiling, billing buffer, unknown-cost checks and reserves above
+        # still apply to every route; this does not disable daily token guards.
+        return True, "monthly_cap_available"
+
     pace = calculate_monthly_budget_pace(
         _nanos_to_usd(guarded_month_nanos),
         _nanos_to_usd(guarded_today_nanos),
         config=config,
-        at=now_pacific,
+        at=(budget_month_window(now_pacific, config=config).at_budget.date()
+            if config.monthly_cap_only else now_pacific),
     )
     expected_nanos = _usd_to_nanos(pace.expected_cost_to_date_usd)
     if policy.relay_protected:
@@ -24781,6 +24862,7 @@ def _reserve_dollar_budget(contents: str, route: str) -> tuple[str, int]:
 
     now_pacific = _pacific_now()
     clock = pacific_budget_clock(now_pacific)
+    month_window = budget_month_window(now_pacific)
     now_utc = datetime.now(timezone.utc)
     expires_utc = now_utc + timedelta(
         minutes=_bounded_env_int(
@@ -24798,34 +24880,25 @@ def _reserve_dollar_budget(contents: str, route: str) -> tuple[str, int]:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         _ensure_token_usage_schema(cursor)
+        expiry_clause, expiry_params = _budget_reservation_expiry_scope(month_window, now_utc)
         cursor.execute(
-            "DELETE FROM gemini_budget_reservations WHERE expires_at <= ?",
-            (now_utc.isoformat(),),
+            f"DELETE FROM gemini_budget_reservations WHERE NOT ({expiry_clause})",
+            expiry_params,
         )
         month_rollup = _event_cost_rollup(
             conn,
-            clock.month_start.isoformat(),
-            clock.next_month_start.isoformat(),
+            month_window.month_start.isoformat(),
+            month_window.next_month_start.isoformat(),
+            month_window=month_window,
         )
         today_rollup = _event_cost_rollup(
             conn,
             clock.usage_date.isoformat(),
             (clock.usage_date + timedelta(days=1)).isoformat(),
         )
-        active = cursor.execute(
-            """
-            SELECT
-                COALESCE(SUM(estimated_cost_nanos), 0),
-                COALESCE(SUM(
-                    CASE WHEN usage_date=? THEN estimated_cost_nanos ELSE 0 END
-                ), 0)
-            FROM gemini_budget_reservations
-            WHERE usage_month=?
-            """,
-            (clock.usage_date.isoformat(), clock.month_key),
-        ).fetchone()
-        active_month_nanos = _usage_int(active[0] if active else 0)
-        active_today_nanos = _usage_int(active[1] if active else 0)
+        active_month_nanos, active_today_nanos = _active_dollar_budget_reservations(
+            conn, month_window, clock.usage_date.isoformat(), now_utc,
+        )
         allowed, reason = _dollar_budget_decision(
             route=route,
             request_nanos=request_nanos,
@@ -24868,7 +24941,7 @@ def _reserve_dollar_budget(contents: str, route: str) -> tuple[str, int]:
                 now_utc.isoformat(),
                 expires_utc.isoformat(),
                 clock.usage_date.isoformat(),
-                clock.month_key,
+                month_window.month_key,
                 str(route or "unknown")[:120],
                 policy_for_route(route).lane,
                 request_nanos,
@@ -24906,10 +24979,8 @@ def _retain_dollar_budget_through_month(reservation_id: str) -> None:
 
     if not reservation_id:
         return
-    clock = pacific_budget_clock(_pacific_now())
-    month_end_utc = clock.next_monthly_reset_at.astimezone(
-        timezone.utc
-    ).isoformat()
+    month_window = budget_month_window(_pacific_now())
+    month_end_utc = month_window.ends_at_utc.isoformat()
     with sqlite3.connect(DB_FILE, timeout=30) as conn:
         conn.execute("BEGIN IMMEDIATE")
         updated = conn.execute(
@@ -25060,6 +25131,12 @@ def get_usage_breakdown() -> dict:
     except (TypeError, ValueError):
         diagnostic_date = _pacific_now().date()
     clock = pacific_budget_clock(diagnostic_date)
+    config = load_budget_config()
+    month_window = budget_month_window(
+        _pacific_now() if config.monthly_cap_only else diagnostic_date,
+        config=config,
+    )
+    month_clause, month_params = _budget_month_event_scope(month_window)
     with sqlite3.connect(DB_FILE) as conn:
         _ensure_token_usage_schema(conn.cursor())
         lane_usage = _generation_lane_usage_on_connection(
@@ -25102,8 +25179,9 @@ def get_usage_breakdown() -> dict:
         ).fetchall()
         month_rollup = _event_cost_rollup(
             conn,
-            clock.month_start.isoformat(),
-            clock.next_month_start.isoformat(),
+            month_window.month_start.isoformat(),
+            month_window.next_month_start.isoformat(),
+            month_window=month_window,
         )
         today_rollup = _event_cost_rollup(
             conn,
@@ -25111,50 +25189,29 @@ def get_usage_breakdown() -> dict:
             (clock.usage_date + timedelta(days=1)).isoformat(),
         )
         attempt_rows = conn.execute(
-            """
+            f"""
             SELECT outcome, is_retry, is_fallback, model,
                    prompt_tokens, candidate_tokens, thought_tokens,
                    cached_tokens, total_tokens, estimated_cost_nanos,
                    cost_priced, usage_date
             FROM model_generation_attempts
-            WHERE usage_date >= ? AND usage_date < ?
+            WHERE {month_clause}
             """,
-            (
-                clock.month_start.isoformat(),
-                clock.next_month_start.isoformat(),
-            ),
+            month_params,
         ).fetchall()
         attempt_route_rows = conn.execute(
-            """
+            f"""
             SELECT route, COUNT(*)
             FROM model_generation_attempts
-            WHERE usage_date >= ? AND usage_date < ?
+            WHERE {month_clause}
             GROUP BY route
             ORDER BY COUNT(*) DESC, route ASC
             """,
-            (
-                clock.month_start.isoformat(),
-                clock.next_month_start.isoformat(),
-            ),
+            month_params,
         ).fetchall()
-        active = conn.execute(
-            """
-            SELECT
-                COALESCE(SUM(estimated_cost_nanos), 0),
-                COALESCE(SUM(
-                    CASE WHEN usage_date=? THEN estimated_cost_nanos ELSE 0 END
-                ), 0)
-            FROM gemini_budget_reservations
-            WHERE usage_month=? AND expires_at>?
-            """,
-            (
-                clock.usage_date.isoformat(),
-                clock.month_key,
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        ).fetchone()
-    active_month_nanos = _usage_int(active[0] if active else 0)
-    active_today_nanos = _usage_int(active[1] if active else 0)
+        active_month_nanos, active_today_nanos = _active_dollar_budget_reservations(
+            conn, month_window, clock.usage_date.isoformat(), datetime.now(timezone.utc),
+        )
     failures = 0
     retries = 0
     fallbacks = 0
@@ -25191,7 +25248,6 @@ def get_usage_breakdown() -> dict:
             unpriced_attempt_models.add(str(attempt[3] or "unknown"))
         else:
             failed_cost_nanos += attempt_nanos
-    config = load_budget_config()
     month_cost = _nanos_to_usd(month_rollup["estimated_cost_nanos"])
     today_cost = _nanos_to_usd(today_rollup["estimated_cost_nanos"])
     guarded_month_nanos = (
@@ -25220,7 +25276,7 @@ def get_usage_breakdown() -> dict:
         _nanos_to_usd(guarded_month_nanos),
         _nanos_to_usd(guarded_today_nanos),
         config=config,
-        at=diagnostic_date,
+        at=month_window.at_budget.date() if config.monthly_cap_only else diagnostic_date,
     )
     restrictions = {}
     for route_class, sample_route in (
@@ -25327,6 +25383,9 @@ def get_usage_breakdown() -> dict:
         ),
         "monthly_target_usd": config.monthly_target_usd,
         "monthly_hard_limit_usd": config.monthly_hard_limit_usd,
+        "monthly_cap_only": config.monthly_cap_only,
+        "budget_month": month_window.month_key,
+        "monthly_budget_timezone": "PST (UTC-08:00)" if config.monthly_cap_only else "America/Los_Angeles",
         "billing_lag_buffer_usd": billing_lag_buffer_usd,
         "effective_hard_limit_usd": effective_hard_limit_usd,
         "remaining_effective_hard_usd": remaining_effective_hard_usd,
@@ -25343,10 +25402,12 @@ def get_usage_breakdown() -> dict:
             pace.average_cost_per_elapsed_day_usd
         ),
         "projected_month_end_cost_usd": pace.projected_month_end_cost_usd,
-        "days_in_month": clock.days_in_month,
-        "day_of_month": clock.day_of_month,
+        "days_in_month": pace.clock.days_in_month,
+        "day_of_month": pace.clock.day_of_month,
         "next_daily_reset_at": clock.next_daily_reset_at.isoformat(),
-        "next_monthly_reset_at": clock.next_monthly_reset_at.isoformat(),
+        "next_monthly_reset_at": (month_window.ends_at_utc.astimezone(month_window.at_budget.tzinfo).isoformat()
+                                  if config.monthly_cap_only
+                                  else clock.next_monthly_reset_at.isoformat()),
         "retry_count_month": retries,
         "fallback_count_month": fallbacks,
         "failed_attempt_count_month": failures,
@@ -51421,6 +51482,16 @@ async def usage(interaction: discord.Interaction):
         ),
         inline=False,
     )
+    monthly_cap_only = diagnostics.get("monthly_cap_only", False)
+    pacing_label = (
+        "Monthly cap mode: generic pace and daily soft limit inactive; "
+        f"Relay allowance **${diagnostics['relay_pace_allowance_usd']:.2f}** retained\n"
+        f"Month: **{diagnostics['budget_month']}** · reset: "
+        f"**{diagnostics['next_monthly_reset_at']}** (fixed PST)\n"
+        if monthly_cap_only else
+        f"Daily soft floor: **${diagnostics['daily_soft_limit_usd']:.2f}** · "
+        f"Relay pace allowance: **${diagnostics['relay_pace_allowance_usd']:.2f}**\n"
+    )
     embed.add_field(
         name="Monthly Dollar Guardrail",
         value=(
@@ -51434,9 +51505,9 @@ async def usage(interaction: discord.Interaction):
             f"Target remaining: **${diagnostics['remaining_target_usd']:.4f}** · "
             f"spendable hard headroom: "
             f"**${diagnostics['remaining_effective_hard_usd']:.4f}**\n"
-            f"Daily soft floor: **${diagnostics['daily_soft_limit_usd']:.2f}** · "
-            f"Relay pace allowance: **${diagnostics['relay_pace_allowance_usd']:.2f}**\n"
-            f"Target pace to date: **${diagnostics['expected_cost_to_date_usd']:.4f}** · "
+            f"{pacing_label}"
+            f"{'Advisory pace' if monthly_cap_only else 'Target pace'} to date: "
+            f"**${diagnostics['expected_cost_to_date_usd']:.4f}** · "
             f"projected month end: **${diagnostics['projected_month_end_cost_usd']:.4f}**\n"
             f"Average/day: **${diagnostics['average_cost_per_elapsed_day_usd']:.4f}** · "
             f"day {diagnostics['day_of_month']}/{diagnostics['days_in_month']}"
