@@ -1097,13 +1097,14 @@ def private_conversation_sources(conn: sqlite3.Connection, *, guild_id: int,
     """
     if channel_id <= 0 or not _table_exists(conn, 'memory_ledger_entries'):
         return ()
-    # Use the existing integer primary key to reopen each ledger source. The
-    # exact text comparison still rejects coercible but noncanonical IDs; the
-    # guild equality prevents a ledger root from borrowing another guild's row.
-    roots = conn.execute("""SELECT e.entry_id FROM memory_ledger_entries e
-        JOIN conversations c ON c.id=CAST(e.source_row_id AS INTEGER)
-          AND CAST(c.id AS TEXT)=e.source_row_id AND e.guild_id=c.guild_id
-        WHERE e.source_table='conversations' AND c.guild_id=? AND c.user_id=?
+    # Select this member/channel before reopening ledger revisions through the
+    # existing source index. CROSS JOIN keeps the planner from reading every
+    # guild conversation revision before applying that scope. Exact text IDs
+    # and guild equality still reject coercible or cross-guild source keys.
+    roots = conn.execute("""SELECT e.entry_id FROM conversations c
+        CROSS JOIN memory_ledger_entries e ON e.guild_id=c.guild_id
+          AND e.source_table='conversations' AND e.source_row_id=CAST(c.id AS TEXT)
+        WHERE c.guild_id=? AND c.user_id=?
           AND c.channel_policy='sealed_test' AND c.channel_id=?
         ORDER BY c.id,e.entry_id""", (guild_id, user_id, channel_id)).fetchall()
     sources = []

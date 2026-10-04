@@ -439,7 +439,14 @@ def _safe_sql_text_col(cols: Set[str], preferred: Iterable[str]) -> str:
     return ""
 
 def _lineage(conn: sqlite3.Connection, guild_id: int, entry_id: str) -> Tuple[Tuple[str, str], ...]:
-    return tuple((str(a), str(b)) for a, b in conn.execute("SELECT lineage_type,target_entry_id FROM memory_ledger_lineage WHERE guild_id=? AND entry_id=? ORDER BY lineage_type,target_entry_id", (guild_id, entry_id)).fetchall())
+    # The guild index cannot narrow on entry_id. Reopen this entry through the
+    # existing entry-first primary key while retaining its guild and ordering.
+    return tuple((str(a), str(b)) for a, b in conn.execute(
+        "SELECT lineage_type,target_entry_id FROM memory_ledger_lineage "
+        "INDEXED BY sqlite_autoindex_memory_ledger_lineage_1 "
+        "WHERE guild_id=? AND entry_id=? ORDER BY lineage_type,target_entry_id",
+        (guild_id, entry_id),
+    ).fetchall())
 
 def _member_scalar_predicate_allowed(
     subject_key: str,
@@ -461,7 +468,12 @@ def _has_eligible_projection_root(conn: sqlite3.Connection, guild_id: int, entry
     if entry_id in seen:
         return False
     seen.add(entry_id)
-    rows = conn.execute("SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=? AND entry_id=? AND lineage_type='derived_from'", (guild_id, entry_id)).fetchall()
+    rows = conn.execute(
+        "SELECT target_entry_id FROM memory_ledger_lineage "
+        "INDEXED BY sqlite_autoindex_memory_ledger_lineage_1 "
+        "WHERE guild_id=? AND entry_id=? AND lineage_type='derived_from'",
+        (guild_id, entry_id),
+    ).fetchall()
     if not rows:
         return False
     for (target,) in rows:
