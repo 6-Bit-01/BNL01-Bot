@@ -3,6 +3,7 @@ import logging
 import os
 import sqlite3
 import unittest
+from unittest import mock
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
 import bnl01_bot
@@ -177,6 +178,174 @@ class GenerationFallbackTests(unittest.TestCase):
                 error.sqlite_errorcode = sqlite_code
                 self.assertEqual(bnl01_bot.classify_generation_error(error)[:2],
                                  (bnl01_bot.GENERATION_ERROR_LOCAL_STORAGE, reason))
+
+    def _quota_preflight_failure(self, error, *, raise_on_failure=False,
+                                 provide_output=True):
+        output = {}
+        with (
+            mock.patch.dict(bnl01_bot._last_generation_status, {
+                "status": "success", "error_category": "stale_category",
+                "provider_error_code": "stale_code",
+            }, clear=True),
+            mock.patch.object(bnl01_bot, "record_generation_result_status",
+                              wraps=bnl01_bot.record_generation_result_status) as recorded,
+            mock.patch.object(bnl01_bot, "check_quota_availability", side_effect=error) as quota,
+            mock.patch.object(bnl01_bot, "get_gemini_client") as client,
+            mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", new_callable=mock.AsyncMock) as provider,
+            mock.patch.object(bnl01_bot, "reserve_local_model_budget") as reserve,
+            mock.patch.object(bnl01_bot, "record_token_usage") as usage,
+            self.assertLogs(level="ERROR") as logs,
+        ):
+            call = bnl01_bot.get_gemini_response(
+                "Test request", 123, 456,
+                raise_on_generation_failure=raise_on_failure,
+                **({"generation_result_out": output} if provide_output else {}),
+            )
+            if raise_on_failure:
+                with self.assertRaises(bnl01_bot.BackgroundGenerationUnavailable) as raised:
+                    asyncio.run(call)
+                self.assertIs(raised.exception.__cause__, error)
+            else:
+                self.assertEqual(asyncio.run(call), "")
+            recorded.assert_called_once()
+            result = recorded.call_args.args[0]
+            if provide_output:
+                self.assertIs(output["result"], result)
+            if raise_on_failure:
+                self.assertIs(raised.exception.result, result)
+            self.assertEqual(bnl01_bot._last_generation_status["status"], "failure")
+            self.assertEqual(bnl01_bot._last_generation_status["error_category"],
+                             result.error_category)
+            self.assertEqual(bnl01_bot._last_generation_status["provider_error_code"],
+                             result.provider_error_code)
+            expected_attempts = 2 if bnl01_bot._sqlite_busy(error) else 1
+            self.assertEqual(quota.call_args_list,
+                             [mock.call("get_gemini_response")] * expected_attempts)
+            client.assert_not_called()
+            provider.assert_not_awaited()
+            reserve.assert_not_called()
+            usage.assert_not_called()
+        self.assertFalse(result.success)
+        return result, "\n".join(logs.output)
+
+    def test_busy_quota_preflight_is_local_storage_without_provider_call(self):
+        result, logged = self._quota_preflight_failure(
+            sqlite3.OperationalError("database is locked"),
+            provide_output=False,
+        )
+        self.assertEqual(result.error_category, bnl01_bot.GENERATION_ERROR_LOCAL_STORAGE)
+        self.assertEqual(result.provider_error_code, "sqlite_busy")
+        self.assertEqual(result.provider_error_message_safe,
+                         "BNL's local storage could not complete this request.")
+        self.assertEqual(result.total_tokens, 0)
+        self.assertEqual(result.estimated_cost_nanos, 0)
+        self.assertIn("response_generation_exception", logged)
+        self.assertIn("error_type=OperationalError", logged)
+        self.assertNotIn("database is locked", logged)
+
+    def test_quota_preflight_uses_existing_error_classifier_and_safe_logging(self):
+        errors = (
+            sqlite3.DatabaseError("malformed private_fixture quota=429"),
+            bnl01_bot.LocalModelBudgetExhausted("interactive_reserved"),
+            TimeoutError("private_fixture timed out token=fictional-token"),
+            RuntimeError("private_fixture token=fictional-token"),
+        )
+        for error in errors:
+            with self.subTest(error_type=type(error).__name__):
+                expected = bnl01_bot.classify_generation_error(error)
+                result, logged = self._quota_preflight_failure(error,
+                                                              provide_output=False)
+                self.assertEqual((result.error_category, result.provider_error_code,
+                                  result.provider_error_message_safe), expected)
+                self.assertNotIn("private_fixture", logged)
+                self.assertNotIn("fictional-token", logged)
+
+    def test_busy_quota_preflight_background_failure_retains_classified_result(self):
+        result, _logged = self._quota_preflight_failure(
+            sqlite3.OperationalError("database is locked"),
+            raise_on_failure=True,
+        )
+        self.assertEqual(result.error_category, bnl01_bot.GENERATION_ERROR_LOCAL_STORAGE)
+        self.assertEqual(result.provider_error_code, "sqlite_busy")
+
+    def test_busy_quota_preflight_recovers_before_one_provider_invocation(self):
+        generated = bnl01_bot.GenerationResult(True, "Hello.")
+        provider = mock.AsyncMock(return_value=generated)
+        with (
+            mock.patch.object(bnl01_bot, "check_quota_availability", side_effect=[
+                sqlite3.OperationalError("database is locked"), True,
+            ]) as quota,
+            mock.patch.object(bnl01_bot, "conversation_context_v2_enabled", return_value=True),
+            mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", provider),
+            mock.patch.object(bnl01_bot.asyncio, "sleep", new_callable=mock.AsyncMock) as pause,
+        ):
+            response = asyncio.run(bnl01_bot.get_gemini_response(
+                "Current user request: Say hello.", 123, 456,
+                allow_style_rewrite=False,
+            ))
+        self.assertEqual(response, "Hello.")
+        self.assertEqual(quota.call_args_list,
+                         [mock.call("get_gemini_response")] * 2)
+        pause.assert_awaited_once_with(0.1)
+        provider.assert_awaited_once()
+
+    def test_real_quota_denial_does_not_retry_or_call_provider(self):
+        output = {}
+        with (
+            mock.patch.dict(bnl01_bot._last_generation_status, {}, clear=True),
+            mock.patch.object(bnl01_bot, "check_quota_availability", return_value=False) as quota,
+            mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", new_callable=mock.AsyncMock) as provider,
+            mock.patch.object(bnl01_bot, "get_gemini_client") as client,
+            mock.patch.object(bnl01_bot, "reserve_local_model_budget") as reserve,
+            mock.patch.object(bnl01_bot, "record_token_usage") as usage,
+            mock.patch.object(bnl01_bot.asyncio, "sleep", new_callable=mock.AsyncMock) as pause,
+        ):
+            response = asyncio.run(bnl01_bot.get_gemini_response(
+                "Test request", 123, 456, generation_result_out=output,
+            ))
+        self.assertEqual(response, "")
+        self.assertEqual(output["result"].error_category,
+                         bnl01_bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET)
+        quota.assert_called_once_with("get_gemini_response")
+        pause.assert_not_awaited()
+        provider.assert_not_awaited()
+        client.assert_not_called()
+        reserve.assert_not_called()
+        usage.assert_not_called()
+
+    def test_cancellation_during_busy_preflight_yield_stops_before_provider(self):
+        async def exercise():
+            paused = asyncio.Event()
+
+            async def hold_yield(delay):
+                self.assertEqual(delay, 0.1)
+                paused.set()
+                await asyncio.Future()
+
+            with (
+                mock.patch.object(bnl01_bot, "check_quota_availability",
+                                  side_effect=sqlite3.OperationalError("database is locked")) as quota,
+                mock.patch.object(bnl01_bot.asyncio, "sleep", side_effect=hold_yield) as pause,
+                mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", new_callable=mock.AsyncMock) as provider,
+                mock.patch.object(bnl01_bot, "get_gemini_client") as client,
+                mock.patch.object(bnl01_bot, "reserve_local_model_budget") as reserve,
+                mock.patch.object(bnl01_bot, "record_token_usage") as usage,
+            ):
+                task = asyncio.create_task(bnl01_bot.get_gemini_response(
+                    "Test request", 123, 456,
+                ))
+                await asyncio.wait_for(paused.wait(), timeout=5)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                quota.assert_called_once_with("get_gemini_response")
+                pause.assert_awaited_once_with(0.1)
+                provider.assert_not_awaited()
+                client.assert_not_called()
+                reserve.assert_not_called()
+                usage.assert_not_called()
+
+        asyncio.run(exercise())
 
 
 if __name__ == "__main__":

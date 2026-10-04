@@ -2428,8 +2428,15 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         and referent_resolution.reason == "discord_reply_source"
     ):
         header.append(
-            "- The exact Discord reply source below is the structural reply "
-            "target and primary referent."
+            "- The exact Discord reply source below identifies the referenced "
+            "message. The current user request determines the task; replying "
+            "to an older message does not make its topic the question to answer."
+        )
+        header.append(
+            "- Use that source only for parts of the current request that "
+            "refer to it. If the current request asks a complete new question, "
+            "answer that question; do not replace it with the older source's "
+            "topic or claims."
         )
         if exact_reply_scope_expanded:
             header.append(
@@ -2439,8 +2446,9 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             )
         else:
             header.append(
-                "- Answer or transform that exact source only. Do not substitute "
-                "a newer, nearby, or topically similar message."
+                "- When answering or transforming the referenced content, use "
+                "this exact source; do not substitute or blend in a newer, "
+                "nearby, or topically similar message."
             )
     if current_payload_anchors:
         header.append(

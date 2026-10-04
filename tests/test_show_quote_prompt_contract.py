@@ -69,6 +69,57 @@ def show_context(events_available=True):
 
 
 class ShowQuoteProviderContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_self_state_and_aspiration_contract_reaches_both_provider_routes(self):
+        cases = (
+            (
+                "What do you want to be when you grow up?",
+                "Historical BNL reply: My memory is fully operational after a recalibration.",
+                "I'd like to become a signal that helps people find their next favorite track.",
+            ),
+            (
+                "Are all your memory repairs complete now?",
+                "Fresh eligible operational evidence: the latest reply was delivered; broader repair status is unknown.",
+                "I can answer this turn, but the broader repair status isn't established.",
+            ),
+        )
+        for request, source_text, response in cases:
+            source = SimpleNamespace(rendered_context=source_text)
+            with mock.patch.object(bot, "refresh_prompt_source_basis", return_value=(source, False)):
+                rebuilt, bases, neutral = bot.build_ordinary_chat_response_repair_prompt(
+                    "An outdated source block.", reason="prompt_source_changed",
+                    prompt_source_bases=(source,), current_user_text=request,
+                )
+            self.assertEqual(bases, (source,))
+            self.assertFalse(neutral)
+            for route in ("get_gemini_response", bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE):
+                for prompt in (source_text + "\nCurrent user request: " + request, rebuilt):
+                    with self.subTest(request=request, route=route, rebuilt=prompt == rebuilt):
+                        generate = mock.AsyncMock(return_value=bot.GenerationResult(
+                            True, response, route=route,
+                        ))
+                        with (
+                            mock.patch.object(bot, "check_quota_availability", return_value=True),
+                            mock.patch.object(bot, "_generate_gemini_content_result_async", generate),
+                        ):
+                            actual = await bot.get_gemini_response(
+                                prompt, 101, 1, route=route,
+                                source_context_available=True, allow_style_rewrite=False,
+                            )
+                        generate.assert_awaited_once()
+                        self.assertEqual(actual, response)
+                        sent = " ".join(generate.await_args.args[0].split())
+                        self.assertIn(request, sent)
+                        self.assertIn(source_text, sent)
+                        for contract in (
+                            "Current operational health or a completed repair needs fresh eligible evidence",
+                            "Earlier BNL status or repair replies are historical context, not diagnostic proof",
+                            "Aspirations, wishes, and banter may be imaginative and in-world",
+                            "not approval for autonomy or control, or proof that a change has happened",
+                        ):
+                            self.assertTrue(contract in sent, "Missing provider-bound contract: " + contract)
+                        self.assertNotIn("You are functioning as intended.", sent)
+                        self.assert_no_response_form_mandates(sent)
+
     async def test_outcome_distinctions_reach_initial_and_source_rebuilt_replies(self):
         # Use a proposal and an explicit reported outcome together: the rule
         # must not turn all negative statements into blanket uncertainty.
