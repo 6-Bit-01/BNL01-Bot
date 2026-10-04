@@ -3284,5 +3284,186 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         )
 
 
+class PacketLedgerFingerprintCostTests(unittest.TestCase):
+    class Connection(sqlite3.Connection):
+        use_legacy_lineage_query = False
+
+        def execute(self, sql, parameters=()):
+            if self.use_legacy_lineage_query:
+                sql = sql.replace(
+                    " INDEXED BY sqlite_autoindex_memory_ledger_lineage_1", ""
+                )
+            return super().execute(sql, parameters)
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:", factory=self.Connection)
+        ledger.ensure_memory_ledger_schema(self.conn)
+        result = ledger.insert_ledger_entry(
+            self.conn,
+            ledger.LedgerEntry(
+                guild_id=1,
+                source_table="conversations",
+                source_row_id="fingerprint_source",
+                source_role="member_self_report",
+                entry_type="preference",
+                subject_key="discord_user:7",
+                subject_display_name="Test Member",
+                predicate_key="favorite_movie",
+                value="Alien",
+                source_class=SourceClass.FIRST_PARTY_RECORD,
+                visibility=Visibility.PUBLIC,
+                confidence=Confidence.HIGH,
+                public_usable=True,
+            ),
+        )
+        self.assertEqual(result.outcome, "inserted")
+        self.entry_id = result.entry_id
+
+    def tearDown(self):
+        self.conn.close()
+
+    def digest(self, *, legacy=False, entry_id=None):
+        self.conn.use_legacy_lineage_query = legacy
+        try:
+            return packet_module._ledger_entry_digest(
+                self.conn, entry_id or self.entry_id
+            )
+        finally:
+            self.conn.use_legacy_lineage_query = False
+
+    def add_edge(self, entry_id, guild_id, kind, target):
+        self.conn.execute(
+            "INSERT INTO memory_ledger_lineage VALUES(?,?,?,?,?)",
+            (entry_id, guild_id, kind, target, "2026-10-04T00:00:00+00:00"),
+        )
+
+    def test_fingerprint_read_is_bounded_with_50000_unrelated_guild_edges(self):
+        self.conn.executemany(
+            "INSERT INTO memory_ledger_lineage VALUES(?,?,?,?,?)",
+            (
+                ("unrelated_%s" % index, 1, "derived_from", "root_%s" % index, "t")
+                for index in range(50000)
+            ),
+        )
+        self.add_edge(self.entry_id, 1, "derived_from", "selected_root")
+        expected = self.digest(legacy=True)
+        statements = []
+        self.conn.set_trace_callback(statements.append)
+        steps = [0]
+
+        def work_budget():
+            steps[0] += 100
+            return int(steps[0] > 5000)
+
+        self.conn.set_progress_handler(work_budget, 100)
+        try:
+            actual = self.digest()
+        finally:
+            self.conn.set_progress_handler(None, 0)
+            self.conn.set_trace_callback(None)
+        self.assertEqual(actual, expected)
+        self.assertLessEqual(steps[0], 5000)
+        outgoing = next(
+            sql for sql in statements
+            if "SELECT lineage_type,target_entry_id" in sql
+        )
+        plan = " ".join(
+            str(row[3]) for row in self.conn.execute(
+                "EXPLAIN QUERY PLAN " + outgoing
+            ).fetchall()
+        )
+        self.assertIn("sqlite_autoindex_memory_ledger_lineage_1", plan)
+        self.assertIn("entry_id=?", plan)
+
+    def test_every_pinned_source_field_retains_legacy_fingerprint_semantics(self):
+        changes = {
+            "entry_id": "changed_entry",
+            "guild_id": 2,
+            "subject_key": "discord_user:8",
+            "entry_type": "observation",
+            "predicate_key": "favorite_instrument",
+            "normalized_value": "modular synths",
+            "source_table": "other_source",
+            "source_row_id": "changed_row",
+            "source_revision": "changed_revision",
+            "source_role": "user",
+            "source_class": "public_observation",
+            "source_sequence": 2,
+            "channel_id": 20,
+            "route_mode": "direct_payload",
+            "channel_policy": "sealed_test",
+            "visibility": "sealed_test",
+            "confidence": "low",
+            "public_usable": 0,
+            "derived": 1,
+            "projection": 1,
+            "observed_at": "2026-10-03T12:00:00+00:00",
+            "lifecycle_status": "forgotten",
+            "updated_at": "2026-10-04T12:00:00+00:00",
+        }
+        baseline = self.digest()
+        self.assertEqual(baseline, self.digest(legacy=True))
+        for column, value in changes.items():
+            with self.subTest(column=column):
+                previous = self.conn.execute(
+                    "SELECT %s FROM memory_ledger_entries WHERE entry_id=?" % column,
+                    (self.entry_id,),
+                ).fetchone()[0]
+                self.assertNotEqual(previous, value)
+                self.conn.execute(
+                    "UPDATE memory_ledger_entries SET %s=? WHERE entry_id=?" % column,
+                    (value, self.entry_id),
+                )
+                current_id = value if column == "entry_id" else self.entry_id
+                changed = self.digest(entry_id=current_id)
+                self.assertNotEqual(changed, baseline)
+                self.assertEqual(changed, self.digest(legacy=True, entry_id=current_id))
+                self.conn.execute(
+                    "UPDATE memory_ledger_entries SET %s=? WHERE entry_id=?" % column,
+                    (previous, current_id),
+                )
+                self.assertEqual(self.digest(), baseline)
+
+    def test_lineage_order_guild_isolation_and_live_controls_match_legacy(self):
+        baseline = self.digest()
+        self.add_edge(self.entry_id, 2, "derived_from", "foreign_root")
+        self.add_edge("foreign_control", 2, "supersedes", self.entry_id)
+        self.add_edge("ordinary_incoming", 1, "derived_from", self.entry_id)
+        self.assertEqual(self.digest(), baseline)
+        self.assertEqual(self.digest(), self.digest(legacy=True))
+        for kind in ("correction_of", "supersedes", "retracts"):
+            with self.subTest(incoming_control=kind):
+                self.add_edge("local_control", 1, kind, self.entry_id)
+                self.assertNotEqual(self.digest(), baseline)
+                self.assertEqual(self.digest(), self.digest(legacy=True))
+                self.conn.execute(
+                    "DELETE FROM memory_ledger_lineage WHERE entry_id='local_control'"
+                )
+                self.assertEqual(self.digest(), baseline)
+        edges = (
+            (self.entry_id, 1, "supersedes", "z_root"),
+            (self.entry_id, 1, "derived_from", "b_root"),
+            (self.entry_id, 1, "derived_from", "a_root"),
+        )
+        for edge in edges:
+            self.add_edge(*edge)
+        first_order = self.digest()
+        self.assertNotEqual(first_order, baseline)
+        self.assertEqual(first_order, self.digest(legacy=True))
+        self.conn.execute(
+            "DELETE FROM memory_ledger_lineage WHERE entry_id=? AND guild_id=1",
+            (self.entry_id,),
+        )
+        for edge in reversed(edges):
+            self.add_edge(*edge)
+        self.assertEqual(self.digest(), first_order)
+
+    def test_missing_source_and_sql_errors_remain_visible(self):
+        self.assertEqual(self.digest(entry_id="missing_source"), "")
+        self.conn.execute("DROP TABLE memory_ledger_lineage")
+        with self.assertRaises(sqlite3.OperationalError):
+            self.digest()
+
+
 if __name__ == "__main__":
     unittest.main()

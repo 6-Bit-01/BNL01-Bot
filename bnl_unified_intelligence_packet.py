@@ -2602,7 +2602,7 @@ def _ledger_entry_digest(
     lineage = conn.execute(
         """
         SELECT lineage_type,target_entry_id
-        FROM main.memory_ledger_lineage
+        FROM main.memory_ledger_lineage INDEXED BY sqlite_autoindex_memory_ledger_lineage_1
         WHERE guild_id=? AND entry_id=?
         ORDER BY lineage_type,target_entry_id
         """,
