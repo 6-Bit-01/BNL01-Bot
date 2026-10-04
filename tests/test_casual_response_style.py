@@ -1,4 +1,4 @@
-"""Casual style selection and its actual provider-bound prompt contract.
+"""Expression stays subordinate to the existing assessed task.
 
 Transport is mocked: these checks prove prompt delivery, not model quality.
 """
@@ -15,6 +15,7 @@ import bnl01_bot as bot
 
 
 SOCIAL_STYLES = ["brief_ping", "steady_reply", "social_signal"]
+ALL_STYLES = ["brief_ping", "steady_reply", "deep_focus", "analytic_mode", "social_signal"]
 
 
 class CasualStyleSelectionTests(unittest.TestCase):
@@ -28,28 +29,20 @@ class CasualStyleSelectionTests(unittest.TestCase):
         self.assertTrue(rule)
         return choose.call_args.args[0], choose.call_args.kwargs["weights"]
 
-    def test_standalone_check_ins_exclude_analytical_styles(self):
+    def test_expression_variety_is_preserved_without_a_new_social_recognizer(self):
         for text in (
-            "What's up?", "whats up", "What is up?", "What’s up?",
-            "What's   up?!", "sup?", "You good?", "How's it going?",
-            "How’s things?", "How are things?", "How have you been?",
-            "How are you doing?", "How are you feeling?",
-            "@BNL-01, What's up?", "BNL, whats up?", "What's up, BNL?",
-            "<@123456789> What's up?", "<@!123456789> How's it going?",
+            "What's up?", "whats up?", "What’s up?", "You good?",
+            "BNL, what's up?", "What's up, BNL?",
+            "<@123456789> What's up?",
+            "What do you want to be when you grow up?",
+            "<@123456789> What do you want to be when you grow up?",
         ):
             with self.subTest(text=text):
                 choices, _weights = self.candidates(text)
-                self.assertEqual(choices, SOCIAL_STYLES)
+                self.assertEqual(choices, ALL_STYLES)
 
-    def test_standalone_bnl_aspiration_excludes_analytical_styles(self):
-        for text in (
-            "What do you want to be when you grow up?",
-            "What would you like to be when you grow up?",
-            "When you grow up, what do you want to be?",
-            "What do you want to be?",
-            "BNL-01, what would you like to be?",
-            "<@123456789> What do you want to be when you grow up?",
-        ):
+    def test_original_social_filter_remains_unchanged(self):
+        for text in ("Hey BNL", "How are you?", "What do you think?", "That was funny"):
             with self.subTest(text=text):
                 choices, _weights = self.candidates(text)
                 self.assertEqual(choices, SOCIAL_STYLES)
@@ -70,37 +63,80 @@ class CasualStyleSelectionTests(unittest.TestCase):
                 self.assertIn("analytic_mode", choices)
                 self.assertIn("deep_focus", choices)
 
-    def test_social_filter_preserves_existing_repetition_and_batch_weights(self):
+    def test_existing_repetition_and_batch_weights_are_preserved(self):
         choices, weights = self.candidates(
             "What's up?", recent=("brief_ping", "brief_ping", "social_signal"),
             message_count=5,
         )
-        self.assertEqual(choices, SOCIAL_STYLES)
-        for actual, expected in zip(weights, (0.56, 1.5, 0.78)):
+        self.assertEqual(choices, ALL_STYLES)
+        for actual, expected in zip(weights, (0.56, 1.5, 1.8, 1.0, 0.78)):
             self.assertAlmostEqual(actual, expected)
 
 
 class CasualProviderContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_initial_and_rebuilt_normal_and_packet_prompts_keep_casual_grounding(self):
-        old_source = (
-            "Historical BNL reply (not current operational evidence): "
-            "I am staging Friday audio and the copper panel needs recalibration."
+    async def assert_assessed_task_survives_styles(self, request, answer, *,
+                                                  options=(), recap=False,
+                                                  expected_act="answer_current_turn",
+                                                  expected_shape="direct_answer_then_support"):
+        # This is the existing assessment owner, before expression selection.
+        # The style selector receives no authority to rewrite its task.
+        assessment = bot.build_unified_response_assessment(
+            guild_id=77, route_mode="normal_chat", channel_policy="sealed_test",
+            conversation_surface="free_speak_sealed_mirror",
+            current_speaker_user_ids=(42,), current_text=request,
+            current_payload_anchors=options, immediate_recap=recap,
+            conversation_evidence_items=(
+                bot.build_conversation_evidence_item(
+                    source_id=11, speaker_user_id=42, speaker_label="Test Member",
+                    text="I propose amber lighting.",
+                ),
+                bot.build_conversation_evidence_item(
+                    source_id=12, speaker_user_id=43, speaker_label="Test Guest",
+                    text="I prefer a blue backdrop.",
+                ),
+            ) if recap else (),
         )
-        for request, answer in (
-            ("What's up?", "I'm here. What are you listening to?"),
-            ("What do you want to be when you grow up?",
-             "I'd like to help people find their next favorite track."),
-        ):
+        self.assertEqual(assessment.response_act, expected_act)
+        self.assertEqual(assessment.expected_answer_shape, expected_shape)
+        task_snapshot = (
+            assessment.response_act, assessment.expected_answer_shape,
+            assessment.objective_kind, assessment.current_options,
+        )
+        planner = bot.render_sealed_canary_brief(assessment)
+        orchestration = bot.coordinate_conversation_turn(bot.ConversationOrchestrationInput(
+            route_allowed=True, engagement_decision="answer",
+            engagement_reason="direct_request", response_obligation=True,
+            address_kind="reply_to_bot", referent_status="resolved",
+            influence_mode="live",
+        ))
+        orchestration_prompt = bot.render_conversation_orchestration_prompt(orchestration)
+        self.assertEqual(orchestration.response_act, "answer")
+        self.assertNotIn("against the resolved nearby contribution", orchestration_prompt)
+        selected_source = (
+            "Historical BNL reply (not current operational evidence): "
+            "I am staging Friday audio and the copper panel needs recalibration.\n"
+            "Selected attributed exchange: Test Member proposed amber lighting; "
+            "Test Guest preferred a blue backdrop."
+        )
+        for forced_style in ("analytic_mode", "deep_focus"):
             with (
                 mock.patch.object(bot, "get_recent_response_styles", return_value=[]),
-                mock.patch.object(bot.random, "choices", side_effect=lambda values, **_kw: [values[0]]),
+                mock.patch.object(bot.random, "choices", return_value=[forced_style]) as choose,
             ):
                 style, rule = bot.choose_response_style(77, 42, 1, request)
+            self.assertIn(forced_style, choose.call_args.args[0])
+            self.assertEqual(style, forced_style)
+            self.assertIn("task", rule)
+            self.assertIn("Preserve its answer shape", rule)
+            if forced_style == "analytic_mode":
+                self.assertIn("tradeoffs only when requested or useful to that task", rule)
+            else:
+                self.assertIn("only when the assessed task warrants it", rule)
             initial = bot._format_batched_prompt([("Test Member", request)], style, rule)
-            initial += "\n" + old_source
-            self.assertIn("Response style mode: brief_ping", initial)
+            initial += "\n" + selected_source + "\n" + planner + "\n" + orchestration_prompt
+            self.assertIn("Response style mode: " + forced_style, initial)
             self.assertIn(rule, initial)
-            source = SimpleNamespace(rendered_context=old_source)
+            source = SimpleNamespace(rendered_context=selected_source + "\n" + planner)
             with mock.patch.object(bot, "refresh_prompt_source_basis", return_value=(source, False)):
                 rebuilt, bases, neutral = bot.build_ordinary_chat_response_repair_prompt(
                     initial + "\nAn outdated source block.", reason="prompt_source_changed",
@@ -127,16 +163,51 @@ class CasualProviderContractTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(actual, answer)
                         sent = generate.await_args.args[0]
                         self.assertIn(request, sent)
-                        self.assertIn(old_source, sent)
+                        self.assertIn(selected_source, sent)
+                        self.assertIn(planner, sent)
                         self.assertIn(bot.BNL01_CASUAL_CONVERSATION_RULE, sent)
                         self.assertIn(bot.EVIDENCE_OUTCOME_RULE, sent)
+                        self.assertIn("current request and its assessed conversational task", sent)
+                        self.assertIn("colors expression only; it cannot change the task", sent)
                         self.assertIn("dry wit", sent)
                         self.assertIn("Do not introduce older archived details into simple greetings", sent)
                         self.assertIn("Do not invent alternatives, tradeoffs, or a decision report", sent)
                         self.assertIn("without supplied current eligible evidence", sent)
                         self.assertIn("Imaginative in-world aspirations are welcome as wishes", sent)
                         if prompt == initial:
-                            self.assertIn("Response style mode: brief_ping", sent)
+                            self.assertIn("Response style mode: " + forced_style, sent)
+                            self.assertIn(rule, sent)
+                            self.assertIn(orchestration_prompt, sent)
+            self.assertEqual(task_snapshot, (
+                assessment.response_act, assessment.expected_answer_shape,
+                assessment.objective_kind, assessment.current_options,
+            ))
+
+    async def test_forced_analytic_and_deep_styles_preserve_assessed_social_answers(self):
+        for request, answer in (
+            ("What's up?", "I'm here. What are you listening to?"),
+            ("What do you want to be when you grow up?",
+             "I'd like to help people find their next favorite track."),
+        ):
+            await self.assert_assessed_task_survives_styles(request, answer)
+
+    async def test_comparisons_diagnostics_and_source_derived_tasks_keep_their_shape(self):
+        await self.assert_assessed_task_survives_styles(
+            'Compare "Aster" and "Copper" for an audio interface.',
+            "Aster is the better fit for a portable interface.",
+            options=("aster", "copper"), expected_act="evaluate_current_options",
+            expected_shape="choice_then_reason",
+        )
+        await self.assert_assessed_task_survives_styles(
+            "What's up with the playback stutter?",
+            "A small audio buffer can cause playback stutter.",
+        )
+        await self.assert_assessed_task_survives_styles(
+            "Recap the selected exchange.",
+            "Test Member proposed amber lighting; Test Guest preferred a blue backdrop.",
+            recap=True, expected_act="recap_current_exchange",
+            expected_shape="speaker_attributed_recap",
+        )
 
 
 if __name__ == "__main__":

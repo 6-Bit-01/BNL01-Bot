@@ -1899,6 +1899,10 @@ PERSONAL_ATTRIBUTION_RULE = (
 )
 
 BNL01_CASUAL_CONVERSATION_RULE = (
+    "- The current request and its assessed conversational task determine what to answer, "
+    "which evidence is relevant, and the required answer shape. A selected response style "
+    "colors expression only; it cannot change the task, topic, source authority, or answer "
+    "shape, invent alternatives, or manufacture present work.\n"
     "- Playfulness is allowed. If a user is being casual, joking, teasing, or asking for humor, "
     "respond naturally with dry wit, odd humor, or BARCODE-flavored jokes. Prefer jokes about "
     "BARCODE related subjects, characters, live-show chaos, and weird system behavior rather "
@@ -32406,11 +32410,11 @@ def choose_response_style(guild_id: int, user_id: int, message_count: int, combi
         },
         "deep_focus": {
             "weight": 1.0,
-            "rule": "Go deeper with useful nuance, but stay readable and avoid bloated over-explanation.",
+            "rule": "Add useful depth only when the assessed task warrants it. Preserve its answer shape, stay readable, and avoid bloated over-explanation.",
         },
         "analytic_mode": {
             "weight": 1.0,
-            "rule": "Answer with structured reasoning and clear tradeoffs while staying conversational.",
+            "rule": "Use structured reasoning when it serves the assessed task, and tradeoffs only when requested or useful to that task. Preserve its answer shape and stay conversational.",
         },
         "social_signal": {
             "weight": 1.0,
@@ -32434,28 +32438,7 @@ def choose_response_style(guild_id: int, user_id: int, message_count: int, combi
         penalty = min(0.75, repeats[style_key] * 0.22)
         styles[style_key]["weight"] = max(0.12, styles[style_key]["weight"] - penalty)
 
-    # Address wrappers do not turn a standalone greeting or BNL's own playful
-    # aspiration into a request for analytical tradeoffs. Keep this anchored so
-    # substantive questions beginning with the same words retain their styles.
-    standalone_turn = re.sub(r"<@!?\d+>", " ", c).replace("’", "'")
-    standalone_turn = re.sub(
-        r"^\s*@?(?:bnl(?:[- ]?01)?|barcode bot)\b[\s,:;-]*",
-        "", standalone_turn,
-    ).strip()
-    standalone_turn = re.sub(
-        r"[\s,:;-]+@?(?:bnl(?:[- ]?01)?|barcode bot)[?!.]*\s*$",
-        "", standalone_turn,
-    ).strip()
-    standalone_turn = re.sub(r"\s+", " ", standalone_turn)
-    standalone_social_turn = bool(re.fullmatch(
-        r"(?:what(?:'s|s| is) up|sup|you good|"
-        r"how(?:'s|s| is) it going|how(?:'s|s| are) things|"
-        r"how (?:are|have) you(?: (?:doing|feeling|been|today))?|"
-        r"what (?:do you want|would you like) to be(?: when you grow up)?|"
-        r"when you grow up[, ]+what (?:do you want|would you like) to be)"
-        r"[?!.]*", standalone_turn,
-    ))
-    social_or_opinion_turn = standalone_social_turn or bool(
+    social_or_opinion_turn = bool(
         re.search(
             r"\b(?:hi|hey|hello|yo|joke|funny|lol|lmao|haha|meme|vibe|nerd|teas(?:e|ing)|"
             r"thanks|thank you|cute|sweet|sorry|not what i (?:asked|meant|said)|"

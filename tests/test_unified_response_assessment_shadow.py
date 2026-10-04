@@ -1,15 +1,23 @@
 import json
 import sqlite3
 import unittest
+from datetime import datetime, timezone
 
+from bnl_conversation_context_v2 import (
+    ConversationContextRequest,
+    assemble_conversation_context_v2,
+)
 from bnl_unified_response_assessment import (
     ASSESSMENT_VERSION,
+    ConversationTurnEvidencePacket,
     assess_response_coherence,
     build_conversation_evidence_item,
     build_evaluation_report,
     build_unified_response_assessment,
+    coordinate_conversation_turn,
     ensure_schema,
     persist_shadow_run,
+    render_conversation_orchestration_prompt,
     render_sealed_canary_brief,
     response_exposes_canary_control_markers,
     shadow_configuration,
@@ -1174,6 +1182,101 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             )
         finally:
             conn.close()
+
+
+class OrchestrationCurrentTaskPrecedenceTests(unittest.TestCase):
+    def context(self, question, *, ideas=False):
+        rows = [
+            dict(id=1, guild_id=77, role="model", user_id=42,
+                 user_name="BNL-01", message_id=101, channel_id=10,
+                 channel_name="home", channel_policy="public_home",
+                 route_mode="normal_chat", timestamp="2026-10-03T07:00:00+00:00",
+                 content="The copper panel needs recalibration."),
+            dict(id=2, guild_id=77, role="user", user_id=43,
+                 user_name="Test Member", message_id=102, channel_id=10,
+                 channel_name="home", channel_policy="public_home",
+                 route_mode="normal_chat", timestamp="2026-10-04T07:00:00+00:00",
+                 content="A paper satellite drifts over the orchard."),
+        ]
+        if ideas:
+            rows[0].update(role="user", user_name="Test Member",
+                           content="Idea A: the copper panel needs recalibration.")
+            rows[1].update(user_id=42,
+                           content="Idea B: a paper satellite drifts over the orchard.")
+        return assemble_conversation_context_v2(rows, ConversationContextRequest(
+            guild_id=77, current_user_id=44, channel_id=10,
+            channel_name="home", channel_policy="public_home",
+            route_mode="normal_chat", conversation_surface="public_home",
+            current_texts=(question,), current_participants=frozenset({44}),
+            referenced_message_ids=frozenset({101}),
+            is_direct_target=True, is_reply_to_bnl=True,
+            now=datetime(2026, 10, 4, 7, 3, tzinfo=timezone.utc),
+            route_allowed_sources=frozenset({"conversation_continuity"}),
+        ))
+
+    def decision(self, *, referent="resolved", **changes):
+        values = dict(route_allowed=True, engagement_decision="answer",
+                      engagement_reason="current_request", response_obligation=True,
+                      address_kind="reply_to_bnl", referent_status=referent,
+                      influence_mode="live", moment_human_entry_count=3,
+                      moment_model_entry_count=1)
+        values.update(changes)
+        return coordinate_conversation_turn(ConversationTurnEvidencePacket(**values))
+
+    def test_complete_new_question_keeps_task_authority_with_an_old_exact_reply(self):
+        for question in (
+            "What do you want to be when you grow up?",
+            "New topic: What do you want to be when you grow up?",
+            "What's up?",
+        ):
+            with self.subTest(question=question):
+                context = self.context(question)
+                decision = self.decision(referent=context.referent_status)
+                orchestration = render_conversation_orchestration_prompt(decision)
+                composed = ("Current user request: " + question + "\n"
+                            + context.rendered_context + "\n" + orchestration)
+                self.assertEqual(decision.response_act, "answer")
+                self.assertEqual(context.referent_selected_row_ids, (1,))
+                self.assertIn(question, composed)
+                self.assertIn("The current user request determines the task", orchestration)
+                self.assertIn("it does not replace a complete standalone question", orchestration)
+                self.assertIn("does not replace the current user's task with its older topic", orchestration)
+                self.assertNotIn("against the resolved nearby contribution", composed)
+                self.assertIn("copper panel", composed)
+                self.assertNotIn("paper satellite", composed)
+
+    def test_source_dependent_transforms_and_explicit_comparisons_keep_exact_scope(self):
+        for question, scope_expanded in (
+            ("Improve this idea in one sentence.", False),
+            ("Compare this idea with the newer idea.", True),
+        ):
+            with self.subTest(question=question):
+                context = self.context(question, ideas=True)
+                orchestration = render_conversation_orchestration_prompt(
+                    self.decision(referent=context.referent_status))
+                self.assertEqual(context.referent_selected_row_ids, (1,))
+                self.assertEqual(context.referent_scope_expanded, scope_expanded)
+                self.assertIn("selected raw contribution as the content authority for referenced, quoted, or transformed content", orchestration)
+                self.assertIn("parts of the current request that depend on it", orchestration)
+                self.assertIn("Preserve its speaker attribution", orchestration)
+                self.assertIn("Moment state describes activity/flow only", orchestration)
+                self.assertIn("never supplies a quote", orchestration)
+                self.assertIn("copper panel", context.rendered_context)
+                self.assertEqual("paper satellite" in context.rendered_context, scope_expanded)
+
+    def test_ambiguity_policy_and_influence_controls_still_precede_expression(self):
+        ambiguous = self.decision(referent="ambiguous", referent_candidate_count=2,
+                                  referent_candidate_labels=("Test Member A", "Test Member B"))
+        self.assertEqual(ambiguous.response_act, "clarify")
+        rendered = render_conversation_orchestration_prompt(ambiguous)
+        self.assertIn("Ask one honest, specific clarification", rendered)
+        self.assertIn("Bounded candidate count: 2", rendered)
+        self.assertNotIn("Use the resolved nearby contribution", rendered)
+        blocked = self.decision(route_allowed=False)
+        self.assertEqual(blocked.response_act, "blocked")
+        self.assertEqual(render_conversation_orchestration_prompt(blocked), "")
+        self.assertEqual(render_conversation_orchestration_prompt(
+            self.decision(influence_mode="off")), "")
 
 
 if __name__ == "__main__":
