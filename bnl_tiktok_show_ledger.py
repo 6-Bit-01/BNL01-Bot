@@ -454,7 +454,11 @@ def _load_finalized_show_ledgers(
         params,
     ).fetchall()
     loaded: list[dict[str, Any]] = []
-    for show_key, source_digest, ended_at_ms, raw_json in rows:
+    # Preserve SQL order while releasing each raw document as its decoded
+    # evidence replaces it. Keeping both complete histories increases peak memory.
+    rows.reverse()
+    while rows:
+        show_key, source_digest, ended_at_ms, raw_json = rows.pop()
         try:
             ledger = _safe_document(json.loads(raw_json or "{}"))
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -3302,6 +3306,19 @@ def _document_relevance(
         if not explicit_episode_scope else set()
     )
     topic_terms = _participant_topic_terms(query, participant_matches or direct_subject_candidates)
+    if (
+        not participant_matches
+        and not direct_subject_candidates
+        and not requested_dates
+        and len(topic_terms) < 2
+        and not _SHOW_QUERY_RE.search(query)
+        and not _COMMUNITY_BASELINE_QUERY_RE.search(query)
+    ):
+        # The final rule requires two authored content matches for an unscoped
+        # topic query. Fewer query terms cannot reach that score, regardless
+        # of how many messages exist. Resolved people and episode scopes keep
+        # their full original-source scan below.
+        return 0, []
     authored_overlap = max((
         len(topic_terms.intersection(_query_terms(str(message.get("text") or ""))))
         for message in _authored_show_messages(ledger)
@@ -4812,7 +4829,11 @@ def build_tiktok_show_evidence_context(
         if conn is not None:
             conn.close()
     ledgers = []
-    for (raw_json,) in rows:
+    # Retain the same ordered selection and full document validation without
+    # holding consumed raw JSON beside the complete decoded history.
+    rows.reverse()
+    while rows:
+        (raw_json,) = rows.pop()
         try:
             ledger = _safe_document(json.loads(raw_json or "{}"))
         except (json.JSONDecodeError, TypeError, ValueError):

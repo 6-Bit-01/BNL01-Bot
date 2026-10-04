@@ -1993,8 +1993,10 @@ def render_conversation_orchestration_prompt(
             "yes" if decision.moment_topic_coherent else "no",
         ),
         (
-            "Use Context v2's selected raw contribution as the content "
-            "authority. Moment state describes activity/flow only; it never "
+            "The current user request determines the task. Use Context v2's "
+            "selected raw contribution as the content authority for referenced, "
+            "quoted, or transformed content; it does not replace a complete "
+            "standalone question. Moment state describes activity/flow only; it never "
             "supplies a quote or replaces raw context."
         ),
     ]
@@ -2015,8 +2017,10 @@ def render_conversation_orchestration_prompt(
         )
     elif decision.referent_status == "resolved":
         lines.append(
-            "Carry out the requested conversational act against the resolved "
-            "nearby contribution. Preserve its speaker attribution."
+            "Use the resolved nearby contribution for the parts of the current "
+            "request that depend on it. A resolved reply target does not replace "
+            "the current user's task with its older topic. Preserve its speaker "
+            "attribution."
         )
     if decision.response_required:
         lines.append(
