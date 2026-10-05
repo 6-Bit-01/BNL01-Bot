@@ -68,6 +68,141 @@ class ShowSyncTransactionTests(unittest.TestCase):
             return tuple(conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
                          for table in ("memory_ledger_entries", "memory_ledger_lineage"))
 
+    def timing(self, info):
+        calls = [call.args[1:] for call in info.call_args_list
+                 if call.args and str(call.args[0]).startswith("barcode_show_episode_sync_timing ")]
+        self.assertEqual(len(calls), 1)
+        return calls[0]
+
+    def test_read_assembly_and_completeness_do_not_reserve_writer(self):
+        self.sync()
+        stored, counts = self.stored(), self.counts()
+        original = sqlite3.connect
+        statements = []
+
+        class ReadAssemblyConnection(sqlite3.Connection):
+            def execute(conn, sql, *args, **kwargs):
+                statements.append(sql)
+                if sql == "BEGIN IMMEDIATE":
+                    raise AssertionError("unchanged complete graph reserved a writer")
+                if "SELECT COUNT(*)" in sql or "SELECT source_row_id,entry_id" in sql:
+                    self.assertFalse(conn.in_transaction)
+                return super().execute(sql, *args, **kwargs)
+
+        def connect(*args, **kwargs):
+            return original(*args, **{**kwargs, "factory": ReadAssemblyConnection})
+
+        with mock.patch.object(sqlite3, "connect", side_effect=connect), \
+                mock.patch.object(shows, "living_canon_v1_formation_enabled", return_value=False), \
+                mock.patch.object(shows.logging, "info") as info:
+            result = self.sync()
+        self.assertEqual(result["showsUnchanged"], 1)
+        self.assertTrue(any("SELECT COUNT(*)" in sql for sql in statements))
+        timing = self.timing(info)
+        self.assertEqual((timing[0], timing[2], timing[3], timing[4], timing[5]),
+                         ("completed", 0.0, 0.0, 1, 0))
+        self.assertEqual((self.stored(), self.counts()), (stored, counts))
+
+    def test_source_commit_during_writer_acquisition_forces_fresh_assembly(self):
+        real_connect = sqlite3.connect
+        assemblies = []
+        original_builder = shows.build_tiktok_show_evidence_ledger
+        changed = []
+
+        class AdmissionConnection(sqlite3.Connection):
+            def execute(conn, sql, *args, **kwargs):
+                if sql == "BEGIN IMMEDIATE" and not changed:
+                    with closing(real_connect(self.db, timeout=0.1)) as writer:
+                        writer.execute("UPDATE conversations SET content=? WHERE id=101",
+                                       ("Corrected source before writer admission",))
+                        writer.commit()
+                    changed.append(True)
+                return super().execute(sql, *args, **kwargs)
+
+        def connect(*args, **kwargs):
+            return real_connect(*args, **{**kwargs, "factory": AdmissionConnection})
+
+        def build(*args, **kwargs):
+            result = original_builder(*args, **kwargs)
+            assemblies.append(copy.deepcopy(result))
+            return result
+
+        with mock.patch.object(sqlite3, "connect", side_effect=connect), \
+                mock.patch.object(shows, "build_tiktok_show_evidence_ledger", side_effect=build), \
+                mock.patch.object(shows.logging, "info") as info:
+            result = self.sync()
+        self.assertEqual(len(assemblies), 2)
+        self.assertEqual(result["showsWritten"], 1)
+        self.assertIn("Corrected source before writer admission", json.dumps(self.stored()[1]))
+        self.assertEqual((self.timing(info)[4], self.timing(info)[5]), (2, 1))
+
+    def test_lease_timing_measures_actual_boundaries_and_preserves_graph(self):
+        clock = [0.0]
+        real_connect = sqlite3.connect
+        original_sources, original_project = shows._load_show_related_sources, shows._project_finalized_show
+
+        class TimedConnection(sqlite3.Connection):
+            def execute(conn, sql, *args, **kwargs):
+                if sql == "BEGIN IMMEDIATE":
+                    clock[0] += 0.2
+                return super().execute(sql, *args, **kwargs)
+
+        def connect(*args, **kwargs):
+            return real_connect(*args, **{**kwargs, "factory": TimedConnection})
+
+        def sources(*args, **kwargs):
+            loaded = original_sources(*args, **kwargs)
+            clock[0] += 0.7
+            return loaded
+
+        def project(*args, **kwargs):
+            projected = original_project(*args, **kwargs)
+            clock[0] += 0.3
+            return projected
+
+        with mock.patch.object(sqlite3, "connect", side_effect=connect), \
+                mock.patch.object(shows, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                mock.patch.object(shows, "_load_show_related_sources", side_effect=sources), \
+                mock.patch.object(shows, "_project_finalized_show", side_effect=project), \
+                mock.patch.object(shows.logging, "info") as info:
+            result = self.sync(max_seconds=2.0)
+        timing = self.timing(info)
+        self.assertEqual((timing[0], timing[4], timing[5], timing[6]), ("completed", 1, 1, "none"))
+        for actual, expected in zip(timing[1:4], (700.0, 200.0, 300.0)):
+            self.assertAlmostEqual(actual, expected)
+        stored, counts = self.stored(), self.counts()
+        self.assertEqual(result["showsWritten"], 1)
+        self.sync()
+        self.assertEqual((self.stored(), self.counts()), (stored, counts))
+
+    def test_diagnostic_omits_source_text_and_cannot_replace_original_error(self):
+        marker = "Fictional private source identifier 998877"
+        for logger_fails in (False, True):
+            with self.subTest(logger_fails=logger_fails), \
+                    mock.patch.object(shows, "_load_show_related_sources", side_effect=ValueError(marker)), \
+                    mock.patch.object(shows.logging, "info", side_effect=OSError("diagnostic unavailable") if logger_fails else None) as info:
+                with self.assertRaisesRegex(ValueError, marker):
+                    self.sync()
+            record = self.timing(info)
+            self.assertEqual((record[0], record[4], record[5], record[6]), ("failed", 1, 0, "ValueError"))
+            self.assertNotIn(marker, str(info.call_args_list))
+            with closing(sqlite3.connect(self.db, timeout=0.1)) as writer:
+                writer.execute("BEGIN EXCLUSIVE")
+                writer.commit()
+
+    def test_related_source_control_materialization_omits_unused_text(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            expected = shows._load_show_related_sources(conn, guild_id=77)
+
+            def authorize(action, table, column, *_):
+                if action == sqlite3.SQLITE_READ and table == "memory_ledger_entries" and column == "normalized_value":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            conn.set_authorizer(authorize)
+            actual = shows._load_show_related_sources(conn, guild_id=77)
+            self.assertEqual(actual, expected)
+
     def test_archive_revision_and_digest_changes_do_not_rewrite_unchanged_show(self):
         self.sync()
         before, counts = self.stored(), self.counts()
@@ -273,7 +408,7 @@ class ShowSyncTransactionTests(unittest.TestCase):
 
         with mock.patch.object(shows, "_load_show_source_events", side_effect=unavailable_first):
             result = self.sync(model)
-        self.assertEqual(observed, [True, True])
+        self.assertEqual(observed, [False, False])
         self.assertEqual(result["showsWritten"], 1)
 
     def test_previous_show_commits_before_next_show_source_read(self):
@@ -303,7 +438,7 @@ class ShowSyncTransactionTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM tiktok_show_evidence_ledgers")
                              .fetchone()[0], 1)
 
-    def test_each_show_refreshes_related_sources_in_its_owned_transaction(self):
+    def test_each_show_refreshes_related_sources_before_its_write_transaction(self):
         second = copy.deepcopy(archived_show())
         second.update(sessionId="second-episode", showDate="2026-08-29")
         model = copy.deepcopy(self.model)
@@ -317,7 +452,7 @@ class ShowSyncTransactionTests(unittest.TestCase):
 
         with mock.patch.object(shows, "_load_show_related_sources", side_effect=inspect_snapshot):
             self.sync(model)
-        self.assertEqual(transactions, [True, True])
+        self.assertEqual(transactions, [False, False])
 
     def two_shows(self):
         second = copy.deepcopy(archived_show())
@@ -326,7 +461,7 @@ class ShowSyncTransactionTests(unittest.TestCase):
         model["sections"]["archive"]["shows"] = [second]
         return model
 
-    def test_unchanged_shows_share_one_source_scan_but_keep_separate_snapshots(self):
+    def test_unchanged_shows_share_one_source_scan_without_write_transactions(self):
         model = self.two_shows()
         self.sync(model)
         original = shows._load_show_source_events
@@ -342,7 +477,7 @@ class ShowSyncTransactionTests(unittest.TestCase):
                                   side_effect=inspect_snapshot):
             result = self.sync(model)
         self.assertEqual(result["showsUnchanged"], 2)
-        self.assertEqual(transactions, [True, True])
+        self.assertEqual(transactions, [False, False])
         self.assertEqual(sources.call_count, 1)
 
     def test_committed_source_edits_or_privacy_changes_reload_between_show_snapshots(self):
@@ -358,12 +493,17 @@ class ShowSyncTransactionTests(unittest.TestCase):
                 captured = []
 
                 class BetweenShowConnection(sqlite3.Connection):
-                    commits = 0
+                    source_reads = 0
 
-                    def commit(conn):
-                        super().commit()
-                        conn.commits += 1
-                        if conn.commits == 2:
+                    def execute(conn, sql, *args, **kwargs):
+                        # Unchanged complete shows have no needless commit.
+                        # Commit the external edit when the second show's
+                        # source read begins; its optimistic token must reject
+                        # mixed inputs and reread all source controls.
+                        if "SELECT source_key,occurred_at_ms,subject_ref,private_display_name" in sql:
+                            conn.source_reads += 1
+                        if conn.source_reads == 2:
+                            conn.source_reads += 1
                             with closing(real_connect(self.db, timeout=0.1)) as writer:
                                 if column == "delete_subject":
                                     purge_user_bound_conversation_sources_on_connection(writer, 77, 42)
@@ -371,6 +511,7 @@ class ShowSyncTransactionTests(unittest.TestCase):
                                     writer.execute("UPDATE conversations SET " + column + "=? WHERE id=101",
                                                    (value,))
                                 writer.commit()
+                        return super().execute(sql, *args, **kwargs)
 
                 def connect(*args, **kwargs):
                     return real_connect(*args, **{**kwargs, "factory": BetweenShowConnection})
@@ -382,8 +523,11 @@ class ShowSyncTransactionTests(unittest.TestCase):
 
                 with mock.patch.object(sqlite3, "connect", side_effect=connect), \
                         mock.patch.object(shows, "_load_show_related_sources", side_effect=capture_sources):
-                    self.sync(model)
-                self.assertEqual(len(captured), 2)
+                    result = self.sync(model)
+                self.assertEqual(result["status"], "completed")
+                # A prior subcase may also require an own graph refresh in
+                # the first show, which correctly invalidates its source cache.
+                self.assertIn(len(captured), (2, 3))
                 current = [record for record in captured[-1]
                            if record.get("conversationRowId") == 101]
                 if column == "content":
