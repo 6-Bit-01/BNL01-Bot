@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import difflib
 import hashlib
 import json
@@ -253,7 +254,7 @@ def utc_now_iso() -> str:
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS website_relay_state (
             guild_id INTEGER PRIMARY KEY,
@@ -343,14 +344,14 @@ def ensure_schema(db_path: str) -> None:
 
 def get_cursor(db_path: str, guild_id: int) -> int | None:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute("SELECT last_published_conversation_cursor FROM website_relay_state WHERE guild_id=?", (guild_id,)).fetchone()
     return int(row[0]) if row else None
 
 
 def bootstrap_cursor(db_path: str, guild_id: int, cursor: int) -> None:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("INSERT OR REPLACE INTO website_relay_state(guild_id,last_published_conversation_cursor,last_publication_timestamp) VALUES(?,?,NULL)", (guild_id, int(cursor or 0)))
 
 
@@ -407,7 +408,7 @@ def recent_history(db_path: str, guild_id: int, limit: int = MAX_HISTORY) -> lis
     # operational duplicate-detection view bounded without deleting older
     # rows that daily and weekly journals still need.
     bounded_limit = max(0, min(int(limit), MAX_HISTORY))
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM website_relay_history WHERE guild_id=? ORDER BY published_timestamp DESC, relay_id DESC LIMIT ?",
@@ -946,7 +947,7 @@ def accepted_publication_count(db_path: str, guild_id: int, event_types: tuple[s
         placeholders = ",".join("?" for _item in normalized_types)
         where += f" AND event_type IN ({placeholders})"
         params.extend(normalized_types)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute(
             f"SELECT COUNT(*) FROM website_relay_history WHERE {where}",
             params,
@@ -976,7 +977,7 @@ def reject_reason_for_candidate(db_path: str, guild_id: int, message: str, direc
 
 def get_pending_v2_publication(db_path: str, guild_id: int) -> dict[str, Any]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM website_relay_pending_v2 WHERE guild_id=?", (guild_id,)).fetchone()
     return dict(row) if row else {}
@@ -1002,7 +1003,7 @@ def save_pending_v2_publication(
     source_basis: list[dict[str, Any]] | None = None,
 ) -> None:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("""
         INSERT OR REPLACE INTO website_relay_pending_v2(
             guild_id,relay_id,message,current_directive,source_class,trigger,source_cursor,source_conversation_fingerprint,
@@ -1018,7 +1019,7 @@ def save_pending_v2_publication(
 
 def clear_pending_v2_publication(db_path: str, guild_id: int, relay_id: str = "") -> None:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         if relay_id:
             conn.execute("DELETE FROM website_relay_pending_v2 WHERE guild_id=? AND relay_id=?", (guild_id, relay_id))
         else:
@@ -1088,7 +1089,7 @@ def record_publication(db_path: str, guild_id: int, *, message: str, directive: 
     fam = semantic_family(message)
     relay_id = relay_id or hashlib.sha256(f"{guild_id}|{source_cursor}|{norm}|{ts}".encode()).hexdigest()[:24]
     inserted = False
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         existing = conn.execute(
             """
@@ -1214,7 +1215,7 @@ def claim_scheduled_relay_period(
     if not normalized_period:
         raise ValueError("period_key_required")
     ensure_schema(db_path)
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("BEGIN IMMEDIATE")
         inserted = conn.execute(
@@ -1232,7 +1233,7 @@ def claim_scheduled_relay_period(
 
 def begin_attempt(db_path: str, attempt_id: str, guild_id: int, trigger: str, source_class: str = "pending", *, cursor: int = 0, highest_eligible_conversation_id: int = 0, aggregate_source_counts: dict[str, int] | None = None) -> None:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("""
         INSERT OR REPLACE INTO website_relay_attempts(attempt_id,guild_id,trigger,source_class,started_at,outcome,aggregate_source_counts,cursor,highest_eligible_conversation_id)
         VALUES(?,?,?,?,?,?,?,?,?)
@@ -1242,14 +1243,14 @@ def begin_attempt(db_path: str, attempt_id: str, guild_id: int, trigger: str, so
 
 def prepare_attempt_relay(db_path: str, attempt_id: str, prepared_relay_id: str) -> None:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("UPDATE website_relay_attempts SET prepared_relay_id=? WHERE attempt_id=?", (prepared_relay_id or "", attempt_id))
 
 def hydrate_publication(db_path: str, guild_id: int, *, relay_id: str, message: str, directive: str, source_class: str, trigger: str, published_timestamp: str) -> bool:
     ensure_schema(db_path)
     norm = normalize_text(message)
     fam = semantic_family(message)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         existing = conn.execute("SELECT public_message, public_directive, published_timestamp FROM website_relay_history WHERE relay_id=?", (relay_id,)).fetchone()
         if existing:
             return False
@@ -1279,7 +1280,7 @@ def hydrate_publication(db_path: str, guild_id: int, *, relay_id: str, message: 
 
 def complete_attempt(db_path: str, attempt_id: str, *, source_class: str, outcome: str, reason: str = "", aggregate_source_counts: dict[str, int] | None = None, cursor: int = 0, highest_eligible_conversation_id: int = 0, accepted_relay_id: str = "", prepared_relay_id: str = "", website_published_at: str = "", idempotent: bool = False) -> None:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("""
         UPDATE website_relay_attempts
         SET source_class=?, completed_at=?, outcome=?, reason=?, aggregate_source_counts=?, cursor=?, highest_eligible_conversation_id=?, accepted_relay_id=?, prepared_relay_id=COALESCE(NULLIF(?, ''), prepared_relay_id), website_published_at=?, idempotent=?
@@ -1289,7 +1290,7 @@ def complete_attempt(db_path: str, attempt_id: str, *, source_class: str, outcom
 
 def get_attempt(db_path: str, attempt_id: str) -> dict[str, Any]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM website_relay_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
     return dict(row) if row else {}
@@ -1297,7 +1298,7 @@ def get_attempt(db_path: str, attempt_id: str) -> dict[str, Any]:
 
 def last_attempt(db_path: str, guild_id: int) -> dict[str, Any]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM website_relay_attempts WHERE guild_id=? ORDER BY started_at DESC LIMIT 1", (guild_id,)).fetchone()
     return dict(row) if row else {}

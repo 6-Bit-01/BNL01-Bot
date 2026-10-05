@@ -8,7 +8,7 @@ import re
 import sqlite3
 import urllib.error
 import urllib.request
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, closing
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -516,7 +516,7 @@ def _norm(text: str) -> str:
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_entries (
             entry_id TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, guild_id INTEGER NOT NULL,
             lifecycle_state TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
@@ -6321,7 +6321,7 @@ def store_validated_draft(
     publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis))
     if publication_failure:
         return JournalResult(False, "no_draft", publication_failure, entry_id=entry_id, revision=revision)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         if not _attempt_fence_owned(conn, attempt_fence):
             conn.rollback()
@@ -6374,7 +6374,7 @@ def generate_and_store_packet_draft(
         return JournalResult(False, "no_draft", "incomplete_source_window", entry_id=entry_id)
     if not packet.get("safeSources") and not _eligible_reflection_basis(packet):
         return JournalResult(False, "no_draft", "insufficient_grounded_material", entry_id=entry_id)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         prior_titles = _prior_titles(conn, guild_id)
     article, reason, allow_advisory = _generate_article_with_repairs(
         packet,
@@ -6536,7 +6536,7 @@ def approve_draft(
     ensure_schema(db_path)
     now = utc_now_iso()
     publication_snapshot = _ballad_snapshot_for_entry(db_path, guild_id, entry_id, revision)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         if not _attempt_fence_owned(conn, attempt_fence):
             conn.rollback()
@@ -6623,7 +6623,7 @@ def approve_draft(
 def reject_draft(db_path: str, guild_id: int, entry_id: str, reason: str = "", revision: Optional[int] = None) -> JournalResult:
     ensure_schema(db_path)
     now = utc_now_iso()
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute("SELECT revision,lifecycle_state,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
         if not row:
             return JournalResult(False, "not_found", "not_found", entry_id)
@@ -6861,7 +6861,7 @@ def generate_published_correction_draft(
     publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis))
     if publication_failure:
         return JournalResult(False, "no_draft", publication_failure, entry_id, previous_revision)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         reason = (_source_review_reason(article, packet, required=True)
                   or _published_correction_base_reason(conn, guild_id, entry_id, preview["correctionContext"])
@@ -6905,7 +6905,7 @@ def regenerate_draft(
     excluded_history_entry_ids: Optional[set[str]] = None,
 ) -> JournalResult:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute(
             """SELECT e.revision,e.lifecycle_state,m.metadata_json,e.public_payload_json
                FROM bnl_journal_entries e
@@ -6943,7 +6943,7 @@ def regenerate_draft(
     if excluded_history_entry_ids is not None:
         packet_kwargs["excluded_history_entry_ids"] = excluded_history_entry_ids
     packet = build_source_packet(db_path, guild_id, hours, **packet_kwargs)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         prior_titles = _prior_titles(conn, guild_id)
     article, reason, allow_advisory = _generate_article_with_repairs(
         packet,
@@ -6957,7 +6957,7 @@ def regenerate_draft(
     publication_failure = ballads.publication_source_failure(basis, ballads.publication_snapshot_for_basis(basis))
     if publication_failure:
         return JournalResult(False, "no_draft", publication_failure, entry_id, old_revision)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         if not journal_shared_source_provenance_is_current(conn, guild_id, basis):
             return JournalResult(False, "no_draft", "privacy_source_ineligible", entry_id, old_revision)
         reason = validate_article(
@@ -7047,7 +7047,7 @@ def deliver_approved(
     original_source_controls: Optional[Callable[..., Any]] = None,
 ) -> JournalResult:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         identity_row = conn.execute(
             "SELECT metadata_json FROM bnl_journal_private_metadata WHERE guild_id=? AND entry_id=? "
             + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"),
@@ -7074,7 +7074,7 @@ def deliver_approved(
         # SQLite transaction is deliberately released before the network wait,
         # so unrelated bot writes are never blocked by website latency.
         with journal_release_privacy_fence(db_path):
-            with sqlite3.connect(db_path, timeout=30) as conn:
+            with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
                 if not _delivery_fence_owned(
                     conn,
@@ -7131,7 +7131,7 @@ def deliver_approved(
                 timeout,
             )
             now = utc_now_iso()
-            with sqlite3.connect(db_path, timeout=30) as conn:
+            with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
                 if not _delivery_fence_owned(
                     conn,
@@ -7185,7 +7185,7 @@ def deliver_approved(
                 conn.commit()
         return JournalResult(status == "published", status, reason, entry_id, rev, content_hash, http, idem)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute("SELECT revision,canonical_payload_bytes,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed') " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
     if not row:
         return JournalResult(False, "not_deliverable", "not_approved", entry_id)
@@ -7199,7 +7199,7 @@ def deliver_approved(
     receipt: dict[str, Any] = {}
     with journal_release_privacy_fence(db_path) if isinstance(correction_context, dict) else nullcontext():
         if isinstance(correction_context, dict):
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 reason = _published_correction_current_reason(
                     conn, guild_id, entry_id, correction_context, rev,
                     correction_guard=correction_guard, original_source_controls=original_source_controls,
@@ -7212,7 +7212,7 @@ def deliver_approved(
             correction_receipt=receipt,
         )
         now = utc_now_iso()
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn, conn:
             with conn:
                 cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state=?,delivery_status=?,delivery_http_status=?,published_at=COALESCE(?,published_at),updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')", (status, reason, http, published or None, now, guild_id, entry_id, rev))
                 cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=?", (status, now, guild_id, entry_id, rev))
@@ -7243,7 +7243,7 @@ def rehydrate_published_entries(
     ensure_schema(db_path)
     if not base_url or not api_key:
         return {"ok": False, "reason": "website_configuration_missing", "attempted": 0, "restored": 0, "failed": 0}
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         rows = conn.execute(
             """SELECT entry_id,revision,canonical_payload_bytes,content_hash
                FROM bnl_journal_entries
@@ -7278,7 +7278,7 @@ def preview(db_path: str, guild_id: int, entry_id: Optional[str] = None, revisio
     if revision is not None:
         sql += " AND revision=?"; args.append(revision)
     sql += " ORDER BY created_at DESC, revision DESC LIMIT 1"
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(sql, tuple(args)).fetchone()
     return dict(row) if row else None

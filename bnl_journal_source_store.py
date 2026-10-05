@@ -169,7 +169,7 @@ def sanitize_summary(text: str, private_names: Optional[Sequence[str]] = None, l
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         # The schema snapshot and its conditional ALTERs are one serialized
         # migration. Without this lease, concurrent startup paths can both see
         # a missing legacy column and race into duplicate-column failures.
@@ -435,7 +435,7 @@ def record_source_event(
     """
     if prepare_schema:
         ensure_schema(db_path)
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         # Serialize the identity check and insert.  Without this write lock, two
         # processes can both observe a missing identity and one can leak a
         # UNIQUE/locking error instead of returning an idempotent result.
@@ -553,7 +553,7 @@ def query_source_events(
         raise ValueError("invalid_source_window")
     if prepare_schema:
         ensure_schema(db_path)
-    with sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True) as conn:
+    with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)) as conn, conn:
         conn.row_factory = sqlite3.Row
         state = conn.execute(
             "SELECT activated_at_ms FROM bnl_journal_source_archive_state WHERE guild_id=?",
@@ -710,7 +710,7 @@ def _purge_discord_source_events(db_path: str, guild_id: int, user_id: Optional[
     """
     ensure_schema(db_path)
     with journal_release_privacy_fence(db_path):
-        with sqlite3.connect(db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
             conn.execute("BEGIN EXCLUSIVE")
             try:
                 removed = _purge_discord_source_events_on_connection(conn, guild_id, user_id)
@@ -762,7 +762,7 @@ def backfill_legacy_sources(db_path: str, guild_id: int) -> LegacyBackfillResult
         "conversation_rows_scanned": 0,
         "invalid_timestamps": 0,
     }
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         now_ms = _now_ms()
         conn.execute(

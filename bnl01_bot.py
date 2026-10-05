@@ -5308,7 +5308,7 @@ def _relay_shared_source_failure(guild_id: int, decision: WebsiteRelayDecision) 
             return "relay_source_unavailable"
     try:
         publication_snapshot = ballad_publications.publication_snapshot_for_basis(basis, _journal_website_base_url())
-        with sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1) as conn:
+        with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn, conn:
             conn.execute("BEGIN")
             return shared_relay_source_failure(conn, guild_id, basis, control_snapshot=snapshot, publication_snapshot=publication_snapshot)
     except (OSError, sqlite3.Error):
@@ -6431,7 +6431,7 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> tuple[str, dict]:
 async def _fetch_fresh_public_relay_rows(guild_id: int) -> tuple[list[tuple], int, str]:
     """Return only fresh eligible public Discord user rows newer than the relay cursor."""
     cursor_value = relay_get_cursor(DB_FILE, guild_id)
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(conversations)")}
         eligibility = (" AND public_usable=1" if "public_usable" in columns else "")
         eligibility += (" AND visibility IN ('public','public_safe')" if "visibility" in columns else "")
@@ -6540,7 +6540,7 @@ def _relay_safe_text_fragment(text: str, *, limit: int = 160) -> str:
 def _select_relay_safe_continuity_source(guild_id: int, cursor_value: int, highest: int, *, limit: int = 12) -> RelaySourceDecision | None:
     """Return anonymized thematic continuity from recent eligible public rows only."""
     cutoff = (datetime.utcnow() - timedelta(hours=RELAY_CONTINUITY_FRESHNESS_HOURS)).replace(microsecond=0).isoformat(sep=" ")
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(conversations)")}
         eligibility = (" AND public_usable=1" if "public_usable" in columns else "")
         eligibility += (" AND visibility IN ('public','public_safe')" if "visibility" in columns else "")
@@ -6566,7 +6566,7 @@ def _select_relay_safe_continuity_source(guild_id: int, cursor_value: int, highe
     if user_ids:
         placeholders = ",".join("?" for _ in user_ids)
         try:
-            with sqlite3.connect(DB_FILE) as conn:
+            with closing(sqlite3.connect(DB_FILE)) as conn, conn:
                 profile_rows = conn.execute(
                     f"SELECT display_name, preferred_name FROM user_profiles WHERE guild_id=? AND user_id IN ({placeholders})",
                     (guild_id, *user_ids),
@@ -6640,7 +6640,7 @@ def _valid_until_active(value: str | None) -> bool:
 
 def _approved_relay_broadcast_memory(guild_id: int, *, limit: int = 8) -> list[dict]:
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
@@ -6675,14 +6675,14 @@ def _select_shared_relay_sources(guild_id: int, cursor_value: int, highest: int,
     # Called off the event loop. Fetch authenticated Journal controls only when
     # its existing canonical reader finds a local candidate for this selection.
     try:
-        with sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1) as conn:
+        with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn, conn:
             probe = select_published_journal_entries_on_connection(
                 conn, guild_id=guild_id, user_text=topic_text or "latest Journal",
                 control_snapshot=None, include_context=True, context_only=bool(topic_text.strip()), limit=1)
             has_ballads = ballad_publications.has_local_versions(conn, guild_id)
         snapshot = _journal_publication_control_snapshot_sync()[0] if probe.candidate_count else None
         publication_snapshot = ballad_publications.read_publication_catalog(_journal_website_base_url()) if has_ballads else None
-        with sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1) as conn:
+        with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn, conn:
             conn.execute("BEGIN")
             return select_shared_relay_sources_on_connection(
                 conn, guild_id=guild_id, topic_text=topic_text, control_snapshot=snapshot, publication_snapshot=publication_snapshot,
@@ -8380,7 +8380,7 @@ def upsert_user_fact(
             source_revision=str(source_conversation_row_id),
         )
         if first_party_result and first_party_result.entry_id:
-            with sqlite3.connect(DB_FILE) as provenance_conn:
+            with closing(sqlite3.connect(DB_FILE)) as provenance_conn, provenance_conn:
                 _ensure_user_fact_provenance_schema(provenance_conn.cursor())
                 provenance_conn.execute(
                     """
@@ -8415,7 +8415,7 @@ def upsert_user_fact(
             source_event_key=source_control_ref,
         )
         if control_result and control_result.entry_id:
-            with sqlite3.connect(DB_FILE) as provenance_conn:
+            with closing(sqlite3.connect(DB_FILE)) as provenance_conn, provenance_conn:
                 _ensure_user_fact_provenance_schema(provenance_conn.cursor())
                 provenance_conn.execute(
                     """
@@ -8491,7 +8491,7 @@ def _advance_relationship_state(prior, signal_text: str, delta_affinity: float, 
 
 
 def update_relationship_state(user_id: int, guild_id: int, signal_text: str = "", delta_affinity: float = 0.08):
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         conn.execute('BEGIN IMMEDIATE')
         prior = get_relationship_state(user_id, guild_id, connection=conn)
         state = _advance_relationship_state(prior, signal_text, delta_affinity, datetime.now(PACIFIC_TZ).isoformat())
@@ -8610,7 +8610,7 @@ def update_user_habits(user_id: int, guild_id: int, content: str):
     if not text:
         return
 
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         conn.execute('BEGIN IMMEDIATE')
         prior = get_user_habits(user_id, guild_id, connection=conn)
         state = _advance_user_habits(prior, text, datetime.now(PACIFIC_TZ).isoformat())
@@ -13070,7 +13070,7 @@ async def maybe_handle_declared_canon_command(
                 allowed={"source_system", "limit"},
             )
             with journal_release_privacy_fence(DB_FILE):
-                with sqlite3.connect(DB_FILE, timeout=30) as conn:
+                with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
                     preview = preview_declared_canon(
                         conn,
                         actor_user_id=actor_id,
@@ -13097,7 +13097,7 @@ async def maybe_handle_declared_canon_command(
                 allowed={"limit", "offset"},
             )
             with journal_release_privacy_fence(DB_FILE):
-                with sqlite3.connect(DB_FILE, timeout=30) as conn:
+                with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
                     preview = preview_historical_broadcast_memory(
                         conn,
                         actor_user_id=actor_id,
@@ -13124,7 +13124,7 @@ async def maybe_handle_declared_canon_command(
                 allowed=set(),
             )
             with journal_release_privacy_fence(DB_FILE):
-                with sqlite3.connect(DB_FILE, timeout=30) as conn:
+                with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
                     preview = preview_canon_entity_bindings(
                         conn,
                         actor_user_id=actor_id,
@@ -13148,7 +13148,7 @@ async def maybe_handle_declared_canon_command(
                 required={"account_id", "entity_id", "reason"},
             )
             with journal_release_privacy_fence(DB_FILE):
-                with sqlite3.connect(DB_FILE, timeout=30) as conn:
+                with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
                     binding_result = bind_discord_account(
                         conn,
                         actor_user_id=actor_id,
@@ -13175,7 +13175,7 @@ async def maybe_handle_declared_canon_command(
                 required={"binding_id", "expected_revision_id", "reason"},
             )
             with journal_release_privacy_fence(DB_FILE):
-                with sqlite3.connect(DB_FILE, timeout=30) as conn:
+                with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
                     binding_result = retire_discord_account_binding(
                         conn,
                         actor_user_id=actor_id,
@@ -13199,7 +13199,7 @@ async def maybe_handle_declared_canon_command(
 
         result = None
         with journal_release_privacy_fence(DB_FILE):
-            with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
                 if action == "add":
                     required = {
                         "subject_type",
@@ -13547,7 +13547,7 @@ def _record_additional_channel_observation(message) -> bool:
     memory_policy = "" if bot_author else public_observation_policy(channel, policy)
     kind = "discord_message" if memory_policy else "discord_channel_observation"
     ensure_journal_source_schema(DB_FILE)
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         seen = conn.execute(
             "SELECT 1 FROM bnl_journal_source_events "
             "WHERE guild_id=? AND source_kind=? AND source_key=?",
@@ -13650,7 +13650,7 @@ def build_channel_audit_rows(guild) -> list[dict]:
     if not guild:
         return rows
     ensure_journal_source_schema(DB_FILE)
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         observations = {
             int(channel_id or 0): (int(count), latest)
             for channel_id, count, latest in conn.execute(
@@ -14759,7 +14759,7 @@ def _load_bnl_self_name_records(
         return ()
     policy_scope = _bnl_self_name_policy_scope(channel_policy)
     try:
-        with sqlite3.connect(DB_FILE, timeout=0.1) as conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=0.1)) as conn, conn:
             records = current_bnl_self_name_records(
                 conn,
                 guild_id=guild_id,
@@ -15565,7 +15565,7 @@ def persist_bnl_self_name_decision_after_send(
         )
         return None
     try:
-        with sqlite3.connect(DB_FILE, timeout=1.0) as lookup_conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=1.0)) as lookup_conn, lookup_conn:
             if "message_id" not in _conversations_columns(timeout=0.1):
                 return None
             source_row = lookup_conn.execute(
@@ -15814,7 +15814,7 @@ def _conversation_row_for_discord_message(
     ):
         return 0, "", ""
     try:
-        with sqlite3.connect(DB_FILE, timeout=0.1) as conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=0.1)) as conn, conn:
             tables = {
                 str(row[0] or "")
                 for row in conn.execute(
@@ -16701,7 +16701,7 @@ def build_current_room_quote_authority(
     ):
         return None
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             rows = conn.execute(
                 """
                 SELECT id,message_id,user_name,content,timestamp
@@ -16812,7 +16812,7 @@ def refresh_current_room_quote_authority(
     if authority is None:
         return None
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             row = conn.execute(
                 """
                 SELECT message_id,user_name,content,timestamp
@@ -18640,7 +18640,7 @@ def _delete_conversation_response_participant_rows(
 
 def prune_conversation_history(user_id: int, guild_id: int, max_rows: int = MAX_CONVERSATION_ROWS_PER_USER):
     keep_rows = max(0, int(max_rows or 0))
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         try:
             # Classify and delete in one snapshot. Concurrent finalization
             # or tier insertion must not add a source dependency mid-prune.
@@ -19583,7 +19583,7 @@ def claim_show_update_period(
     """Atomically claim one show phase before any provider work begins."""
 
     claim_token = uuid.uuid4().hex
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         if cursor.execute(
@@ -19650,7 +19650,7 @@ def renew_show_update_claim(
 
     if not claim_token:
         return False
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         cursor = conn.execute(
             """
             UPDATE friday_show_update_claims
@@ -19853,7 +19853,7 @@ def release_show_update_claim(
 ) -> bool:
     if not claim_token:
         return False
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         cursor = conn.execute(
             """
             DELETE FROM friday_show_update_claims
@@ -20074,7 +20074,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     ledger_saved_at = time.perf_counter()
     if relationship_v2_shadow_enabled():
         try:
-            with sqlite3.connect(DB_FILE) as rel_conn:
+            with closing(sqlite3.connect(DB_FILE)) as rel_conn, rel_conn:
                 observe_relationship_v2_message(
                     rel_conn, guild_id=guild_id, user_id=user_id, role="user", content=content, source_row_id=row_id,
                     user_name=user_name, channel_policy=(channel_policy or "unknown")[:40], channel_name=(channel_name or "").lower()[:80],
@@ -20349,7 +20349,7 @@ def save_model_message(
     )
     if relationship_v2_shadow_enabled() and not is_room_group_response:
         try:
-            with sqlite3.connect(DB_FILE) as rel_conn:
+            with closing(sqlite3.connect(DB_FILE)) as rel_conn, rel_conn:
                 observe_relationship_v2_message(
                     rel_conn, guild_id=guild_id, user_id=storage_user_id, role="model", content=content, source_row_id=row_id,
                     channel_policy=(channel_policy or "unknown")[:40], channel_name=(channel_name or "").lower()[:80], channel_id=int(channel_id or 0),
@@ -22004,7 +22004,7 @@ def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processe
     now = datetime.now(PACIFIC_TZ).isoformat()
     actor_name = getattr(getattr(message, "author", None), "display_name", "system")
     with journal_release_privacy_fence(DB_FILE):
-        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
             new_id, committed = _insert_broadcast_memory_row(
                 conn,
                 guild_id=int(guild_id),
@@ -22668,7 +22668,7 @@ def clear_active_show_state_overrides(guild_id: int, actor_id: int):
     actor_name = "configured_owner"
     correction_reason = "owner restored normal show state"
     with journal_release_privacy_fence(DB_FILE):
-        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
@@ -22784,7 +22784,7 @@ def _set_broadcast_memory_status(
         raise ValueError("broadcast_status_transition_not_allowed")
     now_iso = datetime.now(PACIFIC_TZ).isoformat()
     with journal_release_privacy_fence(DB_FILE):
-        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
             cursor = conn.execute(
                 """
                 UPDATE main.broadcast_memory
@@ -22844,7 +22844,7 @@ def _replace_broadcast_memory_entry(
     prepared = dict(processed or {})
     prepared.pop("supersedes_id", None)
     with journal_release_privacy_fence(DB_FILE):
-        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
             target = conn.execute(
                 """
                 SELECT 1
@@ -23570,7 +23570,7 @@ def clear_guild_history(guild_id: int):
     ensure_journal_schema(DB_FILE)
     ensure_journal_source_schema(DB_FILE)
     with journal_release_privacy_fence(DB_FILE):
-        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
             conn.execute("BEGIN EXCLUSIVE")
             source_row_ids = [
                 int(row[0])
@@ -23613,7 +23613,7 @@ def clear_user_history(user_id: int, guild_id: int):
     ensure_journal_schema(DB_FILE)
     ensure_journal_source_schema(DB_FILE)
     with journal_release_privacy_fence(DB_FILE):
-        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
             conn.execute("BEGIN EXCLUSIVE")
             source_row_ids = {
                 int(row[0])
@@ -23681,7 +23681,7 @@ def _complete_delete_member_data_sync(
     user_id: int,
     confirmation: str,
 ) -> dict:
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         return complete_delete_member_data(
             conn,
             guild_id=guild_id,
@@ -24198,7 +24198,7 @@ def record_token_usage(
     reset = False
     attempt_log = None
     attempt_error = None
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         _ensure_token_usage_schema(cursor)
@@ -24393,7 +24393,7 @@ def _record_model_generation_attempt(
     reservation_id: str = "",
 ) -> None:
     today_pacific = _pacific_usage_date()
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         _ensure_token_usage_schema(cursor)
@@ -25025,7 +25025,7 @@ def _reserve_dollar_budget(contents: str, route: str) -> tuple[str, int]:
         )
     )
     reservation_id = uuid.uuid4().hex
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         _ensure_token_usage_schema(cursor)
@@ -25115,7 +25115,10 @@ def _reserve_dollar_budget(contents: str, route: str) -> tuple[str, int]:
 def _release_dollar_budget(reservation_id: str) -> None:
     if not reservation_id:
         return
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    # The inner connection retains existing commit/rollback behavior. The
+    # outer closing scope also releases its handle if an implicit commit fails
+    # on an older Python runtime; a connection context alone never closes it.
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         _ensure_token_usage_schema(conn.cursor())
         conn.execute(
             "DELETE FROM gemini_budget_reservations WHERE reservation_id=?",
@@ -25130,7 +25133,7 @@ def _retain_dollar_budget_through_month(reservation_id: str) -> None:
         return
     month_window = budget_month_window(_pacific_now())
     month_end_utc = month_window.ends_at_utc.isoformat()
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+    with closing(sqlite3.connect(DB_FILE, timeout=30)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         updated = conn.execute(
             """
@@ -25157,7 +25160,7 @@ def reserve_local_model_budget(
     lane = _protected_usage_lane(route)
     with _token_budget_reservation_lock:
         tokens_used, usage_date = get_usage_stats()
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             lane_usage = _generation_lane_usage_on_connection(
                 conn,
                 usage_date,
@@ -25260,7 +25263,7 @@ def release_local_model_budget(
 
 def get_usage_stats():
     check_and_reset_daily_counters()
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         result = conn.execute(
             """
             SELECT tokens_used_today, last_reset_date
@@ -25286,7 +25289,7 @@ def get_usage_breakdown() -> dict:
         config=config,
     )
     month_clause, month_params = _budget_month_event_scope(month_window)
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         _ensure_token_usage_schema(conn.cursor())
         lane_usage = _generation_lane_usage_on_connection(
             conn,
@@ -26209,7 +26212,7 @@ def build_community_visual_basis(
         if relay_normalize_text(text)
     }
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             rows = conn.execute(
                 """
                 SELECT id, user_id, content, timestamp
@@ -27356,7 +27359,7 @@ def apply_explicit_recall_governance(
             now=datetime.now(PACIFIC_TZ).isoformat(),
         )
         global_live_enabled = memory_governance_live_enabled()
-        with sqlite3.connect(DB_FILE) as gov_conn:
+        with closing(sqlite3.connect(DB_FILE)) as gov_conn, gov_conn:
             gov_result = build_governed_context(
                 gov_conn,
                 gov_req,
@@ -28521,9 +28524,9 @@ def _build_publication_prompt_source_basis(
     if DB_FILE == ":memory:" or not os.path.isfile(DB_FILE):
         return None
     try:
-        with sqlite3.connect(
+        with closing(sqlite3.connect(
             "file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1,
-        ) as conn:
+        )) as conn, conn:
             if source_kind == "journal":
                 # Check relevance locally before fetching website visibility.
                 selection = select_published_journal_entries_on_connection(
@@ -28609,9 +28612,9 @@ def _refresh_publication_prompt_source_basis(
             and any(isinstance(p, JournalPublication) for p in basis.publications)
         ):
             control_snapshot, _reason = _journal_publication_control_snapshot_sync()
-        with sqlite3.connect(
+        with closing(sqlite3.connect(
             "file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1,
-        ) as conn:
+        )) as conn, conn:
             digests = []
             for publication in basis.publications:
                 if isinstance(publication, JournalPublication):
@@ -29220,11 +29223,11 @@ def _active_episode_id_for_unified_assessment(
         if int(user_id or 0) > 0
     )
     try:
-        with sqlite3.connect(
+        with closing(sqlite3.connect(
             "file:%s?mode=ro" % DB_FILE,
             uri=True,
             timeout=0.1,
-        ) as episode_conn:
+        )) as episode_conn, episode_conn:
             reference = active_episode_for_assessment(
                 episode_conn,
                 guild_id=int(guild_id or 0),
@@ -29264,11 +29267,11 @@ def _recent_moment_situation_for_turn(
         if int(user_id or 0) > 0
     )
     try:
-        with sqlite3.connect(
+        with closing(sqlite3.connect(
             "file:%s?mode=ro" % DB_FILE,
             uri=True,
             timeout=0.1,
-        ) as moment_conn:
+        )) as moment_conn, moment_conn:
             return recent_moment_situation_for_assessment(
                 moment_conn,
                 guild_id=int(guild_id or 0),
@@ -29307,11 +29310,11 @@ def _relationship_state_for_turn(
     ):
         return None
     try:
-        with sqlite3.connect(
+        with closing(sqlite3.connect(
             "file:%s?mode=ro" % DB_FILE,
             uri=True,
             timeout=0.1,
-        ) as relation_conn:
+        )) as relation_conn, relation_conn:
             return get_relationship_state(
                 int(user_id),
                 int(guild_id),
@@ -31080,11 +31083,11 @@ def _render_unified_moment_canary_context(
             if int(user_id or 0) > 0
         )
         try:
-            with sqlite3.connect(
+            with closing(sqlite3.connect(
                 "file:%s?mode=ro" % DB_FILE,
                 uri=True,
                 timeout=0.1,
-            ) as episode_conn:
+            )) as episode_conn, episode_conn:
                 episode_context = render_active_episode_canary_context(
                     episode_conn,
                     guild_id=int(guild_id or 0),
@@ -31277,7 +31280,7 @@ def _conversation_prompt_selected_digest(
     message_id_expr = (
         "message_id" if has_message_id else "NULL AS message_id"
     )
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         rows = conn.execute(
             f"""
             SELECT id, role, content, user_id, user_name, channel_id,
@@ -35476,7 +35479,7 @@ async def publish_prepared_dormant_echo(
         return {"status": "not_ready", "reason": "prepared_echo_missing"}
     subject_user_id = int(prepared.get("subjectUserId") or 0)
     try:
-        with sqlite3.connect(DB_FILE, timeout=0.5) as relationship_conn:
+        with closing(sqlite3.connect(DB_FILE, timeout=0.5)) as relationship_conn, relationship_conn:
             consent_allowed, consent_reason = (
                 relationship_v2_proactive_consent_decision(
                     relationship_conn,
@@ -36657,7 +36660,7 @@ def _known_discord_identities_for_tiktok(guild_id: int) -> dict[int, tuple[str, 
 
     identities: dict[int, set[str]] = {}
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             tables = {
                 str(row[0] or "")
                 for row in conn.execute(
@@ -51661,7 +51664,7 @@ async def clear_history(interaction: discord.Interaction):
 async def memory_view(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         items = view_member_memory(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, limit=10)
     if not items:
         await interaction.response.send_message("No governed durable-memory items are currently associated with you in this server.", ephemeral=True); return
@@ -51675,7 +51678,7 @@ async def memory_view(interaction: discord.Interaction):
 async def memory_correct(interaction: discord.Interaction, reference: str, corrected_text: str):
     if not interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         result = correct_member_memory(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, safe_ref=reference.strip(), corrected_text=corrected_text.strip())
     msg = f"✅ Correction recorded. Receipt `{result.get('receipt')}`." if result.get("ok") else f"❌ Correction rejected: {result.get('reason')}"
     await interaction.response.send_message(msg, ephemeral=True)
@@ -51685,7 +51688,7 @@ async def memory_correct(interaction: discord.Interaction, reference: str, corre
 async def memory_forget(interaction: discord.Interaction, reference: str):
     if not interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         result = forget_member_memory(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, safe_ref=reference.strip())
     msg = f"✅ Memory item forgotten for governed retrieval. Receipt `{result.get('receipt')}`." if result.get("ok") else f"❌ Forget rejected: {result.get('reason')}"
     await interaction.response.send_message(msg, ephemeral=True)
@@ -51714,7 +51717,7 @@ async def relationship_settings(interaction: discord.Interaction, action: str = 
     if not interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
     action_norm = (action or "view").strip().lower()
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         if action_norm == "disable_proactive":
             set_relationship_v2_member_setting(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, proactive_enabled=False)
             msg = "✅ Proactive recognition and follow-up disabled for you in this server."

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import argparse
 import gzip
 import hashlib
@@ -244,7 +245,7 @@ def _read_source_snapshot(db_path: Path) -> tuple[list[dict], list[dict]]:
         raise RelayBackupValidationError("source_database_missing")
     uri = source.as_uri() + "?mode=ro"
     try:
-        with sqlite3.connect(uri, uri=True) as connection:
+        with closing(sqlite3.connect(uri, uri=True)) as connection, connection:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
             connection.execute("BEGIN")
@@ -651,7 +652,7 @@ def restore_to_isolated_db(
     elif target.is_dir():
         raise RelayBackupValidationError("restore_target_is_directory")
     try:
-        with sqlite3.connect(str(target)) as connection:
+        with closing(sqlite3.connect(str(target))) as connection, connection:
             connection.row_factory = sqlite3.Row
             _validate_restore_target_schema(connection)
             connection.commit()

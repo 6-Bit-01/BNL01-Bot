@@ -2,6 +2,7 @@
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -86,6 +87,7 @@ class MonthlyCapAlignmentTests(unittest.TestCase):
 
         self.ns = dict(
             __name__=__name__, dataclass=dataclass, sqlite3=sqlite3,
+            closing=closing,
             datetime=BudgetDateTime, date=date, timedelta=timedelta, timezone=timezone,
             Decimal=Decimal, os=os, uuid=uuid, logging=logging, DB_FILE=self.path,
             _NANODOLLARS_PER_USD=Decimal("1000000000"),

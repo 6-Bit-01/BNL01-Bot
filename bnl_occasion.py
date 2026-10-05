@@ -6,6 +6,7 @@ module only for the maintained calendar and same-database occurrence ledger.
 """
 from __future__ import annotations
 
+from contextlib import closing
 import calendar
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -1448,7 +1449,7 @@ def _json(value: Any) -> str:
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS bnl_occasion_calendar_state (
@@ -1556,7 +1557,7 @@ def seed_occurrences(
     now_iso = _iso(now_local)
     disabled = {str(value).strip() for value in disabled_ids if str(value).strip()}
     seeded: list[str] = []
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
@@ -1684,7 +1685,7 @@ def cancel_open_occurrences(
 ) -> int:
     ensure_schema(db_path)
     now_iso = _iso(_utc_now(now))
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         placeholders = ",".join("?" for _ in NONTERMINAL_STATES)
         changed = conn.execute(
             f"""
@@ -1733,7 +1734,7 @@ def claim_next_due(
     due_sql, due_params = _due_predicate(now_iso)
     token = uuid.uuid4().hex
     lease_expires = _iso(current + timedelta(minutes=max(1, int(lease_minutes))))
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -1819,7 +1820,7 @@ def store_prepared(
     now_iso = _iso(_utc_now(now))
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
     source_json = _json(list(source_refs))
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute(
             """
             SELECT guild_id,attempt_count
@@ -1891,7 +1892,7 @@ def fail_claim(
     retry_at = _iso(current + timedelta(minutes=max(1, int(retry_minutes))))
     expected_state = "delivering" if stage == "delivery" else "generating"
     next_state = "delivery_failed" if stage == "delivery" else "retryable"
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute(
             """
             SELECT guild_id,attempt_count,content_hash
@@ -1955,7 +1956,7 @@ def mark_published(
 ) -> bool:
     ensure_schema(db_path)
     now_iso = _iso(_utc_now(now))
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute(
             """
             SELECT guild_id,attempt_count,content_hash
@@ -2009,7 +2010,7 @@ def mark_published(
 
 def get_occurrence(db_path: str, occurrence_key_value: str) -> dict[str, Any]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM bnl_occasion_occurrences WHERE occurrence_key=?",
@@ -2023,7 +2024,7 @@ def occurrence_attempts(
     occurrence_key_value: str,
 ) -> list[dict[str, Any]]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -2061,7 +2062,7 @@ def capacity_state(
     )
     start_iso = _iso(start_local)
     end_iso = _iso(end_local)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         published_today = int(
             conn.execute(
                 """
@@ -2109,7 +2110,7 @@ def capacity_state(
 
 def diagnostics(db_path: str, guild_id: int) -> dict[str, Any]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         counts = dict(
             conn.execute(
                 """
