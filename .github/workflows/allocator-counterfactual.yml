@@ -22,8 +22,9 @@ jobs:
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: '1'
-      ALLOCATOR_OUTPUT: ${{ runner.temp }}/bnl-allocator-evidence
     steps:
+      - name: Set diagnostic output directory
+        run: printf 'ALLOCATOR_OUTPUT=%s/bnl-allocator-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out this diagnostic branch
         uses: actions/checkout@v4
         with:
