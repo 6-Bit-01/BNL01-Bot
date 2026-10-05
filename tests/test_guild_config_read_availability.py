@@ -8,6 +8,8 @@ an unavailable mandatory read must never reach them or invent configuration.
 import ast
 import asyncio
 import logging
+import re
+from functools import wraps
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -21,10 +23,22 @@ from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[1] / "bnl01_bot.py"
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
-FUNCTIONS = {"get_guild_config", "_sqlite_busy", "on_message"}
+FUNCTIONS = {
+    "get_guild_config", "_sqlite_busy", "on_message",
+    "_guard_direct_payload_capture_ingress", "_direct_session_key",
+    "_finish_direct_payload_capture_handoff", "_declared_canon_command_match",
+}
 OWNERS = [node for node in TREE.body
-          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-          and node.name in FUNCTIONS]
+          if (
+              isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and node.name in FUNCTIONS
+          ) or (
+              isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and (
+                  target.id == "SOURCE_INTERNAL_MODES"
+                  or (target.id.startswith("ROUTE_MODE_") and isinstance(node.value, ast.Constant))
+              ) for target in node.targets)
+          )]
 MODULE = ast.Module(body=[ast.ImportFrom(
     module="__future__", names=[ast.alias(name="annotations")], level=0,
 ), *OWNERS], type_ignores=[])
@@ -61,6 +75,13 @@ class GuildConfigReadAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             sqlite3=SimpleNamespace(connect=self.connect,
                                     OperationalError=sqlite3.OperationalError),
             closing=closing, asyncio=asyncio, logging=logging,
+            re=re, wraps=wraps,
+            _direct_payload_capture_waiters={},
+            # Pure route/payload inputs are outside this configuration-owner
+            # fixture. The actual capture wrapper and cleanup owner execute.
+            classify_route_mode=mock.Mock(return_value="normal_chat"),
+            _detect_request_payload_expectation=mock.Mock(return_value=(False, "")),
+            _collect_inline_direct_payload_items=mock.Mock(return_value=[]),
             time=SimpleNamespace(sleep=self.pause), DB_FILE=self.path,
             client=SimpleNamespace(user=object(), event=lambda handler: handler),
             channel_observation_expected=lambda _channel: False,
@@ -199,6 +220,26 @@ class GuildConfigReadAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.delays, [])
         self.assertEqual(self.timeouts, [5, 5])
         self.assert_owned_reads_closed()
+
+    async def test_deferred_capture_reservation_is_released_after_fatal_config_read(self):
+        self.ns["_detect_request_payload_expectation"].return_value = (True, "people")
+        self.message.content = "BNL, tell me something about each of these people"
+        entered = []
+        handler = self.ns["maybe_handle_declared_canon_command"]
+
+        async def observe_reservation(*_args):
+            entered.extend(self.ns["_direct_payload_capture_waiters"].values())
+            return False
+
+        handler.side_effect = observe_reservation
+        Path(self.path).write_bytes(b"invalid fixture database")
+        with self.assertRaisesRegex(sqlite3.DatabaseError, "file is not a database"):
+            await self.ns["on_message"](self.message)
+        self.assertEqual(len(entered), 1)
+        self.assertTrue(entered[0]["event"].is_set())
+        self.assertEqual(self.ns["_direct_payload_capture_waiters"], {})
+        self.assert_owned_reads_closed()
+        self.assert_no_capture_generation_or_delivery()
 
 
 if __name__ == "__main__":
