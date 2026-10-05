@@ -1,0 +1,123 @@
+# REVIEW COPY ONLY. Intended repository path:
+# .github/workflows/allocator-counterfactual.yml
+# The companion artifact is intended for scripts/allocator_show_counterfactual.py.
+name: Temporary neutral allocator evidence
+
+on:
+  push:
+    branches:
+      - codex/allocator-retention-evidence-20261005
+
+permissions:
+  contents: read
+
+concurrency:
+  group: allocator-evidence-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  neutral-allocator-counterfactual:
+    if: github.ref == 'refs/heads/codex/allocator-retention-evidence-20261005'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      ALLOCATOR_OUTPUT: ${{ runner.temp }}/bnl-allocator-evidence
+    steps:
+      - name: Check out this diagnostic branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Use Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install pinned dependencies before measurement
+        timeout-minutes: 4
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Record exact source and runtime
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, platform, sqlite3, subprocess
+          out = pathlib.Path(os.environ['ALLOCATOR_OUTPUT'])
+          out.mkdir(parents=True, exist_ok=False)
+          receipt = {
+              'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'python': platform.python_version(), 'sqlite': sqlite3.sqlite_version,
+              'libc': platform.libc_ver(), 'synthetic_only': True,
+              'scope': 'Diagnostic branch only; no deployment, private inputs or production access',
+          }
+          (out / 'source-runtime.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps(receipt, sort_keys=True))
+          PY
+      - name: Run bounded offline owner experiment
+        # Dependency download is finished. The helper denies socket networking,
+        # strips child environment to a noncredential allowlist, confines SQLite
+        # to its neutral fixture, caps measured child address space at 2 GiB,
+        # and limits its own affinity to at most two CPUs.
+        # Six persistent threads rotate through at most two simultaneous owners.
+        # 60s setup + four 180s children; a traced timeout is inconclusive.
+        run: |
+          timeout --signal=TERM --kill-after=5s 800s \
+            python scripts/allocator_show_counterfactual.py run \
+            --source "$GITHUB_WORKSPACE" \
+            --out "$ALLOCATOR_OUTPUT/measurements"
+      - name: Print compact machine receipts
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['ALLOCATOR_OUTPUT']) / 'measurements'
+          def emit(kind, value):
+              print(json.dumps({'kind': kind, 'receipt': value}, sort_keys=True))
+          supervisor = root / 'supervisor.json'
+          if supervisor.exists():
+              emit('supervisor', json.loads(supervisor.read_text()))
+          else:
+              emit('supervisor', {'status': 'unavailable_no_measurement_claim'})
+          fixture = root / 'fixture-receipt.json'
+          if fixture.exists():
+              data = json.loads(fixture.read_text())
+              keys = ('synthetic_only', 'show_count', 'added_rows', 'added_source_text_bytes',
+                      'stored_ledger_bytes_total', 'authored_messages_per_stored_show',
+                      'database_sha256', 'owner_sha256')
+              emit('fixture', {key: data[key] for key in keys})
+          for mode in ('native', 'python'):
+              for variant in ('default', 'arena2'):
+                  path = root / (variant + '-' + mode) / 'result.json'
+                  if not path.exists():
+                      emit('child', {'variant': variant, 'measurement': mode,
+                                     'status': 'incomplete_no_allocator_conclusion'})
+                      continue
+                  data = json.loads(path.read_text())
+                  keys = ('status', 'variant', 'measurement', 'python', 'glibc', 'cpu_affinity',
+                          'unique_worker_count', 'simultaneous_owner_limit', 'round_timings',
+                          'all_job_output_hashes_equal', 'output_sha256', 'fixture_unchanged')
+                  compact = {key: data[key] for key in keys}
+                  compact['snapshots'] = [{
+                      'label': item['label'], 'rss_kib': item.get('VmRSS'),
+                      'high_water_kib': item.get('VmHWM'), 'swap_kib': item.get('VmSwap'),
+                      'arena_count': item['malloc_info']['heap_count'],
+                      'malloc_allocated_bytes': item['mallinfo']['uordblks'],
+                      'malloc_free_bytes': item['mallinfo']['fordblks'],
+                      'mallinfo_overflow': item['mallinfo_overflow'],
+                      'python_current_bytes': item.get('python_current_bytes'),
+                      'python_peak_bytes': item.get('python_peak_bytes'),
+                  } for item in data['snapshots']]
+                  emit('child', compact)
+          PY
+      - name: Upload only neutral receipts and allocation statistics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neutral-allocator-evidence-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/bnl-allocator-evidence/source-runtime.json
+            ${{ runner.temp }}/bnl-allocator-evidence/measurements/supervisor.json
+            ${{ runner.temp }}/bnl-allocator-evidence/measurements/fixture-receipt.json
+            ${{ runner.temp }}/bnl-allocator-evidence/measurements/*.log
+            ${{ runner.temp }}/bnl-allocator-evidence/measurements/*/result.json
+            ${{ runner.temp }}/bnl-allocator-evidence/measurements/*/*.xml
