@@ -109,7 +109,7 @@ def prepare(args):
     assert not (args.out / 'fixture.sqlite').exists(), 'refuse_existing_fixture'
     db = args.out / 'fixture.sqlite'
     def fixture_audit(event, values):
-        if event == 'sqlite3.connect' and Path(values[0]).absolute() != db.absolute():
+        if event == 'sqlite3.connect' and Path(os.fsdecode(values[0])).absolute() != db.absolute():
             raise PermissionError('setup_nonfixture_database_denied')
     sys.addaudithook(fixture_audit)
     # Existing fixture routines use transaction contexts without closing them.
@@ -227,7 +227,7 @@ def guarded_connect(db, deadline):
 
 def confine_database(db):
     def audit(event, values):
-        if event == 'sqlite3.connect' and str(values[0]) != db.as_uri() + '?mode=ro':
+        if event == 'sqlite3.connect' and os.fsdecode(values[0]) != db.as_uri() + '?mode=ro':
             raise PermissionError('nonfixture_sqlite_denied')
     sys.addaudithook(audit)
 
