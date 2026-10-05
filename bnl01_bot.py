@@ -28901,7 +28901,6 @@ def build_named_public_conversation_context(
 
     try:
         with closing(_open_member_memory_read_connection()) as conn:
-            conn.execute("BEGIN")
             conn.create_function("member_recall_rank", 1, lambda content: len(
                 query_terms & memory_relevance_terms(str(content or ""))
             ))
@@ -31472,36 +31471,110 @@ def _read_bounded_member_memory(
     channel_id: int, connection: sqlite3.Connection | None = None,
     member_recall_query: str | None = None,
 ) -> tuple[str, dict]:
+    started = time.monotonic()
     metadata: dict = {}
-    with (nullcontext(connection) if connection is not None else
-          closing(_open_member_memory_read_connection())) as conn:
-        if connection is None:
-            conn.execute("BEGIN")
-        # Each member uses the same proven public reader. Suppressing receipt
-        # writes keeps selection and revalidation in one SQLite read snapshot.
-        build_user_memory_context(
-            user_id, guild_id, route_mode=route_mode,
-            channel_policy=channel_policy, user_text=user_text,
-            is_owner_or_mod=False, current_direct=current_direct,
-            governance_allowed=governance_allowed, channel_id=channel_id,
-            moment_attribution_target_user_id=0, source_metadata=metadata,
-            connection=conn, record_operational_diagnostics=False,
-            read_only=True,
-            member_recall_query=member_recall_query,
+    try:
+        with (nullcontext(connection) if connection is not None else
+              closing(_open_member_memory_read_connection())) as conn:
+            # Each member uses the same proven public reader. Suppressing receipt
+            # writes keeps selection and revalidation in one SQLite read snapshot.
+            build_user_memory_context(
+                user_id, guild_id, route_mode=route_mode,
+                channel_policy=channel_policy, user_text=user_text,
+                is_owner_or_mod=False, current_direct=current_direct,
+                governance_allowed=governance_allowed, channel_id=channel_id,
+                moment_attribution_target_user_id=0, source_metadata=metadata,
+                connection=conn, record_operational_diagnostics=False,
+                read_only=True,
+                member_recall_query=member_recall_query,
+            )
+            rendered = _bounded_member_memory_context(
+                metadata, speaker_label=speaker_label, budget_chars=budget_chars,
+                user_text=user_text,
+                member_recall_query=member_recall_query,
+            )
+    except BaseException as exc:
+        _log_member_memory_read_result(
+            "bounded", started, guild_id=guild_id, channel_id=channel_id, error=exc,
         )
-        rendered = _bounded_member_memory_context(
-            metadata, speaker_label=speaker_label, budget_chars=budget_chars,
-            user_text=user_text,
-            member_recall_query=member_recall_query,
-        )
+        raise
+    _log_member_memory_read_result(
+        "bounded", started, rendered, guild_id=guild_id, channel_id=channel_id,
+    )
     return rendered, metadata
 
 
-def _open_member_memory_read_connection() -> sqlite3.Connection:
-    """Read the initialized runtime DB; a missing path must never create one."""
-    return sqlite3.connect(
-        Path(DB_FILE).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25,
+def _member_memory_read_error_category(error) -> str:
+    if error is None:
+        return "none"
+    if _sqlite_busy(error):
+        return "busy_or_locked"
+    return "sqlite_other" if isinstance(error, sqlite3.DatabaseError) else "non_sqlite"
+
+
+def _member_memory_read_sqlite_code(error):
+    code = getattr(error, "sqlite_errorcode", None)
+    return code if isinstance(code, int) else "unavailable"
+
+
+def _log_member_memory_read_result(
+    owner, started, context="", *, guild_id: int, channel_id: int, error=None,
+):
+    # Completed rendering is not proof that every optional layer was available.
+    source_bearing = bool(error is None and any(
+        marker in str(context or "") for marker in _SOURCE_BEARING_MEMORY_MARKERS
+    ))
+    logging.info(
+        "member_memory_read_result owner=%s guild_id=%s channel_id=%s "
+        "status=%s source_bearing=%s "
+        "elapsed_ms=%s error_category=%s sqlite_code=%s",
+        owner, int(guild_id), int(channel_id or 0),
+        "completed" if error is None else "failed", int(source_bearing),
+        round((time.monotonic() - started) * 1000),
+        _member_memory_read_error_category(error),
+        _member_memory_read_sqlite_code(error),
     )
+
+
+def _open_member_memory_read_connection(*, busy_retries: int = 2) -> sqlite3.Connection:
+    """Acquire and pin a fresh initialized read snapshot before source work.
+
+    Failed connections close before bounded lock retries. A missing path never
+    creates a database; non-lock errors remain visible. At most three acquisition
+    attempts use a 250ms configured SQLite busy timeout with 50/100ms backoffs.
+    These parameters are not a wall-clock deadline.
+    """
+    retries = max(0, min(int(busy_retries), 2))
+    started = time.monotonic()
+    for attempt in range(retries + 1):
+        conn = None
+        try:
+            conn = sqlite3.connect(
+                Path(DB_FILE).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25,
+            )
+            conn.execute("BEGIN")
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        except BaseException as exc:
+            if conn is not None:
+                conn.close()
+            if _sqlite_busy(exc) and attempt < retries:
+                logging.warning("member_memory_snapshot_retry attempt=%s phase=acquire", attempt + 1)
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            logging.warning(
+                "member_memory_snapshot_acquire status=failed attempt=%s "
+                "elapsed_ms=%s error_category=%s sqlite_code=%s",
+                attempt + 1, round((time.monotonic() - started) * 1000),
+                _member_memory_read_error_category(exc),
+                _member_memory_read_sqlite_code(exc),
+            )
+            raise
+        logging.info(
+            "member_memory_snapshot_acquire status=acquired attempt=%s "
+            "elapsed_ms=%s error_category=none sqlite_code=unavailable",
+            attempt + 1, round((time.monotonic() - started) * 1000),
+        )
+        return conn
 
 
 async def build_user_memory_context_async(
@@ -31510,6 +31583,8 @@ async def build_user_memory_context_async(
 ) -> str:
     """Use the existing memory owner in one off-loop, read-only snapshot."""
     started = time.monotonic()
+    context = ""
+    error = None
     try:
         context, metadata = await asyncio.to_thread(
             _read_user_memory_snapshot, user_id, guild_id, **kwargs,
@@ -31518,12 +31593,21 @@ async def build_user_memory_context_async(
         if source_metadata is not None:
             source_metadata.update(metadata)
         return context
+    except BaseException as exc:
+        error = exc
+        raise
     finally:
         logging.info(
             "response_stage_timing stage=member_memory_read guild_id=%s "
-            "channel_id=%s elapsed_ms=%s",
+            "channel_id=%s elapsed_ms=%s status=%s source_bearing=%s error_category=%s",
             guild_id, int(kwargs.get("channel_id") or 0),
             round((time.monotonic() - started) * 1000),
+            ("cancelled" if isinstance(error, asyncio.CancelledError)
+             else "failed" if error is not None else "completed"),
+            int(error is None and any(
+                marker in str(context or "") for marker in _SOURCE_BEARING_MEMORY_MARKERS
+            )),
+            _member_memory_read_error_category(error),
         )
 
 
@@ -31541,28 +31625,44 @@ def _read_user_memory_snapshot(
             user_id, guild_id, source_metadata=metadata, read_only=True, **kwargs,
         )
         return context, metadata
+    started = time.monotonic()
     retries = max(0, min(int(busy_retries), 2))
     for attempt in range(retries + 1):
         # Failed attempts cannot donate partial context or source metadata to
-        # the next snapshot. Existing batch/presend callers remain one-attempt.
+        # the next snapshot. Batch/presend callers assemble source context once;
+        # only their initial snapshot acquisition receives the bounded grace.
         metadata: dict = {}
         try:
-            with closing(_open_member_memory_read_connection()) as conn:
-                conn.execute("BEGIN")
-                # Pin the read before any private Relationship/source work.
-                # A busy database remains an error, never valid empty memory.
-                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            # Direct prompts retain their existing whole-read retry. Each such
+            # attempt acquires once; other callers retry acquisition only.
+            with closing(_open_member_memory_read_connection(
+                busy_retries=0 if retries else 2,
+            )) as conn:
                 context = build_user_memory_context(
                     user_id, guild_id, source_metadata=metadata,
                     connection=conn, read_only=True, **kwargs,
                 )
+            _log_member_memory_read_result(
+                "user", started, context, guild_id=guild_id,
+                channel_id=kwargs.get("channel_id") or 0,
+            )
             return context, metadata
         except sqlite3.OperationalError as exc:
             if not _sqlite_busy(exc) or attempt == retries:
+                _log_member_memory_read_result(
+                    "user", started, guild_id=guild_id,
+                    channel_id=kwargs.get("channel_id") or 0, error=exc,
+                )
                 raise
-            logging.warning("member_memory_snapshot_retry attempt=%s", attempt + 1)
+            logging.warning("member_memory_snapshot_retry attempt=%s phase=read", attempt + 1)
             # The failed connection is closed before yielding to the writer.
             time.sleep(0.05 * (attempt + 1))
+        except BaseException as exc:
+            _log_member_memory_read_result(
+                "user", started, guild_id=guild_id,
+                channel_id=kwargs.get("channel_id") or 0, error=exc,
+            )
+            raise
 
 
 def build_named_public_member_memory_context(
@@ -31591,7 +31691,6 @@ def build_named_public_member_memory_context(
     governance_allowed = bool(memory_governance_live_enabled())
     try:
         with closing(_open_member_memory_read_connection()) as conn:
-            conn.execute("BEGIN")
             for subject in subjects:
                 label = _safe_prompt_display_label(subject.label_hint, "member")
                 context, metadata = _read_bounded_member_memory(
@@ -31644,7 +31743,6 @@ def build_batch_member_memory_context(
     members = []
     governance_allowed = bool(memory_governance_live_enabled())
     with closing(_open_member_memory_read_connection()) as conn:
-        conn.execute("BEGIN")
         for uid, label in labels.items():
             member_items = tuple(item for item in items if int(item[2] or 0) == uid)
             member_text = " ".join(str(item[1] or "") for item in member_items)
@@ -32258,7 +32356,6 @@ def refresh_prompt_source_basis(
     control_digest = basis.public_recall_control_digest
     if control_digest:
         with closing(_open_member_memory_read_connection()) as conn:
-            conn.execute("BEGIN")
             control_digest, _blocked_rows = _public_conversation_recall_controls(
                 conn, guild_id=basis.guild_id, source_users={
                     int(item.source_id): int(item.speaker_user_id)
@@ -44213,7 +44310,6 @@ def _guard_direct_payload_capture_ingress(handler):
 def _direct_payload_captured_source_basis(message, content: str, channel_policy: str):
     """Bind an accepted turn to its exact original and existing source controls."""
     with closing(_open_member_memory_read_connection()) as conn:
-        conn.execute("BEGIN")
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """SELECT id,role,content,user_id,user_name,channel_id,channel_name,

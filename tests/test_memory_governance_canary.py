@@ -302,12 +302,11 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
         self.assertNotIn("private fixture", expected)
         statements = []
         opened = []
+        connect = sqlite3.connect
 
-        def read_connection():
-            conn = sqlite3.connect(
-                Path(bnl01_bot.DB_FILE).resolve().as_uri() + "?mode=ro",
-                uri=True, timeout=0.02, check_same_thread=False,
-            )
+        def read_connection(*args, **kwargs):
+            kwargs.update(timeout=0.02, check_same_thread=False)
+            conn = connect(*args, **kwargs)
             conn.set_trace_callback(statements.append)
             opened.append(conn)
             return conn
@@ -317,7 +316,7 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
             writer.execute("BEGIN IMMEDIATE")
             actual_metadata = {}
             with mock.patch.object(
-                bnl01_bot, "_open_member_memory_read_connection", side_effect=read_connection,
+                sqlite3, "connect", side_effect=read_connection,
             ), mock.patch.object(bnl01_bot, "persist_shadow_diagnostics") as persist:
                 actual = asyncio.run(bnl01_bot.build_user_memory_context_async(
                     42, 1, **request, source_metadata=actual_metadata,
@@ -341,28 +340,28 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
         writer = sqlite3.connect(bnl01_bot.DB_FILE)
         opened = []
         metadata = {"previous": "unchanged"}
+        connect = sqlite3.connect
 
-        def read_connection():
-            conn = sqlite3.connect(
-                Path(bnl01_bot.DB_FILE).resolve().as_uri() + "?mode=ro",
-                uri=True, timeout=0.02, check_same_thread=False,
-            )
+        def read_connection(*args, **kwargs):
+            kwargs.update(timeout=0.02, check_same_thread=False)
+            conn = connect(*args, **kwargs)
             opened.append(conn)
             return conn
 
         try:
             writer.execute("BEGIN EXCLUSIVE")
             with mock.patch.object(
-                bnl01_bot, "_open_member_memory_read_connection", side_effect=read_connection,
+                sqlite3, "connect", side_effect=read_connection,
             ), self.assertRaises(sqlite3.OperationalError) as retained:
                 asyncio.run(bnl01_bot.build_user_memory_context_async(
                     42, 1, channel_policy="sealed_test", source_metadata=metadata,
                 ))
             self.assertIsNotNone(retained.exception)
             self.assertEqual(metadata, {"previous": "unchanged"})
-            self.assertEqual(len(opened), 1)
-            with self.assertRaises(sqlite3.ProgrammingError):
-                opened[0].execute("SELECT 1")
+            self.assertEqual(len(opened), 3)
+            for conn in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    conn.execute("SELECT 1")
         finally:
             writer.rollback()
             writer.close()

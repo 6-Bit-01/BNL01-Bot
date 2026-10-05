@@ -1071,7 +1071,6 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self._seed_group_member_sources(facts=True)
         with mock.patch.dict(os.environ, {"BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true"}):
             with bnl01_bot.closing(bnl01_bot._open_member_memory_read_connection()) as conn:
-                conn.execute("BEGIN")
                 statements = []
                 conn.set_trace_callback(statements.append)
                 context, _metadata = bnl01_bot._read_bounded_member_memory(
