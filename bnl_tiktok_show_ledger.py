@@ -2819,11 +2819,20 @@ def _load_show_related_sources(
             if original_message:
                 original_messages.add(original_message)
     if _table_columns(conn, "bnl_journal_source_events"):
+        # Older isolated archives may not have received the source owner's
+        # additive index yet. Installed archives must use the authored stream:
+        # SQLite otherwise prefers the broad public/time index without stats.
+        authored_index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='bnl_journal_source_events' "
+            "AND name='idx_bnl_journal_sources_authored_window'"
+        ).fetchone()
+        authored_hint = " INDEXED BY idx_bnl_journal_sources_authored_window" if authored_index else ""
         rows = conn.execute(
-            """SELECT source_kind,source_key,occurred_at_ms,subject_ref,
+            f"""SELECT source_kind,source_key,occurred_at_ms,subject_ref,
                       private_display_name,raw_text,metadata_json,content_hash,
                       channel_id,channel_policy
-               FROM bnl_journal_source_events
+               FROM bnl_journal_source_events{authored_hint}
                WHERE guild_id=? AND public_usable=1
                  AND source_kind IN ('tiktok_live_chat','discord_message')
                ORDER BY occurred_at_ms DESC,event_seq DESC LIMIT ?""",

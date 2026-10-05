@@ -7423,6 +7423,32 @@ def _add_column_if_missing(
         if "duplicate column name" not in str(exc).lower():
             raise
 
+def ensure_conversation_read_indexes(conn: sqlite3.Connection) -> None:
+    """Index existing source reads without changing their scope or ordering.
+
+    The setup caller owns migration/commit. Optional legacy columns may be
+    absent in isolated readers; create only indexes supported by that schema.
+    """
+
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(conversations)")}
+    indexes = (
+        ({"guild_id", "message_id"},
+         "CREATE INDEX IF NOT EXISTS idx_conversations_guild_message "
+         "ON conversations(guild_id,message_id)"),
+        ({"guild_id", "timestamp", "id", "role", "channel_policy"},
+         "CREATE INDEX IF NOT EXISTS idx_conversations_public_time "
+         "ON conversations(guild_id,datetime(timestamp) DESC,id DESC) "
+         "WHERE role IN ('user','model') AND channel_policy IN "
+         "('public_home','public_context','public_selective')"),
+        ({"guild_id", "user_id", "channel_id", "id", "channel_policy"},
+         "CREATE INDEX IF NOT EXISTS idx_conversations_member_scope "
+         "ON conversations(guild_id,user_id,channel_id,id,channel_policy)"),
+    )
+    for required, statement in indexes:
+        if required.issubset(columns):
+            conn.execute(statement)
+
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     ensure_journal_schema(DB_FILE)
@@ -7505,6 +7531,7 @@ def init_db():
         "ALTER TABLE conversations ADD COLUMN route_mode TEXT NOT NULL "
         "DEFAULT 'unknown'",
     )
+    ensure_conversation_read_indexes(conn)
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS conversation_history_backfill_cursors (
@@ -18959,7 +18986,11 @@ def get_guild_config(guild_id: int, *, busy_retries: int = 0):
     for attempt in range(retries + 1):
         try:
             with closing(sqlite3.connect(
-                DB_FILE, timeout=0.01 if retries else 5,
+                # Intake already runs this owner off the Discord event loop.
+                # Keep the quick fresh retries, then preserve the original
+                # five-second read allowance instead of abandoning a message
+                # on the short retry budget during a pending writer's commit.
+                DB_FILE, timeout=0.01 if attempt < retries else 5,
             )) as conn:
                 result = conn.execute(
                     "SELECT active_channel_id FROM guild_configs WHERE guild_id = ?", (guild_id,),
