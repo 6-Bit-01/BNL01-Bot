@@ -159,7 +159,6 @@ class DirectMemorySnapshotTests(unittest.IsolatedAsyncioTestCase):
         self._seed_source(policy="public_home")
         self._seed_source(role="model", audience=(self.runtime.user_id,))
         with closing(bot._open_member_memory_read_connection()) as conn:
-            conn.execute("BEGIN")
             context, metadata = self._compare_original_reader_assembly(conn)
         self.assertIn("cobalt blue", context)
         self.assertTrue(metadata["governed_basis_digest"])
@@ -170,7 +169,6 @@ class DirectMemorySnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def test_fresh_assembly_rechecks_correction_deletion_privacy_audience_and_revision(self):
         def snapshot():
             with closing(bot._open_member_memory_read_connection()) as conn:
-                conn.execute("BEGIN")
                 return self._compare_original_reader_assembly(conn)
         for name in ("revision", "audience", "correction", "privacy", "delete"):
             row_id, root = self._seed_source(role="model" if name == "audience" else "user",
@@ -272,7 +270,6 @@ class DirectMemorySnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         with closing(bot._open_member_memory_read_connection()) as conn, \
                 mock.patch.object(bot, "private_conversation_sources", side_effect=sources):
-            conn.execute("BEGIN")
             bot.build_user_memory_context(self.runtime.user_id, self.runtime.guild_id,
                 connection=conn, read_only=True, **self._memory_kwargs())
         self.assertEqual(len(calls), 2)  # The failed Relationship read is not cached for habits.
@@ -402,10 +399,11 @@ class WholeMemoryReadRetryTests(unittest.TestCase):
         writer = sqlite3.connect(self.path)
         self.addCleanup(writer.close)
         writer.execute("BEGIN EXCLUSIVE")
+        connect = sqlite3.connect
 
-        def open_read():
-            conn = sqlite3.connect(Path(self.path).resolve().as_uri() + "?mode=ro",
-                                  uri=True, timeout=0.01)
+        def open_read(*args, **kwargs):
+            kwargs["timeout"] = 0.01
+            conn = connect(*args, **kwargs)
             opened.append(conn)
             return conn
 
@@ -417,7 +415,7 @@ class WholeMemoryReadRetryTests(unittest.TestCase):
         def read(_user, _guild, **kwargs):
             return kwargs["connection"].execute("SELECT value FROM evidence").fetchone()[0]
 
-        with mock.patch.object(bot, "_open_member_memory_read_connection", side_effect=open_read), \
+        with mock.patch.object(sqlite3, "connect", side_effect=open_read), \
                 mock.patch.object(bot, "build_user_memory_context", side_effect=read) as reader, \
                 mock.patch.object(bot.time, "sleep", side_effect=release):
             context, metadata = bot._read_user_memory_snapshot(

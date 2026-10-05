@@ -973,8 +973,25 @@ class RelationshipMeaningRequest:
     prompt: str
 
 
+def _meaning_source_ledger_scope(entry: Mapping[str, Any], private_channel_id: int) -> tuple[bool, bool]:
+    """The scalar source fence's ledger checks, before any original is read."""
+    private = (private_channel_id > 0 and entry["channel_policy"] == "sealed_test"
+               and entry["channel_id"] == private_channel_id and entry["visibility"] == "sealed_test"
+               and not entry["public_usable"])
+    eligible = not (entry["source_table"] != "conversations" or not str(entry["source_row_id"]).isdigit()
+            or (not private and entry["visibility"] not in {"public", "public_safe"})
+            or (not private and entry["channel_policy"] not in PUBLIC_POLICIES)
+            or entry["route_mode"] not in RELATIONSHIP_LIVE_ROUTES
+            or entry["lifecycle_status"] not in {"active", "review_only"})
+    return private, eligible
+
+
+_SOURCE_ORIGINAL_UNREAD = object()
+
+
 def _meaning_source(conn: sqlite3.Connection, entry_id: str, *, guild_id: int,
-                    user_id: int, private_channel_id: int = 0) -> dict[str, Any] | None:
+                    user_id: int, private_channel_id: int = 0,
+                    _snapshot_source: tuple | None = None) -> dict[str, Any] | None:
     """Reopen original text through its current ledger identity and privacy fence.
 
     BNL's replies can explain what the human is answering. They cannot supply a
@@ -983,38 +1000,40 @@ def _meaning_source(conn: sqlite3.Connection, entry_id: str, *, guild_id: int,
     from bnl_memory_ledger import BNL_SUBJECT_KEY
     from bnl_moment_engine import _contains_sensitive_moment_source
 
-    if not _table_exists(conn, "conversations") or not _table_exists(conn, "memory_ledger_entries"):
-        return None
+    prepared = (_snapshot_source is not None
+                and _snapshot_source[:6] == (conn, conn.total_changes, guild_id,
+                                             user_id, private_channel_id, entry_id)
+                and conn.in_transaction)
+    if prepared:
+        entry, original, controlled = _snapshot_source[6:]
+    else:
+        if not _table_exists(conn, "conversations") or not _table_exists(conn, "memory_ledger_entries"):
+            return None
     # Reopen every field used by the source fence and returned DTO. Unused
     # archive payloads and identity labels are not needed for that judgment.
-    cursor = conn.execute("""SELECT source_table,source_row_id,channel_policy,channel_id,
-        visibility,public_usable,route_mode,lifecycle_status,source_role,normalized_value,
-        predicate_key,subject_key,derived,projection,source_revision,observed_at
-        FROM memory_ledger_entries WHERE entry_id=? AND guild_id=?""",
-        (entry_id, guild_id))
-    row = cursor.fetchone()
-    if not row:
-        return None
-    entry = dict(zip((column[0] for column in cursor.description), row))
-    private = (private_channel_id > 0 and entry["channel_policy"] == "sealed_test"
-               and entry["channel_id"] == private_channel_id and entry["visibility"] == "sealed_test"
-               and not entry["public_usable"])
-    if (entry["source_table"] != "conversations" or not str(entry["source_row_id"]).isdigit()
-            or (not private and entry["visibility"] not in {"public", "public_safe"})
-            or (not private and entry["channel_policy"] not in PUBLIC_POLICIES)
-            or entry["route_mode"] not in RELATIONSHIP_LIVE_ROUTES
-            or entry["lifecycle_status"] not in {"active", "review_only"}
-            or conn.execute("SELECT 1 FROM memory_ledger_lineage WHERE guild_id=? "
+        cursor = conn.execute("""SELECT source_table,source_row_id,channel_policy,channel_id,
+            visibility,public_usable,route_mode,lifecycle_status,source_role,normalized_value,
+            predicate_key,subject_key,derived,projection,source_revision,observed_at
+            FROM memory_ledger_entries WHERE entry_id=? AND guild_id=?""",
+            (entry_id, guild_id))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        entry = dict(zip((column[0] for column in cursor.description), row))
+    private, eligible = _meaning_source_ledger_scope(entry, private_channel_id)
+    if (not eligible
+            or (controlled if prepared else conn.execute("SELECT 1 FROM memory_ledger_lineage WHERE guild_id=? "
                             "AND target_entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')",
-                            (guild_id, entry_id)).fetchone()):
+                            (guild_id, entry_id)).fetchone())):
         return None
-    cursor = conn.execute("""SELECT id,role,content,channel_id,channel_policy,route_mode,timestamp
-        FROM conversations WHERE id=? AND guild_id=? AND user_id=?""",
-        (int(entry["source_row_id"]), guild_id, user_id))
-    row = cursor.fetchone()
-    if not row:
+    if not prepared or original is _SOURCE_ORIGINAL_UNREAD:
+        cursor = conn.execute("""SELECT id,role,content,channel_id,channel_policy,route_mode,timestamp
+            FROM conversations WHERE id=? AND guild_id=? AND user_id=?""",
+            (int(entry["source_row_id"]), guild_id, user_id))
+        row = cursor.fetchone()
+        original = dict(zip((column[0] for column in cursor.description), row)) if row else None
+    if original is None:
         return None
-    original = dict(zip((column[0] for column in cursor.description), row))
     role = original["role"]
     text = str(original["content"] or "")
     if (role != entry["source_role"] or role not in {"user", "model"}
@@ -1045,6 +1064,82 @@ def _meaning_source(conn: sqlite3.Connection, entry_id: str, *, guild_id: int,
             "ledger": {key: entry[key] for key in (
                 "subject_key", "source_revision", "source_role", "channel_policy", "route_mode",
                 "visibility", "public_usable", "derived", "projection", "lifecycle_status", "observed_at")}}
+
+
+_SCALAR_MEANING_SOURCE = _meaning_source
+
+
+def _private_sources_in_snapshot(conn: sqlite3.Connection, roots: list, *, guild_id: int,
+                                 user_id: int, channel_id: int):
+    """Stream only scoped source fields; the existing scalar fence decides eligibility.
+
+    Small ID batches bound SQL parameters, not source length or selection. Text is
+    stepped one row at a time so rejected oversized originals are never preloaded.
+    This input is valid only in this pinned transaction before any own writes.
+    """
+    changes = conn.total_changes
+    ledger_fields = ("source_table", "source_row_id", "channel_policy", "channel_id",
+        "visibility", "public_usable", "route_mode", "lifecycle_status", "source_role",
+        "normalized_value", "predicate_key", "subject_key", "derived", "projection",
+        "source_revision", "observed_at")
+    original_fields = ("id", "role", "content", "channel_id", "channel_policy", "route_mode", "timestamp")
+    columns = ",".join("e." + name for name in ledger_fields)
+    for start in range(0, len(roots), 24):
+        selected = [root for (root,) in roots[start:start + 24] if root is not None]
+        if not selected:
+            continue
+        cursor = conn.execute(f"""SELECT e.entry_id,{columns},
+            EXISTS(SELECT 1 FROM memory_ledger_lineage l WHERE l.guild_id=e.guild_id
+                AND l.target_entry_id=e.entry_id
+                AND l.lineage_type IN ('correction_of','supersedes','retracts'))
+            FROM memory_ledger_entries e INDEXED BY sqlite_autoindex_memory_ledger_entries_1
+            WHERE e.guild_id=? AND e.entry_id IN ({','.join('?' for _ in selected)})""",
+            (guild_id, *selected))
+        validated = {}
+        eligible = {}
+        try:
+            for row in cursor:
+                root = row[0]
+                entry = dict(zip(ledger_fields, row[1:17]))
+                controlled = row[17]
+                if _meaning_source_ledger_scope(entry, channel_id)[1] and not controlled:
+                    # Abnormally large metadata is handled alone by the same
+                    # validator, rather than retained beside a whole chunk.
+                    if sum(len(value) for value in entry.values() if isinstance(value, (str, bytes))) > 16384:
+                        prepared = (conn, changes, guild_id, user_id, channel_id, root,
+                                    entry, _SOURCE_ORIGINAL_UNREAD, controlled)
+                        source = _meaning_source(conn, root, guild_id=guild_id, user_id=user_id,
+                            private_channel_id=channel_id, _snapshot_source=prepared)
+                        if source is not None:
+                            validated[root] = source
+                        del prepared, source
+                    else:
+                        eligible.setdefault(int(entry["source_row_id"]), []).append((root, entry, controlled))
+                del row, entry
+        finally:
+            cursor.close()
+        if eligible:
+            cursor = conn.execute(f"""SELECT {','.join(original_fields)} FROM conversations
+                WHERE guild_id=? AND user_id=? AND id IN ({','.join('?' for _ in eligible)})""",
+                (guild_id, user_id, *eligible))
+            try:
+                for row in cursor:
+                    original = dict(zip(original_fields, row))
+                    for root, entry, controlled in eligible.pop(original["id"]):
+                        prepared = (conn, changes, guild_id, user_id, channel_id, root,
+                                    entry, original, controlled)
+                        source = _meaning_source(conn, root, guild_id=guild_id, user_id=user_id,
+                            private_channel_id=channel_id, _snapshot_source=prepared)
+                        if source is not None:
+                            validated[root] = source
+                        del prepared, source
+                    del row, original, entry
+            finally:
+                cursor.close()
+        # Only complete, validated DTOs survive the chunk. Ordering the raw
+        # payload query would make SQLite buffer oversized rejected originals.
+        for root in selected:
+            yield validated.get(root)
 
 
 def _meaning_digest(sources: list[dict[str, Any]]) -> str:
@@ -1115,9 +1210,21 @@ def private_conversation_sources(conn: sqlite3.Connection, *, guild_id: int,
         ORDER BY c.id,e.entry_id""", (guild_id, user_id, channel_id)).fetchall()
     sources = []
     seen = set()
-    for (root,) in roots:
-        source = _meaning_source(conn, root, guild_id=guild_id, user_id=user_id,
-                                 private_channel_id=channel_id)
+    # Direct callers retain scalar reads. The chat snapshot already pins a read
+    # transaction; only that scope can share the joined fields without weakening
+    # fresh reads between generation/revalidation awaits. An overridden source
+    # owner also retains its original call contract.
+    lineage_columns = set()
+    if conn.in_transaction and _meaning_source is _SCALAR_MEANING_SOURCE:
+        lineage_columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_ledger_lineage)")}
+    if conn.in_transaction and _meaning_source is _SCALAR_MEANING_SOURCE and {
+            'guild_id', 'target_entry_id', 'lineage_type'} <= lineage_columns:
+        candidates = _private_sources_in_snapshot(conn, roots, guild_id=guild_id,
+                                                  user_id=user_id, channel_id=channel_id)
+    else:
+        candidates = (_meaning_source(conn, root, guild_id=guild_id, user_id=user_id,
+                                      private_channel_id=channel_id) for (root,) in roots)
+    for source in candidates:
         if source and source['row_id'] not in seen:
             sources.append(source)
             seen.add(source['row_id'])

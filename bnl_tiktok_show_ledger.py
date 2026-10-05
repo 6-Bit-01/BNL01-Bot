@@ -266,6 +266,101 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _canonical_json_chunks(value: Any):
+    """Canonical characters for this owner's local, non-mutating JSON values.
+
+    Keep the existing C encoder for nested values and at most 64 top-level
+    list items per temporary string. All items are encoded; this is an
+    item-count bound, not a byte cap or source/history limit: the largest
+    nested value still encodes whole. Unexpected root shapes use the existing
+    whole-value encoder. Stored JSON formatting is unchanged.
+    """
+    if type(value) is not dict or any(type(key) is not str for key in value):
+        yield _canonical_json(value)
+        return
+    yield "{"
+    for ordinal, key in enumerate(sorted(value)):
+        if ordinal:
+            yield ","
+        yield _canonical_json(key)
+        yield ":"
+        item = value[key]
+        if type(item) is not list:
+            yield _canonical_json(item)
+            continue
+        yield "["
+        for start in range(0, len(item), 64):
+            if start:
+                yield ","
+            encoded = _canonical_json(item[start:start + 64])
+            yield encoded[1:-1]
+        yield "]"
+    yield "}"
+
+
+def _canonical_digest(value: Any) -> str:
+    digest = hashlib.sha256()
+    try:
+        for part in _canonical_json_chunks(value):
+            digest.update(part.encode("utf-8"))
+    except (TypeError, ValueError, RecursionError, UnicodeError):
+        # Preserve original error ordering and C-encoder recursion boundary
+        # on malformed inputs. Do not suppress a failed source validation.
+        return hashlib.sha256(json.dumps(value, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+    return digest.hexdigest()
+
+
+def _canonical_equal(left: Any, right: Any) -> bool:
+    """Exact canonical equality without retaining two whole JSON strings."""
+    def drain(parts):
+        for _part in parts:
+            pass
+
+    def next_nonempty(parts):
+        for part in parts:
+            if part:
+                return part
+        return None
+
+    try:
+        left_parts, right_parts = iter(_canonical_json_chunks(left)), iter(_canonical_json_chunks(right))
+        left_part = right_part = None
+        left_offset = right_offset = 0
+        while True:
+            if left_part is None:
+                left_part = next_nonempty(left_parts)
+                left_offset = 0
+            if right_part is None:
+                try:
+                    right_part = next_nonempty(right_parts)
+                except Exception:
+                    # Original equality completes left before encoding right.
+                    drain(left_parts)
+                    raise
+                right_offset = 0
+            if left_part is None or right_part is None:
+                same_end = left_part is None and right_part is None
+                drain(left_parts)
+                drain(right_parts)
+                return same_end
+            length = min(len(left_part) - left_offset, len(right_part) - right_offset)
+            if left_part[left_offset:left_offset + length] != right_part[right_offset:right_offset + length]:
+                # Validate all later values even after an early mismatch.
+                drain(left_parts)
+                drain(right_parts)
+                return False
+            left_offset += length
+            right_offset += length
+            if left_offset == len(left_part):
+                left_part = None
+            if right_offset == len(right_part):
+                right_part = None
+    except (TypeError, ValueError, RecursionError, UnicodeError):
+        return (json.dumps(left, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                == json.dumps(right, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
 def _safe_label(value: Any, limit: int = 220) -> str:
     return _SPACE_RE.sub(" ", str(value or "")).strip()[:limit].rstrip()
 
@@ -303,9 +398,7 @@ def _safe_document(value: Any) -> Optional[dict[str, Any]]:
         return None
     digest_payload = dict(value)
     digest_payload.pop("sourceDigest", None)
-    computed_digest = hashlib.sha256(
-        _canonical_json(digest_payload).encode("utf-8")
-    ).hexdigest()
+    computed_digest = _canonical_digest(digest_payload)
     if computed_digest != source_digest:
         return None
     return dict(value)
@@ -343,15 +436,13 @@ def _seal_authorized_show_ledger(
         for receipt in (authority, previous_authority):
             receipt.pop("archiveSourceRevision", None)
             receipt.pop("archiveSourceDigest", None)
-        if (_canonical_json(payload) == _canonical_json(previous_payload)
+        if (_canonical_equal(payload, previous_payload)
                 and authority == previous_authority):
             return prior
     sealed = dict(ledger)
     sealed.pop("sourceDigest", None)
     sealed["sourceAuthorization"] = dict(authorization_receipt)
-    sealed["sourceDigest"] = hashlib.sha256(
-        _canonical_json(sealed).encode("utf-8")
-    ).hexdigest()
+    sealed["sourceDigest"] = _canonical_digest(sealed)
     return _safe_document(sealed)
 
 
