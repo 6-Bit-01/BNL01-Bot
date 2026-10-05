@@ -44021,7 +44021,7 @@ def _is_deictic_payload_placeholder(text: str) -> bool:
     return bool(
         re.fullmatch(
             r"(?:each|all)?\s*(?:of\s+)?(?:these|those|the\s+following)"
-            r"(?:\s+(?:people|names|items|characters|folks|entries|ones))?",
+            r"(?:\s+[^,\r\n]+)?",
             normalized,
         )
     )
@@ -44029,29 +44029,51 @@ def _is_deictic_payload_placeholder(text: str) -> bool:
 
 def _collect_inline_direct_payload_items(clean_content: str):
     payload_items = []
+    literal_payload = False
     exact_name_echo = parse_exact_name_echo_instruction(clean_content)
     if exact_name_echo is not None:
         payload_items.extend(
             _split_exact_name_echo_payload(exact_name_echo)
         )
+        literal_payload = True
     multiline = _extract_multiline_request_payload(clean_content)
     if multiline and not payload_items:
         payload_items.extend(multiline.get("payload_items", []))
+        literal_payload = True
     if not payload_items:
         payload_expected, _payload_reason = _detect_request_payload_expectation(clean_content)
         inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE) if payload_expected else None
-        if inline_match:
+        # A list colon is not a numeric clock or URI/path colon.
+        delimiter = re.search(r"(?<!\d):(?![/\\])|:(?![\d/\\])", clean_content)
+        request_prefix = clean_content[:delimiter.start()] if delimiter else ""
+        if delimiter and _detect_request_payload_expectation(request_prefix)[0]:
+            candidate_text = clean_content[delimiter.end():].strip()
+            literal_payload = True
+        elif inline_match:
             candidate_text = inline_match.group(1).strip().rstrip(".!?")
-            candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
-            candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
-            if candidate_text:
-                parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
-                payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
+        else:
+            candidate_text = ""
+        if not literal_payload:
+            # A reference to described items is request wording, not the items.
+            # Explicitly delimited data keeps its literal names and titles.
+            supplied_items, intro_count = re.subn(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE)
+            supplied_items = re.sub(r"\b(?:please|thanks?)\b$", "", supplied_items, flags=re.IGNORECASE).strip(" ,")
+            if intro_count and supplied_items:
+                literal_payload = True
+            candidate_text = supplied_items
+            if not literal_payload and _is_deictic_payload_placeholder(candidate_text):
+                candidate_text = ""
+        if candidate_text:
+            parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
+            for item_index, part in enumerate(parts):
+                # Vet request prose before shape filtering can shift positions.
+                if not literal_payload and item_index == 0 and _is_deictic_payload_placeholder(part):
+                    continue
+                if _is_single_payload_like_item(part):
+                    payload_items.append(part)
     unique = []
     seen = set()
     for raw_item in payload_items:
-        if _is_deictic_payload_placeholder(raw_item):
-            continue
         key = _normalize_payload_item_key(raw_item)
         if not key or key in seen:
             continue
