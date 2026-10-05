@@ -8,6 +8,7 @@ not infer Discord identity, artist identity, canon, or relationship state.
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, replace
 from collections import Counter
 from datetime import datetime, timezone
@@ -970,11 +971,11 @@ def load_tiktok_show_source_events(
     if not db_file or db_file == ":memory:" or not os.path.exists(db_file):
         return None
     try:
-        with sqlite3.connect(
+        with closing(sqlite3.connect(
             "file:%s?mode=ro" % db_file,
             uri=True,
             timeout=0.5,
-        ) as conn:
+        )) as conn, conn:
             return _load_show_source_events(
                 conn,
                 guild_id=int(guild_id),
@@ -2881,7 +2882,7 @@ def load_show_timeline_discord_messages(
     if not db_file or not os.path.exists(db_file):
         return rows, False
     try:
-        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as conn:
+        with closing(sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5)) as conn, conn:
             result = _load_show_discord_exchanges(conn, guild_id=guild_id, show=show, messages_out=rows)
         return (rows, True) if result is not None else ([], False)
     except (sqlite3.DatabaseError, TypeError, ValueError):
@@ -3286,7 +3287,7 @@ def load_show_preparation_context(
     if not db_file or not os.path.exists(db_file):
         return ""
     try:
-        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as conn:
+        with closing(sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5)) as conn, conn:
             if _table_columns(conn, TIKTOK_SHOW_EVIDENCE_TABLE):
                 row = conn.execute(
                     f"SELECT ledger_json FROM {TIKTOK_SHOW_EVIDENCE_TABLE} WHERE guild_id=? AND show_key=?",
@@ -5185,7 +5186,7 @@ def build_tiktok_show_evidence_context(
             )
     preparation_contexts = []
     if show_preparation_requested(user_text) and selected:
-        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as prep_conn:
+        with closing(sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5)) as prep_conn, prep_conn:
             related = _load_show_related_sources(prep_conn, guild_id=guild_id)
             for _score, _recency, ledger, _matches in selected[:2]:
                 view = _show_preparation_view(
@@ -5207,7 +5208,7 @@ def build_tiktok_show_evidence_context(
             return "Durable BARCODE Radio show episode memory:\n" + "\n\n".join(preparation_contexts)
     if len(selected) == 1 and not original_lookups and not image_scopes and show_conversation_interval_requested(user_text):
         ledger = selected[0][2]
-        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as interval_conn:
+        with closing(sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5)) as interval_conn, interval_conn:
             messages, discord_complete = _show_interval_messages(interval_conn, guild_id=guild_id, ledger=ledger)
         interval = build_show_interval_conversation(ledger, user_text, messages=messages, discord_complete=discord_complete)
         if interval is not None:
@@ -5230,7 +5231,7 @@ def build_tiktok_show_evidence_context(
                            if message.get("surface") == "tiktok"]
                            for _score, _recency, ledger, _matches in selected}
         try:
-            with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as recall_conn:
+            with closing(sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5)) as recall_conn, recall_conn:
                 recall_messages = {str(ledger["showKey"]): _show_recall_messages(
                     recall_conn, guild_id=guild_id, ledger=ledger,
                 ) for _score, _recency, ledger, _matches in selected}
@@ -5262,7 +5263,7 @@ def build_tiktok_show_evidence_context(
     ]
     query_terms = _query_terms(selection_query if candidate_context else user_text)
     if _show_episode_scope_requested(user_text) or tiktok_engagement_requested(user_text):
-        with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5) as metrics_conn:
+        with closing(sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=0.5)) as metrics_conn, metrics_conn:
             for _score, _recency, selected_ledger, _matches in selected[:2]:
                 evidence = read_tiktok_engagement_evidence(metrics_conn, guild_id=guild_id,
                     source_window_ms=recorded_show_engagement_bounds(selected_ledger))
@@ -5758,7 +5759,7 @@ def build_broadcast_ballad_evidence(db_file: str, guild_id: int, show_id: str) -
     """
     if not db_file or not os.path.exists(db_file):
         return "", ""
-    with sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=2) as conn:
+    with closing(sqlite3.connect("file:%s?mode=ro" % db_file, uri=True, timeout=2)) as conn, conn:
         rows = _load_finalized_show_ledgers(conn, guild_id=guild_id, show_keys=(show_id,), limit=1)
         if not rows:
             return "", ""

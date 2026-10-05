@@ -5,6 +5,7 @@ The website owns controls/media/publication; the existing show ledger owns facts
 """
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import http.client
 import json
@@ -341,7 +342,7 @@ def _now():
 
 
 def initialize(db_file):
-    with sqlite3.connect(db_file) as conn:
+    with closing(sqlite3.connect(db_file)) as conn, conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS bnl_ballad_commands (
           guild_id INTEGER NOT NULL, command_id TEXT NOT NULL,
@@ -356,7 +357,7 @@ def initialize(db_file):
 
 def versions(db_file, guild_id, show_id):
     initialize(db_file)
-    with sqlite3.connect(db_file) as conn:
+    with closing(sqlite3.connect(db_file)) as conn, conn:
         return [json.loads(row[0]) for row in conn.execute(
             "SELECT document FROM bnl_ballad_versions WHERE guild_id=? AND show_id=? ORDER BY ordinal",
             (guild_id, show_id),
@@ -365,14 +366,14 @@ def versions(db_file, guild_id, show_id):
 
 def creative_history(db_file, guild_id, direction="", selected_versions=None, *, show_id=""):
     """Compact recent/related song references; full lyrics stay in the version store."""
-    with sqlite3.connect(db_file) as conn:
+    with closing(sqlite3.connect(db_file)) as conn, conn:
         rows = conn.execute("""SELECT document FROM bnl_ballad_versions v WHERE guild_id=?
           AND ordinal=(SELECT MAX(ordinal) FROM bnl_ballad_versions x
                        WHERE x.guild_id=v.guild_id AND x.show_id=v.show_id)
           ORDER BY rowid DESC""", (guild_id,)).fetchall()
     catalog = [json.loads(row[0]) for row in rows]
     if selected_versions:
-        with sqlite3.connect(db_file) as conn:
+        with closing(sqlite3.connect(db_file)) as conn, conn:
             for i, item in enumerate(catalog):
                 selected = selected_versions.get(item["showId"])
                 if selected and selected != item["id"]:
@@ -388,7 +389,7 @@ def creative_history(db_file, guild_id, direction="", selected_versions=None, *,
     # also need the other attempts for THIS episode, including edits and
     # restores, so alternating between two old ideas is not mistaken for range.
     if show_id:
-        with sqlite3.connect(db_file) as conn:
+        with closing(sqlite3.connect(db_file)) as conn, conn:
             attempts = conn.execute("""SELECT document FROM bnl_ballad_versions
                 WHERE guild_id=? AND show_id=? ORDER BY ordinal DESC LIMIT 64""",
                 (guild_id, show_id)).fetchall()
@@ -626,7 +627,7 @@ def parse_draft(raw, show_date, finish_reason="unknown"):
 
 
 def _save_receipt(db_file, guild_id, command, receipt, version=None):
-    with sqlite3.connect(db_file) as conn:
+    with closing(sqlite3.connect(db_file)) as conn, conn:
         if version:
             conn.execute("INSERT INTO bnl_ballad_versions VALUES (?,?,?,?,?)", (
                 guild_id, command["showId"], version["id"], version["ordinal"],
@@ -644,7 +645,7 @@ async def execute_command(db_file, guild_id, command, *, evidence_reader: Callab
     for key in ("id", "showId"):
         if not isinstance(command.get(key), str) or not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,160}", command[key]):
             raise ValueError("invalid_ballad_command")
-    with sqlite3.connect(db_file) as conn:
+    with closing(sqlite3.connect(db_file)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT state,receipt,created_at FROM bnl_ballad_commands WHERE guild_id=? AND command_id=?",
                            (guild_id, command["id"])).fetchone()

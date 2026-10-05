@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import json
 import logging
@@ -223,7 +224,7 @@ def next_preparation_times(now_utc: Optional[datetime] = None) -> tuple[str, str
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         # Serialize the legacy-column snapshot with every conditional ALTER.
         # Journal entrypoints can initialize concurrently during startup.
         conn.execute("BEGIN IMMEDIATE")
@@ -576,7 +577,7 @@ def ensure_cadence_activation(
     # release must not wait on the migration fence while another delivery owns
     # the network boundary.
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         state = conn.execute(
             "SELECT * FROM bnl_journal_automation_state WHERE guild_id=?",
@@ -608,7 +609,7 @@ def _ensure_cadence_activation_under_fence(
     """Activate the 6:30/7:00 cadence once without reinterpreting old rows."""
     ensure_schema(db_path)
     now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         state = conn.execute(
@@ -992,7 +993,7 @@ def store_journal_memory_exclusions(
     }
     now = utc_now_iso()
     with journal_release_privacy_fence(db_path):
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO bnl_journal_automation_state("
@@ -1013,7 +1014,7 @@ def load_journal_memory_exclusions(
 ) -> tuple[set[str], bool]:
     """Return the last confirmed exclusion set; never infer confirmed-empty."""
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         return _load_journal_memory_exclusions_on_connection(conn, guild_id)
 
 
@@ -1213,7 +1214,7 @@ def _record_generation_attempt_event(
         return
     phase = str(event.get("phase") or "")
     now = utc_now_iso()
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         token_boundary, model_boundary = _model_event_boundaries(conn)
         if phase == "started":
@@ -1311,7 +1312,7 @@ def _claim_preparation(
     now = datetime.now(timezone.utc)
     lease = _utc_iso(now + timedelta(minutes=LEASE_MINUTES))
     now_iso = _utc_iso(now)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM bnl_journal_automation_runs WHERE run_id=?", (run_id,)).fetchone()
@@ -1434,7 +1435,7 @@ def _finish_preparation(
             + timedelta(minutes=PREPARATION_RETRY_MINUTES)
         )
     finished_at = utc_now_iso()
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT guild_id FROM bnl_journal_automation_runs WHERE run_id=? AND preparation_epoch=? AND lifecycle_state='preparing'",
@@ -1819,7 +1820,7 @@ def _freeze_or_load_packet(
 
     # Fetch external authority before the write fence, and compare against the
     # actual packet under the fence. A different concurrent basis fails closed.
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         previous = conn.execute("SELECT frozen_packet_json FROM bnl_journal_automation_runs WHERE run_id=?", (run_id,)).fetchone()
     try:
         previous_packet = json.loads(previous[0] or "{}") if previous else {}
@@ -1830,7 +1831,7 @@ def _freeze_or_load_packet(
 
     # Fast recovery still takes the write lock: a privacy deletion and a
     # preparation owner can never pass one another between validation/return.
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
             "SELECT lifecycle_state,preparation_epoch,lease_expires_at,frozen_packet_json,frozen_packet_hash "
@@ -1852,7 +1853,7 @@ def _freeze_or_load_packet(
     packet = builder()
     publication_snapshot = ballads.publication_snapshot_for_basis(
         packet.get("privateSharedSourceProvenance", []) if isinstance(packet, dict) else [])
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
             "SELECT lifecycle_state,preparation_epoch,lease_expires_at,frozen_packet_json,frozen_packet_hash "
@@ -1895,7 +1896,7 @@ def _freeze_or_load_packet(
 
 
 def _latest_entry_row(db_path: str, guild_id: int, entry_id: str) -> Optional[dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT e.revision,e.lifecycle_state,e.content_hash,e.canonical_payload_bytes,m.metadata_json "
@@ -1926,7 +1927,7 @@ def _adopt_legacy_staged_revision(
     occurrence lifecycle. Legacy drafts were never approved and are handled by
     the normal frozen-packet regeneration path instead.
     """
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         run = conn.execute(
@@ -2224,7 +2225,7 @@ def _mark_prepared(
             ),
         )
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         run = conn.execute(
@@ -2386,7 +2387,7 @@ def _store_observation(
         for source in packet.get("privateSources", [])
     ]
     now = utc_now_iso()
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         if run_id or preparation_epoch is not None:
             if not run_id or preparation_epoch is None:
@@ -2470,7 +2471,7 @@ def _mark_observation(
     label: str,
     result: AutomationResult,
 ) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute(
             "UPDATE bnl_journal_observations SET lifecycle_state=?,"
             "journal_entry_id=?,journal_revision=?,updated_at=? "
@@ -2497,7 +2498,7 @@ def _reject_staged_revision_for_retry(
 ) -> bool:
     """Reject only while the same live preparation epoch owns the revision."""
     now = utc_now_iso()
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         run = conn.execute(
             "SELECT lifecycle_state,preparation_epoch,lease_expires_at "
@@ -2939,7 +2940,7 @@ def _claim_delivery(
     # network/finalization interval. This read remains an inexpensive shortcut
     # for direct tests and defensive callers.
     try:
-        with sqlite3.connect(db_path) as read_conn:
+        with closing(sqlite3.connect(db_path)) as read_conn, read_conn:
             read_conn.row_factory = sqlite3.Row
             active = read_conn.execute(
                 "SELECT * FROM bnl_journal_automation_runs WHERE run_id=?",
@@ -2961,7 +2962,7 @@ def _claim_delivery(
                 )
     except (sqlite3.Error, ValueError):
         pass
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         run = conn.execute("SELECT * FROM bnl_journal_automation_runs WHERE run_id=?", (run_id,)).fetchone()
@@ -3140,7 +3141,7 @@ def _finish_delivery(
             datetime.now(timezone.utc)
             + timedelta(minutes=DELIVERY_RETRY_MINUTES)
         )
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT guild_id FROM bnl_journal_automation_runs WHERE run_id=? AND delivery_epoch=? AND lifecycle_state='delivering'",
@@ -3180,7 +3181,7 @@ def _finish_invalidated_delivery(
     result: AutomationResult,
 ) -> AutomationResult:
     """Invalidate a staged revision found ineligible at the final POST fence."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT guild_id,journal_entry_id,journal_revision "
@@ -3480,7 +3481,7 @@ def release_prepared_entry(
     ``None`` so their existing explicit-review delivery path remains intact.
     """
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         latest = conn.execute(
             "SELECT e.revision,e.lifecycle_state,e.source_window_start,e.source_window_end,m.metadata_json "
@@ -3998,7 +3999,7 @@ def _weekly_packet(
         )
     else:
         daily_bounds, final_bound = _weekly_source_period_bounds(start, end)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         observations = conn.execute("""SELECT * FROM bnl_journal_observations
             WHERE guild_id=? AND source_window_start>=? AND source_window_end<=?
@@ -4389,7 +4390,7 @@ def run_weekly(
 
 def _archive_activation_day(db_path: str, guild_id: int) -> Optional[date]:
     try:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn, conn:
             row = conn.execute(
                 "SELECT activated_at_ms FROM bnl_journal_source_archive_state WHERE guild_id=?",
                 (guild_id,),
@@ -4489,7 +4490,7 @@ def _pending_daily_day(db_path: str, guild_id: int, now_utc: Optional[datetime])
         return None
     first = _parse_utc(transition_end).astimezone(PACIFIC).date() - timedelta(days=1)
     latest = _latest_daily_day(now_utc)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         rows = {}
         now = (now_utc or datetime.now(timezone.utc)).astimezone(
@@ -4585,7 +4586,7 @@ def _pending_week_monday(db_path: str, guild_id: int, now_utc: Optional[datetime
         return None
     first_monday = _parse_utc(transition_end).astimezone(PACIFIC).date() - timedelta(days=7)
     latest = _latest_week_monday(now_utc)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         rows = {}
         now = (now_utc or datetime.now(timezone.utc)).astimezone(
@@ -4665,7 +4666,7 @@ def _pending_legacy_run(
 ) -> Optional[dict[str, Any]]:
     """Return one preserved old-schedule obligation without reinterpreting it."""
     ensure_cadence_activation(db_path, guild_id, now_utc=now_utc)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         now = (now_utc or datetime.now(timezone.utc)).astimezone(
             timezone.utc
@@ -5088,7 +5089,7 @@ def run_scheduled(
         start, end = candidate_window(item)
         key = (cadence, start, end)
         if key not in candidate_rows:
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT * FROM bnl_journal_automation_runs "
@@ -5188,7 +5189,7 @@ def run_scheduled(
 def automation_status(db_path: str, guild_id: int) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     ensure_cadence_activation(db_path, guild_id, now_utc=now)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         state = conn.execute("SELECT * FROM bnl_journal_automation_state WHERE guild_id=?", (guild_id,)).fetchone()
         runs = conn.execute("""SELECT cadence,lifecycle_state,reason,journal_entry_id,journal_revision,

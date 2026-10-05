@@ -38,6 +38,23 @@ jobs:
       - name: Verify source and tests
         run: make check PYTHON=python
 
+  sqlite-legacy-runtime-cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Verify failed-commit cleanup on the deployed legacy Python patch
+        # A floating 3.9 matrix resolves to a newer patch with this CPython bug fixed.
+        # Run only neutral, standard-library regressions in the legacy container.
+        run: >-
+          docker run --rm --network none
+          -e PYTHONDONTWRITEBYTECODE=1
+          --mount "type=bind,source=$PWD,target=/workspace,readonly"
+          --workdir /workspace
+          python:3.9.5-slim-buster
+          python -m unittest discover -s tests -p 'test_sqlite_connection_lifetime.py' -v
+
   tiktok-live-transport-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 10
