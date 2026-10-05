@@ -229,6 +229,17 @@ def ensure_schema(db_path: str) -> None:
             "CREATE INDEX IF NOT EXISTS idx_bnl_journal_sources_public_window "
             "ON bnl_journal_source_events(guild_id, public_usable, occurred_at_ms)"
         )
+        # Authored show sources share one ordered stream across both kinds;
+        # excluding other source kinds here avoids filtering the whole archive.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bnl_journal_sources_authored_window "
+            "ON bnl_journal_source_events(guild_id, public_usable, occurred_at_ms, event_seq) "
+            "WHERE source_kind IN ('tiktok_live_chat','discord_message')"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bnl_journal_sources_kind_window "
+            "ON bnl_journal_source_events(guild_id, source_kind, public_usable, occurred_at_ms, event_seq)"
+        )
         conn.execute(
             """
             CREATE TRIGGER IF NOT EXISTS trg_bnl_journal_sources_no_duplicate_insert

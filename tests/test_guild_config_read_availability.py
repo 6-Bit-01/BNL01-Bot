@@ -185,10 +185,97 @@ class GuildConfigReadAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             writer.rollback()
         self.assertTrue(self.ns["_sqlite_busy"](caught.exception))
         self.assertEqual(len(self.opened), 3)
-        self.assertEqual(self.timeouts, [0.01, 0.01, 0.01])
+        self.assertEqual(self.timeouts, [0.01, 0.01, 5])
         self.assertEqual(self.delays, [0.05, 0.1])
         self.ns["upsert_user_profile"].assert_not_called()
         self.ns["conversation_surface_for_channel_policy"].assert_not_called()
+        self.assert_owned_reads_closed()
+        self.assert_no_capture_generation_or_delivery()
+
+    async def test_intake_survives_reader_and_pending_commit_beyond_quick_retry_window(self):
+        # A long background read can block another worker's COMMIT. In DELETE
+        # mode that pending writer also blocks new readers, including intake.
+        # Exercise that actual interaction without pausing/mocking the reader
+        # owner, its retry clock, SQLite, or the Discord event loop.
+        staged = threading.Event()
+        committed = threading.Event()
+        writer_errors = []
+
+        def write_new_configuration():
+            try:
+                with closing(sqlite3.connect(self.path, timeout=8)) as writer:
+                    writer.execute("BEGIN IMMEDIATE")
+                    writer.execute("UPDATE guild_configs SET active_channel_id=8810 WHERE guild_id=7700")
+                    staged.set()
+                    writer.commit()
+                    committed.set()
+            except BaseException as exc:
+                writer_errors.append(exc)
+                staged.set()
+
+        def pending_commit_blocks_new_reader():
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    with closing(sqlite3.connect(self.path, timeout=0)) as probe:
+                        probe.execute("SELECT active_channel_id FROM guild_configs").fetchall()
+                except sqlite3.OperationalError as exc:
+                    if self.ns["_sqlite_busy"](exc):
+                        return True
+                    raise
+                time.sleep(0.005)
+            return False
+
+        task = None
+        with closing(sqlite3.connect(self.path)) as background_reader:
+            self.assertEqual(background_reader.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            background_reader.execute("BEGIN")
+            self.assertEqual(background_reader.execute(
+                "SELECT active_channel_id FROM guild_configs WHERE guild_id=7700"
+            ).fetchone()[0], 8811)
+            worker = threading.Thread(target=write_new_configuration)
+            worker.start()
+            try:
+                self.assertTrue(await asyncio.to_thread(staged.wait, 5))
+                self.assertFalse(writer_errors)
+                self.assertTrue(await asyncio.to_thread(pending_commit_blocks_new_reader))
+                task = asyncio.create_task(self.ns["on_message"](self.message))
+
+                async def observe_pending_commit_retry():
+                    while not self.retry_seen.is_set() and not task.done():
+                        await asyncio.sleep(0.005)
+
+                await asyncio.wait_for(observe_pending_commit_retry(), 5)
+                self.assertTrue(self.retry_seen.is_set())
+
+                async def observe_final_read_attempt():
+                    while len(self.opened) < 3 and not task.done():
+                        await asyncio.sleep(0.005)
+
+                await asyncio.wait_for(observe_final_read_attempt(), 5)
+                self.assertEqual(len(self.opened), 3)
+                # Exceed the old nominal 180ms retry budget. Native SQLite
+                # waits and OS scheduling may add platform-dependent latency.
+                await asyncio.sleep(0.35)
+                self.assertFalse(task.done(), "a temporary pending commit discarded the message")
+                self.assertFalse(committed.is_set())
+                self.assertEqual(background_reader.execute(
+                    "SELECT active_channel_id FROM guild_configs WHERE guild_id=7700"
+                ).fetchone()[0], 8811)
+                background_reader.rollback()
+                with self.assertRaises(ConfigReadFinished):
+                    await asyncio.wait_for(task, 8)
+            finally:
+                background_reader.rollback()
+                await asyncio.to_thread(worker.join, 9)
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(writer_errors)
+        self.assertTrue(committed.is_set())
+        self.ns["conversation_surface_for_channel_policy"].assert_called_once_with("public_home", True)
+        self.ns["upsert_user_profile"].assert_called_once_with(100, 7700, "Test Member")
+        self.assertEqual(self.timeouts, [0.01, 0.01, 5])
         self.assert_owned_reads_closed()
         self.assert_no_capture_generation_or_delivery()
 
