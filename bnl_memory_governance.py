@@ -981,6 +981,7 @@ def build_governed_context(
     include_public_moment_gists: bool = False,
     initialize_schema: bool = True,
     private_fact_extractor=extract_user_facts,
+    _sealed_candidate_reader=None,
 ) -> GovernanceResult:
     diag = GovernanceDiagnostics(route_policy={"route_mode": req.route_mode, "channel_policy": req.channel_policy, "visibility": req.visibility_allowance})
     try:
@@ -1154,7 +1155,8 @@ def build_governed_context(
             )
     if {'derived_summary', 'first_party_record'} & allowed:
         try:
-            private_candidates = tuple(c for c in sealed_tier_candidates(conn, req, private_fact_extractor)
+            candidate_reader = _sealed_candidate_reader or sealed_tier_candidates
+            private_candidates = tuple(c for c in candidate_reader(conn, req, private_fact_extractor)
                                        if c.source_class in allowed)
             overrides = {c.predicate_key: c for c in private_candidates if c.source_type == 'sealed_member_fact'}
             cands = [c for c in cands if c.source_class != 'first_party_record' or c.predicate_key not in overrides

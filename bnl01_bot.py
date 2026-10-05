@@ -275,6 +275,8 @@ from bnl_memory_preview import (
 )
 from bnl_unified_response_assessment import (
     situation_subject_label_spans,
+    situation_request_texts,
+    source_dependent_task_texts,
     ConversationOrchestrationDecision,
     ConversationOrchestrationInput,
     ConversationEvidenceItem,
@@ -8479,6 +8481,7 @@ def get_relationship_state(
     *,
     connection: sqlite3.Connection | None = None,
     private_channel_id: int = 0,
+    _private_source_reader=None,
 ):
     conn = connection or sqlite3.connect(DB_FILE)
     owns_connection = connection is None
@@ -8494,7 +8497,8 @@ def get_relationship_state(
             (user_id, guild_id),
         )
         state = cursor.fetchone()
-        for source in private_conversation_sources(conn, guild_id=guild_id, user_id=user_id, channel_id=private_channel_id):
+        source_reader = _private_source_reader or private_conversation_sources
+        for source in source_reader(conn, guild_id=guild_id, user_id=user_id, channel_id=private_channel_id):
             if source['ledger']['route_mode'] not in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS}:
                 continue
             state = _advance_relationship_state(state, source['text'],
@@ -8597,6 +8601,7 @@ def get_user_habits(
     *,
     connection: sqlite3.Connection | None = None,
     private_channel_id: int = 0,
+    _private_source_reader=None,
 ):
     conn = connection or sqlite3.connect(DB_FILE)
     owns_connection = connection is None
@@ -8612,7 +8617,8 @@ def get_user_habits(
             (user_id, guild_id),
         )
         state = cursor.fetchone()
-        for source in private_conversation_sources(conn, guild_id=guild_id, user_id=user_id, channel_id=private_channel_id):
+        source_reader = _private_source_reader or private_conversation_sources
+        for source in source_reader(conn, guild_id=guild_id, user_id=user_id, channel_id=private_channel_id):
             if source['role'] == 'user' and source['ledger']['route_mode'] in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS}:
                 state = _advance_user_habits(state, source['text'], source['timestamp'])
         return state
@@ -12973,17 +12979,22 @@ def _declared_canon_mutation_summary(result, projection_states: list[str]) -> st
     )
 
 
+def _declared_canon_command_match(raw_text: str):
+    """Keep the raw Declared Canon control matcher shared with ingress."""
+    return re.match(
+        r"^!bnl\s+canon(?:\s+(.*))?$",
+        str(raw_text or "").strip(),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
 async def maybe_handle_declared_canon_command(
     message: discord.Message,
     clean_content: str,
 ) -> bool:
     """Handle strict owner-only Declared Canon JSON controls in R&D."""
 
-    match = re.match(
-        r"^!bnl\s+canon(?:\s+(.*))?$",
-        str(clean_content or "").strip(),
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    match = _declared_canon_command_match(clean_content)
     if not match:
         return False
     if not is_research_and_development_channel(message):
@@ -24132,6 +24143,7 @@ def record_token_usage(
     route: str,
     model: str,
     reservation_id: str = "",
+    _generation_attempt: tuple[str, int, bool, bool] | None = None,
 ) -> int:
     total_tokens = _usage_int(breakdown.total_tokens)
     if not total_tokens:
@@ -24153,6 +24165,8 @@ def record_token_usage(
         today_pacific,
     )
     reset = False
+    attempt_log = None
+    attempt_error = None
     with sqlite3.connect(DB_FILE, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
@@ -24202,6 +24216,33 @@ def record_token_usage(
         daily_total_row = cursor.execute(
             "SELECT tokens_used_today FROM token_usage WHERE id = 1"
         ).fetchone()
+        if _generation_attempt is not None:
+            attempt_route, attempt_number, is_retry, is_fallback = _generation_attempt
+            # Keep the successful attempt under the canonical writer lease.
+            # If diagnostics fail, preserve the charge and report the same
+            # accounting failure only after that charge has committed.
+            cursor.execute("SAVEPOINT generation_attempt_diagnostic")
+            try:
+                attempt_log = _insert_model_generation_attempt(
+                    cursor,
+                    breakdown,
+                    usage_date=today_pacific,
+                    route=attempt_route,
+                    model=model,
+                    outcome="success",
+                    attempt_number=attempt_number,
+                    is_retry=is_retry,
+                    is_fallback=is_fallback,
+                )
+            except Exception as exc:
+                # Some storage failures abort SQLite's whole transaction.
+                # Propagate those without emitting a committed-usage receipt;
+                # the existing provider owner retains the unaccounted lease.
+                if not conn.in_transaction:
+                    raise
+                cursor.execute("ROLLBACK TO generation_attempt_diagnostic")
+                attempt_error = exc
+            cursor.execute("RELEASE generation_attempt_diagnostic")
         cost_clock = pacific_budget_clock(date.fromisoformat(today_pacific))
         daily_cost_rollup = _event_cost_rollup(
             conn,
@@ -24252,6 +24293,10 @@ def record_token_usage(
         _nanos_to_usd(daily_cost_rollup["estimated_cost_nanos"]),
         _nanos_to_usd(monthly_cost_rollup["estimated_cost_nanos"]),
     )
+    if attempt_error is not None:
+        raise attempt_error
+    if attempt_log is not None:
+        _log_model_generation_attempt(attempt_log, reservation_id=reservation_id)
     return daily_total
 
 
@@ -24280,12 +24325,16 @@ def record_generation_token_usage(
             model,
             breakdown.total_tokens,
         )
-    daily_total = record_token_usage(
-        breakdown,
-        route=accounting_route,
-        model=model,
-        reservation_id=reservation_id,
-    )
+    if breakdown.total_tokens:
+        return record_token_usage(
+            breakdown,
+            route=accounting_route,
+            model=model,
+            reservation_id=reservation_id,
+            _generation_attempt=(route, attempt_number, is_retry, is_fallback),
+        )
+    # A success without token metadata or an estimate still has an attempt
+    # receipt, but must not create a zero-valued canonical usage event.
     _record_model_generation_attempt(
         breakdown,
         route=route,
@@ -24296,7 +24345,7 @@ def record_generation_token_usage(
         is_fallback=is_fallback,
         reservation_id=reservation_id,
     )
-    return daily_total
+    return 0
 
 
 def _record_model_generation_attempt(
@@ -24313,6 +24362,42 @@ def _record_model_generation_attempt(
     reservation_id: str = "",
 ) -> None:
     today_pacific = _pacific_usage_date()
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        _ensure_token_usage_schema(cursor)
+        _reset_token_counter_if_needed(cursor, today_pacific)
+        attempt_log = _insert_model_generation_attempt(
+            cursor,
+            breakdown,
+            usage_date=today_pacific,
+            route=route,
+            model=model,
+            outcome=outcome,
+            error_category=error_category,
+            provider_status=provider_status,
+            attempt_number=attempt_number,
+            is_retry=is_retry,
+            is_fallback=is_fallback,
+        )
+        conn.commit()
+    _log_model_generation_attempt(attempt_log, reservation_id=reservation_id)
+
+
+def _insert_model_generation_attempt(
+    cursor: sqlite3.Cursor,
+    breakdown: TokenUsageBreakdown,
+    *,
+    usage_date: str,
+    route: str,
+    model: str,
+    outcome: str,
+    error_category: str = "",
+    provider_status: int = 0,
+    attempt_number: int = 1,
+    is_retry: bool = False,
+    is_fallback: bool = False,
+) -> tuple[Any, ...]:
     safe_route = re.sub(
         r"[^a-zA-Z0-9_.:-]+",
         "_",
@@ -24326,64 +24411,54 @@ def _record_model_generation_attempt(
     cost_estimate = _estimate_breakdown_cost(
         breakdown,
         safe_model,
-        today_pacific,
+        usage_date,
     )
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
-        cursor = conn.cursor()
-        cursor.execute("BEGIN IMMEDIATE")
-        _ensure_token_usage_schema(cursor)
-        _reset_token_counter_if_needed(cursor, today_pacific)
-        cursor.execute(
-            """
-            INSERT INTO model_generation_attempts (
-                usage_date,
-                recorded_at,
-                route,
-                model,
-                outcome,
-                error_category,
-                provider_status_code,
-                prompt_tokens,
-                candidate_tokens,
-                thought_tokens,
-                cached_tokens,
-                total_tokens,
-                attempt_number,
-                is_retry,
-                is_fallback,
-                estimated_cost_nanos,
-                cost_priced,
-                pricing_version
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                today_pacific,
-                datetime.now(timezone.utc).isoformat(),
-                safe_route,
-                safe_model,
-                str(outcome or "unknown")[:40],
-                str(error_category or "")[:80],
-                _usage_int(provider_status),
-                _usage_int(breakdown.prompt_tokens),
-                _usage_int(breakdown.candidate_tokens),
-                _usage_int(breakdown.thought_tokens),
-                _usage_int(breakdown.cached_tokens),
-                _usage_int(breakdown.total_tokens),
-                max(1, _usage_int(attempt_number)),
-                1 if is_retry else 0,
-                1 if is_fallback else 0,
-                cost_estimate.estimated_cost_nanos,
-                1 if cost_estimate.priced else 0,
-                PRICING_VERSION,
-            ),
+    cursor.execute(
+        """
+        INSERT INTO model_generation_attempts (
+            usage_date,
+            recorded_at,
+            route,
+            model,
+            outcome,
+            error_category,
+            provider_status_code,
+            prompt_tokens,
+            candidate_tokens,
+            thought_tokens,
+            cached_tokens,
+            total_tokens,
+            attempt_number,
+            is_retry,
+            is_fallback,
+            estimated_cost_nanos,
+            cost_priced,
+            pricing_version
         )
-        conn.commit()
-    logging.info(
-        "model_generation_attempt reservation_id=%s route=%s model=%s outcome=%s "
-        "attempt=%s retry=%s fallback=%s total_tokens=%s "
-        "estimated_cost_usd=%s cost_priced=%s",
-        str(reservation_id or "none"),
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            usage_date,
+            datetime.now(timezone.utc).isoformat(),
+            safe_route,
+            safe_model,
+            str(outcome or "unknown")[:40],
+            str(error_category or "")[:80],
+            _usage_int(provider_status),
+            _usage_int(breakdown.prompt_tokens),
+            _usage_int(breakdown.candidate_tokens),
+            _usage_int(breakdown.thought_tokens),
+            _usage_int(breakdown.cached_tokens),
+            _usage_int(breakdown.total_tokens),
+            max(1, _usage_int(attempt_number)),
+            1 if is_retry else 0,
+            1 if is_fallback else 0,
+            cost_estimate.estimated_cost_nanos,
+            1 if cost_estimate.priced else 0,
+            PRICING_VERSION,
+        ),
+    )
+    return (
         safe_route,
         safe_model,
         outcome,
@@ -24391,12 +24466,22 @@ def _record_model_generation_attempt(
         bool(is_retry),
         bool(is_fallback),
         _usage_int(breakdown.total_tokens),
-        (
-            str(cost_estimate.estimated_cost_usd)
-            if cost_estimate.priced
-            else "unpriced"
-        ),
+        str(cost_estimate.estimated_cost_usd) if cost_estimate.priced else "unpriced",
         cost_estimate.priced,
+    )
+
+
+def _log_model_generation_attempt(
+    attempt_log: tuple[Any, ...],
+    *,
+    reservation_id: str = "",
+) -> None:
+    logging.info(
+        "model_generation_attempt reservation_id=%s route=%s model=%s outcome=%s "
+        "attempt=%s retry=%s fallback=%s total_tokens=%s "
+        "estimated_cost_usd=%s cost_priced=%s",
+        str(reservation_id or "none"),
+        *attempt_log,
     )
 
 
@@ -27742,10 +27827,48 @@ def build_user_memory_context(
         guild_id,
         connection=connection,
     )
+    private_source_reader = None
+    sealed_candidate_reader = None
+    if (read_only and connection is not None and connection.in_transaction
+            and policy == "sealed_test" and int(channel_id or 0) > 0):
+        # These validated tuples belong only to this synchronous build's
+        # pinned read. Every refresh/send check creates its own fresh build.
+        initial_changes = connection.total_changes
+        private_scope = (guild_id, user_id, int(channel_id))
+        snapshot_valid = True
+        private_sources = None
+        sealed_candidates = None
+        fact_extractor = extract_user_facts
+
+        def private_source_reader(conn, *, guild_id, user_id, channel_id):
+            nonlocal private_sources, snapshot_valid
+            if conn is connection and (not conn.in_transaction or conn.total_changes != initial_changes):
+                snapshot_valid = False
+            if (not snapshot_valid or conn is not connection
+                    or (guild_id, user_id, channel_id) != private_scope):
+                return private_conversation_sources(
+                    conn, guild_id=guild_id, user_id=user_id, channel_id=channel_id)
+            if private_sources is None:
+                private_sources = private_conversation_sources(
+                    conn, guild_id=guild_id, user_id=user_id, channel_id=channel_id)
+            return private_sources
+
+        def sealed_candidate_reader(conn, req, extractor):
+            nonlocal sealed_candidates, snapshot_valid
+            if conn is connection and (not conn.in_transaction or conn.total_changes != initial_changes):
+                snapshot_valid = False
+            if (not snapshot_valid or conn is not connection
+                    or (req.guild_id, req.subject_user_id, req.channel_id) != private_scope
+                    or req.channel_policy != policy or extractor is not fact_extractor):
+                return sealed_tier_candidates(conn, req, extractor)
+            if sealed_candidates is None:
+                sealed_candidates = sealed_tier_candidates(conn, req, extractor)
+            return sealed_candidates
+
     private_candidates = ()
     if policy == "sealed_test" and int(channel_id or 0) > 0:
         with (nullcontext(connection) if connection is not None else closing(sqlite3.connect(DB_FILE))) as private_conn:
-            private_candidates = sealed_tier_candidates(private_conn, GovernanceRequest(
+            private_candidates = (sealed_candidate_reader or sealed_tier_candidates)(private_conn, GovernanceRequest(
                 guild_id, user_id, route_mode, "discord_prompt_assembly", channel_id=int(channel_id),
                 channel_policy=policy, user_text=user_text), extract_user_facts)
         overrides = {c.predicate_key: c for c in private_candidates if c.source_type == 'sealed_member_fact'}
@@ -27756,6 +27879,7 @@ def build_user_memory_context(
         guild_id,
         connection=connection,
         private_channel_id=int(channel_id or 0) if policy == "sealed_test" else 0,
+        **({"_private_source_reader": private_source_reader} if private_source_reader is not None else {}),
     )
     journal = get_relationship_journal(
         user_id,
@@ -27768,6 +27892,7 @@ def build_user_memory_context(
         guild_id,
         connection=connection,
         private_channel_id=int(channel_id or 0) if policy == "sealed_test" else 0,
+        **({"_private_source_reader": private_source_reader} if private_source_reader is not None else {}),
     )
     tier_rows = get_memory_tiers(
         user_id,
@@ -28090,6 +28215,7 @@ def build_user_memory_context(
                     gov_req,
                     legacy_context=legacy_context,
                     private_fact_extractor=extract_user_facts,
+                    **({"_sealed_candidate_reader": sealed_candidate_reader} if sealed_candidate_reader is not None else {}),
                     include_review_moments=True,
                     initialize_schema=not read_only,
                     include_public_moment_gists=bool(
@@ -38024,7 +38150,9 @@ def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id
     text = (user_text or "").strip().lower()
     if not text:
         return {}
-    if _is_show_state_status_query(text) or len(text) <= 80 or bool(re.search(r"\b(it|that|this|why|how|when|what)\b", text)):
+    # Retain bounded prior evidence without assigning the current turn a task.
+    # The conversation coordinator decides whether the user is following up.
+    if text:
         return {
             "target_show_date": ctx.get("target_show_date", ""),
             "cleaned_summary": ctx.get("cleaned_summary", ""),
@@ -38032,21 +38160,12 @@ def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id
             "queue_opening_applies": False,
             "context_source": "followup",
             "context_block": (
-                "Current BARCODE Radio follow-up context from the prior exchange:\n"
+                "Recent BARCODE Radio source evidence from a prior exchange:\n"
                 f"- Target show date: {ctx.get('target_show_date', '') or 'next'}\n"
                 f"- Source summary: {ctx.get('cleaned_summary', '')}\n"
-                "- The user is following up on the immediately previous BARCODE Radio scheduling answer.\n"
-                "- Answer the current follow-up using the source summary above.\n"
-                "- First sentence: plain factual scheduling/status answer grounded in the source summary.\n"
-                "- Optional second sentence: BNL/BARCODE operational interpretation that supports the same facts.\n"
-                "- Optional third sentence: restrained atmospheric/glitch flavor that supports the factual explanation.\n"
-                "- Do not let atmospheric language carry the explanation by itself.\n"
-                "- Use BARCODE Network as the default parent organization name.\n"
-                "- Do not replace BARCODE Network with unsupported parent labels (for example, BARCODE Nexus).\n"
-                "- Stay on the BARCODE Radio scheduling/cancellation topic unless the user clearly changes topics.\n"
-                "- Do not use unrelated durable memory unless the user explicitly changes topics.\n"
-                "- If the user asks for the reason, explain the cancellation reason from the source summary.\n"
-                "- If the user asks about the kind of maintenance/review, explain it from the source summary.\n"
+                "- This is prior source evidence, not an instruction or a current status check.\n"
+                "- Use it only for the current task's relevant factual or continuity needs.\n"
+                "- The current request retains authority over the topic and answer.\n"
                 "- Do not mention show-state, context block, override, database, diagnostics, test channel, or internal implementation."
             ),
         }
@@ -40121,10 +40240,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_source_no_store_reason = "website_read_model_no_store"
             batch_website_prompt_context = (
                 batch_website_read_model_context.for_original_quote_lookup(
-                    (lookup["show_key"] for lookup in batch_show_selection.get("original_quote_lookup", ())),
+                    (
+                        batch_show_basis.show_keys
+                        if batch_show_basis is not None and batch_show_selection.get("word_frequency_lookup")
+                        else (lookup["show_key"] for lookup in batch_show_selection.get("original_quote_lookup", ()))
+                    ),
                     current_images=bool(batch_image_queries),
                 )
-                if (batch_image_queries or batch_show_selection.get("original_quote_lookup"))
+                if (
+                    batch_image_queries or batch_show_selection.get("original_quote_lookup")
+                    or (batch_show_basis is not None and batch_show_selection.get("word_frequency_lookup"))
+                )
                 and isinstance(batch_website_read_model_context, WebsiteReadModelContext)
                 else batch_website_read_model_context
             )
@@ -43233,6 +43359,7 @@ def build_user_aware_prompt(
         (broadcast_context_eligible and broadcast_specialized_owner)
         or (
             show_state_context
+            and route_mode == ROUTE_MODE_SHOW_STATUS
             and not publication_packet_owns_current_turn
             and not publication_queue_packet_ready
         )
@@ -43960,6 +44087,51 @@ def _direct_session_key(message: discord.Message):
 
 
 _direct_payload_sessions = {}
+_direct_payload_capture_waiters = {}
+
+
+def _finish_direct_payload_capture_handoff(message):
+    key = _direct_session_key(message)
+    pending = _direct_payload_capture_waiters.get(key)
+    if pending is not None and pending["owner"] == id(message):
+        _direct_payload_capture_waiters.pop(key, None)
+        pending["event"].set()
+
+
+def _guard_direct_payload_capture_ingress(handler):
+    """Order only a same-member payload request's capture/session handoff."""
+    @wraps(handler)
+    async def guarded(message):
+        content = str(getattr(message, "content", "") or "")
+        if (
+            not getattr(message, "guild", None)
+            or getattr(getattr(message, "author", None), "bot", False)
+            or getattr(message, "webhook_id", None)
+            or content.startswith("/")
+            or _declared_canon_command_match(content)
+        ):
+            return await handler(message)
+        command_mode = classify_route_mode(content)
+        if command_mode in SOURCE_INTERNAL_MODES or command_mode == ROUTE_MODE_OPERATOR_COMMAND:
+            return await handler(message)
+        key = _direct_session_key(message)
+        while (pending := _direct_payload_capture_waiters.get(key)) is not None:
+            await pending["event"].wait()
+        payload_expected, _ = _detect_request_payload_expectation(content)
+        if payload_expected and not _collect_inline_direct_payload_items(content):
+            _direct_payload_capture_waiters[key] = {
+                "owner": id(message), "event": asyncio.Event(),
+            }
+        try:
+            return await handler(message)
+        finally:
+            # Early denial, failed capture and cancellation must not strand
+            # followers or manufacture an accepted payload session.
+            _finish_direct_payload_capture_handoff(message)
+
+    return guarded
+
+
 _rd_ops_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CONTEXT_MAX_TURNS))
 _rd_ops_channel_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CHANNEL_CONTEXT_MAX_TURNS))
 _broadcast_memory_denial_last_at = {}
@@ -44185,6 +44357,7 @@ def _start_direct_payload_session(
         "current_turn_context": current_turn_context,
     }
     _direct_payload_sessions[session_key] = session
+    _finish_direct_payload_capture_handoff(message)
     session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
     logging.info(
         "direct_payload_session_created guild_id=%s channel_id=%s user_id=%s channel_policy=%s",
@@ -44245,6 +44418,7 @@ async def _maybe_start_deferred_payload_session(
         conversation_plan.should_reply
         and conversation_plan.response_timing == RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION
     ):
+        _finish_direct_payload_capture_handoff(message)
         return False
     await _preempt_pending_batch_for_deferred_session(message.channel)
     recall_guard = get_conversation_recall_guard_response(
@@ -44254,6 +44428,7 @@ async def _maybe_start_deferred_payload_session(
         message.channel.id,
     )
     if recall_guard:
+        _finish_direct_payload_capture_handoff(message)
         await message.reply(recall_guard, allowed_mentions=discord.AllowedMentions.none())
         logging.info(
             "direct_payload_session_start_blocked reason=recall_guard guild_id=%s channel_id=%s user_id=%s",
@@ -45626,6 +45801,26 @@ async def apply_guarded_response_regeneration(
 
     def reply_referent_grounding(candidate: str):
         basis = exact_reply_basis()
+        bound_frame = (
+            situation_frame
+            if diagnostics["situation_frame_revalidation_status"] == "valid"
+            else None
+        )
+        dependent_tasks = source_dependent_task_texts(
+            bound_frame,
+            current_text=situation_frame_current_text or current_user_text,
+        )
+        request_tasks = situation_request_texts(
+            bound_frame,
+            current_text=situation_frame_current_text or current_user_text,
+        )
+        # A verified independent request is not a transformation of the Discord
+        # reply target. Missing or mismatched frames retain the original guard.
+        applicable = dependent_tasks != ()
+        independent_tasks = tuple(
+            task for task in (request_tasks or ())
+            if dependent_tasks is not None and task not in dependent_tasks
+        )
         return assess_reply_referent_grounding(
             candidate,
             referent_texts=(
@@ -45633,7 +45828,7 @@ async def apply_guarded_response_regeneration(
                     item.text
                     for item in basis.referent_source_evidence_items
                 )
-                if basis is not None
+                if basis is not None and applicable
                 else ()
             ),
             competing_texts=(
@@ -45647,6 +45842,7 @@ async def apply_guarded_response_regeneration(
             scope_expanded=bool(
                 basis is not None and basis.referent_scope_expanded
             ),
+            independent_task_texts=independent_tasks,
         )
 
     def payload_grounding(candidate: str):
@@ -48868,6 +49064,7 @@ def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: 
     return base_prompt + "\n" + "\n".join(lines)
 
 @client.event
+@_guard_direct_payload_capture_ingress
 async def on_message(message: discord.Message):
     print("BNL DEBUG: on_message triggered")
     if message.author == client.user or not message.guild:
@@ -49856,9 +50053,10 @@ async def on_message(message: discord.Message):
                 return
 
             show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
+            explicit_show_request = bool(show_state_ctx)
             if not show_state_ctx:
                 show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
-            if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
+            if explicit_show_request and route_mode == ROUTE_MODE_NORMAL_CHAT:
                 route_mode = ROUTE_MODE_SHOW_STATUS
                 conversation_plan = plan_conversation_response(
                     direct_content,
@@ -50030,7 +50228,7 @@ async def on_message(message: discord.Message):
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
             show_state_route = "get_gemini_response"
-            if show_state_ctx:
+            if explicit_show_request:
                 show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
             ordinary_chat_generation_metadata: dict = {}
             ordinary_chat_execution = (
@@ -50136,7 +50334,7 @@ async def on_message(message: discord.Message):
                 )
 
             if not response:
-                if show_state_ctx:
+                if explicit_show_request:
                     response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
                 else:
                     _finish_direct_repair_generation(direct_repair_generation, "generation_failed")
@@ -50160,7 +50358,7 @@ async def on_message(message: discord.Message):
                 source_context_available=source_context_available,
                 direct_repair_generation=direct_repair_generation,
                 allow_greeting_on_commit=allow_greeting,
-                show_state_context_on_commit=show_state_ctx,
+                show_state_context_on_commit=show_state_ctx if explicit_show_request else None,
                 conversation_continuity_required=bool(
                     prompt_metadata.get("conversation_continuity_required")
                     or direct_orchestration.continuity_required
@@ -50307,6 +50505,15 @@ async def on_message(message: discord.Message):
 
         await asyncio.to_thread(save_user_message, message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
 
+        if await _maybe_start_deferred_payload_session(
+            message,
+            conversation_plan,
+            channel_policy=channel_policy,
+            request_text=direct_content,
+            current_turn_context=current_turn_context,
+        ):
+            return
+
         self_reflection = (
             ""
             if (
@@ -50397,9 +50604,10 @@ async def on_message(message: discord.Message):
         if payload_expected:
             route_mode = ROUTE_MODE_DIRECT_PAYLOAD
         show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
+        explicit_show_request = bool(show_state_ctx)
         if not show_state_ctx:
             show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
-        if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
+        if explicit_show_request and route_mode == ROUTE_MODE_NORMAL_CHAT:
             route_mode = ROUTE_MODE_SHOW_STATUS
             conversation_plan = plan_conversation_response(
                 direct_content,
@@ -50575,7 +50783,7 @@ async def on_message(message: discord.Message):
                 payload_count=len(direct_payload_items),
             )
         show_state_route = "get_gemini_response"
-        if show_state_ctx:
+        if explicit_show_request:
             show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
         ordinary_chat_generation_metadata: dict = {}
         ordinary_chat_execution = (
@@ -50681,7 +50889,7 @@ async def on_message(message: discord.Message):
             )
 
         if not response:
-            if show_state_ctx:
+            if explicit_show_request:
                 response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
             else:
                 _finish_direct_repair_generation(direct_repair_generation, "generation_failed")
@@ -50704,7 +50912,7 @@ async def on_message(message: discord.Message):
             source_context_available=source_context_available,
             direct_repair_generation=direct_repair_generation,
             allow_greeting_on_commit=allow_greeting,
-            show_state_context_on_commit=show_state_ctx,
+            show_state_context_on_commit=show_state_ctx if explicit_show_request else None,
             conversation_continuity_required=bool(
                 prompt_metadata.get("conversation_continuity_required")
                 or direct_orchestration.continuity_required
@@ -50793,6 +51001,15 @@ async def on_message(message: discord.Message):
             return
 
         await asyncio.to_thread(save_user_message, message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
+
+        if await _maybe_start_deferred_payload_session(
+            message,
+            conversation_plan,
+            channel_policy=channel_policy,
+            request_text=direct_content,
+            current_turn_context=current_turn_context,
+        ):
+            return
 
         self_reflection = (
             ""
@@ -50884,9 +51101,10 @@ async def on_message(message: discord.Message):
         if payload_expected:
             route_mode = ROUTE_MODE_DIRECT_PAYLOAD
         show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
+        explicit_show_request = bool(show_state_ctx)
         if not show_state_ctx:
             show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
-        if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
+        if explicit_show_request and route_mode == ROUTE_MODE_NORMAL_CHAT:
             route_mode = ROUTE_MODE_SHOW_STATUS
             conversation_plan = plan_conversation_response(
                 direct_content,
@@ -51062,7 +51280,7 @@ async def on_message(message: discord.Message):
                 payload_count=len(direct_payload_items),
             )
         show_state_route = "get_gemini_response"
-        if show_state_ctx:
+        if explicit_show_request:
             show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
         ordinary_chat_generation_metadata: dict = {}
         ordinary_chat_execution = (
@@ -51168,7 +51386,7 @@ async def on_message(message: discord.Message):
             )
 
         if not response:
-            if show_state_ctx:
+            if explicit_show_request:
                 response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
             else:
                 _finish_direct_repair_generation(direct_repair_generation, "generation_failed")
@@ -51191,7 +51409,7 @@ async def on_message(message: discord.Message):
             source_context_available=source_context_available,
             direct_repair_generation=direct_repair_generation,
             allow_greeting_on_commit=allow_greeting,
-            show_state_context_on_commit=show_state_ctx,
+            show_state_context_on_commit=show_state_ctx if explicit_show_request else None,
             conversation_continuity_required=bool(
                 prompt_metadata.get("conversation_continuity_required")
                 or direct_orchestration.continuity_required

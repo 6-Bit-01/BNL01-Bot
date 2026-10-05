@@ -24,7 +24,10 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from bnl_canon_source_contract import BNL01, CANON_ENTITY_IDENTITIES
 from bnl_conversation_context_v2 import (
+    CURRENT_TURN_NAMED_PAYLOAD_RE,
     assess_payload_grounding,
+    nearby_contribution_referent_requested,
+    publication_continuation_requested,
     publication_reference_context,
 )
 
@@ -400,7 +403,7 @@ _BNL_SELF_SUBJECT_CUE_RE = re.compile(
 )
 _TASK_LEAD_RE = re.compile(
     r"(?:what|which|who|where|when|why|how|tell|explain|summari[sz]e|"
-    r"restate|repeat|recap|remind|paraphrase|recommend|suggest|list|"
+    r"restate|repeat|recap|remind|paraphrase|improve|rewrite|recommend|suggest|list|"
     r"compare(?:s|d)?|describe|give|show|help|check|find|choose|try|test|"
     r"is|are|do|does|did|can|could|would|should)\b",
     re.I,
@@ -743,18 +746,35 @@ def _situation_task_parts(
     explicit question.
     """
 
-    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    # Keep line boundaries until task extraction; rendered task strings retain
+    # the same whitespace normalization as before.
+    value = re.sub(r"[^\S\n]+", " ", str(text or "")).strip()
     if not value:
         return ()
     boundary = re.compile(
-        r"(?:[?!.]+\s+|,?\s+(?:and|also|plus|then)\s+|,\s+)"
+        r"(?:(?:[?!.;]+\s+|\n+\s*)(?:(?:and|also|plus|then)\s+)?"
+        r"|,?\s+(?:and|also|plus|then)\s+|,\s+)"
         r"(?=(?:(?:briefly|please|quickly|first)\s+)*%s)"
         % _TASK_LEAD_RE.pattern,
         re.I,
     )
+    # Quoted source text and code are payload, not additional instructions.
+    # Do not turn their internal punctuation or line breaks into task owners.
+    quoted_spans = tuple(match.span() for match in re.finditer(
+        r'```[\s\S]*?```|`[^`\n]*`|"(?:\\.|[^"\\])*"|“[^”]*”|‘[^’]*’'
+        r"|(?<!\w)'(?:\\.|[^'\\]|(?<=\w)'(?=\w))*'(?!\w)",
+        value,
+    ))
+
+    def normalized_segment(start: int, end: int) -> str:
+        return re.sub(r"\s+", " ", value[start:end]).strip(" ,;.!?")
+
     ranges = []
     start = 0
     for match in boundary.finditer(value):
+        if any(quote_start <= match.start() < quote_end
+               for quote_start, quote_end in quoted_spans):
+            continue
         if value[start:match.start()].strip(" ,;.!?"):
             ranges.append((start, match.start()))
         start = match.end()
@@ -793,7 +813,7 @@ def _situation_task_parts(
     merged_ranges = []
     pending_start = None
     for start, end in ranges:
-        segment = value[start:end].strip(" ,;.!?")
+        segment = normalized_segment(start, end)
         if pending_start is None:
             pending_start = start
         if explicit_task(segment):
@@ -809,9 +829,9 @@ def _situation_task_parts(
     parts = []
     previous_clause = ""
     for start, end, task_start, task_end in merged_ranges:
-        full_segment = value[start:end].strip(" ,;.!?")
-        clause = value[task_start:task_end].strip(" ,;.!?")
-        setup = value[start:task_start].strip(" ,;.!?")
+        full_segment = normalized_segment(start, end)
+        clause = normalized_segment(task_start, task_end)
+        setup = normalized_segment(start, task_start)
         scoped_clause = _publication_task_continuation(
             clause, setup or previous_clause,
         )
@@ -963,6 +983,77 @@ def situation_task_texts(
     ):
         return ()
     return segments
+
+
+def _bound_situation_task_parts(
+    frame: SituationFrameV1 | None,
+    *,
+    current_text: str,
+) -> Optional[Tuple[Tuple[str, str, str], ...]]:
+    bound_texts = situation_task_texts(frame, current_text=current_text)
+    if not bound_texts or not frame.route_allowed:
+        return None
+    return _situation_task_parts(
+        str(current_text or ""),
+        context_labels=(
+            *frame.current_speaker_labels,
+            *(subject.label_hint for subject in frame.subjects),
+        ),
+    )
+
+
+def situation_request_texts(
+    frame: SituationFrameV1 | None,
+    *,
+    current_text: str,
+) -> Optional[Tuple[str, ...]]:
+    """Recover ordered action clauses only from the verified current frame.
+
+    Incidental setup remains in the original task/prompt, but cannot authorize
+    an unrelated guard exemption. ``None`` retains fail-closed checking when
+    the current request cannot be bound to the frame.
+    """
+
+    parts = _bound_situation_task_parts(frame, current_text=current_text)
+    if parts is None:
+        return None
+    return tuple(action_clause for _full_segment, _scoped_clause, action_clause in parts)
+
+
+def source_dependent_task_texts(
+    frame: SituationFrameV1 | None,
+    *,
+    current_text: str,
+) -> Optional[Tuple[str, ...]]:
+    """Return bound request clauses that need conversational source evidence.
+
+    Existing task decomposition and Context v2 reference rules retain their
+    ownership. This helper selects no source and grants no access: a guard must
+    still validate the existing eligible referent. An empty tuple means that
+    the verified current task does not depend on that contribution; ``None``
+    means the frame could not be verified and must not bypass source checking.
+    """
+
+    parts = _bound_situation_task_parts(frame, current_text=current_text)
+    if parts is None:
+        return None
+    dependent = []
+    for task, (_full_segment, scoped_clause, action_clause) in zip(frame.tasks, parts):
+        if nearby_contribution_referent_requested(scoped_clause):
+            dependent.append(action_clause)
+        elif not CURRENT_TURN_NAMED_PAYLOAD_RE.search(scoped_clause) and (
+            publication_continuation_requested(scoped_clause)
+            or (
+                task.authority_scope == "packet"
+                and (
+                    _CONVERSATION_CONTEXT_TASK_RE.search(action_clause)
+                    or _EXACT_REPLY_CONTINUITY_RE.search(action_clause)
+                )
+                and not _VOLATILE_EXTERNAL_RE.search(action_clause)
+            )
+        ):
+            dependent.append(action_clause)
+    return tuple(dependent)
 
 
 def _task_subject_indexes(
@@ -2312,7 +2403,6 @@ def _response_act(
     continuity_required: bool,
     exact_quote_requested: bool,
     route_mode: str,
-    show_state_present: bool,
     objective_kind: str = "unspecified",
     ambiguity_reasons: Sequence[str] = (),
 ) -> str:
@@ -2330,7 +2420,7 @@ def _response_act(
         return "continue_active_thread"
     if route_mode == "direct_payload_task":
         return "complete_request_payload"
-    if show_state_present or route_mode == "show_status":
+    if route_mode in {"show_status", "show_status_answer"}:
         return "answer_show_status"
     return "answer_current_turn"
 
@@ -2933,7 +3023,6 @@ def build_unified_response_assessment(
         continuity_required=bool(continuity_required),
         exact_quote_requested=bool(exact_quote_requested),
         route_mode=str(route_mode or "unknown"),
-        show_state_present=bool(show_state_present),
         objective_kind=objective_kind,
         ambiguity_reasons=ambiguity_reasons,
     )

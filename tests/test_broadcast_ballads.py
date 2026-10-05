@@ -357,6 +357,17 @@ class BalladTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(evidence, correction_prompt)
         self.assertIn(command["options"]["direction"], correction_prompt)
         self.assertIn(json.dumps(corrected["lyrics"]), self.review.await_args_list[1].args[0])
+        second_review = self.review.await_args_list[1].args[0]
+        parsed_original = parse_draft(json.dumps(original), command["showDate"])
+        expected_original = {key: parsed_original[key]
+            for key in ("title", "style", "palette", "linerNotes", "lyrics")}
+        for label, expected in (("ORIGINAL_DRAFT_JSON: ", expected_original),
+                                ("CORRECTION_FEEDBACK_JSON: ",
+                                 {"verdict": "unsupported", "issues": [issue]})):
+            value = next(line[len(label):] for line in second_review.splitlines()
+                         if line.startswith(label))
+            self.assertEqual(json.loads(value), expected)
+        self.assertNotIn("ORIGINAL_DRAFT_JSON", self.review.await_args_list[0].args[0])
         with sqlite3.connect(self.db) as conn:
             saved_receipt = conn.execute("SELECT receipt FROM bnl_ballad_commands").fetchone()[0]
         self.assertNotIn(issue, saved_receipt)

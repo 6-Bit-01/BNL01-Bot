@@ -753,12 +753,22 @@ def _tiktok_show_word_count_targets(user_text: str) -> list[tuple[int, int, str]
             targets.append((*match.span(group), word))
     # Corrections acquire a target only after an eligible human count selector.
     # The bot supplies the bounded human chain; model replies never enter it.
+    # Keep an unquoted phrase intact so the whole-word counter can reject it.
+    # Silently truncating "red panda" to "red" answers a different question.
+    correction_literal = (
+        r'(?:["“]([^"”\n]*)["”]|'
+        r"['‘]((?:[^'’\n]|['’](?=\w))*)['’]|("
+        + token + r"(?:[ \t]+(?!(?:in|during|for|of|from|through|until|before|after|"
+        r"at|on|with|not|instead|rather|actually|now|today|tonight|tomorrow|yesterday|"
+        r"currently|please|this|current|last|latest|previous|the|whole|entire|full)\b)"
+        + token + r")*)\b)"
+    )
     for prefix, new_groups in (
         (r"\bI\s+meant\s+(?:the\s+word\s+)?", (1, 2, 3)),
         (r"\bnot\s+(?P<discarded>[\"“][^\"”\n]*[\"”]|['‘](?:[^'’\n]|['’](?=\w))*['’]|"
          + token + r")\s*[,;]\s*", (2, 3, 4)),
     ):
-        for match in re.finditer(prefix + literal, query, re.I):
+        for match in re.finditer(prefix + correction_literal, query, re.I):
             if any(start <= match.start() < end for start, end in quoted_spans):
                 continue
             if not any(start < match.start() for start, _end, _word in targets):
@@ -767,7 +777,7 @@ def _tiktok_show_word_count_targets(user_text: str) -> list[tuple[int, int, str]
             if group is None:
                 continue
             word = match.group(group).strip().casefold()
-            if word and (group != new_groups[-1] or word not in {
+            if word and (group != new_groups[-1] or word.split()[0] not in {
                 "it", "that", "this", "anything", "something",
                 "in", "during", "for", "of", "from", "through", "until",
                 "before", "after", "at", "on", "with", "the",

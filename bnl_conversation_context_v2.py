@@ -911,12 +911,15 @@ def assess_reply_referent_grounding(
     referent_texts: Iterable[str] = (),
     competing_texts: Iterable[str] = (),
     scope_expanded: bool = False,
+    independent_task_texts: Iterable[str] = (),
 ) -> ReplyReferentGroundingAssessment:
     """Detect only a positive lexical switch to a bounded competing source.
 
     A paraphrase is not rejected merely because it uses new wording. Failure
     requires at least two distinctive terms from one competing source and a
     stronger match to that source than to the exact Discord reply target.
+    Terms explicitly requested by other verified current tasks do not count as
+    a source switch; their appearance can be a correct independent answer.
     """
 
     referents = tuple(
@@ -938,6 +941,9 @@ def assess_reply_referent_grounding(
         )
 
     response_terms = _reply_grounding_terms(response)
+    independently_requested_terms = frozenset().union(*(
+        _reply_grounding_terms(text) for text in independent_task_texts or ()
+    ))
     referent_terms = _reply_grounding_terms(referents[0])
     competitor_term_sets = tuple(
         _reply_grounding_terms(text) for text in competitors
@@ -948,7 +954,9 @@ def assess_reply_referent_grounding(
 
     strongest_competing_hits = 0
     for competitor_terms in competitor_term_sets:
-        competitor_distinctive = competitor_terms - referent_terms
+        competitor_distinctive = (
+            competitor_terms - referent_terms - independently_requested_terms
+        )
         strongest_competing_hits = max(
             strongest_competing_hits,
             len(response_terms & competitor_distinctive),
