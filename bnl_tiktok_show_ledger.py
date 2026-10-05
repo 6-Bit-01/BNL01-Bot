@@ -1351,6 +1351,17 @@ def _load_show_discord_exchanges(
         conversation_rows_by_id = {
             int(row["id"]): row for row in normalized_rows if int(row["id"]) > 0
         }
+        original_ids = set()
+        for direct_row in direct_rows:
+            try:
+                metadata = json.loads(direct_row[-1] or "{}")
+                if isinstance(metadata, Mapping):
+                    original_ids.add(int(metadata.get("conversationRowId") or 0))
+            except (ValueError, TypeError):
+                pass
+        original_rows, blocked_originals = _show_original_conversation_state(
+            conn, guild_id=int(guild_id), row_roles={row_id: "user" for row_id in original_ids},
+        )
         for (
             source_key,
             occurred_at_ms,
@@ -1365,6 +1376,19 @@ def _load_show_discord_exchanges(
                 metadata = json.loads(metadata_json or "{}")
             except (json.JSONDecodeError, TypeError, ValueError):
                 metadata = {}
+            if isinstance(metadata, Mapping):
+                row_id = int(metadata.get("conversationRowId") or 0)
+                original = original_rows.get(row_id)
+                if row_id in blocked_originals or (original is not None and (
+                    original["guild_id"] != int(guild_id) or original["role"] != "user"
+                    or f"discord_user:{original['user_id']}" != str(subject_ref or "")
+                    or original["channel_policy"] != str(channel_policy or "")
+                    or original["channel_policy"] not in {"public_home", "public_context", "public_selective"}
+                    or original["channel_id"] != int(channel_id or 0)
+                    or str(original["content"] or "").strip()[:4000] != str(raw_text or "").strip()[:4000]
+                    or _timestamp_epoch_ms(original["timestamp"]) != int(occurred_at_ms or 0)
+                )):
+                    continue
             if messages_out is not None and isinstance(metadata, Mapping) and str(channel_policy or "") in {
                 "public_home", "public_context", "public_selective",
             }:
@@ -2006,9 +2030,42 @@ def _discord_exchange_message_keys(exchange: Any) -> set[str]:
     }
 
 
+def _show_original_conversation_state(conn, *, guild_id, row_roles):
+    """Reopen only referenced originals; missing rows still permit age-out."""
+    row_ids = tuple(sorted(row_id for row_id in row_roles if row_id > 0))
+    originals, blocked = {}, set()
+    columns = _table_columns(conn, "conversations")
+    for offset in range(0, len(row_ids), 400):
+        batch = row_ids[offset:offset + 400]
+        marks = ",".join("?" for _ in batch)
+        if {"id", "guild_id", "user_id", "role", "content", "timestamp", "channel_policy"}.issubset(columns):
+            channel = "channel_id" if "channel_id" in columns else "0"
+            route = "route_mode" if "route_mode" in columns else "'unknown'"
+            fields = ("id", "guild_id", "user_id", "role", "content", "timestamp", "channel_policy", "channel_id", "route_mode")
+            rows = conn.execute(
+                f"SELECT id,guild_id,user_id,role,content,timestamp,channel_policy,{channel},{route} "
+                f"FROM conversations WHERE id IN ({marks})", batch,
+            ).fetchall()
+            originals.update((int(row[0]), dict(zip(fields, row))) for row in rows)
+        if _table_columns(conn, "memory_ledger_entries"):
+            rows = conn.execute(
+                f"""SELECT e.source_row_id,e.lifecycle_status,e.public_usable,
+                    EXISTS(SELECT 1 FROM memory_ledger_lineage l WHERE l.guild_id=e.guild_id
+                        AND l.target_entry_id=e.entry_id AND l.lineage_type IN ('correction_of','supersedes','retracts'))
+                    FROM memory_ledger_entries e WHERE e.guild_id=? AND e.source_table='conversations'
+                        AND e.source_row_id IN ({marks}) AND e.entry_type IN ('observation','derived_summary')""",
+                (guild_id, *(str(value) for value in batch)),
+            ).fetchall()
+            blocked.update(int(row_id) for row_id, lifecycle, public, incoming in rows
+                           if lifecycle not in {"active", "review_only"} or incoming
+                           or (not public and row_roles.get(int(row_id)) != "model"))
+    return originals, blocked
+
+
 def _merge_retained_discord_exchanges(
     current: Sequence[Mapping[str, Any]],
     prior_ledger: Mapping[str, Any] | None,
+    *, connection: sqlite3.Connection | None = None, guild_id: int = 0,
 ) -> list[dict[str, Any]]:
     """Keep captured public exchanges when source conversation rows age out.
 
@@ -2019,10 +2076,46 @@ def _merge_retained_discord_exchanges(
 
     candidates: list[tuple[int, Mapping[str, Any]]] = []
     if isinstance(prior_ledger, Mapping):
+        retained = [exchange for exchange in prior_ledger.get("discordInteractions") or ()
+                    if isinstance(exchange, Mapping)]
+        if connection is not None:
+            row_roles = {}
+            for exchange in retained:
+                for leaf in exchange.get("userMessages") or ():
+                    row_roles[int(leaf.get("conversationRowId") or 0)] = "user"
+                response = exchange.get("bnlResponse")
+                if isinstance(response, Mapping):
+                    row_roles[int(response.get("conversationRowId") or 0)] = "model"
+            originals, blocked = _show_original_conversation_state(
+                connection, guild_id=guild_id, row_roles=row_roles,
+            )
+
+            def current_exchange(exchange):
+                leaves = list(exchange.get("userMessages") or ())
+                if isinstance(exchange.get("bnlResponse"), Mapping):
+                    leaves.append(exchange["bnlResponse"])
+                for leaf in leaves:
+                    row_id = int(leaf.get("conversationRowId") or 0)
+                    original = originals.get(row_id)
+                    if row_id in blocked:
+                        return False
+                    if original is None:
+                        continue
+                    if (original["guild_id"] != guild_id or original["role"] != row_roles[row_id]
+                            or original["channel_policy"] not in {"public_home", "public_context", "public_selective"}
+                            or original["channel_policy"] != leaf.get("channelPolicy")
+                            or original["channel_id"] != int(leaf.get("channelId") or 0)
+                            or str(original["content"] or "").strip()[:4000] != str(leaf.get("text") or "").strip()[:4000]
+                            or _timestamp_epoch_ms(original["timestamp"]) != int(leaf.get("occurredAtMs") or 0)
+                            or str(original["route_mode"] or "").casefold() != str(leaf.get("routeMode") or "").casefold()
+                            or (original["role"] == "user" and f"discord_user:{original['user_id']}" != exchange.get("subjectRef"))):
+                        return False
+                return True
+
+            retained = [exchange for exchange in retained if current_exchange(exchange)]
         candidates.extend(
             (0, exchange)
-            for exchange in prior_ledger.get("discordInteractions") or ()
-            if isinstance(exchange, Mapping)
+            for exchange in retained
         )
     candidates.extend(
         (1, exchange)
@@ -2281,23 +2374,26 @@ def sync_tiktok_show_evidence_ledgers(
     cached_related_sources = None
     cached_data_version = None
     try:
+        assembly_ms = writer_wait_ms = writer_held_ms = 0.0
+        assembly_attempts = committed_shows = 0
+        assembly_started = writer_wait_started = writer_held_started = None
+        timing_outcome, timing_error = "failed", "none"
+
+        def finish_writer_lease():
+            nonlocal writer_held_ms, writer_held_started
+            if writer_held_started is not None:
+                writer_held_ms += max(0.0, (time.monotonic() - writer_held_started) * 1000)
+                writer_held_started = None
+
         ensure_tiktok_show_evidence_schema(conn)
         ensure_memory_ledger_schema(conn)
         _check_show_sync_deadline(deadline)
         conn.commit()
-        for show in shows:
-            _check_show_sync_deadline(deadline)
+        def assemble_show(show):
+            nonlocal cached_related_sources, cached_data_version
+            # Consume SQL results before Python assembly. External commits
+            # invalidate the whole attempt before it can write.
             show_key = tiktok_show_evidence_key(show)
-            if not show_key:
-                continue
-            # One snapshot owns the fresh sources and one complete show graph.
-            # A later historical show must not extend an earlier write lease
-            # or reuse preparation sources changed since that lease ended.
-            conn.execute("BEGIN")
-            # Pin the new main-database snapshot before inspecting this same
-            # connection's change marker. No committed external edit, privacy
-            # withdrawal or correction may reuse an earlier source scan.
-            conn.execute("SELECT 1 FROM main.sqlite_master LIMIT 1").fetchone()
             data_version = conn.execute("PRAGMA main.data_version").fetchone()[0]
             own_changes_before = conn.total_changes
             if cached_related_sources is None or cached_data_version != data_version:
@@ -2332,8 +2428,7 @@ def sync_tiktok_show_evidence_ledgers(
             )
             _check_show_sync_deadline(deadline)
             if source_events is None:
-                conn.rollback()
-                continue
+                return None
             discord_exchanges = _load_show_discord_exchanges(
                 conn,
                 guild_id=int(guild_id),
@@ -2341,11 +2436,11 @@ def sync_tiktok_show_evidence_ledgers(
             )
             _check_show_sync_deadline(deadline)
             if discord_exchanges is None:
-                conn.rollback()
-                continue
+                return None
             discord_exchanges = _merge_retained_discord_exchanges(
                 discord_exchanges,
                 prior_ledger,
+                connection=conn, guild_id=int(guild_id),
             )
             base_ledger = build_tiktok_show_evidence_ledger(
                 show, source_events, artist_identity_index=artist_identity_index,
@@ -2353,8 +2448,7 @@ def sync_tiktok_show_evidence_ledgers(
             )
             _check_show_sync_deadline(deadline)
             if not base_ledger:
-                conn.rollback()
-                continue
+                return None
             current = archive.get("currentShow") or {}
             if (current.get("sessionId") == show.get("sessionId")
                     and show.get("status") != "archived"):
@@ -2380,94 +2474,13 @@ def sync_tiktok_show_evidence_ledgers(
                 base_ledger, authorization_receipt, prior_ledger=prior_ledger,
             )
             if ledger is None:
-                conn.rollback()
-                continue
-            result["sourceEvents"] += len(ledger.get("messages") or ())
-            result["participants"] += int(
-                (ledger.get("coverage") or {}).get("distinctSubjectCount")
-                or len(ledger.get("participants") or ())
-            )
-            result["operationalEvents"] += len(
-                ledger.get("operationalEvents") or ()
-            )
-            result["trackRoster"] += len(ledger.get("trackRoster") or ())
-            result["discordInteractions"] += len(
-                ledger.get("discordInteractions") or ()
-            )
-            result["discordExchanges"] += int(
-                (ledger.get("coverage") or {}).get("discordExchangeCount")
-                or 0
-            )
-            result["discordParticipants"] += len(
-                ledger.get("discordParticipants") or ()
-            )
-            result["discordConversationRows"] += len(
-                (ledger.get("coverage") or {}).get("conversationRowIds") or ()
-            )
+                return None
             show_key = str(ledger["showKey"])
             source_digest = str(ledger["sourceDigest"])
-            now = datetime.now(timezone.utc).isoformat()
             lifecycle = str(ledger.get("lifecycle") or "provisional")
-            if prior_ledger is not None and str(existing[0] or "") == source_digest:
-                result["showsUnchanged"] += 1
-            else:
-                conn.execute(
-                    f"""
-                    INSERT INTO {TIKTOK_SHOW_EVIDENCE_TABLE} (
-                        guild_id,show_key,schema_version,show_date,show_title,
-                        lifecycle_status,started_at_ms,ended_at_ms,event_count,
-                        participant_count,topic_count,track_count,source_digest,
-                        ledger_json,finalized_at,created_at,updated_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(guild_id,show_key) DO UPDATE SET
-                        schema_version=excluded.schema_version,
-                        show_date=excluded.show_date,
-                        show_title=excluded.show_title,
-                        lifecycle_status=excluded.lifecycle_status,
-                        started_at_ms=excluded.started_at_ms,
-                        ended_at_ms=excluded.ended_at_ms,
-                        event_count=excluded.event_count,
-                        participant_count=excluded.participant_count,
-                        topic_count=excluded.topic_count,
-                        track_count=excluded.track_count,
-                        source_digest=excluded.source_digest,
-                        ledger_json=excluded.ledger_json,
-                        finalized_at=excluded.finalized_at,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        int(guild_id),
-                        show_key,
-                        SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
-                        str(ledger.get("showDate") or "")[:40],
-                        str(ledger.get("showTitle") or "")[:160],
-                        lifecycle,
-                        int(ledger.get("startedAtMs") or 0),
-                        int(ledger.get("endedAtMs") or 0),
-                        int(
-                            (ledger.get("coverage") or {}).get(
-                                "evidenceItemCount"
-                            )
-                            or len(ledger.get("messages") or ())
-                        ),
-                        int(
-                            (ledger.get("coverage") or {}).get(
-                                "distinctSubjectCount"
-                            )
-                            or len(ledger.get("participants") or ())
-                        ),
-                        len(ledger.get("showTopics") or ledger.get("topics") or ()),
-                        len(ledger.get("trackRoster") or ()),
-                        source_digest,
-                        _canonical_json(ledger),
-                        now if lifecycle == "finalized" else "",
-                        now,
-                        now,
-                    ),
-                )
-                result["showsWritten"] += 1
+            unchanged = prior_ledger is not None and str(existing[0] or "") == source_digest
+            repair_projection = False
             if lifecycle == "finalized":
-                result["showsFinalized"] += 1
                 (
                     expected_projection_count,
                     expected_lineage_count,
@@ -2515,19 +2528,147 @@ def sync_tiktok_show_evidence_ledgers(
                     ).fetchone()[0]
                     or 0
                 )
-                if (
+                repair_projection = (
                     current_projection_count < expected_projection_count
                     or current_lineage_count < expected_lineage_count
-                ):
-                    projections = _project_finalized_show(
-                        conn,
-                        guild_id=int(guild_id),
-                        ledger=ledger,
+                )
+            canon_formation = lifecycle == "finalized" and living_canon_v1_formation_enabled()
+            ledger_json = "" if unchanged else _canonical_json(ledger)
+            _check_show_sync_deadline(deadline)
+            if conn.in_transaction or conn.total_changes != own_changes_before:
+                raise RuntimeError("tiktok_show_sync_assembly_wrote_sources")
+            return (data_version, own_changes_before, ledger, ledger_json,
+                    unchanged, repair_projection, canon_formation)
+
+        for show in shows:
+            _check_show_sync_deadline(deadline)
+            if not tiktok_show_evidence_key(show):
+                continue
+            for attempt in range(2):
+                assembly_started = time.monotonic()
+                assembly_attempts += 1
+                assembled = assemble_show(show)
+                assembly_ms += max(0.0, (time.monotonic() - assembly_started) * 1000)
+                assembly_started = None
+                if assembled is None:
+                    break
+                (data_version, own_changes_before, ledger, ledger_json,
+                 unchanged, repair_projection, canon_formation) = assembled
+                needs_write = not unchanged or repair_projection or canon_formation
+                _check_show_sync_deadline(deadline)
+                source_changed = conn.execute("PRAGMA main.data_version").fetchone()[0] != data_version
+                if not source_changed and needs_write:
+                    # Reserve the writer after source assembly/completeness
+                    # reads. Another writer cannot commit after this check
+                    # until this complete show graph commits or rolls back.
+                    writer_wait_started = time.monotonic()
+                    conn.execute("BEGIN IMMEDIATE")
+                    writer_held_started = time.monotonic()
+                    writer_wait_ms += max(0.0, (writer_held_started - writer_wait_started) * 1000)
+                    writer_wait_started = None
+                    source_changed = conn.execute("PRAGMA main.data_version").fetchone()[0] != data_version
+                if source_changed:
+                    conn.rollback()
+                    finish_writer_lease()
+                    cached_related_sources = cached_data_version = None
+                    if attempt == 0:
+                        _check_show_sync_deadline(deadline)
+                        continue
+                    result["status"], result["reason"] = "deferred", "source_changed"
+                    timing_outcome = "deferred"
+                    return result
+                pending = {key: 0 for key, value in result.items() if type(value) is int}
+                pending["sourceEvents"] += len(ledger.get("messages") or ())
+                pending["participants"] += int(
+                    (ledger.get("coverage") or {}).get("distinctSubjectCount")
+                    or len(ledger.get("participants") or ())
+                )
+                pending["operationalEvents"] += len(
+                    ledger.get("operationalEvents") or ()
+                )
+                pending["trackRoster"] += len(ledger.get("trackRoster") or ())
+                pending["discordInteractions"] += len(
+                    ledger.get("discordInteractions") or ()
+                )
+                pending["discordExchanges"] += int(
+                    (ledger.get("coverage") or {}).get("discordExchangeCount")
+                    or 0
+                )
+                pending["discordParticipants"] += len(
+                    ledger.get("discordParticipants") or ()
+                )
+                pending["discordConversationRows"] += len(
+                    (ledger.get("coverage") or {}).get("conversationRowIds") or ()
+                )
+                pending["showsUnchanged" if unchanged else "showsWritten"] = 1
+                pending["showsFinalized"] = int(str(ledger.get("lifecycle") or "provisional") == "finalized")
+                show_key = str(ledger["showKey"])
+                source_digest = str(ledger["sourceDigest"])
+                lifecycle = str(ledger.get("lifecycle") or "provisional")
+                now = datetime.now(timezone.utc).isoformat()
+                if not unchanged:
+                    conn.execute(
+                        f"""
+                        INSERT INTO {TIKTOK_SHOW_EVIDENCE_TABLE} (
+                            guild_id,show_key,schema_version,show_date,show_title,
+                            lifecycle_status,started_at_ms,ended_at_ms,event_count,
+                            participant_count,topic_count,track_count,source_digest,
+                            ledger_json,finalized_at,created_at,updated_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(guild_id,show_key) DO UPDATE SET
+                            schema_version=excluded.schema_version,
+                            show_date=excluded.show_date,
+                            show_title=excluded.show_title,
+                            lifecycle_status=excluded.lifecycle_status,
+                            started_at_ms=excluded.started_at_ms,
+                            ended_at_ms=excluded.ended_at_ms,
+                            event_count=excluded.event_count,
+                            participant_count=excluded.participant_count,
+                            topic_count=excluded.topic_count,
+                            track_count=excluded.track_count,
+                            source_digest=excluded.source_digest,
+                            ledger_json=excluded.ledger_json,
+                            finalized_at=excluded.finalized_at,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            int(guild_id),
+                            show_key,
+                            SHOW_EVIDENCE_LEDGER_SCHEMA_VERSION,
+                            str(ledger.get("showDate") or "")[:40],
+                            str(ledger.get("showTitle") or "")[:160],
+                            lifecycle,
+                            int(ledger.get("startedAtMs") or 0),
+                            int(ledger.get("endedAtMs") or 0),
+                            int(
+                                (ledger.get("coverage") or {}).get(
+                                    "evidenceItemCount"
+                                )
+                                or len(ledger.get("messages") or ())
+                            ),
+                            int(
+                                (ledger.get("coverage") or {}).get(
+                                    "distinctSubjectCount"
+                                )
+                                or len(ledger.get("participants") or ())
+                            ),
+                            len(ledger.get("showTopics") or ledger.get("topics") or ()),
+                            len(ledger.get("trackRoster") or ()),
+                            source_digest,
+                            ledger_json,
+                            now if lifecycle == "finalized" else "",
+                            now,
+                            now,
+                        ),
                     )
-                    result["projectionInserted"] += projections["inserted"]
-                    result["projectionDeduplicated"] += projections["deduplicated"]
-                    result["projectionErrors"] += projections["errors"]
-                if living_canon_v1_formation_enabled():
+                if repair_projection:
+                    projections = _project_finalized_show(
+                        conn, guild_id=int(guild_id), ledger=ledger,
+                    )
+                    pending["projectionInserted"] += projections["inserted"]
+                    pending["projectionDeduplicated"] += projections["deduplicated"]
+                    pending["projectionErrors"] += projections["errors"]
+                if canon_formation:
                     subject_refs: set[str] = set()
                     for message in ledger.get("messages") or ():
                         if not isinstance(message, Mapping):
@@ -2535,7 +2676,7 @@ def sync_tiktok_show_evidence_ledgers(
                         subject_ref = str(message.get("subjectRef") or "")
                         if subject_ref.startswith("discord_user:"):
                             subject_refs.add(subject_ref)
-                    result["livingCanonSubjectsEvaluated"] += len(
+                    pending["livingCanonSubjectsEvaluated"] += len(
                         subject_refs
                     )
                     for subject_ref in sorted(subject_refs):
@@ -2548,11 +2689,11 @@ def sync_tiktok_show_evidence_ledgers(
                                     subject_key=subject_ref,
                                 )
                             )
-                            result["livingCanonCandidatesRefreshed"] += len(
+                            pending["livingCanonCandidatesRefreshed"] += len(
                                 refreshed
                             )
                         except Exception as exc:
-                            result["livingCanonFormationErrors"] += 1
+                            pending["livingCanonFormationErrors"] += 1
                             logging.debug(
                                 "tiktok_show_living_canon_refresh_failed "
                                 "guild_id=%s subject_ref=%s error_type=%s",
@@ -2560,22 +2701,50 @@ def sync_tiktok_show_evidence_ledgers(
                                 subject_ref,
                                 type(exc).__name__,
                             )
-            _check_show_sync_deadline(deadline)
-            conn.commit()
-            # data_version deliberately ignores this connection's commits.
-            # A graph repair or its triggers may change reader inputs, so be
-            # conservative after ANY own write; only unchanged shows reuse.
-            if conn.total_changes != own_changes_before:
-                cached_related_sources = None
+                _check_show_sync_deadline(deadline)
+                if needs_write:
+                    conn.commit()
+                    finish_writer_lease()
+                    committed_shows += 1
+                for key, value in pending.items():
+                    result[key] += value
+                # Own commits do not advance data_version. Any graph/canon
+                # change must therefore invalidate this connection's cache.
+                if conn.total_changes != own_changes_before:
+                    cached_related_sources = cached_data_version = None
+                break
+        timing_outcome = "completed"
     except Exception as exc:
+        timing_error = ("TimeoutError" if isinstance(exc, sqlite3.OperationalError)
+                        and deadline_interrupted else type(exc).__name__)
         conn.set_progress_handler(None, 0)
         conn.rollback()
+        finish_writer_lease()
         if isinstance(exc, sqlite3.OperationalError) and deadline_interrupted:
             raise TimeoutError("tiktok_show_sync_deadline_exceeded") from exc
         raise
     finally:
-        conn.set_progress_handler(None, 0)
-        conn.close()
+        try:
+            conn.set_progress_handler(None, 0)
+            conn.close()
+        finally:
+            # Numeric wall times include host scheduling and I/O. A failed
+            # diagnostic must never replace a source/deadline exception.
+            try:
+                if assembly_started is not None:
+                    assembly_ms += max(0.0, (time.monotonic() - assembly_started) * 1000)
+                if writer_wait_started is not None:
+                    writer_wait_ms += max(0.0, (time.monotonic() - writer_wait_started) * 1000)
+                finish_writer_lease()
+                logging.info(
+                    "barcode_show_episode_sync_timing outcome=%s assembly_wall_ms=%.3f "
+                    "writer_wait_wall_ms=%.3f writer_held_wall_ms=%.3f "
+                    "assembly_attempts=%s committed_shows=%s error_type=%s",
+                    timing_outcome, assembly_ms, writer_wait_ms, writer_held_ms,
+                    assembly_attempts, committed_shows, timing_error,
+                )
+            except Exception:
+                pass
     result["status"] = "completed"
     result["reason"] = "eligible"
     return result
@@ -2812,7 +2981,7 @@ def _load_show_related_sources(
         for index, (original_id, original_message) in enumerate(conn.execute(
             f"SELECT id,{message_column} FROM conversations WHERE guild_id=?",
             (guild_id,),
-        )):
+        ).fetchall()):
             if index % 256 == 0:
                 _check_show_sync_deadline(deadline)
             original_rows.add(original_id)
@@ -2891,13 +3060,13 @@ def _load_show_related_sources(
         rejected = set()
         superseded = {str(r[0]) for r in conn.execute(
             """SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=?
-               AND lineage_type IN ('correction_of','supersedes','retracts')""", (guild_id,))}
-        for index, (table, row_id, lifecycle, public, text, entry_id) in enumerate(conn.execute(
+               AND lineage_type IN ('correction_of','supersedes','retracts')""", (guild_id,)).fetchall()}
+        for index, (table, row_id, lifecycle, public, entry_id) in enumerate(conn.execute(
             """SELECT source_table,source_row_id,lifecycle_status,public_usable,
-                      normalized_value,entry_id FROM memory_ledger_entries
+                      entry_id FROM memory_ledger_entries
                WHERE guild_id=? AND source_table IN ('conversations','tiktok_live_chat')
                  AND entry_type IN ('observation','derived_summary')""", (guild_id,),
-        )):
+        ).fetchall()):
             if index % 256 == 0:
                 _check_show_sync_deadline(deadline)
             key = ("discord", str(row_id)) if table == "conversations" else ("tiktok", str(row_id))
@@ -3025,9 +3194,9 @@ def _show_preparation_view(
                       canonical_ledger_entry_id,window_started_at,last_activity_at
                FROM memory_moment_windows WHERE guild_id=? AND lifecycle_status='finalized'
                  AND public_usable=1""", (guild_id,),
-        ):
+        ).fetchall():
             roots = {str(r[0]) for r in conn.execute(
-                "SELECT ledger_entry_id FROM memory_moment_members WHERE moment_id=?", (mid,))}
+                "SELECT ledger_entry_id FROM memory_moment_members WHERE moment_id=?", (mid,)).fetchall()}
             if not roots.intersection(explicit_roots):
                 continue
             if _moment_is_renderable(
