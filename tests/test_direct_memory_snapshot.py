@@ -1,5 +1,6 @@
 """Direct prompts retain the existing private memory reader under short locks."""
 
+import asyncio
 import os
 import sqlite3
 import tempfile
@@ -9,6 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 from tests import test_public_network_knowledge as network
+import bnl_memory_governance as governance
+import bnl_memory_ledger as ledger
 
 
 bot = network.bnl01_bot
@@ -58,6 +61,239 @@ class DirectMemorySnapshotTests(unittest.IsolatedAsyncioTestCase):
             sqlite3, "connect", side_effect=tracked_connect))
         self.addAsyncCleanup(self.runtime.asyncTearDown)
 
+    def _seed_source(self, text="Copper Kite sounds funny tonight, lol?",
+                     *, user_id=None, guild_id=None, channel_id=8810,
+                     policy="sealed_test", role="user", audience=()):
+        user_id = self.runtime.user_id if user_id is None else user_id
+        guild_id = self.runtime.guild_id if guild_id is None else guild_id
+        stamp = bot.datetime.now(bot.PACIFIC_TZ).isoformat()
+        with closing(sqlite3.connect(bot.DB_FILE)) as conn, conn:
+            ledger.ensure_memory_ledger_schema(conn)
+            row_id = conn.execute(
+                "INSERT INTO conversations (user_id,user_name,guild_id,channel_id,channel_policy,"
+                "route_mode,role,content,timestamp) VALUES(?,?,?,?,?,?,?,?,?)",
+                (user_id, "Test Member", guild_id, channel_id, policy,
+                 bot.ROUTE_MODE_NORMAL_CHAT, role, text, stamp)).lastrowid
+            root = ledger.shadow_conversation_row(conn, row_id=row_id,
+                user_id=user_id, user_name="Test Member", guild_id=guild_id,
+                channel_id=channel_id, channel_policy=policy,
+                route_mode=bot.ROUTE_MODE_NORMAL_CHAT, role=role, content=text,
+                observed_at=stamp, conversation_target_user_ids=audience,
+                environ={"BNL_MEMORY_LEDGER_SHADOW_ENABLED": "1"}).entry_id
+            for target in audience:
+                conn.execute("INSERT INTO conversation_response_participants "
+                    "(conversation_row_id,guild_id,user_id) VALUES(?,?,?)", (row_id, guild_id, target))
+            if role == "user":
+                bot._insert_memory_tier(conn.cursor(), user_id, guild_id, "long",
+                    "Test Member remembers cobalt blue and the Copper Kite joke.", .95,
+                    source_role="user", source_channel_policy=policy,
+                    source_trust="source_safe_private", topic_key="music",
+                    source_conversation_row_ids=(row_id,), source_lineage_complete=True)
+        return row_id, root
+
+    def _memory_kwargs(self):
+        return dict(route_mode=bot.ROUTE_MODE_NORMAL_CHAT, channel_policy="sealed_test",
+            channel_id=8810, user_text="What do you remember about Copper Kite and my favorite color?",
+            current_direct=True, record_operational_diagnostics=False,
+            environ={"BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true"})
+
+    def _compare_original_reader_assembly(self, conn):
+        """The original default owners remain the independent assembly oracle."""
+        original_relation = bot.get_relationship_state
+        original_habits = bot.get_user_habits
+        original_governed = bot.build_governed_context
+
+        def defaults(owner, keyword):
+            def read(*args, **kwargs):
+                kwargs.pop(keyword, None)
+                return owner(*args, **kwargs)
+            return read
+
+        def build():
+            metadata = {}
+            context = bot.build_user_memory_context(self.runtime.user_id, self.runtime.guild_id,
+                connection=conn, read_only=True, source_metadata=metadata, **self._memory_kwargs())
+            return context, metadata
+
+        old_sources, new_sources, old_candidates, new_candidates = [], [], [], []
+
+        def record(owner, outputs, *, private=False):
+            def read(*args, **kwargs):
+                result = owner(*args, **kwargs)
+                if not private or kwargs["channel_id"] > 0:
+                    outputs.append(result)
+                return result
+            return read
+
+        with mock.patch.object(bot, "get_relationship_state", side_effect=defaults(original_relation, "_private_source_reader")), \
+                mock.patch.object(bot, "get_user_habits", side_effect=defaults(original_habits, "_private_source_reader")), \
+                mock.patch.object(bot, "build_governed_context", side_effect=defaults(original_governed, "_sealed_candidate_reader")), \
+                mock.patch.object(bot, "private_conversation_sources", side_effect=record(bot.private_conversation_sources, old_sources, private=True)) as old_private, \
+                mock.patch.object(bot, "sealed_tier_candidates", side_effect=record(bot.sealed_tier_candidates, old_candidates)) as old_tier, \
+                mock.patch.object(governance, "sealed_tier_candidates", side_effect=record(governance.sealed_tier_candidates, old_candidates)) as old_gov_tier:
+            original = build()
+        with mock.patch.object(bot, "private_conversation_sources", side_effect=record(bot.private_conversation_sources, new_sources, private=True)) as new_private, \
+                mock.patch.object(bot, "sealed_tier_candidates", side_effect=record(bot.sealed_tier_candidates, new_candidates)) as new_tier, \
+                mock.patch.object(governance, "sealed_tier_candidates", side_effect=record(governance.sealed_tier_candidates, new_candidates)) as new_gov_tier:
+            reused = build()
+        self.assertEqual(original, reused)  # Complete text, selected DTOs, exclusions and basis digest.
+        positive_calls = lambda reader: [call for call in reader.call_args_list if call.kwargs["channel_id"] > 0]
+        self.assertEqual(len(positive_calls(old_private)), 2)
+        self.assertEqual(len(positive_calls(new_private)), 1)
+        self.assertEqual(old_tier.call_count + old_gov_tier.call_count, 2)
+        self.assertEqual(new_tier.call_count + new_gov_tier.call_count, 1)
+        self.assertEqual(old_sources, new_sources * 2)
+        self.assertEqual(old_candidates, new_candidates * 2)
+        self.validated_sources = new_sources[0]
+        # Adaptive sizing must still use its original public-baseline readers.
+        self.assertEqual([call.kwargs["channel_id"] for call in old_private.call_args_list].count(0), 2)
+        self.assertEqual([call.kwargs["channel_id"] for call in new_private.call_args_list].count(0), 2)
+        return reused
+
+    async def test_complete_assembly_matches_original_readers_with_one_validated_read_each(self):
+        row_id, root = self._seed_source()
+        self._seed_source("My favorite color is cobalt blue.")
+        self._seed_source(user_id=101)
+        self._seed_source(guild_id=7701)
+        self._seed_source(channel_id=8811)
+        self._seed_source(policy="public_home")
+        self._seed_source(role="model", audience=(self.runtime.user_id,))
+        with closing(bot._open_member_memory_read_connection()) as conn:
+            conn.execute("BEGIN")
+            context, metadata = self._compare_original_reader_assembly(conn)
+        self.assertIn("cobalt blue", context)
+        self.assertTrue(metadata["governed_basis_digest"])
+        self.assertIn(root, [source["entry_id"] for source in self.validated_sources])
+        self.assertEqual(len(self.validated_sources), 2)  # This member's user and single-audience model only.
+        self.assertTrue(metadata["legacy_relationship_present"])
+
+    async def test_fresh_assembly_rechecks_correction_deletion_privacy_audience_and_revision(self):
+        def snapshot():
+            with closing(bot._open_member_memory_read_connection()) as conn:
+                conn.execute("BEGIN")
+                return self._compare_original_reader_assembly(conn)
+        for name in ("revision", "audience", "correction", "privacy", "delete"):
+            row_id, root = self._seed_source(role="model" if name == "audience" else "user",
+                audience=(self.runtime.user_id,) if name == "audience" else ())
+            previous = snapshot()
+            self.assertIn(root, [source["entry_id"] for source in self.validated_sources])
+            await asyncio.sleep(0)  # No build-local tuple may survive this fresh external read.
+            with closing(sqlite3.connect(bot.DB_FILE)) as conn, conn:
+                if name == "revision":
+                    cursor = conn.execute("SELECT * FROM memory_ledger_entries WHERE entry_id=?", (root,))
+                    values = dict(zip((column[0] for column in cursor.description), cursor.fetchone()))
+                    values.update(entry_id="aaa-revision", source_revision="fresh-revision")
+                    conn.execute("INSERT INTO memory_ledger_entries (" + ",".join(values) + ") VALUES ("
+                        + ",".join("?" for _ in values) + ")", tuple(values.values()))
+                elif name == "audience":
+                    conn.execute("INSERT INTO conversation_response_participants "
+                        "(conversation_row_id,guild_id,user_id) VALUES(?,?,?)", (row_id, self.runtime.guild_id, 101))
+                elif name == "correction":
+                    conn.execute("INSERT INTO memory_ledger_lineage VALUES(?,?,?,?,?)",
+                        ("correction", self.runtime.guild_id, "correction_of", root, "now"))
+                elif name == "privacy":
+                    conn.execute("UPDATE conversations SET channel_policy='internal_controlled' WHERE id=?", (row_id,))
+                else:
+                    conn.execute("DELETE FROM conversations WHERE id=?", (row_id,))
+            with self.subTest(mutation=name):
+                current = snapshot()
+                self.assertNotIn(root, [source["entry_id"] for source in self.validated_sources])
+                if name == "revision":
+                    self.assertIn("fresh-revision", [source["ledger"]["source_revision"] for source in self.validated_sources])
+                if name == "audience":
+                    self.assertNotEqual(previous[0], current[0])
+
+    async def test_scope_and_transaction_mismatches_use_original_readers(self):
+        self._seed_source()
+        captured = {}
+        original_relation = bot.get_relationship_state
+        original_governed = bot.build_governed_context
+
+        def relation(*args, **kwargs):
+            if "_private_source_reader" in kwargs:
+                captured["private"] = kwargs["_private_source_reader"]
+            return original_relation(*args, **kwargs)
+
+        def governed(*args, **kwargs):
+            captured["tier"] = kwargs["_sealed_candidate_reader"]
+            return original_governed(*args, **kwargs)
+
+        with closing(sqlite3.connect(bot.DB_FILE)) as conn, \
+                mock.patch.object(bot, "get_relationship_state", side_effect=relation), \
+                mock.patch.object(bot, "build_governed_context", side_effect=governed):
+            conn.execute("BEGIN")
+            bot.build_user_memory_context(self.runtime.user_id, self.runtime.guild_id,
+                connection=conn, read_only=True, **self._memory_kwargs())
+            private = captured["private"]
+            tier = captured["tier"]
+            scope = dict(guild_id=self.runtime.guild_id, user_id=self.runtime.user_id, channel_id=8810)
+            request = bot.GovernanceRequest(self.runtime.guild_id, self.runtime.user_id,
+                bot.ROUTE_MODE_NORMAL_CHAT, "test", channel_id=8810, channel_policy="sealed_test")
+            with mock.patch.object(bot, "private_conversation_sources", wraps=bot.private_conversation_sources) as real_private, \
+                    mock.patch.object(bot, "sealed_tier_candidates", wraps=bot.sealed_tier_candidates) as real_tier:
+                private(conn, **scope)
+                tier(conn, request, bot.extract_user_facts)
+                real_private.assert_not_called()
+                real_tier.assert_not_called()
+                for key in scope:
+                    private(conn, **dict(scope, **{key: scope[key] + 1}))
+                from dataclasses import replace
+                for field, value in (("guild_id", 7701), ("subject_user_id", 101),
+                                     ("channel_id", 8811), ("channel_policy", "public_home")):
+                    tier(conn, replace(request, **{field: value}), bot.extract_user_facts)
+                tier(conn, request, lambda text: bot.extract_user_facts(text))
+                self.assertEqual(real_private.call_count, 3)
+                self.assertEqual(real_tier.call_count, 5)
+                with closing(sqlite3.connect(bot.DB_FILE)) as other:
+                    private(other, **scope)
+                    tier(other, request, bot.extract_user_facts)
+                self.assertEqual(real_private.call_count, 4)
+                self.assertEqual(real_tier.call_count, 6)
+                conn.rollback()
+                private(conn, **scope)  # Loss of the pinned transaction permanently invalidates both tuples.
+                conn.execute("BEGIN")
+                private(conn, **scope)
+                tier(conn, request, bot.extract_user_facts)
+                self.assertEqual(real_private.call_count, 6)
+                self.assertEqual(real_tier.call_count, 7)
+
+    async def test_own_write_and_failed_read_never_supply_previous_tuple(self):
+        row_id, _root = self._seed_source()
+        original_sources = bot.private_conversation_sources
+        original_journal = bot.get_relationship_journal
+        calls = []
+
+        def sources(conn, **kwargs):
+            if kwargs["channel_id"] > 0:
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise sqlite3.OperationalError("fixture read failure")
+            return original_sources(conn, **kwargs)
+
+        with closing(bot._open_member_memory_read_connection()) as conn, \
+                mock.patch.object(bot, "private_conversation_sources", side_effect=sources):
+            conn.execute("BEGIN")
+            bot.build_user_memory_context(self.runtime.user_id, self.runtime.guild_id,
+                connection=conn, read_only=True, **self._memory_kwargs())
+        self.assertEqual(len(calls), 2)  # The failed Relationship read is not cached for habits.
+
+        def revoke_between_reducers(*args, **kwargs):
+            kwargs["connection"].execute("UPDATE conversations SET channel_policy='internal_controlled' WHERE id=?", (row_id,))
+            return original_journal(*args, **kwargs)
+
+        with closing(sqlite3.connect(bot.DB_FILE)) as conn, \
+                mock.patch.object(bot, "get_relationship_journal", side_effect=revoke_between_reducers), \
+                mock.patch.object(bot, "private_conversation_sources", wraps=original_sources) as real_private, \
+                mock.patch.object(bot, "sealed_tier_candidates", wraps=bot.sealed_tier_candidates) as real_tier:
+            conn.execute("BEGIN")
+            bot.build_user_memory_context(self.runtime.user_id, self.runtime.guild_id,
+                connection=conn, read_only=True, **self._memory_kwargs())
+            positive = [call for call in real_private.call_args_list if call.kwargs["channel_id"] > 0]
+            self.assertEqual(len(positive), 2)
+            self.assertEqual(real_tier.call_count, 2)
+            self.assertEqual(original_sources(conn, guild_id=self.runtime.guild_id,
+                user_id=self.runtime.user_id, channel_id=8810), ())
+
     async def test_direct_private_relationship_reader_has_one_read_only_snapshot(self):
         original = bot.private_conversation_sources
         snapshots = []
@@ -79,7 +315,7 @@ class DirectMemorySnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(network.PUBLIC_MEMORY, prompt)
         self.assertNotIn(network.INTERNAL_MEMORY, prompt)
         self.assertNotIn(network.SEALED_MEMORY, prompt)
-        self.assertGreaterEqual(len(snapshots), 2)
+        self.assertEqual(len(snapshots), 1)
         self.assertTrue(all(conn is snapshots[0] for conn in snapshots))
         memory_bases = [basis for basis in inputs["prompt_metadata"]["prompt_source_bases"]
                         if isinstance(basis, bot.MemoryPromptSourceBasis)]
