@@ -248,7 +248,8 @@ class PrivateSourceReadEfficiencyTests(unittest.TestCase):
                 try:
                     self.assertEqual(self.sources(),())
                 finally:
-                    self.conn.set_authorizer(None)
+                    # Python 3.9 cannot disable the authorizer with None.
+                    self.conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK)
                 self.assertEqual(reads,[])
         self.conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='active',visibility='sealed_test' WHERE entry_id=?",(root,))
         self.conn.execute("DELETE FROM memory_ledger_lineage")
