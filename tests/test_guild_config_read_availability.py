@@ -76,6 +76,7 @@ class GuildConfigReadAvailabilityTests(unittest.IsolatedAsyncioTestCase):
                                     OperationalError=sqlite3.OperationalError),
             closing=closing, asyncio=asyncio, logging=logging,
             re=re, wraps=wraps,
+            _direct_payload_sessions={},
             _direct_payload_capture_waiters={},
             # Pure route/payload inputs are outside this configuration-owner
             # fixture. The actual capture wrapper and cleanup owner execute.
