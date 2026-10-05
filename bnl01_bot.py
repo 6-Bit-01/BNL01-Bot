@@ -44021,7 +44021,7 @@ def _is_deictic_payload_placeholder(text: str) -> bool:
     return bool(
         re.fullmatch(
             r"(?:each|all)?\s*(?:of\s+)?(?:these|those|the\s+following)"
-            r"(?:\s+(?:people|names|items|characters|folks|entries|ones))?",
+            r"(?:\s+[^,\r\n]+)?",
             normalized,
         )
     )
@@ -44029,29 +44029,51 @@ def _is_deictic_payload_placeholder(text: str) -> bool:
 
 def _collect_inline_direct_payload_items(clean_content: str):
     payload_items = []
+    literal_payload = False
     exact_name_echo = parse_exact_name_echo_instruction(clean_content)
     if exact_name_echo is not None:
         payload_items.extend(
             _split_exact_name_echo_payload(exact_name_echo)
         )
+        literal_payload = True
     multiline = _extract_multiline_request_payload(clean_content)
     if multiline and not payload_items:
         payload_items.extend(multiline.get("payload_items", []))
+        literal_payload = True
     if not payload_items:
         payload_expected, _payload_reason = _detect_request_payload_expectation(clean_content)
         inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE) if payload_expected else None
-        if inline_match:
+        # A list colon is not a numeric clock or URI/path colon.
+        delimiter = re.search(r"(?<!\d):(?![/\\])|:(?![\d/\\])", clean_content)
+        request_prefix = clean_content[:delimiter.start()] if delimiter else ""
+        if delimiter and _detect_request_payload_expectation(request_prefix)[0]:
+            candidate_text = clean_content[delimiter.end():].strip()
+            literal_payload = True
+        elif inline_match:
             candidate_text = inline_match.group(1).strip().rstrip(".!?")
-            candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
-            candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
-            if candidate_text:
-                parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
-                payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
+        else:
+            candidate_text = ""
+        if not literal_payload:
+            # A reference to described items is request wording, not the items.
+            # Explicitly delimited data keeps its literal names and titles.
+            supplied_items, intro_count = re.subn(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE)
+            supplied_items = re.sub(r"\b(?:please|thanks?)\b$", "", supplied_items, flags=re.IGNORECASE).strip(" ,")
+            if intro_count and supplied_items:
+                literal_payload = True
+            candidate_text = supplied_items
+            if not literal_payload and _is_deictic_payload_placeholder(candidate_text):
+                candidate_text = ""
+        if candidate_text:
+            parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
+            for item_index, part in enumerate(parts):
+                # Vet request prose before shape filtering can shift positions.
+                if not literal_payload and item_index == 0 and _is_deictic_payload_placeholder(part):
+                    continue
+                if _is_single_payload_like_item(part):
+                    payload_items.append(part)
     unique = []
     seen = set()
     for raw_item in payload_items:
-        if _is_deictic_payload_placeholder(raw_item):
-            continue
         key = _normalize_payload_item_key(raw_item)
         if not key or key in seen:
             continue
@@ -44152,18 +44174,131 @@ def _guard_direct_payload_capture_ingress(handler):
         while (pending := _direct_payload_capture_waiters.get(key)) is not None:
             await pending["event"].wait()
         payload_expected, _ = _detect_request_payload_expectation(content)
-        if payload_expected and not _collect_inline_direct_payload_items(content):
+        active_session = _direct_payload_sessions.get(key)
+        if active_session and (
+            getattr(message, "id", None) == active_session.get("anchor_message_id")
+            or getattr(message, "id", None) in active_session.get("payload_message_ids", ())
+        ):
+            return
+        if active_session or (payload_expected and not _collect_inline_direct_payload_items(content)):
             _direct_payload_capture_waiters[key] = {
                 "owner": id(message), "event": asyncio.Event(),
             }
+            committed_ack = bool(active_session and (
+                active_session.get("last_bot_response_at")
+                or active_session.get("last_committed_payload_count", 0)
+            ) and _is_ack_after_committed_direct_response(
+                resolve_discord_user_mentions_for_conversation(
+                    message, content,
+                    bot_user_id=int(getattr(client.user, "id", 0) or 0),
+                    remove_bot_mention=True,
+                )
+            ))
+            if active_session and active_session.get("generating") and not committed_ack:
+                active_session["generation_invalidated"] = True
         try:
             return await handler(message)
+        except (Exception, asyncio.CancelledError):
+            if active_session and _direct_payload_sessions.get(key) is active_session:
+                close_direct_payload_session_after_failed_generation(key, active_session, "capture_failed")
+            raise
         finally:
             # Early denial, failed capture and cancellation must not strand
             # followers or manufacture an accepted payload session.
             _finish_direct_payload_capture_handoff(message)
 
     return guarded
+
+
+def _direct_payload_captured_source_basis(message, content: str, channel_policy: str):
+    """Bind an accepted turn to its exact original and existing source controls."""
+    with closing(_open_member_memory_read_connection()) as conn:
+        conn.execute("BEGIN")
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """SELECT id,role,content,user_id,user_name,channel_id,channel_name,
+                      channel_policy,timestamp,message_id
+               FROM main.conversations WHERE guild_id=? AND message_id=?
+               ORDER BY id DESC LIMIT 1""",
+            (message.guild.id, message.id),
+        ).fetchone()
+        if row is None:
+            return None
+        source = dict(row)
+        if (
+            source["role"] != "user"
+            or int(source["user_id"] or 0) != message.author.id
+            or int(source["channel_id"] or 0) != message.channel.id
+            or source["channel_policy"] != channel_policy
+            or source["content"] != content
+        ):
+            raise ValueError("direct_payload_original_mismatch")
+        control_digest, blocked = _public_conversation_recall_controls(
+            conn, guild_id=message.guild.id,
+            source_users={int(source["id"]): message.author.id},
+        )
+        if blocked:
+            raise ValueError("direct_payload_original_unavailable")
+        source["prompt_history_excluded"] = should_exclude_from_prompt_history(
+            source["role"], source["content"],
+        )
+    row_ids = (int(source["id"]),)
+    return ConversationPromptSourceBasis(
+        expected_digest=_prompt_source_digest(json.dumps(
+            [_conversation_prompt_row_snapshot(source)],
+            ensure_ascii=False, separators=(",", ":"),
+        )),
+        rendered_context=content, guild_id=message.guild.id,
+        current_user_id=message.author.id, channel_id=message.channel.id,
+        channel_name=getattr(message.channel, "name", ""),
+        channel_policy=channel_policy, source_row_ids=row_ids,
+        revalidation_row_ids=row_ids, public_recall_control_digest=control_digest,
+        evidence_items=(build_conversation_evidence_item(
+            text=content, source_id=row_ids[0], speaker_user_id=message.author.id,
+            speaker_label=_safe_prompt_display_label(message.author.display_name),
+            current_turn=True,
+        ),),
+    )
+
+
+def _capture_direct_payload_session_turn(message, content, channel_policy, reply_row_id):
+    # A previous attempt may have committed the original before a downstream
+    # observer failed. Never replay that original transaction for the same ID.
+    existing = _direct_payload_captured_source_basis(message, content, channel_policy)
+    if existing is not None:
+        return existing
+    decision = save_user_message(
+        message.author.id, message.author.display_name, message.guild.id, content,
+        channel_name=getattr(message.channel, "name", ""),
+        channel_policy=channel_policy, channel_id=message.channel.id,
+        message_id=message.id, route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
+        directed_to_bnl=True, reply_to_conversation_row_id=reply_row_id,
+    )
+    if not decision.save_conversation:
+        return None
+    basis = _direct_payload_captured_source_basis(message, content, channel_policy)
+    if basis is None:
+        raise ValueError("direct_payload_original_missing")
+    return basis
+
+
+async def _capture_direct_payload_session_turn_async(*args):
+    worker = asyncio.create_task(asyncio.to_thread(_capture_direct_payload_session_turn, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Cancelling to_thread does not stop its writer. Drain it before the
+        # ingress handoff is released, without accepting the cancelled turn.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if worker.done() and not worker.cancelled():
+            worker.exception()
+        raise
 
 
 _rd_ops_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CONTEXT_MAX_TURNS))
@@ -44377,6 +44512,8 @@ def _start_direct_payload_session(
         ),
         "payload_lines": [],
         "payload_turn_contexts": [],
+        "payload_message_ids": [],
+        "payload_source_bases": [],
         "created_at": now,
         "last_payload_at": None,
         "hard_deadline": now + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS),
@@ -44741,6 +44878,8 @@ def _is_ack_after_committed_direct_response(text: str) -> bool:
 
 
 async def _generate_direct_payload_session(session_key, reason: str):
+    while (pending := _direct_payload_capture_waiters.get(session_key)) is not None:
+        await pending["event"].wait()
     session = _direct_payload_sessions.get(session_key)
     if not session:
         return
@@ -44749,6 +44888,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
     session["generating"] = True
     generation_revision = int(session.get("revision", 0))
     payload_lines = list(session.get("payload_lines", []))
+    captured_source_bases = tuple(session.get("payload_source_bases", ()))
     anchor_message = session.get("anchor_message")
     payload_count = len(payload_lines)
     last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
@@ -44776,6 +44916,11 @@ async def _generate_direct_payload_session(session_key, reason: str):
         return False
 
     if _abort_if_invalidated("revision_changed_before_send"):
+        return
+
+    if captured_source_bases and await prompt_source_basis_failure_async(captured_source_bases):
+        if not _abort_if_invalidated("revision_changed_during_source_validation"):
+            close_direct_payload_session_after_failed_generation(session_key, session, "conversation_source_changed")
         return
 
     if payload_count == 0:
@@ -44841,7 +44986,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         route="direct_payload_session",
         current_text=direct_content,
         current_user_id=session["requester_user_id"],
-        current_message_ids={session.get("anchor_message_id")},
+        current_message_ids={session.get("anchor_message_id"), *session.get("payload_message_ids", ())},
         referenced_message_ids={
             session_addressing.reply_message_id
         }
@@ -45264,6 +45409,14 @@ async def _generate_direct_payload_session(session_key, reason: str):
         )
     if _abort_if_invalidated("revision_changed_during_source_validation"):
         return
+    # Current payload text cannot be reconstructed from a deleted/corrected
+    # original. Keep its captured basis immutable across generic guard repair.
+    if captured_source_bases and await prompt_source_basis_failure_async(captured_source_bases):
+        if not _abort_if_invalidated("revision_changed_during_source_validation"):
+            close_direct_payload_session_after_failed_generation(session_key, session, "conversation_source_changed")
+        return
+    if _abort_if_invalidated("revision_changed_during_source_validation"):
+        return
     sent_message_ids = []
     try:
         if len(response) <= 2000:
@@ -45368,6 +45521,10 @@ async def _generate_direct_payload_session(session_key, reason: str):
 
 async def _direct_session_timer(session_key):
     while True:
+        pending = _direct_payload_capture_waiters.get(session_key)
+        if pending is not None:
+            await pending["event"].wait()
+            continue
         session = _direct_payload_sessions.get(session_key)
         if not session:
             return
@@ -49721,6 +49878,28 @@ async def on_message(message: discord.Message):
                         f"payload_count={payload_count};last_committed_payload_count={last_committed_payload_count}"
                     )
                 else:
+                    if message.id in active_direct_session.get("payload_message_ids", ()):
+                        return
+                    if channel_policy not in get_route_mode_contract(ROUTE_MODE_DIRECT_PAYLOAD).allowed_channel_policies:
+                        close_direct_payload_session_after_failed_generation(session_key, active_direct_session, "channel_policy_changed")
+                        return
+                    try:
+                        captured_basis = await _capture_direct_payload_session_turn_async(
+                            message, durable_conversation_content, channel_policy,
+                            turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0,
+                        )
+                    except (Exception, asyncio.CancelledError):
+                        if _direct_payload_sessions.get(session_key) is active_direct_session:
+                            close_direct_payload_session_after_failed_generation(session_key, active_direct_session, "capture_failed")
+                        raise
+                    if captured_basis is None:
+                        close_direct_payload_session_after_failed_generation(session_key, active_direct_session, "capture_denied")
+                        return
+                    if _direct_payload_sessions.get(session_key) is not active_direct_session:
+                        return
+                    if channel_policy != active_direct_session.get("channel_policy"):
+                        close_direct_payload_session_after_failed_generation(session_key, active_direct_session, "channel_policy_changed")
+                        return
                     recall_guard_content = "\n".join(
                         [
                             active_direct_session.get("original_request_text", ""),
@@ -49751,6 +49930,8 @@ async def on_message(message: discord.Message):
                         line,
                         current_turn_context,
                     )
+                    active_direct_session.setdefault("payload_message_ids", []).append(message.id)
+                    active_direct_session.setdefault("payload_source_bases", []).append(captured_basis)
                     active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
                     active_direct_session["hard_deadline"] = datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS)
                     active_direct_session["revision"] = int(active_direct_session.get("revision", 0)) + 1

@@ -3378,11 +3378,12 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             author=author,
         )
         payload = FakeMessage(channel, "<@456>", author=author, mentions=[miss_bit])
+        real_capture = bnl01_bot.save_user_message
 
-        with self._on_message_runtime(channel.id, followup_candidate=True), mock.patch.object(
-            bnl01_bot,
-            "_direct_session_timer",
-            new=mock.AsyncMock(return_value=None),
+        with (
+            self._on_message_runtime(channel.id, followup_candidate=True),
+            mock.patch.object(bnl01_bot, "save_user_message", side_effect=real_capture),
+            mock.patch.object(bnl01_bot, "_direct_session_timer", new=mock.AsyncMock(return_value=None)),
         ):
             await bnl01_bot.on_message(first)
             old_batch_task = bnl01_bot._channel_tasks[channel.id]
@@ -3466,9 +3467,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
         key = (channel.guild.id, channel.id, author.id)
+        real_capture = bnl01_bot.save_user_message
         with (
             self._on_message_runtime(channel.id, followup_candidate=True),
             mock.patch.object(bnl01_bot, "resolve_channel_policy", return_value="public_home"),
+            mock.patch.object(bnl01_bot, "save_user_message", side_effect=real_capture),
         ):
             await bnl01_bot.on_message(payload)
 

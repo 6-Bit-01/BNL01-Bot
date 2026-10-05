@@ -1,7 +1,7 @@
 """Deferred ownership spans ingress through mandatory capture and handoff.
 
-Late-capture cases use real SQLite capture. Early-ingress and delivery cases
-use the existing synthetic coordinator inputs with mocked transport/provider.
+Capture uses the real SQLite owner throughout. Coordinator inputs and external
+transport/provider remain synthetic.
 """
 
 import asyncio
@@ -20,7 +20,13 @@ class DeferredCaptureOrderingTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = existing.ConversationBatchCoordinatorTests.asyncSetUp
     asyncTearDown = existing.ConversationBatchCoordinatorTests.asyncTearDown
     _channel = existing.ConversationBatchCoordinatorTests._channel
-    _on_message_runtime = existing.ConversationBatchCoordinatorTests._on_message_runtime
+    def _on_message_runtime(self, channel_id, *, followup_candidate=True):
+        capture = bot.save_user_message
+        stack = existing.ConversationBatchCoordinatorTests._on_message_runtime(
+            self, channel_id, followup_candidate=followup_candidate,
+        )
+        stack.enter_context(mock.patch.object(bot, "save_user_message", side_effect=capture))
+        return stack
 
     def setUp(self):
         self.addCleanup(self._clear_capture_waiters)
@@ -119,7 +125,7 @@ class DeferredCaptureOrderingTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchall()
             finally:
                 conn.close()
-            self.assertEqual(rows, [("user", request.content)])
+            self.assertEqual(rows, [("user", request.content), ("user", payload.content)])
 
     async def _capture_exit_releases_followup(self, *, cancel):
         channel = self._channel(991650 if cancel else 991651)
