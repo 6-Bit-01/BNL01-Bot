@@ -2493,12 +2493,14 @@ def sync_tiktok_show_evidence_ledgers(
                     ).fetchone()[0]
                     or 0
                 )
+                # The schema owner ensured this index above. Count this show's
+                # roots before joining edges, rather than all active guild roots.
                 current_lineage_count = int(
                     conn.execute(
                         """
                         SELECT COUNT(*)
                         FROM memory_ledger_lineage AS lineage
-                        JOIN memory_ledger_entries AS entry
+                        JOIN memory_ledger_entries AS entry INDEXED BY idx_mle_source
                           ON entry.entry_id=lineage.entry_id
                         WHERE entry.guild_id=? AND entry.source_table=?
                           AND entry.source_event_key=?
@@ -2892,9 +2894,9 @@ def _load_show_related_sources(
         superseded = {str(r[0]) for r in conn.execute(
             """SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=?
                AND lineage_type IN ('correction_of','supersedes','retracts')""", (guild_id,))}
-        for index, (table, row_id, lifecycle, public, text, entry_id) in enumerate(conn.execute(
+        for index, (table, row_id, lifecycle, public, entry_id) in enumerate(conn.execute(
             """SELECT source_table,source_row_id,lifecycle_status,public_usable,
-                      normalized_value,entry_id FROM memory_ledger_entries
+                      entry_id FROM memory_ledger_entries
                WHERE guild_id=? AND source_table IN ('conversations','tiktok_live_chat')
                  AND entry_type IN ('observation','derived_summary')""", (guild_id,),
         )):

@@ -44018,7 +44018,9 @@ def _is_deictic_payload_placeholder(text: str) -> bool:
     return bool(
         re.fullmatch(
             r"(?:each|all)?\s*(?:of\s+)?(?:these|those|the\s+following)"
-            r"(?:\s+(?:people|names|items|characters|folks|entries|ones))?",
+            # Modifiers describe the missing group, not a supplied item.
+            # Punctuation/quotes remain literal payload boundaries.
+            r"(?:\s+(?:[\w'-]+\s+)*(?:people|names|items|characters|folks|entries|ones))?",
             normalized,
         )
     )
@@ -44027,6 +44029,7 @@ def _is_deictic_payload_placeholder(text: str) -> bool:
 def _collect_inline_direct_payload_items(clean_content: str):
     payload_items = []
     exact_name_echo = parse_exact_name_echo_instruction(clean_content)
+    explicit_payload = exact_name_echo is not None
     if exact_name_echo is not None:
         payload_items.extend(
             _split_exact_name_echo_payload(exact_name_echo)
@@ -44034,20 +44037,28 @@ def _collect_inline_direct_payload_items(clean_content: str):
     multiline = _extract_multiline_request_payload(clean_content)
     if multiline and not payload_items:
         payload_items.extend(multiline.get("payload_items", []))
+        explicit_payload = True
     if not payload_items:
         payload_expected, _payload_reason = _detect_request_payload_expectation(clean_content)
         inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE) if payload_expected else None
         if inline_match:
             candidate_text = inline_match.group(1).strip().rstrip(".!?")
-            candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
-            candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
+            prefix, separator, supplied_items = candidate_text.partition(":")
+            if separator and _is_deictic_payload_placeholder(prefix):
+                candidate_text = supplied_items.strip()
+                explicit_payload = True
+            if not explicit_payload:
+                candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
+                candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
             if candidate_text:
                 parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
                 payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
     unique = []
     seen = set()
     for raw_item in payload_items:
-        if _is_deictic_payload_placeholder(raw_item):
+        # User-supplied literal data can itself be a title like "These Names".
+        # Only inferred prose tails need missing-group rejection.
+        if not explicit_payload and _is_deictic_payload_placeholder(raw_item):
             continue
         key = _normalize_payload_item_key(raw_item)
         if not key or key in seen:
