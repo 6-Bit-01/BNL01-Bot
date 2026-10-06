@@ -54,6 +54,14 @@ jobs:
           --workdir /workspace
           python:3.9.5-slim-buster
           python -m unittest discover -s tests -p 'test_sqlite_connection_lifetime.py' -v
+      - name: Verify exact repair rollback and privacy fence on the legacy runtime
+        run: >-
+          docker run --rm --network none
+          -e PYTHONDONTWRITEBYTECODE=1
+          --mount "type=bind,source=$PWD,target=/workspace,readonly"
+          --workdir /workspace
+          python:3.9.5-slim-buster
+          python -m unittest discover -s tests -p 'test_retained_conversation_repair.py' -v
 
   tiktok-live-transport-contract:
     runs-on: ubuntu-latest

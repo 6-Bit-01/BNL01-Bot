@@ -7,7 +7,7 @@ adapters may consume only revalidated, route-safe projections.
 from __future__ import annotations
 
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from typing import Any, Iterable, Mapping
 import unicodedata
 
@@ -2787,6 +2788,10 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
 
 def record_shadow_receipt(conn: sqlite3.Connection, *, guild_id: int, writer: str, source_table: str, source_row_id: int | str, source_revision: str = "", source_event_key: str = "", outcome: str, reason_code: str, entry_id: str = "") -> None:
     ensure_memory_ledger_schema(conn)
+    _record_prepared_shadow_receipt(conn, guild_id=guild_id, writer=writer, source_table=source_table, source_row_id=source_row_id, source_revision=source_revision, source_event_key=source_event_key, outcome=outcome, reason_code=reason_code, entry_id=entry_id)
+
+
+def _record_prepared_shadow_receipt(conn: sqlite3.Connection, *, guild_id: int, writer: str, source_table: str, source_row_id: int | str, source_revision: str = "", source_event_key: str = "", outcome: str, reason_code: str, entry_id: str = "") -> None:
     conn.execute(
         "INSERT INTO memory_ledger_shadow_receipts (guild_id, writer, source_table, source_row_id, source_revision, source_event_key, attempted_at, outcome, reason_code, entry_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (int(guild_id or 0), (writer or "unknown")[:80], (source_table or "unknown")[:80], str(source_row_id or ""), (source_revision or "")[:160], (source_event_key or "")[:160], _now(), outcome if outcome in OUTCOMES else "error", (reason_code or "unknown")[:120], entry_id or ""),
@@ -2801,6 +2806,12 @@ def insert_ledger_entry(conn: sqlite3.Connection, entry: LedgerEntry) -> LedgerW
     if entry.entry_type not in ENTRY_TYPES:
         return LedgerWriteResult(outcome="error", reason_code="unsupported_entry_type", source_table=entry.source_table, source_row_id=str(entry.source_row_id), source_revision=entry.source_revision, source_event_key=entry.source_event_key, guild_id=entry.guild_id)
     ensure_memory_ledger_schema(conn)
+    return _insert_prepared_ledger_entry(conn, entry)
+
+
+def _insert_prepared_ledger_entry(conn: sqlite3.Connection, entry: LedgerEntry) -> LedgerWriteResult:
+    if entry.entry_type not in ENTRY_TYPES:
+        return LedgerWriteResult(outcome="error", reason_code="unsupported_entry_type", source_table=entry.source_table, source_row_id=str(entry.source_row_id), source_revision=entry.source_revision, source_event_key=entry.source_event_key, guild_id=entry.guild_id)
     now = _now()
     cur = conn.cursor()
     cur.execute("""
@@ -11951,6 +11962,8 @@ def backfill_retained_conversation_ledger_entries(
     *,
     batch_size: int = 1000,
     environ: dict[str, str] | None = None,
+    exact_manifest: Mapping[str, Any] | None = None,
+    expected_manifest_sha256: str = "",
 ) -> dict[str, Any]:
     """Project one bounded slice of retained public chat into the Ledger.
 
@@ -11960,6 +11973,10 @@ def backfill_retained_conversation_ledger_entries(
     create or promote a durable member claim.
     """
 
+    if exact_manifest is not None:
+        result, _rows = _retained_repair_preview(conn, exact_manifest,
+            expected_manifest_sha256=expected_manifest_sha256, environ=environ)
+        return result
     env = dict(os.environ if environ is None else environ)
     if not shadow_enabled(env):
         return {
@@ -12971,6 +12988,45 @@ def resolve_conversation_reply_target(
     return str(entry_id)
 
 
+def _conversation_observation_entry(
+    *, row_id: int, user_id: int, user_name: str, guild_id: int, content: str,
+    channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0,
+    message_id: int | None = None, route_mode: str = "unknown", observed_at: str = "",
+    source_sequence: int | None = None, reply_target: str = "",
+) -> LedgerEntry:
+    subject_key = subject_key_for_user(user_id)
+    source_class = _source_class("conversation_continuity", SourceClass.PUBLIC_OBSERVATION)
+    value = (content or "")[:500]
+    visibility = _visibility(channel_policy)
+    public_ok = _public_ok(subject_key, "conversation", value, source_class, visibility, Confidence.MEDIUM)
+    return LedgerEntry(
+            guild_id=guild_id,
+            source_table="conversations",
+            source_row_id=row_id,
+            source_revision=str(row_id),
+            source_role="user",
+            entry_type="observation",
+            subject_key=subject_key,
+            subject_display_name=user_name or "",
+            predicate_key="conversation",
+            value=value,
+            source_class=source_class,
+            route_mode=route_mode,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            channel_policy=channel_policy,
+            source_message_id=message_id,
+            visibility=visibility,
+            confidence=Confidence.MEDIUM,
+            public_usable=public_ok,
+            salience=0.2,
+            observed_at=observed_at or _now(),
+            source_sequence=int(source_sequence or row_id),
+            participants=(LedgerParticipant(subject_key, user_name or "", "author", 0),),
+            lineage=(("reply_to", reply_target),) if reply_target else (),
+        )
+
+
 def shadow_conversation_row(
     conn: sqlite3.Connection,
     *,
@@ -12990,6 +13046,7 @@ def shadow_conversation_row(
     conversation_target_user_ids: tuple[int, ...] = (),
     reply_to_conversation_row_id: int = 0,
     environ: dict[str, str] | None = None,
+    _schema_prepared: bool = False,
 ) -> LedgerWriteResult:
     role_norm = (role or "").lower()
     visibility = _visibility(channel_policy)
@@ -13025,16 +13082,7 @@ def shadow_conversation_row(
         entry = LedgerEntry(guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id), source_role="model", entry_type="derived_summary", subject_key=BNL_SUBJECT_KEY, subject_display_name="BNL-01", predicate_key="model_output", value=(content or "")[:500], source_class=SourceClass.DERIVED_SUMMARY, route_mode=route_mode, channel_id=channel_id, channel_name=channel_name, channel_policy=channel_policy, source_message_id=message_id, visibility=visibility, confidence=Confidence.LOW, public_usable=False, derived=True, projection=True, salience=0.1, observed_at=observed_at or _now(), source_sequence=int(source_sequence or row_id), participants=participants)
         return insert_ledger_entry(conn, entry)
     subject_key = subject_key_for_user(user_id)
-    source_class = _source_class("conversation_continuity", SourceClass.PUBLIC_OBSERVATION)
     value = (content or "")[:500]
-    public_ok = _public_ok(
-        subject_key,
-        "conversation",
-        value,
-        source_class,
-        visibility,
-        Confidence.MEDIUM,
-    )
     observed_at = observed_at or _now()
     reply_target = resolve_conversation_reply_target(
         conn,
@@ -13048,34 +13096,12 @@ def shadow_conversation_row(
         observed_at=observed_at,
         source_sequence=int(source_sequence or row_id),
     ) if reply_to_conversation_row_id else ""
-    result = insert_ledger_entry(
+    result = (_insert_prepared_ledger_entry if _schema_prepared else insert_ledger_entry)(
         conn,
-        LedgerEntry(
-            guild_id=guild_id,
-            source_table="conversations",
-            source_row_id=row_id,
-            source_revision=str(row_id),
-            source_role="user",
-            entry_type="observation",
-            subject_key=subject_key,
-            subject_display_name=user_name or "",
-            predicate_key="conversation",
-            value=value,
-            source_class=source_class,
-            route_mode=route_mode,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            channel_policy=channel_policy,
-            source_message_id=message_id,
-            visibility=visibility,
-            confidence=Confidence.MEDIUM,
-            public_usable=public_ok,
-            salience=0.2,
-            observed_at=observed_at or _now(),
-            source_sequence=int(source_sequence or row_id),
-            participants=(LedgerParticipant(subject_key, user_name or "", "author", 0),),
-            lineage=(("reply_to", reply_target),) if reply_target else (),
-        ),
+        _conversation_observation_entry(row_id=row_id, user_id=user_id, user_name=user_name,
+            guild_id=guild_id, content=content, channel_name=channel_name, channel_policy=channel_policy,
+            channel_id=channel_id, message_id=message_id, route_mode=route_mode, observed_at=observed_at,
+            source_sequence=source_sequence, reply_target=reply_target),
     )
     if result.outcome == "inserted":
         (
@@ -15333,3 +15359,295 @@ def build_memory_ledger_evaluation(
                 "updated_at": str(lifecycle_sweep[2] or ""),
             }
     return report
+
+
+def _retained_repair_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                    separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _retained_repair_schema(conn: sqlite3.Connection) -> str:
+    """Inspect an already prepared schema; a repair never initializes it."""
+    required = {
+        "conversations": {"id", "guild_id", "user_id", "role", "content", "channel_id",
+                          "channel_policy", "message_id", "timestamp", "route_mode"},
+        "bnl_journal_source_events": {"event_seq", "guild_id", "source_kind", "source_key",
+            "raw_text", "content_hash", "public_usable", "channel_policy", "channel_id",
+            "subject_ref", "occurred_at_ms", "metadata_json"},
+        "memory_ledger_entries": {"entry_id", "guild_id", "subject_key", "source_table",
+            "source_row_id", "source_revision", "source_role", "normalized_value"},
+        "memory_ledger_participants": {"entry_id", "guild_id", "participant_key",
+                                      "display_name", "participant_role", "order_index", "created_at"},
+        "memory_ledger_lineage": {"entry_id", "guild_id", "lineage_type", "target_entry_id"},
+        "memory_ledger_shadow_receipts": {"guild_id", "writer", "source_table", "source_row_id",
+            "source_revision", "source_event_key", "attempted_at", "outcome", "reason_code", "entry_id"},
+    }
+    for table, columns in required.items():
+        if not columns.issubset({str(row[1]) for row in conn.execute("PRAGMA main.table_info(%s)" % table)}):
+            raise ValueError("retained_repair_schema_unavailable")
+    installed = {str(row[1]): row for row in conn.execute("PRAGMA main.index_list(memory_ledger_lineage)")}
+    for name, shape in (
+        ("sqlite_autoindex_memory_ledger_lineage_1", ("entry_id", "lineage_type", "target_entry_id")),
+        ("idx_mll_guild", ("guild_id", "lineage_type", "target_entry_id")),
+    ):
+        if name not in installed or int(installed[name][4]):
+            raise ValueError("retained_repair_lineage_index_unavailable")
+        if tuple(str(row[2]) for row in conn.execute("PRAGMA main.index_info(%s)" % name)) != shape:
+            raise ValueError("retained_repair_lineage_index_changed")
+    if not int(installed["sqlite_autoindex_memory_ledger_lineage_1"][2]):
+        raise ValueError("retained_repair_lineage_primary_key_changed")
+    names = tuple(required)
+    schema = conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE tbl_name IN (%s) ORDER BY type,name" %
+                          ",".join("?" for _ in names), names).fetchall()
+    return _retained_repair_digest([tuple(row) for row in schema])
+
+
+def _retained_repair_original(conn: sqlite3.Connection, row_id: int) -> dict[str, Any] | None:
+    columns = ("id", "guild_id", "user_id", "role", "content", "channel_id",
+               "channel_policy", "message_id", "timestamp", "route_mode")
+    row = conn.execute("SELECT %s FROM conversations WHERE id=?" % ",".join(columns), (row_id,)).fetchone()
+    return dict(zip(columns, row)) if row is not None else None
+
+
+def _retained_repair_rows(conn: sqlite3.Connection, sql: str, args: tuple[Any, ...],
+                          columns: tuple[str, ...], maximum: int = 64) -> list[dict[str, Any]]:
+    with closing(conn.execute(sql, args)) as cursor:
+        rows = cursor.fetchmany(maximum + 1)
+    if len(rows) > maximum:
+        raise ValueError("retained_repair_row_bound")
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def _retained_repair_binding(conn: sqlite3.Connection, row: dict[str, Any]) -> dict[str, Any]:
+    """Same stored-original/Journal/control binding as the reviewed preview."""
+    original = dict(row)
+    body = original.pop("content")
+    original["content_sha256"] = hashlib.sha256(str(body or "").encode("utf-8")).hexdigest()
+    guild = int(row["guild_id"])
+    subject = subject_key_for_user(row["user_id"])
+    root = stable_entry_id(guild_id=guild, source_table="conversations", source_row_id=row["id"],
+                          source_revision=str(row["id"]), entry_type="observation",
+                          subject_key=subject, predicate_key="conversation")
+    roots = _retained_repair_rows(conn, """SELECT entry_id,source_revision,entry_type,predicate_key,
+        source_role,lifecycle_status,public_usable,channel_policy,channel_id,subject_key
+        FROM memory_ledger_entries WHERE guild_id=? AND source_table='conversations'
+          AND source_row_id=? ORDER BY entry_id LIMIT 65""", (guild, str(row["id"])),
+        ("entry_id", "source_revision", "entry_type", "predicate_key", "source_role",
+         "lifecycle_status", "public_usable", "channel_policy", "channel_id", "subject_key"))
+    edge_columns = ("entry_id", "target_entry_id", "lineage_type", "guild_id")
+    incoming = _retained_repair_rows(conn, """SELECT entry_id,target_entry_id,lineage_type,guild_id
+        FROM memory_ledger_lineage INDEXED BY idx_mll_guild WHERE guild_id=? AND target_entry_id=?
+          AND lineage_type IN ('correction_of','supersedes','retracts')
+        ORDER BY entry_id,lineage_type LIMIT 65""", (guild, root), edge_columns)
+    outgoing = _retained_repair_rows(conn, """SELECT entry_id,target_entry_id,lineage_type,guild_id
+        FROM memory_ledger_lineage INDEXED BY sqlite_autoindex_memory_ledger_lineage_1
+        WHERE guild_id=? AND entry_id=? ORDER BY target_entry_id,lineage_type LIMIT 65""",
+        (guild, root), edge_columns)
+    member = _retained_repair_rows(conn, """SELECT entry_id,source_row_id,source_revision,predicate_key,
+        lifecycle_status FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?
+          AND source_table='member_memory_control' ORDER BY entry_id LIMIT 65""", (guild, subject),
+        ("entry_id", "source_row_id", "source_revision", "predicate_key", "lifecycle_status"))
+    key = str(int(row["message_id"] or 0)) if int(row["message_id"] or 0) else "legacy_row:" + str(row["id"])
+    archives = _retained_repair_rows(conn, """SELECT event_seq,raw_text,content_hash,public_usable,
+        channel_policy,channel_id,subject_ref,occurred_at_ms,metadata_json
+        FROM bnl_journal_source_events WHERE guild_id=? AND source_kind='discord_message'
+          AND source_key=? ORDER BY event_seq LIMIT 3""", (guild, key),
+        ("event_seq", "raw_text", "content_hash", "public_usable", "channel_policy", "channel_id",
+         "subject_ref", "occurred_at_ms", "metadata_json"), 2)
+    archive_valid = len(archives) == 1
+    for archive in archives:
+        raw = archive.pop("raw_text")
+        archive["raw_text_sha256"] = hashlib.sha256(str(raw or "").encode("utf-8")).hexdigest()
+        archive_valid = archive_valid and (
+            archive["raw_text_sha256"] == original["content_sha256"] == archive["content_hash"]
+            and archive["channel_policy"] == row["channel_policy"]
+            and int(archive["channel_id"] or 0) == int(row["channel_id"] or 0)
+            and archive["subject_ref"] == subject and bool(archive["public_usable"]))
+    eligible = (int(row["guild_id"] or 0) > 0 and int(row["user_id"] or 0) > 0
+        and row["role"] == "user" and row["channel_policy"] == "public_selective"
+        and row["route_mode"] == "channel_observation" and archive_valid
+        and _public_ok(subject, "conversation", (body or "")[:500],
+            _source_class("conversation_continuity", SourceClass.PUBLIC_OBSERVATION),
+            _visibility(row["channel_policy"]), Confidence.MEDIUM)
+        and not _CONVERSATION_CORRECTION_RE.search((body or "")[:500])
+        and not incoming and not outgoing and not member)
+    return {"row_id": int(row["id"]), "guild_id": guild, "expected_root": root,
+        "original_fingerprint": _retained_repair_digest(original),
+        "archive_fingerprint": _retained_repair_digest(archives),
+        "control_fingerprint": _retained_repair_digest([incoming, outgoing, member]),
+        "root_count": len(roots), "stored_source_eligible": bool(eligible)}
+
+
+def _retained_repair_entry(row: dict[str, Any]) -> LedgerEntry:
+    return _conversation_observation_entry(row_id=int(row["id"]), user_id=int(row["user_id"]),
+        user_name="", guild_id=int(row["guild_id"]), content=row["content"], channel_name="",
+        channel_policy=row["channel_policy"], channel_id=int(row["channel_id"] or 0),
+        message_id=row["message_id"], route_mode=row["route_mode"], observed_at=row["timestamp"],
+        source_sequence=int(row["id"]))
+
+
+def _retained_repair_root_exact(conn: sqlite3.Connection, entry: LedgerEntry) -> bool:
+    # Compare private display fields in SQL; never retrieve a historical name.
+    expected = {
+        "entry_id": entry.entry_id, "schema_version": MEMORY_LEDGER_SCHEMA_VERSION,
+        "guild_id": entry.guild_id, "subject_key": entry.subject_key, "subject_display_name": "",
+        "entry_type": entry.entry_type, "predicate_key": entry.predicate_key,
+        "normalized_value": entry.value[:1000], "source_class": entry.source_class.value,
+        "source_table": entry.source_table, "source_row_id": str(entry.source_row_id),
+        "source_revision": entry.source_revision, "source_event_key": entry.source_event_key,
+        "source_role": entry.source_role, "route_mode": entry.route_mode, "channel_id": entry.channel_id,
+        "channel_name": "", "channel_policy": entry.channel_policy, "source_message_id": entry.source_message_id,
+        "visibility": entry.visibility.value, "confidence": entry.confidence.value,
+        "public_usable": int(entry.public_usable), "derived": int(entry.derived),
+        "projection": int(entry.projection), "salience": entry.salience, "observed_at": entry.observed_at,
+        "source_sequence": entry.source_sequence, "valid_from": entry.valid_from,
+        "valid_until": entry.valid_until, "freshness": entry.freshness, "lifecycle_status": entry.lifecycle_status,
+    }
+    matches = conn.execute("SELECT COUNT(*) FROM memory_ledger_entries WHERE %s AND created_at<>'' AND created_at=updated_at" %
+                           " AND ".join(key + " IS ?" for key in expected), tuple(expected.values())).fetchone()[0]
+    participants = conn.execute("""SELECT guild_id,participant_key,participant_role,order_index,display_name=''
+        FROM memory_ledger_participants WHERE entry_id=? ORDER BY order_index,participant_key LIMIT 3""",
+        (entry.entry_id,)).fetchall()
+    return matches == 1 and [tuple(row) for row in participants] == [(entry.guild_id, entry.subject_key, "author", 0, 1)]
+
+
+def _retained_repair_preview(conn: sqlite3.Connection, manifest: Mapping[str, Any], *,
+                            expected_manifest_sha256: str, environ: dict[str, str] | None = None
+                            ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not shadow_enabled(dict(os.environ if environ is None else environ)):
+        raise ValueError("retained_repair_shadow_disabled")
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_manifest_sha256 or "") or _retained_repair_digest(manifest) != expected_manifest_sha256:
+        raise ValueError("retained_repair_manifest_binding_changed")
+    items = manifest.get("rows", ())
+    if (manifest.get("version") != "projection_gap_private_manifest_v1" or not isinstance(items, list)
+        or not 1 <= len(items) <= 23 or len({int(item["row_id"]) for item in items}) != len(items)
+        or len({int(item["guild_id"]) for item in items}) != 1):
+        raise ValueError("retained_repair_manifest_scope_invalid")
+    schema_sha256 = _retained_repair_schema(conn)
+    counts = Counter(expected=len(items), missing_roots=0, already_present=0, blocked=0)
+    accepted = []
+    for prior in items:
+        row = _retained_repair_original(conn, int(prior["row_id"]))
+        if row is None:
+            counts["blocked"] += 1
+            continue
+        binding = _retained_repair_binding(conn, row)
+        same = all(binding[key] == prior.get(key) for key in
+                   ("guild_id", "expected_root", "original_fingerprint", "archive_fingerprint", "control_fingerprint"))
+        eligible = same and binding["stored_source_eligible"]
+        if binding["root_count"] == 0:
+            counts["missing_roots"] += 1
+        elif binding["root_count"] == 1 and _retained_repair_root_exact(conn, _retained_repair_entry(row)):
+            counts["already_present"] += 1
+        else:
+            eligible = False
+        if not eligible:
+            counts["blocked"] += 1
+        else:
+            accepted.append(row)
+    return {"status": "stored_eligibility_preview", "counts": dict(counts),
+        "schema_sha256": schema_sha256, "database_writes": 0,
+        "external_controls_verified": False, "repair_executed": False}, accepted
+
+
+def run_retained_conversation_repair(
+    db_path: str, manifest: Mapping[str, Any], *, expected_manifest_sha256: str,
+    dry_run: bool = True, expected_schema_sha256: str = "", channel_policy_resolver: Any = None,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Default-RO exact-cohort operator; applying needs separately approved live adapters.
+
+    The policy supplier must use the existing live channel-policy owner with a
+    bounded transport. Source/member controls are read from their existing local
+    Ledger owners. Journal-publication controls do not authorize conversation roots.
+    This operator does not turn a stored preview into live-write approval. A timeout is
+    still required for imports, filesystem I/O, fence acquisition and callbacks.
+    """
+    from pathlib import Path
+    from bnl_journal_source_store import journal_release_privacy_fence
+
+    # Snapshot caller-owned structures before any supplier/fence can yield.
+    reviewed = json.loads(json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+    if not dry_run and not callable(channel_policy_resolver):
+        raise ValueError("retained_repair_live_authority_unavailable")
+    path = Path(db_path).resolve(strict=True)
+    if not Path(str(path) + ".journal-privacy.lock").is_file():
+        raise ValueError("retained_repair_existing_fence_missing")
+    env = dict(os.environ if environ is None else environ)
+    env[CONVERSATION_MOTIF_FORMATION_ENV] = "false"
+    with journal_release_privacy_fence(str(path), blocking=False) as acquired:
+        if not acquired:
+            return {"status": "deferred_privacy_fence_busy", "database_writes": 0, "repair_executed": False}
+        with closing(sqlite3.connect(path.as_uri() + ("?mode=ro" if dry_run else "?mode=rw"), uri=True, timeout=0.1)) as conn:
+            if dry_run:
+                conn.execute("PRAGMA query_only=ON")
+            deadline = time.monotonic() + (8.0 if dry_run else 3.0)
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            writes = {"memory_ledger_entries", "memory_ledger_participants", "memory_ledger_shadow_receipts"}
+            allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+                       sqlite3.SQLITE_RECURSIVE, sqlite3.SQLITE_TRANSACTION}
+            def authorize(action, first, second, database, trigger):
+                if action == sqlite3.SQLITE_INSERT and not dry_run and first in writes:
+                    return sqlite3.SQLITE_OK
+                if action == sqlite3.SQLITE_PRAGMA and first in {"table_info", "index_info", "index_list"}:
+                    return sqlite3.SQLITE_OK
+                if action not in allowed or (action == sqlite3.SQLITE_FUNCTION and
+                        str(second or first).lower() in {"load_extension", "readfile", "writefile"}):
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            conn.set_authorizer(authorize)
+            try:
+                conn.execute("BEGIN" if dry_run else "BEGIN IMMEDIATE")
+                result, rows = _retained_repair_preview(conn, reviewed,
+                    expected_manifest_sha256=expected_manifest_sha256, environ=env)
+                if dry_run:
+                    conn.rollback()
+                    return result
+                if result["counts"]["blocked"]:
+                    raise ValueError("retained_repair_current_source_blocked")
+                if not expected_schema_sha256 or result["schema_sha256"] != expected_schema_sha256:
+                    raise ValueError("retained_repair_schema_binding_changed")
+                def authority():
+                    policies = []
+                    for row in rows:
+                        policy = channel_policy_resolver(int(row["guild_id"]), int(row["channel_id"]))
+                        if policy != row["channel_policy"]:
+                            raise ValueError("retained_repair_channel_policy_changed")
+                        policies.append(policy)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("retained_repair_deadline")
+                    return tuple(policies)
+                initial_authority = authority()
+                before = conn.total_changes
+                inserted = 0
+                for row in rows:
+                    entry = _retained_repair_entry(row)
+                    if _retained_repair_root_exact(conn, entry):
+                        continue
+                    written = shadow_conversation_row(conn, row_id=int(row["id"]), user_id=int(row["user_id"]),
+                        user_name="", guild_id=int(row["guild_id"]), role="user", content=row["content"],
+                        channel_policy=row["channel_policy"], channel_id=int(row["channel_id"] or 0),
+                        message_id=row["message_id"], route_mode=row["route_mode"], observed_at=row["timestamp"],
+                        source_sequence=int(row["id"]), environ=env, _schema_prepared=True)
+                    if written.outcome != "inserted" or written.entry_id != entry.entry_id:
+                        raise ValueError("retained_repair_write_conflict")
+                    _record_prepared_shadow_receipt(conn, guild_id=entry.guild_id, writer="retained_conversation_repair",
+                        source_table="conversations", source_row_id=row["id"], source_revision=str(row["id"]),
+                        source_event_key=expected_manifest_sha256, outcome="inserted", reason_code="exact_reviewed_original",
+                        entry_id=entry.entry_id)
+                    if not _retained_repair_root_exact(conn, entry):
+                        raise ValueError("retained_repair_postcondition_failed")
+                    inserted += 1
+                if conn.total_changes - before != inserted * 3:
+                    raise ValueError("retained_repair_unexpected_mutation")
+                if authority() != initial_authority:
+                    raise ValueError("retained_repair_external_controls_changed")
+                conn.commit()
+                return dict(result, status="exact_cohort_repair_committed", database_writes=inserted * 3,
+                    repair_executed=bool(inserted), external_controls_verified=True, inserted=inserted)
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                conn.set_authorizer(None)
+                conn.set_progress_handler(None, 0)
