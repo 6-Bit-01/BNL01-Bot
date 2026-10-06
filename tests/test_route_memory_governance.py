@@ -629,7 +629,11 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
             bnl01_bot,
             "_direct_session_timer",
             new=mock.AsyncMock(return_value=None),
-        ) as timer:
+        ) as timer, mock.patch.object(
+            bnl01_bot,
+            "_direct_payload_captured_source_basis",
+            return_value=mock.Mock(spec=bnl01_bot.ConversationPromptSourceBasis),
+        ):
             started = await bnl01_bot._maybe_start_deferred_payload_session(
                 message,
                 plan,
@@ -646,7 +650,7 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["original_request_text"], "BNL, tell me something about each of these people")
         self.assertEqual(session["payload_lines"], [])
         self.assertEqual(session["current_turn_context"], "anchor addressing")
-        timer.assert_awaited_once_with(key)
+        timer.assert_awaited_once_with(key, session)
 
 
 class ConversationPlannerTests(unittest.TestCase):

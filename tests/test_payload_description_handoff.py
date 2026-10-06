@@ -532,7 +532,7 @@ class PayloadDescriptionHandoffTests(unittest.IsolatedAsyncioTestCase):
             await bot.on_message(request)
             await bot.on_message(payload)
             session = bot._direct_payload_sessions[key]
-            bases = tuple(session["payload_source_bases"])
+            bases = (session["anchor_source_basis"],) + tuple(session["payload_source_bases"])
             self.assertTrue(bases)
 
             async def validate_then_interleave(candidate_bases, *args, **kwargs):

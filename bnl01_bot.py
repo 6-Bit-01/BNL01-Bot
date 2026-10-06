@@ -44587,6 +44587,7 @@ def _start_direct_payload_session(
     channel_policy: str,
     request_text: str,
     current_turn_context: str,
+    anchor_source_basis: ConversationPromptSourceBasis | None = None,
 ):
     """Start the existing protected waiter for a request whose payload is still coming."""
     session_key = _direct_session_key(message)
@@ -44603,6 +44604,7 @@ def _start_direct_payload_session(
         "original_request_text": request_text,
         "anchor_message_id": message.id,
         "anchor_message": message,
+        "anchor_source_basis": anchor_source_basis,
         "moment_attribution_target_user_id": (
             typed_moment_attribution_target_user_id(message)
         ),
@@ -44621,11 +44623,12 @@ def _start_direct_payload_session(
         "last_committed_revision": 0,
         "last_committed_payload_count": 0,
         "last_bot_response_at": None,
+        "no_payload_ack_attempted": False,
         "current_turn_context": current_turn_context,
     }
     _direct_payload_sessions[session_key] = session
     _finish_direct_payload_capture_handoff(message)
-    session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
+    session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key, session))
     logging.info(
         "direct_payload_session_created guild_id=%s channel_id=%s user_id=%s channel_policy=%s",
         message.guild.id,
@@ -44679,6 +44682,7 @@ async def _maybe_start_deferred_payload_session(
     channel_policy: str,
     request_text: str,
     current_turn_context: str,
+    source_capture_text: str | None = None,
 ) -> bool:
     """Connect the coordinator's deferred decision to the existing session waiter."""
     if not (
@@ -44704,11 +44708,21 @@ async def _maybe_start_deferred_payload_session(
             message.author.id,
         )
         return True
+    anchor_source_basis = await asyncio.to_thread(
+        _direct_payload_captured_source_basis, message,
+        request_text if source_capture_text is None else source_capture_text,
+        channel_policy,
+    )
+    if anchor_source_basis is None:
+        _finish_direct_payload_capture_handoff(message)
+        logging.info("direct_payload_session_start_blocked reason=original_unavailable")
+        return True
     _start_direct_payload_session(
         message,
         channel_policy=channel_policy,
         request_text=request_text,
         current_turn_context=current_turn_context,
+        anchor_source_basis=anchor_source_basis,
     )
     return True
 
@@ -44973,18 +44987,24 @@ def _is_ack_after_committed_direct_response(text: str) -> bool:
     return False
 
 
-async def _generate_direct_payload_session(session_key, reason: str):
+async def _generate_direct_payload_session(session_key, reason: str, *, expected_session=None):
     while (pending := _direct_payload_capture_waiters.get(session_key)) is not None:
+        if expected_session is not None and _direct_payload_sessions.get(session_key) is not expected_session:
+            return
         await pending["event"].wait()
     session = _direct_payload_sessions.get(session_key)
-    if not session:
+    if not session or (expected_session is not None and session is not expected_session):
         return
     if session.get("completed") or session.get("generating"):
         return
     session["generating"] = True
     generation_revision = int(session.get("revision", 0))
     payload_lines = list(session.get("payload_lines", []))
-    captured_source_bases = tuple(session.get("payload_source_bases", ()))
+    anchor_source_basis = session.get("anchor_source_basis")
+    captured_source_bases = (
+        ((anchor_source_basis,) if anchor_source_basis is not None else ())
+        + tuple(session.get("payload_source_bases", ()))
+    )
     anchor_message = session.get("anchor_message")
     payload_count = len(payload_lines)
     last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
@@ -45014,22 +45034,58 @@ async def _generate_direct_payload_session(session_key, reason: str):
     if _abort_if_invalidated("revision_changed_before_send"):
         return
 
-    if captured_source_bases and await prompt_source_basis_failure_async(captured_source_bases):
+    if "anchor_source_basis" in session and anchor_source_basis is None:
+        close_direct_payload_session_after_failed_generation(session_key, session, "original_unavailable")
+        return
+
+    try:
+        captured_source_failure = (
+            await prompt_source_basis_failure_async(captured_source_bases)
+            if captured_source_bases else ""
+        )
+    except asyncio.CancelledError:
+        close_direct_payload_session_after_failed_generation(session_key, session, "source_validation_cancelled")
+        raise
+    if captured_source_failure:
         if not _abort_if_invalidated("revision_changed_during_source_validation"):
             close_direct_payload_session_after_failed_generation(session_key, session, "conversation_source_changed")
         return
 
     if payload_count == 0:
-        logging.info("direct_payload_session_expired payload_count=0 reason=no_payload")
+        # Asking for the list must not retire the request that will receive it.
+        # The existing timer owns the finite no-payload lifetime; its hard cap
+        # still applies to collected payloads, and this ACK is attempted once.
+        if not session.get("no_payload_ack_attempted"):
+            session["no_payload_ack_attempted"] = True
+            logging.info("direct_payload_session_waiting payload_count=0 reason=awaiting_payload")
+            try:
+                await anchor_message.reply(
+                    "I can do that—send the list/items and I’ll run it.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except asyncio.CancelledError:
+                close_direct_payload_session_after_failed_generation(
+                    session_key, session, "ack_cancelled"
+                )
+                raise
+            except Exception:
+                pass
+            finally:
+                session["generating"] = False
+        else:
+            session["generating"] = False
+        if _abort_if_invalidated("payload_changed_during_ack"):
+            return
         try:
-            await anchor_message.reply(
-                "I can do that—send the list/items and I’ll run it.",
-                allowed_mentions=discord.AllowedMentions.none(),
+            captured_source_failure = (
+                await prompt_source_basis_failure_async(captured_source_bases)
+                if captured_source_bases else ""
             )
-        except Exception:
-            pass
-        session["generating"] = False
-        _direct_payload_sessions.pop(session_key, None)
+        except asyncio.CancelledError:
+            close_direct_payload_session_after_failed_generation(session_key, session, "source_validation_cancelled")
+            raise
+        if captured_source_failure:
+            close_direct_payload_session_after_failed_generation(session_key, session, "conversation_source_changed")
         return
 
     logging.info(f"direct_payload_session_generation_started payload_count={payload_count} reason={reason}")
@@ -45615,15 +45671,20 @@ async def _generate_direct_payload_session(session_key, reason: str):
         logging.info(f"direct_session_delta_completed new_payload_count={payload_count}")
 
 
-async def _direct_session_timer(session_key):
+async def _direct_session_timer(session_key, owned_session=None):
+    # A timer belongs to its creating request, including while an ACK or capture
+    # yields. It must never adopt a replacement request under the same key.
+    owned_session = owned_session if owned_session is not None else _direct_payload_sessions.get(session_key)
+    if owned_session is None:
+        return
     while True:
+        if _direct_payload_sessions.get(session_key) is not owned_session:
+            return
         pending = _direct_payload_capture_waiters.get(session_key)
         if pending is not None:
             await pending["event"].wait()
             continue
-        session = _direct_payload_sessions.get(session_key)
-        if not session:
-            return
+        session = owned_session
         if _direct_session_is_expired(session) and not session.get("generating"):
             _direct_payload_sessions.pop(session_key, None)
             return
@@ -45635,7 +45696,9 @@ async def _direct_session_timer(session_key):
                 logging.info("direct_payload_session_expired payload_count=0 reason=no_payload_timeout")
                 _direct_payload_sessions.pop(session_key, None)
                 return
-        if now >= session["hard_deadline"]:
+        if now >= session["hard_deadline"] and (
+            payload_lines or not session.get("no_payload_ack_attempted")
+        ):
             payload_count = len(payload_lines)
             last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
             revision = int(session.get("revision", 0))
@@ -45649,12 +45712,16 @@ async def _direct_session_timer(session_key):
                 session["hard_deadline"] = now + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS)
                 await asyncio.sleep(0.2)
                 continue
-            await _generate_direct_payload_session(session_key, "hard_cap")
+            await _generate_direct_payload_session(session_key, "hard_cap", expected_session=session)
+            if _direct_payload_sessions.get(session_key) is not session:
+                return
             await asyncio.sleep(0.2)
             continue
         quiet_elapsed = (now - session["last_payload_at"]).total_seconds() if session.get("last_payload_at") else 0
         if session.get("payload_lines") and len(session.get("payload_lines", [])) > int(session.get("last_committed_payload_count", 0)) and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
-            await _generate_direct_payload_session(session_key, "quiet_timeout")
+            await _generate_direct_payload_session(session_key, "quiet_timeout", expected_session=session)
+            if _direct_payload_sessions.get(session_key) is not session:
+                return
             await asyncio.sleep(0.2)
             continue
         await asyncio.sleep(0.2)
@@ -50207,6 +50274,7 @@ async def on_message(message: discord.Message):
             channel_policy=channel_policy,
             request_text=direct_content,
             current_turn_context=current_turn_context,
+            source_capture_text=durable_conversation_content,
         ):
             return
 
@@ -50354,11 +50422,20 @@ async def on_message(message: discord.Message):
             if payload_expected:
                 route_mode = ROUTE_MODE_DIRECT_PAYLOAD
             if payload_expected and len(direct_payload_items) == 0:
+                anchor_source_basis = await asyncio.to_thread(
+                    _direct_payload_captured_source_basis, message,
+                    durable_conversation_content, channel_policy,
+                )
+                if anchor_source_basis is None:
+                    _finish_direct_payload_capture_handoff(message)
+                    _finish_direct_repair_generation(direct_repair_generation, "original_unavailable")
+                    return
                 _start_direct_payload_session(
                     message,
                     channel_policy=channel_policy,
                     request_text=direct_content,
                     current_turn_context=current_turn_context,
+                    anchor_source_basis=anchor_source_basis,
                 )
                 _finish_direct_repair_generation(direct_repair_generation, "deferred_payload_session")
                 return
@@ -50822,6 +50899,7 @@ async def on_message(message: discord.Message):
             channel_policy=channel_policy,
             request_text=direct_content,
             current_turn_context=current_turn_context,
+            source_capture_text=durable_conversation_content,
         ):
             return
 
@@ -51319,6 +51397,7 @@ async def on_message(message: discord.Message):
             channel_policy=channel_policy,
             request_text=direct_content,
             current_turn_context=current_turn_context,
+            source_capture_text=durable_conversation_content,
         ):
             return
 
