@@ -54,6 +54,13 @@ jobs:
           --workdir /workspace
           python:3.9.5-slim-buster
           python -m unittest discover -s tests -p 'test_sqlite_connection_lifetime.py' -v
+      - name: Native implicit commit phase diagnostics (deployed Python 3.9.5)
+        run: >-
+          docker run --rm --network none
+          -v "$PWD:/workspace:ro" -w /workspace
+          -e PYTHONDONTWRITEBYTECODE=1
+          python:3.9.5-slim-buster
+          python -m unittest discover -s tests -p 'test_reply_persistence_timing.py' -v
       - name: Verify exact repair rollback and privacy fence on the legacy runtime
         run: >-
           docker run --rm --network none

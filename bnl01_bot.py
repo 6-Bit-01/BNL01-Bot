@@ -20195,16 +20195,84 @@ def _persist_reply_transaction(write, *, operation: str, timeout: float = 5):
     reader/writer can finish. Exhaustion and non-lock failures stay visible.
     Callers must keep external effects and post-commit learning outside write.
     """
-    for attempt in range(3):
-        try:
-            with closing(sqlite3.connect(DB_FILE, timeout=timeout)) as conn, conn:
-                return write(conn)
-        except sqlite3.OperationalError as exc:
-            if not _sqlite_busy(exc) or attempt == 2:
-                raise
-            logging.warning("reply_persistence_retry operation=%s attempt=%s",
-                            operation, attempt + 1)
-            time.sleep(0.1 * (attempt + 1))
+    timed = operation in {
+        "intelligence_packet", "single_packet_begin", "single_packet_evaluation",
+    }
+    if not timed:
+        for attempt in range(3):
+            try:
+                with closing(sqlite3.connect(DB_FILE, timeout=timeout)) as conn, conn:
+                    return write(conn)
+            except sqlite3.OperationalError as exc:
+                if not _sqlite_busy(exc) or attempt == 2:
+                    raise
+                logging.warning("reply_persistence_retry operation=%s attempt=%s",
+                                operation, attempt + 1)
+                time.sleep(0.1 * (attempt + 1))
+    started = time.perf_counter() if timed else 0
+    callback_ms = commit_ms = 0.0
+    builds = attempts = 0
+    phase = "connect"
+    status = "failed"
+    error_category = "none"
+    try:
+        for attempt in range(3):
+            result = None
+            attempts = attempt + 1
+            phase = "connect"
+            try:
+                with closing(sqlite3.connect(DB_FILE, timeout=timeout)) as conn:
+                    phase = "write"
+                    callback_started = time.perf_counter() if timed else 0
+                    exit_started = None
+                    try:
+                        with conn:
+                            builds += 1
+                            try:
+                                result = write(conn)
+                            finally:
+                                if timed:
+                                    callback_ms += (time.perf_counter() - callback_started) * 1000
+                            # This boundary measures the native implicit COMMIT,
+                            # including its failed exit. Callback errors stay write.
+                            phase = "commit"
+                            exit_started = time.perf_counter() if timed else None
+                    finally:
+                        if exit_started is not None:
+                            commit_ms += (time.perf_counter() - exit_started) * 1000
+                    status = "completed"
+                    return result
+            except sqlite3.OperationalError as exc:
+                result = None
+                if not _sqlite_busy(exc) or attempt == 2:
+                    raise
+                if timed:
+                    logging.warning(
+                        "reply_persistence_retry operation=%s attempt=%s phase=%s retained=0",
+                        operation, attempt + 1, phase,
+                    )
+                else:
+                    logging.warning("reply_persistence_retry operation=%s attempt=%s",
+                                    operation, attempt + 1)
+                phase = "backoff"
+                time.sleep(0.1 * (attempt + 1))
+    except BaseException as exc:
+        status = "failed"
+        result = None
+        if timed:
+            error_category = (
+                "busy_or_locked" if _sqlite_busy(exc) else
+                "sqlite_other" if isinstance(exc, sqlite3.DatabaseError) else "non_sqlite"
+            )
+        raise
+    finally:
+        if timed:
+            logging.info(
+                "reply_persistence_timing operation=%s status=%s phase=%s "
+                "total_ms=%s callback_ms=%s commit_ms=%s builds=%s attempts=%s error_category=%s",
+                operation, status, phase, round((time.perf_counter() - started) * 1000),
+                round(callback_ms), round(commit_ms), builds, attempts, error_category,
+            )
 
 
 def save_model_message(
