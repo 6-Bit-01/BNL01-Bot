@@ -4467,7 +4467,8 @@ def build_tiktok_show_evidence_context_for_turn(
     if selection_out is not None and context:
         selection_out["subject_user_id"] = selected_subject_user_id
         selection_out["user_text"] = tiktok_show_evidence_query
-        selection_out["artist_identity_request"] = artist_request
+        if artist_request is not None:
+            selection_out["artist_identity_request"] = artist_request
     logging.info(
         "response_stage_timing stage=show_source_read elapsed_ms=%s context_chars=%s",
         round((time.perf_counter() - show_read_started) * 1000), len(context),
