@@ -1,0 +1,330 @@
+"""Artist credits in retained shows are distinct from submission accounts."""
+
+import ast
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import tempfile
+import time
+import unittest
+from contextlib import closing
+from dataclasses import dataclass, replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import bnl_tiktok_live_context as live
+import bnl_tiktok_show_ledger as ledger
+import bnl_unified_response_assessment as assessment
+import bnl_unified_intelligence_packet as packet
+import bnl_canon_entity_binding as binding
+
+from bnl_tiktok_live_context import is_tiktok_show_analysis_query
+from bnl_tiktok_show_ledger import (
+    broad_show_history_requested, build_tiktok_show_evidence_context,
+    select_tiktok_show_episode_context_items, sync_tiktok_show_evidence_ledgers,
+    tiktok_show_episode_context_item_version,
+)
+from bnl_unified_response_assessment import self_public_activity_requested
+from tests import test_tiktok_show_evidence_ledger as source_fixture
+from tests.test_tiktok_show_evidence_ledger import archived_show, authorized_read_model, ENABLED_QUEUE_ENV
+
+
+HISTORY_REQUESTS = (
+    "Have I ever submitted any songs?",
+    "Do I have any songs in any show?",
+    "People have submitted my songs before",
+    "BNL what songs of mine have been submitted?",
+    "Will you list the songs of mine that have been submitted?",
+    "Have any of my songs been submitted before, and can I submit again next Friday?",
+)
+
+
+def turn_reader_namespace(db_file):
+    """Execute source-owner definitions only, without importing bot startup."""
+    source = Path(__file__).resolve().parents[1] / "bnl01_bot.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    names = {
+        "_show_artist_identity_request", "_show_artist_labels", "_prior_queue_request_for_context",
+        "build_tiktok_show_evidence_context_for_turn", "FinalizedShowPromptSourceBasis",
+        "FinalizedShowAuthoredExcerpt", "_finalized_show_basis_digest", "_prompt_source_digest",
+        "_finalized_show_authored_excerpts_from_selection", "build_finalized_show_prompt_source_basis",
+        "refresh_prompt_source_basis", "_open_member_memory_read_connection",
+        "finalized_show_packet_owner_requested", "_current_queue_state_query",
+        "resolve_tiktok_show_analysis_request",
+    }
+    namespace = {**vars(live), **vars(ledger), **vars(assessment), **vars(packet),
+        "__name__": __name__, "DB_FILE": db_file, "closing": closing, "Path": Path,
+        "os": os, "time": time, "logging": logging, "hashlib": hashlib,
+        "dataclass": dataclass, "replace": replace,
+        "_consented_tiktok_show_subject_user_id": lambda **kwargs: kwargs["subject_user_id"],
+        "_public_member_continuation_query": lambda text, *_args, **_kwargs: text,
+    }
+    nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+    code = "from __future__ import annotations\n" + "\n".join(ast.unparse(node) for node in nodes)
+    exec(compile(code, str(source), "exec"), namespace)
+    return namespace
+
+
+class ArtistSubmissionHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.db_file = str(Path(self.scratch.name) / "artist-history.sqlite")
+        with closing(sqlite3.connect(self.db_file)):
+            pass
+        source_fixture.TikTokShowEvidenceLedgerTests().seed_source_and_memory(self.db_file, include_shadow_memory=False)
+        shows = []
+        for index, date in enumerate(("2026-08-28", "2026-09-04", "2026-09-11", "2026-09-18", "2026-09-25", "2026-10-02")):
+            show = archived_show()
+            show["sessionId"] = "neutral-history-" + str(index)
+            show["showDate"] = date
+            show["trackRoster"] = [dict(trackId=f"row-{row}", projectLabel="Other Artist",
+                title=f"Neutral Song {row}", submittedByTikTokHandle="other.submitter", outcome="finished")
+                for row in range(50)]
+            if index == 2:
+                show["trackRoster"][48].update(projectLabel="6 Bit", title="Neutral Signal", submittedByTikTokHandle="test.submitter")
+                show["trackRoster"][41].update(projectLabel="Different Artist", title="6Bit the imaginary panda")
+            if index == 4:
+                show["trackRoster"][37].update(projectLabel="6-Bit featuring Second Artist", title="Neutral Collaboration", submittedByTikTokHandle="second.submitter")
+            shows.append(show)
+        result = sync_tiktok_show_evidence_ledgers(self.db_file, guild_id=77,
+            read_model=authorized_read_model({"currentShow": None, "latestShow": shows[-1], "shows": shows}),
+            environ=ENABLED_QUEUE_ENV)
+        self.assertEqual(result["showsFinalized"], 6, result)
+
+    def test_historical_self_music_uses_show_scope_and_requester_subject(self):
+        for request in HISTORY_REQUESTS:
+            with self.subTest(request=request):
+                self.assertTrue(is_tiktok_show_analysis_query(request))
+                self.assertTrue(broad_show_history_requested(request))
+                self.assertTrue(self_public_activity_requested(request))
+
+    def test_credit_search_reads_full_retained_rosters_and_separates_submitter(self):
+        for request in HISTORY_REQUESTS:
+            with self.subTest(request=request):
+                selection = {}
+                context = build_tiktok_show_evidence_context(self.db_file, guild_id=77,
+                    user_text=request, artist_labels=("6 Bit", "Six Bit"), selection_out=selection)
+                self.assertIn("Neutral Signal", context)
+                self.assertIn("Neutral Collaboration", context)
+                self.assertIn("test.submitter", context)
+                self.assertIn("second.submitter", context)
+                self.assertNotIn("imaginary panda", context)
+                self.assertIn("6 eligible retained finalized shows", context)
+                self.assertIn("2 matching credit rows", context)
+                self.assertEqual(len(selection["source_refs"]), 6)
+                self.assertLess(len(context), 2400)
+
+    def test_current_human_scope_beats_prior_show_date(self):
+        context = build_tiktok_show_evidence_context(self.db_file, guild_id=77,
+            user_text=HISTORY_REQUESTS[1], selection_user_text="What happened in the show on 2026-10-02?",
+            artist_labels=("6 Bit",))
+        self.assertIn("Neutral Signal", context)
+        dated = build_tiktok_show_evidence_context(self.db_file, guild_id=77,
+            user_text="Were my songs submitted on 2026-09-11?", artist_labels=("6 Bit",))
+        self.assertIn("Neutral Signal", dated)
+        self.assertNotIn("Neutral Collaboration", dated)
+        self.assertIn("1 eligible retained finalized shows", dated)
+
+    def test_unresolved_and_empty_credit_have_honest_limits(self):
+        unresolved = build_tiktok_show_evidence_context(self.db_file, guild_id=77, user_text=HISTORY_REQUESTS[1])
+        self.assertIn("artist credit is unresolved", unresolved)
+        self.assertNotIn("Neutral Signal", unresolved)
+        empty = build_tiktok_show_evidence_context(self.db_file, guild_id=77,
+            user_text=HISTORY_REQUESTS[1], artist_labels=("Absent Artist",))
+        self.assertIn("No matching artist credit", empty)
+        self.assertIn("not all-time submission history", empty)
+
+    def test_packet_projection_uses_same_roots_and_revalidates_removal(self):
+        with closing(sqlite3.connect(self.db_file)) as conn:
+            items = select_tiktok_show_episode_context_items(conn, guild_id=77,
+                user_text=HISTORY_REQUESTS[1], artist_labels=("6 Bit",))
+            self.assertEqual(len(items), 1)
+            item = items[0]
+            self.assertEqual(len(item.show_keys), 6)
+            self.assertIn("Neutral Signal", item.text)
+            conn.execute("DELETE FROM tiktok_show_evidence_ledgers WHERE show_key=?", (item.show_keys[0],))
+            conn.commit()
+            version = tiktok_show_episode_context_item_version(conn, guild_id=77,
+                user_text=HISTORY_REQUESTS[1], subject_user_id=0, source_ref=item.source_ref,
+                artist_labels=("6 Bit",))
+            self.assertNotEqual(version, item.source_digest)
+
+    def test_current_queue_and_nonmusic_requests_keep_existing_owner(self):
+        for request in ("Is queue open?", "Is my song in the queue?", "How can I submit my song?", "Have I ever hosted a show?",
+                        "Will my songs be played next Friday?", "Can my song be featured in the next show?"):
+            with self.subTest(request=request):
+                from bnl_unified_response_assessment import music_submission_history_requested
+                self.assertFalse(music_submission_history_requested(request))
+
+    def test_exact_credit_punctuation_is_not_mistaken_for_collaborators(self):
+        for label in ("Test / Artist", "Test & Artist", "Test with Artist", "Test, Artist", "Test + Artist"):
+            self.assertTrue(ledger._artist_credit_matches(label, (label,)))
+        self.assertFalse(ledger._artist_credit_matches("Other Test Artist", ("Test Artist",)))
+
+    def frame(self, text, speakers=(42,)):
+        return assessment.build_situation_frame_v1(
+            route_allowed=True, route_mode="normal_chat", conversation_surface="sealed_test",
+            channel_policy="sealed_test", current_text=text,
+            current_speaker_user_ids=speakers, current_speaker_labels=("Test Member",),
+            response_act="answer",
+        )
+
+    def test_real_turn_frame_resolves_current_artist_and_does_not_reuse_queue_scope(self):
+        ns = turn_reader_namespace(self.db_file)
+        env = {**ENABLED_QUEUE_ENV, "BNL_OWNER_USER_ID": "42", "BNL_PRIMARY_GUILD_ID": "77"}
+        prior = SimpleNamespace(current_user_id=42, evidence_items=(SimpleNamespace(
+            source_id=1, speaker_user_id=42, text="Is queue open?"),))
+        context_result = SimpleNamespace(thread_focus_mode="continue_or_answer", referent_status="not_requested", selected_row_ids=(1,))
+        with mock.patch.dict(os.environ, env):
+            for text in HISTORY_REQUESTS:
+                with self.subTest(text=text):
+                    frame = self.frame(text)
+                    self.assertEqual(tuple(subject.user_id for subject in frame.subjects), (42,))
+                    selection = {}
+                    context = ns["build_tiktok_show_evidence_context_for_turn"](
+                        guild_id=77, subject_user_id=42, user_text=text,
+                        situation_frame=frame, selection_out=selection)
+                    self.assertIn("Neutral Signal", context)
+                    self.assertEqual(len(selection["source_refs"]), 6)
+                    self.assertEqual(ns["_prior_queue_request_for_context"](
+                        text, conversation_basis=prior, context_result=context_result), "")
+
+    def test_native_basis_reloads_artist_binding_and_source_authorization(self):
+        ns = turn_reader_namespace(self.db_file)
+        env = {**ENABLED_QUEUE_ENV, "BNL_OWNER_USER_ID": "42", "BNL_PRIMARY_GUILD_ID": "77"}
+        text = HISTORY_REQUESTS[1]
+        with mock.patch.dict(os.environ, env):
+            selection = {}
+            context = ns["build_tiktok_show_evidence_context_for_turn"](
+                guild_id=77, subject_user_id=42, user_text=text,
+                situation_frame=self.frame(text), selection_out=selection)
+            basis = ns["build_finalized_show_prompt_source_basis"](context, guild_id=77, selection=selection)
+            fresh, changed = ns["refresh_prompt_source_basis"](basis)
+            self.assertFalse(changed)
+            with mock.patch.dict(os.environ, {"BNL_OWNER_USER_ID": "99"}):
+                withdrawn, changed = ns["refresh_prompt_source_basis"](basis)
+                self.assertTrue(changed)
+                self.assertNotIn("Neutral Signal", withdrawn.rendered_context)
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                conn.execute("UPDATE tiktok_show_evidence_ledgers SET ledger_json='{}'")
+                conn.commit()
+            invalid, changed = ns["refresh_prompt_source_basis"](basis)
+            self.assertTrue(changed)
+            self.assertNotIn("Neutral Signal", invalid.rendered_context)
+
+    def test_identity_uses_account_authority_not_display_name_and_retirement_wins(self):
+        ns = turn_reader_namespace(self.db_file)
+        text = HISTORY_REQUESTS[1]
+        env = {**ENABLED_QUEUE_ENV, "BNL_OWNER_USER_ID": "42", "BNL_PRIMARY_GUILD_ID": "77",
+               "BNL_DECLARED_CANON_AUTHORITY_SECRET": "neutral-artist-binding-test-secret-0001"}
+        with mock.patch.dict(os.environ, env), closing(sqlite3.connect(self.db_file)) as conn:
+            request = ns["_show_artist_identity_request"](guild_id=77, user_text=text, situation_frame=self.frame(text))
+            self.assertEqual(packet.show_artist_labels_for_request(conn, request), ("6 Bit", "Six Bit"))
+            other = ns["_show_artist_identity_request"](guild_id=77, user_text=text, situation_frame=self.frame(text, speakers=(99,)))
+            self.assertEqual(packet.show_artist_labels_for_request(conn, other), ())
+            multi = ns["_show_artist_identity_request"](guild_id=77, user_text=text, situation_frame=self.frame(text, speakers=(42, 99)))
+            self.assertEqual(packet.show_artist_labels_for_request(conn, multi), ())
+            created = binding.bind_discord_account(conn, actor_user_id=42, authority_nonce="artist-bind-neutral-0001",
+                guild_id=77, account_id="42", entity_id="6_bit", reason="Neutral test binding").revision
+            binding.retire_discord_account_binding(conn, actor_user_id=42, authority_nonce="artist-retire-neutral-0001",
+                guild_id=77, binding_id=created.binding_id, expected_revision_id=created.binding_revision_id,
+                reason="Neutral test withdrawal")
+            conn.commit()
+            self.assertEqual(packet.show_artist_labels_for_request(conn, request), ())
+
+    def test_unrelated_packet_does_not_add_artist_binding_read(self):
+        with closing(sqlite3.connect(self.db_file)) as conn:
+            request = packet.IntelligencePacketRequest(guild_id=77, subject_user_id=42,
+                route_mode="normal_chat", conversation_surface="sealed_test", user_text="Is queue open?")
+            with mock.patch.object(packet, "resolve_packet_subject", side_effect=AssertionError("Unrelated binding read")):
+                self.assertEqual(packet.show_artist_labels_for_request(conn, request), ())
+
+    def test_resolved_human_history_referent_keeps_artist_separate_from_submitter(self):
+        import test_conversation_batching as bot_fixture
+        bot = bot_fixture.bnl01_bot
+        ns = vars(bot)
+        db_patch = mock.patch.object(bot, "DB_FILE", self.db_file)
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        text = "And which of those did Test Submitter submit, and when?"
+        with closing(sqlite3.connect(self.db_file)) as conn:
+            conn.execute("UPDATE conversations SET content=? WHERE id=101", (HISTORY_REQUESTS[1],))
+            conn.commit()
+        prior = SimpleNamespace(guild_id=77, current_user_id=42, evidence_items=(SimpleNamespace(
+            source_id=101, speaker_user_id=42, text=HISTORY_REQUESTS[1]),))
+        context_result = SimpleNamespace(thread_focus_mode="continue_or_answer", referent_status="resolved",
+            selected_row_ids=(101,), referent_selected_row_ids=(102,), referent_request_row_ids=(101,),
+            requester_user_id=42, referent_reason="selected_human_request", requester_human_turns=((101, HISTORY_REQUESTS[1]),))
+        env = {**ENABLED_QUEUE_ENV, "BNL_OWNER_USER_ID": "42", "BNL_PRIMARY_GUILD_ID": "77"}
+        with mock.patch.dict(os.environ, env):
+            selection = {}
+            context = ns["build_tiktok_show_evidence_context_for_turn"](
+                guild_id=77, subject_user_id=42, user_text=text, situation_frame=self.frame(text),
+                conversation_basis=prior, conversation_context_result=context_result, selection_out=selection)
+            self.assertIn("Neutral Signal", context)
+            self.assertIn("test.submitter", context)
+            self.assertIn("2026-09-11", context)
+            self.assertIn("Neutral Collaboration", context)
+            for followup, website in (
+                ("Which of those songs did Test Submitter submit, and when?", ""),
+                (text, bot.WebsiteReadModelContext("", continuation_show_dates=("2026-10-02",))),
+            ):
+                with self.subTest(followup=followup, website=bool(website)):
+                    retained = ns["build_tiktok_show_evidence_context_for_turn"](
+                        guild_id=77, subject_user_id=42, user_text=followup, situation_frame=self.frame(followup),
+                        conversation_basis=prior, conversation_context_result=context_result,
+                        website_read_model_context=website)
+                    self.assertIn("Neutral Signal", retained)
+                    self.assertIn("Neutral Collaboration", retained)
+            artist_request = selection["artist_identity_request"]
+            self.assertIsNotNone(artist_request)
+            request = packet.IntelligencePacketRequest(guild_id=77, subject_user_id=99,
+                route_mode="normal_chat", conversation_surface="sealed_test", user_text=text,
+                show_episode_selection_text=selection["selection_user_text"],
+                show_episode_artist_request=artist_request)
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                labels = packet.show_artist_labels_for_request(conn, request)
+                self.assertEqual(labels[0], "6 Bit")
+                items = ledger.select_tiktok_show_episode_context_items(conn, guild_id=77,
+                    user_text=packet._show_episode_query(request), artist_labels=labels)
+                self.assertIn("Neutral Signal", items[0].text)
+                self.assertIn("Neutral Collaboration", items[0].text)
+            for new_text, author, status in (
+                ("What songs by Other Artist have been submitted?", 42, "resolved"),
+                ("What about 2026-09-25?", 42, "resolved"),
+                ("Is queue open?", 42, "resolved"),
+                (text, 99, "resolved"), (text, 42, "ambiguous"),
+                (text, 0, "resolved"), ("What about Mac Modem?", 42, "resolved"),
+            ):
+                with self.subTest(text=new_text, author=author, status=status):
+                    control = SimpleNamespace(**vars(context_result))
+                    control.referent_status = status
+                    anchor = SimpleNamespace(**vars(prior))
+                    anchor.evidence_items = (SimpleNamespace(source_id=101, speaker_user_id=author, text=HISTORY_REQUESTS[1]),)
+                    selected = {}
+                    frame = self.frame(new_text)
+                    if "Mac Modem" in new_text:
+                        frame = replace(frame, subjects=(assessment.SituationSubjectReference(entity_ref="mac_modem"),))
+                    ns["build_tiktok_show_evidence_context_for_turn"](
+                        guild_id=77, subject_user_id=42, user_text=new_text, situation_frame=frame,
+                        conversation_basis=anchor, conversation_context_result=control, selection_out=selected)
+                    inherited = selected.get("artist_identity_request")
+                    self.assertFalse(inherited and inherited.frame_subjects and
+                        any(subject.user_id == 42 for subject in inherited.frame_subjects))
+            show_basis = bot.build_finalized_show_prompt_source_basis(context, guild_id=77, selection=selection)
+            human_basis = bot.ConversationPromptSourceBasis(
+                expected_digest=bot._conversation_prompt_basis_digest(
+                    bot._conversation_prompt_selected_digest(guild_id=77, source_row_ids=(101,)), (), ()),
+                rendered_context=HISTORY_REQUESTS[1], guild_id=77, current_user_id=42,
+                channel_id=9001, channel_name="barcode-bot", channel_policy="public_home",
+                source_row_ids=(101,), revalidation_row_ids=(101,),
+            )
+            self.assertEqual(bot.prompt_source_basis_failure((human_basis, show_basis)), "")
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                conn.execute("DELETE FROM conversations WHERE id=101")
+                conn.commit()
+            self.assertNotEqual(bot.prompt_source_basis_failure((human_basis, show_basis)), "")

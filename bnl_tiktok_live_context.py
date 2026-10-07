@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from bnl_canon_source_contract import SIX_BIT
+from bnl_unified_response_assessment import music_submission_history_requested
 
 
 SCHEMA_VERSION = 2
@@ -1081,6 +1082,8 @@ def is_tiktok_show_analysis_query(text: str) -> bool:
     normalized = _SPACE_RE.sub(" ", str(text or "")).strip().lower()
     if not normalized:
         return False
+    if music_submission_history_requested(normalized):
+        return True
     if requested_tiktok_show_word_count(normalized) and (
         _SHOW_DATE_SCOPE_RE.search(normalized) or _AUDIENCE_SCOPE_RE.search(normalized)
     ):
