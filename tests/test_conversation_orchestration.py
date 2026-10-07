@@ -4,6 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
@@ -679,7 +680,7 @@ class GovernedSelfNameTests(unittest.TestCase):
     def test_ledger_acceptance_survives_reopen_and_routes_without_literal_patch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, "bnl.sqlite")
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 ensure_memory_ledger_schema(conn)
                 _seed_conversation_source_rows(
                     conn,
@@ -776,7 +777,7 @@ class GovernedSelfNameTests(unittest.TestCase):
     def test_historical_weak_grammar_is_reported_and_quarantined_read_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, "bnl.sqlite")
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 ensure_memory_ledger_schema(conn)
                 _seed_conversation_source_rows(
                     conn,
@@ -939,7 +940,7 @@ class GovernedSelfNameTests(unittest.TestCase):
     def test_punctuation_only_source_cannot_persist_name_authority(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, "bnl.sqlite")
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 conn.execute(
                     """
                     CREATE TABLE conversations (
@@ -1051,7 +1052,7 @@ class GovernedSelfNameTests(unittest.TestCase):
                     )
                 )
             self.assertIsNone(result)
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 self.assertEqual(
                     conn.execute(
                         """
@@ -1205,7 +1206,7 @@ class GovernedSelfNameTests(unittest.TestCase):
     def test_sent_explicit_decision_commits_through_existing_ledger_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, "bnl.sqlite")
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 conn.execute(
                     """
                     CREATE TABLE conversations (
@@ -1300,7 +1301,7 @@ class GovernedSelfNameTests(unittest.TestCase):
                     channel_policy="public_home",
                     route_mode="normal_chat",
                 )
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 records = current_bnl_self_name_records(conn, guild_id=77)
                 participants = conn.execute(
                     """
@@ -1326,7 +1327,7 @@ class GovernedSelfNameTests(unittest.TestCase):
     def test_sealed_only_name_decision_does_not_leak_to_public_routing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, "bnl.sqlite")
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 ensure_memory_ledger_schema(conn)
                 _seed_conversation_source_rows(
                     conn,
@@ -1423,7 +1424,7 @@ class GovernedSelfNameTests(unittest.TestCase):
     def test_sealed_correction_does_not_supersede_public_name_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, "bnl.sqlite")
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 ensure_memory_ledger_schema(conn)
                 _seed_conversation_source_rows(
                     conn,
@@ -2632,7 +2633,7 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
             db_path = os.path.join(temp_dir, "bnl.sqlite")
             with mock.patch.object(bnl01_bot, "DB_FILE", db_path):
                 bnl01_bot.init_db()
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(db_path)) as conn, conn:
                     conn.execute(
                         """
                         INSERT INTO conversations (
@@ -2870,7 +2871,7 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
                     )
 
                 self.assertIsNone(result)
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(db_path)) as conn, conn:
                     derived_count = conn.execute(
                         """
                         SELECT COUNT(*)
@@ -2895,7 +2896,7 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
                     success.outcome,
                     {"inserted", "deduplicated"},
                 )
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(db_path)) as conn, conn:
                     states = {
                         record.normalized_name: record.decision
                         for record in current_bnl_self_name_records(
@@ -3152,7 +3153,7 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
             db_path = os.path.join(temp_dir, "bnl.sqlite")
             conn, _decision = self._seed_governed_self_name()
             try:
-                with sqlite3.connect(db_path) as persisted:
+                with closing(sqlite3.connect(db_path)) as persisted, persisted:
                     conn.backup(persisted)
             finally:
                 conn.close()
@@ -3172,7 +3173,7 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
                 bnl01_bot._bnl_self_name_cache[
                     (77, ("public_home",))
                 ] = (9999999999.0, first)
-                with sqlite3.connect(db_path) as persisted:
+                with closing(sqlite3.connect(db_path)) as persisted, persisted:
                     persisted.execute(
                         """
                         UPDATE memory_ledger_entries
@@ -3516,7 +3517,7 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
                     channel_id=700,
                     discord_message_ids=(9001, 9002),
                 )
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(db_path)) as conn, conn:
                     model_row = conn.execute(
                         """
                         SELECT id,message_id
@@ -3778,14 +3779,14 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
         self.assertTrue(addressing.addresses_bnl)
 
     def test_interruption_rebuild_has_no_stale_answer_latch(self):
-        with open("bnl01_bot.py", encoding="utf-8") as source_file:
+        with open(bnl01_bot.__file__, encoding="utf-8") as source_file:
             source = source_file.read()
 
         self.assertNotIn("answer_intent_locked", source)
         self.assertNotIn("preserved_prior_request_intent", source)
 
     def test_legacy_previous_message_shortcut_cannot_bypass_live_packet(self):
-        with open("bnl01_bot.py", encoding="utf-8") as source_file:
+        with open(bnl01_bot.__file__, encoding="utf-8") as source_file:
             source = source_file.read()
 
         self.assertIn(
@@ -3795,7 +3796,7 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
         )
 
     def test_live_third_party_batch_reaches_final_packet_authority(self):
-        with open("bnl01_bot.py", encoding="utf-8") as source_file:
+        with open(bnl01_bot.__file__, encoding="utf-8") as source_file:
             source = source_file.read()
 
         self.assertEqual(

@@ -12526,6 +12526,7 @@ def plan_conversation_response(
     operator_command: bool = False,
     source_command: bool = False,
     active_direct_session: bool = False,
+    specialized_direct_followup: bool = False,
     conversation_surface: str | None = None,
 ) -> ConversationPlan:
     """Return the conversation coordinator decision before any normal reply is sent.
@@ -12565,7 +12566,9 @@ def plan_conversation_response(
         governed_name_obligation=governed_name_obligation,
         followup_candidate=followup_candidate,
         channel_allows_conversation=channel_allows_conversation,
-        batching_enabled=batching,
+        # An already-addressed request can hand off to an approved specialized
+        # direct owner without pretending the follow-up contains a Discord tag.
+        batching_enabled=batching and not specialized_direct_followup,
         operator_command=operator_command,
         source_command=source_command,
         active_direct_session=active_direct_session,
@@ -14479,6 +14482,7 @@ class DiscordTurnAddressing:
     explicit_tag_user_ids: tuple[int, ...] = ()
     reply_target_user_id: int = 0
     subject_user_ids: tuple[int, ...] = ()
+    established_bnl_followup: bool = False
 
     @property
     def third_party_only(self) -> bool:
@@ -14493,6 +14497,7 @@ class DiscordTurnAddressing:
         canonical_name = self.bnl_name_state == "canonical"
         return bool(
             self.directly_targets_bnl
+            or self.established_bnl_followup
             or (
                 self.plain_text_names_bnl
                 and (canonical_name or governed_name_live)
@@ -14507,6 +14512,8 @@ class DiscordTurnAddressing:
             return "discord_mention"
         if self.directly_targets_bnl:
             return "discord_direct"
+        if self.established_bnl_followup:
+            return "addressed_turn_followup"
         if self.bnl_name_state not in {"", "none", "other_human", "denied"}:
             return "self_name_%s" % self.bnl_name_state
         return "none"
@@ -37988,6 +37995,9 @@ _channel_generation_id = defaultdict(int)
 _channel_preempted_generation_id = defaultdict(int)
 _channel_message_interrupt_generation_id = defaultdict(int)
 _channel_interrupt_handoff = {}  # channel_id -> list[(name, content, user_id)] full-size merged batch for post-interrupt flush
+# Metadata only: the existing buffer/handoff owns pending turns; a generation
+# retains its addressed participants while that buffer is drained.
+_channel_addressed_generation = {}
 _channel_payload_wait_extended = defaultdict(bool)
 _channel_pending_request_intent = {}
 _channel_pending_request_anchor = {}
@@ -38402,6 +38412,11 @@ def _adaptive_batch_wait_seconds(channel: discord.TextChannel, items, pending_st
     max_wait = float(BATCH_MAX_WAIT_SECONDS)
     if request_anchor:
         max_wait = float(min(BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS, ADAPTIVE_PAYLOAD_MAX_WAIT_SECONDS))
+    elif _channel_addressed_generation.get(channel_id):
+        # Collect an addressed burst within the existing direct pacing budget.
+        # This replaces the direct path's post-generation pacing delay.
+        base_wait = 1.0
+        max_wait = 1.25
     selected_wait = max(0.75, min(base_wait, max_wait))
 
     _log_batch_event(logging.INFO, "adaptive_batch_wait_selected", guild_id, channel_id, len(collapsed), f"payload_count={payload_count};elapsed_seconds={elapsed_seconds:.2f};selected_wait_seconds={selected_wait:.2f}")
@@ -38430,6 +38445,15 @@ async def _clear_generation_state(channel_id: int, generation_id: int):
     if _channel_generation_id[channel_id] == generation_id:
         _channel_generating[channel_id] = False
         _channel_generation_typing_pause_used[channel_id] = False
+    addressed = _channel_addressed_generation.get(channel_id)
+    if addressed and addressed["generation_id"] == generation_id:
+        if _channel_buffers[channel_id] or _channel_interrupt_handoff.get(channel_id):
+            addressed["generation_id"] = 0
+            addressed["author_ids"] = ()
+            addressed["message_ids"] = ()
+            addressed["commit_started"] = False
+        else:
+            _channel_addressed_generation.pop(channel_id, None)
     if (
         _channel_batch_typing_interrupt_revision.get(channel_id, 0)
         <= _channel_batch_typing_applied_revision.get(channel_id, 0)
@@ -38455,6 +38479,141 @@ def _hard_interrupt_active_for_generation(channel_id: int, generation_id: int):
         return False
     if _channel_preempted_generation_id.get(channel_id) != generation_id:
         return False
+    return True
+
+
+def _addressed_batch_authors(items):
+    return frozenset(
+        int(item[2]) for item in items
+        if item[2] and isinstance(getattr(item, "addressing", None), DiscordTurnAddressing)
+        and item.addressing.addresses_bnl
+    )
+
+
+def _ordinary_burst_continuation(message, channel_policy: str) -> bool:
+    """A continuation needs an actual, still-owned addressed turn in this room."""
+    if not BNL_ACTIVE_BATCHING_ENABLED or not getattr(message, "guild", None):
+        return False
+    cid = message.channel.id
+    state = _channel_addressed_generation.get(cid)
+    if not state or (
+        state["guild_id"] != message.guild.id
+        or state["channel_policy"] != channel_policy
+    ):
+        return False
+    uid = message.author.id
+    pending = list(_channel_buffers[cid]) + list(_channel_interrupt_handoff.get(cid, ()))
+    return bool(
+        uid in _addressed_batch_authors(pending)
+        or (
+            _channel_generating[cid]
+            and state["generation_id"] == _channel_generation_id[cid]
+            and uid in state["author_ids"]
+        )
+    )
+
+
+def _ordinary_burst_has_message(message, channel_policy: str) -> bool:
+    state = _channel_addressed_generation.get(message.channel.id)
+    if not state or state["guild_id"] != message.guild.id or state["channel_policy"] != channel_policy:
+        return False
+    message_id = int(getattr(message, "id", 0) or 0)
+    pending = list(_channel_buffers[message.channel.id]) + list(
+        _channel_interrupt_handoff.get(message.channel.id, ())
+    )
+    return bool(message_id and (
+        message_id in state.get("message_ids", ())
+        or any(int(getattr(getattr(item, "addressing", None), "source_message_id", 0) or 0)
+               == message_id for item in pending)
+    ))
+
+
+async def _await_addressed_batch_capture(channel, items):
+    # The capture handoff has no response authority. Wait for acceptance or
+    # rejection, then let the existing revision/interrupt checks decide.
+    for uid in _addressed_batch_authors(items):
+        key = (channel.guild.id, channel.id, uid)
+        while (pending := _direct_payload_capture_waiters.get(key)) is not None:
+            await pending["event"].wait()
+
+
+async def _enqueue_conversation_batch(message, content, addressing, image_inputs=(), *, channel_policy):
+    cid = message.channel.id
+    if resolve_channel_policy(message.channel) != channel_policy:
+        _finish_direct_payload_capture_handoff(message)
+        return
+    state = _channel_addressed_generation.get(cid)
+    if state and state["channel_policy"] != channel_policy:
+        _channel_buffers[cid].clear()
+        _channel_interrupt_handoff.pop(cid, None)
+        _channel_addressed_generation.pop(cid, None)
+        _channel_first_seen.pop(cid, None)
+    _channel_buffers[cid].append(build_batched_conversation_turn(
+        message, content, direct_to_bnl=addressing.directly_targets_bnl,
+        addressing=addressing, image_inputs=image_inputs,
+    ))
+    _channel_last_message_at[cid] = datetime.now(PACIFIC_TZ)
+    # Publish the accepted typed turn before waking the generation's capture
+    # fence. No intermediate state can permit the superseded draft to send.
+    _finish_direct_payload_capture_handoff(message)
+    state = _channel_addressed_generation.get(cid)
+    committing = bool(state and state.get("commit_started"))
+    if _channel_generating[cid] and not committing:
+        generation_id = _channel_generation_id[cid]
+        _channel_preempted_generation_id[cid] = generation_id
+        _channel_message_interrupt_generation_id[cid] = generation_id
+        await _interrupt_batch_typing(
+            cid, generation_id, reason="new_message_while_generating", restart_expected=True,
+        )
+        _log_batch_event(logging.INFO, "hard_message_interrupt_detected", message.guild.id,
+                         cid, len(_channel_buffers[cid]), "new_message_while_generating")
+        _log_batch_event(logging.INFO, "stale_generation_interrupted", message.guild.id,
+                         cid, len(_channel_buffers[cid]), "new_message_while_generating")
+    if len(_channel_buffers[cid]) >= BATCH_MAX_MESSAGES:
+        await _flush_channel_buffer_now(message.channel)
+    else:
+        _reset_debounce(message.channel)
+
+
+def _direct_source_context_requested(message, content, channel_policy):
+    member = message.guild.get_member(message.author.id)
+    return bool(should_inject_source_context(
+        channel_policy=channel_policy, channel_name=getattr(message.channel, "name", ""),
+        privileged=can_use_source_context_injection(message.author, member, message.guild),
+        direct_interaction=True, route="direct",
+    ) and parse_source_context_subjects(content))
+
+
+async def _maybe_enqueue_addressed_conversation(message, plan, content, addressing, image_inputs=()):
+    if not (
+        BNL_ACTIVE_BATCHING_ENABLED and plan.should_reply
+        and plan.route_mode == ROUTE_MODE_NORMAL_CHAT
+        and plan.response_timing == RESPONSE_TIMING_PACED_DIRECT
+        and plan.batch_behavior != BATCH_BEHAVIOR_DO_NOT_BATCH
+        and addressing.addresses_bnl
+    ):
+        return False
+    if resolve_channel_policy(message.channel) != plan.channel_policy:
+        return True
+    if _direct_source_context_requested(message, content, plan.channel_policy):
+        # Approved Source Files lookups retain their existing direct owner.
+        return False
+    cid = message.channel.id
+    previous = _channel_addressed_generation.get(cid)
+    if previous and previous["channel_policy"] != plan.channel_policy:
+        # A policy change ends the old owner. Its original rows remain durable;
+        # neither its queued text nor its draft enters the newly scoped turn.
+        _channel_buffers[cid].clear()
+        _channel_interrupt_handoff.pop(cid, None)
+        _channel_addressed_generation.pop(cid, None)
+    _channel_addressed_generation.setdefault(cid, {
+        "guild_id": message.guild.id, "channel_policy": plan.channel_policy,
+        "generation_id": 0, "author_ids": (), "message_ids": (),
+        "commit_started": False,
+    })
+    await _enqueue_conversation_batch(
+        message, content, addressing, image_inputs, channel_policy=plan.channel_policy,
+    )
     return True
 
 
@@ -39155,7 +39314,10 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
     distinct_users = len({uid for (_n, _c, uid) in items if uid})
     substantive_cluster = token_count >= 18 or (token_count >= 12 and len(texts) >= 3)
     casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
-    code_derived_bnl_target = any(meta and meta.directly_targets_bnl for meta in item_addressing)
+    code_derived_bnl_target = any(
+        meta and (meta.directly_targets_bnl or meta.established_bnl_followup)
+        for meta in item_addressing
+    )
 
     # Free-speak lets BNL join the room; it does not make questions directed at
     # another person into questions for BNL. A literal BNL name still opts in.
@@ -39332,6 +39494,7 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
             getattr(item, "addressing", None)
             and (
                 getattr(item, "addressing").directly_targets_bnl
+                or getattr(item, "addressing").established_bnl_followup
                 or getattr(item, "addressing").plain_text_names_bnl
             )
             for item in original_items
@@ -39421,6 +39584,8 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
                 reply_label = addressing.reply_target if addressing.reply_target == "BNL-01" else "@" + addressing.reply_target
                 routing_bits.append("Discord reply target=" + reply_label)
             routing_bits.append("directly targets BNL=" + ("yes" if addressing.directly_targets_bnl else "no"))
+            if addressing.established_bnl_followup:
+                routing_bits.append("continues the addressed BNL exchange=yes")
             routing_bits.append(
                 "BNL self-name state=" + addressing.bnl_name_state
             )
@@ -39787,6 +39952,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         or queue_response_obligation_pending
     )
 
+    addressed = _channel_addressed_generation.get(channel_id)
+    if addressed and addressed["channel_policy"] != channel_policy:
+        buf.clear()
+        _channel_first_seen.pop(channel_id, None)
+        _channel_last_message_at.pop(channel_id, None)
+        _channel_addressed_generation.pop(channel_id, None)
+        return
     if handoff_items is None and not buf:
         _log_batch_event(logging.INFO, "skip", guild_id, channel_id, 0, "empty_buffer")
         return
@@ -39873,6 +40045,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     _channel_generation_id[channel_id] += 1
     local_generation_id = _channel_generation_id[channel_id]
     _channel_generating[channel_id] = True
+    addressed = _channel_addressed_generation.get(channel_id)
+    if addressed and addressed["guild_id"] == guild_id and addressed["channel_policy"] == channel_policy:
+        addressed["generation_id"] = local_generation_id
+        addressed["author_ids"] = _addressed_batch_authors(items)
+        addressed["message_ids"] = tuple(
+            int(getattr(getattr(item, "addressing", None), "source_message_id", 0) or 0)
+            for item in items
+        )
+        addressed["commit_started"] = False
     safe_mentions = discord.AllowedMentions.none()
     batch_orchestration_influences = (
         conversation_orchestration_influence_mode(
@@ -40400,6 +40581,34 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     )
                 )
             )
+            # Preserve the direct owner's optional factual lanes when its sole
+            # speaker is collected by this coordinator. These are the existing
+            # source readers, with the same public/operator and packet scope.
+            batch_broadcast_context = ""
+            batch_queue_artist_context = ""
+            batch_show_state_context = ""
+            if len(unique_user_ids) == 1 and _channel_addressed_generation.get(channel_id):
+                member = channel.guild.get_member(first_uid)
+                operator_authority = bool(
+                    is_privileged_member(member, channel.guild)
+                    and is_operator_authority_context(channel_policy, getattr(channel, "name", ""))
+                )
+                batch_broadcast_context = await asyncio.to_thread(
+                    build_broadcast_memory_context, guild_id, combined_text, channel_policy,
+                    is_owner_or_mod=operator_authority,
+                )
+                batch_queue_artist_context = await asyncio.to_thread(
+                    build_queue_artist_memory_context, DB_FILE, guild_id=guild_id,
+                    user_text=combined_text, environ=os.environ,
+                )
+                prior_show = _get_recent_show_state_topic_context(
+                    guild_id, channel_id, first_uid, True, combined_text,
+                )
+                batch_show_state_context = str(prior_show.get("context_block") or "")
+            batch_broadcast_eligible = bool(
+                batch_broadcast_context and not batch_finalized_show_packet_owner
+                and not batch_publication_packet_owns_turn
+            )
             batch_ordinary_chat_scope = ordinary_chat_route_scope_decision(
                 guild_id=guild_id,
                 user_id=first_uid,
@@ -40416,12 +40625,35 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         and not batch_publication_packet_owns_turn
                         and not batch_publication_queue_packet_ready
                     )
+                    or (batch_broadcast_eligible and _broadcast_memory_requires_specialized_owner(combined_text))
+                    or (batch_queue_artist_context and not batch_publication_packet_owns_turn
+                        and not batch_publication_queue_packet_ready)
                     or community_visual_prompt
                 ),
             )
             batch_ordinary_chat_single_packet = bool(
                 len(unique_user_ids) == 1
                 and batch_ordinary_chat_scope.eligible
+            )
+            batch_broadcast_prompt_block = (
+                "\n\nBroadcast memory context:\n" + batch_broadcast_context
+                + "\n" + BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE + "\n"
+                if batch_broadcast_eligible else ""
+            )
+            batch_queue_artist_prompt_block = (
+                "\n\n" + batch_queue_artist_context + "\n"
+                if batch_queue_artist_context and not batch_publication_packet_owns_turn
+                and not batch_publication_queue_packet_ready else ""
+            )
+            batch_show_state_prompt_block = (
+                "\n\n" + batch_show_state_context + "\n"
+                if batch_show_state_context and not batch_publication_packet_owns_turn
+                and not batch_publication_queue_packet_ready else ""
+            )
+            prompt += batch_broadcast_prompt_block + batch_queue_artist_prompt_block + batch_show_state_prompt_block
+            batch_source_context_available = bool(
+                batch_source_context_available or batch_broadcast_prompt_block
+                or batch_queue_artist_prompt_block or batch_show_state_prompt_block
             )
             batch_public_tiktok_memory_allowed = (
                 public_tiktok_interaction_memory_allowed(
@@ -40705,6 +40937,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     lane
                     for lane, present in (
                         ("current_exchange", True),
+                        ("broadcast_memory", bool(batch_broadcast_eligible and not batch_ordinary_chat_single_packet)),
+                        ("queue_artist_memory", bool(batch_queue_artist_prompt_block)),
+                        ("show_state", bool(batch_show_state_prompt_block)),
                         (
                             "conversation_context",
                             bool(batch_conversation_basis or batch_named_conversation_basis),
@@ -40824,6 +41059,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_attribution_contract.exact_quote_authority
                         is not None
                     ),
+                    broadcast_memory_present=bool(batch_broadcast_eligible and not batch_ordinary_chat_single_packet),
+                    show_state_present=bool(batch_show_state_prompt_block),
                     website_read_model_present=(
                         bool(
                             batch_website_read_model_context
@@ -40890,6 +41127,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         block
                         for block in (
                             recent_room_prompt,
+                            batch_broadcast_prompt_block,
+                            batch_queue_artist_prompt_block,
+                            batch_show_state_prompt_block,
                             batch_named_conversation_context,
                             batch_memory_prompt_block,
                             batch_named_memory_context,
@@ -40965,6 +41205,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         context
                         for context in (
                             batch_memory_context,
+                            batch_broadcast_prompt_block,
+                            batch_queue_artist_prompt_block,
+                            batch_show_state_prompt_block,
                             batch_named_memory_context,
                             batch_named_conversation_context,
                             batch_tiktok_show_evidence_prompt_block,
@@ -41065,6 +41308,18 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
                 post_generation_regeneration_pending = None
 
+            await _await_addressed_batch_capture(channel, items)
+            if resolve_channel_policy(channel) != channel_policy:
+                return
+            if _channel_buffers[channel_id] or _hard_interrupt_active_for_generation(channel_id, local_generation_id):
+                _channel_interrupt_handoff[channel_id] = list(items)
+                _channel_first_seen.setdefault(channel_id, datetime.now(PACIFIC_TZ))
+                _channel_preempted_generation_id[channel_id] = 0
+                _channel_message_interrupt_generation_id[channel_id] = 0
+                _log_batch_event(logging.INFO, "batch_rebuilt_before_generation", guild_id,
+                                 channel_id, len(items), "new_contribution_during_preparation")
+                return
+
             generation_route = "free_speak_media_generation" if reason == "free_speak_media_generation" else "get_gemini_response"
             response_stage = "generation"
             _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
@@ -41156,6 +41411,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     guild_id=guild_id,
                     channel_id=channel_id,
                 )
+
+            if resolve_channel_policy(channel) != channel_policy:
+                await _finalize_stale_batch_single_packet(
+                    batch_ordinary_chat_execution,
+                    stale_reason="channel_policy_changed_after_generation", final_response=response,
+                )
+                return
 
             if not response:
                 latest_result = GenerationResult(
@@ -41327,6 +41589,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         return
                     continue
 
+            await _await_addressed_batch_capture(channel, items)
             late_count = len(_channel_buffers[channel_id])
             if late_count > 0:
                 _log_batch_event(logging.INFO, "late_message_during_generation", guild_id, channel_id, late_count, "detected")
@@ -42723,6 +42986,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 guard_diagnostics[
                     "generated_frame_clarification"
                 ] = True
+        await _await_addressed_batch_capture(channel, items)
+        if resolve_channel_policy(channel) != channel_policy:
+            await _finalize_stale_batch_single_packet(
+                batch_ordinary_chat_execution,
+                stale_reason="channel_policy_changed_before_send", final_response=response,
+            )
+            return
         final_rewrite_interrupt = _hard_interrupt_active_for_generation(
             channel_id,
             local_generation_id,
@@ -42761,6 +43031,22 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             len(items),
             f"generation_id={local_generation_id}",
         )
+        addressed = _channel_addressed_generation.get(channel_id)
+        reply_kwargs = {}
+        if addressed and addressed["generation_id"] == local_generation_id:
+            addressed["commit_started"] = True
+            if batch_route_mode == ROUTE_MODE_NORMAL_CHAT and len(unique_user_ids) == 1:
+                reply_message_id = next((
+                    item.addressing.source_message_id for item in items
+                    if isinstance(getattr(item, "addressing", None), DiscordTurnAddressing)
+                    and item.addressing.addresses_bnl
+                    and item.addressing.source_message_id > 0
+                ), 0)
+                if reply_message_id:
+                    reply_kwargs["reference"] = discord.MessageReference(
+                        message_id=reply_message_id, channel_id=channel_id,
+                        guild_id=guild_id, fail_if_not_exists=False,
+                    )
         response_stage = "discord_send"
         sent_message_ids = []
         try:
@@ -42768,6 +43054,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 sent = await channel.send(
                     response,
                     allowed_mentions=safe_mentions,
+                    **reply_kwargs,
                 )
                 if int(getattr(sent, "id", 0) or 0) > 0:
                     sent_message_ids.append(int(sent.id))
@@ -42776,6 +43063,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 sent = await channel.send(
                     chunks[0] + "...",
                     allowed_mentions=safe_mentions,
+                    **reply_kwargs,
                 )
                 if int(getattr(sent, "id", 0) or 0) > 0:
                     sent_message_ids.append(int(sent.id))
@@ -44321,7 +44609,7 @@ def _finish_direct_payload_capture_handoff(message):
 
 
 def _guard_direct_payload_capture_ingress(handler):
-    """Order only a same-member payload request's capture/session handoff."""
+    """Order same-member addressed capture before its existing owner handoff."""
     @wraps(handler)
     async def guarded(message):
         content = str(getattr(message, "content", "") or "")
@@ -44346,7 +44634,13 @@ def _guard_direct_payload_capture_ingress(handler):
             or getattr(message, "id", None) in active_session.get("payload_message_ids", ())
         ):
             return
-        if active_session or (payload_expected and not _collect_inline_direct_payload_items(content)):
+        if _ordinary_burst_has_message(message, resolve_channel_policy(message.channel)):
+            return
+        ordinary_capture = bool(BNL_ACTIVE_BATCHING_ENABLED and command_mode == ROUTE_MODE_NORMAL_CHAT and (
+            is_direct_bnl_target(message)
+            or _ordinary_burst_continuation(message, resolve_channel_policy(message.channel))
+        ))
+        if ordinary_capture or active_session or (payload_expected and not _collect_inline_direct_payload_items(content)):
             _direct_payload_capture_waiters[key] = {
                 "owner": id(message), "event": asyncio.Event(),
             }
@@ -44716,6 +45010,7 @@ async def _preempt_pending_batch_for_deferred_session(channel: discord.TextChann
 
     _channel_buffers[channel_id].clear()
     _channel_interrupt_handoff.pop(channel_id, None)
+    _channel_addressed_generation.pop(channel_id, None)
     _channel_first_seen.pop(channel_id, None)
     _channel_last_message_at.pop(channel_id, None)
     _channel_payload_wait_extended[channel_id] = False
@@ -50183,6 +50478,23 @@ async def on_message(message: discord.Message):
                     return
 
     active_same_user_session = bool(_direct_payload_sessions.get(session_key))
+    ordinary_burst_continuation = bool(
+        _ordinary_burst_continuation(message, channel_policy)
+        and not turn_addressing.third_party_only
+        and classify_route_mode(conversation_content, channel_policy) == ROUTE_MODE_NORMAL_CHAT
+    )
+    specialized_source_continuation = bool(
+        ordinary_burst_continuation
+        and _direct_source_context_requested(message, conversation_content, channel_policy)
+    )
+    if specialized_source_continuation:
+        ordinary_burst_continuation = False
+        followup_candidate = True
+        turn_addressing = replace(turn_addressing, established_bnl_followup=True)
+        current_turn_context = build_current_turn_addressing_context(
+            message, direct_to_bnl=real_direct_target, reply_to_bnl=is_reply,
+            established_bnl_followup=True, addressing=turn_addressing,
+        )
     message_should_enter_conversation = bool(
         conversation_content
         and (
@@ -50194,6 +50506,7 @@ async def on_message(message: discord.Message):
             )
             or followup_candidate
             or active_same_user_session
+            or ordinary_burst_continuation
         )
     )
     logging.info(f"response_route_active_session active={int(active_same_user_session)}")
@@ -50277,6 +50590,7 @@ async def on_message(message: discord.Message):
         direct_interaction=turn_addressing.addresses_bnl,
         active_handled_elsewhere=bool(
             turn_addressing.addresses_bnl or should_handle_as_active_channel
+            or ordinary_burst_continuation
         ),
     )
 
@@ -50307,6 +50621,26 @@ async def on_message(message: discord.Message):
         )
         return
 
+    if ordinary_burst_continuation and conversation_content:
+        addressed = _channel_addressed_generation.get(message.channel.id)
+        if addressed and addressed.get("commit_started"):
+            turn_addressing = replace(turn_addressing, established_bnl_followup=True)
+        await asyncio.to_thread(
+            save_user_message, message.author.id, message.author.display_name,
+            message.guild.id, durable_conversation_content,
+            channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy,
+            channel_id=message.channel.id, message_id=message.id,
+            route_mode=ROUTE_MODE_NORMAL_CHAT, directed_to_bnl=turn_addressing.addresses_bnl,
+            reply_to_conversation_row_id=(
+                turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0
+            ),
+        )
+        await _enqueue_conversation_batch(
+            message, conversation_content, turn_addressing, current_image_inputs,
+            channel_policy=channel_policy,
+        )
+        return
+
     # ---------------- ACTIVE CHANNEL ----------------
     if should_handle_as_active_channel:
         if not conversation_content and message_should_enter_conversation:
@@ -50333,6 +50667,7 @@ async def on_message(message: discord.Message):
             payload_expected=payload_expected_for_plan,
             payload_count=len(direct_payload_items),
             active_direct_session=active_same_user_session,
+            specialized_direct_followup=specialized_source_continuation,
             conversation_surface=conversation_surface,
         )
         save_decision = await asyncio.to_thread(save_user_message, message.author.id, message.author.display_name, message.guild.id, durable_conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=conversation_plan_is_directed_to_bnl(conversation_plan), reply_to_conversation_row_id=turn_addressing.reply_conversation_row_id if turn_addressing.reply_targets_bnl else 0)
@@ -50347,8 +50682,13 @@ async def on_message(message: discord.Message):
         ):
             return
 
-        # Direct/direct-like traffic is planned independently from passive batching;
-        # non-direct active-channel traffic falls through to the batch planner below.
+        if await _maybe_enqueue_addressed_conversation(
+            message, conversation_plan, direct_content, turn_addressing, current_image_inputs,
+        ):
+            return
+
+        # Specialized direct owners and the independent batching kill switch
+        # retain the existing direct path; ordinary addressed turns joined above.
         if conversation_plan.should_reply and conversation_plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
             route_mode = conversation_plan.route_mode
             direct_repair_generation = None
@@ -50392,13 +50732,18 @@ async def on_message(message: discord.Message):
                 len(_channel_buffers[message.channel.id])
                 + len(_channel_interrupt_handoff.get(message.channel.id, []))
             )
-            if pending_count:
+            addressed_to_preempt = _channel_addressed_generation.pop(message.channel.id, None)
+            if pending_count or (
+                addressed_to_preempt and not addressed_to_preempt.get("commit_started")
+            ):
                 _channel_buffers[message.channel.id].clear()
                 _channel_interrupt_handoff.pop(message.channel.id, None)
                 _channel_first_seen.pop(message.channel.id, None)
                 _channel_last_message_at.pop(message.channel.id, None)
                 pending_task = _channel_tasks.get(message.channel.id)
-                if pending_task and not pending_task.done():
+                if pending_task and not pending_task.done() and not (
+                    addressed_to_preempt and addressed_to_preempt.get("commit_started")
+                ):
                     pending_task.cancel()
                 _log_batch_event(logging.INFO, "skip", message.guild.id, message.channel.id, pending_count, "direct_reply_preempts_batch")
             self_reflection = (
@@ -50856,46 +51201,10 @@ async def on_message(message: discord.Message):
             return
         if free_speak_surface:
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} conversation_surface={conversation_surface} reason=free_speak_surface_batch")
-        if _channel_generating[message.channel.id]:
-            interrupted_generation_id = _channel_generation_id[message.channel.id]
-            _channel_preempted_generation_id[message.channel.id] = interrupted_generation_id
-            _channel_message_interrupt_generation_id[message.channel.id] = interrupted_generation_id
-            await _interrupt_batch_typing(
-                message.channel.id,
-                interrupted_generation_id,
-                reason="new_message_while_generating",
-                restart_expected=True,
-            )
-            _log_batch_event(
-                logging.INFO,
-                "hard_message_interrupt_detected",
-                message.guild.id,
-                message.channel.id,
-                len(_channel_buffers[message.channel.id]) + 1,
-                "new_message_while_generating",
-            )
-            _log_batch_event(
-                logging.INFO,
-                "stale_generation_interrupted",
-                message.guild.id,
-                message.channel.id,
-                len(_channel_buffers[message.channel.id]) + 1,
-                "new_message_while_generating",
-            )
-        _channel_buffers[message.channel.id].append(
-            build_batched_conversation_turn(
-                message,
-                conversation_content,
-                direct_to_bnl=real_direct_target,
-                addressing=turn_addressing,
-                image_inputs=current_image_inputs,
-            )
+        await _enqueue_conversation_batch(
+            message, conversation_content, turn_addressing, current_image_inputs,
+            channel_policy=channel_policy,
         )
-        _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)
-        if len(_channel_buffers[message.channel.id]) >= BATCH_MAX_MESSAGES:
-            await _flush_channel_buffer_now(message.channel)
-            return
-        _reset_debounce(message.channel)
         return
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
@@ -50969,6 +51278,11 @@ async def on_message(message: discord.Message):
             request_text=direct_content,
             current_turn_context=current_turn_context,
             source_capture_text=durable_conversation_content,
+        ):
+            return
+
+        if await _maybe_enqueue_addressed_conversation(
+            message, conversation_plan, direct_content, turn_addressing, current_image_inputs,
         ):
             return
 
@@ -51467,6 +51781,11 @@ async def on_message(message: discord.Message):
             request_text=direct_content,
             current_turn_context=current_turn_context,
             source_capture_text=durable_conversation_content,
+        ):
+            return
+
+        if await _maybe_enqueue_addressed_conversation(
+            message, conversation_plan, direct_content, turn_addressing, current_image_inputs,
         ):
             return
 

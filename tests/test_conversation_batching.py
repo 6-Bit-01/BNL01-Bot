@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -295,6 +295,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 bnl01_bot._channel_preempted_generation_id,
                 bnl01_bot._channel_message_interrupt_generation_id,
                 bnl01_bot._channel_interrupt_handoff,
+                bnl01_bot._channel_addressed_generation,
                 bnl01_bot._channel_payload_wait_extended,
                 bnl01_bot._channel_pending_request_intent,
                 bnl01_bot._channel_pending_request_anchor,
@@ -777,7 +778,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     content="What makes Friday's opener work?",
                     direct_target=direct, profile_update=real_profile,
                 )
-        with real_connect(bnl01_bot.DB_FILE, timeout=0.01) as conn:
+        with closing(real_connect(bnl01_bot.DB_FILE, timeout=0.01)) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM user_profiles").fetchone()[0], 0)
 
     async def test_profile_wait_does_not_block_discord_event_loop(self):
@@ -1452,7 +1453,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.dict(os.environ, canary_env, clear=False),
             ):
                 bnl01_bot.init_db()
-                with bnl01_bot.sqlite3.connect(db_path) as connection:
+                with closing(bnl01_bot.sqlite3.connect(db_path)) as connection, connection:
                     connection.executemany(
                         """
                         INSERT INTO conversations (
@@ -2925,6 +2926,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             self._on_message_runtime(channel.id, followup_candidate=False),
+            mock.patch.object(bnl01_bot, "BNL_ACTIVE_BATCHING_ENABLED", False),
             mock.patch.object(bnl01_bot, "is_direct_bnl_target", return_value=True),
             mock.patch.object(bnl01_bot, "plan_conversation_response", return_value=plan),
             mock.patch.object(bnl01_bot, "try_self_reflection_response", return_value="Direct reply."),
@@ -2960,6 +2962,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             self._on_message_runtime(channel.id, followup_candidate=False),
+            mock.patch.object(bnl01_bot, "BNL_ACTIVE_BATCHING_ENABLED", False),
             mock.patch.object(bnl01_bot, "is_direct_bnl_target", return_value=True),
             mock.patch.object(bnl01_bot, "plan_conversation_response", return_value=plan),
             mock.patch.object(bnl01_bot, "is_privileged_member", return_value=False),
@@ -3020,7 +3023,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         bnl01_bot._finish_direct_repair_generation(second_token, "test_complete")
         self.assertNotIn(key, bnl01_bot._inflight_direct_repair_generations)
 
-    async def test_stale_repair_paused_before_route_cannot_clear_newer_batch(self):
+    async def test_repair_paused_before_route_captures_newer_turn_before_batch_generation(self):
         channel = self._channel(8123)
         author = FakeAuthor()
         first = FakeMessage(channel, "BNL, that's not what I asked", author=author)
@@ -3041,6 +3044,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         direct_generate = mock.AsyncMock(side_effect=AssertionError("stale repair must stop before generation"))
         with (
             self._on_message_runtime(channel.id, followup_candidate=False),
+            mock.patch.object(bnl01_bot, "_reset_debounce"),
             mock.patch.object(
                 bnl01_bot,
                 "maybe_handle_provider_status_command",
@@ -3059,21 +3063,21 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ):
             first_task = asyncio.create_task(bnl01_bot.on_message(first))
             await asyncio.wait_for(first_hook_entered.wait(), timeout=0.5)
-            await bnl01_bot.on_message(newer)
-            scheduled = bnl01_bot._channel_tasks.pop(channel.id)
-            scheduled.cancel()
+            newer_task = asyncio.create_task(bnl01_bot.on_message(newer))
             try:
-                await scheduled
-            except asyncio.CancelledError:
-                pass
+                await asyncio.sleep(0)
+                self.assertFalse(newer_task.done())
+                self.assertFalse(bnl01_bot._channel_buffers[channel.id])
+                direct_generate.assert_not_awaited()
+            finally:
+                release_first_hook.set()
+                await asyncio.wait_for(asyncio.gather(first_task, newer_task), timeout=2)
 
-            buffered_before_resume = list(bnl01_bot._channel_buffers[channel.id])
-            self.assertEqual(len(buffered_before_resume), 1)
-            self.assertIn("Friday's opener", buffered_before_resume[0].content)
-
-            release_first_hook.set()
-            await asyncio.wait_for(first_task, timeout=0.5)
-            self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), buffered_before_resume)
+            captured = list(bnl01_bot._channel_buffers[channel.id])
+            self.assertEqual(len(captured), 2)
+            self.assertIn("not what I asked", captured[0].content)
+            self.assertIn("Friday's opener", captured[1].content)
+            self.assertEqual([turn.addressing.source_message_id for turn in captured], [first.id, newer.id])
             direct_generate.assert_not_awaited()
             self.assertEqual(first.replies, [])
 
@@ -3085,7 +3089,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ["Friday's opener—got it. That's the question I should have answered."],
         )
 
-    async def test_newer_fragment_during_direct_repair_generation_discards_old_and_flushes_newer_batch(self):
+    async def test_newer_fragment_during_repair_batch_generation_discards_old_and_keeps_full_request(self):
         channel = self._channel(8124)
         author = FakeAuthor()
         first = FakeMessage(channel, "BNL, that's not what I asked", author=author)
@@ -3093,81 +3097,47 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         generation_started = asyncio.Event()
         release_generation = asyncio.Event()
 
-        async def direct_generate(_channel, _prompt, _user_id, _guild_id, **_kwargs):
-            generation_started.set()
-            await release_generation.wait()
-            return "Stale answer that must never send."
-
+        prompts = []
         async def batch_generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                generation_started.set()
+                await release_generation.wait()
+                return "Stale answer that must never send."
+            self.assertIn("not what I asked", prompt)
             self.assertIn("I meant Friday's opener", prompt)
             return "Friday's opener—understood. Here's the corrected answer."
-
-        plan = bnl01_bot.plan_conversation_response(
-            "that's not what I asked",
-            "sealed_test",
-            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
-            active_channel=True,
-            real_direct_target=True,
-            batching_enabled=True,
-            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
-        )
-        real_planner = bnl01_bot.plan_conversation_response
-
-        def plan_for_message(text, *args, **kwargs):
-            if bnl01_bot.is_conversational_repair_intent(text):
-                return plan
-            return real_planner(text, *args, **kwargs)
 
         send_planned = mock.AsyncMock()
         with (
             self._on_message_runtime(channel.id, followup_candidate=False),
+            self._flush_runtime(channel.id, batch_generate),
             mock.patch.object(
                 bnl01_bot,
                 "is_direct_bnl_target",
                 side_effect=lambda message: message.id == first.id,
             ),
-            mock.patch.object(bnl01_bot, "plan_conversation_response", side_effect=plan_for_message),
-            mock.patch.object(bnl01_bot, "is_privileged_member", return_value=False),
-            mock.patch.object(bnl01_bot, "resolve_recent_media_followup", return_value=""),
-            mock.patch.object(bnl01_bot, "try_memory_recall_response", return_value=""),
-            mock.patch.object(bnl01_bot, "build_show_state_override_context", return_value={}),
-            mock.patch.object(bnl01_bot, "_get_recent_show_state_topic_context", return_value={}),
-            mock.patch.object(bnl01_bot, "build_room_first_direct_context", return_value="Prior visible exchange: Friday's opener."),
-            mock.patch.object(bnl01_bot, "maybe_build_bnl_read_model_context", return_value=""),
-            mock.patch.object(bnl01_bot, "maybe_build_source_context_for_direct_message", new=mock.AsyncMock(return_value="")),
-            mock.patch.object(
-                bnl01_bot,
-                "build_user_aware_prompt",
-                return_value=("Prior visible exchange: Friday's opener.\nCorrection-turn contract.", False, "social_signal"),
-            ),
-            mock.patch.object(bnl01_bot, "log_response_style"),
             mock.patch.object(
                 bnl01_bot,
                 "get_gemini_response_with_optional_typing",
-                new=mock.AsyncMock(side_effect=direct_generate),
+                new=mock.AsyncMock(side_effect=AssertionError("addressed repair must use batch generation")),
             ),
-            mock.patch.object(bnl01_bot, "suppress_stale_media_fallback", side_effect=lambda response, **_kwargs: response),
             mock.patch.object(bnl01_bot, "send_planned_conversation_response", new=send_planned),
         ):
-            first_task = asyncio.create_task(bnl01_bot.on_message(first))
-            await asyncio.wait_for(generation_started.wait(), timeout=0.5)
-            await bnl01_bot.on_message(newer)
-            scheduled = bnl01_bot._channel_tasks.pop(channel.id)
-            scheduled.cancel()
+            await bnl01_bot.on_message(first)
+            scheduled = bnl01_bot._channel_tasks[channel.id]
             try:
-                await scheduled
-            except asyncio.CancelledError:
-                pass
-
-            release_generation.set()
-            await asyncio.wait_for(first_task, timeout=0.5)
+                await asyncio.wait_for(generation_started.wait(), timeout=3)
+                await bnl01_bot.on_message(newer)
+                self.assertEqual(len(bnl01_bot._channel_buffers[channel.id]), 1)
+                self.assertFalse(scheduled.cancelled())
+            finally:
+                release_generation.set()
+                await asyncio.wait_for(scheduled, timeout=5)
             send_planned.assert_not_awaited()
             self.assertEqual(first.replies, [])
-            self.assertEqual(len(bnl01_bot._channel_buffers[channel.id]), 1)
 
-            with self._flush_runtime(channel.id, batch_generate):
-                await bnl01_bot._flush_channel_buffer(channel)
-
+        self.assertEqual(len(prompts), 2)
         self.assertEqual(channel.sent, ["Friday's opener—understood. Here's the corrected answer."])
 
     async def test_newer_message_during_direct_repair_pacing_prevents_guard_send_save_and_mark(self):

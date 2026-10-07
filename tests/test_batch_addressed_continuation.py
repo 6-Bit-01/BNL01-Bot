@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from unittest import mock
 
@@ -112,7 +113,7 @@ class AddressedContinuationDeliveryTests(unittest.IsolatedAsyncioTestCase):
         row_id = channel_id * 10
         reply_message_id = row_id * 10 + 2
         channel_name = "bnl-testing" if policy == "sealed_test" else "barcode-bot"
-        with sqlite3.connect(bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bot.DB_FILE)) as conn, conn:
             conn.executemany(
                 """INSERT INTO conversations
                 (id,user_id,user_name,guild_id,channel_name,channel_policy,
