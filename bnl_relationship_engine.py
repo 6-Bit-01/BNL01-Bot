@@ -761,11 +761,15 @@ def refresh_moment_links(conn: sqlite3.Connection, *, guild_id: int | None = Non
     else:
         conn.execute("UPDATE relationship_event_moment_links_v2 SET lifecycle='retracted', updated_at=? WHERE guild_id=?", (now, guild_id))
     try:
+        # Follow each event's exact source lineage before checking participation.
+        # Reordering through all Moments for a participant multiplies this
+        # per-message refresh by unrelated history while holding the writer.
+        # CROSS JOIN fixes that inner-join order without requiring any index.
         rows = conn.execute(f"""SELECT e.event_id,w.moment_id,e.guild_id,e.subject_user_id FROM relationship_events_v2 e
-            JOIN memory_ledger_entries src ON src.guild_id=e.guild_id AND src.source_table=e.source_table AND src.source_row_id=CAST(e.source_row_id AS TEXT) AND src.source_role=e.actor_role
-            JOIN memory_moment_members mm ON mm.ledger_entry_id=src.entry_id
-            JOIN memory_moment_windows w ON w.moment_id=mm.moment_id AND w.guild_id=e.guild_id
-            JOIN memory_moment_participants p ON p.moment_id=w.moment_id AND p.participant_key=e.subject_key
+            CROSS JOIN memory_ledger_entries src ON src.guild_id=e.guild_id AND src.source_table=e.source_table AND src.source_row_id=CAST(e.source_row_id AS TEXT) AND src.source_role=e.actor_role
+            CROSS JOIN memory_moment_members mm ON mm.ledger_entry_id=src.entry_id
+            CROSS JOIN memory_moment_windows w ON w.moment_id=mm.moment_id AND w.guild_id=e.guild_id
+            CROSS JOIN memory_moment_participants p ON p.moment_id=w.moment_id AND p.participant_key=e.subject_key
             WHERE e.lifecycle='active' AND e.actor_role='user' AND w.lifecycle_status='finalized'
               AND src.lifecycle_status IN ('active','review_only')
               AND (e.channel_policy NOT LIKE 'public_%' OR w.visibility IN ('public','public_safe')) {where}
