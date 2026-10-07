@@ -12,7 +12,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from types import SimpleNamespace
 from unittest import mock
 
@@ -69,7 +69,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.guild_id = 7700
         self.user_id = 100
         bnl01_bot.upsert_user_profile(self.user_id, self.guild_id, "Test Member")
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             for text, policy, trust in (
                 (PUBLIC_MEMORY, "public_home", "source_safe_public"),
                 (INTERNAL_MEMORY, "internal_controlled", "legacy_unknown"),
@@ -297,7 +297,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             environ=show_fixtures.ENABLED_QUEUE_ENV,
         )
         self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "")
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             conn.execute(
                 "DELETE FROM tiktok_show_evidence_ledgers WHERE guild_id=77 AND show_key=?",
                 (bases[0].show_keys[0],),
@@ -316,7 +316,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
     def _seed_publications(self, *, public_excluded=(), memory_excluded=()):
         bnl_journal.ensure_schema(bnl01_bot.DB_FILE)
         bnl_website_relay_state.ensure_schema(bnl01_bot.DB_FILE)
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             fixtures = SimpleNamespace(conn=conn)
             publication_fixtures.PublicationReadAdapterTests.add_journal(
                 fixtures,
@@ -452,7 +452,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertEqual(message.replies, [answer])
                 self.assertTrue(decision.save_conversation)
-                with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                     row = conn.execute(
                         "SELECT content,channel_policy FROM conversations WHERE role='model' ORDER BY rowid DESC LIMIT 1"
                     ).fetchone()
@@ -563,7 +563,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         controls = self._seed_publications()
         prompt, metadata = self._direct_prompt("public_home", privileged=False)
         self._assert_publications_in_prompt_and_basis(prompt, metadata["prompt_source_bases"])
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             publication_fixtures.PublicationReadAdapterTests.add_journal(
                 SimpleNamespace(conn=conn),
                 "journal_copper_kite",
@@ -616,7 +616,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.sent, [answer])
         self.assertIn(JOURNAL_BODY, generation.await_args.args[0])
         self.assertIn(RELAY_BODY, generation.await_args.args[0])
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             rows = conn.execute("SELECT id,user_id,content,channel_policy FROM conversations WHERE role='model'").fetchall()
             self.assertEqual(len(rows), 1)
             row_id, user_id, stored, policy = rows[0]
@@ -627,13 +627,13 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sealed_publication_reply_stays_out_of_public_recall_and_durable_memory(self):
         self._seed_publications()
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             tiers_before = conn.execute("SELECT COUNT(*) FROM memory_tiers").fetchone()[0]
             facts_before = conn.execute("SELECT COUNT(*) FROM user_memory_facts").fetchone()[0]
         answer = "The Copper Kite listening exchange felt like violet lanterns over an open room."
         channel, _, _ = await self._batch("sealed_test", answer=answer, privileged=False)
         self.assertEqual(channel.sent, [answer])
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             rows = conn.execute("SELECT content,channel_policy FROM conversations WHERE role='model'").fetchall()
             self.assertEqual(rows, [(answer, "sealed_test")])
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_tiers").fetchone()[0], tiers_before)
@@ -649,7 +649,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         async def generate(prompt, *_args, **kwargs):
             calls.append(prompt)
             if len(calls) == 1:
-                with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                     publication_fixtures.PublicationReadAdapterTests.add_journal(
                         SimpleNamespace(conn=conn), "journal_copper_kite", revision=2,
                         title="Copper Kite Correction", excerpt="The exchange moved to a later evening.",
@@ -664,7 +664,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(JOURNAL_BODY, calls[1])
         self.assertIn(RELAY_BODY, calls[1])
         self.assertEqual(channel.sent, [final_answer])
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             rows = conn.execute("SELECT content FROM conversations WHERE role='model'").fetchall()
         self.assertEqual(rows, [(final_answer,)])
 
@@ -680,7 +680,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             ("Second Member", "BNL, what do you remember me telling you about the glass orchard?", 101),
         )
         target_ids = {}
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             conn.execute("DELETE FROM memory_tiers")
             for uid, text in targets.items():
                 tier = "medium" if cross_tier and uid == 100 else "long"
@@ -755,7 +755,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_repeated_request_wording_does_not_displace_distinctive_topic(self):
         target = "The saffron melody has muted bells."
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             conn.execute("DELETE FROM memory_tiers")
             bnl01_bot._insert_memory_tier(
                 conn.cursor(), 100, self.guild_id, "short", target, 0.1,
@@ -806,7 +806,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             user_text=members[0][1], current_direct=True,
         )
         bnl01_bot.build_user_memory_context(100, self.guild_id, source_metadata=before, **read_args)
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             for uid, guild, policy, trust in (
                 (100, self.guild_id, "internal_controlled", "legacy_unknown"),
                 (100, self.guild_id, "sealed_test", "legacy_unknown"),
@@ -829,7 +829,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_matching_approved_color_survives_incidental_topic_under_group_budget(self):
         self._seed_group_member_sources(facts=True)
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             cursor = conn.execute(
                 "INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,role,content) VALUES (?,?,?,?,?,?,?,?)",
                 (100, "Test Member", self.guild_id, "barcode-bot", "public_home", 8800, "user", "My favorite color is blue."),
@@ -880,7 +880,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
                     prompts.append(prompt)
                     if len(prompts) == 1:
                         self.assertIn(targets[101], prompt)
-                        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                             if mutation == "change":
                                 conn.execute("UPDATE memory_tiers SET summary=? WHERE id=?", (replacement, target_ids[101]))
                             else:
@@ -896,7 +896,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(generation.await_count, 2)
                 self.assertEqual(channel.sent, [final_answer])
-                with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                     saved = conn.execute(
                         "SELECT content FROM conversations WHERE role='model' AND channel_id=?",
                         (channel.id,),
@@ -907,7 +907,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         names = ("Amber Instrumentalist", "Violet Sound Designer", "Copper Percussionist", "Indigo Studio Artist", "Cyan Music Producer", "Green Sound Engineer", "Blue Session Artist", "Golden Instrumentalist")
         colors = ("amber", "violet", "copper", "indigo", "cyan", "green", "blue", "gold")
         members = []
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             conn.execute("DELETE FROM memory_tiers")
             for index in range(count):
                 uid, name, color = 100 + index, names[index], colors[index]
@@ -935,7 +935,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
                 )
         if facts:
             for index, (name, _request, uid) in enumerate(members):
-                with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                     cursor = conn.execute(
                         "INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,role,content) VALUES (?,?,?,?,?,?,?,?)",
                         (uid, name, self.guild_id, "barcode-bot", "public_home", 8800, "user", f"My favorite color is {colors[index]}."),
@@ -988,7 +988,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(channel.sent, [answer])
             # The existing group boundary must not become a new canary gate.
             self.assertTrue(all(not call.kwargs["scope_applied"] for call in ordinary.await_args_list))
-            with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                 row = conn.execute("SELECT id,user_id,content FROM conversations WHERE role='model' AND channel_id=?", (channel.id,)).fetchone()
                 self.assertEqual(row[1:], (0, answer))
                 links = conn.execute("SELECT user_id FROM conversation_response_participants WHERE conversation_row_id=? ORDER BY user_id", (row[0],)).fetchall()
@@ -1034,7 +1034,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("speaker 2 - Test Member", transcript)
         self.assertIn("Favorite color: amber", bases[0].rendered_context)
         self.assertNotIn("Favorite color: violet", bases[0].rendered_context)
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             conn.execute("UPDATE user_memory_facts SET fact_value='green' WHERE user_id=101")
         prompt, fresh, changed, failed = bnl01_bot.refresh_prompt_source_bases(context, bases)
         self.assertFalse(failed)
@@ -1051,7 +1051,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         async def generate(prompt, *_args, **_kwargs):
             drafts.append(prompt)
             if len(drafts) == 1:
-                with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                     conn.execute("UPDATE user_memory_facts SET lifecycle_status='forgotten',fact_value='' WHERE user_id=101")
                 return "Amber Instrumentalist named amber, while Violet Sound Designer named violet."
             self.assertNotIn("Favorite color: violet", prompt)
@@ -1063,7 +1063,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(generation.await_count, 2)
         self.assertNotIn("while Violet Sound Designer named violet", "\n".join(channel.sent))
         self.assertEqual(channel.sent, ["Amber Instrumentalist named amber; the other preference is not available now."])
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             saved = conn.execute("SELECT content FROM conversations WHERE role='model'").fetchall()
         self.assertEqual(saved, [(channel.sent[0],)])
 
@@ -1095,7 +1095,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
     def test_group_member_governed_canary_retains_authority_and_revalidates(self):
         self._seed_group_member_sources(facts=True)
         expected = "The Copper Kite arrangement is the current music goal."
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
             # Production enabled the Moment shadow before startup. Preserve
             # that initialized-schema prerequisite for the read-only canary.
             moments.ensure_moment_schema(conn)
@@ -1139,7 +1139,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(basis.governed_basis_digest)
             self.assertIn(entry_id, metadata["governed_entry_ids"])
             self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "")
-            with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                 conn.execute("UPDATE memory_ledger_entries SET normalized_value=? WHERE entry_id=?", ("The Silver Moth arrangement is the corrected music goal.", entry_id))
             self.assertEqual(bnl01_bot.prompt_source_basis_failure(bases), "memory_source_changed")
 
@@ -1203,7 +1203,7 @@ class PublicNetworkKnowledgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(show_context in value for value in contexts))
             self.assertEqual(generation.await_count, 1)
             self.assertEqual(channel.sent, [answer])
-            with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            with closing(sqlite3.connect(bnl01_bot.DB_FILE)) as conn, conn:
                 self.assertEqual(conn.execute(
                     "SELECT COUNT(*) FROM conversations WHERE role='model' AND content=?",
                     (answer,),
