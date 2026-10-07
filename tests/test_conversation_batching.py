@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -204,6 +205,13 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         show_context = mock.Mock(return_value=show_evidence)
         save_model = mock.Mock()
         record_assessment = mock.AsyncMock()
+        orchestration_decisions = []
+        actual_orchestration = bnl01_bot.build_live_conversation_orchestration_decision
+
+        def capture_orchestration(*args, **kwargs):
+            decision = actual_orchestration(*args, **kwargs)
+            orchestration_decisions.append(decision)
+            return decision
 
         async def generate(prompt, **kwargs):
             generation_calls.append((prompt, kwargs))
@@ -212,6 +220,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self._prime_flush(channel, request)
         with (
             self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "build_live_conversation_orchestration_decision",
+                side_effect=capture_orchestration,
+            ),
             mock.patch.object(
                 bnl01_bot,
                 "maybe_build_bnl_read_model_context",
@@ -245,6 +258,13 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bnl01_bot._flush_channel_buffer(channel)
 
+        frame = show_context.call_args.kwargs["situation_frame"]
+        self.assertTrue(any(
+            frame is decision.situation_frame for decision in orchestration_decisions
+        ))
+        self.assertEqual(frame.current_text_digest, hashlib.sha256(request.encode("utf-8")).hexdigest())
+        self.assertEqual(frame.current_speaker_user_ids, (100,))
+        self.assertEqual(frame.channel_policy, "sealed_test")
         show_context.assert_called_once_with(
             guild_id=channel.guild.id,
             user_text=request,
@@ -253,6 +273,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             conversation_basis=None,
             conversation_context_result=None,
             selection_out={},
+            situation_frame=frame,
         )
         self.assertEqual(channel.sent, [answer])
         self.assertEqual(len(generation_calls), 1)

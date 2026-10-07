@@ -498,6 +498,9 @@ class IntelligencePacketRequest:
     # The native reader's resolved human person/topic continuation. A later
     # packet projection must not select a different episode for the same turn.
     show_episode_selection_text: str = ""
+    # The selected human history request may own the artist while a followup
+    # asks about another role, such as who submitted those tracks.
+    show_episode_artist_request: IntelligencePacketRequest | None = None
     participant_user_ids: tuple[int, ...] = ()
     direct_state: str = "direct"
     budget_chars: int = 2400
@@ -1261,6 +1264,24 @@ def resolve_packet_subject(
             else "display_label_not_identity_authority",
         ),
     )
+
+
+def show_artist_labels_for_request(
+    conn: sqlite3.Connection, request: IntelligencePacketRequest, *,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Reuse the governed frame/account owner for public artist-credit reads."""
+    from bnl_unified_response_assessment import music_submission_history_requested
+
+    if request.show_episode_artist_request is not None:
+        request = request.show_episode_artist_request
+    if not music_submission_history_requested(request.user_text):
+        return ()
+    resolution = resolve_packet_subject(conn, request, environ=environ)
+    if resolution.status != "resolved":
+        return ()
+    identity = _CANON_ENTITY_BY_KEY.get(resolution.entity_ref)
+    return (identity.name, *identity.aliases) if identity is not None else ()
 
 
 def _table_columns(
@@ -3335,8 +3356,14 @@ def _episode_items(
 
 def _show_episode_query(request: IntelligencePacketRequest) -> str:
     from bnl_tiktok_live_context import has_explicit_show_date, requested_show_dates
+    from bnl_unified_response_assessment import music_submission_history_query
 
     query = str(request.user_text or "")[:8000]
+    if request.show_episode_artist_request is not None:
+        query = request.show_episode_selection_text or request.show_episode_artist_request.user_text
+    history_query = music_submission_history_query(query)
+    if history_query:
+        return history_query
     if has_explicit_show_date(query) or requested_show_dates(query, now=request.now or None):
         return query
     if request.show_episode_selection_text:
@@ -3404,6 +3431,7 @@ def _show_episode_items(
         subject_user_id=subject_user_id,
         allow_subject_continuity=allow_subject_continuity,
         now=request.now or None,
+        artist_labels=show_artist_labels_for_request(conn, request, environ=environ),
     )) if queue_enabled else []
     measurements = select_tiktok_engagement_context_items(
         conn, guild_id=int(request.guild_id or 0), user_text=_show_episode_query(request),
@@ -6396,6 +6424,7 @@ def _show_episode_versions(
             == "required"
         ),
         now=packet.request.now or None,
+        artist_labels=show_artist_labels_for_request(conn, packet.request, environ=environ),
     ), **measured_windows}
 
 

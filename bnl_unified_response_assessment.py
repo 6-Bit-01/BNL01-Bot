@@ -377,11 +377,40 @@ _FIRST_PERSON_REFERENCE_RE = re.compile(r"\b(?:i(?:['’](?:ve|m|d|ll))?|my|mine
 _PUBLIC_ACTIVITY_SOURCE_RE = re.compile(r"\b(?:discord|tik\s*tok|chat|queue|submissions?)\b", re.I)
 
 
+def _music_submission_history_clause_requested(text: str) -> bool:
+    value = str(text or "")
+    return bool(
+        re.search(r"\b(?:songs?|tracks?|music)\b", value, re.I)
+        and not re.search(r"\b(?:going to|tomorrow)\b|\b(?:next|upcoming)\s+"
+                          r"(?:show|broadcast|episode|week|friday)\b|"
+                          r"\bbe\s+(?:played|featured|submitted)\b", value, re.I)
+        and (
+            re.search(r"\b(?:submitted|played|featured|appeared)\b", value, re.I)
+            or (re.search(r"\b(?:shows?|broadcasts?|episodes?)\b", value, re.I)
+                and re.search(r"\b(?:any|ever|past|previous|history|before)\b", value, re.I))
+        )
+        and not re.search(r"\b(?:right now|currently|current queue|in (?:the )?queue|"
+                          r"queue (?:open|closed)|can i submit|how (?:do|can) i submit)\b", value, re.I)
+    )
+
+
+def music_submission_history_query(text: str) -> str:
+    """Use existing task clauses so another request cannot date-pin history."""
+    return "\n".join(clause for clause in situation_request_clauses(str(text or ""))
+                     if _music_submission_history_clause_requested(clause))
+
+
+def music_submission_history_requested(text: str) -> bool:
+    """Recognize recorded music participation, independently of current intake."""
+    return bool(music_submission_history_query(text))
+
+
 def self_public_activity_requested(text: str) -> bool:
     """One requester scope shared by the frame and public evidence readers."""
     return bool(re.search(_SELF_PUBLIC_ACTIVITY_PATTERN, str(text or ""), re.I)
                 or (_FIRST_PERSON_REFERENCE_RE.search(str(text or ""))
-                    and _PUBLIC_ACTIVITY_SOURCE_RE.search(str(text or ""))))
+                    and (_PUBLIC_ACTIVITY_SOURCE_RE.search(str(text or ""))
+                         or music_submission_history_requested(text))))
 
 
 _SELF_SUBJECT_CUE_RE = re.compile(
@@ -405,7 +434,7 @@ _TASK_LEAD_RE = re.compile(
     r"(?:what|which|who|where|when|why|how|tell|explain|summari[sz]e|"
     r"restate|repeat|recap|remind|paraphrase|improve|rewrite|recommend|suggest|list|"
     r"compare(?:s|d)?|describe|give|show|help|check|find|choose|try|test|"
-    r"is|are|do|does|did|can|could|would|should)\b",
+    r"is|are|was|were|have|has|had|do|does|did|can|could|will|would|should)\b",
     re.I,
 )
 _TASK_SEGMENT_START_RE = re.compile(

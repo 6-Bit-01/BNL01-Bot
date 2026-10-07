@@ -73,6 +73,7 @@ from bnl_tiktok_live_context import (
 )
 from bnl_unified_response_assessment import (
     situation_subject_label_spans, self_public_activity_requested,
+    music_submission_history_requested, music_submission_history_query,
 )
 from bnl_tiktok_live_memory import archive_record, ENGAGEMENT_EVENT_TYPES
 
@@ -479,7 +480,7 @@ def broad_show_history_requested(
 ) -> bool:
     """Share the existing history scope across archive and packet readers."""
 
-    text = str(user_text or "")
+    text = music_submission_history_query(user_text) or str(user_text or "")
     dates = requested_show_dates(text, now=now)
     if dates:
         return len(dates) > 1
@@ -498,7 +499,7 @@ def broad_show_history_requested(
         text, flags=re.IGNORECASE,
     ):
         return False
-    return bool(_MULTI_SHOW_QUERY_RE.search(text) or (
+    return bool(music_submission_history_requested(text) or _MULTI_SHOW_QUERY_RE.search(text) or (
         include_community_baseline and _community_baseline_requested(text)
     ))
 
@@ -4500,6 +4501,62 @@ def _dialogue_episode_context_item(
     )
 
 
+def _artist_credit_matches(project_label: str, artist_labels: tuple[str, ...]) -> bool:
+    """Match a credited artist, never a title mention or submission account."""
+    normalize = lambda value: "".join(re.findall(r"[^\W_]", str(value).casefold()))
+    labels = {normalize(label) for label in artist_labels if normalize(label)}
+    if normalize(project_label) in labels:
+        return True
+    credits = re.split(r"\s+(?:featuring|feat\.?|ft\.?|with)\s+|\s*[&+,/]\s*",
+                       str(project_label or ""), flags=re.I)
+    return any(normalize(credit) in labels for credit in credits)
+
+
+def _artist_submission_history_view(
+    ledgers: Sequence[Mapping[str, Any]], *, user_text: str,
+    artist_labels: tuple[str, ...], now: Any = None,
+) -> tuple[str, tuple[Mapping[str, Any], ...]]:
+    """A small credit projection over the existing authorized retained roots."""
+    user_text = music_submission_history_query(user_text) or user_text
+    dates = requested_show_dates(user_text, now=now, available_show_dates=tuple(
+        str(row.get("showDate") or "") for row in ledgers))
+    exact_keys = {str(row["showKey"]) for row in ledgers if re.search(
+        r"(?<![\w-])" + re.escape(str(row["showKey"])) + r"(?![\w-])", user_text)}
+    window = requested_history_window(user_text, now=now)
+    selected = [row for row in ledgers if
+        (not dates or row.get("showDate") in dates)
+        and (not exact_keys or row.get("showKey") in exact_keys)
+        and (not window or window[0] <= str(row.get("showDate") or "") < window[1])]
+    if has_explicit_show_date(user_text) and not dates:
+        selected = []
+    selected.sort(key=lambda row: int(row.get("endedAtMs") or 0), reverse=True)
+    recent = requested_recent_show_count(user_text)
+    if recent is not None and not dates and not exact_keys:
+        selected = selected[:recent]
+    elif not broad_show_history_requested(user_text, now=now) and not dates and not exact_keys and not window:
+        selected = selected[:1]
+    lines = ["Durable BARCODE Radio show episode memory:",
+             "- Recorded artist-credit history (website-owned finalized show rosters)."]
+    if not artist_labels:
+        lines.append("- The current requester's public artist credit is unresolved. Ask which artist name to search; do not infer it from a display name, submitter account, hosting role, or prior BNL answer.")
+        return "\n".join(lines), tuple(selected)
+    matches = [(row, track) for row in selected for track in row.get("trackRoster", ())
+               if isinstance(track, Mapping) and _artist_credit_matches(
+                   str(track.get("projectLabel") or ""), artist_labels)]
+    lines.append("- Artist searched: " + json.dumps(artist_labels[0], ensure_ascii=False) + ".")
+    lines.append(f"- Coverage: searched complete rosters in {len(selected)} eligible retained finalized shows; {len(matches)} matching credit rows. This bounded archive is not all-time submission history; missing or ineligible shows are not evidence of absence.")
+    for row, track in matches[:12]:
+        fields = {key: _safe_label(track.get(key), 160) for key in
+                  ("projectLabel", "title", "submittedByTikTokHandle", "outcome")}
+        lines.append(f"- Show {row.get('showDate')}: " + json.dumps(fields, ensure_ascii=False))
+    if len(matches) > 12:
+        lines.append(f"- {len(matches) - 12} additional matching credit rows omitted from this bounded answer.")
+    if not matches:
+        lines.append("- No matching artist credit was found in the searched rosters. Report this coverage limit; do not say the artist never had a song submitted.")
+    lines.append("- Artist credit and submitted-by are separate roles. A different submitter may submit this artist's song; a credited song does not prove the artist personally submitted it. A title mentioning the artist is not an artist credit. Hosting does not exclude making music or appearing in a roster.")
+    return "\n".join(lines), tuple(selected)
+
+
 def select_tiktok_show_episode_context_items(
     conn: sqlite3.Connection,
     *,
@@ -4509,6 +4566,7 @@ def select_tiktok_show_episode_context_items(
     allow_subject_continuity: bool = False,
     now: Any = None,
     max_shows: int = 8,
+    artist_labels: tuple[str, ...] = (),
 ) -> tuple[TikTokShowEpisodeContextItem, ...]:
     """Select compact show evidence for the existing intelligence packet.
 
@@ -4528,6 +4586,20 @@ def select_tiktok_show_episode_context_items(
         )
     except (sqlite3.DatabaseError, TypeError, ValueError):
         return ()
+    if music_submission_history_requested(user_text) and (artist_labels or self_public_activity_requested(user_text)):
+        text, selected = _artist_submission_history_view(
+            [row["ledger"] for row in loaded], user_text=user_text,
+            artist_labels=artist_labels, now=now,
+        )
+        keys = {row["showKey"] for row in selected}
+        if not keys:
+            return ()
+        return (_show_context_item(
+            kind="operations", loaded_rows=[row for row in loaded if row["showKey"] in keys],
+            source_class=SourceClass.FIRST_PARTY_RECORD.value, confidence=Confidence.HIGH.value,
+            subject_key="barcode_radio", text=text, participants=(), score=230.0,
+            usage="authoritative_show_chronology", uncertainty_status="bounded_retained_artist_credits",
+        ),)
     frequency_scope = (_tiktok_word_frequency_scope_query(user_text)
                        if requested_tiktok_show_word_count(user_text) else user_text)
     # A finalized-only reader cannot answer an undated active-episode count.
@@ -4715,6 +4787,7 @@ def tiktok_show_episode_context_item_version(
     source_ref: str,
     allow_subject_continuity: bool = False,
     now: Any = None,
+    artist_labels: tuple[str, ...] = (),
 ) -> str:
     """Rebuild a selected item and return its current source digest."""
 
@@ -4722,6 +4795,7 @@ def tiktok_show_episode_context_item_version(
         conn, guild_id=guild_id, user_text=user_text,
         subject_user_id=subject_user_id,
         allow_subject_continuity=allow_subject_continuity, now=now,
+        artist_labels=artist_labels,
     ).get(str(source_ref or ""), "")
 
 
@@ -4729,6 +4803,7 @@ def tiktok_show_episode_context_item_versions(
     conn: sqlite3.Connection, *, guild_id: int, user_text: str,
     subject_user_id: int, allow_subject_continuity: bool = False,
     now: Any = None,
+    artist_labels: tuple[str, ...] = (),
 ) -> dict[str, str]:
     """Rebuild linked show views together within the caller's fresh snapshot."""
 
@@ -4739,6 +4814,7 @@ def tiktok_show_episode_context_item_versions(
         subject_user_id=subject_user_id,
         allow_subject_continuity=allow_subject_continuity,
         now=now,
+        artist_labels=artist_labels,
     )
     return {item.source_ref: item.source_digest for item in items}
 
@@ -5021,6 +5097,7 @@ def build_tiktok_show_evidence_context(
     candidate_context: bool = False,
     selection_out: Optional[dict] = None,
     image_queries: tuple[CurrentImageShowQuery, ...] = (),
+    artist_labels: tuple[str, ...] = (),
 ) -> str:
     """Render relevant finalized BARCODE show memory for ordinary conversation."""
 
@@ -5147,6 +5224,19 @@ def build_tiktok_show_evidence_context(
             or str(ledger.get("showKey") or "") in pinned_show_keys
         ):
             ledgers.append(ledger)
+    if not image_queries and music_submission_history_requested(user_text) and (
+        artist_labels or self_public_activity_requested(user_text)
+    ):
+        context, selected = _artist_submission_history_view(
+            ledgers, user_text=user_text, artist_labels=artist_labels,
+        )
+        if selection_out is not None:
+            selection_out.update(
+                user_text=user_text, selection_user_text=user_text, candidate_context=False,
+                source_refs=tuple((row["showKey"], row["sourceDigest"]) for row in selected),
+                authored_excerpts=(), artist_history_lookup=True,
+            )
+        return context
     # Earlier retrieval cues and pinned finalized roots do not override a
     # current human request for the active stream. That source is website-owned.
     if tiktok_show_word_frequency_current_requested(user_text) and not any(

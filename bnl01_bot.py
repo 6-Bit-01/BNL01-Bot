@@ -232,6 +232,7 @@ from bnl_unified_intelligence_packet import (
     PacketFrameTask,
     PacketFrameSubject,
     PacketConversationEvidence,
+    show_artist_labels_for_request,
     UnifiedIntelligencePacket,
     build_packet as build_unified_intelligence_packet,
     ensure_schema as ensure_unified_intelligence_packet_schema,
@@ -274,6 +275,8 @@ from bnl_memory_preview import (
     snapshots_equivalent as memory_preview_snapshots_equivalent,
 )
 from bnl_unified_response_assessment import (
+    music_submission_history_requested,
+    self_public_activity_requested,
     situation_subject_label_spans,
     situation_request_texts,
     source_dependent_task_texts,
@@ -4225,6 +4228,39 @@ def _consented_tiktok_show_subject_user_id(
     return selected_subject_user_id if allowed else 0
 
 
+def _show_artist_identity_request(
+    *, guild_id: int, user_text: str, situation_frame: SituationFrameV1 | None,
+) -> IntelligencePacketRequest | None:
+    """Keep the frozen conversation subject as the sole artist identity input."""
+    if not music_submission_history_requested(user_text) or not isinstance(situation_frame, SituationFrameV1):
+        return None
+    return IntelligencePacketRequest(
+        guild_id=guild_id, subject_user_id=0, route_mode="normal_chat",
+        conversation_surface="show_history", user_text=user_text,
+        frame_revision=situation_frame.frame_revision,
+        frame_input_evidence_digest=situation_frame.input_evidence_digest,
+        frame_status=situation_frame.status,
+        frame_ambiguity_reasons=situation_frame.ambiguity_reasons,
+        frame_subject_requirement=situation_frame.subject_requirement,
+        frame_subjects=tuple(PacketFrameSubject(
+            user_id=subject.user_id, entity_ref=subject.entity_ref,
+            label_hint=subject.label_hint, binding_method=subject.binding_method,
+            confidence=subject.confidence, role_hints=subject.role_hints,
+            domain_hints=subject.domain_hints,
+        ) for subject in situation_frame.subjects),
+    )
+
+
+def _show_artist_labels(request: IntelligencePacketRequest | None) -> tuple[str, ...]:
+    if request is None:
+        return ()
+    try:
+        with closing(_open_member_memory_read_connection()) as conn:
+            return show_artist_labels_for_request(conn, request, environ=os.environ)
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return ()
+
+
 def build_tiktok_show_evidence_context_for_turn(
     *,
     guild_id: int,
@@ -4235,6 +4271,7 @@ def build_tiktok_show_evidence_context_for_turn(
     conversation_context_result: ConversationContextResult | None = None,
     selection_out: dict | None = None,
     image_queries: tuple[CurrentImageShowQuery, ...] = (),
+    situation_frame: SituationFrameV1 | None = None,
 ) -> str:
     """Select finalized show evidence through the shared turn-level owner."""
 
@@ -4305,6 +4342,7 @@ def build_tiktok_show_evidence_context_for_turn(
         else:
             tiktok_show_evidence_query = dated_selection
     selection_query = continuation_selection_query or tiktok_show_evidence_query
+    artist_continuation_frame = None
     candidate_context = bool(continuation_selection_query)
     member_selection_query = (
         _public_member_continuation_query(
@@ -4322,8 +4360,10 @@ def build_tiktok_show_evidence_context_for_turn(
         candidate_context = True
     if (
         conversation_basis is not None
-        and member_selection_query == user_text
-        and not continuation_selection_query
+        and (member_selection_query == user_text or (
+            conversation_context_result is not None and conversation_context_result.referent_status == "resolved"))
+        and (not continuation_selection_query or (
+            conversation_context_result is not None and conversation_context_result.referent_status == "resolved"))
         and not broad_show_history_requested(user_text, include_community_baseline=False)
         and not image_queries
         and conversation_context_result is not None
@@ -4375,6 +4415,31 @@ def build_tiktok_show_evidence_context_for_turn(
             ):
                 selection_query = tiktok_show_evidence_query + "\n" + item.text
                 candidate_context = True
+                if (
+                    conversation_context_result.referent_status == "resolved"
+                    and music_submission_history_requested(item.text)
+                    and self_public_activity_requested(item.text)
+                    and not request_owns_show_date
+                    and isinstance(situation_frame, SituationFrameV1)
+                    and situation_frame.current_speaker_user_ids == (int(subject_user_id),)
+                    and not (situation_frame.subjects
+                             and any(subject.entity_ref or subject.user_id not in (0, int(subject_user_id))
+                                     for subject in situation_frame.subjects)
+                             and not re.search(r"\bsubmit(?:s|ted)?\b", user_text, re.I))
+                ):
+                    # Reuse only the selected human request's subject. The
+                    # current question can name a submitter without making
+                    # that person the artist; BNL prose supplies neither.
+                    artist_continuation_frame = build_situation_frame_v1(
+                        route_allowed=situation_frame.route_allowed,
+                        route_mode=situation_frame.route_mode,
+                        conversation_surface=situation_frame.conversation_surface,
+                        channel_policy=situation_frame.channel_policy,
+                        current_text=item.text,
+                        current_speaker_user_ids=(int(subject_user_id),),
+                        exact_source_row_ids=(item.source_id,), response_act="answer",
+                    )
+                    tiktok_show_evidence_query = selection_query
                 break
             if (
                 item.speaker_user_id == int(subject_user_id)
@@ -4384,6 +4449,10 @@ def build_tiktok_show_evidence_context_for_turn(
                 # historical episode. The current request can name it again.
                 break
     show_read_started = time.perf_counter()
+    artist_request = _show_artist_identity_request(
+        guild_id=guild_id, user_text=tiktok_show_evidence_query,
+        situation_frame=artist_continuation_frame or situation_frame,
+    )
     context = build_tiktok_show_evidence_context(
         DB_FILE,
         guild_id=guild_id,
@@ -4392,11 +4461,14 @@ def build_tiktok_show_evidence_context_for_turn(
         selection_user_text=selection_query,
         candidate_context=candidate_context,
         selection_out=selection_out,
+        **({"artist_labels": _show_artist_labels(artist_request)} if artist_request is not None else {}),
         **({"image_queries": image_queries} if image_queries else {}),
     )
     if selection_out is not None and context:
         selection_out["subject_user_id"] = selected_subject_user_id
         selection_out["user_text"] = tiktok_show_evidence_query
+        if artist_request is not None:
+            selection_out["artist_identity_request"] = artist_request
     logging.info(
         "response_stage_timing stage=show_source_read elapsed_ms=%s context_chars=%s",
         round((time.perf_counter() - show_read_started) * 1000), len(context),
@@ -29140,6 +29212,7 @@ class FinalizedShowPromptSourceBasis:
     candidate_context: bool = False
     authored_excerpts: tuple[FinalizedShowAuthoredExcerpt, ...] = ()
     image_queries: tuple[CurrentImageShowQuery, ...] = ()
+    artist_identity_request: IntelligencePacketRequest | None = None
 
 
 def _finalized_show_basis_digest(
@@ -29216,6 +29289,7 @@ def build_finalized_show_prompt_source_basis(
         candidate_context=bool(selection.get("candidate_context")),
         authored_excerpts=authored_excerpts,
         image_queries=tuple(selection.get("image_queries") or ()),
+        artist_identity_request=selection.get("artist_identity_request"),
     )
 
 
@@ -30263,6 +30337,7 @@ def _build_unified_intelligence_packet_shadow(
     current_direct: bool,
     show_episode_dates: tuple[str, ...] = (),
     show_episode_selection_text: str = "",
+    show_episode_artist_request: IntelligencePacketRequest | None = None,
     situation_frame: SituationFrameV1 | None = None,
 ) -> UnifiedIntelligencePacket | None:
     """Build and persist one packet receipt without exposing it to the prompt."""
@@ -30425,6 +30500,7 @@ def _build_unified_intelligence_packet_shadow(
         user_text=str(current_text or "")[:8000],
         show_episode_dates=show_episode_dates,
         show_episode_selection_text=show_episode_selection_text,
+        show_episode_artist_request=show_episode_artist_request,
         participant_user_ids=participants,
         direct_state="direct" if current_direct else "indirect",
         conversation_evidence=evidence,
@@ -30730,6 +30806,11 @@ def build_unified_response_assessment_shadow(
             basis.selection_user_text for basis in prompt_source_bases
             if isinstance(basis, FinalizedShowPromptSourceBasis)
         ), ""),
+        show_episode_artist_request=next((
+            basis.artist_identity_request for basis in prompt_source_bases
+            if isinstance(basis, FinalizedShowPromptSourceBasis)
+            and basis.artist_identity_request is not None
+        ), None),
         current_direct=current_direct,
         situation_frame=situation_frame,
     )
@@ -32229,6 +32310,8 @@ def refresh_prompt_source_basis(
                 subject_user_id=selected_subject_user_id,
                 selection_user_text=basis.selection_user_text,
                 pinned_show_keys=basis.show_keys,
+                **({"artist_labels": _show_artist_labels(basis.artist_identity_request)}
+                   if basis.artist_identity_request is not None else {}),
                 **({"image_queries": basis.image_queries} if basis.image_queries else {}),
                 candidate_context=basis.candidate_context,
                 selection_out=selection,
@@ -38898,8 +38981,11 @@ def _is_payload_like_cluster(items):
     return payloadish >= max(2, len(texts) - 1)
 
 
-def _set_pending_request_intent(channel_id: int, now: datetime, reason: str):
-    _channel_pending_request_intent[channel_id] = {"expires_at": now + timedelta(seconds=PENDING_REQUEST_INTENT_TTL_SECONDS), "reason": reason}
+def _set_pending_request_intent(channel_id: int, now: datetime, reason: str, *, payload_expected: bool | None = None):
+    state = {"expires_at": now + timedelta(seconds=PENDING_REQUEST_INTENT_TTL_SECONDS), "reason": reason}
+    if payload_expected is not None:
+        state["payload_expected"] = bool(payload_expected)
+    _channel_pending_request_intent[channel_id] = state
 
 
 def _consume_pending_request_intent(channel_id: int, now: datetime):
@@ -39439,6 +39525,31 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         and is_conversational_repair_intent(combined_text)
     )
     pending_request = bool(pending_state)
+    if (
+        isinstance(pending_state, dict)
+        and pending_state.get("payload_expected") is False
+        and len(current_user_ids) == 1
+        and not any(
+            getattr(item, "addressing", None) and item.addressing.addresses_bnl
+            for item in original_items
+        )
+        and all(
+            _is_low_signal_conversation_fragment(content)
+            or _is_ack_after_committed_direct_response(content)
+            for _name, content, _uid in original_items
+        )
+    ):
+        state = _get_conversation_continuation_state(
+            guild_id, channel_id, next(iter(current_user_ids)),
+        )
+        if state and state.get("channel_policy") == channel_policy:
+            # An answered ordinary question leaves a short generic anchor,
+            # but a closing acknowledgment is not a new list item. Explicit
+            # payload owners and answers to BNL's own question retain priority.
+            answer_until = state.get("awaiting_answer_until")
+            if not answer_until or datetime.now(timezone.utc) > answer_until:
+                pending_request = False
+                pending_anchor = None
     decision, reason = _classify_batch_engagement(
         collapsed_items,
         bot_user,
@@ -40401,7 +40512,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 for uid in unique_user_ids:
-                    _mark_conversation_continuation_state(guild_id, channel_id, uid)
+                    _mark_conversation_continuation_state(guild_id, channel_id, uid, channel_policy=channel_policy)
                 return
             # The response obligation is settled. Show progress while source
             # readers prepare the answer, retaining the existing generation
@@ -40483,6 +40594,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     conversation_basis=batch_conversation_basis,
                     conversation_context_result=orchestration_state.get("context_result"),
                     selection_out=batch_show_selection,
+                    situation_frame=orchestration_state["decision"].situation_frame,
                     **({"image_queries": batch_image_queries} if batch_image_queries else {}),
                 )
             )
@@ -43158,7 +43270,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         for uid in unique_user_ids:
             _consume_awaiting_retransmission(guild_id, channel_id, uid)
             meaningful_followup_question = _response_contains_direct_question_to_user(response) and not is_generic_non_answer_response(response)
-            _mark_conversation_continuation_state(guild_id, channel_id, uid, awaiting_answer=meaningful_followup_question)
+            _mark_conversation_continuation_state(guild_id, channel_id, uid, awaiting_answer=meaningful_followup_question, channel_policy=channel_policy)
             if meaningful_followup_question:
                 logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", guild_id, channel_id, uid, BNL_QUESTION_ANSWER_TTL_SECONDS)
             elif _response_contains_direct_question_to_user(response):
@@ -43201,7 +43313,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         )
 
         if BNL_ACTIVE_BATCHING_ENABLED and (reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation")):
-            _set_pending_request_intent(channel_id, datetime.now(PACIFIC_TZ), reason)
+            _set_pending_request_intent(
+                channel_id, datetime.now(PACIFIC_TZ), reason,
+                payload_expected=bool(
+                    active_packet["payload_items"]
+                    or _detect_request_payload_expectation(combined_text)[0]
+                ),
+            )
             _set_pending_request_anchor(channel_id, guild_id, first_uid, "request_payload", datetime.now(PACIFIC_TZ), reason)
             _log_batch_event(logging.INFO, "pending_request_intent_set", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             _log_batch_event(logging.INFO, "pending_request_anchor_preserved", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])}")
@@ -43735,6 +43853,8 @@ def build_user_aware_prompt(
         conversation_basis=conversation_prompt_basis,
         conversation_context_result=conversation_context_result,
         selection_out=show_selection,
+        situation_frame=(conversation_orchestration.situation_frame
+                         if isinstance(conversation_orchestration, ConversationOrchestrationDecision) else None),
         **({"image_queries": image_queries} if image_queries else {}),
     )
     show_basis = build_finalized_show_prompt_source_basis(
@@ -45200,7 +45320,7 @@ def _mark_recent_direct_response(channel_id: int, user_id: int):
     _recent_direct_response_window[(channel_id, user_id)] = datetime.now(timezone.utc)
 
 
-def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_id: int, *, awaiting_retransmission: bool = False, awaiting_answer: bool = False):
+def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_id: int, *, awaiting_retransmission: bool = False, awaiting_answer: bool = False, channel_policy: str | None = None):
     if not channel_id or not user_id:
         return
     now = datetime.now(timezone.utc)
@@ -45210,6 +45330,8 @@ def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_i
         "last_bnl_reply_at": now,
         "live_exchange_until": now + timedelta(seconds=CONVERSATION_CONTINUATION_TTL_SECONDS),
     })
+    if channel_policy is not None:
+        state["channel_policy"] = str(channel_policy or "unknown")
     if awaiting_retransmission:
         state["awaiting_retransmission_until"] = now + timedelta(seconds=CONVERSATION_RETRANSMISSION_TTL_SECONDS)
     if awaiting_answer:
@@ -45258,6 +45380,47 @@ def _is_recent_conversation_continuation(guild_id: int, channel_id: int, user_id
         return False
     live_until = state.get("live_exchange_until")
     return bool(live_until and datetime.now(timezone.utc) <= live_until)
+
+
+def _completed_conversation_followup_addressed(
+    guild_id: int, channel_id: int, user_id: int, channel_policy: str,
+    content: str, addressing: DiscordTurnAddressing,
+) -> bool:
+    """Carry an existing completed exchange into typed current-turn intent.
+
+    This proves conversational addressing only. Source readers still determine
+    whether any claim in the new turn is supported by fresh governed evidence.
+    """
+    state = _get_conversation_continuation_state(guild_id, channel_id, user_id)
+    if not state:
+        return False
+    policy = str(channel_policy or "unknown")
+    prior_policy = state.get("channel_policy")
+    if prior_policy is not None and prior_policy != policy:
+        # A conversation in a formerly sealed (or otherwise changed) surface
+        # cannot establish addressing in its successor policy.
+        _conversation_continuation_state.pop(
+            _conversation_state_key(guild_id, channel_id, user_id), None,
+        )
+        _recent_direct_response_window.pop((channel_id, user_id), None)
+        return False
+    if prior_policy != policy or policy not in CONVERSATIONAL_POLICIES:
+        return False
+    if addressing.targets_other_human and not addressing.directly_targets_bnl:
+        return False
+    if not content.strip() or _is_emoji_only_or_symbol_fragment(content):
+        return False
+    now = datetime.now(timezone.utc)
+    answer_until = state.get("awaiting_answer_until")
+    if answer_until and now <= answer_until:
+        return True
+    live_until = state.get("live_exchange_until")
+    if not live_until or now > live_until:
+        return False
+    return not (
+        _is_low_signal_conversation_fragment(content)
+        or _is_ack_after_committed_direct_response(content)
+    )
 
 
 def _consume_awaiting_retransmission(guild_id: int, channel_id: int, user_id: int) -> bool:
@@ -49765,6 +49928,7 @@ async def send_planned_conversation_response(
             message.channel.id,
             message.author.id,
             awaiting_answer=meaningful_followup_question,
+            channel_policy=plan.channel_policy,
         )
         if meaningful_followup_question:
             logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", message.guild.id, message.channel.id, message.author.id, BNL_QUESTION_ANSWER_TTL_SECONDS)
@@ -50013,10 +50177,17 @@ async def on_message(message: discord.Message):
         turn_addressing.addresses_bnl,
     )
     channel_allows_conversation = bool(free_speak_surface or is_active_channel)
+    completed_followup = _completed_conversation_followup_addressed(
+        message.guild.id, message.channel.id, message.author.id,
+        channel_policy, conversation_content, turn_addressing,
+    )
+    if completed_followup:
+        turn_addressing = replace(turn_addressing, established_bnl_followup=True)
     followup_candidate = (
         bool(conversation_content)
         and (
-            _is_recent_direct_followup(message.channel.id, message.author.id)
+            completed_followup
+            or _is_recent_direct_followup(message.channel.id, message.author.id)
             or _is_recent_conversation_continuation(message.guild.id, message.channel.id, message.author.id)
         )
     )
@@ -51224,6 +51395,7 @@ async def on_message(message: discord.Message):
     if active_channel_id is not None and not should_handle_as_active_channel:
         if not (
             real_direct_target
+            or completed_followup
             or (
                 plain_text_name_seen
                 and (free_speak_surface or governed_name_obligation)
@@ -51247,7 +51419,7 @@ async def on_message(message: discord.Message):
             reply_to_bot=is_reply,
             plain_text_name_seen=plain_text_name_seen,
             governed_name_obligation=governed_name_obligation,
-            followup_candidate=False,
+            followup_candidate=completed_followup,
             batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
             payload_expected=payload_expected_for_plan,
             payload_count=len(direct_payload_items),
@@ -51750,7 +51922,7 @@ async def on_message(message: discord.Message):
             reply_to_bot=is_reply,
             plain_text_name_seen=plain_text_name_seen,
             governed_name_obligation=governed_name_obligation,
-            followup_candidate=False,
+            followup_candidate=completed_followup,
             batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
             payload_expected=payload_expected_for_plan,
             payload_count=len(direct_payload_items),
