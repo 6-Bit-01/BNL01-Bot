@@ -119,8 +119,6 @@ from bnl_memory_ledger import (
     conversation_motif_formation_enabled,
     current_bnl_self_name_records,
     ensure_memory_ledger_schema,
-    ensure_governed_subject_read_index,
-    governed_subject_read_index_ready,
     effective_broadcast_representations,
     form_atomic_candidate_from_ledger_entry,
     form_atomic_candidates_from_recurring_conversation,
@@ -7452,62 +7450,6 @@ def ensure_conversation_read_indexes(conn: sqlite3.Connection) -> None:
             conn.execute(statement)
 
 
-_governed_subject_index_attempted_paths: set[str] = set()
-
-
-def _prepare_governed_subject_read_index() -> str:
-    """Prepare the optional read index once at startup, outside source reads.
-
-    The progress deadline bounds interruptible SQLite work, not blocked OS I/O.
-    A failed build leaves the existing reader usable and waits for a future
-    process start instead of retrying on every Discord reconnect.
-    """
-    path = os.path.abspath(os.fspath(DB_FILE))
-    if path in _governed_subject_index_attempted_paths:
-        return "already_attempted"
-    _governed_subject_index_attempted_paths.add(path)
-    started = time.monotonic()
-    deadline = started + 20.0
-    conn = None
-    status = "deferred"
-    error_type = "none"
-    cleanup_error_type = "none"
-    try:
-        conn = sqlite3.connect(Path(path).as_uri() + "?mode=rw", uri=True, timeout=0.25)
-        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
-        if governed_subject_read_index_ready(conn):
-            status = "ready"
-        else:
-            # DDL otherwise autocommits on supported Python/SQLite versions.
-            # Keep a failed/interrupted optional build entirely rollbackable.
-            conn.execute("BEGIN IMMEDIATE")
-            if ensure_governed_subject_read_index(conn):
-                conn.commit()
-                status = "created"
-            else:
-                status = "unavailable"
-    except (OSError, sqlite3.DatabaseError) as exc:
-        error_type = type(exc).__name__
-    finally:
-        if conn is not None:
-            for operation, cleanup in (
-                ("progress", lambda: conn.set_progress_handler(None, 0)),
-                ("rollback", conn.rollback),
-                ("close", conn.close),
-            ):
-                try:
-                    cleanup()
-                except sqlite3.DatabaseError as exc:
-                    status = "deferred"
-                    cleanup_error_type = operation + ":" + type(exc).__name__
-        logging.info(
-            "governed_subject_read_index status=%s elapsed_ms=%s error_type=%s cleanup_error_type=%s",
-            status, round((time.monotonic() - started) * 1000), error_type,
-            cleanup_error_type,
-        )
-    return status
-
-
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     ensure_journal_schema(DB_FILE)
@@ -8049,7 +7991,6 @@ def init_db():
         evidence_conn.commit()
     finally:
         evidence_conn.close()
-    _prepare_governed_subject_read_index()
     if int(orphan_reconciliation.get("raw_ledger_entries", 0) or 0):
         logging.info(
             "memory_orphan_reconciliation counts=%s",
