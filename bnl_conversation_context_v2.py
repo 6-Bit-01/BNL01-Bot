@@ -1398,6 +1398,15 @@ def _publication_scoped_referent_text(clause: str, *, inherited_source: bool = F
     return ''.join(characters)
 
 
+def _deictic_subset_requested(text: str) -> bool:
+    """A subset question points to an earlier request, not a named speaker."""
+    value = _referent_input_text(text)
+    return bool(re.search(r"^\s*(?:and\s+)?(?:which|what)\s+(?:of\s+)?(?:those|these)\b", value, re.I)
+                and not CURRENT_TURN_NAMED_PAYLOAD_RE.search(value)
+                and len(_extract_named_anchors(value)) < 2
+                and not EXPLICIT_NEW_TOPIC_RE.search(value))
+
+
 def nearby_contribution_referent_requested(text: str) -> bool:
     """Recognize a structural reference without keying on one exact phrase."""
 
@@ -1427,6 +1436,8 @@ def nearby_contribution_referent_requested(text: str) -> bool:
         and not explicit_historical_position
     ):
         return False
+    if _deictic_subset_requested(value):
+        return True
     # Do not combine a pointer from one statement with a request in another:
     # a correction followed by an independent question is still two acts.
     for original_clause, clause in zip(clauses, scoped_clauses):
@@ -1661,6 +1672,36 @@ def _resolve_nearby_contribution_referent(
         )
 
     structural_text = TEMPORAL_REFERENT_MODIFIER_RE.sub(" ", current_text)
+
+    if _deictic_subset_requested(current_text):
+        # Keep a person named in the filter separate from the conversational
+        # target. Facts still reload from the selected human request's owner.
+        immediate = tuple(row for row in candidates
+                          if _row_age_ok(row, now, IMMEDIATE_REFERENT_RECENCY_MINUTES))
+        if immediate and set(req.current_participants) <= {int(req.current_user_id)}:
+            latest = immediate[0]
+            for pair in pairs:
+                if int(pair["model"].get("id") or 0) != int(latest.get("id") or 0):
+                    continue
+                users = (tuple(pair.get("users") or ()) if pair.get("_room_group")
+                         else tuple(pair["user"].get("_cluster_rows") or (pair["user"],)))
+                participants = set(pair.get("_response_participant_ids") or (
+                    int(user.get("user_id") or 0) for user in users))
+                eligible_ids = {int(row.get("id") or 0) for row in immediate}
+                if users and participants == {int(req.current_user_id)} and all(
+                    int(user.get("id") or 0) in eligible_ids for user in users
+                ):
+                    return _ReferentResolution(status="resolved", candidates=(latest,), selected=(latest,),
+                        labels=_referent_candidate_labels((latest,)), reason="latest_answer_subset")
+            # An answer need not have been retained. A unique recent human
+            # request can still own the query; never use orphan model prose.
+            if (len(immediate) == 1 and str(latest.get("role") or "").lower() == "user"
+                    and int(latest.get("user_id") or 0) == int(req.current_user_id)):
+                return _ReferentResolution(status="resolved", candidates=(latest,), selected=(latest,),
+                    labels=_referent_candidate_labels((latest,)), reason="single_request_subset")
+        return _ReferentResolution(status="ambiguous" if len(immediate) > 1 else "unresolved",
+            candidates=immediate, labels=_referent_candidate_labels(immediate),
+            reason="subset_request_not_uniquely_bound")
 
     speaker_matches = tuple(
         row
