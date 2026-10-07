@@ -175,31 +175,36 @@ class ShowReadHydrationTests(unittest.TestCase):
                     self.assertEqual(selected, {})
             self.assertEqual(validate.call_count, 200)
 
-    def test_explicit_subject_date_community_and_topic_scopes_keep_authored_hydration(self):
+    def test_explicit_subject_date_community_and_topic_scopes_keep_relevance(self):
         document = self.document()
+        # Scores and complete participant records from the original hydrated
+        # reader. All seven scopes must survive streamed text scoring.
         cases = (
-            ("What did Fixture Viewer say?", "", False, ()),
-            ("What did I say?", "tiktok_user:fixture", True, ()),
-            ("Recap the show.", "", False, ()),
-            ("What time did the broadcast start?", "", False, ()),
-            ("Summarize the community.", "", False, ()),
-            ("The copper lantern", "", False, ()),
-            ("What happened on January 1, 2026?", "", False, ("2026-01-01",)),
+            ("What did Fixture Viewer say?", "", False, (), 140, document["participants"]),
+            ("What did I say?", "tiktok_user:fixture", True, (), 140, document["participants"]),
+            ("Recap the show.", "", False, (), 50, []),
+            ("What time did the broadcast start?", "", False, (), 50, []),
+            ("Summarize the community.", "", False, (), 44, []),
+            ("The copper lantern", "", False, (), 180, []),
+            ("What happened on January 1, 2026?", "", False, ("2026-01-01",), 170, []),
         )
-        for query, subject, direct, dates in cases:
+        for query, subject, direct, dates, expected_score, expected_participants in cases:
             with self.subTest(query=query):
                 with mock.patch.object(shows, "_authored_show_messages",
-                                       wraps=shows._authored_show_messages) as authored:
-                    score, participants = shows._document_relevance(
+                                       side_effect=AssertionError("ranking must not hydrate attributed output")):
+                    result = shows._document_relevance(
                         document, user_text=query, subject_ref=subject,
                         recency_rank=0, allow_direct_subject=direct,
                         requested_dates=dates,
                     )
-                self.assertGreater(score, 0)
-                self.assertEqual(authored.call_count, 1)
-                if subject or "Fixture Viewer" in query:
-                    self.assertEqual([p["subjectRef"] for p in participants],
-                                     ["tiktok_user:fixture"])
+                self.assertEqual(result, (expected_score, expected_participants))
+        changed_original = {
+            **document,
+            "messages": [{**document["messages"][0], "text": "An entirely separate passage."}],
+        }
+        self.assertEqual(shows._document_relevance(
+            changed_original, user_text="The copper lantern", subject_ref="", recency_rank=0,
+        ), (0, []), "The current original text must still determine topic relevance")
 
     def test_topic_recall_preserves_full_text_and_exact_root_digest(self):
         with tempfile.TemporaryDirectory() as directory:
