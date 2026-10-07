@@ -2607,6 +2607,13 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_second_late_fragment_survives_slow_regeneration_and_keeps_full_context(self):
         channel = self._channel(8112)
+        fixture_now = [bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)]
+
+        class FixtureDatetime(bnl01_bot.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls.fromtimestamp(fixture_now[0].timestamp(), tz)
+
         first_generation_started = asyncio.Event()
         release_first_generation = asyncio.Event()
         regenerated_generation_started = asyncio.Event()
@@ -2626,8 +2633,8 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 return "Stale regenerated draft."
             return "Fresh response covering all three fragments."
 
-        self._prime_flush(channel, "hey BNL")
         with (
+            mock.patch.object(bnl01_bot, "datetime", FixtureDatetime),
             self._flush_runtime(channel.id, generate),
             mock.patch.object(bnl01_bot, "_batch_max_wait_seconds", return_value=0.2),
             mock.patch.object(
@@ -2636,10 +2643,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda _level, event, _guild_id, _channel_id, _count, reason: batch_events.append((event, reason)),
             ),
         ):
+            self._prime_flush(channel, "hey BNL")
             first_task = asyncio.create_task(bnl01_bot._flush_channel_buffer(channel))
             bnl01_bot._channel_tasks[channel.id] = first_task
             # These are ordering barriers, not a provider latency assertion.
-            # Leave setup room on shared CI runners; the slow-retry interval below is unchanged.
+            # The fixture clock advances explicitly past the retry deadline below.
             await asyncio.wait_for(first_generation_started.wait(), timeout=3)
 
             generation_id = bnl01_bot._channel_generation_id[channel.id]
@@ -2656,14 +2664,18 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             self._append(channel, "but I know you're trying")
             bnl01_bot._reset_debounce(channel)
 
-            # Hold the retry past the original batch deadline, as the live provider
-            # plus glitch-rewrite path did, without making the test wait ten seconds.
-            await asyncio.sleep(0.25)
+            # Advance only after the retry is running and the third fragment
+            # arrived. Fixture setup and CI scheduling cannot age the first turn.
+            fixture_now[0] += bnl01_bot.timedelta(seconds=0.25)
+            await asyncio.sleep(0)
             release_regenerated_generation.set()
             await asyncio.wait_for(first_task, timeout=5)
 
             successor = bnl01_bot._channel_tasks[channel.id]
             self.assertIsNot(successor, first_task)
+            # The handoff starts a new collection window. Advance that window
+            # too, so its real scheduler can flush with the controlled clock.
+            fixture_now[0] += bnl01_bot.timedelta(seconds=0.25)
             await asyncio.wait_for(successor, timeout=5)
 
         self.assertEqual(len(prompts), 3)
