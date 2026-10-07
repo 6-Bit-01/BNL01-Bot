@@ -6301,6 +6301,8 @@ def _episode_version(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
     item: IntelligencePacketItem,
+    *,
+    episode_rows_reader=None,
 ) -> str:
     topic_association = _historical_topic_item(item)
     if topic_association and not (
@@ -6313,7 +6315,11 @@ def _episode_version(
         if item.source_type == "participant_episode_gist"
         else ""
     )
-    rows, fresh_association, selection_digest = _episode_rows(conn, packet.request, participant_key)
+    rows, fresh_association, selection_digest = (
+        episode_rows_reader(participant_key)
+        if episode_rows_reader is not None
+        else _episode_rows(conn, packet.request, participant_key)
+    )
     if fresh_association != topic_association:
         return ""
     for row in rows:
@@ -6836,6 +6842,39 @@ def _revalidate_packet_in_snapshot(
     # these digests across validation boundaries: edits and privacy changes
     # must be observed again before generation and delivery.
     show_versions: dict[str, str] | None = None
+    episode_selections: dict[str, tuple] = {}
+    episode_request: IntelligencePacketRequest | None = None
+    episode_changes = conn.total_changes
+
+    def episode_rows_in_snapshot(participant_key: str):
+        nonlocal episode_request, episode_changes
+        if not conn.in_transaction:
+            # Private/direct callers without a pinned snapshot keep scalar reads.
+            episode_selections.clear()
+            episode_request = None
+            return _episode_rows(conn, packet.request, participant_key)
+        if conn.total_changes != episode_changes:
+            episode_selections.clear()
+            episode_request = None
+            episode_changes = conn.total_changes
+        if episode_request is None:
+            # A coherent episode selection has one reference time, chosen when
+            # its first read starts. Preserve an explicit request time. This is
+            # local to this validation; later passes observe a fresh clock and
+            # snapshot. Journal control expiry continues using its own clock.
+            episode_request = replace(
+                packet.request, now=packet.request.now or _now(),
+            )
+        if participant_key not in episode_selections:
+            before = conn.total_changes
+            selected = _episode_rows(conn, episode_request, participant_key)
+            # Errors propagate without caching. Same-connection source writes
+            # or a reader ending the transaction cannot leave reusable results.
+            if conn.in_transaction and conn.total_changes == before:
+                episode_selections[participant_key] = selected
+            return selected
+        return episode_selections[participant_key]
+
     for item in revalidation_items:
         try:
             if item.revalidation_kind == "conversation":
@@ -6886,7 +6925,10 @@ def _revalidate_packet_in_snapshot(
             elif item.revalidation_kind == "moment":
                 current = _moment_version(conn, packet, item)
             elif item.revalidation_kind == "episode":
-                current = _episode_version(conn, packet, item)
+                current = _episode_version(
+                    conn, packet, item,
+                    episode_rows_reader=episode_rows_in_snapshot,
+                )
             elif item.revalidation_kind == "show_episode":
                 if show_versions is None:
                     show_versions = _show_episode_versions(
