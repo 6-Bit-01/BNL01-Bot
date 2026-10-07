@@ -38490,6 +38490,24 @@ def _addressed_batch_authors(items):
     )
 
 
+def _refresh_addressed_batch_generation(channel, items, generation_id, channel_policy):
+    addressed = _channel_addressed_generation.get(channel.id)
+    if not addressed or (
+        addressed["guild_id"] != channel.guild.id
+        or addressed["channel_policy"] != channel_policy
+        or _channel_generation_id[channel.id] != generation_id
+        or addressed["generation_id"] not in {0, generation_id}
+        or addressed.get("commit_started")
+    ):
+        return
+    addressed["generation_id"] = generation_id
+    addressed["author_ids"] = _addressed_batch_authors(items)
+    addressed["message_ids"] = tuple(
+        int(getattr(getattr(item, "addressing", None), "source_message_id", 0) or 0)
+        for item in items
+    )
+
+
 def _ordinary_burst_continuation(message, channel_policy: str) -> bool:
     """A continuation needs an actual, still-owned addressed turn in this room."""
     if not BNL_ACTIVE_BATCHING_ENABLED or not getattr(message, "guild", None):
@@ -40045,15 +40063,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     _channel_generation_id[channel_id] += 1
     local_generation_id = _channel_generation_id[channel_id]
     _channel_generating[channel_id] = True
-    addressed = _channel_addressed_generation.get(channel_id)
-    if addressed and addressed["guild_id"] == guild_id and addressed["channel_policy"] == channel_policy:
-        addressed["generation_id"] = local_generation_id
-        addressed["author_ids"] = _addressed_batch_authors(items)
-        addressed["message_ids"] = tuple(
-            int(getattr(getattr(item, "addressing", None), "source_message_id", 0) or 0)
-            for item in items
-        )
-        addressed["commit_started"] = False
+    _refresh_addressed_batch_generation(channel, items, local_generation_id, channel_policy)
     safe_mentions = discord.AllowedMentions.none()
     batch_orchestration_influences = (
         conversation_orchestration_influence_mode(
@@ -41517,6 +41527,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     _channel_first_seen.pop(channel_id, None)
                     _channel_last_message_at.pop(channel_id, None)
                     items.extend(late_after_generation)
+                    _refresh_addressed_batch_generation(channel, items, local_generation_id, channel_policy)
                     final_count = len(items)
                     _log_batch_event(
                         logging.INFO,
@@ -41617,6 +41628,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     _channel_first_seen.pop(channel_id, None)
                     _channel_last_message_at.pop(channel_id, None)
                     items.extend(late_items)
+                    _refresh_addressed_batch_generation(channel, items, local_generation_id, channel_policy)
                     regenerated_once = True
                     _channel_preempted_generation_id[channel_id] = 0
                     _channel_message_interrupt_generation_id[channel_id] = 0
@@ -41734,6 +41746,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _channel_first_seen.pop(channel_id, None)
                 _channel_last_message_at.pop(channel_id, None)
                 items.extend(late_items)
+                _refresh_addressed_batch_generation(channel, items, local_generation_id, channel_policy)
                 regenerated_once = True
                 _channel_preempted_generation_id[channel_id] = 0
                 _channel_message_interrupt_generation_id[channel_id] = 0

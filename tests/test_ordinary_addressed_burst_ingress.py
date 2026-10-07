@@ -380,6 +380,58 @@ class OrdinaryAddressedBurstIngressTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("reference", channel.send.await_args.kwargs)
                 self.assertEqual(channel.send.await_args.kwargs["allowed_mentions"].to_dict(), {"parse": []})
 
+    async def test_late_tagged_second_author_keeps_untagged_detail_during_regeneration(self):
+        channel = self._channel(995187)
+        first, _ = self._messages(channel)
+        second_author = existing.FakeAuthor(200, "Other Test Member")
+        mention = existing.SimpleNamespace(id=999, display_name="BNL-01", bot=True)
+        second = existing.FakeMessage(
+            channel, "<@999> I have a narrow desk beside the window.",
+            author=second_author, mentions=[mention],
+        )
+        detail = existing.FakeMessage(
+            channel, "There is only enough room for one notebook.", author=second_author,
+        )
+        first_started, release_first = asyncio.Event(), asyncio.Event()
+        rebuilt_started, release_rebuilt = asyncio.Event(), asyncio.Event()
+        prompts = []
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                first_started.set()
+                await release_first.wait()
+                return "STALE FIRST-SPEAKER DRAFT"
+            if len(prompts) == 2:
+                self.assertIn("narrow desk beside the window", prompt)
+                rebuilt_started.set()
+                await release_rebuilt.wait()
+                return "STALE DRAFT MISSING THE SECOND SPEAKER'S DETAIL"
+            self.assertIn(FIRST, prompt)
+            self.assertIn("narrow desk beside the window", prompt)
+            self.assertIn(detail.content, prompt)
+            return ANSWER
+
+        with self._runtime(channel, generate, policy="public_context"):
+            await bot.on_message(first)
+            try:
+                await asyncio.wait_for(first_started.wait(), timeout=8)
+                await bot.on_message(second)
+                release_first.set()
+                await asyncio.wait_for(rebuilt_started.wait(), timeout=8)
+                await bot.on_message(detail)
+            finally:
+                release_first.set()
+                release_rebuilt.set()
+            await self._drain()
+        self.assertEqual(channel.sent, [ANSWER])
+        self.assertEqual(first.replies + second.replies + detail.replies, [])
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(set(self.frames[-1].source_message_ids), {first.id, second.id, detail.id})
+        self.assertNotIn("reference", channel.send.await_args.kwargs)
+        self.model_save.assert_called_once()
+        self._assert_originals_once(first, second, detail)
+
     async def test_duplicate_gateway_event_does_not_duplicate_turn_or_delivery(self):
         for index, phase in enumerate(("pending", "provider")):
             with self.subTest(phase=phase):
