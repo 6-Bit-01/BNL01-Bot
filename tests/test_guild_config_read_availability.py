@@ -27,6 +27,7 @@ FUNCTIONS = {
     "get_guild_config", "_sqlite_busy", "on_message",
     "_guard_direct_payload_capture_ingress", "_direct_session_key",
     "_finish_direct_payload_capture_handoff", "_declared_canon_command_match",
+    "_ordinary_burst_has_message", "_ordinary_burst_continuation",
 }
 OWNERS = [node for node in TREE.body
           if (
@@ -78,6 +79,9 @@ class GuildConfigReadAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             re=re, wraps=wraps,
             _direct_payload_sessions={},
             _direct_payload_capture_waiters={},
+            _channel_addressed_generation={},
+            BNL_ACTIVE_BATCHING_ENABLED=True,
+            is_direct_bnl_target=lambda _message: True,
             # Pure route/payload inputs are outside this configuration-owner
             # fixture. The actual capture wrapper and cleanup owner execute.
             classify_route_mode=mock.Mock(return_value="normal_chat"),

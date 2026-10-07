@@ -9,6 +9,7 @@ import base64
 import os
 import sqlite3
 import unittest
+from contextlib import closing
 from types import SimpleNamespace
 from unittest import mock
 
@@ -94,6 +95,19 @@ class ConversationImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def clear_room_events(self):
         for channel_id in self.owners.channel_ids:
             bot._recent_room_events.pop((self.owners.guild_id, channel_id), None)
+            bot._channel_addressed_generation.pop(channel_id, None)
+
+    async def drain_batch(self):
+        for _ in range(4):
+            pending = [
+                task for channel_id in self.owners.channel_ids
+                for task in (bot._channel_tasks.get(channel_id),)
+                if task is not None and not task.done()
+            ]
+            if not pending:
+                return
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=20)
+        self.fail("image conversation coordinator did not settle")
 
     def channel_fixture(self, channel_id):
         self.owners.channel_ids.add(channel_id)
@@ -137,10 +151,17 @@ class ConversationImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
         bot._channel_last_message_at[self.channel.id] = now
         bot._channel_last_reply_at[self.channel.id] = now - bot.timedelta(hours=2)
 
-    async def test_tagged_current_image_reaches_native_provider_and_direct_send(self):
+    async def check_tagged_current_image_delivery(self, *, batching_enabled):
         message = self.message(tagged=True)
-        await bot.on_message(message)
-        self.assertEqual(message.replies, [ANSWER])
+        with mock.patch.object(bot, "BNL_ACTIVE_BATCHING_ENABLED", batching_enabled):
+            await bot.on_message(message)
+            if batching_enabled:
+                await self.drain_batch()
+                self.assertEqual(self.channel.sent, [ANSWER])
+                self.assertEqual(message.replies, [])
+            else:
+                self.assertEqual(message.replies, [ANSWER])
+                self.assertEqual(self.channel.sent, [])
         self.assertEqual(self.provider.call_count, 1)
         text, images = self.provider_parts()
         self.assertEqual([(part.mime_type, part.data) for part in images], [("image/png", PNG)])
@@ -148,6 +169,12 @@ class ConversationImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("submitting_user_id=100", text)
         message.attachments[0].read.assert_awaited_once_with(use_cached=False)
         self.assertNotIn(message.attachments[0].url, text)
+
+    async def test_tagged_current_image_reaches_native_provider_and_batch_send(self):
+        await self.check_tagged_current_image_delivery(batching_enabled=True)
+
+    async def test_tagged_current_image_reaches_native_provider_and_direct_fallback_send(self):
+        await self.check_tagged_current_image_delivery(batching_enabled=False)
 
     async def test_two_same_name_batch_speakers_keep_separate_image_origins(self):
         first = self.message(user_id=100, attachment_id=7101)
@@ -161,7 +188,7 @@ class ConversationImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"message_id={message.id}; submitting_user_id={message.author.id}", text)
             self.assertIn(f"attachment_id={message.attachments[0].id}", text)
             message.attachments[0].read.assert_awaited_once()
-        with sqlite3.connect(bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bot.DB_FILE)) as conn:
             stored = "\n".join(str(row[0]) for row in conn.execute("SELECT content FROM conversations"))
         self.assertNotIn(first.attachments[0].url, stored)
         self.assertNotIn(base64.b64encode(PNG).decode(), stored)

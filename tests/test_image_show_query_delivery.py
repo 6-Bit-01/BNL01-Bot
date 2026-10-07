@@ -9,6 +9,7 @@ import json
 import time
 import sqlite3
 import unittest
+from contextlib import closing
 from unittest import mock
 
 import test_conversation_image_delivery as image_fixture
@@ -48,6 +49,7 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
     channel_fixture = image_fixture.ConversationImageDeliveryTests.channel_fixture
     message = image_fixture.ConversationImageDeliveryTests.message
     provider_parts = image_fixture.ConversationImageDeliveryTests.provider_parts
+    drain_batch = image_fixture.ConversationImageDeliveryTests.drain_batch
 
     async def asyncSetUp(self):
         await image_fixture.ConversationImageDeliveryTests.asyncSetUp(self)
@@ -103,7 +105,7 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("matchedOriginalRows=1", text)
         self.assertIn("eligibleOriginalRowsChecked=1", text)
 
-    async def check_current_image_source_delivery(self, *, tagged):
+    async def check_current_image_source_delivery(self, *, tagged, batching_enabled=True):
         # Both optional persona rewrite branches would fire without the
         # source-verification rule; no third provider call may appear here.
         self.stack.enter_context(mock.patch.object(bot.random, "random", return_value=0.0))
@@ -113,8 +115,15 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.extraction(message), image_fixture.provider_response(answer),
         ]
         if tagged:
-            await bot.on_message(message)
-            self.assertEqual(message.replies, [answer])
+            with mock.patch.object(bot, "BNL_ACTIVE_BATCHING_ENABLED", batching_enabled):
+                await bot.on_message(message)
+                if batching_enabled:
+                    await self.drain_batch()
+                    self.assertEqual(self.channel.sent, [answer])
+                    self.assertEqual(message.replies, [])
+                else:
+                    self.assertEqual(message.replies, [answer])
+                    self.assertEqual(self.channel.sent, [])
         else:
             with mock.patch.object(bot, "_reset_debounce"):
                 await bot.on_message(message)
@@ -144,6 +153,9 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await self.check_current_image_source_delivery(tagged=False)
 
     async def test_direct_screenshot_date_and_literal_reach_original_reader(self):
+        await self.check_current_image_source_delivery(tagged=True, batching_enabled=False)
+
+    async def test_tagged_batch_screenshot_date_and_literal_reach_original_reader(self):
         await self.check_current_image_source_delivery(tagged=True)
 
     def seed_format_original(self):
@@ -170,7 +182,7 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Test Original", text)
         self.assertIn("text=" + json.dumps(FORMAT_ORIGINAL), text)
 
-    async def check_format_candidate_delivery(self, *, tagged):
+    async def check_format_candidate_delivery(self, *, tagged, batching_enabled=True):
         self.seed_format_original()
         message = self.message(REQUEST, tagged=tagged)
         answer = "The original comment has different capitalization and punctuation."
@@ -179,8 +191,15 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
             image_fixture.provider_response(answer),
         ]
         if tagged:
-            await bot.on_message(message)
-            self.assertEqual(message.replies, [answer])
+            with mock.patch.object(bot, "BNL_ACTIVE_BATCHING_ENABLED", batching_enabled):
+                await bot.on_message(message)
+                if batching_enabled:
+                    await self.drain_batch()
+                    self.assertEqual(self.channel.sent, [answer])
+                    self.assertEqual(message.replies, [])
+                else:
+                    self.assertEqual(message.replies, [answer])
+                    self.assertEqual(self.channel.sent, [])
         else:
             with mock.patch.object(bot, "_reset_debounce"):
                 await bot.on_message(message)
@@ -199,6 +218,9 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         message.attachments[0].read.assert_awaited_once_with(use_cached=False)
 
     async def test_direct_changed_format_delivers_original_candidate_to_answer(self):
+        await self.check_format_candidate_delivery(tagged=True, batching_enabled=False)
+
+    async def test_tagged_batch_changed_format_delivers_original_candidate_to_answer(self):
         await self.check_format_candidate_delivery(tagged=True)
 
     async def test_batch_changed_format_delivers_original_candidate_to_answer(self):
@@ -238,7 +260,7 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         refreshed, changed = bot.refresh_prompt_source_basis(basis)
         self.assertFalse(changed)
         self.assert_format_original(refreshed.rendered_context)
-        with sqlite3.connect(bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bot.DB_FILE)) as conn, conn:
             purge_user_bound_conversation_sources_on_connection(conn, 77, 4243)
         withdrawn, changed = bot.refresh_prompt_source_basis(refreshed)
         self.assertTrue(changed)
@@ -296,7 +318,7 @@ class ImageShowQueryDeliveryTests(unittest.IsolatedAsyncioTestCase):
         refreshed, changed = bot.refresh_prompt_source_basis(basis)
         self.assertFalse(changed)
         self.assert_selected_original(refreshed.rendered_context)
-        with sqlite3.connect(bot.DB_FILE) as conn:
+        with closing(sqlite3.connect(bot.DB_FILE)) as conn, conn:
             purge_user_bound_conversation_sources_on_connection(conn, 77, 4242)
         withdrawn, changed = bot.refresh_prompt_source_basis(refreshed)
         self.assertTrue(changed)

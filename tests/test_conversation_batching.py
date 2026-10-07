@@ -2638,7 +2638,9 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ):
             first_task = asyncio.create_task(bnl01_bot._flush_channel_buffer(channel))
             bnl01_bot._channel_tasks[channel.id] = first_task
-            await asyncio.wait_for(first_generation_started.wait(), timeout=0.5)
+            # These are ordering barriers, not a provider latency assertion.
+            # Leave setup room on shared CI runners; the slow-retry interval below is unchanged.
+            await asyncio.wait_for(first_generation_started.wait(), timeout=3)
 
             generation_id = bnl01_bot._channel_generation_id[channel.id]
             bnl01_bot._channel_preempted_generation_id[channel.id] = generation_id
@@ -2647,7 +2649,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             bnl01_bot._reset_debounce(channel)
             release_first_generation.set()
 
-            await asyncio.wait_for(regenerated_generation_started.wait(), timeout=0.5)
+            await asyncio.wait_for(regenerated_generation_started.wait(), timeout=3)
             self.assertIn(("regenerated_batch_once", "retry"), batch_events)
             bnl01_bot._channel_preempted_generation_id[channel.id] = generation_id
             bnl01_bot._channel_message_interrupt_generation_id[channel.id] = generation_id
@@ -2658,11 +2660,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             # plus glitch-rewrite path did, without making the test wait ten seconds.
             await asyncio.sleep(0.25)
             release_regenerated_generation.set()
-            await asyncio.wait_for(first_task, timeout=1)
+            await asyncio.wait_for(first_task, timeout=5)
 
             successor = bnl01_bot._channel_tasks[channel.id]
             self.assertIsNot(successor, first_task)
-            await asyncio.wait_for(successor, timeout=1)
+            await asyncio.wait_for(successor, timeout=5)
 
         self.assertEqual(len(prompts), 3)
         self.assertIn("hey BNL", prompts[2])
