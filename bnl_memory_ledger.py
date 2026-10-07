@@ -37,14 +37,6 @@ from bnl_canon_source_contract import (
 )
 
 MEMORY_LEDGER_SCHEMA_VERSION = "memory_ledger_v1"
-GOVERNED_SUBJECT_READ_INDEX = "idx_mle_governed_subject_read_v1"
-GOVERNED_SUBJECT_READ_COLUMNS = (
-    "guild_id", "subject_key", "entry_id", "entry_type", "predicate_key",
-    "source_class", "source_table", "source_row_id", "route_mode",
-    "channel_policy", "visibility", "confidence", "public_usable", "derived",
-    "projection", "salience", "observed_at", "valid_from", "valid_until",
-    "lifecycle_status",
-)
 ATOMIC_KNOWLEDGE_SCHEMA_VERSION = "memory_ledger_atomic_knowledge_v1"
 ATOMIC_KNOWLEDGE_BACKFILL = "atomic_knowledge_backfill_v1"
 RETAINED_CONVERSATION_LEDGER_BACKFILL = (
@@ -2147,56 +2139,6 @@ def unresolved_memory_tier_sources_count(conn: sqlite3.Connection, *, guild_id: 
         return 0
     incomplete = "AND COALESCE(source_lineage_complete,0)<>1" if "source_lineage_complete" in cols else ""
     return int(conn.execute("SELECT COUNT(*) FROM memory_tiers WHERE guild_id=? AND user_id=? AND tier IN ('short','medium','long') AND TRIM(COALESCE(summary,''))<>'' " + incomplete, (guild_id, user_id)).fetchone()[0])
-
-
-def governed_subject_read_index_ready(
-    conn: sqlite3.Connection, *, available_columns: Iterable[str] | None = None,
-) -> bool:
-    """Inspect this connection's schema without creating or caching anything."""
-    columns = set(available_columns) if available_columns is not None else {
-        row[1] for row in conn.execute("PRAGMA table_info(memory_ledger_entries)")
-    }
-    if (not set(GOVERNED_SUBJECT_READ_COLUMNS).union({"normalized_value"}) <= columns
-            or {str(column).lower() for column in columns} & {"rowid", "_rowid_", "oid"}):
-        return False
-    indexes = conn.execute("PRAGMA index_list(memory_ledger_entries)").fetchall()
-    index = next((row for row in indexes if row[1] == GOVERNED_SUBJECT_READ_INDEX), None)
-    if index is None or len(index) < 5 or index[2] or index[3] != "c" or index[4]:
-        return False
-    shape = conn.execute("PRAGMA index_xinfo(%s)" % GOVERNED_SUBJECT_READ_INDEX).fetchall()
-    keys = [row for row in shape if len(row) >= 6 and row[5]]
-    auxiliary = [row for row in shape if len(row) >= 6 and not row[5]]
-    return (
-        tuple(row[2] for row in keys) == GOVERNED_SUBJECT_READ_COLUMNS
-        and all(row[1] >= 0 and row[3] == 0 and row[4] == "BINARY" for row in keys)
-        # A real rowid suffix excludes WITHOUT ROWID and expression indexes.
-        and len(auxiliary) == 1 and auxiliary[0][1:6] == (-1, None, 0, "BINARY", 0)
-    )
-
-
-def ensure_governed_subject_read_index(conn: sqlite3.Connection) -> bool:
-    """Install the optional physical read index during bounded initialization.
-
-    This is deliberately separate from generic schema checks and selectors:
-    existing databases need a measured migration, never a first-chat index
-    build. The caller owns transaction/deadline/commit and may roll it back.
-    SQLite maintains this index through the existing ledger lifecycle writes.
-    """
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_ledger_entries)")}
-    if (not set(GOVERNED_SUBJECT_READ_COLUMNS).union({"normalized_value"}) <= columns
-            or {str(column).lower() for column in columns} & {"rowid", "_rowid_", "oid"}):
-        return False
-    # Reduced or noncanonical legacy schemas keep their current read path.
-    table = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_ledger_entries'"
-    ).fetchone()
-    if not table or re.search(r"\b(?:COLLATE|WITHOUT\s+ROWID)\b", str(table[0] or ""), re.I):
-        return False
-    indexes = conn.execute("PRAGMA index_list(memory_ledger_entries)").fetchall()
-    if not any(row[1] == GOVERNED_SUBJECT_READ_INDEX for row in indexes):
-        conn.execute("CREATE INDEX %s ON memory_ledger_entries (%s)" % (
-            GOVERNED_SUBJECT_READ_INDEX, ",".join(GOVERNED_SUBJECT_READ_COLUMNS)))
-    return governed_subject_read_index_ready(conn, available_columns=columns)
 
 
 def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
