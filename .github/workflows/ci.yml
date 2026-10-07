@@ -69,6 +69,14 @@ jobs:
           --workdir /workspace
           python:3.9.5-slim-buster
           python -m unittest discover -s tests -p 'test_retained_conversation_repair.py' -v
+      - name: Verify governed memory payload read cost on legacy SQLite
+        run: >-
+          docker run --rm --network none
+          -e PYTHONDONTWRITEBYTECODE=1
+          --mount "type=bind,source=$PWD,target=/workspace,readonly"
+          --workdir /workspace
+          python:3.9.5-slim-buster
+          python -m unittest discover -s tests -p 'test_governed_subject_read_io.py' -v
 
   tiktok-live-transport-contract:
     runs-on: ubuntu-latest
