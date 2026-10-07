@@ -43243,13 +43243,19 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 else "batch_established_path_sent"
             ),
         )
+        # A delivered answer opens the existing scoped, ephemeral follow-up
+        # window even when its contents must not be persisted.
+        for uid in unique_user_ids:
+            _consume_awaiting_retransmission(guild_id, channel_id, uid)
+            meaningful_followup_question = _response_contains_direct_question_to_user(response) and not is_generic_non_answer_response(response)
+            _mark_conversation_continuation_state(guild_id, channel_id, uid, awaiting_answer=meaningful_followup_question, channel_policy=channel_policy)
+            if meaningful_followup_question:
+                logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", guild_id, channel_id, uid, BNL_QUESTION_ANSWER_TTL_SECONDS)
+            elif _response_contains_direct_question_to_user(response):
+                logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", ROUTE_MODE_NORMAL_CHAT, channel_policy)
+            if _response_requests_retransmission(response):
+                _mark_awaiting_retransmission(guild_id, channel_id, uid)
         if not batch_model_persistence_allowed:
-            # Delivery completed, so the old question has been answered. Keep
-            # this no-store path from extending conversational state.
-            for uid in unique_user_ids:
-                state = _get_conversation_continuation_state(guild_id, channel_id, uid)
-                if state:
-                    state.pop("awaiting_answer_until", None)
             logging.info(
                 "batch_response_persistence_skipped "
                 "reason=%s channel_policy=%s",
@@ -43267,16 +43273,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             return
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
-        for uid in unique_user_ids:
-            _consume_awaiting_retransmission(guild_id, channel_id, uid)
-            meaningful_followup_question = _response_contains_direct_question_to_user(response) and not is_generic_non_answer_response(response)
-            _mark_conversation_continuation_state(guild_id, channel_id, uid, awaiting_answer=meaningful_followup_question, channel_policy=channel_policy)
-            if meaningful_followup_question:
-                logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", guild_id, channel_id, uid, BNL_QUESTION_ANSWER_TTL_SECONDS)
-            elif _response_contains_direct_question_to_user(response):
-                logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", ROUTE_MODE_NORMAL_CHAT, channel_policy)
-            if _response_requests_retransmission(response):
-                _mark_awaiting_retransmission(guild_id, channel_id, uid)
         if active_packet.get("media_present"):
             mark_recent_media_events_response_state(guild_id, channel_id, set(unique_user_ids), channel_policy, "responded")
 

@@ -213,14 +213,21 @@ class AddressedContinuationDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(packet["decision"], "answer")
                 self.assertEqual(packet["reason"], "same_user_awaiting_answer")
 
-    async def test_successful_no_store_delivery_only_consumes_existing_question_state(self):
+    def _model_source_counts(self):
+        with closing(sqlite3.connect(bot.DB_FILE)) as conn:
+            return (
+                conn.execute("SELECT COUNT(*) FROM conversations WHERE role='model'").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM memory_ledger_entries WHERE source_role='model'").fetchone()[0],
+            )
+
+    async def test_successful_no_store_question_opens_only_scoped_ephemeral_answer_window(self):
         for policy in ("public_home", "sealed_test"):
             for has_existing_window in (False, True):
                 with self.subTest(policy=policy, existing_window=has_existing_window):
                     channel_id = 8811 + len(self.runtime.channel_ids)
                     if has_existing_window:
                         channel_id, state = self._next_answer_window(policy)
-                        previous_state = dict(state)
+                        state["awaiting_answer_until"] = bot.datetime.now(bot.timezone.utc) + bot.timedelta(seconds=5)
                         participants = (("Test Member", "Continue.", 42),)
                     else:
                         self._seed_exchange(channel_id, policy)
@@ -228,9 +235,12 @@ class AddressedContinuationDeliveryTests(unittest.IsolatedAsyncioTestCase):
                             bot.BatchConversationTurn("Test Member", "Continue.", 42, addressing("mention")),
                         )
                     answer = "The recap covers that show's visuals. Would you like another comment?"
+                    counts_before = self._model_source_counts()
+                    before_send = bot.datetime.now(bot.timezone.utc)
                     with (
                         mock.patch.object(bot, "model_response_persistence_allowed_with_website_context", return_value=False),
                         mock.patch.object(bot, "save_model_message") as save,
+                        mock.patch.object(bot, "persist_batch_bnl_self_name_decision_after_send_async", new=mock.AsyncMock()) as persist_name,
                     ):
                         channel, generation, guard = await self.runtime._batch(
                             policy, request="Continue.", answer=answer, participants=participants,
@@ -239,14 +249,46 @@ class AddressedContinuationDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     guard.assert_awaited_once()
                     self.assertEqual(channel.sent, [answer])
                     save.assert_not_called()
-                    if has_existing_window:
-                        previous_state.pop("awaiting_answer_until")
-                        self.assertEqual(state, previous_state)
-                    else:
-                        self.assertNotIn((77, channel_id, 42), bot._conversation_continuation_state)
-                    packet = self._followup_packet(channel_id, policy)
-                    self.assertNotEqual(packet["decision"], "answer")
-                    self.assertNotEqual(packet["reason"], "same_user_awaiting_answer")
+                    persist_name.assert_not_awaited()
+                    self.assertEqual(self._model_source_counts(), counts_before)
+                    state = bot._conversation_continuation_state[(77, channel_id, 42)]
+                    self.assertEqual(set(state), {"channel_policy", "last_bnl_reply_at", "live_exchange_until", "awaiting_answer_until"})
+                    self.assertEqual(state["channel_policy"], policy)
+                    after_send = bot.datetime.now(bot.timezone.utc)
+                    self.assertLessEqual(before_send, state["last_bnl_reply_at"])
+                    self.assertLessEqual(state["last_bnl_reply_at"], after_send)
+                    for key, ttl in (("live_exchange_until", bot.CONVERSATION_CONTINUATION_TTL_SECONDS),
+                                     ("awaiting_answer_until", bot.BNL_QUESTION_ANSWER_TTL_SECONDS)):
+                        self.assertGreater(state[key], before_send + bot.timedelta(seconds=5))
+                        self.assertLessEqual(state[key], after_send + bot.timedelta(seconds=ttl))
+                    packet = self._followup_packet(channel_id, policy, "Yes.")
+                    self.assertEqual(packet["decision"], "answer")
+                    self.assertEqual(packet["reason"], "same_user_awaiting_answer")
+
+    async def test_no_store_nonquestion_closes_old_question_but_keeps_substantive_followup(self):
+        policy = "sealed_test"
+        channel_id, state = self._next_answer_window(policy)
+        counts_before = self._model_source_counts()
+        with (
+            mock.patch.object(bot, "model_response_persistence_allowed_with_website_context", return_value=False),
+            mock.patch.object(bot, "save_model_message") as save,
+            mock.patch.object(bot, "persist_batch_bnl_self_name_decision_after_send_async", new=mock.AsyncMock()) as persist_name,
+        ):
+            channel, generation, guard = await self.runtime._batch(
+                policy, request="Continue.", answer="Let's continue with the recap.",
+            )
+        generation.assert_awaited_once()
+        guard.assert_awaited_once()
+        self.assertEqual(channel.sent, ["Let's continue with the recap."])
+        save.assert_not_called()
+        persist_name.assert_not_awaited()
+        self.assertEqual(self._model_source_counts(), counts_before)
+        self.assertNotIn("awaiting_answer_until", state)
+        self.assertTrue(bot._completed_conversation_followup_addressed(
+            77, channel_id, 42, policy, "Which of those recordings appeared first?", addressing()))
+        self.assertFalse(bot._completed_conversation_followup_addressed(
+            77, channel_id, 42, policy, "Thanks.", addressing()))
+        self.assertNotEqual(self._followup_packet(channel_id, policy)["decision"], "answer")
 
     async def test_real_bare_continue_reaches_provider_with_its_existing_source_scope(self):
         # The fixture checks source handoff and delivery, not live semantic
