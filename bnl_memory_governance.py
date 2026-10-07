@@ -26,8 +26,10 @@ from bnl_journal_source_store import (
     purge_user_bound_conversation_sources_on_connection,
 )
 from bnl_memory_ledger import (
+    GOVERNED_SUBJECT_READ_INDEX,
     ensure_memory_ledger_schema,
     form_atomic_candidate_from_ledger_entry,
+    governed_subject_read_index_ready,
     invalidate_memory_tiers_for_conversation_sources,
     purge_atomic_knowledge_for_subject,
     reconcile_atomic_knowledge_lifecycle_for_roots,
@@ -964,9 +966,15 @@ def _governed_subject_rows(
         if column == "normalized_value" and skipped_text else column
         for column in columns
     ]
+    indexed = governed_subject_read_index_ready(conn, available_columns=available)
+    # Keep the narrow subject index's rowid traversal, including exclusion and
+    # malformed-row error order. Only the physical access path changes; CASE
+    # expressions, parameters, controls and snapshot boundaries remain intact.
+    access = " INDEXED BY " + GOVERNED_SUBJECT_READ_INDEX if indexed else ""
+    order = " ORDER BY rowid" if indexed else ""
     rows = conn.execute(
-        "SELECT %s FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?"
-        % ",".join(projection),
+        "SELECT %s FROM memory_ledger_entries%s WHERE guild_id=? AND subject_key=?%s"
+        % (",".join(projection), access, order),
         (*parameters, guild_id, subject),
     ).fetchall()
     return [dict(zip(columns, row)) for row in rows]
