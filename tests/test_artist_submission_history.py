@@ -11,6 +11,7 @@ import time
 import unittest
 from contextlib import closing
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -20,6 +21,7 @@ import bnl_tiktok_show_ledger as ledger
 import bnl_unified_response_assessment as assessment
 import bnl_unified_intelligence_packet as packet
 import bnl_canon_entity_binding as binding
+import bnl_conversation_context_v2 as context_owner
 
 from bnl_tiktok_live_context import is_tiktok_show_analysis_query
 from bnl_tiktok_show_ledger import (
@@ -328,3 +330,114 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
                 conn.execute("DELETE FROM conversations WHERE id=101")
                 conn.commit()
             self.assertNotEqual(bot.prompt_source_basis_failure((human_basis, show_basis)), "")
+
+    def test_raw_context_keeps_artist_history_for_submitter_subset_followup(self):
+        import test_conversation_batching as bot_fixture
+        bot = bot_fixture.bnl01_bot
+        now = datetime.now(timezone.utc)
+        first = ("BNL, have any songs of mine appeared in the archived shows? Include tracks sent by somebody else, "
+                 "and give the recorded artist, title, submitter, and show date.")
+        answer = ("The retained shows include 6 Bit — Neutral Signal, submitted by Test Submitter on September 11, "
+                  "and 6-Bit featuring Second Artist — Neutral Collaboration, submitted by Second Submitter on September 25.")
+        followup = "And which of those songs did Test Submitter submit, and when?"
+        with closing(sqlite3.connect(self.db_file)) as conn:
+            conn.execute("DELETE FROM conversations")
+            conn.executemany("""INSERT INTO conversations
+                (id,user_id,user_name,guild_id,channel_name,channel_policy,route_mode,role,content,timestamp,channel_id,message_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", [
+                    (201, 42, "Test Member", 77, "bnl-testing", "sealed_test", "normal_chat", "user", first,
+                     (now - timedelta(seconds=44)).isoformat(), 9001, 7201),
+                    (202, 42, "BNL-01", 77, "bnl-testing", "sealed_test", "normal_chat", "model", answer,
+                     (now - timedelta(seconds=19)).isoformat(), 9001, 7202),
+                ])
+            if getattr(self, "_unpaired_history", False):
+                conn.execute("DELETE FROM conversations WHERE id=202")
+            conn.execute("""INSERT INTO conversations
+                (id,user_id,user_name,guild_id,channel_name,channel_policy,route_mode,role,content,timestamp,channel_id,message_id)
+                VALUES (203,42,'Test Member',77,'bnl-testing','sealed_test','normal_chat','user',?,?,9001,7203)""",
+                (followup, now.isoformat()))
+            conn.commit()
+        env = {**ENABLED_QUEUE_ENV, "BNL_OWNER_USER_ID": "42", "BNL_PRIMARY_GUILD_ID": "77"}
+        with mock.patch.object(bot, "DB_FILE", self.db_file), mock.patch.dict(os.environ, env):
+            result_out = {}
+            rendered = bot.build_conversation_context_v2_for_prompt(
+                guild_id=77, current_user_id=42, channel_id=9001, channel_name="bnl-testing",
+                channel_policy="sealed_test", route_mode="normal_chat", conversation_surface="sealed_test",
+                current_texts=(followup,), current_participants={42}, is_batch=True,
+                current_message_ids={7203}, is_direct_target=True, now=now, result_out=result_out)
+            context_result = result_out["result"]
+            basis = bot.build_conversation_prompt_source_basis(rendered, guild_id=77, current_user_id=42,
+                channel_id=9001, channel_name="bnl-testing", channel_policy="sealed_test", context_result=context_result)
+            self.assertIsNotNone(basis)
+            self.assertIn(201, basis.source_row_ids)
+            selection = {}
+            context = bot.build_tiktok_show_evidence_context_for_turn(
+                guild_id=77, subject_user_id=42, user_text=followup, situation_frame=self.frame(followup),
+                conversation_basis=basis, conversation_context_result=context_result, selection_out=selection)
+            diagnostic = (context_result.thread_focus_mode, context_result.referent_status,
+                          context_result.referent_reason, context_result.selected_row_ids,
+                          context_result.referent_request_row_ids, len(context))
+            with self.subTest(owner="native", context_selection=diagnostic):
+                self.assertIn("Neutral Signal", context)
+                self.assertIn("test.submitter", context)
+                self.assertLess(len(context), 2400)
+            request = packet.IntelligencePacketRequest(guild_id=77, subject_user_id=42,
+                route_mode="normal_chat", conversation_surface="sealed_test", user_text=followup,
+                show_episode_selection_text=selection.get("selection_user_text", ""),
+                show_episode_artist_request=selection.get("artist_identity_request"))
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                items = packet._show_episode_items(conn, request, packet.IntelligencePacketDiagnostics(), [], environ=env)
+            with self.subTest(owner="packet", context_selection=diagnostic):
+                self.assertTrue(any("Neutral Signal" in item.text for item in items))
+            for current in ("What songs by Mac Modem have been submitted?", "Which of those songs were on 2026-09-25?", "Is queue open?"):
+                with self.subTest(current_override=current):
+                    scoped_out = {}
+                    scoped_rendered = bot.build_conversation_context_v2_for_prompt(
+                        guild_id=77, current_user_id=42, channel_id=9001, channel_name="bnl-testing",
+                        channel_policy="sealed_test", route_mode="normal_chat", conversation_surface="sealed_test",
+                        current_texts=(current,), current_participants={42}, is_batch=True,
+                        current_message_ids={7203}, is_direct_target=True, now=now, result_out=scoped_out)
+                    scoped_basis = bot.build_conversation_prompt_source_basis(scoped_rendered,
+                        guild_id=77, current_user_id=42, channel_id=9001, channel_name="bnl-testing",
+                        channel_policy="sealed_test", context_result=scoped_out["result"])
+                    scoped_selection = {}
+                    bot.build_tiktok_show_evidence_context_for_turn(guild_id=77, subject_user_id=42,
+                        user_text=current, situation_frame=self.frame(current), conversation_basis=scoped_basis,
+                        conversation_context_result=scoped_out["result"], selection_out=scoped_selection)
+                    artist_request = scoped_selection.get("artist_identity_request")
+                    self.assertFalse(artist_request and any(subject.user_id == 42 for subject in artist_request.frame_subjects))
+            show_basis = bot.build_finalized_show_prompt_source_basis(context, guild_id=77, selection=selection)
+            self.assertEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                conn.execute("DELETE FROM conversations WHERE id=201")
+                conn.commit()
+            self.assertNotEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
+
+    def test_raw_unpaired_human_request_and_current_duplicate_keep_history(self):
+        self._unpaired_history = True
+        self.test_raw_context_keeps_artist_history_for_submitter_subset_followup()
+
+    def test_raw_subset_context_preserves_ambiguity_and_current_payload(self):
+        from tests import test_conversation_context_v2 as fixture
+        row, req = fixture.row, fixture.req
+        text = "Which of those songs did Test Submitter submit?"
+        human = row(1, "user", "Which of my recordings appeared in past shows?", name="Test Member")
+        answer = row(2, "model", "Two retained recordings appeared.", name="BNL-01")
+        cases = (
+            ("multiple requests", [human, row(2, "user", "Which other artist's recordings appeared?")], text),
+            ("intervening topic", [human, answer, row(3, "user", "New topic: help me move this desk.")], text),
+            ("other author", [row(1, "user", human["content"], user=2)], text),
+            ("other room", [dict(human, channel_id=11)], text),
+            ("expired", [dict(human, timestamp=(fixture.NOW - timedelta(minutes=11)).isoformat())], text),
+            ("orphan model", [answer], text),
+            ("current payload", [human, answer], "Which of these options: Blue Lamp or Green Desk?"),
+        )
+        for label, rows, current in cases:
+            with self.subTest(boundary=label):
+                result = context_owner.assemble_conversation_context_v2(rows, req(current_texts=(current,)))
+                self.assertNotEqual(result.referent_status, "resolved")
+        exact = context_owner.assemble_conversation_context_v2(
+            [human, answer, row(3, "user", "Different question.")],
+            req(current_texts=(text,), referenced_conversation_row_ids=frozenset({1})))
+        self.assertEqual(exact.referent_reason, "discord_reply_source")
+        self.assertEqual(exact.referent_selected_row_ids, (1,))
