@@ -35,6 +35,9 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
         stack.enter_context(mock.patch.object(bot, "_is_recent_conversation_continuation", side_effect=actual_continuation))
         stack.enter_context(mock.patch.object(bot, "BATCH_WINDOW_SECONDS", 0.01))
         stack.enter_context(mock.patch.object(bot, "BATCH_REPLY_COOLDOWN_SECONDS", 0))
+        if getattr(self, "no_store_context", ""):
+            stack.enter_context(mock.patch.object(bot, "maybe_build_bnl_read_model_context",
+                return_value=self.no_store_context))
         return stack
 
     def _first(self, channel):
@@ -96,6 +99,75 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
                     await self._drain()
                 self.assertEqual(len(prompts), 1)
                 self.assertEqual(len(channel.sent), 1)
+
+    async def test_no_store_answer_keeps_public_followup_without_persisting_output(self):
+        channel = self._channel(996260)
+        first = self._first(channel)
+        followup = existing.FakeMessage(channel,
+            "Which of those did Test Submitter submit, and when was that show?",
+            author=first.author)
+        generate = mock.AsyncMock(return_value="The neutral record contains two entries.")
+        website = "Website private queue read model context:\nNEUTRAL NO-STORE SOURCE"
+        with self._completed_runtime(channel, generate, policy="public_context"), mock.patch.object(
+            bot, "maybe_build_bnl_read_model_context", return_value=website,
+        ):
+            await bot.on_message(first)
+            await self._drain()
+            self.assertEqual(len(channel.sent), 1)
+            self.model_save.assert_not_called()
+            # This is beyond the legacy direct window but inside the ordinary
+            # completed-exchange window, as in the public delivery regression.
+            key = bot._conversation_state_key(first.guild.id, channel.id, first.author.id)
+            state = bot._conversation_continuation_state.get(key)
+            if state:
+                state["last_bnl_reply_at"] -= timedelta(seconds=70)
+                state["live_exchange_until"] -= timedelta(seconds=70)
+            if (channel.id, first.author.id) in bot._recent_direct_response_window:
+                bot._recent_direct_response_window[(channel.id, first.author.id)] -= timedelta(seconds=70)
+            await bot.on_message(followup)
+            await self._drain()
+            self.assertEqual(generate.await_count, 2)
+            self.assertEqual(len(channel.sent), 2)
+            self.model_save.assert_not_called()
+            state = bot._conversation_continuation_state[key]
+            self.assertEqual(state["channel_policy"], "public_context")
+            self.assertNotIn("NEUTRAL", str(state))
+            await bot.on_message(existing.FakeMessage(channel, "thanks", author=first.author))
+            await self._drain()
+            self.assertEqual(generate.await_count, 2)
+        self._assert_originals_once(first, followup)
+        conn = ingress.sqlite3.connect(bot.DB_FILE)
+        try:
+            self.assertEqual(conn.execute("SELECT count(*) FROM conversations WHERE role='model'").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM memory_ledger_entries WHERE source_role='model'").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM conversations WHERE content LIKE '%NEUTRAL NO-STORE SOURCE%'").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    async def test_no_store_failed_or_partial_send_does_not_open_followup(self):
+        self.no_store_context = "Website private queue read model context:\nNEUTRAL NO-STORE SOURCE"
+        for index, partial in enumerate((False, True)):
+            with self.subTest(partial=partial):
+                channel = self._channel(996270 + index)
+                first = self._first(channel)
+                answer = "A neutral record has one entry. " * (90 if partial else 1)
+                generate = mock.AsyncMock(return_value=answer)
+                outcomes = ([existing.SimpleNamespace(id=77)] if partial else []) + [RuntimeError("neutral send failure")]
+                with self._completed_runtime(channel, generate, policy="public_context"), mock.patch.object(
+                    channel, "send", new=mock.AsyncMock(side_effect=outcomes),
+                ) as send:
+                    await bot.on_message(first)
+                    await self._drain()
+                    self.assertEqual(send.await_count, 2 if partial else 1)
+                    self.model_save.assert_not_called()
+                    self.assertNotIn(bot._conversation_state_key(first.guild.id, channel.id, first.author.id),
+                        bot._conversation_continuation_state)
+                    self.assertNotIn((channel.id, first.author.id), bot._recent_direct_response_window)
+
+    async def test_no_store_followup_retains_existing_identity_scope_and_expiry_guards(self):
+        self.no_store_context = "Website private queue read model context:\nNEUTRAL NO-STORE SOURCE"
+        await self.test_completed_followup_does_not_cross_identity_scope_or_expiry()
+        self.model_save.assert_not_called()
 
     async def test_completed_followup_does_not_cross_identity_scope_or_expiry(self):
         for offset, boundary in enumerate(("author", "channel", "thread", "guild", "expiry", "policy", "other_person")):
