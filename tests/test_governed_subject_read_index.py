@@ -106,7 +106,8 @@ class GovernedSubjectReadIndexTests(unittest.TestCase):
         try:
             self.assert_parity()
         finally:
-            self.conn.set_authorizer(None)
+            # Python 3.9 does not support clearing this callback with None.
+            self.conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK)
         self.assertEqual(before, self.conn.total_changes)
         self.assertFalse(ledger.governed_subject_read_index_ready(self.conn))
 
