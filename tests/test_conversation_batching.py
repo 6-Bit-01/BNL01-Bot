@@ -1225,8 +1225,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         finalize_synthesis.assert_awaited_once()
         self.assertTrue(finalize_synthesis.await_args.kwargs["response_sent"])
         generate_synthesis.assert_not_awaited()
-        mark_continuation.assert_not_called()
-        consume_retransmission.assert_not_called()
+        mark_continuation.assert_called_once_with(
+            channel.guild.id, channel.id, 100,
+            awaiting_answer=False, channel_policy="sealed_test",
+        )
+        consume_retransmission.assert_called_once_with(channel.guild.id, channel.id, 100)
         self.assertNotIn(
             channel.id,
             bnl01_bot._channel_pending_request_intent,
