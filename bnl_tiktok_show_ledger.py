@@ -3456,6 +3456,42 @@ def _named_recall_subject_refs(
             if str(item.get("subjectRef") or "")}
 
 
+def _authored_show_topic_overlap(
+    ledger: Mapping[str, Any], topic_terms: set[str], subject_refs: set[str],
+) -> int:
+    """Score original human text without constructing attributed output rows."""
+
+    overlap = 0
+    for message in ledger.get("messages") or ():
+        if not isinstance(message, Mapping):
+            continue
+        if subject_refs and str(message.get("subjectRef") or "") not in subject_refs:
+            continue
+        if topic_terms and overlap < 3:
+            overlap = min(3, max(overlap, len(topic_terms.intersection(
+                _query_terms(str(message.get("text") or "")),
+            ))))
+    for exchange in ledger.get("discordInteractions") or ():
+        if not isinstance(exchange, Mapping):
+            continue
+        # Discord attribution belongs to the exchange, never an individual
+        # leaf's possibly conflicting subjectRef or its display label.
+        subject_ref = str(exchange.get("subjectRef") or "")
+        for message in exchange.get("userMessages") or ():
+            if not isinstance(message, Mapping):
+                continue
+            if subject_refs and subject_ref not in subject_refs:
+                continue
+            if topic_terms and overlap < 3:
+                overlap = min(3, max(overlap, len(topic_terms.intersection(
+                    _query_terms(str(message.get("text") or "")),
+                ))))
+    # Three terms saturate the 240-point contribution and exceed the only
+    # later threshold (two). Keep traversing container shapes even after
+    # saturation so malformed source containers retain their error behavior.
+    return overlap
+
+
 def _document_relevance(
     ledger: Mapping[str, Any],
     *,
@@ -3589,11 +3625,9 @@ def _document_relevance(
         # of how many messages exist. Resolved people and episode scopes keep
         # their full original-source scan below.
         return 0, []
-    authored_overlap = max((
-        len(topic_terms.intersection(_query_terms(str(message.get("text") or ""))))
-        for message in _authored_show_messages(ledger)
-        if not authored_subject_refs or str(message.get("subjectRef") or "") in authored_subject_refs
-    ), default=0)
+    authored_overlap = _authored_show_topic_overlap(
+        ledger, topic_terms, authored_subject_refs,
+    )
     if authored_overlap:
         score += min(240, 80 * authored_overlap)
     authored_subject = re.search(
