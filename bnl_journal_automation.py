@@ -50,6 +50,7 @@ DAILY_RELEASE_WEEKDAYS = frozenset({1, 2, 3, 4, 5, 6})  # Tuesday-Sunday.
 LEASE_MINUTES = 30
 DELIVERY_LEASE_MINUTES = 2
 PREPARATION_RETRY_MINUTES = 30
+PRE_RELEASE_PREPARATION_RETRY_MINUTES = 5
 DELIVERY_RETRY_MINUTES = 15
 MAX_AUTOMATIC_GENERATION_CYCLES = 4
 GENERATION_CYCLE_WINDOW_HOURS = 24
@@ -94,6 +95,25 @@ def _parse_utc(value: str) -> datetime:
 
 def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _preparation_retry_at(
+    finished_at: str,
+    source_window_end: str,
+    *,
+    schedule_contract_version: int,
+) -> str:
+    finished = _parse_utc(finished_at)
+    delay = PREPARATION_RETRY_MINUTES
+    # Only this occurrence's frozen preparation window gets the shorter wait.
+    if (
+        schedule_contract_version == CADENCE_CONTRACT_VERSION
+        and source_window_end
+        and _parse_utc(source_window_end) <= finished
+        and not _window_release_is_due(source_window_end, finished)
+    ):
+        delay = PRE_RELEASE_PREPARATION_RETRY_MINUTES
+    return _utc_iso(finished + timedelta(minutes=delay))
 
 
 def _pacific_journal_cutoff(day: date) -> datetime:
@@ -1333,9 +1353,11 @@ def _claim_preparation(
             if current["lifecycle_state"] in {"held", "delivery_failed", "deferred"} and not force:
                 updated_at = str(current.get("updated_at") or "")
                 if updated_at:
-                    retry_at = _parse_utc(updated_at) + timedelta(
-                        minutes=PREPARATION_RETRY_MINUTES
-                    )
+                    retry_at = _parse_utc(_preparation_retry_at(
+                        updated_at,
+                        str(current.get("source_window_end") or ""),
+                        schedule_contract_version=int(current.get("schedule_contract_version") or 1),
+                    ))
                     if retry_at > now:
                         current["retry_at"] = _utc_iso(retry_at)
                         conn.commit()
@@ -1428,17 +1450,12 @@ def _finish_preparation(
     preparation_epoch: int,
     result: AutomationResult,
 ) -> AutomationResult:
-    retry_at = ""
-    if result.status in {"held", "delivery_failed", "deferred"}:
-        retry_at = _utc_iso(
-            datetime.now(timezone.utc)
-            + timedelta(minutes=PREPARATION_RETRY_MINUTES)
-        )
     finished_at = utc_now_iso()
     with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT guild_id FROM bnl_journal_automation_runs WHERE run_id=? AND preparation_epoch=? AND lifecycle_state='preparing'",
+            "SELECT guild_id,source_window_end,schedule_contract_version "
+            "FROM bnl_journal_automation_runs WHERE run_id=? AND preparation_epoch=? AND lifecycle_state='preparing'",
             (run_id, int(preparation_epoch)),
         ).fetchone()
         if not row:
@@ -1451,6 +1468,13 @@ def _finish_preparation(
                 source_window_start=result.source_window_start,
                 source_window_end=result.source_window_end,
                 aggregate_counts=result.aggregate_counts,
+            )
+        retry_at = ""
+        if result.status in {"held", "delivery_failed", "deferred"}:
+            retry_at = _preparation_retry_at(
+                finished_at,
+                str(row[1] or ""),
+                schedule_contract_version=int(row[2] or 1),
             )
         updated = conn.execute("""UPDATE bnl_journal_automation_runs SET lifecycle_state=?,reason=?,journal_entry_id=?,
                 journal_revision=?,aggregate_counts_json=?,lease_expires_at=NULL,updated_at=?
@@ -1931,7 +1955,7 @@ def _adopt_legacy_staged_revision(
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         run = conn.execute(
-            "SELECT lifecycle_state,preparation_epoch,lease_expires_at "
+            "SELECT lifecycle_state,preparation_epoch,lease_expires_at,schedule_contract_version "
             "FROM bnl_journal_automation_runs WHERE run_id=?",
             (run_id,),
         ).fetchone()
@@ -2040,6 +2064,9 @@ def _adopt_legacy_staged_revision(
                 "WHERE run_id=? AND preparation_epoch=? AND lifecycle_state='preparing'",
                 (failure, now, run_id, int(preparation_epoch)),
             )
+            retry_at = _preparation_retry_at(
+                now, end, schedule_contract_version=int(run["schedule_contract_version"] or 1)
+            )
             _finish_preparation_attempt_on_connection(
                 conn,
                 run_id=run_id,
@@ -2047,13 +2074,10 @@ def _adopt_legacy_staged_revision(
                 result_status=result.status,
                 result_reason=result.reason,
                 finished_at=now,
-                next_retry_at=_utc_iso(
-                    datetime.now(timezone.utc)
-                    + timedelta(minutes=PREPARATION_RETRY_MINUTES)
-                ),
+                next_retry_at=retry_at,
             )
             _reconcile_daily_observation(conn, guild_id, result)
-            _update_state(conn, guild_id, result)
+            _update_state(conn, guild_id, result, next_retry_at=retry_at)
             conn.commit()
             return result
 
@@ -2865,7 +2889,7 @@ def _invalidate_prepared_in_transaction(
 ) -> None:
     now = utc_now_iso()
     run = conn.execute(
-        "SELECT cadence,source_window_start,source_window_end,aggregate_counts_json "
+        "SELECT cadence,source_window_start,source_window_end,aggregate_counts_json,schedule_contract_version "
         "FROM bnl_journal_automation_runs WHERE run_id=?",
         (run_id,),
     ).fetchone()
@@ -2915,9 +2939,10 @@ def _invalidate_prepared_in_transaction(
             conn,
             guild_id,
             result,
-            next_retry_at=_utc_iso(
-                datetime.now(timezone.utc)
-                + timedelta(minutes=PREPARATION_RETRY_MINUTES)
+            next_retry_at=_preparation_retry_at(
+                now,
+                str(run[2] or ""),
+                schedule_contract_version=int(run[4] or 1),
             ),
         )
 
@@ -4458,7 +4483,11 @@ def _run_recovery_ready(
     updated = str(row.get("updated_at") or "")
     if lifecycle in {"held", "deferred"} and updated:
         return (
-            _parse_utc(updated) + timedelta(minutes=PREPARATION_RETRY_MINUTES)
+            _parse_utc(_preparation_retry_at(
+                updated,
+                str(row.get("source_window_end") or ""),
+                schedule_contract_version=int(row.get("schedule_contract_version") or 1),
+            ))
             <= now
         )
     if lifecycle == "delivery_failed" and updated:
