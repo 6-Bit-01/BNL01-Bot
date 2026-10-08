@@ -22,6 +22,7 @@ from bnl_unified_response_assessment import (
     revalidate_situation_frame,
     situation_request_clauses,
     situation_task_texts,
+    source_dependent_task_texts,
 )
 
 
@@ -132,6 +133,105 @@ class PrefacedSituationRequestTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(situation_request_clauses(text), (clause,))
                 self.assertFalse(music_submission_history_requested(text))
+
+
+class ResolvedDependentRequestTests(unittest.TestCase):
+    def _frame(self, text, *, status="resolved", source_ids=(11, 12, 13)):
+        return build_situation_frame_v1(
+            route_allowed=True, route_mode="normal_chat",
+            conversation_surface="public_home", channel_policy="public_home",
+            current_text=text, current_speaker_user_ids=(101,), response_act="answer",
+            referent_status=status, exact_source_row_ids=source_ids,
+        )
+
+    def _support(self, frame, *, lane="source_file", evidence=True):
+        from types import SimpleNamespace
+        from bnl_shared_brain_synthesis import ordinary_chat_task_support_plan
+
+        basis = SimpleNamespace(
+            packet=SimpleNamespace(request=SimpleNamespace(frame_tasks=frame.tasks)),
+            rendered_evidence_refs=(("E1", lane, "fixture-source-digest", ()),) if evidence else (),
+        )
+        return ordinary_chat_task_support_plan(basis)
+
+    def test_resolved_same_item_followups_use_selected_source_support(self):
+        for text, lane in (
+            ("And what is the full artist credit for that same track?", "show_episode"),
+            ("And what is the model number for that same device?", "source_file"),
+        ):
+            with self.subTest(text=text):
+                frame = self._frame(text)
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(frame.tasks[0].required_response_act, "answer")
+                support = self._support(frame, lane=lane)[0]
+                self.assertEqual((support.support_kind, support.evidence_ids), ("packet", ("E1",)))
+                self.assertEqual(source_dependent_task_texts(frame, current_text=text), (text.rstrip("?"),))
+
+    def test_resolved_subset_followups_use_selected_source_support(self):
+        for text in (
+            "Which of those has the featured-artist credit?",
+            "Which of those has the longer warranty?",
+        ):
+            with self.subTest(text=text):
+                frame = self._frame(text)
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(frame.tasks[0].required_response_act, "answer")
+                support = self._support(frame)[0]
+                self.assertEqual((support.support_kind, support.evidence_ids), ("packet", ("E1",)))
+                self.assertEqual(source_dependent_task_texts(frame, current_text=text), (text.rstrip("?"),))
+
+    def test_resolved_same_item_without_packet_evidence_holds(self):
+        frame = self._frame("What is the model number for that same device?")
+        support = self._support(frame, evidence=False)[0]
+        self.assertEqual((support.support_kind, support.evidence_ids), ("hold", ()))
+
+    def test_unbound_or_ambiguous_reference_does_not_gain_packet_authority(self):
+        text = "What is the model number for that same device?"
+        for status, source_ids in (
+            ("not_requested", (11, 12, 13)),
+            ("unresolved", (11, 12, 13)),
+            ("ambiguous", (11, 12, 13)),
+            ("resolved", ()),
+        ):
+            with self.subTest(status=status, source_ids=source_ids):
+                frame = self._frame(text, status=status, source_ids=source_ids)
+                self.assertNotEqual(frame.tasks[0].authority_scope, "packet")
+                support = self._support(frame)[0]
+                self.assertNotEqual(support.support_kind, "packet")
+                self.assertNotIn("E1", support.evidence_ids)
+                self.assertEqual(source_dependent_task_texts(frame, current_text=text), ())
+
+    def test_resolved_context_does_not_own_independent_questions_or_current_payload(self):
+        for text, authority, response, support_kind, evidence_ids in (
+            ("Where is Seattle?", "external_public", "answer", "external_public", ("PUBLIC",)),
+            ("What is Seattle's weather today?", "external_current", "hold", "hold", ()),
+            ("Please help rewrite this request: what is the model number for that same device?",
+             "current_request", "answer", "current_request", ("REQUEST",)),
+        ):
+            with self.subTest(text=text):
+                frame = self._frame(text)
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].authority_scope, authority)
+                self.assertEqual(frame.tasks[0].required_response_act, response)
+                support = self._support(frame)[0]
+                self.assertEqual((support.support_kind, support.evidence_ids), (support_kind, evidence_ids))
+                self.assertEqual(source_dependent_task_texts(frame, current_text=text), ())
+
+    def test_mixed_dependent_and_external_tasks_keep_separate_support(self):
+        text = "What is the full artist credit for that same track? Then where is Seattle?"
+        frame = self._frame(text)
+        self.assertEqual(tuple(task.authority_scope for task in frame.tasks), ("packet", "external_public"))
+        self.assertEqual(tuple(task.required_response_act for task in frame.tasks), ("answer", "answer"))
+        support = self._support(frame, lane="show_episode")
+        self.assertEqual(
+            tuple((item.support_kind, item.evidence_ids) for item in support),
+            (("packet", ("E1",)), ("external_public", ("PUBLIC",))),
+        )
+        self.assertEqual(
+            source_dependent_task_texts(frame, current_text=text),
+            ("What is the full artist credit for that same track",),
+        )
 
 
 def addressing(**overrides):

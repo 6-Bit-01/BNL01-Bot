@@ -30233,7 +30233,13 @@ def build_live_conversation_orchestration_decision(
                             ).lower()
                             # These labels identify a conversational target,
                             # not the person the current question is about.
-                            in {"discord_reply_source", "latest_answer_continuation"}
+                            in {
+                                "discord_reply_source",
+                                "latest_answer_continuation",
+                                "latest_answer_subset",
+                                "single_request_subset",
+                                "human_request_subset_chain",
+                            }
                         )
                     )
                     else ()
@@ -30267,11 +30273,22 @@ def build_live_conversation_orchestration_decision(
             for meta in addressings
             if int(meta.reply_message_id or 0) > 0
         ),
-        exact_source_row_ids=tuple(
-            meta.reply_conversation_row_id
-            for meta in addressings
-            if int(meta.reply_conversation_row_id or 0) > 0
-        ),
+        # Context already selected and privacy-filtered the referent. Preserve
+        # that lineage for ordinary follow-ups as well as Discord replies;
+        # general room history and unresolved candidates confer no authority.
+        exact_source_row_ids=tuple(dict.fromkeys((
+            *(
+                meta.reply_conversation_row_id
+                for meta in addressings
+                if int(meta.reply_conversation_row_id or 0) > 0
+            ),
+            *(
+                context_result.referent_selected_row_ids
+                if context_result is not None
+                and context_result.referent_status == "resolved"
+                else ()
+            ),
+        ))),
         explicit_mention_count=sum(
             len(meta.explicit_tag_recipients) for meta in addressings
         ),

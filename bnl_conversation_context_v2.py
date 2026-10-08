@@ -1407,11 +1407,12 @@ def _deictic_subset_requested(text: str) -> bool:
                 and not EXPLICIT_NEW_TOPIC_RE.search(value))
 
 
-def _dependent_request_scope_candidate(text: str) -> bool:
+def dependent_request_scope_candidate(text: str) -> bool:
     """Recognize candidates only for a fully proven human request chain.
 
     The bounded chain resolver still proves its human root and every link;
     these cues never change generic referent detection or its fallback paths.
+    Downstream planning may reuse them only with a resolved source reference.
     """
     value = _referent_input_text(text)
     clauses = tuple(re.split(r"[.!?;\n]+", value))
@@ -1694,7 +1695,7 @@ def _resolve_nearby_contribution_referent(
         or dynamic_speaker_reference
     )
     legacy_subset_requested = _deictic_subset_requested(current_text)
-    dependent_scope_candidate = _dependent_request_scope_candidate(current_text)
+    dependent_scope_candidate = dependent_request_scope_candidate(current_text)
     if not legacy_referent_requested and not dependent_scope_candidate:
         return _ReferentResolution()
     if not candidates:
@@ -1722,7 +1723,7 @@ def _resolve_nearby_contribution_referent(
                 if str(row.get("role") or "").lower() == "user"
                 and int(row.get("user_id") or 0) == int(req.current_user_id)
                 and not nearby_contribution_referent_requested(str(row.get("content") or ""))
-                and not _dependent_request_scope_candidate(str(row.get("content") or ""))), default=0)
+                and not dependent_request_scope_candidate(str(row.get("content") or ""))), default=0)
             complete_pairs = []
             for pair in pairs:
                 users = (tuple(pair.get("users") or ()) if pair.get("_room_group")
@@ -1743,7 +1744,7 @@ def _resolve_nearby_contribution_referent(
             humans = tuple(row for row in chain if str(row.get("role") or "").lower() == "user")
             if (anchor_id and len(humans) > 1 and int(humans[0].get("id") or 0) == anchor_id
                     and all(int(row.get("user_id") or 0) == int(req.current_user_id) for row in humans)
-                    and all(_dependent_request_scope_candidate(str(row.get("content") or "")) for row in humans[1:])
+                    and all(dependent_request_scope_candidate(str(row.get("content") or "")) for row in humans[1:])
                     and all(str(row.get("role") or "").lower() == "user"
                             or int(row.get("id") or 0) in model_ids for row in chain)):
                 return _ReferentResolution(status="resolved", candidates=chain, selected=chain,
