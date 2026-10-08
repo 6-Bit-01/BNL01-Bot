@@ -158,7 +158,7 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
 
         def generate_image(*_args, **_kwargs):
             if cross_close:
-                self.fixture.now += timedelta(seconds=5)
+                self.fixture.now += timedelta(minutes=30, seconds=5)
             return png, {'sha256': hashlib.sha256(png).hexdigest(), 'mimeType': 'image/jpeg'}
 
         with ExitStack() as stack:
@@ -219,11 +219,11 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
                 opener.return_value.open.assert_called_once()
             self.assertEqual(self.execute('SELECT website_status FROM bnl_own_art_delivery')[0][0], 'unconfirmed')
 
-    def test_website_after_posting_window_preserves_confirmed_discord_without_http(self):
+    def test_website_after_delivery_cutoff_preserves_confirmed_discord_without_http(self):
         with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}):
             art_id = art.claim(bot, 42)
             art.record(bot, art_id, 'discord_confirmed', message_id=123456)
-            self.fixture.now = self.fixture.now.replace(hour=20, minute=0, second=0)
+            self.fixture.now = self.fixture.now.replace(hour=19, minute=59, second=0)
             with mock.patch.object(bot, '_journal_website_base_url', return_value='https://example.test'), \
                  mock.patch.object(art.urllib.request, 'build_opener') as opener:
                 art.publish_website(bot, {'image': b'png', 'metadata': {'artId': art_id}})
@@ -233,15 +233,15 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
                 ('discord_confirmed', '123456', 'outside_posting_window'),
             )
 
-    def test_website_rechecks_posting_window_after_local_preparation(self):
-        self.fixture.now = self.fixture.now.replace(hour=19, minute=59, second=59)
+    def test_website_rechecks_delivery_cutoff_after_local_preparation(self):
+        self.fixture.now = self.fixture.now.replace(hour=19, minute=58, second=59)
         with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}):
             art_id = art.claim(bot, 42)
             art.record(bot, art_id, 'discord_confirmed', message_id=123456)
             opener = mock.Mock()
 
             def prepare_opener(*_args):
-                self.fixture.now = self.fixture.now.replace(hour=20, minute=0, second=0)
+                self.fixture.now = self.fixture.now.replace(hour=19, minute=59, second=0)
                 return opener
 
             with mock.patch.object(bot, '_journal_website_base_url', return_value='https://example.test'), \
@@ -254,6 +254,7 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
 
     def test_website_upload_uses_actual_image_type_and_generic_payload(self):
+        self.fixture.now = self.fixture.now.replace(hour=19, minute=58, second=59)
         data = b'provider-jpeg-fixture'
         digest = hashlib.sha256(data).hexdigest()
         with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}):
@@ -263,6 +264,7 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(bot, '_journal_website_base_url', return_value='https://example.test'), mock.patch.object(art.urllib.request, 'build_opener') as opener:
                 opener.return_value.open.return_value = response
                 art.publish_website(bot, {'image': data, 'metadata': {'artId': art_id, 'sha256': digest, 'mimeType': 'image/jpeg'}})
+                self.assertEqual(opener.return_value.open.call_args.kwargs['timeout'], 20)
                 packet = json.loads(opener.return_value.open.call_args.args[0].data)
             self.assertEqual(packet['contractVersion'], 2)
             self.assertIn('imageBase64', packet)
@@ -283,7 +285,7 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
         await self._run_art_scheduler_case()
 
     async def test_image_preparation_crossing_close_withholds_delivery_and_closes_attachment(self):
-        self.fixture.now = self.fixture.now.replace(hour=19, minute=59, second=58)
+        self.fixture.now = self.fixture.now.replace(hour=19, minute=29, second=58)
         await self._run_art_scheduler_case(cross_close=True)
 
     async def test_creative_lineage_stays_local_and_development_uses_shared_function(self):

@@ -198,6 +198,29 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await bot.generate_dynamic_ambient(43, 100), LEGACY_TEXT)
         generate.assert_not_awaited()
 
+    async def test_preparation_freezes_source_window_before_thread_and_art_expansion(self):
+        self.fixture.now = self.fixture.now.replace(hour=19, minute=29)
+        cutoff = self.fixture.now
+        actual_to_thread = asyncio.to_thread
+        async def delayed_read(function, *args, **kwargs):
+            if function.__name__ == "read":
+                self.fixture.now = self.fixture.now.replace(hour=19, minute=45)
+            return await actual_to_thread(function, *args, **kwargs)
+        art_context = {"sources": [], "sourceBases": [], "continuity": []}
+        self.provider.side_effect = None
+        self.provider.return_value = '{"action":"skip"}'
+        with mock.patch.object(bot, "ambient_source_window_end", side_effect=lambda: self.fixture.now, create=True) as end, \
+                mock.patch.object(edition.asyncio, "to_thread", side_effect=delayed_read), \
+                mock.patch.object(sources, "build_context", wraps=sources.build_context) as reader, \
+                mock.patch.object(art, "available", return_value=True), \
+                mock.patch.object(art, "journal_context", return_value=None), \
+                mock.patch.object(art, "build_art_context", return_value=art_context), \
+                mock.patch.object(bot, "revalidate_ambient_sources", new=mock.AsyncMock(return_value=True)):
+            await bot.generate_dynamic_ambient(42, 100)
+        end.assert_called_once()
+        self.assertEqual(reader.call_args.kwargs["now"], cutoff)
+        self.assertEqual(datetime.fromisoformat(art_context["ambient_source_window_end"].replace("Z", "+00:00")), cutoff)
+
     async def test_real_provider_wrapper_preserves_rich_envelope_without_voice_rewrite(self):
         self.add_message("WITHHELD_EDITION_MARKER", self.stamp(minutes=4), policy="sealed_test")
         publication = self.add_publication(body="UNSUPPORTED_JOURNAL_NARRATIVE: Everyone heard an imaginary instrument.")

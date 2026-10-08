@@ -389,6 +389,11 @@ def develop_art_concept(bot, guild_id: int, proposal: dict, context: dict, *, at
     """
     if proposal["action"] != "create" or not proposal["inspirationRefs"]:
         return proposal
+    ambient_end = context.get("ambient_source_window_end")
+    if ambient_end is not None:
+        ambient_end = datetime.fromisoformat(str(ambient_end).replace("Z", "+00:00"))
+        if ambient_end.tzinfo is None:
+            raise ValueError("ambient_art_source_cutoff_requires_timezone")
     selected = set(proposal["inspirationRefs"])
     anchors = [s for s in context["sources"] if s["ref"] in selected]
     focused = {s["ref"]: s for s in anchors}
@@ -406,6 +411,10 @@ def develop_art_concept(bot, guild_id: int, proposal: dict, context: dict, *, at
             break
         start = stamp - timedelta(minutes=6)
         end = min(stamp + timedelta(minutes=6), datetime.now(timezone.utc))
+        if ambient_end is not None:
+            end = min(end, ambient_end)
+            if end <= start:
+                continue
         expanded = build_source_packet_between(bot.DB_FILE, guild_id, start.isoformat(), end.isoformat(),
                                               entry_kind="manual", prepare_schema=False)
         packet_filter = context.get("packet_filter")

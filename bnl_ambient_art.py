@@ -247,7 +247,7 @@ def publish_website(bot, art):
         request = urllib.request.Request(base + "/api/bnl/art", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "x-api-key": bot.BNL_API_KEY}, method="POST")
         opener = urllib.request.build_opener(_NoRedirect)
-        if not bot.ambient_posting_window_open():
+        if not bot.ambient_delivery_window_open():
             status = "outside_posting_window"
             return
         with opener.open(request, timeout=20) as response:

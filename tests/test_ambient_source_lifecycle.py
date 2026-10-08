@@ -264,11 +264,13 @@ class AmbientSourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         logged.assert_not_called()
 
 
-    async def test_recent_source_aging_out_during_generation_discards_draft(self):
+    async def test_source_window_stays_fixed_during_preparation(self):
         self.execute('UPDATE conversations SET timestamp=?', ((self.fixture.now - timedelta(hours=24) + timedelta(seconds=1)).isoformat(),))
         def advance():
             self.fixture.now += timedelta(seconds=2)
-        self.assertEqual(await self.generate(advance), '')
+        # Preparation now fixes the existing 24-hour window. Its oldest
+        # eligible source does not disappear merely while the writer works.
+        self.assertEqual(await self.generate(advance), ANSWER)
         self.provider.assert_awaited_once()
 
     async def test_older_linked_memory_remains_eligible_as_historical_context(self):

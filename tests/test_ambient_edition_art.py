@@ -1,4 +1,5 @@
 import copy
+from datetime import datetime
 import json
 from types import SimpleNamespace
 import unittest
@@ -71,6 +72,29 @@ class AmbientEditionArtTests(unittest.TestCase):
         art.develop_art_concept(self.bot, 42, self.proposal, self.context)
         self.assertIn("WITHDRAWN ORIGINAL TEXT", self.provider.call_args.args[0])
         self.bot.revalidate_ambient_local_sources.assert_not_called()
+
+    def test_ambient_expansion_stops_at_frozen_source_cutoff(self):
+        cutoff = "2026-01-01T12:00:30+00:00"
+        self.context["ambient_source_window_end"] = cutoff
+        def read(_db, _guild, start, end, **_kwargs):
+            packet = copy.deepcopy(self.packet)
+            packet["sourceWindowStart"], packet["sourceWindowEnd"] = start, end
+            stop = datetime.fromisoformat(end)
+            packet["safeSources"] = [item for item in packet["safeSources"]
+                if datetime.fromisoformat(item["observedAt"].replace("Z", "+00:00")) < stop]
+            return packet
+        self.reader.side_effect = read
+        art.develop_art_concept(self.bot, 42, self.proposal, self.context)
+        self.assertEqual(self.reader.call_args.args[3], cutoff)
+        self.assertNotIn("WITHDRAWN ORIGINAL TEXT", self.provider.call_args.args[0])
+        self.assertEqual(self.context["sourceBases"][0]["end"], cutoff)
+
+    def test_invalid_ambient_cutoff_fails_before_source_expansion(self):
+        self.context["ambient_source_window_end"] = "not-a-date"
+        with self.assertRaises(ValueError):
+            art.develop_art_concept(self.bot, 42, self.proposal, self.context)
+        self.reader.assert_not_called()
+        self.provider.assert_not_called()
 
     def test_existing_development_keeps_full_creative_publication_and_continuity(self):
         self.context["packet_filter"] = self.public_expansion

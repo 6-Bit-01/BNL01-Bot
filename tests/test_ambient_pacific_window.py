@@ -1,5 +1,6 @@
 """Automatic Ambient delivery observes Pacific quiet hours at the send boundary."""
 from contextlib import closing
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import sqlite3
@@ -18,6 +19,18 @@ def pacific(year=2026, month=9, day=11, hour=8, minute=0, second=0):
 
 
 class AmbientWindowClockTests(unittest.TestCase):
+    def test_preparation_stops_at_1930_with_delivery_buffer_before_twenty(self):
+        self.assertTrue(bot.ambient_preparation_window_open(pacific(hour=19, minute=29, second=59)))
+        self.assertFalse(bot.ambient_preparation_window_open(pacific(hour=19, minute=30)))
+        self.assertTrue(bot.ambient_delivery_window_open(pacific(hour=19, minute=58, second=59)))
+        self.assertFalse(bot.ambient_delivery_window_open(pacific(hour=19, minute=59)))
+        self.assertEqual(bot.next_ambient_window_time(pacific(hour=19, minute=30)), pacific(day=12))
+
+    def test_source_cutoff_is_the_preparation_instant_capped_at_1930(self):
+        for now, expected in ((pacific(hour=14), pacific(hour=14)),
+                              (pacific(hour=19, minute=45), pacific(hour=19, minute=30))):
+            self.assertEqual(bot.ambient_source_window_end(now), expected)
+
     def test_window_includes_eight_am_and_excludes_eight_pm(self):
         for hour, minute, second, allowed in (
             (7, 59, 59, False), (8, 0, 0, True),
@@ -70,7 +83,7 @@ class AmbientWindowClockTests(unittest.TestCase):
         for path, now, expected_time in (
             ("initial", pacific(hour=19, minute=59), (8, 0)),
             ("failure_retry", pacific(hour=19, minute=59), (8, 0)),
-            ("next_day_random_max", pacific(hour=19, minute=59), (19, 59)),
+            ("next_day_random_max", pacific(hour=19, minute=59), (19, 29)),
             ("optional_second", pacific(hour=16), None),
         ):
             with self.subTest(path=path):
@@ -109,6 +122,22 @@ class AmbientWindowSchedulerTests(unittest.IsolatedAsyncioTestCase):
     def count_posts(self):
         return self.edition.execute("SELECT COUNT(*) FROM ambient_log")[0][0]
 
+    async def test_stalled_transport_is_cancelled_without_retry_or_success_log(self):
+        self.clock.now = pacific(hour=19, minute=29)
+        stopped = asyncio.Event()
+        async def stalled_send(*_args, **_kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        channel, _guild, _ = self.edition.scheduler(send_effect=stalled_send)
+        with mock.patch.object(bot, "AMBIENT_DELIVERY_TIMEOUT_SECONDS", 0.01):
+            await asyncio.wait_for(bot.ambient_message_task.coro(), timeout=10)
+            await bot.ambient_message_task.coro()
+        self.assertTrue(stopped.is_set())
+        channel.send.assert_awaited_once()
+        self.assertEqual(self.count_posts(), 0)
+
     async def test_old_due_slot_waits_at_0759_then_resumes_at_0800(self):
         self.clock.now = pacific(hour=7, minute=59)
         channel, _guild, _ = self.edition.scheduler()
@@ -137,10 +166,10 @@ class AmbientWindowSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next_at.date(), pacific(day=12).date())
 
     async def test_generation_crossing_close_never_sends_or_logs(self):
-        self.clock.now = pacific(hour=19, minute=59, second=58)
+        self.clock.now = pacific(hour=19, minute=29, second=58)
         channel, _guild, _ = self.edition.scheduler()
         async def generate(*_args, **_kwargs):
-            self.clock.now += timedelta(seconds=5)
+            self.clock.now += timedelta(minutes=30, seconds=5)
             return editions.LEGACY_TEXT
         with mock.patch.object(bot, "generate_dynamic_ambient", new=mock.AsyncMock(side_effect=generate)), \
                 mock.patch.object(bot, "revalidate_ambient_sources", new=mock.AsyncMock(return_value=True)):
@@ -149,9 +178,9 @@ class AmbientWindowSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.count_posts(), 0)
 
     async def test_member_confirmation_crossing_close_never_sends_or_logs(self):
-        self.clock.now = pacific(hour=19, minute=59, second=58)
+        self.clock.now = pacific(hour=19, minute=29, second=58)
         def after_close(_user_id):
-            self.clock.now += timedelta(seconds=5)
+            self.clock.now += timedelta(minutes=30, seconds=5)
             return SimpleNamespace(id=7, bot=False, guild=SimpleNamespace(id=42))
         channel, guild, _ = self.edition.scheduler(fetch_effect=after_close)
         await bot.ambient_message_task.coro()
@@ -235,10 +264,10 @@ class OccasionWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2026-07-04", result["occurrenceKey"])
 
     async def test_generation_crossing_close_preserves_payload_for_next_opening(self):
-        initial = self.now = pacific(month=7, day=4, hour=19, minute=59, second=58)
+        initial = self.now = pacific(month=7, day=4, hour=19, minute=29, second=58)
         content = occasions.valid_reflection()
         async def generate(*_args, **_kwargs):
-            self.now += timedelta(seconds=5)
+            self.now += timedelta(minutes=30, seconds=5)
             return content, ""
         generator = mock.AsyncMock(side_effect=generate)
         await self.cycle(generator, initial)

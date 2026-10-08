@@ -415,9 +415,10 @@ async def generate(bot, guild_id, channel_id, *, source_basis_out=None):
     basis = {"guild_id": guild_id}
     if source_basis_out is not None:
         source_basis_out.clear()
+    source_window_end = bot.ambient_source_window_end()
 
     def read():
-        context = sources.build_context(bot, guild_id, channel_id, basis=basis)
+        context = sources.build_context(bot, guild_id, channel_id, basis=basis, now=source_window_end)
         recent = bot.get_recent_ambient(guild_id, channel_id=channel_id, limit=bot.AMBIENT_AVOID_LAST)
         art_available = art.available(bot, guild_id)
         journal = art.journal_context(bot, guild_id) if art_available else None
@@ -426,6 +427,7 @@ async def generate(bot, guild_id, channel_id, *, source_basis_out=None):
                 bot, guild_id, packet=context["_packet"], journal=journal,
                 journal_provided=True, ambient_inputs=("", "", basis),
             )
+            basis["art_context"]["ambient_source_window_end"] = context["window_end"]
             def filter_expansion(packet, start, end):
                 filtered, originals = sources._fence_discord_originals(bot, guild_id, packet, start, end)
                 for table, rows in originals.get("rows", {}).items():
