@@ -17,6 +17,14 @@ from tests.test_bnl_journal_prepared_release import AcceptedResponse, article_js
 from tests.journal_review_helpers import is_source_review, supported_review
 
 
+class JournalClock(datetime):
+    current = datetime(2026, 7, 22, 1, 31, 17, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current.astimezone(tz) if tz is not None else cls.current.replace(tzinfo=None)
+
+
 class JournalCadenceV2Tests(unittest.TestCase):
     def setUp(self):
         self.archive_clock = patch.object(source_store, "_now_ms", return_value=0)
@@ -359,6 +367,177 @@ class JournalCadenceV2Tests(unittest.TestCase):
                     ).fetchone()[0],
                 ),
             )
+
+    def assert_failed_preparation_retries_before_release(self, release_day, cadence, retry_at):
+        self.activate(release_day - timedelta(days=1))
+        target = release_day - timedelta(days=1 if cadence == "daily" else 7)
+        start, end, _ = (
+            automation._daily_period_for_day(target)
+            if cadence == "daily"
+            else automation._weekly_period_for_monday(target)
+        )
+        self.add_sources(start, end, prefix="retry-window")
+        failure = self.utc(release_day, 18, 31, 17)
+        posts = []
+        flags = {"journalMemoryExclusionsConfirmed": True}
+        with patch.object(automation, "datetime", JournalClock) as clock, patch.object(
+            journal, "datetime", clock
+        ), patch.object(
+            automation, "utc_now_iso", side_effect=lambda: automation._utc_iso(clock.current)
+        ):
+            clock.current = failure
+            def timed_out(_packet, _prompt):
+                raise RuntimeError("journal_preparation_timeout")
+
+            first = automation.prepare_scheduled(
+                self.db, 1, timed_out,
+                flags, now_utc=self.utc(release_day, 18, 30),
+            )[0]
+            self.assertEqual("held", first.status, first)
+            self.assertEqual(cadence, first.cadence)
+            with sqlite3.connect(self.db) as conn:
+                conn.row_factory = sqlite3.Row
+                before = dict(conn.execute(
+                    "SELECT * FROM bnl_journal_automation_runs WHERE schedule_contract_version=2"
+                ).fetchone())
+                attempt_retry = conn.execute(
+                    "SELECT next_retry_at FROM bnl_journal_preparation_attempts WHERE run_id=?",
+                    (before["run_id"],),
+                ).fetchone()[0]
+            self.assertEqual(retry_at, attempt_retry)
+
+            # Re-enter from persisted state, as a restarted scheduler would.
+            clock.current = self.utc(release_day, 18, 36, 16)
+            waiting = automation.run_scheduled(
+                self.db, 1, lambda *_args: self.fail("retried before backoff elapsed"),
+                "https://site.example", "key", flags,
+                now_utc=clock.current, opener=self.opener(posts),
+            )[0]
+            self.assertEqual("backoff", waiting.status, waiting)
+            clock.current = self.utc(release_day, 18, 45)
+            prepared = automation.run_scheduled(
+                self.db, 1, self.generator, "https://site.example", "key", flags,
+                now_utc=clock.current, opener=self.opener(posts),
+            )[0]
+            self.assertEqual("prepared", prepared.status, prepared)
+            self.assertEqual([], posts)
+            with sqlite3.connect(self.db) as conn:
+                after = conn.execute(
+                    "SELECT run_id,frozen_packet_hash,preparation_epoch "
+                    "FROM bnl_journal_automation_runs WHERE run_id=?", (before["run_id"],),
+                ).fetchone()
+            self.assertEqual((before["run_id"], before["frozen_packet_hash"], 2), tuple(after))
+            clock.current = self.utc(release_day, 19, 0)
+            with patch.object(automation, "generate_and_store_packet_draft", side_effect=AssertionError(
+                "release regenerated instead of using the saved payload"
+            )):
+                released = automation.release_scheduled(
+                    self.db, 1, "https://site.example", "key", flags,
+                    now_utc=clock.current, opener=self.opener(posts),
+                )[0]
+                duplicate = automation.release_scheduled(
+                    self.db, 1, "https://site.example", "key", flags,
+                    now_utc=clock.current, opener=self.opener(posts),
+                )[0]
+            self.assertEqual("published", released.status, released)
+            self.assertEqual((prepared.entry_id, prepared.revision), (released.entry_id, released.revision))
+            self.assertEqual("published", duplicate.status, duplicate)
+            self.assertEqual(1, len(posts))
+
+    def test_failed_daily_preparation_retries_on_existing_tick_before_release(self):
+        self.assert_failed_preparation_retries_before_release(
+            date(2026, 7, 21), "daily", "2026-07-22T01:36:17Z"
+        )
+
+    def test_failed_monday_weekly_preparation_retries_before_release_without_a_daily(self):
+        self.assert_failed_preparation_retries_before_release(
+            date(2026, 7, 20), "weekly", "2026-07-21T01:36:17Z"
+        )
+
+    def test_preparation_retry_receipt_claim_and_recovery_agree_at_window_boundaries(self):
+        cases = (
+            (2, "2026-10-08T01:30:00Z", "2026-10-08T01:31:17Z", "2026-10-08T01:36:17Z"),
+            (2, "2026-10-08T01:30:00Z", "2026-10-08T01:30:00Z", "2026-10-08T01:35:00Z"),
+            (2, "2026-10-08T01:30:00Z", "2026-10-08T01:29:59Z", "2026-10-08T01:59:59Z"),
+            (2, "2026-10-08T01:30:00Z", "2026-10-08T01:59:59Z", "2026-10-08T02:04:59Z"),
+            (2, "2026-10-08T01:30:00Z", "2026-10-08T02:00:00Z", "2026-10-08T02:30:00Z"),
+            (2, "2026-10-08T01:30:00Z", "2026-10-09T01:31:17Z", "2026-10-09T02:01:17Z"),
+            (1, "2026-10-08T02:00:00Z", "2026-10-08T01:31:17Z", "2026-10-08T02:01:17Z"),
+            (2, "2026-11-02T02:30:00Z", "2026-11-02T02:31:17Z", "2026-11-02T02:36:17Z"),
+            (2, "2026-03-09T01:30:00Z", "2026-03-09T01:31:17Z", "2026-03-09T01:36:17Z"),
+        )
+        with patch.object(automation, "datetime", JournalClock) as clock, patch.object(
+            automation, "utc_now_iso", side_effect=lambda: automation._utc_iso(clock.current)
+        ):
+            for guild_id, (version, end, finished, retry) in enumerate(cases, start=10):
+                with self.subTest(version=version, end=end, finished=finished):
+                    clock.current = automation._parse_utc(finished)
+                    start = automation._utc_iso(automation._parse_utc(end) - timedelta(days=1))
+                    claim, run_id, epoch, _ = automation._claim_preparation(
+                        self.db, guild_id, "daily", start, end, schedule_contract_version=version
+                    )
+                    self.assertEqual("claimed", claim)
+                    automation._finish_preparation(
+                        self.db, run_id, epoch, automation.AutomationResult(
+                            False, "daily", "held", "provider_down",
+                            source_window_start=start, source_window_end=end,
+                        )
+                    )
+                    with sqlite3.connect(self.db) as conn:
+                        conn.row_factory = sqlite3.Row
+                        row = dict(conn.execute(
+                            "SELECT * FROM bnl_journal_automation_runs WHERE run_id=?", (run_id,)
+                        ).fetchone())
+                        self.assertEqual(retry, conn.execute(
+                            "SELECT next_retry_at FROM bnl_journal_preparation_attempts WHERE run_id=?",
+                            (run_id,),
+                        ).fetchone()[0])
+                        self.assertEqual(retry, conn.execute(
+                            "SELECT next_retry_at FROM bnl_journal_automation_state WHERE guild_id=?",
+                            (guild_id,),
+                        ).fetchone()[0])
+                    clock.current = automation._parse_utc(retry) - timedelta(seconds=1)
+                    self.assertFalse(automation._run_recovery_ready(row, clock.current))
+                    self.assertEqual("backoff", automation._claim_preparation(
+                        self.db, guild_id, "daily", start, end, schedule_contract_version=version
+                    )[0])
+                    clock.current += timedelta(seconds=1)
+                    self.assertTrue(automation._run_recovery_ready(row, clock.current))
+                    self.assertEqual("claimed", automation._claim_preparation(
+                        self.db, guild_id, "daily", start, end, schedule_contract_version=version
+                    )[0])
+                    self.assertEqual("busy", automation._claim_preparation(
+                        self.db, guild_id, "daily", start, end, force=True,
+                        schedule_contract_version=version,
+                    )[0])
+
+    def test_short_preparation_retry_does_not_bypass_automatic_generation_cycle_cap(self):
+        self.activate(date(2026, 7, 20))
+        self.add_daily_period(date(2026, 7, 20))
+        calls = []
+
+        def provider_down(_packet, _prompt):
+            calls.append(1)
+            raise RuntimeError("provider_down")
+
+        with patch.object(automation, "datetime", JournalClock) as clock, patch.object(
+            journal, "datetime", clock
+        ), patch.object(
+            automation, "utc_now_iso", side_effect=lambda: automation._utc_iso(clock.current)
+        ):
+            for minute in (31, 36, 41, 46):
+                clock.current = self.utc(date(2026, 7, 21), 18, minute, 17)
+                result = automation.prepare_scheduled(
+                    self.db, 1, provider_down, now_utc=clock.current,
+                )[0]
+                self.assertEqual("held", result.status, result)
+            clock.current = self.utc(date(2026, 7, 21), 18, 51, 17)
+            capped = automation.prepare_scheduled(
+                self.db, 1, provider_down, now_utc=clock.current,
+            )[0]
+        self.assertEqual(4, len(calls))
+        self.assertEqual("backoff", capped.status, capped)
+        self.assertTrue(capped.reason.startswith("generation_cycle_limit_until_"), capped)
 
     def test_preparation_deadline_miss_posts_nothing_and_same_occurrence_recovers(self):
         self.activate(date(2026, 7, 20))
