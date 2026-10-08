@@ -21,7 +21,9 @@ import urllib.request
 from bnl_own_art import (IMAGE_EXTENSIONS, _NoRedirect, _private_write, build_own_art_creative_context,
                          generate_private_image, parse_own_art_concept, build_art_context,
                          render_art_sources, continuity_for_prompt, art_context_current,
-                         saved_creative_continuity, develop_art_concept)
+                         saved_creative_continuity, develop_art_concept, bind_art_visual_references,
+                         visual_reference_availability, visual_reference_snapshot_current,
+                         visual_reference_guidance)
 
 PUBLIC_MAX_IMAGE_BYTES = 2 * 1024 * 1024
 
@@ -171,14 +173,21 @@ async def prepare(bot, guild_id, basis):
                 await asyncio.to_thread(record, bot, art_id, "bnl_declined_after_development")
                 return None
             basis["art"] = concept
-            continuity = saved_creative_continuity(guild_id, concept, basis["art_context"], ambient_basis=basis)
-        else:
-            continuity = None
+        context = basis.get("art_context") or {"sourceBases": []}
+        reference_inputs, reference_snapshot = await asyncio.to_thread(
+            bind_art_visual_references, bot, guild_id, concept, context)
+        if reference_snapshot:
+            basis["art_visual_references"] = reference_snapshot
+        continuity = (saved_creative_continuity(guild_id, concept, context, ambient_basis=basis)
+                      if basis.get("art_context") else None)
         stage = "source_check_before_image"
         if not await bot.revalidate_ambient_sources(guild_id, basis, stage="before_image"):
             raise ValueError("art_sources_changed")
         stage = "image_generation"
-        image, receipt = await asyncio.to_thread(generate_private_image, bot, concept["imagePrompt"])
+        reference_kwargs = ({"reference_inputs": reference_inputs, "reference_snapshot": reference_snapshot}
+                            if reference_snapshot else {})
+        image, receipt = await asyncio.to_thread(generate_private_image, bot, concept["imagePrompt"],
+                                                **reference_kwargs)
         if len(image) > PUBLIC_MAX_IMAGE_BYTES:
             raise ValueError("art_public_image_too_large")
         stage = "source_check_after_image"
@@ -194,6 +203,8 @@ async def prepare(bot, guild_id, basis):
         folder.mkdir(mode=0o700, parents=True, exist_ok=False)
         _private_write(folder / ("image" + IMAGE_EXTENSIONS[receipt["mimeType"]]), image)
         private_metadata = dict(metadata)
+        if reference_snapshot:
+            private_metadata["visualReferenceSnapshot"] = reference_snapshot
         if continuity:
             private_metadata["privateCreativeContinuity"] = continuity
         # Keep the original private lineage beside the already-rendered image

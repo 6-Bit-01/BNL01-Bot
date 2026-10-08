@@ -460,8 +460,9 @@ async def generate(bot, guild_id, channel_id, *, source_basis_out=None):
         # Public identity already applies to the whole expression. Reuse only
         # the art owner's additional guidance here rather than repeating canon.
         prompt += ("\nImage-specific creative guidance: the public world context above also "
-                   "informs your artistic understanding. No visual reference images or established "
-                   "appearances are supplied.\n" + OWN_ART_CREATIVE_GUIDANCE)
+                   "informs your artistic understanding.\n" + OWN_ART_CREATIVE_GUIDANCE
+                   + art.visual_reference_guidance(art.visual_reference_availability(
+                       basis.get("art_context", {}).get("visualReferenceSnapshot"))))
         # The existing development stage receives the full artistic history
         # and continuity after the edition chooses its featured roots. Feeding
         # those narratives into this same text call would undo the compact
