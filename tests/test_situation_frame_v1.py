@@ -15,12 +15,123 @@ from bnl_unified_response_assessment import (
     SITUATION_FRAME_VERSION,
     build_situation_frame_v1,
     build_unified_response_assessment,
+    music_submission_history_query,
+    music_submission_history_requested,
     persist_shadow_run,
     render_situation_frame_receipt,
     revalidate_situation_frame,
     situation_request_clauses,
     situation_task_texts,
 )
+
+
+class PrefacedSituationRequestTests(unittest.TestCase):
+    def test_explicit_instruction_colon_keeps_history_in_its_task(self):
+        clause = "Please check: which of my songs have other people submitted to past shows"
+        text = clause + "? Give me the track and artist credit."
+        self.assertIn(clause, situation_request_clauses(text))
+        self.assertEqual(music_submission_history_query(text), clause)
+        self.assertTrue(music_submission_history_requested(text))
+
+    def test_conversational_prefix_preserves_historical_submission_request(self):
+        question = "which of my songs have other people submitted to past shows"
+        for prefix in (
+            "Archive gremlin, I need a crate inspection:",
+            "Quick archive check:",
+            "One question for the archive:",
+        ):
+            with self.subTest(prefix=prefix):
+                text = (prefix + " " + question + "? Give me the track, artist credit, "
+                        "TikTok submitter profile, and show date.")
+                self.assertIn(question, "\n".join(situation_request_clauses(text)))
+                self.assertIn(question, music_submission_history_query(text))
+                self.assertNotIn("TikTok submitter profile", music_submission_history_query(text))
+                self.assertTrue(music_submission_history_requested(text))
+                frame = build_situation_frame_v1(
+                    route_allowed=True, route_mode="normal_chat",
+                    conversation_surface="public_context", channel_policy="public_context",
+                    current_text=text, current_speaker_user_ids=(101,), response_act="answer",
+                )
+                self.assertEqual(tuple(subject.user_id for subject in frame.subjects), (101,))
+                self.assertTrue(any(task.subject_indexes for task in frame.tasks))
+
+    def test_prefaced_auxiliary_question_keeps_history_scope(self):
+        for question in (
+            "were my songs submitted to past shows",
+            "can you list my tracks that appeared in past shows",
+        ):
+            with self.subTest(question=question):
+                text = "A question for the archive: " + question + "? Give me artist credits."
+                self.assertIn(question, music_submission_history_query(text))
+                self.assertNotIn("Give me artist credits", music_submission_history_query(text))
+
+    def test_prefaced_external_question_remains_an_independent_task(self):
+        text = "A question for the booth: where is Seattle? Then explain how stars form."
+        clauses = situation_request_clauses(text)
+        self.assertEqual(len(clauses), 2)
+        self.assertIn("where is Seattle", clauses[0])
+        self.assertEqual(clauses[1], "explain how stars form")
+
+    def test_title_declaration_does_not_become_a_prefaced_history_request(self):
+        text = (
+            "The album title is Archive: Which Songs Were Submitted to Past Shows. "
+            "Explain checksum detection."
+        )
+        self.assertEqual(situation_request_clauses(text), ("Explain checksum detection",))
+        self.assertEqual(music_submission_history_query(text), "")
+        self.assertFalse(music_submission_history_requested(text))
+
+    def test_incidental_journal_setup_does_not_own_prefaced_weather_question(self):
+        text = (
+            "I read your latest Journal. A quick question: "
+            "what is the weather in Seattle today? Then explain how stars form."
+        )
+        frame = build_situation_frame_v1(
+            route_allowed=True, route_mode="normal_chat",
+            conversation_surface="public_home", channel_policy="public_home",
+            current_text=text, current_speaker_user_ids=(101,), response_act="answer",
+        )
+        self.assertEqual(len(frame.tasks), 2)
+        self.assertEqual(frame.tasks[0].subject_indexes, ())
+        self.assertEqual(frame.tasks[0].authority_scope, "external_current")
+        self.assertEqual(frame.tasks[0].required_response_act, "hold")
+        self.assertEqual(frame.tasks[1].authority_scope, "external_public")
+        self.assertEqual(frame.tasks[1].required_response_act, "answer")
+
+    def test_explicit_show_date_prefix_remains_in_history_scope(self):
+        clause = "For the September 25 show: which of my songs were submitted"
+        for suffix in ("?", "? Give me track names."):
+            with self.subTest(suffix=suffix):
+                text = clause + suffix
+                self.assertEqual(music_submission_history_query(text), clause)
+                self.assertIn(clause, situation_request_clauses(text))
+
+    def test_quoted_and_background_colons_do_not_promote_history_to_current_request(self):
+        for setup in (
+            'The fictional note says "Archive check: which of my songs were submitted?".',
+            "The fictional note says `Archive check: which of my songs were submitted?`.",
+            "Background: Test Artist submitted songs to past shows.",
+            "Background: Will Somebody submitted songs to past shows.",
+        ):
+            with self.subTest(setup=setup):
+                text = setup + " Explain checksum detection."
+                self.assertEqual(situation_request_clauses(text), ("Explain checksum detection",))
+                self.assertFalse(music_submission_history_requested(text))
+
+    def test_url_time_and_title_colons_do_not_create_additional_requests(self):
+        for text, clause in (
+            ("Please inspect https://example.invalid/archive:which.",
+             "Please inspect https://example.invalid/archive:which"),
+            ("Please explain the 12:30 show timestamp.",
+             "Please explain the 12:30 show timestamp"),
+            ('Tell me about "Test Album: What We Remember" as a title.',
+             'Tell me about "Test Album: What We Remember" as a title'),
+            ("Tell me about Test Album: What We Remember as a title.",
+             "Tell me about Test Album: What We Remember as a title"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(situation_request_clauses(text), (clause,))
+                self.assertFalse(music_submission_history_requested(text))
 
 
 def addressing(**overrides):
