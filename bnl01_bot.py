@@ -33232,7 +33232,7 @@ def _generation_config_for_model(
     if route == "conversation_followup_addressing":
         config_kwargs["response_mime_type"] = "application/json"
         config_kwargs["http_options"] = genai.types.HttpOptions(
-            timeout=8000, retry_options=genai.types.HttpRetryOptions(attempts=1),
+            timeout=10000, retry_options=genai.types.HttpRetryOptions(attempts=1),
         )
     if route in {'moment_meaning_background', 'relationship_meaning_background'}:
         config_kwargs['response_mime_type'] = 'application/json'

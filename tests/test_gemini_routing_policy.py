@@ -92,11 +92,11 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
         }, clear=True):
             policy = routing.policy_for_route("conversation_followup_addressing")
         self.assertEqual(policy.lane, "conversation")
-        self.assertEqual(policy.max_output_tokens, 64)
+        self.assertEqual(policy.max_output_tokens, 1024)
         self.assertEqual(policy.legacy_thinking_budget, 0)
         self.assertEqual(policy.provider_retries, 0)
         self.assertFalse(policy.allow_fallback)
-        self.assertEqual(routing.estimated_generation_reservation("abc", policy), 65)
+        self.assertEqual(routing.estimated_generation_reservation("abc", policy), 1025)
 
     def test_followup_addressing_keeps_existing_reserves_and_other_chat_policy(self):
         with mock.patch.dict("os.environ", {}, clear=True):

@@ -515,6 +515,13 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CompletedFollowupClassifierTests(unittest.IsolatedAsyncioTestCase):
+    def test_request_timeout_meets_provider_minimum_without_sdk_retries(self):
+        config = bot._generation_config_for_model("gemini-3.6-flash", "conversation_followup_addressing")
+        self.assertEqual(config.http_options.timeout, 10000)
+        self.assertEqual(config.http_options.retry_options.attempts, 1)
+        self.assertEqual(config.max_output_tokens, 1024)
+        self.assertEqual(config.response_mime_type, "application/json")
+
     async def test_classifier_accepts_only_the_exact_true_boolean_contract(self):
         exchange = {"previous_user": FIRST, "bnl_reply": "The earlier recordings are listed."}
         for text, expected in (

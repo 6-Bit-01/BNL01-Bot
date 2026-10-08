@@ -202,7 +202,7 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
     )
     if normalized_route == "conversation_followup_addressing":
         return GeminiRoutePolicy(
-            lane="conversation", max_output_tokens=64, legacy_thinking_budget=0,
+            lane="conversation", max_output_tokens=1024, legacy_thinking_budget=0,
             provider_retries=0, allow_fallback=False,
         )
     if normalized_route in {OWN_ART_CONCEPT_ROUTE, OWN_ART_IMAGE_ROUTE}:
