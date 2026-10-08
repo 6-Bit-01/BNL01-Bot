@@ -35326,6 +35326,9 @@ async def revalidate_ambient_sources(guild_id: int, basis: dict, *, stage: str) 
             valid = not changed and bool(refreshed.publications)
         if valid and basis.get('art_context'):
             valid = await asyncio.to_thread(ambient_art.art_context_current, sys.modules[__name__], guild_id, basis['art_context'])
+        if valid and basis.get('art_visual_references'):
+            valid = await asyncio.to_thread(ambient_art.visual_reference_snapshot_current,
+                                            DB_FILE, guild_id, basis['art_visual_references'])
     except Exception as exc:
         logging.warning('ambient_source_check_unavailable error_type=%s', type(exc).__name__)
         valid = False
@@ -35411,7 +35414,8 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int,
             "imagePrompt (4000 max), inspirationRefs (array from the supplied source references, empty for imagination). "
             "The text must stand on its own if image generation fails.\n"
             f"Allowed original source references: {json.dumps(references)}\n"
-            + ambient_art.build_own_art_creative_context()
+            + ambient_art.build_own_art_creative_context(reference_subjects=
+                ambient_art.visual_reference_availability((art_context or {}).get('visualReferenceSnapshot')))
         )
         if art_context:
             prompt += ambient_art.render_art_sources(art_context['sources'],

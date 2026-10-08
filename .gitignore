@@ -11,3 +11,6 @@ __pycache__/
 
 # Local VPS recovery backups
 backups/
+
+# Private, owner-approved appearance pixels; canon retains their authority.
+/reference_assets/

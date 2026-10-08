@@ -21,16 +21,20 @@ import urllib.error
 import urllib.request
 
 from bnl_gemini_routing import (OWN_ART_CONCEPT_ROUTE, OWN_ART_IMAGE_MODEL, OWN_ART_IMAGE_ROUTE,
+                                GeminiImagePart, GeminiImageRequest,
                                 policy_for_route, provider_server_diagnostics)
 from bnl_journal import (build_source_packet, build_source_packet_between, _eligible_reflection_basis,
                          journal_shared_source_provenance_is_current,
                          revalidate_published_journal_entry_on_connection)
 from bnl_canon_source_contract import render_prompt_canon_block, render_ecosystem_lore_block
+from bnl_visual_references import (read_visual_reference_snapshot, visual_reference_availability,
+                                   load_visual_reference_inputs, visual_reference_snapshot_current)
 
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 12 * 1024 * 1024
 MAX_ERROR_BYTES = 8192
+MAX_IMAGE_REQUEST_BYTES = 20_000_000
 IMAGE_ENDPOINT = "https://generativelanguage.googleapis.com/v1/interactions"
 IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg"}
 ART_CONTEXT_HOURS = 7 * 24  # Include a weekly Radio cycle; the source owner still bounds selection.
@@ -65,8 +69,8 @@ OWN_ART_CREATIVE_GUIDANCE = (
     "Preserve source privacy and distinguish a speaker from a person merely mentioned. You may "
     "invent the scene and visual treatment; you may not invent the community evidence.\n"
     "Describe the complete picture in imagePrompt: what is happening, the visual hook, expressive "
-    "details, composition, materials, lighting and chosen medium. The renderer sees only that prompt, "
-    "not your context or meaning. Carry essential BARCODE and community details into it. Choose "
+    "details, composition, materials, lighting and chosen medium. The renderer sees that prompt and "
+    "any selected appearance references, not your context or meaning. Carry essential BARCODE and community details into it. Choose "
     "something that works visually before someone reads the caption. In meaning, briefly explain "
     "the actual inspiration and your interpretation, without private deliberation or a transcript.\n"
     "Previous artwork is optional creative history and helps you avoid repetition. Each new image "
@@ -78,14 +82,28 @@ OWN_ART_CREATIVE_GUIDANCE = (
 )
 
 
-def build_own_art_creative_context() -> str:
+def visual_reference_guidance(reference_subjects=()) -> str:
+    subjects = [{"subjectId": item["subjectId"], "label": item["label"]}
+                for item in reference_subjects]
+    return (
+        "Appearance references are optional identity evidence, not a reason to include anyone. "
+        "Choose your scene and cast independently. In depictedSubjects, list the supplied subjectId "
+        "only when that person actually appears in the image; use [] for an unrelated image. "
+        "Do not select a person merely mentioned in source context, a credit, or a style description. "
+        "Selected references guide likeness only, not pose, background, composition or medium. "
+        "The renderer receives the selected photos; do not claim you saw pixels in this text context. "
+        "Available approved appearance references: " + json.dumps(subjects, ensure_ascii=False) + "\n"
+    )
+
+
+def build_own_art_creative_context(*, reference_subjects=()) -> str:
     """Reuse the existing canon owner; no separate art lore or visual templates."""
     return (
         "BARCODE world context for artistic understanding, from the existing canon owner. "
         "Let its musical roots, personalities, contradictions, and continuity inform your own "
         "interpretation. These are not assigned subjects, a required cast, or instructions to "
         "make portraits. Canon describes established identity, not evidence of a new event. "
-        "No visual reference images or established appearances are supplied.\n"
+        + visual_reference_guidance(reference_subjects)
         + render_prompt_canon_block() + "\n" + render_ecosystem_lore_block() + "\n"
         + OWN_ART_CREATIVE_GUIDANCE
     )
@@ -138,7 +156,8 @@ def render_art_sources(sources: list[dict], continuity=()) -> str:
     )
 
 
-def build_own_art_brief(packet: dict, *, continuity=(), source_records=None) -> tuple[str, set[str]]:
+def build_own_art_brief(packet: dict, *, continuity=(), source_records=None,
+                       reference_subjects=()) -> tuple[str, set[str]]:
     """Only the existing public projection is creative input; no raw archive."""
     sources = art_source_records(packet) if source_records is None else source_records
     prompt = (
@@ -155,7 +174,7 @@ def build_own_art_brief(packet: dict, *, continuity=(), source_records=None) -> 
         "To create: action=create, title (1-120 characters), meaning (1-1000 characters), "
         "imagePrompt (1-4000 characters), inspirationRefs (an array of supplied ref values; "
         "empty is valid for your own imagination). Describe one complete original image.\n"
-        + build_own_art_creative_context()
+        + build_own_art_creative_context(reference_subjects=reference_subjects)
         + render_art_sources(sources, continuity)
     )
     return prompt, {item["ref"] for item in [*sources, *continuity]}
@@ -200,6 +219,10 @@ def art_sources_current(bot, guild_id: int, bases: list[dict]) -> bool:
         return False
     try:
         for basis in bases:
+            if "visualReferences" in basis:
+                if not visual_reference_snapshot_current(bot.DB_FILE, guild_id, basis["visualReferences"]):
+                    return False
+                continue
             if "journalEntries" in basis:
                 snapshot, _ = bot._journal_publication_control_snapshot_sync()
                 if journal_art_basis(bot, guild_id, basis["journalEntries"], snapshot) != basis:
@@ -319,7 +342,22 @@ def build_art_context(bot, guild_id: int, *, packet=None, journal=None, journal_
             journal.journal_control_snapshot))
     history = public_creative_history(bot, guild_id)
     return {"packet": packet, "sources": sources, "basis": basis, "sourceBases": roots,
-            "continuity": history, "journal": journal}
+            "continuity": history, "journal": journal,
+            "visualReferenceSnapshot": read_visual_reference_snapshot(bot.DB_FILE, guild_id)}
+
+
+def bind_art_visual_references(bot, guild_id: int, concept: dict, context: dict):
+    """A selected appearance joins the existing art lineage, never the cast policy."""
+    selected = concept.get("depictedSubjects", [])
+    if not selected:
+        return (), None
+    snapshot, inputs = load_visual_reference_inputs(bot.DB_FILE, guild_id, selected,
+        snapshot=context.get("visualReferenceSnapshot"))
+    if snapshot:
+        root = {"visualReferences": snapshot}
+        if root not in context.setdefault("sourceBases", []):
+            context["sourceBases"].append(root)
+    return inputs, snapshot
 
 
 def art_context_current(bot, guild_id: int, context: dict) -> bool:
@@ -385,7 +423,8 @@ def develop_art_concept(bot, guild_id: int, proposal: dict, context: dict, *, at
     context["sourceBases"] = list({_source_digest(root): root for root in context["sourceBases"]}.values())
     if not art_context_current(bot, guild_id, context):
         raise ValueError("art_sources_changed")
-    prompt = (bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + build_own_art_creative_context()
+    prompt = (bot.BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + build_own_art_creative_context(
+              reference_subjects=visual_reference_availability(context.get("visualReferenceSnapshot")))
               + "Develop your provisional image idea using the broader BARCODE world, community context "
               "and any recovered surrounding exchanges below. The proposal is your earlier interpretation, "
               "not evidence. Correct misread references, then choose the connections that make the most "
@@ -455,21 +494,47 @@ def parse_own_art_concept(raw: str, allowed_refs: set[str]) -> dict:
     if not isinstance(refs, list) or len(refs) > 16 or any(not isinstance(ref, str) or ref not in allowed_refs for ref in refs):
         raise ValueError("art_concept_source_refs_invalid")
     result["inspirationRefs"] = list(dict.fromkeys(refs))
+    subjects = value.get("depictedSubjects", [])
+    if (not isinstance(subjects, list) or len(subjects) > 4
+            or any(not isinstance(subject, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_]{0,63}", subject)
+                   for subject in subjects)):
+        raise ValueError("art_concept_depicted_subjects_invalid")
+    if subjects:
+        result["depictedSubjects"] = list(dict.fromkeys(subjects))
     return result
 
 
-def own_art_image_request(prompt: str) -> dict:
+def own_art_image_request(prompt: str, *, reference_inputs=()) -> dict:
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 4000:
         raise ValueError("art_image_prompt_invalid")
-    return {
+    if not isinstance(reference_inputs, (tuple, list)) or len(reference_inputs) > 4:
+        raise ValueError("art_reference_inputs_invalid")
+    image_parts = []
+    total = 0
+    for item in reference_inputs:
+        if (not isinstance(item, dict) or item.get("mimeType") != "image/png"
+                or not isinstance(item.get("data"), bytes)
+                or not 32 <= len(item["data"]) <= MAX_IMAGE_BYTES):
+            raise ValueError("art_reference_input_invalid")
+        if image_info(item["data"])["mimeType"] != "image/png":
+            raise ValueError("art_reference_input_invalid")
+        total += len(item["data"])
+        if total > 16 * 1024 * 1024:
+            raise ValueError("art_reference_inputs_too_large")
+        image_parts.append({"type": "image", "mime_type": "image/png",
+                            "data": base64.b64encode(item["data"]).decode("ascii")})
+    body = {
         "model": OWN_ART_IMAGE_MODEL,
-        "input": prompt,
+        "input": ([{"type": "text", "text": prompt}, *image_parts] if image_parts else prompt),
         "store": False,
         "generation_config": {"max_output_tokens": policy_for_route(OWN_ART_IMAGE_ROUTE).max_output_tokens},
         # Gemini returns image data inline by default. Explicit delivery modes
         # are rejected by the live API even though its schema lists them.
         "response_format": {"type": "image", "aspect_ratio": "1:1", "image_size": "1K"},
     }
+    if len(json.dumps(body).encode("utf-8")) > MAX_IMAGE_REQUEST_BYTES:
+        raise ValueError("art_image_request_too_large")
+    return body
 
 
 def image_usage_response(payload: dict):
@@ -557,7 +622,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _image_provider_error(exc: Exception, *, secrets: tuple[str, ...]) -> RuntimeError:
+def _image_provider_error(exc: Exception, *, secrets: tuple[str, ...],
+                          omit_provider_text: bool = False) -> RuntimeError:
     """Keep bounded, redacted Google error fields, never raw bodies or URLs."""
     error = RuntimeError("art_image_provider_request_failed")
     error.status_code = int(exc.code) if isinstance(exc, urllib.error.HTTPError) else 0
@@ -577,16 +643,42 @@ def _image_provider_error(exc: Exception, *, secrets: tuple[str, ...]) -> Runtim
         "invalid_request": "INVALID_ARGUMENT", "unauthenticated": "UNAUTHENTICATED",
         "permission_denied": "PERMISSION_DENIED", "not_found": "NOT_FOUND",
     }.get(fields.get("code") if isinstance(fields.get("code"), str) else "")
-    carrier = SimpleNamespace(message=fields.get("message"),
-                              status=fields.get("status") or interaction_status, details=fields)
+    # Reference-call errors may echo image bytes in prose or auxiliary details.
+    # Keep only the structured status needed to classify a definite rejection.
+    carrier = SimpleNamespace(message=None if omit_provider_text else fields.get("message"),
+                              status=fields.get("status") or interaction_status,
+                              details=None if omit_provider_text else fields)
     error.provider_diagnostics = provider_server_diagnostics(carrier, secrets=secrets)
+    if omit_provider_text:
+        error.provider_diagnostics["message_omitted"] = "reference_image_request"
     return error
 
 
-def generate_private_image(bot, prompt: str, *, attempt_counter=None) -> tuple[bytes, dict]:
+def generate_private_image(bot, prompt: str, *, attempt_counter=None,
+                           reference_inputs=(), reference_snapshot=None) -> tuple[bytes, dict]:
     """One physical call, same token/dollar guards; no retries or fallback."""
-    body = own_art_image_request(prompt)
-    reservation = bot.reserve_local_model_budget(prompt, OWN_ART_IMAGE_ROUTE)
+    body = own_art_image_request(prompt, reference_inputs=reference_inputs)
+    if bool(reference_inputs) != bool(reference_snapshot):
+        raise ValueError("art_reference_binding_required")
+    if reference_snapshot:
+        actual = [{"sha256": hashlib.sha256(item["data"]).hexdigest(),
+                   "bytes": len(item["data"]), "mimeType": item["mimeType"]}
+                  for item in reference_inputs]
+        if not isinstance(reference_snapshot, dict) or actual != reference_snapshot.get("assets"):
+            raise ValueError("art_reference_pixels_unbound")
+    if reference_snapshot and not visual_reference_snapshot_current(
+            bot.DB_FILE, reference_snapshot["guildId"], reference_snapshot):
+        raise ValueError("art_visual_references_changed")
+    accounting_input = prompt
+    if reference_inputs:
+        parts = []
+        for item in reference_inputs:
+            info = image_info(item["data"])
+            tiles = ((info["width"] + 767) // 768) * ((info["height"] + 767) // 768)
+            parts.append(GeminiImagePart(data=item["data"], mime_type=item["mimeType"],
+                source_label="Approved appearance reference", estimated_tokens=max(4096, tiles * 258)))
+        accounting_input = GeminiImageRequest(text=prompt, images=tuple(parts))
+    reservation = bot.reserve_local_model_budget(accounting_input, OWN_ART_IMAGE_ROUTE)
     reservation_id = getattr(reservation, "cost_reservation_id", "")
     retain = True  # Unknown transport/accounting outcome must keep its reserve.
     request = urllib.request.Request(IMAGE_ENDPOINT, data=json.dumps(body).encode("utf-8"),
@@ -603,7 +695,8 @@ def generate_private_image(bot, prompt: str, *, attempt_counter=None) -> tuple[b
             if not isinstance(payload, dict):
                 raise ValueError("art_image_response_invalid")
         except Exception as exc:
-            safe_error = _image_provider_error(exc, secrets=(bot.GEMINI_API_KEY, prompt))
+            safe_error = _image_provider_error(exc, secrets=(bot.GEMINI_API_KEY, prompt),
+                                               omit_provider_text=bool(reference_inputs))
             bot.record_failed_generation_attempt(safe_error, route=OWN_ART_IMAGE_ROUTE, model=OWN_ART_IMAGE_MODEL,
                                                  reservation_id=reservation_id)
             # Only an explicit pre-generation rejection releases the estimate.
@@ -622,8 +715,12 @@ def generate_private_image(bot, prompt: str, *, attempt_counter=None) -> tuple[b
                                           reservation_id=reservation_id)
         retain = False
         image, info = extract_generated_image(payload)
+        if reference_snapshot and not visual_reference_snapshot_current(
+                bot.DB_FILE, reference_snapshot["guildId"], reference_snapshot):
+            raise ValueError("art_visual_references_changed")
         return image, {"model": OWN_ART_IMAGE_MODEL, "providerCalls": 1,
                        **info,
+                       **({"visualReferenceSnapshot": reference_snapshot} if reference_snapshot else {}),
                        "usage": vars(usage.usage_metadata), "costBasis": "image_output_upper_bound_2026-09-25",
                        "sha256": hashlib.sha256(image).hexdigest(), "bytes": len(image)}
     finally:
@@ -651,7 +748,8 @@ def prepare_private_preview(bot, output_dir: str, *, generate: bool = False) -> 
         packet = build_source_packet(bot.DB_FILE, bot.BNL_PRIMARY_GUILD_ID, hours=ART_CONTEXT_HOURS, entry_kind="manual", prepare_schema=False)
         context = build_art_context(bot, bot.BNL_PRIMARY_GUILD_ID, packet=packet)
         prompt, refs = build_own_art_brief(packet, continuity=continuity_for_prompt(context["continuity"]),
-                                         source_records=context["sources"])
+                                         source_records=context["sources"],
+                                         reference_subjects=visual_reference_availability(context.get("visualReferenceSnapshot")))
         moment_sources = _preview_moment_sources(packet, refs)
         receipt["momentSourceVersions"] = {s["sourceId"]: s["sourceVersion"] for s in moment_sources}
         receipt["sourcePacketHash"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -680,9 +778,14 @@ def prepare_private_preview(bot, output_dir: str, *, generate: bool = False) -> 
         _revalidate_preview_moments(bot, moment_sources)
         if not art_context_current(bot, bot.BNL_PRIMARY_GUILD_ID, context):
             raise ValueError("art_sources_changed")
+        reference_inputs, reference_snapshot = bind_art_visual_references(bot, bot.BNL_PRIMARY_GUILD_ID,
+                                                                          concept, context)
         continuity = saved_creative_continuity(bot.BNL_PRIMARY_GUILD_ID, concept, context)
         receipt["status"] = "image_generation_started"
-        image, image_receipt = generate_private_image(bot, concept["imagePrompt"], attempt_counter=image_counter)
+        reference_kwargs = ({"reference_inputs": reference_inputs, "reference_snapshot": reference_snapshot}
+                            if reference_snapshot else {})
+        image, image_receipt = generate_private_image(bot, concept["imagePrompt"], attempt_counter=image_counter,
+                                                      **reference_kwargs)
         _revalidate_preview_moments(bot, moment_sources)
         if not art_context_current(bot, bot.BNL_PRIMARY_GUILD_ID, context):
             raise ValueError("art_sources_changed")
