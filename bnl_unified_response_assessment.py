@@ -924,6 +924,7 @@ def _situation_task_parts(
         if (
             setup
             and _TASK_SCOPE_PREFIX_RE.match(setup)
+            and "," not in setup
             and not re.search(r"[.!?;\n]", value[start:task_start])
         ):
             # Keep a locally attached qualifier for the task's authority.

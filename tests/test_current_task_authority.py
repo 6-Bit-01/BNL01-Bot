@@ -121,10 +121,15 @@ class SourceDependentTaskBindingTests(unittest.TestCase):
                 self.assertEqual(len(frame.tasks), 1)
                 self.assertEqual(frame.tasks[0].authority_scope, "packet")
                 self.assertTrue(source_dependent_task_texts(frame, current_text=text))
-        independent = "That same track was interesting. Where is Seattle?"
-        _context, frame = self.context_and_frame(independent)
-        self.assertEqual(frame.tasks[0].authority_scope, "external_public")
-        self.assertEqual(source_dependent_task_texts(frame, current_text=independent), ())
+        for independent in (
+            "That same track was interesting. Where is Seattle?",
+            "For context, I read your latest Journal, where is Seattle?",
+            "For context, that same track was interesting, where is Seattle?",
+        ):
+            with self.subTest(independent=independent):
+                _context, frame = self.context_and_frame(independent)
+                self.assertEqual(frame.tasks[0].authority_scope, "external_public")
+                self.assertEqual(source_dependent_task_texts(frame, current_text=independent), ())
 
     def test_coordinated_show_date_field_does_not_create_a_new_imperative(self):
         for text in (
