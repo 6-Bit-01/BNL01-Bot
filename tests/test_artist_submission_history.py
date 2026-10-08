@@ -529,6 +529,7 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             rows.extend(((406, "user", "Which lamps fit a desk?", 50),
                          (407, "model", "A shaded desk lamp fits.", 48)))
             current_row_id += 2
+        current = getattr(self, "_current_chain_question", current)
         rows.append((current_row_id, "user", current, 0))
         with closing(sqlite3.connect(self.db_file)) as conn:
             conn.execute("DELETE FROM conversations")
@@ -553,14 +554,23 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
                 basis = bot.build_conversation_prompt_source_basis(rendered, guild_id=77, current_user_id=42,
                     channel_id=9001, channel_name=channel_name, channel_policy=policy, context_result=result)
                 selection = {}
+                frame = self.frame(current, policy=policy)
+                external_subject = getattr(self, "_current_external_subject", None)
+                if external_subject is not None:
+                    frame = replace(frame, subjects=(external_subject,))
                 context = bot.build_tiktok_show_evidence_context_for_turn(
-                    guild_id=77, subject_user_id=42, user_text=current, situation_frame=self.frame(current, policy=policy),
+                    guild_id=77, subject_user_id=42, user_text=current, situation_frame=frame,
                     conversation_basis=basis, conversation_context_result=result, selection_out=selection)
                 return result, basis, selection, context
 
             result, basis, selection, context = read_turn()
             diagnostic = (result.referent_status, result.referent_reason,
                           result.referent_selected_row_ids, selection.get("selection_user_text", ""))
+            if getattr(self, "_unresolved_typed_submitter", False):
+                self.assertEqual(result.referent_reason, "human_request_subset_chain", diagnostic)
+                self.assertIsNone(selection.get("artist_identity_request"), diagnostic)
+                self.assertNotIn("Neutral Signal", context)
+                return
             if independent_topic:
                 self.assertIsNone(selection.get("artist_identity_request"), diagnostic)
                 self.assertNotIn("Neutral Signal", context)
@@ -571,6 +581,10 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             self.assertIn("2026-09-11", context)
             self.assertNotIn("2026-10-02", context)
             self.assertNotIn("Neutral Counterfeit", context)
+            if getattr(self, "_current_chain_question", ""):
+                self.assertLess(len(context), 2000)
+                self.assertIn("human request root", basis.rendered_context)
+                self.assertIn("human request constraint", basis.rendered_context)
             self.assertTrue({403, subset_row_id}.issubset(set(result.referent_selected_row_ids)))
             self.assertTrue({403, subset_row_id}.issubset(set(basis.source_row_ids)))
             if saved_subset_answer:
@@ -599,6 +613,27 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             self.assertNotIn("Neutral Counterfeit", packet_text)
             show_basis = bot.build_finalized_show_prompt_source_basis(context, guild_id=77, selection=selection)
             self.assertEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
+
+            if getattr(self, "_current_chain_question", ""):
+                saved_current = current
+                for explicit_current in (
+                    "What songs by Other Artist have been submitted?",
+                    "What about 2026-09-25?", "Is the queue open?", "What about Mac Modem?",
+                    "Which of those tracks by Another Artist was latest?",
+                    "Keep this narrowed to Another Artist's music instead",
+                    "Keep this narrowed to songs by Another Artist submitted in past shows.",
+                    "Keep this narrowed to the latest one by Another Artist that was submitted.",
+                ):
+                    with self.subTest(current_override=explicit_current):
+                        current = explicit_current
+                        self._current_external_subject = assessment.SituationSubjectReference(
+                            entity_ref="another_artist", binding_method="existing_typed_entity")
+                        _result, _basis, override_selection, _context = read_turn()
+                        override_request = override_selection.get("artist_identity_request")
+                        self.assertFalse(override_request is not None and any(
+                            subject.user_id == 42 for subject in override_request.frame_subjects))
+                current = saved_current
+                self._current_external_subject = None
 
             # A newer dependent date replaces the older date for retrieval;
             # both original human turns remain governed context.
@@ -637,7 +672,8 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
                 conn.commit()
             _result, _basis, changed_selection, changed_context = read_turn()
             self.assertIsNone(changed_selection.get("artist_identity_request"))
-            self.assertNotIn("Neutral Signal", changed_context)
+            if not getattr(self, "_current_chain_question", ""):
+                self.assertNotIn("Neutral Signal", changed_context)
             self.assertNotEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
 
             # Correcting or withdrawing the human root invalidates the saved chain.
@@ -648,14 +684,16 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             self.assertNotEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
             _result, _basis, corrected_selection, corrected_context = read_turn()
             self.assertIsNone(corrected_selection.get("artist_identity_request"))
-            self.assertNotIn("Neutral Signal", corrected_context)
+            if not getattr(self, "_current_chain_question", ""):
+                self.assertNotIn("Neutral Signal", corrected_context)
             with closing(sqlite3.connect(self.db_file)) as conn:
                 conn.execute("DELETE FROM conversations WHERE id=403")
                 conn.commit()
             self.assertNotEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
             _result, _basis, withdrawn_selection, withdrawn_context = read_turn()
             self.assertIsNone(withdrawn_selection.get("artist_identity_request"))
-            self.assertNotIn("Neutral Signal", withdrawn_context)
+            if not getattr(self, "_current_chain_question", ""):
+                self.assertNotIn("Neutral Signal", withdrawn_context)
 
     def test_public_context_unstored_answer_chain_preserves_artist_and_submitter_scope(self):
         self._flow_policy = "public_context"
@@ -686,6 +724,22 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
     def test_completed_independent_topic_blocks_old_artist_chain(self):
         self._independent_topic = True
         self.test_multiple_retained_subset_answers_keep_middle_human_constraint()
+
+    def test_scoped_clarification_keeps_original_artist_source_chain(self):
+        self._current_chain_question = (
+            "Yes, keep this narrowed to Test Submitter's submissions. "
+            "What's the artist credit and date for his latest one?")
+        self.test_multiple_retained_subset_answers_keep_middle_human_constraint()
+
+    def test_same_submission_credit_keeps_original_artist_source_chain(self):
+        self._current_chain_question = "What artist credit is attached to that same submission?"
+        self.test_multiple_retained_subset_answers_keep_middle_human_constraint()
+
+    def test_typed_external_subject_still_requires_role_disambiguation(self):
+        self._unresolved_typed_submitter = True
+        self._current_external_subject = assessment.SituationSubjectReference(
+            user_id=99, label_hint="Test Submitter", binding_method="existing_typed_target")
+        self.test_scoped_clarification_keeps_original_artist_source_chain()
 
     def test_raw_subset_context_preserves_ambiguity_and_current_payload(self):
         from tests import test_conversation_context_v2 as fixture

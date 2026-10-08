@@ -4437,12 +4437,13 @@ def build_tiktok_show_evidence_context_for_turn(
                     and situation_frame.current_speaker_user_ids == (int(subject_user_id),)
                     and not (situation_frame.subjects
                              and any(subject.entity_ref or subject.user_id not in (0, int(subject_user_id))
-                                     for subject in situation_frame.subjects)
-                             and not re.search(r"\bsubmit(?:s|ted)?\b", user_text, re.I))
+                                     for subject in situation_frame.subjects))
                 ):
                     # Reuse only the selected human request's subject. The
                     # current question can name a submitter without making
                     # that person the artist; BNL prose supplies neither.
+                    # A concrete current subject still owns its scope: a
+                    # submission verb does not disambiguate that subject's role.
                     artist_continuation_frame = build_situation_frame_v1(
                         route_allowed=situation_frame.route_allowed,
                         route_mode=situation_frame.route_mode,

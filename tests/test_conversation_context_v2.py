@@ -126,6 +126,54 @@ class ConversationContextV2Tests(unittest.TestCase):
                 blocked = assemble_conversation_context_v2(changed, req(current_texts=(current,)))
                 self.assertNotEqual(blocked.referent_reason, "human_request_subset_chain")
 
+    def test_dependent_clarification_preserves_human_scope_over_model_alternative(self):
+        rows = [row(1, "user", "Which of my recordings appeared in past shows?", minutes=4),
+                row(2, "user", "Which of those did Test Submitter send?", minutes=3),
+                row(3, "model", "Test Submitter sent Quiet Signal. Another person sent Later Signal.", minutes=2),
+                row(4, "user", "Which of those was latest from that same person?", minutes=1)]
+        for current in (
+            "Yes, keep this narrowed to Test Submitter's submissions. What's the artist credit and date for his latest one?",
+            "For that same submission, what was the artist credit and date?",
+            "Still just that person's entries. Which was latest?",
+            "What's the artist credit and date for his latest one?",
+            "When was the latest one?",
+            "Keep this narrowed to Another Submitter's entries instead.",
+        ):
+            with self.subTest(current=current):
+                result = assemble_conversation_context_v2(rows, req(current_texts=(current,)))
+                self.assertEqual(result.referent_reason, "human_request_subset_chain")
+                self.assertEqual(result.referent_selected_row_ids, (1, 2, 3, 4))
+                self.assertIn("human request root", result.rendered_context)
+                self.assertIn("human request constraint", result.rendered_context)
+                self.assertIn("prior answer within request chain", result.rendered_context)
+                self.assertIn("Earlier human limits remain in force", result.rendered_context)
+                self.assertIn("BNL-added alternatives do not change", result.rendered_context)
+        clarified = [*rows, row(5, "user", "Keep this narrowed to that person's entries.", minutes=.5)]
+        result = assemble_conversation_context_v2(clarified,
+            req(current_texts=("What is the date for that same entry?",)))
+        self.assertEqual(result.referent_selected_row_ids, (1, 2, 3, 4, 5))
+
+    def test_dependent_clarification_respects_scope_and_source_boundaries(self):
+        rows = [row(1, "user", "Which of my recordings appeared in past shows?", minutes=4),
+                row(2, "user", "Which of those did Test Submitter send?", minutes=3),
+                row(3, "model", "Quiet Signal was one; another person sent Later Signal.", minutes=2)]
+        for current in ("New topic: which lamps fit a desk?",
+                        "What has Test Submitter submitted overall, including other artists?",
+                        "What songs by Another Artist appeared in past shows?",
+                        "Keep this in mind. What is the current queue?",
+                        "Set that aside. Which recordings did Another Artist release?"):
+            with self.subTest(current=current):
+                result = assemble_conversation_context_v2(rows, req(current_texts=(current,)))
+                self.assertNotEqual(result.referent_reason, "human_request_subset_chain")
+        for changed in (rows[1:], [rows[0], dict(rows[1], user_id=2), rows[2]],
+                        [dict(rows[0], channel_policy="sealed_test"), *rows[1:]],
+                        [*rows, row(4, "model", "An orphan answer.", user=2)],
+                        [*rows, row(4, "user", "Which lamps fit a desk?")]):
+            with self.subTest(rows=changed):
+                result = assemble_conversation_context_v2(changed,
+                    req(current_texts=("Keep this narrowed to that person's entries.",)))
+                self.assertNotEqual(result.referent_reason, "human_request_subset_chain")
+
     def test_explicit_publication_sources_do_not_request_a_nearby_room_contribution(self):
         history = [
             row(1, "user", "Recall the correction about the missing shoes.", minutes=4),
