@@ -198,6 +198,29 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await bot.generate_dynamic_ambient(43, 100), LEGACY_TEXT)
         generate.assert_not_awaited()
 
+    async def test_preparation_freezes_source_window_before_thread_and_art_expansion(self):
+        self.fixture.now = self.fixture.now.replace(hour=19, minute=29)
+        cutoff = self.fixture.now
+        actual_to_thread = asyncio.to_thread
+        async def delayed_read(function, *args, **kwargs):
+            if function.__name__ == "read":
+                self.fixture.now = self.fixture.now.replace(hour=19, minute=45)
+            return await actual_to_thread(function, *args, **kwargs)
+        art_context = {"sources": [], "sourceBases": [], "continuity": []}
+        self.provider.side_effect = None
+        self.provider.return_value = '{"action":"skip"}'
+        with mock.patch.object(bot, "ambient_source_window_end", side_effect=lambda: self.fixture.now, create=True) as end, \
+                mock.patch.object(edition.asyncio, "to_thread", side_effect=delayed_read), \
+                mock.patch.object(sources, "build_context", wraps=sources.build_context) as reader, \
+                mock.patch.object(art, "available", return_value=True), \
+                mock.patch.object(art, "journal_context", return_value=None), \
+                mock.patch.object(art, "build_art_context", return_value=art_context), \
+                mock.patch.object(bot, "revalidate_ambient_sources", new=mock.AsyncMock(return_value=True)):
+            await bot.generate_dynamic_ambient(42, 100)
+        end.assert_called_once()
+        self.assertEqual(reader.call_args.kwargs["now"], cutoff)
+        self.assertEqual(datetime.fromisoformat(art_context["ambient_source_window_end"].replace("Z", "+00:00")), cutoff)
+
     async def test_real_provider_wrapper_preserves_rich_envelope_without_voice_rewrite(self):
         self.add_message("WITHHELD_EDITION_MARKER", self.stamp(minutes=4), policy="sealed_test")
         publication = self.add_publication(body="UNSUPPORTED_JOURNAL_NARRATIVE: Everyone heard an imaginary instrument.")
@@ -853,12 +876,12 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("file", channel.send.call_args.kwargs)
         self.assertIsNone(channel.send.call_args.kwargs["embed"].image.url)
 
-    async def test_midnight_during_member_confirmation_drops_the_previous_day_image(self):
+    async def test_midnight_candidate_is_withheld_before_generation_or_member_confirmation(self):
         self.fixture.now = self.fixture.now.replace(hour=23, minute=59, second=58)
         def after_midnight(_user_id):
             self.fixture.now += timedelta(seconds=5)
             return SimpleNamespace(id=7, bot=False, guild=SimpleNamespace(id=42))
-        channel, _guild, _ = self.scheduler(fetch_effect=after_midnight)
+        channel, guild, _ = self.scheduler(fetch_effect=after_midnight)
         image = {"metadata": {"artId": "bnl-art-2026-09-11"}}
         attachment = SimpleNamespace(filename="fixture.png", close=mock.Mock())
         with mock.patch.object(art, "prepare", new=mock.AsyncMock(return_value=image)), \
@@ -866,10 +889,10 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(art, "discord_file", return_value=attachment), \
                 mock.patch.object(art, "publish_website") as website:
             await bot.ambient_message_task.coro()
-        channel.send.assert_awaited_once()
-        self.assertNotIn("file", channel.send.call_args.kwargs)
-        self.assertIsNone(channel.send.call_args.kwargs["embed"].image.url)
-        attachment.close.assert_called_once()
+        self.provider.assert_not_awaited()
+        guild.fetch_member.assert_not_awaited()
+        channel.send.assert_not_awaited()
+        self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 0)
         website.assert_not_called()
 
 

@@ -57,10 +57,15 @@ class DormantSignalEchoTests(unittest.IsolatedAsyncioTestCase):
         bnl01_bot.init_db()
         bnl01_bot._ambient_runtime_state.clear()
         self.now = PACIFIC.localize(datetime(2026, 7, 23, 14, 0, 0))
+        clock = mock.Mock(wraps=datetime)
+        clock.now.side_effect = lambda _tz=None: self.now
+        self.clock_patch = mock.patch.object(bnl01_bot, "datetime", clock)
+        self.clock_patch.start()
         self.guild = FakeGuild(77, [FakeMember(42, "Emerald")])
         self.channel = FakeChannel(222, self.guild)
 
     def tearDown(self):
+        self.clock_patch.stop()
         self.db_patch.stop()
         bnl01_bot._ambient_runtime_state.clear()
         try:

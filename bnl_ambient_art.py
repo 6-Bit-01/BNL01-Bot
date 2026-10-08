@@ -246,7 +246,11 @@ def publish_website(bot, art):
                    "imageBase64": base64.b64encode(art["image"]).decode("ascii")}
         request = urllib.request.Request(base + "/api/bnl/art", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "x-api-key": bot.BNL_API_KEY}, method="POST")
-        with urllib.request.build_opener(_NoRedirect).open(request, timeout=20) as response:
+        opener = urllib.request.build_opener(_NoRedirect)
+        if not bot.ambient_delivery_window_open():
+            status = "outside_posting_window"
+            return
+        with opener.open(request, timeout=20) as response:
             result = json.loads(response.read(8192))
         if result.get("ok") is True and result.get("artId") == art_id and result.get("sha256") == hashlib.sha256(art["image"]).hexdigest():
             status = "confirmed"

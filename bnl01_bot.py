@@ -23890,7 +23890,7 @@ _AMBIENT_SOURCE_FIELDS = {
 }
 
 
-def _ambient_source_rows(conn, table, guild_id, *, row_ids=None, limit=100):
+def _ambient_source_rows(conn, table, guild_id, *, row_ids=None, limit=100, window_end=None):
     """Bounded reads of existing owners; never include raw operator notes."""
     fields = _AMBIENT_SOURCE_FIELDS[table]
     if table == "conversations":
@@ -23903,7 +23903,7 @@ def _ambient_source_rows(conn, table, guild_id, *, row_ids=None, limit=100):
     if row_ids is None:
         extra, params = '', [guild_id]
         if table == 'conversations':
-            now = _pacific_now().astimezone(timezone.utc)
+            now = (window_end or _pacific_now()).astimezone(timezone.utc)
             extra = (" AND role='user' AND channel_policy IN ('public_home','public_context','public_selective')"
                      " AND datetime(timestamp)>=datetime(?) AND datetime(timestamp)<=datetime(?)")
             params.extend([(now - timedelta(hours=24)).isoformat(), now.isoformat()])
@@ -23971,7 +23971,8 @@ def revalidate_ambient_local_sources(guild_id: int, basis: dict) -> bool:
                     return False
             recent_ids = tuple(basis.get('recent_conversation_ids', ()))
             if recent_ids:
-                now = _pacific_now().astimezone(timezone.utc)
+                frozen_end = basis.get('ambient_source_window_end')
+                now = (datetime.fromisoformat(frozen_end) if frozen_end else _pacific_now()).astimezone(timezone.utc)
                 current_ids = {row[0] for row in conn.execute(
                     "SELECT id FROM conversations WHERE guild_id=? AND id IN (" + ','.join('?' for _ in recent_ids) + ") "
                     "AND datetime(timestamp)>=datetime(?) AND datetime(timestamp)<=datetime(?)",
@@ -23994,7 +23995,9 @@ def revalidate_ambient_local_sources(guild_id: int, basis: dict) -> bool:
 def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_MESSAGES,
                                    *, source_basis: dict | None = None, dated: bool = False):
     with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
-        rows = _ambient_source_rows(conn, 'conversations', guild_id, limit=limit)
+        frozen_end = (source_basis or {}).get('ambient_source_window_end')
+        rows = _ambient_source_rows(conn, 'conversations', guild_id, limit=limit,
+                                    window_end=datetime.fromisoformat(frozen_end) if frozen_end else None)
     _remember_ambient_sources(source_basis, 'conversations', rows)
     if source_basis is not None:
         source_basis['recent_conversation_ids'] = tuple(row['id'] for row in rows)
@@ -25810,10 +25813,60 @@ def get_usage_breakdown() -> dict:
 
 # ==================== AMBIENT SCHEDULING ====================
 
+AMBIENT_WINDOW_START_HOUR = 8
+AMBIENT_WINDOW_END_HOUR = 20
+AMBIENT_PREPARATION_END_HOUR = 19
+AMBIENT_PREPARATION_END_MINUTE = 30
+AMBIENT_DELIVERY_BUFFER_SECONDS = 60
+AMBIENT_DELIVERY_TIMEOUT_SECONDS = 30
+
+
+def ambient_posting_window_open(now_pacific: datetime | None = None) -> bool:
+    """Automatic Ambient delivery may start only between 08:00 and 20:00 Pacific."""
+    now = now_pacific or _pacific_now()
+    now = PACIFIC_TZ.localize(now) if now.tzinfo is None else now.astimezone(PACIFIC_TZ)
+    return AMBIENT_WINDOW_START_HOUR <= now.hour < AMBIENT_WINDOW_END_HOUR
+
+
+def ambient_source_window_end(now_pacific: datetime | None = None) -> datetime:
+    """Freeze the existing 24-hour source window when preparation starts."""
+    now = now_pacific or _pacific_now()
+    now = PACIFIC_TZ.localize(now) if now.tzinfo is None else now.astimezone(PACIFIC_TZ)
+    cutoff = now.replace(hour=AMBIENT_PREPARATION_END_HOUR,
+                         minute=AMBIENT_PREPARATION_END_MINUTE, second=0, microsecond=0)
+    return min(now, cutoff)
+
+
+def ambient_preparation_window_open(now_pacific: datetime | None = None) -> bool:
+    now = now_pacific or _pacific_now()
+    now = PACIFIC_TZ.localize(now) if now.tzinfo is None else now.astimezone(PACIFIC_TZ)
+    return ambient_posting_window_open(now) and (now.hour, now.minute) < (
+        AMBIENT_PREPARATION_END_HOUR, AMBIENT_PREPARATION_END_MINUTE)
+
+
+def ambient_delivery_window_open(now_pacific: datetime | None = None) -> bool:
+    now = now_pacific or _pacific_now()
+    now = PACIFIC_TZ.localize(now) if now.tzinfo is None else now.astimezone(PACIFIC_TZ)
+    closing = now.replace(hour=AMBIENT_WINDOW_END_HOUR, minute=0, second=0, microsecond=0)
+    return ambient_posting_window_open(now) and (closing - now).total_seconds() > AMBIENT_DELIVERY_BUFFER_SECONDS
+
+
+def next_ambient_window_time(now_pacific: datetime | None = None) -> datetime:
+    """Keep an eligible preparation time, otherwise advance to the next opening."""
+    now = now_pacific or _pacific_now()
+    now = PACIFIC_TZ.localize(now) if now.tzinfo is None else now.astimezone(PACIFIC_TZ)
+    if ambient_preparation_window_open(now):
+        return now
+    day = now.date() + timedelta(days=int((now.hour, now.minute) >= (
+        AMBIENT_PREPARATION_END_HOUR, AMBIENT_PREPARATION_END_MINUTE)))
+    # Localize the destination date separately: a DST change may be overnight.
+    return PACIFIC_TZ.localize(datetime(day.year, day.month, day.day, AMBIENT_WINDOW_START_HOUR))
+
+
 def _random_time_today_pacific():
     now = datetime.now(PACIFIC_TZ)
     delay_hours = random.uniform(AMBIENT_RESCHEDULE_MIN_HOURS, AMBIENT_RESCHEDULE_MAX_HOURS)
-    return now + timedelta(hours=delay_hours)
+    return next_ambient_window_time(now + timedelta(hours=delay_hours))
 
 def ensure_next_ambient_scheduled(guild_id: int):
     active_channel_id, last_msg, next_at = get_guild_ambient_state(guild_id)
@@ -25825,16 +25878,17 @@ def ensure_next_ambient_scheduled(guild_id: int):
     update_guild_ambient_times(guild_id, last_msg or "", scheduled)
 
 def _reschedule_ambient_soon(guild_id: int, last_msg: str):
-    next_dt = datetime.now(PACIFIC_TZ) + timedelta(minutes=AMBIENT_FAIL_RESCHEDULE_MINUTES)
+    next_dt = next_ambient_window_time(
+        _pacific_now() + timedelta(minutes=AMBIENT_FAIL_RESCHEDULE_MINUTES))
     update_guild_ambient_times(guild_id, last_msg or "", next_dt.isoformat())
 
 def _random_next_day_ambient_time_pacific():
     now = datetime.now(PACIFIC_TZ)
     next_day = (now + timedelta(days=1)).date()
-    start_hour = 9
-    end_hour = 22
+    start_hour = AMBIENT_WINDOW_START_HOUR
+    end_hour = AMBIENT_WINDOW_END_HOUR - 1
     hour = random.randint(start_hour, end_hour)
-    minute = random.randint(0, 59)
+    minute = random.randint(0, AMBIENT_PREPARATION_END_MINUTE - 1 if hour == AMBIENT_PREPARATION_END_HOUR else 59)
     scheduled = datetime(
         next_day.year,
         next_day.month,
@@ -26066,8 +26120,7 @@ def schedule_after_ambient_post(
                 AMBIENT_RESCHEDULE_MAX_HOURS,
             )
         )
-        latest = now.replace(hour=22, minute=0, second=0, microsecond=0)
-        if candidate.date() == now.date() and candidate <= latest:
+        if candidate.date() == now.date() and ambient_preparation_window_open(candidate):
             next_at = candidate.isoformat()
             update_guild_ambient_times(guild_id, last_msg or "", next_at)
             return next_at
@@ -35342,7 +35395,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int,
     if ambient_edition.enabled(sys.modules[__name__], guild_id):
         return await ambient_edition.generate(sys.modules[__name__], guild_id, channel_id,
                                               source_basis_out=source_basis_out)
-    basis = {'guild_id': guild_id}
+    basis = {'guild_id': guild_id, 'ambient_source_window_end': ambient_source_window_end().isoformat()}
     if source_basis_out is not None:
         source_basis_out.clear()
     def read_sources():
@@ -35360,6 +35413,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int,
         if art_available:
             basis['art_context'] = ambient_art.build_art_context(sys.modules[__name__], guild_id,
                 journal=journal, journal_provided=True, ambient_inputs=(cues, broadcast, basis))
+            basis['art_context']['ambient_source_window_end'] = basis['ambient_source_window_end']
         return recent, avoid, cues, broadcast, moments, art_available, journal
     try:
         recent_user, recent_ambient, cues, broadcast, moments, art_available, journal = await asyncio.to_thread(read_sources)
@@ -35827,17 +35881,19 @@ async def publish_prepared_dormant_echo(
             consent_reason,
         )
         return {"status": "withheld", "reason": consent_reason}
-    now = now_pacific or datetime.now(PACIFIC_TZ)
-    if now.tzinfo is None:
-        now = PACIFIC_TZ.localize(now)
-    else:
-        now = now.astimezone(PACIFIC_TZ)
+    # Preparation and consent lookup can finish after the window closes.
+    now = _pacific_now()
+    if not ambient_delivery_window_open(now):
+        _set_dormant_echo_runtime_state(guild_id, status="withheld", reason="outside_posting_window")
+        _, last_msg, _ = get_guild_ambient_state(guild_id)
+        _reschedule_ambient_soon(guild_id, last_msg or "")
+        return {"status": "withheld", "reason": "outside_posting_window"}
     echo_message = str(prepared.get("message") or "")
     try:
-        await channel.send(
+        await asyncio.wait_for(channel.send(
             echo_message,
             allowed_mentions=discord.AllowedMentions.none(),
-        )
+        ), timeout=AMBIENT_DELIVERY_TIMEOUT_SECONDS)
     except Exception as exc:
         _set_dormant_echo_runtime_state(
             guild_id,
@@ -36288,6 +36344,9 @@ async def process_due_occasion_for_guild(
     if channel is None:
         return {"status": "waiting_for_channel"}
 
+    if not ambient_preparation_window_open(now) or not ambient_preparation_window_open():
+        return {"status": "waiting_for_window", "reason": "outside_posting_window"}
+
     capacity = ambient_capacity_decision(
         guild_id,
         channel_id,
@@ -36368,6 +36427,10 @@ async def process_due_occasion_for_guild(
         )
         if not stored:
             return {"status": "superseded", "reason": "generation_lease_lost"}
+        if not ambient_delivery_window_open():
+            # Keep the canonical payload and occurrence identity, without taking
+            # a delivery lease that cannot be used until the next opening.
+            return {"status": "prepared", "reason": "outside_posting_window"}
         claim = await asyncio.to_thread(
             claim_next_due_occasion,
             DB_FILE,
@@ -36431,12 +36494,20 @@ async def process_due_occasion_for_guild(
             )
             return {"status": "retryable", "reason": "discord_history_unavailable"}
 
+    now = _pacific_now()
+    if not ambient_delivery_window_open(now):
+        await asyncio.to_thread(
+            fail_occasion_claim, DB_FILE, claim["occurrence_key"], claim["lease_token"],
+            stage="delivery", reason="outside_posting_window",
+            retry_minutes=OCCASION_DELIVERY_RETRY_MINUTES, now=now,
+        )
+        return {"status": "waiting_for_window", "reason": "outside_posting_window"}
     try:
-        message = await channel.send(
+        message = await asyncio.wait_for(channel.send(
             content,
             allowed_mentions=discord.AllowedMentions.none(),
             nonce=occasion_delivery_nonce(claim["occurrence_key"]),
-        )
+        ), timeout=AMBIENT_DELIVERY_TIMEOUT_SECONDS)
     except Exception as exc:
         reason = f"discord_send_{type(exc).__name__.lower()}"
         await asyncio.to_thread(
@@ -36606,9 +36677,8 @@ async def ambient_message_task():
         configs = cursor.fetchall()
         conn.close()
 
-        now = datetime.now(PACIFIC_TZ)
-
         for guild_id, channel_id, last_msg, next_at in configs:
+            now = _pacific_now()
             channel = client.get_channel(channel_id)
             channel_policy = resolve_channel_policy(channel) if channel else "unknown"
             occasion_channel = (
@@ -36622,9 +36692,8 @@ async def ambient_message_task():
                         guild_id,
                         channel_id,
                         occasion_channel,
-                        now_pacific=now,
                     )
-                if occasion_result.get("status") not in {"idle", "waiting_for_channel"}:
+                if occasion_result.get("status") not in {"idle", "waiting_for_channel", "waiting_for_window"}:
                     logging.info(
                         "occasion_cycle guild=%s status=%s reason=%s",
                         guild_id,
@@ -36649,7 +36718,16 @@ async def ambient_message_task():
             except Exception:
                 next_dt = _random_time_today_pacific()
 
+            eligible_next = next_ambient_window_time(next_dt)
+            if eligible_next != next_dt:
+                next_dt = eligible_next
+                update_guild_ambient_times(guild_id, last_msg or "", next_dt.isoformat())
+            now = _pacific_now()
             if now >= next_dt:
+                if not ambient_preparation_window_open(now):
+                    _set_ambient_runtime_state(guild_id, skip_reason="outside_posting_window")
+                    update_guild_ambient_times(guild_id, last_msg or "", next_ambient_window_time(now).isoformat())
+                    continue
                 if not channel:
                     update_guild_ambient_times(guild_id, last_msg or "", _random_time_today_pacific().isoformat())
                     continue
@@ -36660,10 +36738,14 @@ async def ambient_message_task():
                     continue
 
                 async with _ambient_post_lock_for(guild_id):
+                    now = _pacific_now()
+                    if not ambient_preparation_window_open(now):
+                        _reschedule_ambient_soon(guild_id, last_msg or "")
+                        continue
                     last_posted_at = get_last_ambient_posted_at(guild_id, channel_id)
                     if last_posted_at and (now - last_posted_at) < timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES):
                         _set_ambient_runtime_state(guild_id, skip_reason="cooldown_window")
-                        next_scheduled = (last_posted_at + timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES)).isoformat()
+                        next_scheduled = next_ambient_window_time(last_posted_at + timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES)).isoformat()
                         update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
                         continue
 
@@ -36699,7 +36781,6 @@ async def ambient_message_task():
                             channel,
                             dormant_echo,
                             capacity_used_before_send=capacity["capacityUsed"],
-                            now_pacific=now,
                         )
                         continue
 
@@ -36718,6 +36799,10 @@ async def ambient_message_task():
                         _reschedule_ambient_soon(guild_id, last_msg or "")
                         continue
 
+                    if not ambient_delivery_window_open():
+                        _set_ambient_runtime_state(guild_id, skip_reason="outside_posting_window")
+                        _reschedule_ambient_soon(guild_id, last_msg or "")
+                        continue
                     art = await ambient_art.prepare(sys.modules[__name__], guild_id, source_basis)
                     if art:
                         await asyncio.to_thread(ambient_art.record, sys.modules[__name__], art['metadata']['artId'], 'discord_delivery_reserved')
@@ -36757,7 +36842,20 @@ async def ambient_message_task():
                             next_scheduled = schedule_next_day_ambient(guild_id, last_msg or '')
                         elif art:
                             kwargs['file'] = ambient_art.discord_file(sys.modules[__name__], art)
-                        delivered = await channel.send(content, **kwargs)
+                        # Re-read after every awaited preparation/revalidation and
+                        # the durable reservation, immediately before transport.
+                        if not ambient_delivery_window_open():
+                            pending_file = kwargs.get('file')
+                            if pending_file:
+                                pending_file.close()
+                            if art:
+                                await asyncio.to_thread(ambient_art.record, sys.modules[__name__], art['metadata']['artId'], 'outside_posting_window')
+                            _set_ambient_runtime_state(guild_id, skip_reason='outside_posting_window')
+                            _reschedule_ambient_soon(guild_id, last_msg or '')
+                            send_outcome = 'withheld_outside_window'
+                            continue
+                        delivered = await asyncio.wait_for(
+                            channel.send(content, **kwargs), timeout=AMBIENT_DELIVERY_TIMEOUT_SECONDS)
                         send_outcome = 'confirmed'
                     except Exception:
                         # Do not retry an ambiguous send on the next five-minute tick.
@@ -36782,7 +36880,7 @@ async def ambient_message_task():
                             guild_id,
                             msg,
                             capacity["capacityUsed"] + 1,
-                            now_pacific=now,
+                            now_pacific=_pacific_now(),
                         )
                     logging.info(f"📡 Ambient posted successfully in guild {guild_id}")
                     logging.info(f"📡 Next ambient scheduled for guild {guild_id} at {next_scheduled}")
