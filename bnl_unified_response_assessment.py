@@ -794,9 +794,79 @@ def _situation_task_parts(
         r"|(?<!\w)'(?:\\.|[^'\\]|(?<=\w)'(?=\w))*'(?!\w)",
         value,
     ))
+    prefaced_question = re.compile(
+        r":\s+(?:(?:briefly|please|quickly|first)\s+)*"
+        r"(?P<lead>what|which|who|where|when|why|how|"
+        r"is|are|was|were|have|has|had|do|does|did|can|could|will|would|should)\b",
+        re.I,
+    )
 
     def normalized_segment(start: int, end: int) -> str:
         return re.sub(r"\s+", " ", value[start:end]).strip(" ,;.!?")
+
+    labels = tuple(str(label or "").strip() for label in context_labels if label)
+    label_pattern = "(?:%s)" % "|".join(
+        re.escape(label) for label in sorted(set(labels), key=len, reverse=True)
+    )
+    declaration_pattern = re.compile(
+        r"^%s(?:(?:\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+)%s)*"
+        r"\s+(?:is|are|was|were|has|have|had)\b"
+        % (label_pattern, label_pattern),
+        re.I,
+    ) if labels else None
+
+    def explicit_task_start(segment: str, start: int, end: int) -> Optional[int]:
+        # An observed display label can begin with a task word (e.g. Test).
+        # A declaration about one or several labels remains context, not an
+        # instruction or a resolved antecedent for an ambiguous pronoun.
+        if declaration_pattern is not None and declaration_pattern.search(segment):
+            return None
+        if (
+            _TASK_SEGMENT_START_RE.search(segment)
+            or any(
+                re.search(
+                    r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(label),
+                    segment,
+                    re.I,
+                )
+                for label in labels
+            )
+        ):
+            return start
+        # Keep introductions in the full segment, but let the question own
+        # its authority. A declared title or quoted payload is not a request.
+        question_mark = value[end:end + 1] == "?" or value[start:end].rstrip().endswith("?")
+        for match in prefaced_question.finditer(value, start, end):
+            if any(quote_start <= match.start() < quote_end
+                   for quote_start, quote_end in quoted_spans):
+                continue
+            prefix = value[start:match.start()]
+            if re.search(r"\b(?:title|name|text|line|note|quote|lyrics?)\s+"
+                         r"(?:is|was|reads?|says?)\b|\b(?:called|named|titled)\s+",
+                         prefix, re.I):
+                continue
+            if match.group("lead").lower() not in {
+                "what", "which", "who", "where", "when", "why", "how",
+            } and not question_mark:
+                continue
+            question_start = match.start("lead")
+            question = value[question_start:end]
+            # A topic label can scope an explicitly dependent question, such
+            # as "Songs submitted to past shows: Which of those ...?".
+            # Independent questions never borrow that label's authority.
+            dependent = re.search(
+                r"^(?:what\s+about\b|(?:what|which)\s+"
+                r"(?:(?:one|ones)\s+)?(?:of\s+)?(?:these|those|them)\b)",
+                question, re.I,
+            )
+            explicit_scope = re.match(
+                r"^(?:for|in|from|during|about|regarding|concerning|as\s+for)\b",
+                prefix.strip(), re.I,
+            )
+            if (dependent or explicit_scope) and not re.search(r"[.!?]", prefix):
+                return start
+            return question_start
+        return None
 
     ranges = []
     start = 0
@@ -810,43 +880,15 @@ def _situation_task_parts(
     if value[start:].strip(" ,;.!?"):
         ranges.append((start, len(value)))
 
-    labels = tuple(str(label or "").strip() for label in context_labels if label)
-    label_pattern = "(?:%s)" % "|".join(
-        re.escape(label) for label in sorted(set(labels), key=len, reverse=True)
-    )
-    declaration_pattern = re.compile(
-        r"^%s(?:(?:\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+)%s)*"
-        r"\s+(?:is|are|was|were|has|have|had)\b"
-        % (label_pattern, label_pattern),
-        re.I,
-    ) if labels else None
-
-    def explicit_task(segment: str) -> bool:
-        # An observed display label can begin with a task word (e.g. Test).
-        # A declaration about one or several labels remains context, not an
-        # instruction or a resolved antecedent for an ambiguous pronoun.
-        if declaration_pattern is not None and declaration_pattern.search(segment):
-            return False
-        return bool(
-            _TASK_SEGMENT_START_RE.search(segment)
-            or any(
-                re.search(
-                    r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(label),
-                    segment,
-                    re.I,
-                )
-                for label in labels
-            )
-        )
-
     merged_ranges = []
     pending_start = None
     for start, end in ranges:
         segment = normalized_segment(start, end)
         if pending_start is None:
             pending_start = start
-        if explicit_task(segment):
-            merged_ranges.append((pending_start, end, start, end))
+        task_start = explicit_task_start(segment, start, end)
+        if task_start is not None:
+            merged_ranges.append((pending_start, end, task_start, end))
             pending_start = None
     if pending_start is not None:
         # A trailing setup clause still belongs to the last complete task.

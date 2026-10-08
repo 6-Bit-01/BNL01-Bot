@@ -218,6 +218,45 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertNotIn("Neutral Signal", invalid.rendered_context)
 
+    def test_prefaced_archive_question_reaches_native_and_packet_artist_history(self):
+        text = (
+            "Archive gremlin, I need a crate inspection: which of my songs have other people "
+            "submitted to past shows? Give me the track, artist credit, TikTok submitter profile, "
+            "and show date.")
+        ns = turn_reader_namespace(self.db_file)
+        env = {**ENABLED_QUEUE_ENV, "BNL_OWNER_USER_ID": "42", "BNL_PRIMARY_GUILD_ID": "77"}
+        with mock.patch.dict(os.environ, env):
+            selection = {}
+            native_text = ns["build_tiktok_show_evidence_context_for_turn"](
+                guild_id=77, subject_user_id=42, user_text=text,
+                situation_frame=self.frame(text, policy="public_context"), selection_out=selection)
+            request = packet.IntelligencePacketRequest(
+                guild_id=77, subject_user_id=42, route_mode="normal_chat",
+                conversation_surface="public_context", channel_policy="public_context", user_text=text,
+                show_episode_selection_text=selection.get("selection_user_text", ""),
+                show_episode_artist_request=selection.get("artist_identity_request"))
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                items = packet._show_episode_items(
+                    conn, request, packet.IntelligencePacketDiagnostics(), [], environ=env)
+            packet_text = "\n".join(item.text for item in items)
+
+        expected = {
+            ("2026-09-11", "6 Bit", "Neutral Signal", "test.submitter"),
+            ("2026-09-25", "6-Bit featuring Second Artist", "Neutral Collaboration", "second.submitter"),
+        }
+        for surface, context in (("native", native_text), ("packet", packet_text)):
+            with self.subTest(surface=surface):
+                observed = set()
+                for line in context.splitlines():
+                    if line.startswith("- Show "):
+                        show, _, payload = line.partition(": ")
+                        record = json.loads(payload)
+                        observed.add((show.removeprefix("- Show "), record["projectLabel"],
+                                      record["title"], record["submittedByTikTokHandle"]))
+                self.assertEqual(observed, expected)
+                self.assertNotIn("imaginary panda", context)
+                self.assertNotIn("Other Artist", context)
+
     def test_identity_uses_account_authority_not_display_name_and_retirement_wins(self):
         ns = turn_reader_namespace(self.db_file)
         text = HISTORY_REQUESTS[1]
