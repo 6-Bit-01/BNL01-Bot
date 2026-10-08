@@ -14,17 +14,53 @@ bot = ingress.bot
 existing = ingress.existing
 FIRST = "Can you find the earlier recordings by this fictional musician?"
 CORRECTION = "That account is incomplete. Others sent my recordings earlier."
+# These are labelled provider outcomes for routing integration, not a lexical
+# substitute for the semantic classifier. Provider quality is checked separately.
+FOLLOWUP_DECISIONS = {
+    CORRECTION: True,
+    "Could you explain what you mean by those earlier recordings?": True,
+    "The recordings by that musician were captured at a different show.": True,
+    "He only gives us the buttons we are allowed to press": True,
+    "The second one.": True,
+    "Which of those did Test Submitter submit, and when was that show?": True,
+    "yes": True,
+    "BNL, can you help me choose a replacement bicycle tyre?": True,
+    "Did you find those earlier recordings?": True,
+    "I am making mushroom pasta for dinner tonight.": False,
+    "Does anyone know where to buy a replacement bicycle tyre?": False,
+    "Unrelated question: which keyboard should I buy?": False,
+    "My bicycle needs new brakes before the weekend.": False,
+    "What is everyone cooking for dinner?": False,
+    "Has anyone watched the new cartoon series?": False,
+    "Does anyone know a good bicycle repair shop?": False,
+    "Does anyone have a good mushroom pasta recipe?": False,
+    "BNL mentioned those earlier recordings in the archive.": False,
+    "I told BNL that the earlier recordings were missing.": False,
+    "thanks": False,
+    "nice": False,
+    "👍": False,
+}
 
 
 class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = ingress.OrdinaryAddressedBurstIngressTests.asyncSetUp
     asyncTearDown = ingress.OrdinaryAddressedBurstIngressTests.asyncTearDown
-    _channel = ingress.OrdinaryAddressedBurstIngressTests._channel
     _on_message_runtime = ingress.OrdinaryAddressedBurstIngressTests._on_message_runtime
     _flush_runtime = ingress.OrdinaryAddressedBurstIngressTests._flush_runtime
     _runtime = ingress.OrdinaryAddressedBurstIngressTests._runtime
     _drain = ingress.OrdinaryAddressedBurstIngressTests._drain
     _assert_originals_once = ingress.OrdinaryAddressedBurstIngressTests._assert_originals_once
+
+    def _channel(self, channel_id, **kwargs):
+        channel = ingress.OrdinaryAddressedBurstIngressTests._channel(self, channel_id, **kwargs)
+        original_send = channel.send
+
+        async def send_with_receipt(text, **send_kwargs):
+            await original_send(text, **send_kwargs)
+            return existing.SimpleNamespace(id=channel_id * 100 + len(channel.sent))
+
+        channel.send = mock.AsyncMock(side_effect=send_with_receipt)
+        return channel
 
     def _completed_runtime(self, channel, generate, *, policy="sealed_test"):
         actual_direct = bot._is_recent_direct_followup
@@ -35,6 +71,28 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
         stack.enter_context(mock.patch.object(bot, "_is_recent_conversation_continuation", side_effect=actual_continuation))
         stack.enter_context(mock.patch.object(bot, "BATCH_WINDOW_SECONDS", 0.01))
         stack.enter_context(mock.patch.object(bot, "BATCH_REPLY_COOLDOWN_SECONDS", 0))
+
+        async def load_exchange(_message, _state):
+            first = getattr(channel, "completed_request_fixture", None)
+            delivered = channel.sent or (first.replies if first is not None else [])
+            if not delivered:
+                return None
+            return {
+                "previous_user": first.content if first is not None else FIRST,
+                "bnl_reply": delivered[-1],
+            }
+
+        async def classify_exchange(exchange, content):
+            self.assertTrue(exchange["bnl_reply"])
+            self.assertIn(content, FOLLOWUP_DECISIONS, "Add an explicit semantic fixture label")
+            return FOLLOWUP_DECISIONS[content]
+
+        self.exchange_loader = mock.AsyncMock(side_effect=load_exchange)
+        self.followup_classifier = mock.AsyncMock(side_effect=classify_exchange)
+        stack.enter_context(mock.patch.object(bot, "_load_completed_followup_exchange",
+            new=self.exchange_loader, create=True))
+        stack.enter_context(mock.patch.object(bot, "_classify_completed_followup_exchange",
+            new=self.followup_classifier, create=True))
         if getattr(self, "no_store_context", ""):
             stack.enter_context(mock.patch.object(bot, "maybe_build_bnl_read_model_context",
                 return_value=self.no_store_context))
@@ -42,7 +100,9 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
 
     def _first(self, channel):
         mention = existing.SimpleNamespace(id=999, display_name="BNL-01", bot=True)
-        return existing.FakeMessage(channel, "<@999> " + FIRST, mentions=[mention])
+        first = existing.FakeMessage(channel, "<@999> " + FIRST, mentions=[mention])
+        channel.completed_request_fixture = first
+        return first
 
     async def test_correction_after_committed_answer_is_a_new_owed_turn(self):
         for offset, policy in enumerate(("sealed_test", "public_home", "public_context")):
@@ -100,6 +160,221 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(prompts), 1)
                 self.assertEqual(len(channel.sent), 1)
 
+    async def test_unrelated_public_messages_do_not_inherit_completed_addressing(self):
+        for offset, text in enumerate((
+            "I am making mushroom pasta for dinner tonight.",
+            "Does anyone know where to buy a replacement bicycle tyre?",
+            "Unrelated question: which keyboard should I buy?",
+        )):
+            with self.subTest(text=text):
+                channel = self._channel(996300 + offset)
+                first = self._first(channel)
+                second = existing.FakeMessage(channel, text, author=first.author)
+                generate = mock.AsyncMock(return_value="The earlier recordings are listed in the archive.")
+                with self._completed_runtime(channel, generate, policy="public_context"):
+                    await bot.on_message(first)
+                    await self._drain()
+                    self.assertEqual(generate.await_count, 1)
+                    # Exercise the immediate legacy follow-up window as well as
+                    # the completed-exchange state; neither proves relevance.
+                    await bot.on_message(second)
+                    await self._drain()
+                self.assertEqual(generate.await_count, 1)
+                self.assertEqual(len(channel.sent), 1)
+                self.assertEqual(second.replies, [])
+
+    async def test_outstanding_question_accepts_its_answer_but_not_unrelated_chatter(self):
+        channel = self._channel(996310)
+        first = self._first(channel)
+        unrelated = existing.FakeMessage(channel,
+            "My bicycle needs new brakes before the weekend.", author=first.author)
+        answer = existing.FakeMessage(channel, "yes", author=first.author)
+        later = existing.FakeMessage(channel,
+            "What is everyone cooking for dinner?", author=first.author)
+        generate = mock.AsyncMock(side_effect=(
+            "Would you like the earlier version?",
+            "The earlier version is selected.",
+        ))
+        with self._completed_runtime(channel, generate, policy="public_context"):
+            await bot.on_message(first)
+            await self._drain()
+            await bot.on_message(unrelated)
+            await self._drain()
+            self.assertEqual(generate.await_count, 1)
+            self.assertEqual(len(channel.sent), 1)
+            await bot.on_message(answer)
+            await self._drain()
+            self.assertEqual(generate.await_count, 2)
+            self.assertEqual(len(channel.sent), 2)
+            await bot.on_message(later)
+            await self._drain()
+        self.assertEqual(generate.await_count, 2)
+        self.assertEqual(len(channel.sent), 2)
+        self.assertEqual(self.frames[-1].source_message_ids, (answer.id,))
+
+    async def test_direct_mention_or_reply_can_change_the_completed_topic(self):
+        for offset, target in enumerate(("mention", "reply")):
+            with self.subTest(target=target):
+                channel = self._channel(996320 + offset)
+                first = self._first(channel)
+                bnl = existing.SimpleNamespace(id=999, display_name="BNL-01", bot=True)
+                text = "Can you help me choose a replacement bicycle tyre?"
+                second = existing.FakeMessage(channel,
+                    "<@999> " + text if target == "mention" else text,
+                    author=first.author, mentions=[bnl] if target == "mention" else [])
+                if target == "reply":
+                    prior = existing.FakeMessage(channel,
+                        "The earlier recordings are listed in the archive.", author=bnl)
+                    second.reference = existing.SimpleNamespace(message_id=prior.id, resolved=prior)
+                generate = mock.AsyncMock(return_value="The neutral request has been answered.")
+                with self._completed_runtime(channel, generate, policy="public_context"):
+                    await bot.on_message(first)
+                    await self._drain()
+                    await bot.on_message(second)
+                    await self._drain()
+                self.assertEqual(generate.await_count, 2)
+                self.assertEqual(len(first.replies + second.replies + channel.sent), 2)
+                self.assertEqual(self.frames[-1].source_message_ids, (second.id,))
+
+    async def test_permissions_continuation_responds_but_room_wide_topic_change_does_not(self):
+        for offset, policy in enumerate(("public_context", "public_selective")):
+            with self.subTest(policy=policy):
+                channel = self._channel(996370 + offset)
+                first = self._first(channel)
+                first.content = "<@999> Can you change channel permissions for us?"
+                followup = existing.FakeMessage(channel,
+                    "He only gives us the buttons we are allowed to press", author=first.author)
+                generate = mock.AsyncMock(side_effect=(
+                    "I cannot change channel permissions; access is controlled by the server.",
+                    "Your access follows the permissions granted by the server.",
+                ))
+                with self._completed_runtime(channel, generate, policy=policy), mock.patch.object(
+                    bot, "get_guild_config", return_value=channel.id + 1000,
+                ):
+                    await bot.on_message(first)
+                    await self._drain()
+                    self.assertEqual(generate.await_count, 1)
+                    await bot.on_message(followup)
+                    await self._drain()
+                    self.assertEqual(generate.await_count, 2)
+                    self.assertEqual(len(channel.sent), 2)
+                    self.assertEqual(self.frames[-1].source_message_ids, (followup.id,))
+                    for text in (
+                        "Has anyone watched the new cartoon series?",
+                        "Does anyone know a good bicycle repair shop?",
+                    ):
+                        unrelated = existing.FakeMessage(channel, text, author=first.author)
+                        await bot.on_message(unrelated)
+                        await self._drain()
+                        self.assertEqual(generate.await_count, 2)
+                        self.assertEqual(unrelated.replies, [])
+                self.assertEqual(len(channel.sent), 2)
+
+    async def test_choice_question_accepts_an_ordinal_answer(self):
+        channel = self._channel(996380)
+        first = self._first(channel)
+        first.content = "<@999> Can you help me choose a version of this recording?"
+        answer = existing.FakeMessage(channel, "The second one.", author=first.author)
+        generate = mock.AsyncMock(side_effect=(
+            "Do you prefer the acoustic or electric version?",
+            "The electric version is selected.",
+        ))
+        with self._completed_runtime(channel, generate, policy="public_context"):
+            await bot.on_message(first)
+            await self._drain()
+            await bot.on_message(answer)
+            await self._drain()
+        self.assertEqual(generate.await_count, 2)
+        self.assertEqual(len(channel.sent), 2)
+        self.assertEqual(self.frames[-1].source_message_ids, (answer.id,))
+
+    async def test_contextual_public_followups_remain_addressed(self):
+        for offset, text in enumerate((
+            "Could you explain what you mean by those earlier recordings?",
+            CORRECTION,
+            "The recordings by that musician were captured at a different show.",
+        )):
+            with self.subTest(text=text):
+                channel = self._channel(996330 + offset)
+                first = self._first(channel)
+                second = existing.FakeMessage(channel, text, author=first.author)
+                generate = mock.AsyncMock(return_value="The earlier recordings are listed in the archive.")
+                with self._completed_runtime(channel, generate, policy="public_context"):
+                    await bot.on_message(first)
+                    await self._drain()
+                    await bot.on_message(second)
+                    await self._drain()
+                self.assertEqual(generate.await_count, 2)
+                self.assertEqual(len(channel.sent), 2)
+                self.assertEqual(self.frames[-1].source_message_ids, (second.id,))
+                self.assertEqual(self.frames[-1].explicit_mention_count, 0)
+
+    async def test_contextual_message_targeting_another_human_remains_quiet(self):
+        for offset, target in enumerate(("mention", "reply")):
+            with self.subTest(target=target):
+                channel = self._channel(996340 + offset)
+                first = self._first(channel)
+                other = existing.FakeAuthor(200, "Another Fictional Member")
+                text = "Did you find those earlier recordings?"
+                second = existing.FakeMessage(channel,
+                    "<@200> " + text if target == "mention" else text,
+                    author=first.author, mentions=[other] if target == "mention" else [])
+                if target == "reply":
+                    prior = existing.FakeMessage(channel, "I can look for those recordings.", author=other)
+                    second.reference = existing.SimpleNamespace(message_id=prior.id, resolved=prior)
+                generate = mock.AsyncMock(return_value="The earlier recordings are listed in the archive.")
+                with self._completed_runtime(channel, generate, policy="public_context"):
+                    await bot.on_message(first)
+                    await self._drain()
+                    await bot.on_message(second)
+                    await self._drain()
+                self.assertEqual(generate.await_count, 1)
+                self.assertEqual(len(channel.sent), 1)
+                self.assertEqual(second.replies, [])
+
+    async def test_canonical_bnl_salutation_is_distinct_from_third_person_mention(self):
+        cases = (
+            ("BNL, can you help me choose a replacement bicycle tyre?", True),
+            ("BNL mentioned those earlier recordings in the archive.", False),
+            ("I told BNL that the earlier recordings were missing.", False),
+        )
+        for offset, (text, should_reply) in enumerate(cases):
+            with self.subTest(text=text):
+                channel = self._channel(996350 + offset)
+                first = self._first(channel)
+                second = existing.FakeMessage(channel, text, author=first.author)
+                generate = mock.AsyncMock(return_value="The earlier recordings are listed in the archive.")
+                with self._completed_runtime(channel, generate, policy="public_context"):
+                    await bot.on_message(first)
+                    await self._drain()
+                    await bot.on_message(second)
+                    await self._drain()
+                expected = 2 if should_reply else 1
+                self.assertEqual(generate.await_count, expected)
+                self.assertEqual(len(first.replies + second.replies + channel.sent), expected)
+
+    async def test_batching_disabled_still_requires_relevant_public_followup(self):
+        for offset, (text, should_reply) in enumerate((
+            ("Does anyone have a good mushroom pasta recipe?", False),
+            (CORRECTION, True),
+        )):
+            with self.subTest(text=text):
+                channel = self._channel(996360 + offset)
+                first = self._first(channel)
+                second = existing.FakeMessage(channel, text, author=first.author)
+                generate = mock.AsyncMock(return_value="The earlier recordings are listed in the archive.")
+                with self._completed_runtime(channel, generate, policy="public_context"), mock.patch.object(
+                    bot, "BNL_ACTIVE_BATCHING_ENABLED", False,
+                ):
+                    await bot.on_message(first)
+                    await self._drain()
+                    self.assertEqual(generate.await_count, 1)
+                    await bot.on_message(second)
+                    await self._drain()
+                expected = 2 if should_reply else 1
+                self.assertEqual(generate.await_count, expected)
+                self.assertEqual(len(first.replies + second.replies + channel.sent), expected)
+
     async def test_no_store_answer_keeps_public_followup_without_persisting_output(self):
         channel = self._channel(996260)
         first = self._first(channel)
@@ -132,6 +407,9 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
             state = bot._conversation_continuation_state[key]
             self.assertEqual(state["channel_policy"], "public_context")
             self.assertNotIn("NEUTRAL", str(state))
+            self.assertNotIn("neutral", str(state).lower())
+            self.assertNotIn(FIRST, str(state))
+            self.assertNotIn("The neutral record contains two entries.", str(state))
             await bot.on_message(existing.FakeMessage(channel, "thanks", author=first.author))
             await self._drain()
             self.assertEqual(generate.await_count, 2)
@@ -234,6 +512,43 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(packet["decision"], "answer")
         self.assertEqual(packet["reason"], "pending_request_single_payload_continuation")
+
+
+class CompletedFollowupClassifierTests(unittest.IsolatedAsyncioTestCase):
+    async def test_classifier_accepts_only_the_exact_true_boolean_contract(self):
+        exchange = {"previous_user": FIRST, "bnl_reply": "The earlier recordings are listed."}
+        for text, expected in (
+            ('{"continue": true}', True),
+            ('{"continue": false}', False),
+            ('{"continue": "true"}', False),
+            ('{"continue": 1}', False),
+            ('{"continue": true, "reason": "same topic"}', False),
+            ('[true]', False),
+            ('Yes, continue.', False),
+            ('```json\n{"continue": true}\n```', False),
+        ):
+            with self.subTest(text=text), mock.patch.object(
+                bot, "_generate_gemini_content_result_async",
+                new=mock.AsyncMock(return_value=bot.GenerationResult(True, text)),
+            ) as provider:
+                self.assertIs(await bot._classify_completed_followup_exchange(exchange, CORRECTION), expected)
+                provider.assert_awaited_once()
+                self.assertEqual(provider.await_args.args[1], "conversation_followup_addressing")
+
+    async def test_classifier_stays_quiet_when_budget_or_provider_is_unavailable(self):
+        exchange = {"previous_user": FIRST, "bnl_reply": "The earlier recordings are listed."}
+        for category in (
+            bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+            bot.GENERATION_ERROR_PROVIDER_TIMEOUT,
+        ):
+            with self.subTest(category=category), mock.patch.object(
+                bot, "_generate_gemini_content_result_async",
+                new=mock.AsyncMock(return_value=bot.GenerationResult(
+                    False, '{"continue": true}', error_category=category,
+                )),
+            ) as provider:
+                self.assertFalse(await bot._classify_completed_followup_exchange(exchange, CORRECTION))
+                provider.assert_awaited_once()
 
 
 if __name__ == "__main__":

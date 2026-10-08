@@ -84,6 +84,30 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             routing.single_attempt_reservation("abc", policy),
         )
 
+    def test_followup_addressing_has_one_small_attempt_without_retry_or_fallback(self):
+        with mock.patch.dict("os.environ", {
+            "BNL_GEMINI_PROVIDER_RETRIES": "2",
+            "BNL_GEMINI_CONVERSATION_MAX_OUTPUT_TOKENS": "16384",
+            "BNL_GEMINI_CONVERSATION_LEGACY_THINKING_BUDGET": "8192",
+        }, clear=True):
+            policy = routing.policy_for_route("conversation_followup_addressing")
+        self.assertEqual(policy.lane, "conversation")
+        self.assertEqual(policy.max_output_tokens, 64)
+        self.assertEqual(policy.legacy_thinking_budget, 0)
+        self.assertEqual(policy.provider_retries, 0)
+        self.assertFalse(policy.allow_fallback)
+        self.assertEqual(routing.estimated_generation_reservation("abc", policy), 65)
+
+    def test_followup_addressing_keeps_existing_reserves_and_other_chat_policy(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(routing.budget_ceiling_for_route(
+                1_350_000, "conversation_followup_addressing",
+            ), 1_000_000)
+            chat = routing.policy_for_route("normal_chat")
+            self.assertEqual(chat.max_output_tokens, 4_096)
+            self.assertEqual(chat.provider_retries, 1)
+            self.assertTrue(chat.allow_fallback)
+
     def test_background_routes_are_one_attempt_without_fallback(self):
         with mock.patch.dict(
             "os.environ",
