@@ -149,16 +149,24 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
         raw = json.dumps({'action': 'post', 'text': TEXT, 'art': {**CONCEPT, 'inspirationRefs': ['private:99']}})
         self.assertEqual(art.parse_response(raw), (TEXT, None, False))
 
-    async def _run_art_scheduler_case(self, withdraw=False):
+    async def _run_art_scheduler_case(self, withdraw=False, cross_close=False):
         self.execute("INSERT INTO guild_configs(guild_id,active_channel_id,next_ambient_message_at) VALUES(42,100,?)", ((self.fixture.now - timedelta(minutes=1)).isoformat(),))
         channel = mock.Mock(id=100, name='public-room')
         channel.send = mock.AsyncMock(return_value=mock.Mock(id=123456))
         self.provider.return_value = json.dumps({'action': 'post', 'text': TEXT, 'art': CONCEPT})
         png = b'private-test-image'
+
+        def generate_image(*_args, **_kwargs):
+            if cross_close:
+                self.fixture.now += timedelta(seconds=5)
+            return png, {'sha256': hashlib.sha256(png).hexdigest(), 'mimeType': 'image/jpeg'}
+
         with ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}))
             stack.enter_context(mock.patch.object(art, 'journal_context', return_value=None))
-            stack.enter_context(mock.patch.object(art, 'generate_private_image', return_value=(png, {'sha256': hashlib.sha256(png).hexdigest(), 'mimeType': 'image/jpeg'})))
+            stack.enter_context(mock.patch.object(art, 'generate_private_image', side_effect=generate_image))
+            close_file = stack.enter_context(mock.patch.object(
+                bot.discord.File, 'close', autospec=True, side_effect=bot.discord.File.close))
             stack.enter_context(mock.patch.object(bot.client, 'get_channel', return_value=channel))
             stack.enter_context(mock.patch.object(bot, 'resolve_channel_policy', return_value='public_home'))
             stack.enter_context(mock.patch.object(bot, 'is_community_image_channel', return_value=False))
@@ -174,6 +182,19 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
                 return record(*args, **kwargs)
             stack.enter_context(mock.patch.object(art, 'record', side_effect=save))
             await bot.ambient_message_task.coro()
+            if cross_close:
+                channel.send.assert_not_awaited()
+                website.assert_not_called()
+                close_file.assert_called_once()
+                attachment = close_file.call_args.args[0]
+                self.assertIsInstance(attachment, bot.discord.File)
+                self.assertEqual(attachment.fp.close, attachment._closer)
+                self.assertEqual(
+                    self.execute('SELECT status,discord_message_id,website_status FROM bnl_own_art_delivery')[0],
+                    ('outside_posting_window', '', ''),
+                )
+                self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log WHERE source_type='ambient'")[0][0], 0)
+                return
             if withdraw:
                 channel.send.assert_not_awaited()
                 website.assert_not_called()
@@ -197,6 +218,40 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
                 art.publish_website(bot, {'image': b'png', 'metadata': {'artId': art_id}})
                 opener.return_value.open.assert_called_once()
             self.assertEqual(self.execute('SELECT website_status FROM bnl_own_art_delivery')[0][0], 'unconfirmed')
+
+    def test_website_after_posting_window_preserves_confirmed_discord_without_http(self):
+        with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}):
+            art_id = art.claim(bot, 42)
+            art.record(bot, art_id, 'discord_confirmed', message_id=123456)
+            self.fixture.now = self.fixture.now.replace(hour=20, minute=0, second=0)
+            with mock.patch.object(bot, '_journal_website_base_url', return_value='https://example.test'), \
+                 mock.patch.object(art.urllib.request, 'build_opener') as opener:
+                art.publish_website(bot, {'image': b'png', 'metadata': {'artId': art_id}})
+                opener.return_value.open.assert_not_called()
+            self.assertEqual(
+                self.execute('SELECT status,discord_message_id,website_status FROM bnl_own_art_delivery')[0],
+                ('discord_confirmed', '123456', 'outside_posting_window'),
+            )
+
+    def test_website_rechecks_posting_window_after_local_preparation(self):
+        self.fixture.now = self.fixture.now.replace(hour=19, minute=59, second=59)
+        with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}):
+            art_id = art.claim(bot, 42)
+            art.record(bot, art_id, 'discord_confirmed', message_id=123456)
+            opener = mock.Mock()
+
+            def prepare_opener(*_args):
+                self.fixture.now = self.fixture.now.replace(hour=20, minute=0, second=0)
+                return opener
+
+            with mock.patch.object(bot, '_journal_website_base_url', return_value='https://example.test'), \
+                 mock.patch.object(art.urllib.request, 'build_opener', side_effect=prepare_opener):
+                art.publish_website(bot, {'image': b'png', 'metadata': {'artId': art_id}})
+            opener.open.assert_not_called()
+            self.assertEqual(
+                self.execute('SELECT status,discord_message_id,website_status FROM bnl_own_art_delivery')[0],
+                ('discord_confirmed', '123456', 'outside_posting_window'),
+            )
 
     def test_website_upload_uses_actual_image_type_and_generic_payload(self):
         data = b'provider-jpeg-fixture'
@@ -226,6 +281,10 @@ class AmbientRefreshTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_scheduler_attaches_one_image_and_distinguishes_delivery(self):
         await self._run_art_scheduler_case()
+
+    async def test_image_preparation_crossing_close_withholds_delivery_and_closes_attachment(self):
+        self.fixture.now = self.fixture.now.replace(hour=19, minute=59, second=58)
+        await self._run_art_scheduler_case(cross_close=True)
 
     async def test_creative_lineage_stays_local_and_development_uses_shared_function(self):
         with mock.patch.dict(os.environ, {'BNL_OWN_ART_ENABLED': 'true'}), \

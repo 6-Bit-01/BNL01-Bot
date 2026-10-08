@@ -503,7 +503,10 @@ class OccasionBotPathTests(unittest.TestCase):
 
     def run_cycle(self, channel, now, generator):
         fake_client = SimpleNamespace(user=SimpleNamespace(id=channel.bot_user_id))
-        with mock.patch.object(bnl01_bot, "client", fake_client), \
+        clock = mock.Mock(wraps=datetime)
+        clock.now.return_value = now
+        with mock.patch.object(bnl01_bot, "datetime", clock), \
+             mock.patch.object(bnl01_bot, "client", fake_client), \
              mock.patch.object(
                  bnl01_bot,
                  "generate_occasion_reflection",
@@ -706,8 +709,11 @@ class OccasionBotPathTests(unittest.TestCase):
         channel = FakeChannel()
         generator = mock.AsyncMock(return_value=(content, ""))
         fake_client = SimpleNamespace(user=SimpleNamespace(id=channel.bot_user_id))
+        clock = mock.Mock(wraps=datetime)
+        clock.now.return_value = now
 
-        with mock.patch.object(bnl01_bot, "client", fake_client), \
+        with mock.patch.object(bnl01_bot, "datetime", clock), \
+             mock.patch.object(bnl01_bot, "client", fake_client), \
              mock.patch.object(
                  bnl01_bot,
                  "generate_occasion_reflection",

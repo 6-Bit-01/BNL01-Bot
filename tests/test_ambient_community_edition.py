@@ -853,12 +853,12 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("file", channel.send.call_args.kwargs)
         self.assertIsNone(channel.send.call_args.kwargs["embed"].image.url)
 
-    async def test_midnight_during_member_confirmation_drops_the_previous_day_image(self):
+    async def test_midnight_candidate_is_withheld_before_generation_or_member_confirmation(self):
         self.fixture.now = self.fixture.now.replace(hour=23, minute=59, second=58)
         def after_midnight(_user_id):
             self.fixture.now += timedelta(seconds=5)
             return SimpleNamespace(id=7, bot=False, guild=SimpleNamespace(id=42))
-        channel, _guild, _ = self.scheduler(fetch_effect=after_midnight)
+        channel, guild, _ = self.scheduler(fetch_effect=after_midnight)
         image = {"metadata": {"artId": "bnl-art-2026-09-11"}}
         attachment = SimpleNamespace(filename="fixture.png", close=mock.Mock())
         with mock.patch.object(art, "prepare", new=mock.AsyncMock(return_value=image)), \
@@ -866,10 +866,10 @@ class CommunityEditionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(art, "discord_file", return_value=attachment), \
                 mock.patch.object(art, "publish_website") as website:
             await bot.ambient_message_task.coro()
-        channel.send.assert_awaited_once()
-        self.assertNotIn("file", channel.send.call_args.kwargs)
-        self.assertIsNone(channel.send.call_args.kwargs["embed"].image.url)
-        attachment.close.assert_called_once()
+        self.provider.assert_not_awaited()
+        guild.fetch_member.assert_not_awaited()
+        channel.send.assert_not_awaited()
+        self.assertEqual(self.execute("SELECT COUNT(*) FROM ambient_log")[0][0], 0)
         website.assert_not_called()
 
 
