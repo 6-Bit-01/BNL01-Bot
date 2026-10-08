@@ -1211,6 +1211,14 @@ def _situation_tasks(
     for index, (full_segment, segment, action_clause) in enumerate(parts, start=1):
         phase = _situation_phase(action_clause)
         object_kind = _situation_object(segment)
+        if (
+            object_kind == "unknown"
+            and _music_submission_history_clause_requested(segment)
+            and re.search(r"\b(?:shows?|broadcasts?|episodes?)\b", segment, re.I)
+        ):
+            # Use the show reader's history intent for plural archive requests.
+            # General television/music questions retain their existing owner.
+            object_kind = "broadcast"
         temporal_scope, currentness = _situation_temporal_scope(segment)
         evidence = build_conversation_evidence_item(
             text=action_clause,
