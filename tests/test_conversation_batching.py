@@ -1228,6 +1228,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         mark_continuation.assert_called_once_with(
             channel.guild.id, channel.id, 100,
             awaiting_answer=False, channel_policy="sealed_test",
+            request_message_ids=(0,), reply_message_ids=(),
         )
         consume_retransmission.assert_called_once_with(channel.guild.id, channel.id, 100)
         self.assertNotIn(
