@@ -252,7 +252,16 @@ class AddressedContinuationDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     persist_name.assert_not_awaited()
                     self.assertEqual(self._model_source_counts(), counts_before)
                     state = bot._conversation_continuation_state[(77, channel_id, 42)]
-                    self.assertEqual(set(state), {"channel_policy", "last_bnl_reply_at", "live_exchange_until", "awaiting_answer_until"})
+                    self.assertEqual(set(state), {
+                        "channel_policy", "last_bnl_reply_at", "live_exchange_until",
+                        "awaiting_answer_until", "request_message_ids", "reply_message_ids",
+                    })
+                    # This fixture supplies no Discord IDs. No-store turns must
+                    # not fall back to retaining either request or response text.
+                    self.assertEqual(state["request_message_ids"], ())
+                    self.assertEqual(state["reply_message_ids"], ())
+                    self.assertNotIn(answer, state.values())
+                    self.assertNotIn("Continue.", state.values())
                     self.assertEqual(state["channel_policy"], policy)
                     after_send = bot.datetime.now(bot.timezone.utc)
                     self.assertLessEqual(before_send, state["last_bnl_reply_at"])
