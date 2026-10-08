@@ -1693,12 +1693,37 @@ def _resolve_nearby_contribution_referent(
                 ):
                     return _ReferentResolution(status="resolved", candidates=(latest,), selected=(latest,),
                         labels=_referent_candidate_labels((latest,)), reason="latest_answer_subset")
-            # An answer need not have been retained. A unique recent human
-            # request can still own the query; never use orphan model prose.
-            if (len(immediate) == 1 and str(latest.get("role") or "").lower() == "user"
+            # An answer need not have been retained. Completed older pairs
+            # are history, not competing open requests. Exclude only complete
+            # eligible pairs; another unpaired human or orphan model still
+            # prevents selecting a unique request.
+            if (str(latest.get("role") or "").lower() == "user"
                     and int(latest.get("user_id") or 0) == int(req.current_user_id)):
-                return _ReferentResolution(status="resolved", candidates=(latest,), selected=(latest,),
-                    labels=_referent_candidate_labels((latest,)), reason="single_request_subset")
+                eligible_ids = {int(row.get("id") or 0) for row in immediate}
+                completed_ids = set()
+                for pair in pairs:
+                    users = (tuple(pair.get("users") or ()) if pair.get("_room_group")
+                             else tuple(pair["user"].get("_cluster_rows") or (pair["user"],)))
+                    pair_ids = {int(row.get("id") or 0) for row in (*users, pair["model"])}
+                    observed_participants = {int(user.get("user_id") or 0) for user in users}
+                    declared_participants = set(pair.get("_response_participant_ids") or observed_participants)
+                    if users and observed_participants == declared_participants and pair_ids <= eligible_ids and all(
+                        0 < row_id < int(latest.get("id") or 0) for row_id in pair_ids
+                    ):
+                        completed_ids.update(pair_ids)
+                open_rows = tuple(reversed(tuple(row for row in immediate
+                    if int(row.get("id") or 0) not in completed_ids)))
+                if len(open_rows) == 1:
+                    return _ReferentResolution(status="resolved", candidates=(latest,), selected=(latest,),
+                        labels=_referent_candidate_labels((latest,)), reason="single_request_subset")
+                if (open_rows and all(str(row.get("role") or "").lower() == "user"
+                        and int(row.get("user_id") or 0) == int(req.current_user_id) for row in open_rows)
+                        and not nearby_contribution_referent_requested(str(open_rows[0].get("content") or ""))
+                        and all(_deictic_subset_requested(str(row.get("content") or "")) for row in open_rows[1:])):
+                    # Retain every dependent human request, including its
+                    # filters. No saved BNL answer or inferred result is needed.
+                    return _ReferentResolution(status="resolved", candidates=open_rows, selected=open_rows,
+                        labels=_referent_candidate_labels(open_rows), reason="human_request_subset_chain")
         return _ReferentResolution(status="ambiguous" if len(immediate) > 1 else "unresolved",
             candidates=immediate, labels=_referent_candidate_labels(immediate),
             reason="subset_request_not_uniquely_bound")

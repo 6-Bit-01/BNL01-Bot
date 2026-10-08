@@ -45,6 +45,78 @@ def req(**kw):
     return ConversationContextRequest(**base)
 
 class ConversationContextV2Tests(unittest.TestCase):
+    def test_subset_uses_latest_unpaired_request_after_completed_history(self):
+        older = [row(1, "user", "Hello, how is the room?", minutes=4),
+                 row(2, "model", "The room is quiet.", minutes=3.5)]
+        for request in ("Which recordings appeared in previous shows?",
+                        "New topic: which recordings appeared in previous shows?"):
+            for followup in ("Which of those did Test Submitter send?",
+                             "And which of those recordings did Test Submitter send?"):
+                with self.subTest(request=request, followup=followup):
+                    rows = older + [row(3, "user", request, minutes=3),
+                                    row(4, "user", followup.upper(), minutes=0)]
+                    result = assemble_conversation_context_v2(rows, req(current_texts=(followup,)))
+                    self.assertEqual(result.referent_status, "resolved")
+                    self.assertEqual(result.referent_selected_row_ids, (3,))
+                    self.assertEqual(result.referent_request_row_ids, ())
+                    self.assertNotIn(4, result.selected_row_ids)
+                    self.assertEqual(result.current_message_duplicates_removed, 1)
+        exact = assemble_conversation_context_v2(older + [row(3, "user", request)],
+            req(current_texts=(followup,), referenced_conversation_row_ids=(1,)))
+        self.assertEqual(exact.referent_selected_row_ids, (1,))
+        self.assertEqual(exact.referent_reason, "discord_reply_source")
+
+    def test_subset_keeps_unpaired_or_incomplete_history_ambiguous(self):
+        older = [row(1, "user", "Hello, how is the room?", minutes=4),
+                 row(2, "model", "The room is quiet.", minutes=3.5)]
+        latest = row(5, "user", "Which recordings appeared in previous shows?", minutes=2)
+        cases = (
+            ("other open request", older + [row(3, "user", "Which videos appeared?"), latest]),
+            ("intervening other author", older + [row(3, "user", "Which files were missing?", user=2), latest]),
+            ("orphan model", older + [row(3, "model", "Two other entries remain."), latest]),
+            ("latest other author", older + [dict(latest, user_id=2)]),
+            ("missing mapped participant", [older[0], dict(older[1], response_participant_ids=(1, 2)), latest]),
+            ("pair member outside immediate window", [dict(older[0], timestamp=(NOW-timedelta(minutes=11)).isoformat()), older[1], latest]),
+            ("pair member private", [dict(older[0], channel_policy="sealed_test"), older[1], latest]),
+        )
+        for boundary, rows in cases:
+            with self.subTest(boundary=boundary):
+                result = assemble_conversation_context_v2(rows,
+                    req(current_texts=("Which of those did Test Submitter send?",)))
+                self.assertNotEqual(result.referent_status, "resolved")
+
+    def test_subset_can_retire_a_complete_older_room_group(self):
+        rows = [row(1, "user", "Hello, how is the room?", minutes=4),
+                row(2, "user", "It is quiet here.", user=2, minutes=4),
+                dict(row(3, "model", "Good evening to both of you.", user=0, minutes=3.5),
+                     response_participant_ids=(1, 2)),
+                row(4, "user", "Which recordings appeared in previous shows?", minutes=2)]
+        result = assemble_conversation_context_v2(rows,
+            req(current_texts=("Which of those did Test Submitter send?",)))
+        self.assertEqual(result.referent_status, "resolved")
+        self.assertEqual(result.referent_selected_row_ids, (4,))
+
+    def test_subset_chain_keeps_every_human_root_and_refuses_independent_requests(self):
+        rows = [row(1, "user", "Which recordings appeared in previous shows?", minutes=4),
+                row(2, "user", "Which of those did Test Submitter send?", minutes=3),
+                row(3, "user", "Which of those were in the September 11 show?", minutes=2)]
+        current = "Which of those appeared first?"
+        result = assemble_conversation_context_v2(rows, req(current_texts=(current,)))
+        self.assertEqual(result.referent_reason, "human_request_subset_chain")
+        self.assertEqual(result.referent_selected_row_ids, (1, 2, 3))
+        self.assertTrue({1, 2, 3}.issubset(set(result.selected_row_ids)))
+        for item in rows:
+            self.assertIn(item["content"], result.rendered_context)
+        for changed in (
+            rows[1:],
+            [rows[0], dict(rows[1], content="Which lamps fit a desk?"), rows[2]],
+            [rows[0], dict(rows[1], user_id=2), rows[2]],
+            [rows[0], dict(rows[1], role="model"), rows[2]],
+        ):
+            with self.subTest(rows=changed):
+                blocked = assemble_conversation_context_v2(changed, req(current_texts=(current,)))
+                self.assertNotEqual(blocked.referent_reason, "human_request_subset_chain")
+
     def test_explicit_publication_sources_do_not_request_a_nearby_room_contribution(self):
         history = [
             row(1, "user", "Recall the correction about the missing shoes.", minutes=4),

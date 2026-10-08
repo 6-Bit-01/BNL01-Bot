@@ -167,10 +167,10 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             self.assertTrue(ledger._artist_credit_matches(label, (label,)))
         self.assertFalse(ledger._artist_credit_matches("Other Test Artist", ("Test Artist",)))
 
-    def frame(self, text, speakers=(42,)):
+    def frame(self, text, speakers=(42,), *, policy="sealed_test"):
         return assessment.build_situation_frame_v1(
-            route_allowed=True, route_mode="normal_chat", conversation_surface="sealed_test",
-            channel_policy="sealed_test", current_text=text,
+            route_allowed=True, route_mode="normal_chat", conversation_surface=policy,
+            channel_policy=policy, current_text=text,
             current_speaker_user_ids=speakers, current_speaker_labels=("Test Member",),
             response_act="answer",
         )
@@ -417,6 +417,209 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
         self._unpaired_history = True
         self.test_raw_context_keeps_artist_history_for_submitter_subset_followup()
 
+    def test_raw_newer_unpaired_archive_request_beats_older_greeting_pair(self):
+        """A no-store answer must not make an older complete pair own the follow-up."""
+        import test_conversation_batching as bot_fixture
+        bot = bot_fixture.bnl01_bot
+        now = datetime.now(timezone.utc)
+        policy = getattr(self, "_flow_policy", "sealed_test")
+        channel_name = "general-chat" if policy == "public_context" else "bnl-testing"
+        first = ("BNL, have any songs of mine appeared in the archived shows? Include tracks sent by somebody else, "
+                 "and give the recorded artist, title, submitter, and show date.")
+        followup = "Which of those did Test Submitter submit, and when was that show?"
+        rows = [
+            (301, "user", "Hey BNL, how are you?", 240),
+            (302, "model", "Running smoothly, Test Member. What is happening?", 220),
+            (303, "user", first, 180),
+            # The archive answer was delivered without a stored model row.
+            (304, "user", followup, 0),
+        ]
+        with closing(sqlite3.connect(self.db_file)) as conn:
+            conn.execute("DELETE FROM conversations")
+            conn.executemany("""INSERT INTO conversations
+                (id,user_id,user_name,guild_id,channel_name,channel_policy,route_mode,role,content,timestamp,channel_id,message_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", [
+                    (row_id, 42, "Test Member" if role == "user" else "BNL-01", 77,
+                     channel_name, policy, "normal_chat", role, content,
+                     (now - timedelta(seconds=age)).isoformat(), 9001, 7300 + row_id)
+                    for row_id, role, content, age in rows
+                ])
+            conn.commit()
+        env = {**ENABLED_QUEUE_ENV, "BNL_OWNER_USER_ID": "42", "BNL_PRIMARY_GUILD_ID": "77"}
+        with mock.patch.object(bot, "DB_FILE", self.db_file), mock.patch.dict(os.environ, env):
+            result_out = {}
+            rendered = bot.build_conversation_context_v2_for_prompt(
+                guild_id=77, current_user_id=42, channel_id=9001, channel_name=channel_name,
+                channel_policy=policy, route_mode="normal_chat", conversation_surface=policy,
+                current_texts=(followup,), current_participants={42}, is_batch=True,
+                current_message_ids={7604}, is_direct_target=True, now=now, result_out=result_out)
+            context_result = result_out["result"]
+            basis = bot.build_conversation_prompt_source_basis(rendered, guild_id=77, current_user_id=42,
+                channel_id=9001, channel_name=channel_name, channel_policy=policy, context_result=context_result)
+            self.assertIsNotNone(basis)
+            selection = {}
+            context = bot.build_tiktok_show_evidence_context_for_turn(
+                guild_id=77, subject_user_id=42, user_text=followup, situation_frame=self.frame(followup, policy=policy),
+                conversation_basis=basis, conversation_context_result=context_result, selection_out=selection)
+            diagnostic = (context_result.thread_focus_mode, context_result.referent_status,
+                          context_result.referent_reason, context_result.selected_row_ids,
+                          context_result.referent_request_row_ids, selection.get("selection_user_text", ""))
+            with self.subTest(owner="native", context_selection=diagnostic):
+                self.assertIn("Neutral Signal", context)
+                self.assertIn("test.submitter", context)
+                self.assertIn("2026-09-11", context)
+                self.assertNotIn("2026-10-02", context)
+                self.assertNotIn("Neutral Song 0", context)
+                self.assertEqual(context_result.referent_selected_row_ids, (303,))
+                self.assertIn(303, basis.source_row_ids)
+            request = packet.IntelligencePacketRequest(guild_id=77, subject_user_id=42,
+                route_mode="normal_chat", conversation_surface=policy, channel_policy=policy, user_text=followup,
+                show_episode_selection_text=selection.get("selection_user_text", ""),
+                show_episode_artist_request=selection.get("artist_identity_request"))
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                items = packet._show_episode_items(conn, request, packet.IntelligencePacketDiagnostics(), [], environ=env)
+            with self.subTest(owner="packet", context_selection=diagnostic):
+                text = "\n".join(item.text for item in items)
+                self.assertIn("Neutral Signal", text)
+                self.assertIn("test.submitter", text)
+                self.assertIn("2026-09-11", text)
+                self.assertNotIn("2026-10-02", text)
+                self.assertNotIn("Neutral Song 0", text)
+
+    def test_public_context_unpaired_archive_request_beats_older_greeting_pair(self):
+        self._flow_policy = "public_context"
+        self.test_raw_newer_unpaired_archive_request_beats_older_greeting_pair()
+
+    def test_raw_unstored_answer_chain_preserves_artist_and_submitter_scope(self):
+        import test_conversation_batching as bot_fixture
+        bot = bot_fixture.bnl01_bot
+        now = datetime.now(timezone.utc)
+        policy = getattr(self, "_flow_policy", "sealed_test")
+        channel_name = "general-chat" if policy == "public_context" else "bnl-testing"
+        first = ("BNL, have any songs of mine appeared in the archived shows? Include tracks sent by somebody else, "
+                 "and give the recorded artist, title, submitter, and show date.")
+        subset = "Which of those did Test Submitter submit, and when was that show?"
+        current = "Which of those recordings appeared first, and on what date?"
+        rows = [(401, "user", "Hey BNL, how are you?", 300),
+                (402, "model", "Running smoothly, Test Member.", 280),
+                (403, "user", first, 240), (404, "user", subset, 120),
+                (405, "user", current, 0)]
+        with closing(sqlite3.connect(self.db_file)) as conn:
+            conn.execute("DELETE FROM conversations")
+            conn.executemany("""INSERT INTO conversations
+                (id,user_id,user_name,guild_id,channel_name,channel_policy,route_mode,role,content,timestamp,channel_id,message_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", [
+                    (row_id, 42, "Test Member" if role == "user" else "BNL-01", 77,
+                     channel_name, policy, "normal_chat", role, content,
+                     (now - timedelta(seconds=age)).isoformat(), 9001, 7400 + row_id)
+                    for row_id, role, content, age in rows])
+            conn.commit()
+        env = {**ENABLED_QUEUE_ENV, "BNL_OWNER_USER_ID": "42", "BNL_PRIMARY_GUILD_ID": "77"}
+        with mock.patch.object(bot, "DB_FILE", self.db_file), mock.patch.dict(os.environ, env):
+            def read_turn():
+                result_out = {}
+                rendered = bot.build_conversation_context_v2_for_prompt(
+                    guild_id=77, current_user_id=42, channel_id=9001, channel_name=channel_name,
+                    channel_policy=policy, route_mode="normal_chat", conversation_surface=policy,
+                    current_texts=(current,), current_participants={42}, is_batch=True,
+                    current_message_ids={7805}, is_direct_target=True, now=now, result_out=result_out)
+                result = result_out["result"]
+                basis = bot.build_conversation_prompt_source_basis(rendered, guild_id=77, current_user_id=42,
+                    channel_id=9001, channel_name=channel_name, channel_policy=policy, context_result=result)
+                selection = {}
+                context = bot.build_tiktok_show_evidence_context_for_turn(
+                    guild_id=77, subject_user_id=42, user_text=current, situation_frame=self.frame(current, policy=policy),
+                    conversation_basis=basis, conversation_context_result=result, selection_out=selection)
+                return result, basis, selection, context
+
+            result, basis, selection, context = read_turn()
+            diagnostic = (result.referent_status, result.referent_reason,
+                          result.referent_selected_row_ids, selection.get("selection_user_text", ""))
+            self.assertIn("Neutral Signal", context, diagnostic)
+            self.assertIn("test.submitter", context)
+            self.assertIn("2026-09-11", context)
+            self.assertNotIn("2026-10-02", context)
+            self.assertTrue({403, 404}.issubset(set(result.referent_selected_row_ids)))
+            self.assertTrue({403, 404}.issubset(set(basis.source_row_ids)))
+            self.assertIn(subset, selection["selection_user_text"])
+            self.assertIn(first, selection["selection_user_text"])
+            artist_request = selection["artist_identity_request"]
+            self.assertEqual(tuple(subject.user_id for subject in artist_request.frame_subjects), (42,))
+            request = packet.IntelligencePacketRequest(guild_id=77, subject_user_id=42,
+                route_mode="normal_chat", conversation_surface=policy, channel_policy=policy, user_text=current,
+                show_episode_selection_text=selection["selection_user_text"],
+                show_episode_artist_request=artist_request)
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                items = packet._show_episode_items(conn, request, packet.IntelligencePacketDiagnostics(), [], environ=env)
+            packet_text = "\n".join(item.text for item in items)
+            self.assertIn("Neutral Signal", packet_text)
+            self.assertIn("test.submitter", packet_text)
+            self.assertIn("2026-09-11", packet_text)
+            self.assertNotIn("2026-10-02", packet_text)
+            show_basis = bot.build_finalized_show_prompt_source_basis(context, guild_id=77, selection=selection)
+            self.assertEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
+
+            # A newer dependent date replaces the older date for retrieval;
+            # both original human turns remain governed context.
+            dated_root = "Were my songs submitted on 2026-09-11?"
+            dated_subset = "Which of those were in the 2026-09-25 show?"
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                conn.execute("UPDATE conversations SET content=? WHERE id=403", (dated_root,))
+                conn.execute("UPDATE conversations SET content=? WHERE id=404", (dated_subset,))
+                conn.commit()
+            dated_result, dated_basis, dated_selection, dated_context = read_turn()
+            self.assertTrue({403, 404}.issubset(set(dated_result.referent_selected_row_ids)))
+            self.assertIn(dated_root, dated_basis.rendered_context)
+            self.assertIn(dated_subset, dated_basis.rendered_context)
+            self.assertIn("Neutral Collaboration", dated_context)
+            self.assertIn("2026-09-25", dated_context)
+            self.assertNotIn("Neutral Signal", dated_context)
+            dated_request = packet.IntelligencePacketRequest(guild_id=77, subject_user_id=42,
+                route_mode="normal_chat", conversation_surface=policy, channel_policy=policy, user_text=current,
+                show_episode_selection_text=dated_selection["selection_user_text"],
+                show_episode_artist_request=dated_selection["artist_identity_request"])
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                dated_items = packet._show_episode_items(
+                    conn, dated_request, packet.IntelligencePacketDiagnostics(), [], environ=env)
+            dated_text = "\n".join(item.text for item in dated_items)
+            self.assertIn("Neutral Collaboration", dated_text)
+            self.assertIn("2026-09-25", dated_text)
+            self.assertNotIn("Neutral Signal", dated_text)
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                conn.execute("UPDATE conversations SET content=? WHERE id=403", (first,))
+                conn.execute("UPDATE conversations SET content=? WHERE id=404", (subset,))
+                conn.commit()
+
+            # A distinct latest request cannot lend the older artist scope.
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                conn.execute("UPDATE conversations SET content=? WHERE id=404", ("Which lamps fit a desk?",))
+                conn.commit()
+            _result, _basis, changed_selection, changed_context = read_turn()
+            self.assertIsNone(changed_selection.get("artist_identity_request"))
+            self.assertNotIn("Neutral Signal", changed_context)
+            self.assertNotEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
+
+            # Correcting or withdrawing the human root invalidates the saved chain.
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                conn.execute("UPDATE conversations SET content=? WHERE id=404", (subset,))
+                conn.execute("UPDATE conversations SET content=? WHERE id=403", ("What instruments does Test Quartet use?",))
+                conn.commit()
+            self.assertNotEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
+            _result, _basis, corrected_selection, corrected_context = read_turn()
+            self.assertIsNone(corrected_selection.get("artist_identity_request"))
+            self.assertNotIn("Neutral Signal", corrected_context)
+            with closing(sqlite3.connect(self.db_file)) as conn:
+                conn.execute("DELETE FROM conversations WHERE id=403")
+                conn.commit()
+            self.assertNotEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
+            _result, _basis, withdrawn_selection, withdrawn_context = read_turn()
+            self.assertIsNone(withdrawn_selection.get("artist_identity_request"))
+            self.assertNotIn("Neutral Signal", withdrawn_context)
+
+    def test_public_context_unstored_answer_chain_preserves_artist_and_submitter_scope(self):
+        self._flow_policy = "public_context"
+        self.test_raw_unstored_answer_chain_preserves_artist_and_submitter_scope()
+
     def test_raw_subset_context_preserves_ambiguity_and_current_payload(self):
         from tests import test_conversation_context_v2 as fixture
         row, req = fixture.row, fixture.req
@@ -425,7 +628,6 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
         answer = row(2, "model", "Two retained recordings appeared.", name="BNL-01")
         cases = (
             ("multiple requests", [human, row(2, "user", "Which other artist's recordings appeared?")], text),
-            ("intervening topic", [human, answer, row(3, "user", "New topic: help me move this desk.")], text),
             ("other author", [row(1, "user", human["content"], user=2)], text),
             ("other room", [dict(human, channel_id=11)], text),
             ("expired", [dict(human, timestamp=(fixture.NOW - timedelta(minutes=11)).isoformat())], text),
@@ -436,6 +638,11 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             with self.subTest(boundary=label):
                 result = context_owner.assemble_conversation_context_v2(rows, req(current_texts=(current,)))
                 self.assertNotEqual(result.referent_status, "resolved")
+        changed_topic = context_owner.assemble_conversation_context_v2(
+            [human, answer, row(3, "user", "New topic: help me move this desk.")],
+            req(current_texts=(text,)))
+        self.assertNotIn(1, changed_topic.referent_selected_row_ids)
+        self.assertNotIn(1, changed_topic.referent_request_row_ids)
         exact = context_owner.assemble_conversation_context_v2(
             [human, answer, row(3, "user", "Different question.")],
             req(current_texts=(text,), referenced_conversation_row_ids=frozenset({1})))
