@@ -1680,6 +1680,39 @@ def _resolve_nearby_contribution_referent(
                           if _row_age_ok(row, now, IMMEDIATE_REFERENT_RECENCY_MINUTES))
         if immediate and set(req.current_participants) <= {int(req.current_user_id)}:
             latest = immediate[0]
+            # A dependent chain may contain retained answers, unsaved answers,
+            # or both. Only complete pairs before its concrete human root are
+            # unrelated history; every later constraint and answer stays bound.
+            eligible_ids = {int(row.get("id") or 0) for row in immediate}
+            anchor_id = max((int(row.get("id") or 0) for row in immediate
+                if str(row.get("role") or "").lower() == "user"
+                and int(row.get("user_id") or 0) == int(req.current_user_id)
+                and not nearby_contribution_referent_requested(str(row.get("content") or ""))), default=0)
+            complete_pairs = []
+            for pair in pairs:
+                users = (tuple(pair.get("users") or ()) if pair.get("_room_group")
+                         else tuple(pair["user"].get("_cluster_rows") or (pair["user"],)))
+                pair_ids = {int(row.get("id") or 0) for row in (*users, pair["model"])}
+                observed = {int(user.get("user_id") or 0) for user in users}
+                declared = set(pair.get("_response_participant_ids") or observed)
+                if users and observed == declared and 0 not in pair_ids and pair_ids <= eligible_ids:
+                    complete_pairs.append((pair, users, pair_ids, observed))
+            retired_ids = {row_id for _pair, _users, pair_ids, _participants in complete_pairs
+                           if all(row_id < anchor_id for row_id in pair_ids) for row_id in pair_ids}
+            chain = tuple(reversed(tuple(row for row in immediate
+                if int(row.get("id") or 0) not in retired_ids)))
+            chain_ids = {int(row.get("id") or 0) for row in chain}
+            model_ids = {int(pair["model"].get("id") or 0)
+                         for pair, _users, pair_ids, participants in complete_pairs
+                         if pair_ids <= chain_ids and participants == {int(req.current_user_id)}}
+            humans = tuple(row for row in chain if str(row.get("role") or "").lower() == "user")
+            if (anchor_id and len(humans) > 1 and int(humans[0].get("id") or 0) == anchor_id
+                    and all(int(row.get("user_id") or 0) == int(req.current_user_id) for row in humans)
+                    and all(_deictic_subset_requested(str(row.get("content") or "")) for row in humans[1:])
+                    and all(str(row.get("role") or "").lower() == "user"
+                            or int(row.get("id") or 0) in model_ids for row in chain)):
+                return _ReferentResolution(status="resolved", candidates=chain, selected=chain,
+                    labels=_referent_candidate_labels(chain), reason="human_request_subset_chain")
             for pair in pairs:
                 if int(pair["model"].get("id") or 0) != int(latest.get("id") or 0):
                     continue
@@ -1716,14 +1749,6 @@ def _resolve_nearby_contribution_referent(
                 if len(open_rows) == 1:
                     return _ReferentResolution(status="resolved", candidates=(latest,), selected=(latest,),
                         labels=_referent_candidate_labels((latest,)), reason="single_request_subset")
-                if (open_rows and all(str(row.get("role") or "").lower() == "user"
-                        and int(row.get("user_id") or 0) == int(req.current_user_id) for row in open_rows)
-                        and not nearby_contribution_referent_requested(str(open_rows[0].get("content") or ""))
-                        and all(_deictic_subset_requested(str(row.get("content") or "")) for row in open_rows[1:])):
-                    # Retain every dependent human request, including its
-                    # filters. No saved BNL answer or inferred result is needed.
-                    return _ReferentResolution(status="resolved", candidates=open_rows, selected=open_rows,
-                        labels=_referent_candidate_labels(open_rows), reason="human_request_subset_chain")
         return _ReferentResolution(status="ambiguous" if len(immediate) > 1 else "unresolved",
             candidates=immediate, labels=_referent_candidate_labels(immediate),
             reason="subset_request_not_uniquely_bound")

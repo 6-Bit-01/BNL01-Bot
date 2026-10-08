@@ -499,11 +499,37 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
         first = ("BNL, have any songs of mine appeared in the archived shows? Include tracks sent by somebody else, "
                  "and give the recorded artist, title, submitter, and show date.")
         subset = "Which of those did Test Submitter submit, and when was that show?"
-        current = "Which of those recordings appeared first, and on what date?"
+        saved_subset_answer = getattr(self, "_saved_subset_answer", False)
+        current = ("Which of those was the most recent for the submitter we just discussed, and what was the show date?"
+                   if saved_subset_answer else "Which of those recordings appeared first, and on what date?")
         rows = [(401, "user", "Hey BNL, how are you?", 300),
                 (402, "model", "Running smoothly, Test Member.", 280),
-                (403, "user", first, 240), (404, "user", subset, 120),
-                (405, "user", current, 0)]
+                (403, "user", first, 240), (404, "user", subset, 120)]
+        if saved_subset_answer:
+            rows.append((405, "model", getattr(self, "_saved_subset_answer_text",
+                "Test Submitter sent Neutral Signal, credited to 6 Bit, for the September 11 show."), 60))
+        current_row_id = 406 if saved_subset_answer else 405
+        if saved_subset_answer and getattr(self, "_saved_subset_answer_count", 1) > 1:
+            rows.extend(((406, "user", current, 45),
+                (407, "model", "Different Artist performed Neutral Counterfeit on October 2.", 30)))
+            current_row_id = 408
+            current = "Which of those entries should I look at first, and what was the recorded date?"
+        saved_archive_answer = int(bool(getattr(self, "_saved_archive_answer", False)))
+        if saved_archive_answer:
+            rows = [(row_id + int(row_id >= 404), role, text, age) for row_id, role, text, age in rows]
+            rows.append((404, "model", "Two retained recordings appeared in the archive.", 180))
+            current_row_id += 1
+        subset_row_id = 404 + saved_archive_answer
+        last_subset_answer_saved = getattr(self, "_last_subset_answer_saved", True)
+        if not last_subset_answer_saved:
+            rows = [item for item in rows if item[0] != 407 + saved_archive_answer]
+        independent_topic = getattr(self, "_independent_topic", False)
+        if independent_topic:
+            rows = [(row_id + (2 if row_id >= 406 else 0), role, text, age) for row_id, role, text, age in rows]
+            rows.extend(((406, "user", "Which lamps fit a desk?", 50),
+                         (407, "model", "A shaded desk lamp fits.", 48)))
+            current_row_id += 2
+        rows.append((current_row_id, "user", current, 0))
         with closing(sqlite3.connect(self.db_file)) as conn:
             conn.execute("DELETE FROM conversations")
             conn.executemany("""INSERT INTO conversations
@@ -522,7 +548,7 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
                     guild_id=77, current_user_id=42, channel_id=9001, channel_name=channel_name,
                     channel_policy=policy, route_mode="normal_chat", conversation_surface=policy,
                     current_texts=(current,), current_participants={42}, is_batch=True,
-                    current_message_ids={7805}, is_direct_target=True, now=now, result_out=result_out)
+                    current_message_ids={7400 + current_row_id}, is_direct_target=True, now=now, result_out=result_out)
                 result = result_out["result"]
                 basis = bot.build_conversation_prompt_source_basis(rendered, guild_id=77, current_user_id=42,
                     channel_id=9001, channel_name=channel_name, channel_policy=policy, context_result=result)
@@ -535,12 +561,26 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             result, basis, selection, context = read_turn()
             diagnostic = (result.referent_status, result.referent_reason,
                           result.referent_selected_row_ids, selection.get("selection_user_text", ""))
+            if independent_topic:
+                self.assertIsNone(selection.get("artist_identity_request"), diagnostic)
+                self.assertNotIn("Neutral Signal", context)
+                self.assertNotIn(403, result.referent_selected_row_ids)
+                return
             self.assertIn("Neutral Signal", context, diagnostic)
             self.assertIn("test.submitter", context)
             self.assertIn("2026-09-11", context)
             self.assertNotIn("2026-10-02", context)
-            self.assertTrue({403, 404}.issubset(set(result.referent_selected_row_ids)))
-            self.assertTrue({403, 404}.issubset(set(basis.source_row_ids)))
+            self.assertNotIn("Neutral Counterfeit", context)
+            self.assertTrue({403, subset_row_id}.issubset(set(result.referent_selected_row_ids)))
+            self.assertTrue({403, subset_row_id}.issubset(set(basis.source_row_ids)))
+            if saved_subset_answer:
+                self.assertIn(405 + saved_archive_answer, result.referent_selected_row_ids)
+            if saved_archive_answer:
+                self.assertIn(404, result.referent_selected_row_ids)
+            if getattr(self, "_saved_subset_answer_count", 1) > 1:
+                self.assertIn(406 + saved_archive_answer, result.referent_selected_row_ids)
+                if last_subset_answer_saved:
+                    self.assertIn(407 + saved_archive_answer, result.referent_selected_row_ids)
             self.assertIn(subset, selection["selection_user_text"])
             self.assertIn(first, selection["selection_user_text"])
             artist_request = selection["artist_identity_request"]
@@ -556,6 +596,7 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             self.assertIn("test.submitter", packet_text)
             self.assertIn("2026-09-11", packet_text)
             self.assertNotIn("2026-10-02", packet_text)
+            self.assertNotIn("Neutral Counterfeit", packet_text)
             show_basis = bot.build_finalized_show_prompt_source_basis(context, guild_id=77, selection=selection)
             self.assertEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
 
@@ -565,10 +606,10 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             dated_subset = "Which of those were in the 2026-09-25 show?"
             with closing(sqlite3.connect(self.db_file)) as conn:
                 conn.execute("UPDATE conversations SET content=? WHERE id=403", (dated_root,))
-                conn.execute("UPDATE conversations SET content=? WHERE id=404", (dated_subset,))
+                conn.execute("UPDATE conversations SET content=? WHERE id=?", (dated_subset, subset_row_id))
                 conn.commit()
             dated_result, dated_basis, dated_selection, dated_context = read_turn()
-            self.assertTrue({403, 404}.issubset(set(dated_result.referent_selected_row_ids)))
+            self.assertTrue({403, subset_row_id}.issubset(set(dated_result.referent_selected_row_ids)))
             self.assertIn(dated_root, dated_basis.rendered_context)
             self.assertIn(dated_subset, dated_basis.rendered_context)
             self.assertIn("Neutral Collaboration", dated_context)
@@ -587,12 +628,12 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
             self.assertNotIn("Neutral Signal", dated_text)
             with closing(sqlite3.connect(self.db_file)) as conn:
                 conn.execute("UPDATE conversations SET content=? WHERE id=403", (first,))
-                conn.execute("UPDATE conversations SET content=? WHERE id=404", (subset,))
+                conn.execute("UPDATE conversations SET content=? WHERE id=?", (subset, subset_row_id))
                 conn.commit()
 
             # A distinct latest request cannot lend the older artist scope.
             with closing(sqlite3.connect(self.db_file)) as conn:
-                conn.execute("UPDATE conversations SET content=? WHERE id=404", ("Which lamps fit a desk?",))
+                conn.execute("UPDATE conversations SET content=? WHERE id=?", ("Which lamps fit a desk?", subset_row_id))
                 conn.commit()
             _result, _basis, changed_selection, changed_context = read_turn()
             self.assertIsNone(changed_selection.get("artist_identity_request"))
@@ -601,7 +642,7 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
 
             # Correcting or withdrawing the human root invalidates the saved chain.
             with closing(sqlite3.connect(self.db_file)) as conn:
-                conn.execute("UPDATE conversations SET content=? WHERE id=404", (subset,))
+                conn.execute("UPDATE conversations SET content=? WHERE id=?", (subset, subset_row_id))
                 conn.execute("UPDATE conversations SET content=? WHERE id=403", ("What instruments does Test Quartet use?",))
                 conn.commit()
             self.assertNotEqual(bot.prompt_source_basis_failure((basis, show_basis)), "")
@@ -619,6 +660,32 @@ class ArtistSubmissionHistoryTests(unittest.TestCase):
     def test_public_context_unstored_answer_chain_preserves_artist_and_submitter_scope(self):
         self._flow_policy = "public_context"
         self.test_raw_unstored_answer_chain_preserves_artist_and_submitter_scope()
+
+    def test_retained_subset_answer_preserves_original_human_source_chain(self):
+        self._flow_policy = "public_context"
+        self._saved_subset_answer = True
+        self.test_raw_unstored_answer_chain_preserves_artist_and_submitter_scope()
+
+    def test_retained_answer_invented_artist_and_date_cannot_retarget_sources(self):
+        self._saved_subset_answer_text = (
+            "Test Submitter sent Neutral Counterfeit, credited to Different Artist, for the October 2 show.")
+        self.test_retained_subset_answer_preserves_original_human_source_chain()
+
+    def test_multiple_retained_subset_answers_keep_middle_human_constraint(self):
+        self._saved_subset_answer_count = 2
+        self.test_retained_answer_invented_artist_and_date_cannot_retarget_sources()
+
+    def test_retained_archive_answer_keeps_original_human_root(self):
+        self._saved_archive_answer = True
+        self.test_multiple_retained_subset_answers_keep_middle_human_constraint()
+
+    def test_latest_unpaired_subset_keeps_earlier_retained_constraints(self):
+        self._last_subset_answer_saved = False
+        self.test_multiple_retained_subset_answers_keep_middle_human_constraint()
+
+    def test_completed_independent_topic_blocks_old_artist_chain(self):
+        self._independent_topic = True
+        self.test_multiple_retained_subset_answers_keep_middle_human_constraint()
 
     def test_raw_subset_context_preserves_ambiguity_and_current_payload(self):
         from tests import test_conversation_context_v2 as fixture

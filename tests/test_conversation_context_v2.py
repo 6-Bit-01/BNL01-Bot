@@ -107,11 +107,20 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertTrue({1, 2, 3}.issubset(set(result.selected_row_ids)))
         for item in rows:
             self.assertIn(item["content"], result.rendered_context)
+        with_answer = assemble_conversation_context_v2(
+            [*rows, row(4, "model", "The selected recording appeared then.", minutes=1)],
+            req(current_texts=(current,)))
+        self.assertEqual(with_answer.referent_reason, "human_request_subset_chain")
+        self.assertEqual(with_answer.referent_selected_row_ids, (1, 2, 3, 4))
         for changed in (
             rows[1:],
             [rows[0], dict(rows[1], content="Which lamps fit a desk?"), rows[2]],
             [rows[0], dict(rows[1], user_id=2), rows[2]],
-            [rows[0], dict(rows[1], role="model"), rows[2]],
+            [rows[0], dict(rows[1], role="model", user_id=2), rows[2]],
+            [*rows[:2], dict(row(3, "model", "A partial group answer."), response_participant_ids=(1, 2)),
+             row(4, "user", "Which of those appeared first?")],
+            [*rows[:2], row(3, "model", "Another member's answer.", user=2),
+             row(4, "user", "Which of those appeared first?")],
         ):
             with self.subTest(rows=changed):
                 blocked = assemble_conversation_context_v2(changed, req(current_texts=(current,)))
