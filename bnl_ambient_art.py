@@ -22,7 +22,8 @@ from bnl_own_art import (IMAGE_EXTENSIONS, _NoRedirect, _private_write, build_ow
                          generate_private_image, parse_own_art_concept, build_art_context,
                          render_art_sources, continuity_for_prompt, art_context_current,
                          saved_creative_continuity, develop_art_concept, bind_art_visual_references,
-                         visual_reference_availability, visual_reference_snapshot_current)
+                         visual_reference_availability, visual_reference_snapshot_current,
+                         visual_reference_guidance)
 
 PUBLIC_MAX_IMAGE_BYTES = 2 * 1024 * 1024
 
