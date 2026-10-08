@@ -1399,10 +1399,19 @@ def _publication_scoped_referent_text(clause: str, *, inherited_source: bool = F
 
 
 def _deictic_subset_requested(text: str) -> bool:
-    """Recognize a dependent scope, not an independently named new request.
+    """A subset question points to an earlier request, not a named speaker."""
+    value = _referent_input_text(text)
+    return bool(re.search(r"^\s*(?:and\s+)?(?:which|what)\s+(?:of\s+)?(?:those|these)\b", value, re.I)
+                and not CURRENT_TURN_NAMED_PAYLOAD_RE.search(value)
+                and len(_extract_named_anchors(value)) < 2
+                and not EXPLICIT_NEW_TOPIC_RE.search(value))
+
+
+def _dependent_request_scope_candidate(text: str) -> bool:
+    """Recognize candidates only for a fully proven human request chain.
 
     The bounded chain resolver still proves its human root and every link;
-    these structural cues alone never authorize carrying earlier sources.
+    these cues never change generic referent detection or its fallback paths.
     """
     value = _referent_input_text(text)
     clauses = tuple(re.split(r"[.!?;\n]+", value))
@@ -1410,7 +1419,7 @@ def _deictic_subset_requested(text: str) -> bool:
             or len(_extract_named_anchors(value)) >= 2
             or any(EXPLICIT_NEW_TOPIC_RE.search(clause) for clause in clauses)):
         return False
-    if re.search(r"^\s*(?:and\s+)?(?:which|what)\s+(?:of\s+)?(?:those|these)\b", value, re.I):
+    if _deictic_subset_requested(value):
         return True
     for clause in clauses:
         if re.search(r"\b(?:that|this|the)\s+same\s+[\w'-]+", clause, re.I):
@@ -1680,12 +1689,17 @@ def _resolve_nearby_contribution_referent(
         )
         for row in rows
     )
-    if (
-        not nearby_contribution_referent_requested(current_text)
-        and not dynamic_speaker_reference
-    ):
+    legacy_referent_requested = bool(
+        nearby_contribution_referent_requested(current_text)
+        or dynamic_speaker_reference
+    )
+    legacy_subset_requested = _deictic_subset_requested(current_text)
+    dependent_scope_candidate = _dependent_request_scope_candidate(current_text)
+    if not legacy_referent_requested and not dependent_scope_candidate:
         return _ReferentResolution()
     if not candidates:
+        if not legacy_referent_requested:
+            return _ReferentResolution()
         return _ReferentResolution(
             status="unresolved",
             reason="no_bounded_same_room_candidates",
@@ -1693,7 +1707,7 @@ def _resolve_nearby_contribution_referent(
 
     structural_text = TEMPORAL_REFERENT_MODIFIER_RE.sub(" ", current_text)
 
-    if _deictic_subset_requested(current_text):
+    if dependent_scope_candidate:
         # Keep a person named in the filter separate from the conversational
         # target. Facts still reload from the selected human request's owner.
         immediate = tuple(row for row in candidates
@@ -1707,7 +1721,8 @@ def _resolve_nearby_contribution_referent(
             anchor_id = max((int(row.get("id") or 0) for row in immediate
                 if str(row.get("role") or "").lower() == "user"
                 and int(row.get("user_id") or 0) == int(req.current_user_id)
-                and not nearby_contribution_referent_requested(str(row.get("content") or ""))), default=0)
+                and not nearby_contribution_referent_requested(str(row.get("content") or ""))
+                and not _dependent_request_scope_candidate(str(row.get("content") or ""))), default=0)
             complete_pairs = []
             for pair in pairs:
                 users = (tuple(pair.get("users") or ()) if pair.get("_room_group")
@@ -1728,12 +1743,12 @@ def _resolve_nearby_contribution_referent(
             humans = tuple(row for row in chain if str(row.get("role") or "").lower() == "user")
             if (anchor_id and len(humans) > 1 and int(humans[0].get("id") or 0) == anchor_id
                     and all(int(row.get("user_id") or 0) == int(req.current_user_id) for row in humans)
-                    and all(_deictic_subset_requested(str(row.get("content") or "")) for row in humans[1:])
+                    and all(_dependent_request_scope_candidate(str(row.get("content") or "")) for row in humans[1:])
                     and all(str(row.get("role") or "").lower() == "user"
                             or int(row.get("id") or 0) in model_ids for row in chain)):
                 return _ReferentResolution(status="resolved", candidates=chain, selected=chain,
                     labels=_referent_candidate_labels(chain), reason="human_request_subset_chain")
-            for pair in pairs:
+            for pair in pairs if legacy_subset_requested else ():
                 if int(pair["model"].get("id") or 0) != int(latest.get("id") or 0):
                     continue
                 users = (tuple(pair.get("users") or ()) if pair.get("_room_group")
@@ -1750,7 +1765,7 @@ def _resolve_nearby_contribution_referent(
             # are history, not competing open requests. Exclude only complete
             # eligible pairs; another unpaired human or orphan model still
             # prevents selecting a unique request.
-            if (str(latest.get("role") or "").lower() == "user"
+            if (legacy_subset_requested and str(latest.get("role") or "").lower() == "user"
                     and int(latest.get("user_id") or 0) == int(req.current_user_id)):
                 eligible_ids = {int(row.get("id") or 0) for row in immediate}
                 completed_ids = set()
@@ -1769,9 +1784,13 @@ def _resolve_nearby_contribution_referent(
                 if len(open_rows) == 1:
                     return _ReferentResolution(status="resolved", candidates=(latest,), selected=(latest,),
                         labels=_referent_candidate_labels((latest,)), reason="single_request_subset")
-        return _ReferentResolution(status="ambiguous" if len(immediate) > 1 else "unresolved",
-            candidates=immediate, labels=_referent_candidate_labels(immediate),
-            reason="subset_request_not_uniquely_bound")
+        if legacy_subset_requested:
+            return _ReferentResolution(status="ambiguous" if len(immediate) > 1 else "unresolved",
+                candidates=immediate, labels=_referent_candidate_labels(immediate),
+                reason="subset_request_not_uniquely_bound")
+
+    if not legacy_referent_requested:
+        return _ReferentResolution()
 
     speaker_matches = tuple(
         row
