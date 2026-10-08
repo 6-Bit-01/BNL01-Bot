@@ -274,6 +274,77 @@ class FollowupPacketPromptTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT role FROM conversations WHERE channel_id=? ORDER BY id", (self.channel_id,))]
         self.assertEqual(roles, ["user", "user", "user", "model"])
 
+    async def test_qualified_same_track_credit_keeps_packet_support_without_saved_answers(self):
+        questions = (
+            "the jukebox goblin is checking the sleeve notes: which of my tracks have appeared in past shows? "
+            "Give me the full artist credits and show dates, without submitter names.",
+            "Which of those tracks includes a featured artist? Give me its show date too.",
+            "And for that same track, what is the full artist credit?",
+        )
+        answers = (
+            "The retained shows include Neutral Signal by 6 Bit on September 11, 2026, and "
+            "Neutral Collaboration by 6-Bit featuring Second Artist on September 25, 2026.",
+            "Neutral Collaboration includes Second Artist and appeared in the September 25, 2026 show.",
+            "The full artist credit for Neutral Collaboration is 6-Bit featuring Second Artist.",
+        )
+        expected_records = {
+            ("2026-09-11", "6 Bit", "Neutral Signal"),
+            ("2026-09-25", "6-Bit featuring Second Artist", "Neutral Collaboration"),
+        }
+        plans = []
+        for turn, (question, answer) in enumerate(zip(questions, answers), 1):
+            # Substitute only the external website boundary. The real persistence
+            # policy must leave human-only history for both subsequent turns.
+            website = (
+                "Website public read model context:\naccessScope=public\nPublic archive view available."
+                if turn < 3 else ""
+            )
+            with mock.patch.object(bot, "maybe_build_bnl_read_model_context", return_value=website):
+                prompt, basis, source_bases = await self.run_batch(question, answer)
+            with closing(sqlite3.connect(bot.DB_FILE)) as conn:
+                roles = [row[0] for row in conn.execute(
+                    "SELECT role FROM conversations WHERE channel_id=? ORDER BY id", (self.channel_id,))]
+            self.assertEqual(roles, ["user"] * turn + (["model"] if turn == 3 else []))
+            native = next(item for item in source_bases if isinstance(item, bot.FinalizedShowPromptSourceBasis))
+            self.assertIsNotNone(native.artist_identity_request)
+            self.assertEqual(tuple(subject.user_id for subject in native.artist_identity_request.frame_subjects), (42,))
+            show_items = [item for item in basis.packet.items if item.lane == "show_episode"]
+            self.assertEqual(len(show_items), 1)
+            for surface, source in (("native", native.rendered_context), ("packet", show_items[0].text)):
+                with self.subTest(turn=turn, surface=surface):
+                    records = set()
+                    for line in source.splitlines():
+                        if line.startswith("- Show "):
+                            show, _, payload = line.partition(": ")
+                            record = json.loads(payload)
+                            records.add((show.removeprefix("- Show "), record["projectLabel"], record["title"]))
+                    self.assertEqual(records, expected_records)
+            self.assertFalse(basis.packet.diagnostics.invalid_invariants)
+            self.assertTrue(basis.rendered_context)
+            self.assertIn(basis.rendered_context, prompt)
+            self.assertIn(questions[0], prompt)
+            if turn == 3:
+                self.assertIn(questions[1], native.selection_user_text)
+                self.assertIn(questions[1], prompt)
+                self.assertTrue(basis.assessment.situation_frame.exact_source_row_ids)
+            plans.append(prompt[prompt.index("TURN RESPONSE PLAN:"):].split("VISIBLE RESPONSE CONTRACT:", 1)[0])
+
+        # Validate each plan after exercising the whole sequence, so a root
+        # credit-clause regression cannot mask the dependent third-turn failure.
+        for turn, plan in enumerate(plans, 1):
+            task_lines = [line for line in plan.splitlines() if " | request=" in line]
+            self.assertTrue(task_lines, plan)
+            if turn == 1:
+                self.assertTrue(any("full artist credits" in task for task in task_lines), plan)
+            else:
+                self.assertEqual(len(task_lines), 2 if turn == 2 else 1, plan)
+            for task in task_lines:
+                with self.subTest(turn=turn, task=task):
+                    self.assertIn("authority=packet", task)
+                    self.assertIn("supportKind=packet", task)
+                    self.assertRegex(task, r'evidenceIds=\["E\d+')
+                    self.assertNotIn('evidenceIds=["PUBLIC"]', task)
+
     async def test_mismatched_frame_cannot_lend_resolved_artist_scope_to_current_request(self):
         self.save_human("Which of my tracks have appeared in past shows?")
         current = "Which of those tracks includes a featured artist, and what show date belongs to it?"

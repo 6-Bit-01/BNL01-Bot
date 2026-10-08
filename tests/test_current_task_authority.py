@@ -110,6 +110,39 @@ class SourceDependentTaskBindingTests(unittest.TestCase):
         )
         return context, frame
 
+    def test_same_sentence_scope_qualifier_reaches_task_authority(self):
+        for text in (
+            "And for that same track, what is the full artist credit?",
+            "For that same track: what is the full artist credit?",
+            "And for that same track: what is the full artist credit?",
+        ):
+            with self.subTest(text=text):
+                _context, frame = self.context_and_frame(text)
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertTrue(source_dependent_task_texts(frame, current_text=text))
+        independent = "That same track was interesting. Where is Seattle?"
+        _context, frame = self.context_and_frame(independent)
+        self.assertEqual(frame.tasks[0].authority_scope, "external_public")
+        self.assertEqual(source_dependent_task_texts(frame, current_text=independent), ())
+
+    def test_coordinated_show_date_field_does_not_create_a_new_imperative(self):
+        for text in (
+            "Give me the full artist credits and show dates.",
+            "Give me the full artist credits, show dates.",
+        ):
+            with self.subTest(text=text):
+                _context, frame = self.context_and_frame(text)
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+        for text in (
+            "Give me the full artist credits and show me how a clock works.",
+            "Give me the full artist credits. Show dates.",
+        ):
+            with self.subTest(text=text):
+                _context, frame = self.context_and_frame(text)
+                self.assertEqual(len(frame.tasks), 2)
+
     def test_complete_current_request_is_independent_of_its_old_exact_source(self):
         for text in (
             "What's up?",

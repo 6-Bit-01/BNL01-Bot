@@ -443,6 +443,11 @@ _TASK_SEGMENT_START_RE = re.compile(
     % _TASK_LEAD_RE.pattern,
     re.I,
 )
+_TASK_SCOPE_PREFIX_RE = re.compile(
+    r"^(?:(?:and|also|plus|then)\s+)?"
+    r"(?:for|in|from|during|about|regarding|concerning|as\s+for)\b",
+    re.I,
+)
 _ELLIPTICAL_EVALUATION_RE = re.compile(
     r"^\s*(?:"
     r"what(?:['’]s|\s+is|\s+are)\s+your\s+(?:own\s+)?"
@@ -860,10 +865,7 @@ def _situation_task_parts(
                 r"(?:(?:one|ones)\s+)?(?:of\s+)?(?:these|those|them)\b)",
                 question, re.I,
             )
-            explicit_scope = re.match(
-                r"^(?:for|in|from|during|about|regarding|concerning|as\s+for)\b",
-                prefix.strip(), re.I,
-            )
+            explicit_scope = _TASK_SCOPE_PREFIX_RE.match(prefix.strip())
             if (dependent or explicit_scope) and not re.search(r"[.!?]", prefix):
                 return start
             return question_start
@@ -874,6 +876,18 @@ def _situation_task_parts(
     for match in boundary.finditer(value):
         if any(quote_start <= match.start() < quote_end
                for quote_start, quote_end in quoted_spans):
+            continue
+        if (
+            not re.search(r"[.!?;\n]", match.group())
+            and re.match(r"show\s+dates?\b", value[match.end():], re.I)
+            and re.match(
+                r"^(?:(?:briefly|please|quickly|first)\s+)*(?:give|list)\b",
+                normalized_segment(start, match.start()), re.I,
+            )
+        ):
+            # A coordinated output field ("credits and show dates") is a
+            # noun phrase, not a new imperative. "Show me ..." and a new
+            # sentence still begin their own task.
             continue
         if value[start:match.start()].strip(" ,;.!?"):
             ranges.append((start, match.start()))
@@ -907,6 +921,15 @@ def _situation_task_parts(
         scoped_clause = _publication_task_continuation(
             clause, setup or previous_clause,
         )
+        if (
+            setup
+            and _TASK_SCOPE_PREFIX_RE.match(setup)
+            and not re.search(r"[.!?;\n]", value[start:task_start])
+        ):
+            # Keep a locally attached qualifier for the task's authority.
+            # Earlier statements remain background, even if they mention
+            # "that same" item. The action text itself stays unchanged.
+            scoped_clause = "%s, %s" % (setup, clause)
         parts.append((full_segment, scoped_clause, clause))
         previous_clause = scoped_clause
     return tuple(parts) or ((str(text or ""),) * 3,)
@@ -1120,7 +1143,7 @@ def source_dependent_task_texts(
                 and (
                     _CONVERSATION_CONTEXT_TASK_RE.search(action_clause)
                     or _EXACT_REPLY_CONTINUITY_RE.search(action_clause)
-                    or dependent_request_scope_candidate(action_clause)
+                    or dependent_request_scope_candidate(scoped_clause)
                 )
                 and not _VOLATILE_EXTERNAL_RE.search(action_clause)
             )
