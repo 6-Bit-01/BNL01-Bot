@@ -7415,7 +7415,10 @@ def _packet_invariants(
                 and item.attribution_mode == "first_party_record"
                 and item.usage == "authoritative_show_chronology"
                 and item.uncertainty_status
-                == "recorded_public_operations_only"
+                in {
+                    "recorded_public_operations_only",
+                    "bounded_retained_artist_credits",
+                }
                 or item.source_type == "barcode_show_engagement_projection"
                 and item.source_class == SourceClass.EVIDENCE_PROJECTION.value
                 and item.attribution_mode == "measured_platform_projection"

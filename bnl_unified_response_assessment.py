@@ -26,6 +26,7 @@ from bnl_canon_source_contract import BNL01, CANON_ENTITY_IDENTITIES
 from bnl_conversation_context_v2 import (
     CURRENT_TURN_NAMED_PAYLOAD_RE,
     assess_payload_grounding,
+    dependent_request_scope_candidate,
     nearby_contribution_referent_requested,
     publication_continuation_requested,
     publication_reference_context,
@@ -1119,6 +1120,7 @@ def source_dependent_task_texts(
                 and (
                     _CONVERSATION_CONTEXT_TASK_RE.search(action_clause)
                     or _EXACT_REPLY_CONTINUITY_RE.search(action_clause)
+                    or dependent_request_scope_candidate(action_clause)
                 )
                 and not _VOLATILE_EXTERNAL_RE.search(action_clause)
             )
@@ -1308,7 +1310,10 @@ def _situation_tasks(
             authority_scope = "current_request"
         elif (
             exact_reply_resolved
-            and _EXACT_REPLY_CONTINUITY_RE.search(segment)
+            and (
+                _EXACT_REPLY_CONTINUITY_RE.search(segment)
+                or dependent_request_scope_candidate(segment)
+            )
             and not _VOLATILE_EXTERNAL_RE.search(segment)
         ):
             authority_scope = "packet"
