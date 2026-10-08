@@ -4358,13 +4358,36 @@ def build_tiktok_show_evidence_context_for_turn(
     if member_selection_query != user_text:
         selection_query = member_selection_query
         candidate_context = True
+    dependent_show_tasks = source_dependent_task_texts(
+        situation_frame, current_text=user_text,
+    )
+    current_request_tasks = situation_request_texts(
+        situation_frame, current_text=user_text,
+    )
+    resolved_show_dependency = bool(
+        conversation_context_result is not None
+        and conversation_context_result.referent_status == "resolved"
+        and dependent_show_tasks
+        and current_request_tasks is not None
+        and not any(
+            broad_show_history_requested(task, include_community_baseline=False)
+            or finalized_show_packet_owner_requested(
+                task, "Durable BARCODE Radio show episode memory:"
+            )
+            for task in current_request_tasks if task not in dependent_show_tasks
+        )
+    )
     if (
         conversation_basis is not None
         and (member_selection_query == user_text or (
             conversation_context_result is not None and conversation_context_result.referent_status == "resolved"))
         and (not continuation_selection_query or (
             conversation_context_result is not None and conversation_context_result.referent_status == "resolved"))
-        and not broad_show_history_requested(user_text, include_community_baseline=False)
+        # A recognized show topic does not reset a proved conversational
+        # dependency (for example, "which of those tracks is featured?").
+        # The current task still owns explicit dates, subjects and live state.
+        and (resolved_show_dependency or not broad_show_history_requested(
+            user_text, include_community_baseline=False))
         and not image_queries
         and conversation_context_result is not None
         and conversation_context_result.thread_focus_mode
@@ -4373,9 +4396,9 @@ def build_tiktok_show_evidence_context_for_turn(
         and int(subject_user_id or 0) > 0
         and conversation_basis.current_user_id == int(subject_user_id)
         and conversation_basis.guild_id == int(guild_id)
-        and not finalized_show_packet_owner_requested(
+        and (resolved_show_dependency or not finalized_show_packet_owner_requested(
             user_text, "Durable BARCODE Radio show episode memory:"
-        )
+        ))
         and not is_live_show_reaction_query(user_text)
         and not _current_queue_state_query(user_text)
     ):
