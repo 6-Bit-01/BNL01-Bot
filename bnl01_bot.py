@@ -4395,11 +4395,24 @@ def build_tiktok_show_evidence_context_for_turn(
                 item for item in source_items
                 if item.source_id in selected_row_ids
             )
+        subset_chain_root = (
+            min((item.source_id for item in source_items), default=0)
+            if conversation_context_result.referent_status == "resolved"
+            and conversation_context_result.referent_reason == "human_request_subset_chain"
+            else 0
+        )
+        dependent_queries = []
         for item in sorted(
             source_items,
             key=lambda item: item.source_id,
             reverse=True,
         ):
+            if (subset_chain_root and item.source_id != subset_chain_root
+                    and item.speaker_user_id == int(subject_user_id)):
+                # Context proved this same-author chain. Preserve its human
+                # constraints while the original request owns artist identity.
+                dependent_queries.append(item.text)
+                continue
             if (
                 item.speaker_user_id == int(subject_user_id)
                 and (
@@ -4413,7 +4426,7 @@ def build_tiktok_show_evidence_context_for_turn(
                     )
                 )
             ):
-                selection_query = tiktok_show_evidence_query + "\n" + item.text
+                selection_query = "\n".join((tiktok_show_evidence_query, item.text, *reversed(dependent_queries)))
                 candidate_context = True
                 if (
                     conversation_context_result.referent_status == "resolved"
@@ -4439,6 +4452,14 @@ def build_tiktok_show_evidence_context_for_turn(
                         current_speaker_user_ids=(int(subject_user_id),),
                         exact_source_row_ids=(item.source_id,), response_act="answer",
                     )
+                    if subset_chain_root:
+                        prior_temporal_scope = next((query for query in dependent_queries
+                            if requested_show_dates(query) or requested_history_window(query)), "")
+                        if prior_temporal_scope:
+                            # Project the latest human selector as retrieval intent.
+                            # Full earlier questions remain in governed Context;
+                            # their dates must not be unioned into this selection.
+                            selection_query = "Songs submitted to past shows: " + prior_temporal_scope
                     tiktok_show_evidence_query = selection_query
                 break
             if (
