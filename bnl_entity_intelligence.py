@@ -773,8 +773,20 @@ def _should_extract_named_topics_from_row(row: dict[str, Any]) -> bool:
     return row.get("scope") in STRONG_SUBJECT_SCOPES
 
 
-def _collect_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, max_rows: int) -> list[dict[str, Any]]:
+def _collect_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, max_rows: int, *, aliases: list[str] | None = None, source_read_snapshot: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    from bnl_entity_evidence import (
+        PUBLIC_CONVERSATION_POLICIES,
+        _conversation_author_matches_subject,
+        _conversation_match_labels,
+        _source_read_reference,
+        _source_row_id,
+        contains_subject_mention,
+        conversation_source_fingerprint,
+        validate_entity_evidence_source,
+    )
+
     skey = subject_key(subject)
+    match_labels = _conversation_match_labels(subject, skey, aliases)
     rows: list[dict[str, Any]] = []
     matched_ids: set[int] = set()
     scope_counts: Counter[str] = Counter()
@@ -786,14 +798,14 @@ def _collect_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, 
         params = (guild_id,) if where else ()
         for r in conn.execute(f"SELECT {', '.join(select)} FROM user_profiles{where} LIMIT ?", (*params, max_rows * 3)):
             d = dict(r)
-            if any(_exact_subject_name_match(d.get(k), subject) for k in ("display_name", "preferred_name")):
+            if _conversation_author_matches_subject(d, match_labels):
                 uid = _safe_int(d.get("user_id"))
                 if uid is not None:
                     matched_ids.add(uid)
     known_names = _known_entity_names(conn, guild_id, subject)
     table_cols = {
-        "conversations": ["id", "rowid", "user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "guild_id", "channel_name", "channel_policy", "role", "content", "timestamp"],
-        "entity_evidence_events": ["id", "guild_id", "subject_key", "subject_name", "source_type", "source_table", "source_row_id", "channel_name", "channel_policy", "visibility", "authority", "safe_summary", "topic", "dossier_relevance", "public_safe_candidate", "review_only", "raw_ref_json", "created_at", "observed_at"],
+        "conversations": ["id", "rowid", "user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "guild_id", "channel_id", "channel_name", "channel_policy", "role", "content", "timestamp", "created_at"],
+        "entity_evidence_events": ["id", "guild_id", "subject_key", "subject_name", "matched_user_id", "relation_to_subject", "evidence_kind", "source_type", "source_table", "source_row_id", "channel_name", "channel_policy", "visibility", "authority", "safe_summary", "topic", "dossier_relevance", "public_safe_candidate", "review_only", "raw_ref_json", "created_at", "observed_at"],
         "relationship_journal": ["id", "user_id", "guild_id", "entry_type", "summary", "timestamp"],
         "relationship_state": ["user_id", "guild_id", "trust_stage", "social_stance", "last_topic", "updated_at"],
         "memory_tiers": ["id", "user_id", "guild_id", "tier", "summary", "mentions", "updated_at", "source_trust", "source_channel_policy"],
@@ -816,9 +828,34 @@ def _collect_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, 
             d = dict(r)
             text = _row_text(table, d)
             scope, scope_reason = _subject_row_scope(table, d, subject, skey, matched_ids, known_names)
+            if scope == "rejected" and table == "conversations":
+                if _conversation_author_matches_subject(d, match_labels):
+                    scope, scope_reason = "subject_authored", "conversation author matched current confirmed subject labels"
+                elif contains_subject_mention(text, subject, aliases):
+                    scope, scope_reason = "subject_co_mention", "conversation mentions current confirmed subject label"
             scope_counts[scope] += 1
             if scope == "rejected":
                 continue
+            reference = None
+            if table == "entity_evidence_events" and d.get("source_table") == "conversations":
+                decision = validate_entity_evidence_source(conn, d, subject, guild_id, aliases=aliases)
+                if not decision["eligible"]:
+                    continue
+                reference = _source_read_reference(d, decision["sourceFingerprint"])
+            elif table == "conversations":
+                policy = str(d.get("channel_policy") or "unknown").strip().lower() or "unknown"
+                event = {
+                    "guild_id": d.get("guild_id"), "subject_name": subject, "subject_key": skey,
+                    "source_type": "conversation", "source_table": "conversations", "source_row_id": _source_row_id(d),
+                    "relation_to_subject": "authored" if scope == "subject_authored" else "mentioned",
+                    "channel_policy": policy, "public_safe_candidate": policy in PUBLIC_CONVERSATION_POLICIES,
+                    "review_only": policy not in PUBLIC_CONVERSATION_POLICIES,
+                    "raw_ref_json": {"source_fingerprint": conversation_source_fingerprint(d)},
+                }
+                decision = validate_entity_evidence_source(conn, event, subject, guild_id, aliases=aliases)
+                if not decision["eligible"]:
+                    continue
+                reference = _source_read_reference(event, decision["sourceFingerprint"])
             visibility, authority, public_safe, review_only = _visibility_for_source(table, d)
             if scope in {"global_mixed_memory", "source_blind_global"}:
                 visibility, authority, public_safe, review_only = "source_blind", "source_blind_memory", False, True
@@ -842,6 +879,8 @@ def _collect_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, 
                 "public_safe": public_safe,
                 "review_only": review_only,
             })
+            if source_read_snapshot is not None and reference is not None:
+                source_read_snapshot.append(reference)
             if len(rows) >= max_rows:
                 rows[0]["_scope_counts"] = dict(scope_counts)
                 return rows
@@ -1215,7 +1254,7 @@ def _upsert_question(conn: sqlite3.Connection, guild_id: int | None, skey: str, 
     """, (guild_id, skey, question, reason, priority, ts, ts))
 
 
-def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subject: str, *, refresh: bool = False, max_rows: int = 240) -> dict[str, Any]:
+def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subject: str, *, refresh: bool = False, max_rows: int = 240, aliases: list[str] | None = None, source_read_snapshot: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     subject = safe_text(subject, 90) or "Unknown subject"
     skey = subject_key(subject)
     conn = sqlite3.connect(db_path)
@@ -1223,7 +1262,7 @@ def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subjec
     try:
         ensure_entity_intelligence_schema(conn)
         logging.info("entity_intelligence_profile_started subject_key=%s", skey)
-        rows = _collect_rows(conn, subject, guild_id, max_rows)
+        rows = _collect_rows(conn, subject, guild_id, max_rows, aliases=aliases, source_read_snapshot=source_read_snapshot)
         classified = _classify(subject, rows)
         scope_counts = classified.get("scopeCounts") or {}
         logging.info(

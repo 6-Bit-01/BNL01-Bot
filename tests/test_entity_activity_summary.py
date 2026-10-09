@@ -43,6 +43,11 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
     def _summary(self, subject="Crow"):
         return entity.build_entity_activity_summary(self.db, subject, guild_id=1)
 
+    def _conversation_fingerprint(self, row_id):
+        cursor = self.conn.execute("SELECT rowid AS _rowid, * FROM conversations WHERE id=?", (row_id,))
+        row = cursor.fetchone()
+        return evidence.conversation_source_fingerprint(dict(zip((column[0] for column in cursor.description), row)))
+
 
     def test_entity_evidence_schema_created_safely(self):
         evidence.ensure_entity_evidence_schema(self.conn)
@@ -90,6 +95,9 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertTrue(any("research-and-development" in raw_ref for raw_ref in raw_refs))
 
     def test_entity_activity_summary_prefers_structured_evidence_events(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (99,42,'Crow',1,'finished-tracks','public_home','user',?,'now')",
+                          ("raw private-ish transcript 123456789012345678",))
         evidence.ensure_entity_evidence_schema(self.conn)
         evidence.upsert_entity_evidence_event(
             self.conn, guild_id=1, subject_name="Crow", source_type="conversation", source_table="conversations",
@@ -98,7 +106,7 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
             relation_to_subject="authored", topic="source-file/dossier planning context", evidence_kind="authored_public_conversation",
             safe_summary="Subject authored approved public-side conversation about dossier/source-file behavior.",
             public_safe_candidate=True, review_only=False, music_signal=True, community_signal=True, bnl_interaction=True,
-            dossier_relevance="candidate_after_owner_review", raw_ref_json={"table": "conversations", "row_id": 99, "content": "raw private-ish transcript 123456789012345678"},
+            dossier_relevance="candidate_after_owner_review", raw_ref_json={"table": "conversations", "row_id": 99, "content": "raw private-ish transcript 123456789012345678", "source_fingerprint": self._conversation_fingerprint(99)},
             observed_at="now",
         )
         self.conn.execute("INSERT INTO conversations VALUES (100,7,'Other',1,'general','public_home','user','Crow loose fallback text should not appear when structured evidence exists.','now')")
@@ -115,6 +123,9 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertIn(entity.QUEUE_NOT_CONNECTED_NOTE, summary["notPublicYet"])
 
     def test_ranked_evidence_prioritizes_public_conversation_over_bulk_source_blind(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (98,42,'Crow',1,'barcode-bot','public_context','user',?,'2026-06-01T00:00:00')",
+                          ("raw transcript 123456789012345678",))
         evidence.ensure_entity_evidence_schema(self.conn)
         for idx in range(12):
             evidence.upsert_entity_evidence_event(
@@ -127,28 +138,31 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
             )
         evidence.upsert_entity_evidence_event(
             self.conn, guild_id=1, subject_name="Crow", source_type="conversation", source_table="conversations",
-            source_row_id="older-public", source_label="conversations/public_discord_observed", channel_name="barcode-bot",
+            source_row_id="98", source_label="conversations/public_discord_observed", channel_name="barcode-bot",
             channel_policy="public_context", visibility="public_side", authority="channel_policy_observed", confidence=0.72,
             relation_to_subject="authored", topic="source-file/dossier planning context", evidence_kind="authored_public_conversation",
             safe_summary="Subject authored approved public-side conversation about BNL/source-file/dossier handling.",
-            public_safe_candidate=True, review_only=False, bnl_interaction=True, raw_ref_json={"content": "raw transcript 123456789012345678"}, observed_at="2026-06-01T00:00:00",
+            public_safe_candidate=True, review_only=False, bnl_interaction=True, raw_ref_json={"content": "raw transcript 123456789012345678", "source_fingerprint": self._conversation_fingerprint(98)}, observed_at="2026-06-01T00:00:00",
         )
         self.conn.commit()
 
         ranked = evidence.get_ranked_entity_evidence_for_subject(self.conn, "Crow", guild_id=1, limit=3)
 
         self.assertEqual(ranked[0]["evidence_kind"], "authored_public_conversation")
-        self.assertEqual(ranked[0]["source_row_id"], "older-public")
+        self.assertEqual(ranked[0]["source_row_id"], "98")
 
     def test_source_blind_is_capped_deduped_and_best_review_uses_safe_summaries(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (97,7,'Other',1,'barcode-bot','public_context','user',?,'2026-06-02')",
+                          ("Crow VERY RAW TRANSCRIPT 123456789012345678",))
         evidence.ensure_entity_evidence_schema(self.conn)
         evidence.upsert_entity_evidence_event(
             self.conn, guild_id=1, subject_name="Crow", source_type="conversation", source_table="conversations",
-            source_row_id="public-1", source_label="conversations/public_discord_observed", channel_name="barcode-bot",
+            source_row_id="97", source_label="conversations/public_discord_observed", channel_name="barcode-bot",
             channel_policy="public_context", visibility="public_side", authority="channel_policy_observed", confidence=0.8,
             relation_to_subject="mentioned", topic="source-file/dossier planning context", evidence_kind="mentioned_public_conversation",
             safe_summary="Subject was mentioned in approved public-side conversation as a possible source-file candidate.",
-            public_safe_candidate=True, review_only=False, community_signal=True, raw_ref_json={"content": "VERY RAW TRANSCRIPT 123456789012345678"}, observed_at="2026-06-02",
+            public_safe_candidate=True, review_only=False, community_signal=True, raw_ref_json={"content": "Crow VERY RAW TRANSCRIPT 123456789012345678", "source_fingerprint": self._conversation_fingerprint(97)}, observed_at="2026-06-02",
         )
         for idx in range(6):
             evidence.upsert_entity_evidence_event(
@@ -191,6 +205,33 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertIn(entity.QUEUE_NOT_CONNECTED_NOTE, formatted)
         for forbidden in ("websiteIngest", "dossierCreated", "published", "payment", "artistAccount", "ambient", "publicDiscordPost"):
             self.assertNotIn(forbidden, json.dumps(summary))
+
+    def test_public_output_preserves_public_evidence_without_raw_refs_or_private_intelligence(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (1,42,'Crow',1,'finished-tracks','public_home','user',?,'2026-06-01')",
+                          ("Crow shares a public music track and radio show context.",))
+        self.conn.executemany("INSERT INTO conversations VALUES (?,42,'Crow',1,'research-and-development','internal_controlled','user',?,'2026-06-02')", [
+            (2, "Crow internal PRIVATE_REVIEW_BALSAM mentions Obsidian Lantern through Crow with BNL."),
+            (3, "Crow private PRIVATE_REVIEW_BALSAM repeats Obsidian Lantern through Crow with BNL."),
+        ])
+        self.conn.commit()
+        evidence.derive_entity_evidence_for_subject(self.db, "Crow", guild_id=1)
+
+        admin = self._summary()
+        self.assertTrue("PRIVATE_REVIEW_BALSAM" in json.dumps(admin["rawProvenance"]),
+                        "Authorized current internal evidence must remain in admin raw provenance")
+        public = entity.build_entity_activity_summary(self.db, "Crow", guild_id=1, output_mode="public")
+        fragments = public["rawProvenance"]["rawFragments"]
+        self.assertTrue(any(fragment.get("evidenceKind") == "authored_public_conversation"
+                            and str(fragment.get("rowId")) == "1" for fragment in fragments),
+                        "Public output lost the current public conversation evidence")
+        self.assertTrue(bool(public["conversationHighlights"]), "Public conversation readout must remain available")
+        for forbidden_key in ("rawRefJson", "snippet"):
+            self.assertFalse(any(forbidden_key in fragment for fragment in fragments),
+                             "Public raw fragments retained " + forbidden_key)
+        serialized = json.dumps(public, sort_keys=True)
+        for marker in ("PRIVATE_REVIEW_BALSAM", "Obsidian Lantern", "research-and-development"):
+            self.assertFalse(marker in serialized, "Public output retained private evidence: " + marker)
 
     def test_entity_summary_finds_local_profile_match(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
@@ -551,7 +592,7 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
             relation_to_subject="authored", topic="community context", evidence_kind="authored_public_conversation",
             safe_summary="Subject authored approved public-side conversation. Possible Reviewed Evidence Tool Platform Source Context.",
             public_safe_candidate=True, review_only=False, music_signal=False, community_signal=True, bnl_interaction=True,
-            dossier_relevance="candidate_after_owner_review", raw_ref_json={"table": "conversations", "row_id": 576, "snippet": "Orion here"},
+            dossier_relevance="candidate_after_owner_review", raw_ref_json={"table": "conversations", "row_id": 576, "snippet": "Crow says tiny snippet is not enough.", "source_fingerprint": self._conversation_fingerprint(576)},
             observed_at="now",
         )
         self.conn.commit()
@@ -560,7 +601,7 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
 
         self.assertNotIn("Recurring named topic", normal_text)
-        self.assertNotIn("Orion here", normal_text)
+        self.assertNotIn("Crow says tiny snippet is not enough.", normal_text)
         for garbage in ("Possible appears", "Reviewed appears", "Evidence appears", "Tool appears", "Platform appears", "Source appears", "Context appears"):
             self.assertNotIn(garbage, normal_text)
         self.assertNotIn("raw_ref_json", normal_text)
