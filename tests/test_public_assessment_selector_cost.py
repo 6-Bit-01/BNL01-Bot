@@ -100,6 +100,7 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
         message_id,
         source_text,
         observed_at,
+        channel_id=10,
     ):
         self._ensure_journal_receipt_schema()
         observed = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
@@ -123,7 +124,7 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
                 str(message_id),
                 int(observed.timestamp() * 1000),
                 int(observed.timestamp() * 1000) + 1,
-                10,
+                int(channel_id),
                 "public_home",
                 self.SUBJECT_KEY,
                 self.USER_NAME,
@@ -143,6 +144,7 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
         source_sequence_domain="row",
         text=None,
         route_mode="normal_chat",
+        channel_id=10,
     ):
         message_id = 1_000_000 + int(row_id)
         source_sequence = (
@@ -167,7 +169,7 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
                 self.USER_NAME,
                 "user",
                 source_text,
-                10,
+                int(channel_id),
                 "barcode-bot",
                 "public_home",
                 message_id,
@@ -185,7 +187,7 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
             guild_id=self.GUILD_ID,
             role="user",
             content=source_text,
-            channel_id=10,
+            channel_id=int(channel_id),
             channel_name="barcode-bot",
             channel_policy="public_home",
             message_id=message_id,
@@ -200,6 +202,7 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
                 message_id=message_id,
                 source_text=source_text,
                 observed_at=observed_at,
+                channel_id=channel_id,
             )
         return result.entry_id
 
@@ -268,6 +271,121 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
 
         self.assertEqual(expanded, original)
         self.assertLess(expanded_steps, original_steps * 2 + 10_000)
+
+    def test_occurrence_author_cost_is_bounded_with_retained_participant_history(self):
+        base = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        for row_id in range(1, 81):
+            self._add_source(
+                row_id,
+                observed_at=(base + timedelta(hours=row_id)).isoformat(),
+            )
+
+        def read_candidates():
+            return ledger._main_public_assessment_occurrence_candidates(
+                self.conn,
+                guild_id=self.GUILD_ID,
+                subject_key=self.SUBJECT_KEY,
+                channel_id=10,
+                channel_policy="public_home",
+                max_observed_at=(base + timedelta(hours=80)).isoformat(),
+            )
+
+        original = read_candidates()
+        self.assertEqual(len(original), ledger._CONVERSATION_OCCURRENCE_MAX_SCAN + 1)
+        # Matching participant-index prefixes outside this channel must not
+        # make every candidate's exact author check scan the member's history.
+        for row_id in range(1001, 5001):
+            self._add_source(
+                row_id,
+                observed_at=(base - timedelta(minutes=row_id)).isoformat(),
+                channel_id=11,
+            )
+        # Put target authors after the retained history in the broad index's
+        # rowid tie order; early matches would conceal the expensive plan.
+        authors = self.conn.execute(
+            """SELECT entry_id,guild_id,participant_key,display_name,
+                      participant_role,order_index,created_at
+               FROM memory_ledger_participants
+               WHERE entry_id IN (
+                 SELECT entry_id FROM memory_ledger_entries WHERE channel_id=10
+               )"""
+        ).fetchall()
+        self.conn.executemany(
+            "DELETE FROM memory_ledger_participants WHERE entry_id=?",
+            ((row[0],) for row in authors),
+        )
+        self.conn.executemany(
+            "INSERT INTO memory_ledger_participants VALUES (?,?,?,?,?,?,?)",
+            authors,
+        )
+        self.conn.commit()
+        ticks = [0]
+
+        def progress():
+            ticks[0] += 1
+            return 0
+
+        self.conn.set_progress_handler(progress, 1000)
+        try:
+            expanded = read_candidates()
+        finally:
+            self.conn.set_progress_handler(None, 0)
+        self.assertEqual(expanded, original)
+        self.assertLess(
+            ticks[0] * 1000,
+            350_000,
+            "Exact author lookups must not repeatedly scan retained participant history",
+        )
+
+    def test_occurrence_candidates_keep_exact_author_controls(self):
+        base = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        entry_ids = [
+            self._add_source(
+                row_id,
+                observed_at=(base + timedelta(hours=row_id)).isoformat(),
+            )
+            for row_id in range(1, 4)
+        ]
+        candidate_id = entry_ids[1]
+
+        def candidates():
+            return ledger._main_public_assessment_occurrence_candidates(
+                self.conn,
+                guild_id=self.GUILD_ID,
+                subject_key=self.SUBJECT_KEY,
+                channel_id=10,
+                channel_policy="public_home",
+                max_observed_at=(base + timedelta(hours=3)).isoformat(),
+            )
+
+        original = candidates()
+        self.assertEqual([row[0] for row in original], list(reversed(entry_ids)))
+        mutations = (
+            ("wrong_guild", "UPDATE memory_ledger_participants SET guild_id=2 WHERE entry_id=?"),
+            ("wrong_subject", "UPDATE memory_ledger_participants SET participant_key='discord_user:99' WHERE entry_id=?"),
+            ("wrong_role", "UPDATE memory_ledger_participants SET participant_role='observer' WHERE entry_id=?"),
+            ("wrong_order", "UPDATE memory_ledger_participants SET order_index=1 WHERE entry_id=?"),
+            ("wrong_label", "UPDATE memory_ledger_participants SET display_name='Test Member' WHERE entry_id=?"),
+            ("missing_author", "DELETE FROM memory_ledger_participants WHERE entry_id=?"),
+            ("extra_participant", "INSERT INTO memory_ledger_participants SELECT entry_id,guild_id,'discord_user:99','Test Member','observer',1,created_at FROM memory_ledger_participants WHERE entry_id=?"),
+        )
+        for label, sql in mutations:
+            with self.subTest(label=label):
+                self.conn.execute("SAVEPOINT author_mutation")
+                try:
+                    self.conn.execute(sql, (candidate_id,))
+                    self.assertEqual(
+                        candidates(),
+                        [row for row in original if row[0] != candidate_id],
+                    )
+                finally:
+                    self.conn.execute("ROLLBACK TO author_mutation")
+                    self.conn.execute("RELEASE author_mutation")
+        self.conn.execute(
+            "UPDATE memory_ledger_participants SET participant_role='Author' WHERE entry_id=?",
+            (candidate_id,),
+        )
+        self.assertEqual(candidates(), original)
 
     def test_selector_cost_is_bounded_for_221_retained_rows(self):
         base = datetime(2026, 7, 1, tzinfo=timezone.utc)
