@@ -11162,7 +11162,10 @@ async def maybe_handle_source_file_refresh_command(message: discord.Message, cle
     subject = str(options.get("subject") or "").strip()
     if action == "clear":
         cleared = await asyncio.to_thread(clear_source_file_refresh, DB_FILE, guild_id=guild_id, subject_name=subject)
-        await message.reply(f"Source refresh queue cleared for {subject}: {cleared} active row(s) marked skipped.")
+        if cleared:
+            await message.reply(f"Source refresh queue cleared for {subject}: {cleared} pending row(s) marked skipped.")
+        else:
+            await message.reply(f"No pending Source File refresh rows were cleared for {subject}. Busy, running or uncertain work was left untouched.")
         return True
     if action == "subject":
         summary = await asyncio.to_thread(
