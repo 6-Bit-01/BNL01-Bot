@@ -36,7 +36,12 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Verify source and tests
-        run: make check PYTHON=python
+        run: |
+          set -o pipefail
+          make check PYTHON=python 2>&1 | awk '
+            /^=+$/ || /^\*\*\* Error compiling/ { failed_output=1 }
+            failed_output || /^Ran [0-9]+ tests in / || /^OK/ || /^FAILED/ || /^make: / { print }
+          '
 
   sqlite-legacy-runtime-cleanup:
     runs-on: ubuntu-latest
