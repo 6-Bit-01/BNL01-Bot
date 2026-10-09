@@ -6,6 +6,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
 import tempfile
 import unittest
 import urllib.error
+from types import SimpleNamespace
 from unittest import mock
 
 import bnl01_bot
@@ -62,6 +63,143 @@ class ContractV2Tests(unittest.TestCase):
             c.map_source_class("mystery")
         with self.assertRaises(c.ContractV2Error):
             c.map_trigger("mystery")
+
+    def test_engagement_source_uses_existing_public_memory_contract(self):
+        try:
+            envelope = c.build_relay_envelope(
+                "bnl-engagement-0001", "Captured platform measurements.",
+                "Consider the original collection period.", "tiktok_live_engagement", "scheduled",
+            )
+        except c.ContractV2Error as exc:
+            self.fail("An existing public engagement source needs contract support: %s" % exc)
+        self.assertEqual(envelope["relay"]["sourceClass"], "public_safe_memory")
+        with self.assertRaisesRegex(c.ContractV2Error, "unknown_source_class"):
+            c.map_source_class("unrecognized_platform_measurement")
+
+    def test_unknown_source_is_failed_transaction_without_cursor_or_pending_save(self):
+        decision = bnl01_bot.WebsiteRelayDecision(
+            True, eventType="unrecognized_platform_measurement", sourceCursor=8,
+            message="A fictional candidate.", directive="Consider the source.",
+            metadata={"source_class": "unrecognized_platform_measurement"},
+        )
+        with tempfile.NamedTemporaryFile() as f, \
+             mock.patch.object(bnl01_bot, "DB_FILE", f.name), \
+             mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "2"), \
+             mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value={"websiteRelayEnabled": True}), \
+             mock.patch.object(bnl01_bot, "_generate_website_relay_guarded", new=mock.AsyncMock(return_value=decision)), \
+             mock.patch.object(bnl01_bot, "_publish_relay_candidate") as publish:
+            state.bootstrap_cursor(f.name, 42, 7)
+            try:
+                result = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, attempt_id="contract-fail"))
+            except c.ContractV2Error as exc:
+                self.fail("Contract rejection escaped its transaction boundary: %s" % exc)
+            self.assertFalse(result.publish)
+            self.assertEqual(result.skipReason, "website_post_failed")
+            self.assertEqual(result.metadata["reason"], "unknown_source_class")
+            self.assertEqual(result.metadata["prepared_relay_id"], "")
+            self.assertEqual(state.get_cursor(f.name, 42), 7)
+            self.assertEqual(state.get_pending_v2_publication(f.name, 42), {})
+            self.assertEqual(state.recent_history(f.name, 42), [])
+            attempt = state.get_attempt(f.name, "contract-fail")
+            self.assertEqual((attempt["outcome"], attempt["reason"]),
+                             ("delivery_failed", "unknown_source_class"))
+            publish.assert_not_called()
+
+    def test_engagement_transaction_keeps_original_basis_and_refreshes_before_delivery(self):
+        basis = [{
+            "sourceKind": "tiktok_live_engagement", "sourceId": "fictional-collection-period",
+            "sourceVersion": "fixture-source-digest",
+            "originalSourceRefs": [{"sourceKind": "tiktok_live_engagement",
+                                    "sourceKey": "fixture-like-event", "contentHash": "fixture-content-digest"}],
+        }]
+        decision = bnl01_bot.WebsiteRelayDecision(
+            True, eventType="tiktok_live_engagement", sourceCursor=7,
+            message="The captured collection period recorded platform engagement.",
+            directive="Consider what the historical measurement can support.",
+            metadata={"source_class": "tiktok_live_engagement", "shared_source_provenance": basis},
+        )
+        sent = []
+
+        def accepted(req, timeout=10):
+            sent.append(json.loads(req.data))
+            return Resp(200, accepted_body(sent[-1]))
+
+        with tempfile.NamedTemporaryFile() as f, \
+             mock.patch.object(bnl01_bot, "DB_FILE", f.name), \
+             mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "2"), \
+             mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"), \
+             mock.patch.object(bnl01_bot, "BNL_API_KEY", "test-key"), \
+             mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value={"websiteRelayEnabled": True}), \
+             mock.patch.object(bnl01_bot, "_generate_website_relay_guarded", new=mock.AsyncMock(return_value=decision)), \
+             mock.patch.object(bnl01_bot, "_relay_shared_source_failure", return_value="") as refresh, \
+             mock.patch("urllib.request.urlopen", side_effect=accepted):
+            state.bootstrap_cursor(f.name, 42, 7)
+            try:
+                result = asyncio.run(bnl01_bot._execute_website_relay_transaction(42))
+            except c.ContractV2Error as exc:
+                self.fail("A valid engagement transaction escaped contract handling: %s" % exc)
+            self.assertTrue(result.publish)
+            self.assertEqual(result.eventType, "tiktok_live_engagement")
+            self.assertEqual(sent[0]["relay"]["sourceClass"], "public_safe_memory")
+            self.assertGreaterEqual(refresh.call_count, 2)
+            self.assertTrue(all(call.args == (42, decision) for call in refresh.call_args_list))
+            history = state.recent_history(f.name, 42)
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["event_type"], "tiktok_live_engagement")
+            self.assertEqual(json.loads(history[0]["source_basis_json"]), basis)
+            self.assertEqual(state.get_pending_v2_publication(f.name, 42), {})
+
+    def test_scheduled_contract_failure_allows_next_tick_without_publication(self):
+        rejected = bnl01_bot.WebsiteRelayDecision(
+            True, eventType="unrecognized_platform_measurement", sourceCursor=8,
+            message="A fictional unsupported candidate.", directive="Consider its source.",
+            metadata={"source_class": "unrecognized_platform_measurement"},
+        )
+        accepted = bnl01_bot.WebsiteRelayDecision(
+            True, eventType="canon", sourceCursor=9,
+            message="A fictional supported candidate.", directive="Consider its approved source.",
+            metadata={"source_class": "canon"},
+        )
+        sent = []
+
+        def opener(req, timeout=10):
+            envelope = json.loads(req.data)
+            sent.append(envelope)
+            return Resp(200, accepted_body(envelope))
+
+        async def two_ticks(db):
+            await bnl01_bot.website_relay_task.coro()
+            self.assertEqual(state.get_cursor(db, 42), 7)
+            self.assertEqual(state.get_pending_v2_publication(db, 42), {})
+            self.assertEqual(state.recent_history(db, 42), [])
+            self.assertEqual(sent, [])
+            self.assertEqual(state.last_attempt(db, 42)["reason"], "unknown_source_class")
+            await bnl01_bot.website_relay_task.coro()
+
+        with tempfile.NamedTemporaryFile() as f, \
+             mock.patch.object(bnl01_bot, "DB_FILE", f.name), \
+             mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "2"), \
+             mock.patch.object(bnl01_bot, "BNL_WEBSITE_RELAY_ENABLED", True), \
+             mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"), \
+             mock.patch.object(bnl01_bot, "BNL_API_KEY", "test-key"), \
+             mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value={"websiteRelayEnabled": True}), \
+             mock.patch.object(bnl01_bot, "_scheduled_relay_due", return_value=True), \
+             mock.patch.object(bnl01_bot, "_scheduled_quiet_relay_due", return_value=False), \
+             mock.patch.object(bnl01_bot, "iter_managed_guilds", return_value=[SimpleNamespace(id=42)]), \
+             mock.patch.object(bnl01_bot, "get_guild_config", return_value=0), \
+             mock.patch.object(bnl01_bot, "relay_claim_scheduled_period", return_value=True), \
+             mock.patch.object(bnl01_bot, "_generate_website_relay_guarded", new=mock.AsyncMock(side_effect=[rejected, accepted])) as generate, \
+             mock.patch("urllib.request.urlopen", side_effect=opener):
+            state.bootstrap_cursor(f.name, 42, 7)
+            try:
+                asyncio.run(two_ticks(f.name))
+            except c.ContractV2Error as exc:
+                self.fail("Contract rejection terminated the scheduled tick: %s" % exc)
+            self.assertEqual(generate.await_count, 2)
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0]["relay"]["sourceClass"], "approved_canon")
+            self.assertEqual(state.get_cursor(f.name, 42), 9)
+            self.assertEqual(len(state.recent_history(f.name, 42)), 1)
 
     def test_relay_id_validation(self):
         self.assertEqual(c.validate_relay_id("bnl-abc_123:45"), "bnl-abc_123:45")

@@ -28,6 +28,7 @@ SOURCE_CLASS_MAP = {
     "public_safe_memory": "public_safe_memory",
     "public_moment": "public_safe_memory",
     "finalized_show": "public_safe_memory",
+    "tiktok_live_engagement": "public_safe_memory",
     "published_journal": "public_safe_memory",
     "published_ballad": "public_safe_memory",
     "canon": "approved_canon",
