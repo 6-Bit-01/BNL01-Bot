@@ -8783,6 +8783,7 @@ def _main_public_assessment_occurrence_candidates(
           )=1
           AND EXISTS (
             SELECT 1 FROM main.memory_ledger_participants participant
+            INDEXED BY sqlite_autoindex_memory_ledger_participants_1
             WHERE participant.entry_id=e.entry_id
               AND participant.guild_id=e.guild_id
               AND participant.participant_key=e.subject_key
@@ -8947,6 +8948,7 @@ def _main_public_assessment_occurrence_candidates(
         participant = conn.execute(
             """
             SELECT display_name FROM main.memory_ledger_participants
+            INDEXED BY sqlite_autoindex_memory_ledger_participants_1
             WHERE entry_id=? AND guild_id=? AND participant_key=?
               AND LOWER(participant_role)='author' AND order_index=0
             """,
