@@ -840,6 +840,11 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         conn = sqlite3.connect(self.db)
         try:
             entity_evidence.ensure_entity_evidence_schema(conn)
+            conn.row_factory = sqlite3.Row
+            conn.execute("INSERT INTO conversations VALUES (42,123456789012345678,'HellcatNZ',1,'finished-tracks','public_selective','user',?,'now')",
+                         ("raw transcript with 123456789012345678 should stay provenance-only",))
+            conn.execute("INSERT INTO conversations VALUES (43,7,'Other',1,'research-and-development','private_internal','user',?,'now')",
+                         ("HellcatNZ private raw transcript",))
             entity_evidence.upsert_entity_evidence_event(
                 conn,
                 guild_id=1,
@@ -863,7 +868,8 @@ class SourceFileEnrichmentTests(unittest.TestCase):
                 music_signal=True,
                 community_signal=True,
                 bnl_interaction=True,
-                raw_ref_json={"content": "raw transcript with 123456789012345678 should stay provenance-only", "channel_name": "finished-tracks"},
+                raw_ref_json={"content": "raw transcript with 123456789012345678 should stay provenance-only", "channel_name": "finished-tracks",
+                              "source_fingerprint": entity_evidence.conversation_source_fingerprint(dict(conn.execute("SELECT rowid AS _rowid,* FROM conversations WHERE id=42").fetchone()))},
             )
             entity_evidence.upsert_entity_evidence_event(
                 conn,
@@ -884,7 +890,8 @@ class SourceFileEnrichmentTests(unittest.TestCase):
                 safe_summary="Review-only planning context exists for owner review.",
                 public_safe_candidate=False,
                 review_only=True,
-                raw_ref_json={"content": "private raw transcript", "channel_name": "research-and-development"},
+                raw_ref_json={"content": "HellcatNZ private raw transcript", "channel_name": "research-and-development",
+                              "source_fingerprint": entity_evidence.conversation_source_fingerprint(dict(conn.execute("SELECT rowid AS _rowid,* FROM conversations WHERE id=43").fetchone()))},
             )
             conn.commit()
         finally:

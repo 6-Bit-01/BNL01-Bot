@@ -1110,7 +1110,9 @@ def _scan_table(conn: sqlite3.Connection, table: str, subject: str, aliases: lis
     return out
 
 
-def resolve_subject_memory(subject_name: str, db_path: str, aliases: list[str] | None = None) -> dict[str, Any]:
+def resolve_subject_memory(subject_name: str, db_path: str, aliases: list[str] | None = None, *, guild_id: int | None = None, source_read_snapshot: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    from bnl_entity_evidence import _source_read_reference, validate_entity_evidence_source
+
     subject = _text(subject_name, 120) or "Unnamed subject"
     clean_aliases = []
     for alias in aliases or []:
@@ -1132,6 +1134,20 @@ def resolve_subject_memory(subject_name: str, db_path: str, aliases: list[str] |
                 continue
             result["diagnostic"]["tablesScanned"].append(table)
             rows = _scan_table(conn, table, subject, clean_aliases)
+            if guild_id is not None:
+                rows = [data for data in rows if "guild_id" not in data or str(data.get("guild_id")) == str(guild_id)]
+            current_rows = []
+            for data in rows:
+                if table == "entity_evidence_events" and data.get("source_table") == "conversations":
+                    decision = validate_entity_evidence_source(conn, data, subject, guild_id, aliases=clean_aliases)
+                    if not decision["eligible"]:
+                        continue
+                    if source_read_snapshot is not None:
+                        source_read_snapshot.append(_source_read_reference(data, decision["sourceFingerprint"]))
+                if table == "entity_intelligence_facts" and str(data.get("source_type") or "") == "entity_intelligence_engine" and data.get("source_row_id") in (None, ""):
+                    continue
+                current_rows.append(data)
+            rows = current_rows
             if rows:
                 result["diagnostic"]["tablesContributed"][table] = len(rows)
             for data in rows:

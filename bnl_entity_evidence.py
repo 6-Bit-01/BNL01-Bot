@@ -7,6 +7,7 @@ canonical profiles, website dossiers, Source Files, queue links, or public outpu
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -19,6 +20,7 @@ from bnl_dossier_source_packets import normalize_subject_name, subject_key
 
 ENTITY_EVIDENCE_TABLE = "entity_evidence_events"
 PUBLIC_CONVERSATION_POLICIES = {"public_home", "public_context", "public_selective", "broadcast_memory"}
+EXCLUDED_CONVERSATION_POLICIES = {"sealed_test", "protected_system"}
 QUEUE_NOT_CONNECTED_NOTE = "Queue/submission identity is not connected yet."
 MAX_SAFE_SUMMARY_LENGTH = 220
 MAX_REF_SNIPPET_LENGTH = 160
@@ -721,8 +723,134 @@ def group_entity_evidence_details(rows: list[sqlite3.Row | dict[str, Any]]) -> d
     }
 
 def _source_row_id(data: dict[str, Any]) -> str | None:
-    value = data.get("id")
+    value = data.get("id") if data.get("id") not in (None, "") else data.get("_rowid", data.get("rowid"))
     return None if value in (None, "") else str(value)
+
+
+def conversation_source_fingerprint(row: sqlite3.Row | dict[str, Any]) -> str:
+    """Fingerprint the original read, including content beyond retained snippets."""
+
+    data = dict(row)
+    fields = (
+        "guild_id", "user_id", "author_id", "discord_user_id", "member_id",
+        "user_name", "author_name", "channel_id", "channel_name", "channel_policy",
+        "role", "content", "timestamp", "created_at",
+    )
+    original = {field: str(data.get(field) or "") for field in fields}
+    original["id"] = _source_row_id(data) or ""
+    return hashlib.sha256(json.dumps(original, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def _source_read_reference(data: dict[str, Any], fingerprint: str) -> dict[str, Any]:
+    reference = {field: data.get(field) for field in (
+        "guild_id", "subject_key", "subject_name", "matched_user_id", "source_type",
+        "source_table", "source_row_id", "relation_to_subject", "channel_policy",
+        "public_safe_candidate", "review_only",
+    )}
+    reference["raw_ref_json"] = {
+        "table": "conversations", "row_id": data.get("source_row_id"), "source_fingerprint": fingerprint,
+    }
+    return reference
+
+
+def validate_entity_evidence_source(
+    conn: sqlite3.Connection,
+    event: sqlite3.Row | dict[str, Any],
+    subject_name: str | None = None,
+    guild_id: int | None = None,
+    *,
+    aliases: list[str] | None = None,
+) -> dict[str, Any]:
+    """Revalidate conversation provenance without changing stored evidence."""
+
+    data = dict(event)
+    public = bool(data.get("public_safe_candidate")) and not bool(data.get("review_only"))
+    decision = {"eligible": False, "reason": "", "sourceFingerprint": "", "publicSafe": False}
+
+    def reject(reason: str) -> dict[str, Any]:
+        decision["reason"] = reason
+        return decision
+
+    if str(data.get("channel_policy") or "").strip().lower() in EXCLUDED_CONVERSATION_POLICIES:
+        return reject("excluded_channel_policy")
+    if str(data.get("source_table") or "") != "conversations":
+        decision.update(eligible=True, reason="non_conversation_source", publicSafe=public)
+        return decision
+    subject = normalize_subject_name(subject_name or data.get("subject_name") or "")
+    if not subject or str(data.get("subject_key") or "") != subject_key(subject):
+        return reject("source_subject_mismatch")
+    expected_guild = guild_id if guild_id is not None else data.get("guild_id")
+    if guild_id is not None and str(data.get("guild_id") or "") != str(guild_id):
+        return reject("source_guild_mismatch")
+    try:
+        raw_ref = data.get("raw_ref_json") or {}
+        if not isinstance(raw_ref, dict):
+            raw_ref = json.loads(raw_ref)
+        if not isinstance(raw_ref, dict):
+            return reject("source_reference_invalid")
+        row_id = int(data.get("source_row_id"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return reject("source_reference_invalid")
+    if str(raw_ref.get("table") or raw_ref.get("sourceTable") or "conversations") != "conversations":
+        return reject("source_reference_mismatch")
+    raw_id = raw_ref.get("row_id", raw_ref.get("sourceRowId"))
+    if raw_id not in (None, "") and str(raw_id) != str(row_id):
+        return reject("source_reference_mismatch")
+    cols = columns(conn, "conversations")
+    if not cols:
+        return reject("source_missing")
+    cur = conn.cursor()
+    cur.row_factory = sqlite3.Row
+    where = "id=? OR (id IS NULL AND rowid=?)" if "id" in cols else "rowid=?"
+    params = (row_id, row_id) if "id" in cols else (row_id,)
+    original_row = cur.execute(f"SELECT rowid AS _rowid, * FROM conversations WHERE {where} LIMIT 1", params).fetchone()
+    if original_row is None:
+        return reject("source_missing")
+    original = dict(original_row)
+    decision["sourceFingerprint"] = conversation_source_fingerprint(original)
+    if expected_guild is not None and str(original.get("guild_id") or "") != str(expected_guild):
+        return reject("source_guild_mismatch")
+    policy = str(original.get("channel_policy") or "unknown").strip().lower() or "unknown"
+    if policy in EXCLUDED_CONVERSATION_POLICIES:
+        return reject("excluded_channel_policy")
+    if _is_bnl_conversation_author(original):
+        return reject("source_author_ineligible")
+    stored_policy = str(data.get("channel_policy") or "unknown").strip().lower() or "unknown"
+    if stored_policy != policy or public != (policy in PUBLIC_CONVERSATION_POLICIES):
+        return reject("source_policy_changed")
+    relation = str(data.get("relation_to_subject") or "mentioned")
+    labels = _conversation_match_labels(subject, str(data.get("subject_key") or ""), aliases)
+    if relation == "authored":
+        authored = _conversation_author_matches_subject(original, labels)
+        profile_cols = columns(conn, "user_profiles") if not authored else set()
+        profile_labels = [field for field in ("display_name", "preferred_name") if field in profile_cols]
+        author_ids = {str(original.get(field)) for field in ("user_id", "author_id", "discord_user_id", "member_id") if original.get(field) not in (None, "")}
+        if not authored and author_ids and profile_labels and "user_id" in profile_cols:
+            profile_where = f"CAST(user_id AS TEXT) IN ({','.join('?' for _ in author_ids)})"
+            profile_params: list[Any] = sorted(author_ids)
+            if expected_guild is not None:
+                if "guild_id" not in profile_cols:
+                    return reject("source_subject_mismatch")
+                profile_where += " AND guild_id=?"
+                profile_params.append(expected_guild)
+            for profile in cur.execute(f"SELECT {', '.join(profile_labels)} FROM user_profiles WHERE {profile_where}", profile_params):
+                if _conversation_author_matches_subject(dict(profile), labels):
+                    authored = True
+                    break
+        if not authored:
+            return reject("source_subject_mismatch")
+    elif relation != "mentioned" or not contains_subject_mention(str(original.get("content") or ""), subject, aliases):
+        return reject("source_subject_mismatch")
+    expected_fingerprint = str(raw_ref.get("source_fingerprint") or "")
+    if expected_fingerprint:
+        if expected_fingerprint != decision["sourceFingerprint"]:
+            return reject("source_revision_changed")
+    else:
+        current_text = str(original.get("content") or "")
+        if not current_text or not any(str(raw_ref.get(field) or "") == current_text for field in ("snippet", "safe_snippet", "content")):
+            return reject("source_revision_unverified")
+    decision.update(eligible=True, reason="current_source_validated", publicSafe=public)
+    return decision
 
 
 def backfill_subject_authored_conversation_evidence(
@@ -832,6 +960,7 @@ def backfill_subject_authored_conversation_evidence(
                 "safe_snippet": safe_text(text),
                 "channel_name": data.get("channel_name"),
                 "channel_policy": policy,
+                "source_fingerprint": conversation_source_fingerprint(data),
             },
             observed_at=data.get("timestamp") or data.get("created_at"),
         )
@@ -856,11 +985,12 @@ def derive_entity_evidence_from_conversation_row(
     data = dict(row)
     subject = normalize_subject_name(subject_name)
     text = _row_text(row, ["content"])
-    haystack = _row_text(row, ["user_name", "content", "channel_name", "channel_policy"])
-    authored = data.get("user_id") in (matched_user_ids or set()) or contains_subject_mention(str(data.get("user_name") or ""), subject, aliases)
-    if not authored and not contains_subject_mention(haystack, subject, aliases):
+    authored = _conversation_author_matches_subject(data, _conversation_match_labels(subject, subject_key(subject), aliases), matched_user_ids)
+    if not authored and not contains_subject_mention(text, subject, aliases):
         return None
     policy = str(data.get("channel_policy") or "unknown").strip().lower() or "unknown"
+    if policy in EXCLUDED_CONVERSATION_POLICIES or _is_bnl_conversation_author(data):
+        return None
     public = policy in PUBLIC_CONVERSATION_POLICIES
     relation = "authored" if authored else "mentioned"
     kind = f"{relation}_{'public' if public else 'review_only'}_conversation"
@@ -894,7 +1024,7 @@ def derive_entity_evidence_from_conversation_row(
         community_signal=bool(_COMMUNITY_PATTERN.search(text)),
         bnl_interaction=bool(_BNL_PATTERN.search(text)),
         dossier_relevance="candidate_after_owner_review" if public else "review_only_context",
-        raw_ref_json={"table": "conversations", "row_id": data.get("id"), "channel_policy": policy, "channel_name": data.get("channel_name"), "snippet": text},
+        raw_ref_json={"table": "conversations", "row_id": _source_row_id(data), "channel_policy": policy, "channel_name": data.get("channel_name"), "snippet": text, "source_fingerprint": conversation_source_fingerprint(data)},
         observed_at=data.get("timestamp"),
     )
 
@@ -914,7 +1044,8 @@ def derive_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id
     try:
         ensure_entity_evidence_schema(conn)
         matched_user_ids: set[Any] = set()
-        aliases: list[str] = []
+        aliases: list[str] = list(confirmed_aliases or [])
+        match_labels = _conversation_match_labels(subject, key, confirmed_aliases)
 
         def note(status: str | None, source_type: str, review_only: bool, public_candidate: bool) -> None:
             if not status:
@@ -929,12 +1060,8 @@ def derive_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id
         for row in _fetch_rows(conn, "user_profiles", guild_id, limit):
             data = dict(row)
             names = [data.get("display_name"), data.get("preferred_name")]
-            if not any(contains_subject_mention(str(name or ""), subject) or contains_subject_mention(subject, str(name or "")) for name in names if name):
+            if not _conversation_author_matches_subject(data, match_labels):
                 continue
-            for name in names:
-                clean = normalize_subject_name(str(name or ""))
-                if clean:
-                    aliases.append(clean)
             matched_user_ids.add(data.get("user_id"))
             status = upsert_entity_evidence_event(
                 conn,
@@ -1199,7 +1326,7 @@ def sort_entity_evidence_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
     return sorted(rows, key=_entity_evidence_sort_key)
 
 
-def get_ranked_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str, guild_id: int | None = None, limit: int = 200) -> list[sqlite3.Row]:
+def get_ranked_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str, guild_id: int | None = None, limit: int = 200, *, aliases: list[str] | None = None) -> list[sqlite3.Row]:
     if not table_exists(conn, ENTITY_EVIDENCE_TABLE):
         return []
     key = subject_key(normalize_subject_name(subject_name))
@@ -1211,14 +1338,15 @@ def get_ranked_entity_evidence_for_subject(conn: sqlite3.Connection, subject_nam
     cur = conn.cursor()
     cur.row_factory = sqlite3.Row
     rows = list(cur.execute(f"SELECT * FROM {ENTITY_EVIDENCE_TABLE} WHERE {where}", params))
-    return sort_entity_evidence_rows(rows)[: max(1, limit)]
+    current_rows = [row for row in rows if validate_entity_evidence_source(conn, row, subject_name, guild_id, aliases=aliases)["eligible"]]
+    return sort_entity_evidence_rows(current_rows)[: max(1, limit)]
 
 
-def get_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str, guild_id: int | None = None, limit: int = 200) -> list[sqlite3.Row]:
+def get_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str, guild_id: int | None = None, limit: int = 200, *, aliases: list[str] | None = None) -> list[sqlite3.Row]:
     """Return ranked entity evidence for summaries/readouts.
 
     This deliberately does not simply read newest rows because bulk legacy/source-blind
     refreshes can otherwise bury stronger public-side conversation evidence.
     """
 
-    return get_ranked_entity_evidence_for_subject(conn, subject_name, guild_id=guild_id, limit=limit)
+    return get_ranked_entity_evidence_for_subject(conn, subject_name, guild_id=guild_id, limit=limit, aliases=aliases)

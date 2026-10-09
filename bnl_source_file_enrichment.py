@@ -27,7 +27,7 @@ from typing import Any, Callable
 from bnl_admin_summaries import build_admin_summary, build_dossier_update_summary
 from bnl_dossier_recommendations import build_dossier_recommendation_payload, is_source_file_archive_token_configured, send_dossier_recommendation, send_source_file_archive_enrichment
 from bnl_entity_activity_summary import build_entity_activity_summary, refresh_entity_evidence_for_subject
-from bnl_entity_evidence import _website_safe_payload_text
+from bnl_entity_evidence import PUBLIC_CONVERSATION_POLICIES, _is_bnl_conversation_author, _website_safe_payload_text, conversation_source_fingerprint, subject_key as entity_subject_key, validate_entity_evidence_source
 from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_entity_context_for_surface, safe_text as _entity_safe_text
 from bnl_evidence_ownership import classify_evidence_ownership, subject_owned_text_fragments
 from bnl_source_file_lookup import get_source_file_read_url, lookup_source_file
@@ -865,7 +865,12 @@ def _identity_label_variants(value: Any) -> set[str]:
     raw = str(value or "").strip()
     if not raw:
         return set()
-    variants = {raw, raw.lower(), _subject_key(raw), _normalize_identity_label(raw)}
+    return {variant for variant in (raw, raw.lower(), _subject_key(raw), _normalize_identity_label(raw)) if variant}
+
+
+def _mention_label_variants(value: Any) -> set[str]:
+    raw = str(value or "").strip()
+    variants = _identity_label_variants(raw)
     for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", raw):
         if len(word) >= 3:
             variants.update({word, word.lower(), _normalize_identity_label(word)})
@@ -898,6 +903,25 @@ def _iter_lookup_values(value: Any) -> list[Any]:
         if parsed is not None:
             return _iter_lookup_values(parsed)
     return [text]
+
+
+def _confirmed_alias_values(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+    if isinstance(value, (list, tuple)):
+        return [
+            label
+            for link in value
+            if isinstance(link, dict) and link.get("status") == "confirmed" and link.get("useForMatching") is True
+            for label in (link.get("label"), link.get("normalizedLabel"))
+            if label
+        ]
+    if not isinstance(value, dict):
+        return []
+    return _iter_lookup_values(value.get("confirmed")) + _iter_lookup_values(value.get("confirmedAliases"))
 
 
 def _safe_lookup_metadata(obj: dict[str, Any], keys: tuple[str, ...]) -> dict[str, str]:
@@ -935,24 +959,34 @@ def resolve_enrichment_subject_identity(subject: str, lookup_result: dict[str, A
     match_kind, _match_note, _sf = classify_source_match(lookup_result or {}) if lookup_result else ("none", "", {})
     source_name = _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or subject
     labels: set[str] = set()
+    binding_labels: set[str] = set()
     display_labels: list[str] = []
 
-    def add_label(value: Any) -> None:
+    def add_label(value: Any, *, bind: bool = True) -> None:
         for item in _iter_lookup_values(value):
             text = _safe_text(item, 90)
             if not text:
                 continue
-            for variant in _identity_label_variants(text):
-                labels.add(variant)
+            labels.update(_mention_label_variants(text))
+            if bind:
+                binding_labels.update(_identity_label_variants(text))
             if text not in display_labels and not _LONG_ID_RE.fullmatch(text):
                 display_labels.append(text)
 
     add_label(subject)
     add_label(source_name)
-    for key in ("aliases", "alias", "matchedAlias", "confirmedAliases", "proposedAliases", "possibleAliases", "identityLinks", "identity_links", "possibleConnections", "normalizedName", "displayName", "preferredName"):
-        if lookup_result and isinstance(lookup_result.get("data"), dict):
-            add_label(lookup_result["data"].get(key))
-        add_label(source_file.get(key))
+    data = _lookup_data(lookup_result or {})
+    confirmed_alias_match = _is_confirmed_alias_lookup(lookup_result or {})
+    for obj in (data, source_file):
+        for key in ("confirmedAliases", "normalizedName", "displayName", "preferredName"):
+            add_label(obj.get(key))
+        for key in ("aliases", "identityLinks", "identity_links"):
+            add_label(_confirmed_alias_values(obj.get(key)))
+        if confirmed_alias_match:
+            for key in ("matchedAlias", "alias"):
+                add_label(obj.get(key))
+    # Matched local names may help mention search but cannot create new bindings.
+    confirmed_display_labels = list(display_labels)
 
     matched_user_ids: set[int] = set()
     matched_profile_count = 0
@@ -972,15 +1006,15 @@ def resolve_enrichment_subject_identity(subject: str, lookup_result: dict[str, A
                         continue
                     for variant in _identity_label_variants(row[col]):
                         haystack.add(variant)
-                if labels & haystack:
+                if binding_labels & haystack:
                     try:
                         matched_user_ids.add(int(row["user_id"]))
                     except (TypeError, ValueError):
                         pass
                     matched_profile_count += 1
-                    add_label(row["display_name"])
+                    add_label(row["display_name"], bind=False)
                     if "preferred_name" in row.keys():
-                        add_label(row["preferred_name"])
+                        add_label(row["preferred_name"], bind=False)
         if _table_exists(conn, "community_presence"):
             cols = _columns(conn, "community_presence")
             select_cols = [c for c in ("display_name", "subject_key", "source_lanes", "connection_notes", "user_id", "discord_user_id", "member_id") if c in cols]
@@ -988,12 +1022,12 @@ def resolve_enrichment_subject_identity(subject: str, lookup_result: dict[str, A
                 rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM community_presence WHERE guild_id=?", (guild_id,)).fetchall()
                 for row in rows:
                     haystack = set()
-                    for col in ("display_name", "subject_key", "connection_notes"):
+                    for col in ("display_name", "subject_key"):
                         if col in row.keys():
                             for variant in _identity_label_variants(row[col]):
                                 haystack.add(variant)
-                    if labels & haystack:
-                        add_label(row["display_name"] if "display_name" in row.keys() else "")
+                    if binding_labels & haystack:
+                        add_label(row["display_name"] if "display_name" in row.keys() else "", bind=False)
                         for id_col in ("user_id", "discord_user_id", "member_id"):
                             if id_col in row.keys() and row[id_col] not in (None, ""):
                                 try:
@@ -1012,7 +1046,7 @@ def resolve_enrichment_subject_identity(subject: str, lookup_result: dict[str, A
         "workflowLane": match_kind,
         "sourceFileRecordId": _safe_text(candidate_id, 90) if candidate_id else "",
         "existingDossierMatch": existing_dossier,
-        "aliasLabels": display_labels[:12],
+        "aliasLabels": confirmed_display_labels[:12],
         "matchedUserProfileCount": matched_profile_count,
         "matchedUserIdCount": len(matched_user_ids),
         "matchedIdentityLabels": display_labels[:6],
@@ -1020,6 +1054,7 @@ def resolve_enrichment_subject_identity(subject: str, lookup_result: dict[str, A
         "existingDossierUpdateLane": match_kind == "existing_dossier_update",
         "_matchedUserIds": matched_user_ids,
         "_matchLabels": labels,
+        "_bindingLabels": binding_labels,
     }
     return identity
 
@@ -1256,8 +1291,12 @@ def _is_confirmed_alias_lookup(lookup_result: dict[str, Any]) -> bool:
     data = lookup_result.get("data") if isinstance(lookup_result.get("data"), dict) else {}
     match_text = " ".join(str(x or "") for x in (
         lookup_result.get("matchKind"), data.get("matchKind"), data.get("match_kind"), data.get("aliasStatus"), data.get("alias_status"),
-    )).lower()
-    return "alias" in match_text and "confirm" in match_text
+    )).lower().replace("_", " ")
+    return bool(
+        "alias" in match_text
+        and re.search(r"\bconfirmed\b", match_text)
+        and not re.search(r"\b(?:unconfirmed|proposed|possible)\b", match_text)
+    )
 
 
 def _simple_expansion_note(subject: str, matches: list[dict[str, str]]) -> str:
@@ -1657,7 +1696,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
     """Collect bounded evidence from approved local stores only."""
 
     identity = resolve_enrichment_subject_identity(subject, lookup_result, db_path, guild_id)
-    terms = sorted(identity.get("_matchLabels") or _like_terms(subject), key=len, reverse=True)[:20]
+    terms = sorted(identity.get("_bindingLabels") or {subject}, key=len, reverse=True)[:20]
     matched_user_ids = set(identity.get("_matchedUserIds") or set())
     sections: dict[str, list[str]] = {name: [] for name in SECTION_ORDER}
     source_counts: Counter[str] = Counter()
@@ -1674,6 +1713,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
     channel_theme_texts: list[str] = []
     community_signal_count = 0
     community_theme_texts: list[str] = []
+    source_read_snapshot: list[dict[str, Any]] = []
 
     if lookup_result:
         match_kind, match_note, sf_obj = classify_source_match(lookup_result)
@@ -1773,15 +1813,14 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
 
         if _table_exists(conn, "conversations"):
             cols = _columns(conn, "conversations")
-            select_cols = [c for c in ("user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "channel_name", "channel_policy", "role", "content", "timestamp") if c in cols]
+            select_cols = [c for c in ("id", "guild_id", "user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "channel_id", "channel_name", "channel_policy", "role", "content", "timestamp", "created_at") if c in cols]
             if select_cols:
                 order_col = "timestamp" if "timestamp" in cols else "id" if "id" in cols else "rowid"
-                rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM conversations WHERE guild_id=? ORDER BY {order_col} DESC LIMIT 800", (guild_id,)).fetchall()
+                rows = conn.execute(f"SELECT rowid AS _rowid, {', '.join(select_cols)} FROM conversations WHERE guild_id=? ORDER BY {order_col} DESC LIMIT 800", (guild_id,)).fetchall()
                 matched_rows: list[sqlite3.Row] = []
                 mention_rows = 0
                 for row in rows:
-                    role = str(row["role"] if "role" in row.keys() else "").lower()
-                    if role == "model":
+                    if _is_bnl_conversation_author(dict(row)):
                         continue
                     if _policy_is_dm_or_private(row["channel_policy"] if "channel_policy" in row.keys() else "", row["channel_name"] if "channel_name" in row.keys() else ""):
                         continue
@@ -1794,9 +1833,27 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                             except (TypeError, ValueError):
                                 pass
                     for name_col in ("user_name", "author_name"):
-                        if name_col in row.keys() and any(v in terms for v in _identity_label_variants(row[name_col])):
+                        if name_col in row.keys() and _identity_label_variants(row[name_col]) & set(identity.get("_bindingLabels") or []):
                             author_match = True
                     content_match = _matches_subject(row["content"] if "content" in row.keys() else "", terms)
+                    if author_match or content_match:
+                        data = dict(row)
+                        policy = str(data.get("channel_policy") or "unknown").strip().lower()
+                        public = policy in PUBLIC_CONVERSATION_POLICIES
+                        relation = "authored" if author_match else "mentioned"
+                        source_ref = {
+                            "guild_id": data.get("guild_id"), "subject_name": subject,
+                            "subject_key": entity_subject_key(subject), "source_table": "conversations",
+                            "source_row_id": str(data.get("id") or data.get("_rowid")),
+                            "matched_user_id": next((data.get(key) for key in ("user_id", "author_id", "discord_user_id", "member_id") if data.get(key) not in (None, "")), None) if author_match else None,
+                            "relation_to_subject": relation, "channel_policy": policy,
+                            "public_safe_candidate": public, "review_only": not public,
+                            "evidence_kind": f"{relation}_{'public' if public else 'review_only'}_conversation",
+                            "raw_ref_json": json.dumps({"source_fingerprint": conversation_source_fingerprint(data)}),
+                        }
+                        if policy in {"sealed_test", "protected_system"}:
+                            continue
+                        source_read_snapshot.append(source_ref)
                     if author_match:
                         matched_rows.append(row)
                     elif content_match:
@@ -1888,10 +1945,10 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
             matched = 0
             for row in rows:
                 row_labels: set[str] = set()
-                for col in ("display_name", "subject_key", "connection_notes", "source_lanes"):
+                for col in ("display_name", "subject_key"):
                     if col in row.keys():
                         row_labels.update(_identity_label_variants(row[col]))
-                identity_match = bool(set(terms) & row_labels)
+                identity_match = bool(set(identity.get("_bindingLabels") or []) & row_labels)
                 for id_col in ("user_id", "discord_user_id", "member_id"):
                     if id_col in row.keys() and row[id_col] not in (None, ""):
                         try:
@@ -1932,6 +1989,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         _source_status(source_statuses, "rd_context", "no_match" if rd_context else "not_provided")
 
     refresh_result: dict[str, Any] = {}
+    alias_labels: list[str] = []
     try:
         alias_labels = [label for label in list(identity.get("aliasLabels") or []) if _subject_key(label) != _subject_key(subject)]
         if alias_labels:
@@ -1961,6 +2019,8 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "admin_internal",
         50,
         rd_context,
+        source_read_snapshot=source_read_snapshot,
+        **({"confirmed_aliases": alias_labels} if alias_labels else {}),
     )
     raw_provenance = entity_summary.get("rawProvenance") if _entity_summary_has_evidence(entity_summary) else {}
     if raw_provenance:
@@ -2029,6 +2089,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "classificationMissingInfoCount": len(classification.get("missingInfo") or []),
     })
     return {
+        "_sourceReadSnapshot": source_read_snapshot,
         "sections": {name: values for name, values in sections.items() if values},
         "sourceCounts": dict(source_counts),
         "warningCounts": dict(warning_counts),
@@ -6242,6 +6303,43 @@ def _call_site_sender(sender: Callable[..., dict[str, Any]], payload: dict[str, 
     return sender(payload, **kwargs) if kwargs else sender(payload)
 
 
+def _source_delivery_snapshot_is_current(db_path: str, guild_id: int | None, subject: str, aliases: list[str], references: list[dict[str, Any]]) -> bool:
+    if not references:
+        return True
+    conn = sqlite3.connect(db_path, timeout=2)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        checked: set[tuple[Any, ...]] = set()
+        for reference in references:
+            key = (reference.get("source_table"), reference.get("source_row_id"), json.dumps(reference.get("raw_ref_json"), sort_keys=True), reference.get("evidence_kind"))
+            if key in checked:
+                continue
+            checked.add(key)
+            result = validate_entity_evidence_source(conn, reference, subject_name=subject, guild_id=guild_id, aliases=aliases)
+            if not result.get("eligible"):
+                return False
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def _source_changed_delivery_result(packet: dict[str, Any], stage: str) -> dict[str, Any]:
+    # Do not return the stale source text through a failure response or retry receipt.
+    reason = f"source_changed_before_{stage}"
+    return {
+        "ok": False, "subject": packet.get("subject"), "status": reason,
+        "matchKind": packet.get("matchKind"), "runTime": packet.get("runTime"),
+        "sent": False, "recommendationSent": False, "sendResult": {"ok": False, "error": reason},
+        "archiveSent": bool(packet.get("archiveSent")), "archiveId": packet.get("archiveId") or "",
+        "archiveResult": packet.get("archiveResult") or {}, "archiveStatus": packet.get("archiveStatus"),
+        "archiveError": packet.get("archiveError") or "", "sourceValidationStatus": "changed_or_ineligible",
+        "sections": {}, "sourceCounts": {}, "sourceTypes": [], "warnings": [reason],
+    }
+
+
 def _target_setup_result(subject: str, *, dry_run: bool, status: str, error: str = "") -> dict[str, Any]:
     return {
         "ok": not bool(error),
@@ -6396,8 +6494,16 @@ def run_source_file_enrichment(
     effective_subject = _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or target_value
     with refresh_generation_context(str(effective_subject)):
         evidence = collect_source_enrichment_evidence(db_path, guild_id, str(effective_subject), rd_context=rd_context, lookup_result=lookup_result)
-        entity_profile = build_entity_intelligence_profile(db_path, guild_id, str(effective_subject), refresh=True)
-        resolved_subject_memory = resolve_subject_memory(str(effective_subject), db_path, aliases=list((evidence.get("subjectIdentity") or {}).get("aliasLabels") or []))
+        source_references = list(evidence.get("_sourceReadSnapshot") or [])
+        source_aliases = list((evidence.get("subjectIdentity") or {}).get("aliasLabels") or [])
+        entity_profile = build_entity_intelligence_profile(
+            db_path, guild_id, str(effective_subject), refresh=True,
+            aliases=source_aliases, source_read_snapshot=source_references,
+        )
+        resolved_subject_memory = resolve_subject_memory(
+            str(effective_subject), db_path, aliases=source_aliases,
+            guild_id=guild_id, source_read_snapshot=source_references,
+        )
         subject_analyst_read = build_source_file_subject_analyst_read_v1(
             {
                 "subject": str(effective_subject),
@@ -6478,8 +6584,12 @@ def run_source_file_enrichment(
     packet["caseReportGenerated"] = bool((archive_payload or {}).get("sourceFileCaseReportV1"))
     archive_required = is_source_file_archive_token_configured(environ)
     if archive_required:
+        if not _source_delivery_snapshot_is_current(db_path, guild_id, str(effective_subject), source_aliases, source_references):
+            return _source_changed_delivery_result(packet, "archive")
         if effect_observer:
             effect_observer("archive", "before")
+        if not _source_delivery_snapshot_is_current(db_path, guild_id, str(effective_subject), source_aliases, source_references):
+            return _source_changed_delivery_result(packet, "archive")
         archive_result = _call_site_sender(archive_sender, archive_payload, environ=environ, callback_base_url=callback_base_url)
         if effect_observer:
             effect_observer("archive", "after", archive_result)
@@ -6494,8 +6604,12 @@ def run_source_file_enrichment(
 
     payload = sanitize_compact_recommendation_payload(payload, packet=packet, archive_id=packet.get("archiveId") or "")
     packet["payload"] = payload
+    if not _source_delivery_snapshot_is_current(db_path, guild_id, str(effective_subject), source_aliases, source_references):
+        return _source_changed_delivery_result(packet, "recommendation")
     if effect_observer:
         effect_observer("recommendation", "before")
+    if not _source_delivery_snapshot_is_current(db_path, guild_id, str(effective_subject), source_aliases, source_references):
+        return _source_changed_delivery_result(packet, "recommendation")
     send_result = _call_site_sender(sender, payload, environ=environ, callback_base_url=callback_base_url)
     if effect_observer:
         effect_observer("recommendation", "after", send_result)

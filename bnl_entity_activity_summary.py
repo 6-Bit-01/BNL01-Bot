@@ -24,12 +24,19 @@ from bnl_entity_intelligence import (
 )
 from bnl_entity_evidence import (
     ENTITY_EVIDENCE_TABLE,
+    EXCLUDED_CONVERSATION_POLICIES,
     build_conversation_safe_summary,
     derive_entity_evidence_for_subject,
     extract_conversation_topic_details,
     get_entity_evidence_for_subject,
     group_entity_evidence_details,
     table_exists as _evidence_table_exists,
+    validate_entity_evidence_source,
+    conversation_source_fingerprint,
+    _source_read_reference,
+    _source_row_id,
+    _conversation_author_matches_subject,
+    _conversation_match_labels,
     _website_safe_topic_label,
 )
 
@@ -206,11 +213,13 @@ def _is_public_intelligence_row(source: str, data: dict[str, Any]) -> bool:
     return False
 
 
-def extract_full_text_from_source_row(conn: sqlite3.Connection, source: str, row: sqlite3.Row | dict[str, Any]) -> str:
+def extract_full_text_from_source_row(conn: sqlite3.Connection, source: str, row: sqlite3.Row | dict[str, Any], *, aliases: list[str] | None = None) -> str:
     """Return fuller local text for internal scoring, preferring rehydrated conversation content."""
 
     data = dict(row) if isinstance(row, sqlite3.Row) else dict(row or {})
     if source == "entity_evidence_events":
+        if not validate_entity_evidence_source(conn, data, aliases=aliases)["eligible"]:
+            return ""
         raw_ref = _parse_raw_ref(data.get("raw_ref_json"))
         table = str(raw_ref.get("table") or raw_ref.get("sourceTable") or "")
         row_id = raw_ref.get("row_id", raw_ref.get("sourceRowId"))
@@ -230,6 +239,34 @@ def extract_full_text_from_source_row(conn: sqlite3.Connection, source: str, row
     return " ".join(str(data.get(field) or "") for field in fields_by_source.get(source, [])).strip()
 
 
+def _validated_conversation_read_reference(
+    conn: sqlite3.Connection, data: dict[str, Any], subject: str, guild_id: int | None,
+    aliases: list[str] | None, relation: str,
+) -> dict[str, Any] | None:
+    policy = str(data.get("channel_policy") or "unknown").strip().lower() or "unknown"
+    event = {
+        "guild_id": data.get("guild_id"), "subject_name": subject, "subject_key": subject_key(subject),
+        "source_type": "conversation", "source_table": "conversations", "source_row_id": _source_row_id(data),
+        "relation_to_subject": relation, "channel_policy": policy,
+        "public_safe_candidate": policy in PUBLIC_CONVERSATION_POLICIES,
+        "review_only": policy not in PUBLIC_CONVERSATION_POLICIES,
+        "raw_ref_json": {"source_fingerprint": conversation_source_fingerprint(data)},
+    }
+    decision = validate_entity_evidence_source(conn, event, subject, guild_id, aliases=aliases)
+    return _source_read_reference(event, decision["sourceFingerprint"]) if decision["eligible"] else None
+
+
+def _append_source_read_snapshot(snapshot: list[dict[str, Any]], reference: dict[str, Any]) -> None:
+    source_fields = ("guild_id", "subject_key", "source_table", "source_row_id")
+    fingerprint = _parse_raw_ref(reference.get("raw_ref_json")).get("source_fingerprint")
+    for existing in snapshot:
+        same_source = all(existing.get(field) == reference.get(field) for field in source_fields)
+        same_revision = _parse_raw_ref(existing.get("raw_ref_json")).get("source_fingerprint") == fingerprint
+        if same_source and same_revision:
+            return
+    snapshot.append(reference)
+
+
 def collect_subject_intelligence_rows(
     conn: sqlite3.Connection,
     subject: str,
@@ -239,12 +276,15 @@ def collect_subject_intelligence_rows(
     matched_user_ids: set[Any] | None = None,
     structured_rows: list[sqlite3.Row] | None = None,
     max_rows: int = 200,
+    public_only: bool = False,
+    source_read_snapshot: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Collect selected subject-linked local rows for internal recurring-subject scoring."""
 
     rows: list[dict[str, Any]] = []
     matched_ids = {_safe_int_value(v) for v in (matched_user_ids or set())}
     matched_ids.discard(None)
+    match_labels = _conversation_match_labels(subject, subject_key(subject), aliases)
     try:
         from bnl_entity_intelligence import _known_entity_names, _subject_row_scope, subject_key as _ei_subject_key
         scoped_known_names = _known_entity_names(conn, guild_id, subject)
@@ -266,28 +306,46 @@ def collect_subject_intelligence_rows(
 
     def add(source: str, row: sqlite3.Row | dict[str, Any], relation: str = "mentioned") -> None:
         data = dict(row) if isinstance(row, sqlite3.Row) else dict(row or {})
-        text = extract_full_text_from_source_row(conn, source, data)
+        if str(data.get("channel_policy") or "").strip().lower() in EXCLUDED_CONVERSATION_POLICIES:
+            return
+        text = extract_full_text_from_source_row(conn, source, data, aliases=aliases)
         if not text:
             return
         accepted, scope = scoped_accept(source, data, text, authored=relation in {"authored", "matched"})
-        rows.append({"source": source, "text": text, "publicSafe": _is_public_intelligence_row(source, data) and accepted, "relation": relation, "scope": scope, "legacyDiagnosticOnly": not accepted})
+        reference = None
+        if source == "conversations":
+            reference = _validated_conversation_read_reference(conn, data, subject, guild_id, aliases, relation)
+            if reference is None:
+                return
+            if relation == "authored":
+                accepted, scope = True, "subject_authored"
+        elif source == "entity_evidence_events" and data.get("source_table") == "conversations":
+            decision = validate_entity_evidence_source(conn, data, subject, guild_id, aliases=aliases)
+            if not decision["eligible"]:
+                return
+            reference = _source_read_reference(data, decision["sourceFingerprint"])
+        public_safe = _is_public_intelligence_row(source, data) and accepted
+        if public_only and not public_safe:
+            return
+        rows.append({"source": source, "text": text, "publicSafe": public_safe, "relation": relation, "scope": scope, "legacyDiagnosticOnly": not accepted})
+        if source_read_snapshot is not None and reference is not None:
+            _append_source_read_snapshot(source_read_snapshot, reference)
 
     for row in structured_rows or []:
         add("entity_evidence_events", row, str(_row_value(row, "relation_to_subject", "matched")))
 
     if _table_exists(conn, "conversations"):
-        select_cols = _select_existing_columns(conn, "conversations", ["id", "user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "channel_policy", "content", "timestamp"])
+        select_cols = _select_existing_columns(conn, "conversations", ["id", "guild_id", "user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "channel_id", "channel_name", "channel_policy", "role", "content", "timestamp", "created_at"])
         if select_cols:
             order_col = "timestamp" if "timestamp" in _columns(conn, "conversations") else "id" if "id" in _columns(conn, "conversations") else "rowid"
             query = f"SELECT rowid AS _rowid, {', '.join(select_cols)} FROM conversations WHERE guild_id=? ORDER BY {order_col} DESC LIMIT ?" if guild_id is not None else f"SELECT rowid AS _rowid, {', '.join(select_cols)} FROM conversations ORDER BY {order_col} DESC LIMIT ?"
             params = (guild_id, max_rows * 8) if guild_id is not None else (max_rows * 8,)
             for row in conn.execute(query, params):
                 data = dict(row)
-                author_id_match = any(_safe_int_value(data.get(col)) in matched_ids for col in ("user_id", "author_id", "discord_user_id", "member_id"))
-                author_name_match = any(contains_subject_mention(str(data.get(col) or ""), subject, aliases=aliases) for col in ("user_name", "author_name"))
+                authored = _conversation_author_matches_subject(data, match_labels, matched_ids)
                 content_match = matches_text(str(data.get("content") or ""))
-                if author_id_match or author_name_match or content_match:
-                    relation = "authored" if author_id_match or author_name_match else "mentioned"
+                if authored or content_match:
+                    relation = "authored" if authored else "mentioned"
                     if relation == "authored" or scoped_accept("conversations", data, str(data.get("content") or ""), authored=False)[0]:
                         add("conversations", data, relation)
                 if len(rows) >= max_rows:
@@ -1129,7 +1187,8 @@ def _fetch_rows(conn: sqlite3.Connection, table: str, guild_id: int | None, limi
         if candidate in cols:
             order = f" ORDER BY {candidate} DESC"
             break
-    return list(conn.execute(f"SELECT * FROM {table}{where}{order} LIMIT ?", [*params, max(1, limit)]))
+    select = "rowid AS _rowid, *" if table == "conversations" else "*"
+    return list(conn.execute(f"SELECT {select} FROM {table}{where}{order} LIMIT ?", [*params, max(1, limit)]))
 
 
 def _row_text(row: sqlite3.Row, fields: list[str]) -> str:
@@ -1425,10 +1484,10 @@ def _apply_structured_evidence(summary: dict[str, Any], rows: list[sqlite3.Row],
             _add_unique(summary["bnlInteractionSignals"], f"Structured evidence shows BNL-related interaction context; subject was {relation}.")
 
 
-def _structured_evidence_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, lanes: set[str], max_rows: int) -> list[sqlite3.Row]:
+def _structured_evidence_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, lanes: set[str], max_rows: int, *, aliases: list[str] | None = None) -> list[sqlite3.Row]:
     if "entity_evidence_events" not in lanes or not _evidence_table_exists(conn, ENTITY_EVIDENCE_TABLE):
         return []
-    return get_entity_evidence_for_subject(conn, subject, guild_id=guild_id, limit=max_rows)
+    return get_entity_evidence_for_subject(conn, subject, guild_id=guild_id, limit=max_rows, aliases=aliases)
 
 def build_entity_activity_summary(
     db_path: str,
@@ -1438,12 +1497,17 @@ def build_entity_activity_summary(
     output_mode: str = "admin_internal",
     limit: int = DEFAULT_ENTITY_SUMMARY_LIMIT,
     rd_context: list[dict[str, Any]] | None = None,
+    *,
+    source_read_snapshot: list[dict[str, Any]] | None = None,
+    confirmed_aliases: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a structured, privacy-bounded BNL entity/person activity summary."""
 
     subject = normalize_subject_name(subject_name)
     key = subject_key(subject)
     lanes = _normalize_allowed_lanes(allowed_lanes)
+    if output_mode != "admin_internal":
+        lanes &= {"entity_evidence_events", "conversations", "broadcast_memory"}
     max_rows = max(1, min(int(limit or DEFAULT_ENTITY_SUMMARY_LIMIT), MAX_ENTITY_SUMMARY_LIMIT))
     summary: dict[str, Any] = {
         "subjectName": subject,
@@ -1500,7 +1564,7 @@ def build_entity_activity_summary(
     public_fact_texts: list[str] = []
     review_only_fact_texts: list[str] = []
     matched_user_ids: set[Any] = set()
-    aliases: list[str] = []
+    aliases = [normalize_subject_name(str(alias)) for alias in (confirmed_aliases or []) if alias]
     fallback_activity_rows: list[dict[str, Any]] = []
 
     if not subject:
@@ -1512,10 +1576,14 @@ def build_entity_activity_summary(
     enrichment_identity = _resolve_existing_enrichment_identity(db_path, subject, guild_id)
     for user_id in enrichment_identity.get("_matchedUserIds") or []:
         matched_user_ids.add(user_id)
-    for label in enrichment_identity.get("matchedIdentityLabels") or enrichment_identity.get("aliasLabels") or []:
+    for label in enrichment_identity.get("aliasLabels") or []:
         clean_label = normalize_subject_name(str(label or ""))
         if clean_label:
             aliases.append(clean_label)
+    identity_labels = enrichment_identity.get("matchedIdentityLabels") if output_mode == "admin_internal" else enrichment_identity.get("aliasLabels")
+    for label in identity_labels or []:
+        clean_label = normalize_subject_name(str(label or ""))
+        if clean_label:
             _add_unique(summary["matchedNames"], clean_label)
     if enrichment_identity.get("matchedUserIdCount"):
         _add_unique(summary["evidenceDetails"], "Existing Source File enrichment identity matching linked this subject to local profile/community identity context for review.")
@@ -1523,7 +1591,20 @@ def build_entity_activity_summary(
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        structured_rows = _structured_evidence_rows(conn, subject, guild_id, lanes, max_rows)
+        structured_rows = _structured_evidence_rows(conn, subject, guild_id, lanes, max_rows, aliases=aliases)
+        if output_mode != "admin_internal":
+            structured_rows = [row for row in structured_rows if row["public_safe_candidate"] and not row["review_only"]]
+        current_rows = []
+        for row in structured_rows:
+            data = dict(row)
+            if data.get("source_table") == "conversations":
+                decision = validate_entity_evidence_source(conn, data, subject, guild_id, aliases=aliases)
+                if not decision["eligible"]:
+                    continue
+                if output_mode == "admin_internal" and source_read_snapshot is not None:
+                    _append_source_read_snapshot(source_read_snapshot, _source_read_reference(data, decision["sourceFingerprint"]))
+            current_rows.append(row)
+        structured_rows = current_rows
         if structured_rows:
             _apply_structured_evidence(summary, structured_rows, topic_counts)
             for row in structured_rows:
@@ -1555,7 +1636,6 @@ def build_entity_activity_summary(
                 if row["evidence_kind"] == "profile_match":
                     clean_name = normalize_subject_name(row["subject_name"] or subject)
                     _add_unique(summary["matchedNames"], clean_name)
-                    aliases.append(clean_name)
             lanes = set(lanes) - {
                 "user_profiles",
                 "user_memory_facts",
@@ -1572,12 +1652,11 @@ def build_entity_activity_summary(
             for row in _fetch_rows(conn, "user_profiles", guild_id, max_rows):
                 data = dict(row)
                 names = [data.get("display_name"), data.get("preferred_name")]
-                if any(contains_subject_mention(str(name or ""), subject) or contains_subject_mention(subject, str(name or "")) for name in names if name):
+                if _conversation_author_matches_subject(data, _conversation_match_labels(subject, key, aliases)):
                     for name in names:
                         if name:
                             clean_name = normalize_subject_name(str(name))
                             _add_unique(summary["matchedNames"], clean_name)
-                            aliases.append(clean_name)
                     if "user_id" in data:
                         matched_user_ids.add(data.get("user_id"))
                     _add_unique(summary["knownContext"], f"Local profile match found for {subject}.")
@@ -1594,6 +1673,8 @@ def build_entity_activity_summary(
             matched_user_ids=matched_user_ids,
             structured_rows=structured_rows,
             max_rows=max_rows,
+            public_only=output_mode != "admin_internal",
+            source_read_snapshot=source_read_snapshot if output_mode == "admin_internal" else None,
         )
         if intelligence_rows:
             intelligence = extract_recurring_subject_intelligence(intelligence_rows, subject)
@@ -1678,17 +1759,25 @@ def build_entity_activity_summary(
 
         if "conversations" in lanes:
             for row in _fetch_rows(conn, "conversations", guild_id, max_rows):
-                fields = ["user_name", "content", "channel_name", "channel_policy"]
-                if not row_matches(row, fields):
-                    continue
                 data = dict(row)
                 policy = str(data.get("channel_policy") or "unknown").strip().lower() or "unknown"
+                if policy in EXCLUDED_CONVERSATION_POLICIES:
+                    continue
+                if output_mode != "admin_internal" and policy not in PUBLIC_CONVERSATION_POLICIES:
+                    continue
                 text = _row_text(row, ["content"])
+                authored = _conversation_author_matches_subject(data, _conversation_match_labels(subject, key, aliases), matched_user_ids)
+                if not authored and not contains_subject_mention(text, subject, aliases=aliases):
+                    continue
+                relation = "authored" if authored else "mentioned"
+                reference = _validated_conversation_read_reference(conn, data, subject, guild_id, aliases, relation)
+                if reference is None:
+                    continue
+                if output_mode == "admin_internal" and source_read_snapshot is not None:
+                    _append_source_read_snapshot(source_read_snapshot, reference)
                 channel_name = data.get("channel_name") or ""
                 channel_display = _channel_display_name(channel_name, policy)
-                authored = data.get("user_id") in matched_user_ids or contains_subject_mention(str(data.get("user_name") or ""), subject, aliases=aliases)
                 _record_link_signal(summary, text, source_kind="primary" if authored else "derived")
-                relation = "authored" if authored else "mentioned"
                 timestamp = str(data.get("timestamp") or "")
                 topics = _topic_labels_for_text(text, review_only=policy not in PUBLIC_CONVERSATION_POLICIES)
                 summary["rawProvenance"]["channelPolicies"][policy] += 1
@@ -1766,6 +1855,8 @@ def build_entity_activity_summary(
                 text = _row_text(row, ["cleaned_summary", "summary", "raw_note", "entry_type"])
                 public_safe = bool(data.get("public_safe")) if "public_safe" in data else False
                 status = str(data.get("status") or "active")
+                if output_mode != "admin_internal" and not (public_safe and status == "active"):
+                    continue
                 if public_safe and status == "active":
                     _add_unique(summary["publicSafePossibilities"], "Broadcast-memory context may support public wording after owner review.")
                     _add_unique(summary["publicUseCandidates"], "Active public-safe broadcast memory may support public wording after owner review.")
@@ -1903,7 +1994,7 @@ def build_entity_activity_summary(
     summary.pop("_primaryLinkSignalFingerprints", None)
     if output_mode != "admin_internal":
         # Raw provenance remains separate, but public-facing callers should not receive snippets.
-        raw["rawFragments"] = [{k: v for k, v in frag.items() if k != "snippet"} for frag in raw["rawFragments"]]
+        raw["rawFragments"] = [{k: v for k, v in frag.items() if k not in {"snippet", "rawRefJson"}} for frag in raw["rawFragments"]]
     return summary
 
 
