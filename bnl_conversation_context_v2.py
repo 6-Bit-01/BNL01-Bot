@@ -287,6 +287,30 @@ class TransientDiscordReplySource:
 
 
 @dataclass(frozen=True)
+class CompletedConversationExchange:
+    """A validated completed exchange carried only for the current follow-up."""
+
+    guild_id: int
+    channel_id: int
+    user_id: int
+    channel_policy: str
+    request_message_ids: tuple[int, ...]
+    request_texts: tuple[str, ...]
+    reply_message_ids: tuple[int, ...]
+    reply_texts: tuple[str, ...]
+    revision: str = ""
+    control_digest: str = ""
+    current_message_id: int = 0
+    current_message_text: str = ""
+    request_source_digests: tuple[str, ...] = ()
+    reply_source_digests: tuple[str, ...] = ()
+    unsaved_reply_message_ids: tuple[int, ...] | None = None
+    reply_source_row_ids: tuple[int, ...] = ()
+    reply_owner_texts: tuple[str, ...] = ()
+    control_source_users: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
 class ConversationContextRequest:
     guild_id: int
     current_user_id: int
@@ -311,6 +335,7 @@ class ConversationContextRequest:
     current_recall_scope_complete: bool = False
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     route_allowed_sources: frozenset[str] = field(default_factory=frozenset)
+    active_exchange: CompletedConversationExchange | None = None
 
 @dataclass(frozen=True)
 class ConversationContextResult:
@@ -346,6 +371,7 @@ class ConversationContextResult:
     requester_user_id: int = 0
     requester_human_turns: tuple[tuple[int, str], ...] = ()
     referent_request_row_ids: tuple[int, ...] = ()
+    active_exchange: CompletedConversationExchange | None = None
 
 
 @dataclass(frozen=True)
@@ -1242,11 +1268,13 @@ def _unsafe_row(row: dict) -> bool:
     if UNSAFE_HISTORY_RE.search(content):
         return True
     if role in {"model", "assistant", "bnl"} and _unsafe_operational_state_assertion(content):
-        # A resolved Discord reply to BNL may carry the exact visible wording of
-        # a no-store operational answer. It is eligible only as the structural
-        # referent for this turn; the rendered contract explicitly forbids using
-        # it as current-state evidence. Ordinary stored history remains blocked.
-        return not bool(row.get("_transient_exact_reply_source"))
+        # Validated transient BNL answers may retain their visible wording only
+        # as the current conversational referent, never as current-state evidence.
+        # Ordinary stored operational assertions remain blocked.
+        return not bool(
+            row.get("_transient_exact_reply_source")
+            or row.get("_transient_active_exchange_source")
+        )
     return False
 
 
@@ -1298,6 +1326,114 @@ def _transient_exact_reply_rows(
             }
         )
     return rows
+
+
+def _resolve_active_conversation_exchange(
+    source_rows: list[dict],
+    eligible_rows: list[dict],
+    req: ConversationContextRequest,
+) -> _ReferentResolution:
+    """Bind a completed exchange to exact stored humans, never nearby pairs."""
+    exchange = req.active_exchange
+    unavailable = _ReferentResolution(
+        status="unresolved", reason="active_conversation_exchange_unavailable"
+    )
+    if not isinstance(exchange, CompletedConversationExchange):
+        return unavailable
+    if (
+        exchange.guild_id != req.guild_id
+        or exchange.user_id != req.current_user_id
+        or not exchange.channel_id
+        or exchange.channel_id != req.channel_id
+        or str(exchange.channel_policy or "").strip().lower()
+        != str(req.channel_policy or "").strip().lower()
+    ):
+        return unavailable
+    for message_ids, texts in (
+        (exchange.request_message_ids, exchange.request_texts),
+        (exchange.reply_message_ids, exchange.reply_texts),
+    ):
+        if (
+            not isinstance(message_ids, tuple)
+            or not isinstance(texts, tuple)
+            or not 1 <= len(message_ids) <= 4
+            or len(message_ids) != len(texts)
+            or any(type(message_id) is not int or message_id <= 0 for message_id in message_ids)
+            or len(set(message_ids)) != len(message_ids)
+            or any(not isinstance(text, str) or not text.strip() for text in texts)
+        ):
+            return unavailable
+    if set(exchange.request_message_ids) & set(exchange.reply_message_ids):
+        return unavailable
+
+    if exchange.reply_source_row_ids and (
+        len(exchange.reply_source_row_ids) != len(exchange.reply_message_ids)
+        or len(exchange.reply_owner_texts) != len(exchange.reply_message_ids)
+    ):
+        return unavailable
+
+    def eligible_source(message_id: int, human: bool, owner_row_id: int = 0) -> dict | None:
+        matches = [row for row in source_rows
+                   if (int(row.get("id") or 0) == owner_row_id if owner_row_id else int(row.get("message_id") or 0) == message_id)]
+        if len(matches) != 1:
+            return None
+        row = matches[0]
+        role = str(row.get("role") or "").lower()
+        if (
+            int(row.get("id") or 0) <= 0
+            or int(row.get("guild_id") or req.guild_id) != req.guild_id
+            or int(row.get("channel_id") or 0) != req.channel_id
+            or (int(row.get("user_id") or 0) != req.current_user_id
+                and (human or req.current_user_id not in tuple(row.get("response_participant_ids") or ())))
+            or (role != "user" if human else role not in {"model", "assistant", "bnl"})
+        ):
+            return None
+        return next((dict(candidate) for candidate in eligible_rows
+                     if int(candidate.get("id") or 0) == int(row["id"])
+                     and (owner_row_id or int(candidate.get("message_id") or 0) == message_id)), None)
+
+    selected = []
+    for message_id, text in zip(exchange.request_message_ids, exchange.request_texts):
+        row = eligible_source(message_id, human=True)
+        if row is None or str(row.get("content") or "").strip() != text.strip():
+            return unavailable
+        selected.append(row)
+    for index, (message_id, text) in enumerate(zip(exchange.reply_message_ids, exchange.reply_texts)):
+        owner_row_id = exchange.reply_source_row_ids[index] if exchange.reply_source_row_ids else 0
+        if owner_row_id:
+            row = eligible_source(message_id, human=False, owner_row_id=owner_row_id)
+            if row is None or str(row.get("content") or "").strip() != exchange.reply_owner_texts[index].strip():
+                return unavailable
+            if any(int(prior.get("id") or 0) == owner_row_id for prior in selected):
+                continue
+            selected.append(row)
+            continue
+        stored = any(int(row.get("message_id") or 0) == message_id for row in source_rows)
+        if stored:
+            row = eligible_source(message_id, human=False)
+            if row is None or str(row.get("content") or "").strip() != text.strip():
+                return unavailable
+        else:
+            if exchange.unsaved_reply_message_ids is not None and message_id not in exchange.unsaved_reply_message_ids:
+                return unavailable
+            row = {
+                "id": 0, "role": "model", "content": text.strip(),
+                "guild_id": req.guild_id, "user_id": req.current_user_id,
+                "user_name": "BNL-01", "channel_id": req.channel_id,
+                "channel_name": req.channel_name, "channel_policy": req.channel_policy,
+                "timestamp": req.now.isoformat(), "message_id": message_id,
+                "_same_room": True, "_transient_active_exchange_source": True,
+            }
+            if message_id in req.current_message_ids or _unsafe_row(row):
+                return unavailable
+        selected.append(row)
+    for index, row in enumerate(selected):
+        row["_active_exchange_index"] = index
+    selected_rows = tuple(selected)
+    return _ReferentResolution(
+        status="resolved", candidates=selected_rows, selected=selected_rows,
+        reason="active_conversation_exchange",
+    )
 
 
 def _referent_input_text(text: str) -> str:
@@ -2290,6 +2426,17 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         and referent_resolution.reason != "discord_reply_source"
     ):
         referent_resolution = _ReferentResolution()
+    active_exchange_requested = bool(
+        req.active_exchange is not None
+        and not req.referenced_message_ids
+        and not req.referenced_conversation_row_ids
+        and not EXPLICIT_NEW_TOPIC_RE.search(current_text)
+        and not req.current_recall_scope_complete
+    )
+    if active_exchange_requested:
+        referent_resolution = _resolve_active_conversation_exchange(
+            source_rows, referent_eligible_rows, req
+        )
     exact_reply_scope_expanded = bool(
         referent_resolution.status == "resolved"
         and referent_resolution.reason == "discord_reply_source"
@@ -2453,6 +2600,16 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         open_unpaired = []
         thread_focus_mode = "exact_discord_reply"
         focus_reason = "discord_reply_source_primary"
+    elif active_exchange_requested:
+        suppressed_thread_count = max(
+            suppressed_thread_count,
+            len(selected_pairs) + len(selected_cross) + len(open_unpaired),
+        )
+        selected_pairs = []
+        selected_cross = []
+        open_unpaired = []
+        thread_focus_mode = "continue_or_answer"
+        focus_reason = "active_conversation_exchange"
     candidates = []
     candidate_row_ids: set[int] = set()
     for _score, pair, why in selected_pairs:
@@ -2496,7 +2653,10 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     for row in referent_resolution.selected:
         row_id = int(row.get("id") or 0)
         role = str(row.get("role") or "").lower()
-        if role in {"model", "assistant", "bnl"}:
+        if (
+            role in {"model", "assistant", "bnl"}
+            and referent_resolution.reason != "active_conversation_exchange"
+        ):
             for pair in pairs:
                 if int(pair["model"].get("id") or 0) != row_id:
                     continue
@@ -2539,10 +2699,14 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         candidates.append((int(row.get("id") or 0), "unpaired_user", row, (reason,)))
     candidates.sort(
         key=lambda candidate: (
+            (0, int(candidate[2].get("_active_exchange_index") or 0))
+            if active_exchange_requested
+            else (
             0
             if candidate[1] in {"referent_user", "referent_model"}
             else 1,
             candidate[0],
+            )
         )
     )
     lines = []
@@ -2568,6 +2732,14 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             "Resolve same-person or same-item references from that human scope. "
             "BNL-added alternatives do not change the requested set or its referents. "
             "Use the original factual sources to answer within those limits."
+        )
+    if referent_resolution.reason == "active_conversation_exchange":
+        header.append(
+            "- This active conversation exchange retains the human request "
+            "and its dependent constraints. Earlier human limits remain in "
+            "force until a later human request changes them. BNL's prior "
+            "answers explain this follow-up; reload original factual sources "
+            "to answer within the human scope."
         )
     retained_dates = set()
     for row in source_rows:
@@ -2652,6 +2824,47 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         }
         qualifier = qualifiers.get(item.get("_unpaired_reason"), "open loop")
         return [f"{_user_role_label(item, qualifier)}: {_render_history_excerpt(item.get('content') or '', current_text)}"]
+
+    def referent_block(kind: str, item: dict) -> list[str]:
+        row_id = int(item.get("id") or 0)
+        active_exchange = referent_resolution.reason == "active_conversation_exchange"
+        qualifier = (
+            "exact Discord reply source"
+            if referent_resolution.reason == "discord_reply_source"
+            else "prior answer within active exchange"
+            if active_exchange and kind == "referent_model"
+            else "active human request root"
+            if active_exchange and row_id == request_root_id
+            else "active human request constraint"
+            if active_exchange
+            else "prior answer within request chain"
+            if resolved_request_chain and kind == "referent_model"
+            else "human request root"
+            if resolved_request_chain and row_id == request_root_id
+            else "human request constraint"
+            if resolved_request_chain
+            else "resolved nearby referent"
+        )
+        label = (
+            f"BNL-01 ({qualifier})" if kind == "referent_model"
+            else _user_role_label(item, qualifier)
+        )
+        return [f"{label}: " + sanitize_history_text(
+            item.get("content") or "", limit=MAX_REFERENT_LINE_CHARS
+        )]
+
+    if referent_resolution.reason == "active_conversation_exchange":
+        active_block = [
+            *header,
+            *(line for _id, kind, item, _why in candidates
+              for line in referent_block(kind, item)),
+        ]
+        if not _append_block([], active_block, MAX_RENDERED_CHARS):
+            referent_resolution = _ReferentResolution(
+                status="unresolved", candidates=referent_resolution.candidates,
+                reason="resolved_source_not_rendered",
+            )
+            candidates = []
 
     # Admit the recent human tail before spending the budget on older pairs,
     # while still rendering in chronological order for downstream resolvers.
@@ -2748,50 +2961,24 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                 reasons.extend(why)
             elif kind in {"referent_user", "referent_model"}:
                 row_id = int(item.get("id") or 0)
-                transient_exact_reply = bool(
+                transient_reply = bool(
                     item.get("_transient_exact_reply_source")
+                    or item.get("_transient_active_exchange_source")
                 )
                 transient_message_id = int(item.get("message_id") or 0)
                 if (
                     (row_id > 0 and row_id in rendered_row_ids)
                     or (
-                        transient_exact_reply
+                        transient_reply
                         and transient_message_id
                         in rendered_transient_message_ids
                     )
                 ):
                     continue
-                exact_discord_reply = (
-                    referent_resolution.reason == "discord_reply_source"
-                )
-                qualifier = (
-                    "exact Discord reply source"
-                    if exact_discord_reply
-                    else "prior answer within request chain"
-                    if resolved_request_chain and kind == "referent_model"
-                    else "human request root"
-                    if resolved_request_chain and row_id == request_root_id
-                    else "human request constraint"
-                    if resolved_request_chain
-                    else "resolved nearby referent"
-                )
-                if kind == "referent_model":
-                    label = f"BNL-01 ({qualifier})"
-                else:
-                    label = _user_role_label(
-                        item,
-                        qualifier,
-                    )
-                block = [
-                    f"{label}: "
-                    + sanitize_history_text(
-                        item.get("content") or "",
-                        limit=MAX_REFERENT_LINE_CHARS,
-                    )
-                ]
+                block = referent_block(kind, item)
                 if not _append_block(lines, block, MAX_RENDERED_CHARS):
                     continue
-                if transient_exact_reply:
+                if transient_reply:
                     rendered_transient_message_ids.add(transient_message_id)
                     rendered_transient_texts.append(
                         str(item.get("content") or "").strip()
@@ -2809,7 +2996,8 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     resolved_transient_message_ids = tuple(
         int(row.get("message_id") or 0)
         for row in referent_resolution.selected
-        if row.get("_transient_exact_reply_source")
+        if (row.get("_transient_exact_reply_source")
+            or row.get("_transient_active_exchange_source"))
         and int(row.get("message_id") or 0) > 0
     )
     final_referent_status = referent_resolution.status
@@ -2817,20 +3005,10 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     if (
         final_referent_status == "resolved"
         and (
-            not (
-                resolved_referent_ids
-                and all(
-                    row_id in rendered_row_ids
-                    for row_id in resolved_referent_ids
-                )
-            )
-            and not (
-                resolved_transient_message_ids
-                and all(
-                    message_id in rendered_transient_message_ids
-                    for message_id in resolved_transient_message_ids
-                )
-            )
+            not (resolved_referent_ids or resolved_transient_message_ids)
+            or any(row_id not in rendered_row_ids for row_id in resolved_referent_ids)
+            or any(message_id not in rendered_transient_message_ids
+                   for message_id in resolved_transient_message_ids)
         )
     ):
         final_referent_status = "unresolved"
@@ -2894,6 +3072,11 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         # pairing, never a nearest-row guess or the model's prose as evidence.
         referent_request_row_ids=tuple(sorted({
             int(user.get("id") or 0)
+            for user in referent_resolution.selected
+            if str(user.get("role") or "").lower() == "user"
+            and int(user.get("id") or 0) in rendered_row_ids
+        } if referent_resolution.reason == "active_conversation_exchange" else {
+            int(user.get("id") or 0)
             for pair in pairs
             if int(pair["model"].get("id") or 0) in resolved_referent_ids
             for user in (
@@ -2905,11 +3088,20 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             and _row_is_same_room(user, req)
         })) if final_referent_status == "resolved" else (),
         requester_human_turns=tuple(
-            (int(row["id"]), _render_history_excerpt(row.get("content") or "", current_text))
+            (int(row["id"]),
+             sanitize_history_text(row.get("content") or "", limit=MAX_REFERENT_LINE_CHARS)
+             if referent_resolution.reason == "active_conversation_exchange"
+             else _render_history_excerpt(row.get("content") or "", current_text))
             for row in sorted(source_rows, key=lambda item: int(item.get("id") or 0))
             if int(row.get("id") or 0) in rendered_row_ids
             and str(row.get("role") or "").lower() == "user"
             and int(row.get("user_id") or 0) == int(req.current_user_id)
             and _row_is_same_room(row, req)
+        ),
+        active_exchange=(
+            req.active_exchange
+            if final_referent_status == "resolved"
+            and final_referent_reason == "active_conversation_exchange"
+            else None
         ),
     )

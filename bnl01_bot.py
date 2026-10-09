@@ -213,6 +213,7 @@ from bnl_conversation_context_v2 import (
     ConversationContextRequest,
     ConversationContextResult,
     TransientDiscordReplySource,
+    CompletedConversationExchange,
     assess_payload_grounding,
     assess_reply_referent_grounding,
     assemble_conversation_context_v2,
@@ -4421,7 +4422,7 @@ def build_tiktok_show_evidence_context_for_turn(
         subset_chain_root = (
             min((item.source_id for item in source_items), default=0)
             if conversation_context_result.referent_status == "resolved"
-            and conversation_context_result.referent_reason == "human_request_subset_chain"
+            and conversation_context_result.referent_reason in {"human_request_subset_chain", "active_conversation_exchange"}
             else 0
         )
         dependent_queries = []
@@ -23435,6 +23436,7 @@ def build_conversation_context_v2_for_prompt(
     referenced_message_ids: set[int] | None = None,
     referenced_conversation_row_ids: set[int] | None = None,
     transient_reply_sources: tuple[TransientDiscordReplySource, ...] | None = None,
+    active_exchange: CompletedConversationExchange | None = None,
     is_batch: bool = False,
     is_deferred_payload_session: bool = False, now=None, route_allowed_sources=None,
     result_out: dict | None = None,
@@ -23451,7 +23453,7 @@ def build_conversation_context_v2_for_prompt(
             guild_id=guild_id, current_user_id=current_user_id,
             channel_id=channel_id, channel_policy=channel_policy,
             route_mode=route_mode, query=resume_query, now=request_now,
-        ) if not (referenced_message_ids or referenced_conversation_row_ids or transient_reply_sources)
+        ) if not (referenced_message_ids or referenced_conversation_row_ids or transient_reply_sources or active_exchange)
         else ((), ())
     )
     rows = get_conversation_context_v2_rows(
@@ -23461,10 +23463,26 @@ def build_conversation_context_v2_for_prompt(
         channel_id=channel_id,
         channel_name=channel_name,
         channel_policy=channel_policy,
-        referenced_message_ids=referenced_message_ids,
-        referenced_conversation_row_ids=referenced_conversation_row_ids,
+        referenced_message_ids=set(referenced_message_ids or ()) | set(
+            (*active_exchange.request_message_ids, *active_exchange.reply_message_ids) if active_exchange else ()),
+        referenced_conversation_row_ids=set(referenced_conversation_row_ids or ()) | set(active_exchange.reply_source_row_ids if active_exchange else ()),
         retained_conversation_row_ids=retained_rows,
     )
+    if active_exchange is not None:
+        source_users = {
+            int(row["id"]): int(row.get("user_id") or 0)
+            for row in rows
+            if (int(row.get("message_id") or 0) in active_exchange.request_message_ids
+                and str(row.get("role") or "").lower() == "user"
+                and int(row.get("user_id") or 0) == int(current_user_id))
+            or int(row["id"]) in active_exchange.reply_source_row_ids
+        }
+        with closing(_open_member_memory_read_connection()) as conn:
+            control_digest, blocked_rows = _public_conversation_recall_controls(
+                conn, guild_id=guild_id, source_users=source_users,
+            )
+        rows = [dict(row, prompt_history_excluded=True) if int(row["id"]) in blocked_rows else row for row in rows]
+        active_exchange = replace(active_exchange, control_digest=control_digest, control_source_users=tuple(sorted(source_users.items())))
     if retained_rows and resume_date_scope_requested(resume_query):
         # A dated, resolved occurrence owns this historical context. Recent
         # messages about a different occurrence cannot replace its sources.
@@ -23504,6 +23522,7 @@ def build_conversation_context_v2_for_prompt(
             if x
         ),
         transient_reply_sources=tuple(transient_reply_sources or ()),
+        active_exchange=active_exchange,
         is_direct_target=bool(is_direct_target), is_reply_to_bnl=bool(is_reply_to_bnl), is_batch=bool(is_batch),
         is_deferred_payload_session=bool(is_deferred_payload_session), now=request_now,
         route_allowed_sources=frozenset(route_allowed_sources or getattr(get_route_mode_contract(route_mode), "allowed_context_sources", frozenset())),
@@ -23694,7 +23713,7 @@ def format_room_context_for_prompt(rows: list[dict], current_user_name: str = ""
     return "\n".join(rendered)
 
 
-def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct", current_text: str = "", current_has_media: bool = False, *, current_user_id: int = 0, current_message_ids: set[int] | None = None, referenced_message_ids: set[int] | None = None, referenced_conversation_row_ids: set[int] | None = None, transient_reply_sources: tuple[TransientDiscordReplySource, ...] | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, conversation_surface: str = "unknown", is_direct_target: bool = False, is_reply_to_bnl: bool = False, is_batch: bool = False, is_deferred_payload_session: bool = False, context_result_out: dict | None = None) -> str:
+def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct", current_text: str = "", current_has_media: bool = False, *, current_user_id: int = 0, current_message_ids: set[int] | None = None, referenced_message_ids: set[int] | None = None, referenced_conversation_row_ids: set[int] | None = None, transient_reply_sources: tuple[TransientDiscordReplySource, ...] | None = None, active_exchange: CompletedConversationExchange | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, conversation_surface: str = "unknown", is_direct_target: bool = False, is_reply_to_bnl: bool = False, is_batch: bool = False, is_deferred_payload_session: bool = False, context_result_out: dict | None = None) -> str:
     if conversation_context_v2_enabled():
         formatted = build_conversation_context_v2_for_prompt(
             guild_id=guild_id,
@@ -23712,6 +23731,7 @@ def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name
                 referenced_conversation_row_ids or set()
             ),
             transient_reply_sources=transient_reply_sources or (),
+            active_exchange=active_exchange,
             is_direct_target=is_direct_target,
             is_reply_to_bnl=is_reply_to_bnl,
             is_batch=is_batch,
@@ -28942,6 +28962,8 @@ class ConversationPromptSourceBasis:
     retained_resume_route_mode: str = "normal_chat"
     retained_resume_reference_at: str = ""
 
+    active_exchange: CompletedConversationExchange | None = None
+
 
 def _public_conversation_recall_controls(
     conn: sqlite3.Connection, *, guild_id: int, source_users: dict[int, int],
@@ -30318,6 +30340,7 @@ def build_live_conversation_orchestration_decision(
                                 "latest_answer_subset",
                                 "single_request_subset",
                                 "human_request_subset_chain",
+                                "active_conversation_exchange",
                             }
                         )
                     )
@@ -30389,6 +30412,11 @@ def build_live_conversation_orchestration_decision(
             moment_situation and moment_situation.participant_overlap
         ),
         referent_status=frame_referent_status,
+        validated_exchange_dependency=bool(
+            context_result is not None
+            and context_result.referent_status == "resolved"
+            and context_result.active_exchange is not None
+        ),
         response_act=decision.response_act,
         packet_revision=str(packet_revision or decision.packet_revision),
     )
@@ -30818,7 +30846,11 @@ def build_unified_response_assessment_shadow(
         dict.fromkeys(
             source_row_id
             for basis in conversation_bases
-            for source_row_id in basis.source_row_ids
+            for source_row_id in (
+                tuple(item.source_id for item in basis.evidence_items
+                      if item.source_id in {entry.source_id for entry in basis.referent_source_evidence_items})
+                if basis.active_exchange else basis.source_row_ids
+            )
         )
     )
     has_moment_gist = bool(
@@ -32346,6 +32378,8 @@ def build_conversation_prompt_source_basis(
         ),
         transient_referent_message_ids=transient_referent_message_ids,
         transient_referent_texts=transient_referent_texts,
+        active_exchange=getattr(context_result, "active_exchange", None),
+        public_recall_control_digest=(getattr(getattr(context_result, "active_exchange", None), "control_digest", "")),
     )
 
 
@@ -32634,9 +32668,13 @@ def refresh_prompt_source_basis(
     if control_digest:
         with closing(_open_member_memory_read_connection()) as conn:
             control_digest, _blocked_rows = _public_conversation_recall_controls(
-                conn, guild_id=basis.guild_id, source_users={
+                conn, guild_id=basis.guild_id, source_users=dict(basis.active_exchange.control_source_users) if basis.active_exchange else {
                     int(item.source_id): int(item.speaker_user_id)
-                    for item in basis.evidence_items if int(item.source_id or 0) > 0
+                    for item in basis.evidence_items
+                    if int(item.source_id or 0) > 0
+                    and (not basis.active_exchange or item.source_id in {
+                        source.source_id for source in basis.referent_source_evidence_items
+                    })
                 },
             )
     fresh = replace(
@@ -43346,6 +43384,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     )
         response_stage = "discord_send"
         sent_message_ids = []
+        sent_message_digests = []
         try:
             if len(response) <= 2000:
                 sent = await channel.send(
@@ -43355,6 +43394,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
                 if int(getattr(sent, "id", 0) or 0) > 0:
                     sent_message_ids.append(int(sent.id))
+                    sent_message_digests.append((int(sent.id), _prompt_source_digest(response)))
             else:
                 chunks = split_message(response)
                 sent = await channel.send(
@@ -43364,6 +43404,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
                 if int(getattr(sent, "id", 0) or 0) > 0:
                     sent_message_ids.append(int(sent.id))
+                    sent_message_digests.append((int(sent.id), _prompt_source_digest(chunks[0] + "...")))
                 for chunk in chunks[1:]:
                     sent = await channel.send(
                         "..." + chunk,
@@ -43371,6 +43412,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     )
                     if int(getattr(sent, "id", 0) or 0) > 0:
                         sent_message_ids.append(int(sent.id))
+                        sent_message_digests.append((int(sent.id), _prompt_source_digest("..." + chunk)))
             logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", generation_route if 'generation_route' in locals() else "get_gemini_response", channel_id, len(response or ""))
         except Exception as exc:
             logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", generation_route if 'generation_route' in locals() else "get_gemini_response", channel_id, type(exc).__name__)
@@ -43425,6 +43467,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 channel_policy=channel_policy,
                 request_message_ids=tuple(getattr(getattr(item, "addressing", None), "source_message_id", 0) for item in items if item[2] == uid),
                 reply_message_ids=tuple(sent_message_ids),
+                no_store_reply_message_ids=(tuple(sent_message_ids) if (
+                    not batch_model_persistence_allowed
+                    or turn_local_discord_reply_requires_no_store(batch_presend_source_bases)
+                ) else ()),
+                reply_message_digests=tuple(sent_message_digests),
             )
             if meaningful_followup_question:
                 logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", guild_id, channel_id, uid, BNL_QUESTION_ANSWER_TTL_SECONDS)
@@ -43463,7 +43510,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 channel_policy,
             )
         else:
-            await asyncio.to_thread(
+            batch_model_decision = await asyncio.to_thread(
                 save_model_message,
                 first_uid,
                 channel.guild.id,
@@ -43475,6 +43522,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 conversation_target_user_ids=tuple(unique_user_ids),
                 discord_message_ids=tuple(sent_message_ids),
             )
+            if not getattr(batch_model_decision, "save_conversation", False):
+                for uid in unique_user_ids:
+                    state = _get_conversation_continuation_state(guild_id, channel_id, uid)
+                    if state and state.get("reply_message_ids") == tuple(sent_message_ids):
+                        state["no_store_reply_message_ids"] = tuple(sent_message_ids)
         await persist_batch_bnl_self_name_decision_after_send_async(
             items,
             response=response,
@@ -44071,6 +44123,24 @@ def build_user_aware_prompt(
         clean_content,
         tiktok_show_evidence_context,
     )
+    if (
+        not finalized_show_packet_owner
+        and show_basis is not None
+        and conversation_context_result is not None
+        and conversation_context_result.referent_status == "resolved"
+        and conversation_context_result.active_exchange is not None
+        and not is_live_show_reaction_query(clean_content)
+        and not _current_queue_state_query(clean_content)
+    ):
+        selected_human_ids = set(conversation_context_result.referent_request_row_ids)
+        finalized_show_packet_owner = bool(
+            conversation_prompt_basis is not None
+            and any(
+                item.source_id in selected_human_ids
+                and finalized_show_packet_owner_requested(item.text, tiktok_show_evidence_context)
+                for item in conversation_prompt_basis.evidence_items
+            )
+        )
     tiktok_show_episode_turn_contract = (
         build_tiktok_show_episode_turn_contract(
             tiktok_show_evidence_context
@@ -45493,7 +45563,7 @@ def _mark_recent_direct_response(channel_id: int, user_id: int):
     _recent_direct_response_window[(channel_id, user_id)] = datetime.now(timezone.utc)
 
 
-def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_id: int, *, awaiting_retransmission: bool = False, awaiting_answer: bool = False, channel_policy: str | None = None, request_message_ids=(), reply_message_ids=()):
+def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_id: int, *, awaiting_retransmission: bool = False, awaiting_answer: bool = False, channel_policy: str | None = None, request_message_ids=(), reply_message_ids=(), continuation_request_message_ids=(), continuation_reply_message_ids=(), no_store_reply_message_ids=None, continuation_no_store_reply_message_ids=(), reply_message_digests=(), continuation_reply_message_digests=()):
     if not channel_id or not user_id:
         return
     now = datetime.now(timezone.utc)
@@ -45508,8 +45578,25 @@ def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_i
     if not awaiting_retransmission:
         # References only: re-read the scoped Discord exchange if an untagged
         # follow-up needs interpretation. Never retain no-store reply text.
-        state["request_message_ids"] = tuple(int(mid) for mid in request_message_ids if mid)[-4:]
-        state["reply_message_ids"] = tuple(int(mid) for mid in reply_message_ids if mid)[-4:]
+        current_request_ids = tuple(int(mid) for mid in request_message_ids if mid)
+        current_reply_ids = tuple(int(mid) for mid in reply_message_ids if mid)
+        state["request_message_ids"] = current_request_ids[-4:]
+        state["reply_message_ids"] = current_reply_ids[-4:]
+        for field, prior, current in (
+            ("request_lineage_message_ids", continuation_request_message_ids, current_request_ids),
+            ("reply_lineage_message_ids", continuation_reply_message_ids, current_reply_ids),
+        ):
+            lineage = tuple(dict.fromkeys(int(mid) for mid in (*prior, *current) if mid))
+            state[field] = lineage if len(lineage) <= 4 else (lineage[0], *lineage[-3:])
+        if no_store_reply_message_ids is not None:
+            unsaved_ids = set((*continuation_no_store_reply_message_ids, *no_store_reply_message_ids))
+            state["no_store_reply_message_ids"] = tuple(
+                mid for mid in state["reply_lineage_message_ids"] if mid in unsaved_ids)
+        else:
+            state.pop("no_store_reply_message_ids", None)
+        digests = dict((*continuation_reply_message_digests, *reply_message_digests))
+        state["reply_message_digests"] = tuple(
+            (mid, digests[mid]) for mid in state["reply_lineage_message_ids"] if mid in digests)
     if awaiting_retransmission:
         state["awaiting_retransmission_until"] = now + timedelta(seconds=CONVERSATION_RETRANSMISSION_TTL_SECONDS)
     if awaiting_answer:
@@ -45601,19 +45688,35 @@ def _completed_conversation_followup_addressed(
     )
 
 
-async def _load_completed_followup_exchange(message, state: dict):
+def _completed_exchange_revision(state: dict) -> str:
+    return _prompt_source_digest(json.dumps([
+        state.get("last_bnl_reply_at"), state.get("request_message_ids"),
+        state.get("reply_message_ids"), state.get("request_lineage_message_ids"),
+        state.get("reply_lineage_message_ids"), state.get("channel_policy"),
+        state.get("no_store_reply_message_ids"),
+        state.get("reply_message_digests"),
+    ], default=str))
+
+
+async def _load_completed_followup_exchange(message, state: dict, *, result_out: dict | None = None):
     """Read only the last delivered exchange in this member's current room."""
     request_ids = tuple(state.get("request_message_ids") or ())
     reply_ids = tuple(state.get("reply_message_ids") or ())
     if not request_ids or not reply_ids:
         return None
+    request_ids = tuple(state.get("request_lineage_message_ids") or request_ids)
+    reply_ids = tuple(state.get("reply_lineage_message_ids") or reply_ids)
     sections = {}
+    snapshots = {}
+    request_source_digests = ()
+    reply_source_digests = ()
     bot_id = int(getattr(client.user, "id", 0) or 0)
     for name, ids, author_id in (
         ("previous_user", request_ids, message.author.id),
         ("bnl_reply", reply_ids, bot_id),
     ):
         texts = []
+        raw_digests = []
         for message_id in ids:
             source = await message.channel.fetch_message(message_id)
             if (
@@ -45623,9 +45726,102 @@ async def _load_completed_followup_exchange(message, state: dict):
                 or int(getattr(getattr(source, "guild", None), "id", 0) or 0) != message.guild.id
             ):
                 return None
-            texts.append(str(getattr(source, "content", "") or "")[:2000])
+            raw_text = str(getattr(source, "content", "") or "")
+            expected_reply_digest = dict(state.get("reply_message_digests") or ()).get(message_id)
+            if name == "bnl_reply" and expected_reply_digest and _prompt_source_digest(raw_text) != expected_reply_digest:
+                return None
+            raw_digests.append(_prompt_source_digest(raw_text))
+            texts.append(
+                append_media_context_to_text(
+                    resolve_discord_user_mentions_for_conversation(source, raw_text, bot_user_id=bot_id, remove_bot_mention=True),
+                    build_message_media_context(source),
+                ) if name == "previous_user" else raw_text
+            )
+        if name == "previous_user":
+            request_source_digests = tuple(raw_digests)
+        else:
+            reply_source_digests = tuple(raw_digests)
+        snapshots[name] = tuple(texts)
         sections[name] = "\n".join(texts)[-4000:]
+    if result_out is not None and all(sections.values()):
+        result_out["exchange"] = CompletedConversationExchange(
+            guild_id=message.guild.id, channel_id=message.channel.id,
+            user_id=message.author.id, channel_policy=state.get("channel_policy", "unknown"),
+            request_message_ids=request_ids, request_texts=snapshots["previous_user"],
+            reply_message_ids=reply_ids, reply_texts=snapshots["bnl_reply"],
+            revision=_completed_exchange_revision(state),
+            request_source_digests=request_source_digests,
+            reply_source_digests=reply_source_digests,
+            unsaved_reply_message_ids=(tuple(state["no_store_reply_message_ids"]) if "no_store_reply_message_ids" in state else None),
+        )
     return sections if all(sections.values()) else None
+
+
+def _completed_exchange_originals_available(exchange: CompletedConversationExchange, *, result_out: dict | None = None) -> bool:
+    """Check existing original ownership and privacy before provider exposure."""
+    try:
+        reply_owners = tuple(_conversation_row_for_discord_message(
+            guild_id=exchange.guild_id, message_id=message_id)[0]
+            for message_id in exchange.reply_message_ids)
+        rows = get_conversation_context_v2_rows(
+            exchange.guild_id, current_user_id=exchange.user_id,
+            channel_id=exchange.channel_id, channel_policy=exchange.channel_policy,
+            referenced_message_ids=set(exchange.request_message_ids),
+            referenced_conversation_row_ids=set(reply_owners),
+        )
+        source_users = {}
+        for message_id, text in zip(exchange.request_message_ids, exchange.request_texts):
+            matching = [row for row in rows if int(row.get("message_id") or 0) == message_id]
+            if len(matching) != 1:
+                return False
+            row = matching[0]
+            if (
+                str(row.get("role") or "").lower() != "user"
+                or int(row.get("user_id") or 0) != exchange.user_id
+                or int(row.get("channel_id") or 0) != exchange.channel_id
+                or row.get("channel_policy") != exchange.channel_policy
+                or row.get("prompt_history_excluded")
+                or str(row.get("content") or "").strip() != text.strip()
+            ):
+                return False
+            source_users[int(row["id"])] = exchange.user_id
+        with closing(_open_member_memory_read_connection()) as conn:
+            reply_owner_texts = []
+            for message_id, text, owner_id in zip(exchange.reply_message_ids, exchange.reply_texts, reply_owners):
+                if not owner_id:
+                    if exchange.unsaved_reply_message_ids is None or message_id not in exchange.unsaved_reply_message_ids:
+                        return False
+                    reply_owner_texts.append("")
+                    continue
+                owner = next((row for row in rows if int(row["id"]) == owner_id), None)
+                if (owner is None or str(owner.get("role") or "").lower() != "model"
+                        or int(owner.get("channel_id") or 0) != exchange.channel_id
+                        or owner.get("channel_policy") != exchange.channel_policy
+                        or owner.get("prompt_history_excluded")
+                        or (int(owner.get("user_id") or 0) != exchange.user_id
+                            and exchange.user_id not in tuple(owner.get("response_participant_ids") or ()))):
+                    return False
+                content = str(owner.get("content") or "")
+                if len(content) <= 2000:
+                    delivered_bodies = (content,)
+                else:
+                    chunks = split_message(content)
+                    delivered_bodies = (chunks[0] + "...", *("..." + chunk for chunk in chunks[1:]))
+                linked_ids = tuple(int(row[0]) for row in conn.execute(
+                    "SELECT message_id FROM conversation_discord_message_links WHERE guild_id=? AND conversation_row_id=? ORDER BY message_id",
+                    (exchange.guild_id, owner_id),
+                ).fetchall()) or (int(owner.get("message_id") or 0),)
+                if len(linked_ids) != len(delivered_bodies) or dict(zip(linked_ids, delivered_bodies)).get(message_id) != text:
+                    return False
+                reply_owner_texts.append(content)
+                source_users[owner_id] = int(owner.get("user_id") or 0)
+            _digest, blocked = _public_conversation_recall_controls(
+                conn, guild_id=exchange.guild_id, source_users=source_users)
+        if result_out is not None and source_users and not blocked:
+            result_out["exchange"] = replace(exchange, reply_source_row_ids=reply_owners, reply_owner_texts=tuple(reply_owner_texts))
+        return bool(source_users) and not blocked
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return False
 
 
 async def _classify_completed_followup_exchange(exchange: dict, content: str) -> bool:
@@ -45653,25 +45849,34 @@ async def _classify_completed_followup_exchange(exchange: dict, content: str) ->
     return isinstance(decision, dict) and set(decision) == {"continue"} and decision["continue"] is True
 
 
-async def _resolve_completed_followup_addressing(message, content: str, channel_policy: str) -> bool:
+async def _resolve_completed_followup_addressing(message, content: str, channel_policy: str, *, result_out: dict | None = None) -> bool:
     """Resolve a time-window candidate before making it an owed response."""
     state = _get_conversation_continuation_state(message.guild.id, message.channel.id, message.author.id)
     if not state or state.get("channel_policy") != channel_policy:
         return False
-    revision = (state.get("last_bnl_reply_at"), state.get("request_message_ids"), state.get("reply_message_ids"))
+    revision = _completed_exchange_revision(state)
     original_content = getattr(message, "content", "")
     pending = state.get("followup_check_task")
     if pending is not None and not pending.done():
         # Keep one physical provider call per exchange even after timeout.
         return False
 
+    loaded_exchange = {}
+
     async def check():
-        exchange = await _load_completed_followup_exchange(message, state)
+        exchange = await _load_completed_followup_exchange(message, state, result_out=loaded_exchange)
         if (
             not exchange or resolve_channel_policy(message.channel) != channel_policy
             or _get_conversation_continuation_state(message.guild.id, message.channel.id, message.author.id) is not state
-            or revision != (state.get("last_bnl_reply_at"), state.get("request_message_ids"), state.get("reply_message_ids"))
+            or revision != _completed_exchange_revision(state)
         ):
+            return False
+        if not await asyncio.to_thread(_completed_exchange_originals_available, loaded_exchange["exchange"], result_out=loaded_exchange):
+            return False
+        if (resolve_channel_policy(message.channel) != channel_policy
+                or _get_conversation_continuation_state(message.guild.id, message.channel.id, message.author.id) is not state
+                or revision != _completed_exchange_revision(state)
+                or getattr(message, "content", "") != original_content):
             return False
         return await _classify_completed_followup_exchange(exchange, content)
 
@@ -45693,12 +45898,97 @@ async def _resolve_completed_followup_addressing(message, content: str, channel_
     current = _get_conversation_continuation_state(message.guild.id, message.channel.id, message.author.id)
     allowed = bool(
         matched and current is state
-        and revision == (state.get("last_bnl_reply_at"), state.get("request_message_ids"), state.get("reply_message_ids"))
+        and revision == _completed_exchange_revision(state)
         and getattr(message, "content", "") == original_content
         and resolve_channel_policy(message.channel) == channel_policy
     )
     logging.info("completed_followup_addressing matched=%s channel_id=%s", int(allowed), message.channel.id)
+    if allowed and result_out is not None:
+        result_out.update(loaded_exchange)
+        if result_out.get("exchange") is not None:
+            result_out["exchange"] = replace(
+                result_out["exchange"], current_message_id=int(message.id),
+                current_message_text=original_content,
+            )
     return allowed
+
+
+async def _completed_exchange_source_failure_async(prompt_source_bases, message, channel_policy: str) -> str:
+    """Re-read selected exchange references; transcript text is never authority."""
+    bases = tuple(basis for basis in prompt_source_bases
+                  if isinstance(basis, ConversationPromptSourceBasis) and basis.active_exchange is not None)
+    for basis in bases:
+        exchange = basis.active_exchange
+        state = _get_conversation_continuation_state(exchange.guild_id, exchange.channel_id, exchange.user_id)
+
+        def still_current():
+            return bool(
+                state is not None
+                and _get_conversation_continuation_state(exchange.guild_id, exchange.channel_id, exchange.user_id) is state
+                and _completed_exchange_revision(state) == exchange.revision
+                and resolve_channel_policy(message.channel) == channel_policy == exchange.channel_policy
+                and int(message.guild.id) == exchange.guild_id
+                and int(message.channel.id) == exchange.channel_id
+                and int(message.author.id) == exchange.user_id
+                and int(message.id) == exchange.current_message_id
+                and getattr(message, "content", "") == exchange.current_message_text
+            )
+
+        if not still_current():
+            return "conversation_exchange_changed"
+        try:
+            current_message = await message.channel.fetch_message(exchange.current_message_id)
+            if (
+                int(getattr(current_message, "id", 0) or 0) != exchange.current_message_id
+                or int(getattr(getattr(current_message, "author", None), "id", 0) or 0) != exchange.user_id
+                or int(getattr(getattr(current_message, "channel", None), "id", 0) or 0) != exchange.channel_id
+                or int(getattr(getattr(current_message, "guild", None), "id", 0) or 0) != exchange.guild_id
+                or getattr(current_message, "content", "") != exchange.current_message_text
+            ):
+                return "conversation_exchange_changed"
+            current_text = append_media_context_to_text(
+                resolve_discord_user_mentions_for_conversation(current_message, exchange.current_message_text,
+                    bot_user_id=int(getattr(client.user, "id", 0) or 0), remove_bot_mention=True),
+                build_message_media_context(current_message),
+            )
+            if not await asyncio.to_thread(_completed_exchange_originals_available, replace(
+                exchange, request_message_ids=(exchange.current_message_id,), request_texts=(current_text,),
+                reply_message_ids=(), reply_texts=(),
+            )):
+                return "conversation_exchange_changed"
+            loaded = {}
+            await _load_completed_followup_exchange(message, state, result_out=loaded)
+            fresh = loaded.get("exchange")
+            if fresh is None or any(
+                getattr(fresh, field) != getattr(exchange, field)
+                for field in ("request_message_ids", "request_texts", "request_source_digests", "reply_message_ids", "reply_texts", "reply_source_digests")
+            ):
+                return "conversation_exchange_changed"
+            # Recheck original-row deletion and existing privacy/correction
+            # controls after the Discord reads, not only before generation.
+            if await prompt_source_basis_failure_async((basis,)):
+                return "conversation_exchange_changed"
+            original_result = {}
+            if not await asyncio.to_thread(
+                _completed_exchange_originals_available, fresh, result_out=original_result,
+            ):
+                return "conversation_exchange_changed"
+            original_exchange = original_result.get("exchange")
+            if original_exchange is None or any(
+                getattr(original_exchange, field) != getattr(exchange, field)
+                for field in ("reply_source_row_ids", "reply_owner_texts")
+            ):
+                return "conversation_exchange_changed"
+            if not await asyncio.to_thread(_completed_exchange_originals_available, replace(
+                exchange, request_message_ids=(exchange.current_message_id,), request_texts=(current_text,),
+                reply_message_ids=(), reply_texts=(),
+            )):
+                return "conversation_exchange_changed"
+        except Exception:
+            return "conversation_exchange_unavailable"
+        if not still_current():
+            return "conversation_exchange_changed"
+    return ""
 
 
 def _consume_awaiting_retransmission(guild_id: int, channel_id: int, user_id: int) -> bool:
@@ -50080,7 +50370,17 @@ async def send_planned_conversation_response(
         )
         return model_decision
     sent_message_ids = []
+    sent_message_digests = []
     try:
+        exchange_failure = await _completed_exchange_source_failure_async(prompt_source_bases, message, plan.channel_policy)
+        if exchange_failure or _abort_stale_direct_repair_generation(direct_repair_generation, "after_exchange_revalidation"):
+            logging.info("direct_exchange_delivery_aborted reason=%s", exchange_failure or "stale_generation")
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision, final_response=response, response_sent=False,
+                candidate_live=False, guard_status=exchange_failure or "stale_generation",
+            )
+            _finish_direct_repair_generation(direct_repair_generation, "exchange_invalidated")
+            return model_decision
         if len(response) <= 2000:
             sent = await message.reply(
                 response,
@@ -50097,12 +50397,16 @@ async def send_planned_conversation_response(
             if int(getattr(sent, "id", 0) or 0) > 0:
                 sent_message_ids.append(int(sent.id))
             for chunk in chunks[1:]:
+                if await _completed_exchange_source_failure_async(prompt_source_bases, message, plan.channel_policy):
+                    raise RuntimeError("conversation_exchange_changed_during_delivery")
                 sent = await message.channel.send(
                     "..." + chunk,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 if int(getattr(sent, "id", 0) or 0) > 0:
                     sent_message_ids.append(int(sent.id))
+        delivered_bodies = (response,) if len(response) <= 2000 else (chunks[0] + "...", *("..." + chunk for chunk in chunks[1:]))
+        sent_message_digests = tuple((mid, _prompt_source_digest(body)) for mid, body in zip(sent_message_ids, delivered_bodies))
         logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", plan.route_mode, getattr(message.channel, "id", 0), len(response or ""))
     except Exception as exc:
         logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", plan.route_mode, getattr(message.channel, "id", 0), type(exc).__name__)
@@ -50201,6 +50505,8 @@ async def send_planned_conversation_response(
     )
     if mark_recent_direct:
         meaningful_followup_question = _response_contains_direct_question_to_user(response) and not is_generic_non_answer_response(response, getattr(message.author, "display_name", ""))
+        selected_exchange = next((basis.active_exchange for basis in prompt_source_bases
+                                  if isinstance(basis, ConversationPromptSourceBasis) and basis.active_exchange is not None), None)
         _mark_conversation_continuation_state(
             message.guild.id,
             message.channel.id,
@@ -50209,6 +50515,12 @@ async def send_planned_conversation_response(
             channel_policy=plan.channel_policy,
             request_message_ids=(getattr(message, "id", 0),),
             reply_message_ids=tuple(sent_message_ids),
+            continuation_request_message_ids=(selected_exchange.request_message_ids if selected_exchange else ()),
+            continuation_reply_message_ids=(selected_exchange.reply_message_ids if selected_exchange else ()),
+            no_store_reply_message_ids=(tuple(sent_message_ids) if not getattr(model_decision, "save_conversation", False) else ()),
+            continuation_no_store_reply_message_ids=((selected_exchange.unsaved_reply_message_ids or ()) if selected_exchange else ()),
+            reply_message_digests=sent_message_digests,
+            continuation_reply_message_digests=(tuple(zip(selected_exchange.reply_message_ids, selected_exchange.reply_source_digests)) if selected_exchange else ()),
         )
         if meaningful_followup_question:
             logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", message.guild.id, message.channel.id, message.author.id, BNL_QUESTION_ANSWER_TTL_SECONDS)
@@ -50457,6 +50769,7 @@ async def on_message(message: discord.Message):
         turn_addressing.addresses_bnl,
     )
     channel_allows_conversation = bool(free_speak_surface or is_active_channel)
+    completed_exchange_out = {}
     completed_followup = _completed_conversation_followup_addressed(
         message.guild.id, message.channel.id, message.author.id,
         channel_policy, conversation_content, turn_addressing,
@@ -50464,6 +50777,7 @@ async def on_message(message: discord.Message):
     if completed_followup and not (real_direct_target or channel_allows_conversation):
         completed_followup = await _resolve_completed_followup_addressing(
             message, conversation_content, channel_policy,
+            result_out=completed_exchange_out,
         )
     if completed_followup:
         turn_addressing = replace(turn_addressing, established_bnl_followup=True)
@@ -51369,6 +51683,7 @@ async def on_message(message: discord.Message):
                 transient_reply_sources=transient_discord_reply_sources(
                     (turn_addressing,)
                 ),
+                active_exchange=completed_exchange_out.get("exchange"),
                 route_mode=route_mode,
                 conversation_surface=conversation_surface,
                 is_direct_target=turn_addressing.addresses_bnl,
@@ -51889,6 +52204,7 @@ async def on_message(message: discord.Message):
             transient_reply_sources=transient_discord_reply_sources(
                 (turn_addressing,)
             ),
+            active_exchange=completed_exchange_out.get("exchange"),
             route_mode=route_mode,
             conversation_surface=conversation_surface,
             is_direct_target=turn_addressing.addresses_bnl,
@@ -52392,6 +52708,7 @@ async def on_message(message: discord.Message):
             transient_reply_sources=transient_discord_reply_sources(
                 (turn_addressing,)
             ),
+            active_exchange=completed_exchange_out.get("exchange"),
             route_mode=route_mode,
             conversation_surface=conversation_surface,
             is_direct_target=turn_addressing.addresses_bnl,

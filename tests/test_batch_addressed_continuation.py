@@ -255,11 +255,16 @@ class AddressedContinuationDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(set(state), {
                         "channel_policy", "last_bnl_reply_at", "live_exchange_until",
                         "awaiting_answer_until", "request_message_ids", "reply_message_ids",
+                        "request_lineage_message_ids", "reply_lineage_message_ids",
+                        "no_store_reply_message_ids", "reply_message_digests",
                     })
                     # This fixture supplies no Discord IDs. No-store turns must
                     # not fall back to retaining either request or response text.
                     self.assertEqual(state["request_message_ids"], ())
                     self.assertEqual(state["reply_message_ids"], ())
+                    for field in ("request_lineage_message_ids", "reply_lineage_message_ids",
+                                  "no_store_reply_message_ids", "reply_message_digests"):
+                        self.assertEqual(state[field], ())
                     self.assertNotIn(answer, state.values())
                     self.assertNotIn("Continue.", state.values())
                     self.assertEqual(state["channel_policy"], policy)

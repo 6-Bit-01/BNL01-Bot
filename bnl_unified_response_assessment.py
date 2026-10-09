@@ -686,6 +686,7 @@ class SituationFrameV1:
     open_loop_present: bool
     competing_frames: Tuple[str, ...]
     ambiguity_reasons: Tuple[str, ...]
+    validated_exchange_dependency: bool = False
 
 
 @dataclass(frozen=True)
@@ -1142,7 +1143,8 @@ def source_dependent_task_texts(
             or (
                 task.authority_scope == "packet"
                 and (
-                    _CONVERSATION_CONTEXT_TASK_RE.search(action_clause)
+                    (frame.validated_exchange_dependency and len(frame.tasks) == 1)
+                    or _CONVERSATION_CONTEXT_TASK_RE.search(action_clause)
                     or _EXACT_REPLY_CONTINUITY_RE.search(action_clause)
                     or dependent_request_scope_candidate(scoped_clause)
                 )
@@ -1220,6 +1222,7 @@ def _situation_tasks(
     subjects: Sequence[SituationSubjectReference],
     response_act: str,
     exact_reply_resolved: bool = False,
+    validated_exchange_dependency: bool = False,
     context_labels: Sequence[str] = (),
 ) -> Tuple[SituationTaskReference, ...]:
     tasks = []
@@ -1232,6 +1235,7 @@ def _situation_tasks(
             *(subject.label_hint for subject in subjects),
         ),
     )
+    validated_exchange_dependency = bool(validated_exchange_dependency and len(parts) == 1)
     for index, (full_segment, segment, action_clause) in enumerate(parts, start=1):
         phase = _situation_phase(action_clause)
         object_kind = _situation_object(segment)
@@ -1343,7 +1347,8 @@ def _situation_tasks(
         elif (
             exact_reply_resolved
             and (
-                _EXACT_REPLY_CONTINUITY_RE.search(segment)
+                validated_exchange_dependency
+                or _EXACT_REPLY_CONTINUITY_RE.search(segment)
                 or dependent_request_scope_candidate(segment)
             )
             and not _VOLATILE_EXTERNAL_RE.search(segment)
@@ -1497,6 +1502,7 @@ def build_situation_frame_v1(
     moment_topic_coherent: bool = False,
     moment_participant_overlap: bool = False,
     referent_status: str = "not_requested",
+    validated_exchange_dependency: bool = False,
     response_act: str = "observe",
     packet_revision: str = "",
 ) -> SituationFrameV1:
@@ -1647,13 +1653,20 @@ def build_situation_frame_v1(
             or _unique_positive_ints(exact_source_row_ids)
         )
     )
+    validated_exchange_dependency = bool(
+        validated_exchange_dependency
+        and normalized_referent == "resolved"
+        and _unique_positive_ints(exact_source_row_ids)
+    )
     tasks = _situation_tasks(
         text,
         subjects=subjects,
         response_act=str(response_act or "observe"),
         exact_reply_resolved=exact_reply_resolved,
+        validated_exchange_dependency=bool(validated_exchange_dependency and exact_reply_resolved),
         context_labels=speaker_labels,
     )
+    validated_exchange_dependency = bool(validated_exchange_dependency and len(tasks) == 1)
 
     ambiguity = []
     competing = []
@@ -1774,6 +1787,8 @@ def build_situation_frame_v1(
         "source_messages": _unique_positive_ints(source_message_ids),
         "reply_messages": _unique_positive_ints(reply_message_ids),
         "source_rows": _unique_positive_ints(exact_source_row_ids),
+        **({"validated_exchange_dependency": True}
+           if validated_exchange_dependency and exact_reply_resolved else {}),
         "mention_count": max(0, int(explicit_mention_count or 0)),
         "subject_requirement": subject_requirement,
         "subjects": tuple(
@@ -1860,6 +1875,7 @@ def build_situation_frame_v1(
         open_loop_present="open_loop" in evidence.semantic_roles,
         competing_frames=tuple(competing),
         ambiguity_reasons=tuple(ambiguity),
+        validated_exchange_dependency=validated_exchange_dependency,
     )
 
 

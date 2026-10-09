@@ -54,10 +54,22 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
     def _channel(self, channel_id, **kwargs):
         channel = ingress.OrdinaryAddressedBurstIngressTests._channel(self, channel_id, **kwargs)
         original_send = channel.send
+        channel.completed_request_fixtures = {}
+        channel.completed_reply_fixtures = {}
+        reply_count = 0
+
+        def reply_receipt(text):
+            nonlocal reply_count
+            reply_count += 1
+            receipt = existing.SimpleNamespace(id=channel_id * 100 + reply_count)
+            channel.completed_reply_fixtures[receipt.id] = text
+            return receipt
+
+        channel.completed_reply_receipt = reply_receipt
 
         async def send_with_receipt(text, **send_kwargs):
             await original_send(text, **send_kwargs)
-            return existing.SimpleNamespace(id=channel_id * 100 + len(channel.sent))
+            return reply_receipt(text)
 
         channel.send = mock.AsyncMock(side_effect=send_with_receipt)
         return channel
@@ -72,15 +84,39 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
         stack.enter_context(mock.patch.object(bot, "BATCH_WINDOW_SECONDS", 0.01))
         stack.enter_context(mock.patch.object(bot, "BATCH_REPLY_COOLDOWN_SECONDS", 0))
 
-        async def load_exchange(_message, _state):
-            first = getattr(channel, "completed_request_fixture", None)
-            delivered = channel.sent or (first.replies if first is not None else [])
-            if not delivered:
+        async def load_exchange(message, state, *, result_out=None):
+            channel.completed_request_fixtures[message.id] = message
+            request_ids = tuple(state.get("request_lineage_message_ids") or state.get("request_message_ids") or ())
+            reply_ids = tuple(state.get("reply_lineage_message_ids") or state.get("reply_message_ids") or ())
+            if not request_ids or not reply_ids:
                 return None
-            return {
-                "previous_user": first.content if first is not None else FIRST,
-                "bnl_reply": delivered[-1],
-            }
+            requests = tuple(channel.completed_request_fixtures.get(mid) for mid in request_ids)
+            replies = tuple(channel.completed_reply_fixtures.get(mid) for mid in reply_ids)
+            if any(source is None for source in requests) or any(text is None for text in replies):
+                return None
+            request_texts = tuple(
+                bot.append_media_context_to_text(
+                    bot.resolve_discord_user_mentions_for_conversation(
+                        source, source.content, bot_user_id=999, remove_bot_mention=True,
+                    ),
+                    bot.build_message_media_context(source),
+                )
+                for source in requests
+            )
+            if result_out is not None:
+                result_out["exchange"] = bot.CompletedConversationExchange(
+                    guild_id=message.guild.id, channel_id=message.channel.id,
+                    user_id=message.author.id, channel_policy=state.get("channel_policy", "unknown"),
+                    request_message_ids=request_ids, request_texts=request_texts,
+                    reply_message_ids=reply_ids, reply_texts=replies,
+                    revision=bot._completed_exchange_revision(state),
+                    request_source_digests=tuple(bot._prompt_source_digest(source.content) for source in requests),
+                    reply_source_digests=tuple(bot._prompt_source_digest(text) for text in replies),
+                    unsaved_reply_message_ids=(tuple(state["no_store_reply_message_ids"])
+                                              if "no_store_reply_message_ids" in state else None),
+                )
+            return {"previous_user": "\n".join(request_texts)[-4000:],
+                    "bnl_reply": "\n".join(replies)[-4000:]}
 
         async def classify_exchange(exchange, content):
             self.assertTrue(exchange["bnl_reply"])
@@ -93,6 +129,9 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
             new=self.exchange_loader, create=True))
         stack.enter_context(mock.patch.object(bot, "_classify_completed_followup_exchange",
             new=self.followup_classifier, create=True))
+        # This routing fixture supplies Discord snapshots and substitutes Context;
+        # the real gateway suite covers original-row and privacy validation.
+        stack.enter_context(mock.patch.object(bot, "_completed_exchange_originals_available", return_value=True))
         if getattr(self, "no_store_context", ""):
             stack.enter_context(mock.patch.object(bot, "maybe_build_bnl_read_model_context",
                 return_value=self.no_store_context))
@@ -102,6 +141,14 @@ class CompletedConversationContinuationTests(unittest.IsolatedAsyncioTestCase):
         mention = existing.SimpleNamespace(id=999, display_name="BNL-01", bot=True)
         first = existing.FakeMessage(channel, "<@999> " + FIRST, mentions=[mention])
         channel.completed_request_fixture = first
+        channel.completed_request_fixtures[first.id] = first
+        original_reply = first.reply
+
+        async def reply_with_receipt(text, **reply_kwargs):
+            await original_reply(text, **reply_kwargs)
+            return channel.completed_reply_receipt(text)
+
+        first.reply = reply_with_receipt
         return first
 
     async def test_correction_after_committed_answer_is_a_new_owed_turn(self):

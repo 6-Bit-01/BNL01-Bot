@@ -23,6 +23,7 @@ class CompletedFollowupScopeTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(mock.patch.object(bot, "_conversation_continuation_state", {}))
         self.stack.enter_context(mock.patch.object(bot, "_recent_direct_response_window", {}))
         self.policy = self.stack.enter_context(mock.patch.object(bot, "resolve_channel_policy", return_value="public_context"))
+        self.stack.enter_context(mock.patch.object(bot, "_completed_exchange_originals_available", return_value=True))
         self.sources = {
             10: self.source(10, 7, "Please explain the fictional recording."),
             20: self.source(20, 999, "The fictional recording contains two sections."),
@@ -53,6 +54,71 @@ class CompletedFollowupScopeTests(unittest.IsolatedAsyncioTestCase):
             "bnl_reply": "The fictional recording contains two sections.",
         })
         self.assertEqual(self.channel.fetch_message.await_args_list, [mock.call(10), mock.call(20)])
+
+    async def test_semantic_result_carries_the_validated_exchange_without_another_call(self):
+        output = {}
+        with mock.patch.object(bot, "_classify_completed_followup_exchange", new=mock.AsyncMock(return_value=True)) as classifier:
+            self.assertTrue(await bot._resolve_completed_followup_addressing(
+                self.message, self.message.content, "public_context", result_out=output))
+        classifier.assert_awaited_once()
+        exchange = output["exchange"]
+        self.assertEqual(exchange.request_message_ids, (10,))
+        self.assertEqual(exchange.reply_message_ids, (20,))
+        self.assertEqual(exchange.user_id, 7)
+        self.assertEqual(exchange.channel_policy, "public_context")
+
+    async def test_ineligible_original_does_not_reach_semantic_provider(self):
+        with mock.patch.object(bot, "_completed_exchange_originals_available", return_value=False):
+            with mock.patch.object(bot, "_classify_completed_followup_exchange", new=mock.AsyncMock()) as classifier:
+                self.assertFalse(await self.resolve())
+        classifier.assert_not_awaited()
+
+    async def test_selected_continuation_keeps_bounded_root_and_answer_lineage(self):
+        for index in range(1, 7):
+            state = bot._conversation_continuation_state[self.key]
+            bot._mark_conversation_continuation_state(
+                42, 100, 7, channel_policy="public_context",
+                request_message_ids=(10 + index,), reply_message_ids=(20 + index,),
+                continuation_request_message_ids=state.get("request_lineage_message_ids", (10,)),
+                continuation_reply_message_ids=state.get("reply_lineage_message_ids", (20,)),
+            )
+        state = bot._conversation_continuation_state[self.key]
+        self.assertEqual(state["request_lineage_message_ids"], (10, 14, 15, 16))
+        self.assertEqual(state["reply_lineage_message_ids"], (20, 24, 25, 26))
+        self.assertEqual(state["request_message_ids"], (16,))
+        self.mark(99, 199)
+        self.assertEqual(state["request_lineage_message_ids"], (99,))
+        self.assertEqual(state["reply_lineage_message_ids"], (199,))
+
+    async def test_initial_oversized_exchange_keeps_original_and_last_three_lineage(self):
+        bot._mark_conversation_continuation_state(
+            42, 100, 7, channel_policy="public_context",
+            request_message_ids=(11, 12, 13, 14, 15, 16),
+            reply_message_ids=(21, 22, 23, 24, 25, 26),
+        )
+        state = bot._conversation_continuation_state[self.key]
+        self.assertEqual(state["request_message_ids"], (13, 14, 15, 16))
+        self.assertEqual(state["reply_message_ids"], (23, 24, 25, 26))
+        self.assertEqual(state["request_lineage_message_ids"], (11, 14, 15, 16))
+        self.assertEqual(state["reply_lineage_message_ids"], (21, 24, 25, 26))
+
+    async def test_initial_oversized_exchange_keeps_no_store_and_hashes_by_lineage_id(self):
+        bot._mark_conversation_continuation_state(
+            42, 100, 7, channel_policy="public_context",
+            request_message_ids=(11, 12, 13, 14, 15, 16),
+            reply_message_ids=(21, 22, 23, 24, 25, 26),
+            no_store_reply_message_ids=(21, 22, 23, 24, 25, 26),
+            reply_message_digests=(
+                (26, "digest-26"), (24, "digest-24"), (22, "digest-22"),
+                (21, "digest-21"), (25, "digest-25"), (23, "digest-23"),
+            ),
+        )
+        state = bot._conversation_continuation_state[self.key]
+        self.assertEqual(state["no_store_reply_message_ids"], (21, 24, 25, 26))
+        self.assertEqual(state["reply_message_digests"], (
+            (21, "digest-21"), (24, "digest-24"),
+            (25, "digest-25"), (26, "digest-26"),
+        ))
 
     async def test_loader_rejects_wrong_author_channel_guild_or_message_id(self):
         for message_id, author_id in ((10, 7), (20, 999)):
@@ -130,8 +196,10 @@ class CompletedFollowupScopeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_stays_quiet_and_preserves_single_pending_worker(self):
         release = asyncio.Event()
+        entered = asyncio.Event()
 
         async def classify(_exchange, _content):
+            entered.set()
             await release.wait()
             return True
 
@@ -142,6 +210,11 @@ class CompletedFollowupScopeTests(unittest.IsolatedAsyncioTestCase):
                 pending = self.state["followup_check_task"]
                 try:
                     self.assertFalse(pending.done())
+                    waiter = asyncio.create_task(entered.wait())
+                    await asyncio.wait({waiter}, timeout=2)
+                    if not entered.is_set():
+                        waiter.cancel()
+                    self.assertTrue(entered.is_set())
                     self.assertFalse(await self.resolve())
                     classifier.assert_awaited_once()
                     deadline.assert_awaited_once()
