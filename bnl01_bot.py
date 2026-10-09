@@ -7234,9 +7234,10 @@ async def _execute_website_relay_transaction(
             decision.metadata["accepted_relay_id"] = relay_id
         else:
             source_fingerprint = _relay_source_fingerprint(decision)
-            prepared_relay_id = _new_stable_relay_id(guild_id=guild_id, source_cursor=decision.sourceCursor, message=decision.message, directive=decision.directive, source_class=source_class, trigger=trigger, source_conversation_fingerprint=source_fingerprint)
-            relay_prepare_attempt_relay(DB_FILE, attempt_id, prepared_relay_id)
+            prepared_relay_id = ""
             try:
+                prepared_relay_id = _new_stable_relay_id(guild_id=guild_id, source_cursor=decision.sourceCursor, message=decision.message, directive=decision.directive, source_class=source_class, trigger=trigger, source_conversation_fingerprint=source_fingerprint)
+                relay_prepare_attempt_relay(DB_FILE, attempt_id, prepared_relay_id)
                 envelope = build_relay_envelope(prepared_relay_id, decision.message, decision.directive, source_class, trigger)
                 relay = envelope["relay"]
                 canonical_json = canonical_payload_bytes(envelope).decode("utf-8")
