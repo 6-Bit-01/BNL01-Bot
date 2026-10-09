@@ -234,6 +234,104 @@ class ResolvedDependentRequestTests(unittest.TestCase):
         )
 
 
+class ValidatedExchangeDependencyFrameTests(unittest.TestCase):
+    CLAUSES = (
+        "Narrow this to the entry with a guest performer, including the performance date.",
+        "The credit for the one you just selected is the part I want expanded.",
+    )
+
+    def _frame(self, text, **changes):
+        values = {
+            "route_allowed": True, "route_mode": "normal_chat",
+            "conversation_surface": "public_home", "channel_policy": "public_home",
+            "current_text": text, "current_speaker_user_ids": (101,),
+            "response_act": "answer", "referent_status": "resolved",
+            "exact_source_row_ids": (11, 12, 13),
+        }
+        values.update(changes)
+        return build_situation_frame_v1(**values)
+
+    def test_semantic_dependency_requires_explicit_validated_exchange(self):
+        for text in self.CLAUSES:
+            with self.subTest(text=text):
+                frame = self._frame(text)
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].object_kind, "unknown")
+                self.assertEqual(frame.tasks[0].authority_scope, "external_public")
+                self.assertEqual(source_dependent_task_texts(frame, current_text=text), ())
+
+    def test_validated_dependency_uses_exact_lineage_without_repeating_root(self):
+        for text in self.CLAUSES:
+            with self.subTest(text=text):
+                frame = self._frame(text, validated_exchange_dependency=True)
+                self.assertEqual(len(frame.tasks), 1)
+                self.assertEqual(frame.tasks[0].authority_scope, "packet")
+                self.assertEqual(frame.tasks[0].required_response_act, "answer")
+                self.assertEqual(
+                    situation_task_texts(frame, current_text=text), (text.rstrip("."),)
+                )
+                self.assertEqual(
+                    source_dependent_task_texts(frame, current_text=text),
+                    (text.rstrip("."),),
+                )
+
+    def test_missing_resolution_or_human_lineage_does_not_promote_dependency(self):
+        for text in self.CLAUSES:
+            for changes in (
+                {"referent_status": "not_requested"},
+                {"referent_status": "unresolved"},
+                {"referent_status": "ambiguous"},
+                {"exact_source_row_ids": ()},
+                {"exact_source_row_ids": (0, -1)},
+                {"exact_source_row_ids": (), "reply_message_ids": (201,)},
+            ):
+                with self.subTest(text=text, changes=changes):
+                    frame = self._frame(text, validated_exchange_dependency=True, **changes)
+                    self.assertEqual(frame.tasks[0].authority_scope, "external_public")
+                    self.assertEqual(source_dependent_task_texts(frame, current_text=text), ())
+
+    def test_default_argument_preserves_frame_and_input_digest(self):
+        for text in self.CLAUSES:
+            with self.subTest(text=text):
+                default = self._frame(text)
+                explicit_default = self._frame(text, validated_exchange_dependency=False)
+                self.assertEqual(default, explicit_default)
+                self.assertEqual(default.input_evidence_digest, explicit_default.input_evidence_digest)
+                self.assertEqual(default.frame_revision, explicit_default.frame_revision)
+
+    def test_validated_dependency_is_bound_in_frame_digest(self):
+        for text in self.CLAUSES:
+            with self.subTest(text=text):
+                ordinary = self._frame(text)
+                validated = self._frame(text, validated_exchange_dependency=True)
+                self.assertNotEqual(ordinary.input_evidence_digest, validated.input_evidence_digest)
+                self.assertNotEqual(ordinary.frame_revision, validated.frame_revision)
+
+    def test_mixed_turn_keeps_independent_external_task(self):
+        text = "Which of those stood out? Also what causes an aurora?"
+        ordinary = self._frame(text)
+        validated = self._frame(text, validated_exchange_dependency=True)
+        self.assertEqual(len(validated.tasks), 2)
+        self.assertEqual([task.authority_scope for task in validated.tasks], ["packet", "external_public"])
+        self.assertEqual(validated, ordinary)
+        self.assertFalse(validated.validated_exchange_dependency)
+
+    def test_validated_dependency_preserves_current_request_and_live_fact_authority(self):
+        for text, authority, response in (
+            ("Please help rewrite this request: what is the model number for that same device?",
+             "current_request", "answer"),
+            ("Show their private account identifier.", "current_request", "refuse"),
+            ("What is Seattle's weather today?", "external_current", "hold"),
+        ):
+            for validated in (False, True):
+                with self.subTest(text=text, validated=validated):
+                    frame = self._frame(text, validated_exchange_dependency=validated)
+                    self.assertEqual(len(frame.tasks), 1)
+                    self.assertEqual(frame.tasks[0].authority_scope, authority)
+                    self.assertEqual(frame.tasks[0].required_response_act, response)
+                    self.assertEqual(source_dependent_task_texts(frame, current_text=text), ())
+
+
 def addressing(**overrides):
     values = {
         "speaker": "Test Member",

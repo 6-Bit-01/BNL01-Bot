@@ -1229,6 +1229,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             channel.guild.id, channel.id, 100,
             awaiting_answer=False, channel_policy="sealed_test",
             request_message_ids=(0,), reply_message_ids=(),
+            no_store_reply_message_ids=(), reply_message_digests=(),
         )
         consume_retransmission.assert_called_once_with(channel.guild.id, channel.id, 100)
         self.assertNotIn(
