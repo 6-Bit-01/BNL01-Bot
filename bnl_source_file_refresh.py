@@ -10,6 +10,7 @@ accounts.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import hmac
 import json
 import logging
@@ -17,9 +18,12 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -28,6 +32,7 @@ from bnl_dossier_recommendations import (
     get_source_file_archive_url,
     is_dossier_ingest_token_configured,
     is_source_file_archive_token_configured,
+    normalize_trusted_site_callback_base_url,
     select_trusted_site_callback_base_url,
     send_dossier_recommendation,
     _safe_url_host as _safe_callback_host,
@@ -38,7 +43,7 @@ from bnl_source_refresh_context import is_refresh_generation_subject, refresh_ge
 
 QUEUE_TABLE = "source_file_refresh_queue"
 STATE_TABLE = "source_file_refresh_state"
-ACTIVE_QUEUE_STATUSES = {"queued", "deferred", "cooldown", "running", "failed"}
+ACTIVE_QUEUE_STATUSES = {"queued", "deferred", "cooldown", "running", "failed", "recovery_required"}
 TERMINAL_QUEUE_STATUSES = {"succeeded", "skipped"}
 VALID_STATUSES = ACTIVE_QUEUE_STATUSES | TERMINAL_QUEUE_STATUSES
 VALID_REFRESH_MODES = {"automatic", "manual", "dry_run", "operator_requested", "site_open_request", "site_manual_request"}
@@ -129,6 +134,9 @@ def ensure_source_file_refresh_schema(conn: sqlite3.Connection) -> None:
     )
     if "candidate_id" not in _columns(conn, QUEUE_TABLE):
         conn.execute(f"ALTER TABLE {QUEUE_TABLE} ADD COLUMN candidate_id TEXT")
+    for column in ("claim_token", "delivery_receipts_json", "result_receipt_json", "callback_base_url", "route_fingerprint"):
+        if column not in _columns(conn, QUEUE_TABLE):
+            conn.execute(f"ALTER TABLE {QUEUE_TABLE} ADD COLUMN {column} TEXT")
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {STATE_TABLE} (
@@ -152,6 +160,8 @@ def ensure_source_file_refresh_schema(conn: sqlite3.Connection) -> None:
     )
     if "candidate_id" not in _columns(conn, STATE_TABLE):
         conn.execute(f"ALTER TABLE {STATE_TABLE} ADD COLUMN candidate_id TEXT")
+    if "active_claim_token" not in _columns(conn, STATE_TABLE):
+        conn.execute(f"ALTER TABLE {STATE_TABLE} ADD COLUMN active_claim_token TEXT")
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_source_refresh_queue_status ON {QUEUE_TABLE} (status, not_before_at, priority, queued_at)")
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_source_refresh_queue_subject ON {QUEUE_TABLE} (guild_id, subject_key, status)")
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_source_refresh_state_subject ON {STATE_TABLE} (guild_id, subject_key)")
@@ -249,7 +259,7 @@ def enqueue_source_file_refresh(db_path: str, *, guild_id: int | None, subject_n
         ensure_source_file_refresh_schema(conn)
         if canonical_candidate_id:
             existing = conn.execute(
-                f"SELECT * FROM {QUEUE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND candidate_id=? AND status IN ('queued','deferred','cooldown','failed','running') ORDER BY id DESC LIMIT 1",
+                f"SELECT * FROM {QUEUE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND candidate_id=? AND status IN ('queued','deferred','cooldown','failed','running','recovery_required') ORDER BY id DESC LIMIT 1",
                 (guild_id, guild_id, skey, canonical_candidate_id),
             ).fetchone()
             if not existing:
@@ -259,21 +269,19 @@ def enqueue_source_file_refresh(db_path: str, *, guild_id: int | None, subject_n
                 ).fetchone()
         else:
             existing = conn.execute(
-                f"SELECT * FROM {QUEUE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND (candidate_id IS NULL OR TRIM(candidate_id)='') AND status IN ('queued','deferred','cooldown','failed','running') ORDER BY id DESC LIMIT 1",
+                f"SELECT * FROM {QUEUE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND (candidate_id IS NULL OR TRIM(candidate_id)='') AND status IN ('queued','deferred','cooldown','failed','running','recovery_required') ORDER BY id DESC LIMIT 1",
                 (guild_id, guild_id, skey),
             ).fetchone()
         if existing:
-            new_count = int(existing["evidence_count"] or 0) + max(1, int(evidence_count or 1))
-            new_priority = max(int(existing["priority"] or 0), int(priority or 0))
-            merged_reason = _safe_text(f"{existing['reason']}; {reason}", 260)
-            status = "queued" if existing["status"] in {"failed", "deferred", "cooldown"} else existing["status"]
-            conn.execute(
-                f"UPDATE {QUEUE_TABLE} SET reason=?, evidence_source=?, evidence_count=?, priority=?, status=?, updated_at=?, not_before_at=COALESCE(?, not_before_at), refresh_mode=?, created_by=?, candidate_id=COALESCE(?, candidate_id) WHERE id=?",
-                (merged_reason, _safe_text(evidence_source, 80), new_count, new_priority, status, now, not_before_at, mode, _safe_text(created_by, 80), canonical_candidate_id, existing["id"]),
+            changed = conn.execute(
+                f"UPDATE {QUEUE_TABLE} SET reason=SUBSTR(reason || '; ' || ?, 1, 260), evidence_source=?, evidence_count=evidence_count+?, priority=MAX(priority, ?), status=CASE WHEN status IN ('failed','deferred','cooldown') THEN 'queued' ELSE status END, updated_at=?, not_before_at=COALESCE(?, not_before_at), refresh_mode=?, created_by=?, candidate_id=COALESCE(?, candidate_id) WHERE id=? AND candidate_id IS ? AND status IN ('queued','deferred','cooldown','failed','running','recovery_required') AND (? IS NULL OR candidate_id IS NOT NULL OR status NOT IN ('running','recovery_required'))",
+                (_safe_text(reason, 260), _safe_text(evidence_source, 80), max(1, int(evidence_count or 1)), int(priority or 0), now, not_before_at, mode, _safe_text(created_by, 80), canonical_candidate_id, existing["id"], existing["candidate_id"], canonical_candidate_id),
             )
-            conn.commit()
-            logging.info("source_refresh_queued subject_key=%s priority=%s", skey, new_priority)
-            return {"ok": True, "queued": True, "deduped": True, "id": existing["id"], "subject_key": skey, "status": status, "evidence_count": new_count}
+            if changed.rowcount:
+                conn.commit()
+                current = conn.execute(f"SELECT status, evidence_count, priority FROM {QUEUE_TABLE} WHERE id=?", (existing["id"],)).fetchone()
+                logging.info("source_refresh_queued subject_key=%s priority=%s", skey, current["priority"])
+                return {"ok": True, "queued": True, "deduped": True, "id": existing["id"], "subject_key": skey, "status": current["status"], "evidence_count": current["evidence_count"]}
         cur = conn.execute(
             f"""
             INSERT INTO {QUEUE_TABLE} (guild_id, subject_key, subject_name, reason, evidence_source, evidence_count, priority, status, queued_at, updated_at, not_before_at, attempts, refresh_mode, created_by, candidate_id)
@@ -293,7 +301,7 @@ def list_source_file_refresh_queue(db_path: str, *, guild_id: int | None = None,
     conn.row_factory = sqlite3.Row
     try:
         ensure_source_file_refresh_schema(conn)
-        where = "WHERE status IN ('queued','deferred','cooldown','running','failed')"
+        where = "WHERE status IN ('queued','deferred','cooldown','running','failed','recovery_required')"
         params: list[Any] = []
         if guild_id is not None:
             where += " AND guild_id=?"
@@ -316,11 +324,18 @@ def get_refresh_state(db_path: str, guild_id: int | None, subject_key: str) -> d
 
 
 def clear_source_file_refresh(db_path: str, *, guild_id: int | None, subject_name: str) -> int:
+    with _source_refresh_fence(db_path) as acquired:
+        if not acquired:
+            return 0
+        return _clear_source_file_refresh(db_path, guild_id=guild_id, subject_name=subject_name)
+
+
+def _clear_source_file_refresh(db_path: str, *, guild_id: int | None, subject_name: str) -> int:
     skey = source_refresh_subject_key(subject_name)
     conn = sqlite3.connect(db_path)
     try:
         ensure_source_file_refresh_schema(conn)
-        cur = conn.execute(f"UPDATE {QUEUE_TABLE} SET status='skipped', updated_at=?, last_error='cleared_by_operator' WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND status IN ('queued','deferred','cooldown','failed','running')", (utc_now(), guild_id, guild_id, skey))
+        cur = conn.execute(f"UPDATE {QUEUE_TABLE} SET status='skipped', updated_at=?, last_error='cleared_by_operator' WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND status IN ('queued','deferred','cooldown','failed')", (utc_now(), guild_id, guild_id, skey))
         conn.commit()
         logging.info("source_refresh_skipped subject_key=%s reason=cleared_by_operator", skey)
         return int(cur.rowcount or 0)
@@ -730,6 +745,9 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         callback_base_url=callback_base_url or None,
     )
     item = (local.get("items") or [{}])[0]
+    if not item and local.get("reason") == "worker_busy":
+        item = {"subject": subject or lookup_value, "status": "deferred", "reason": "worker_busy", "error": "worker_busy"}
+        local["items"] = [item]
     if not item:
         state = get_refresh_state(db_path, guild_id, skey)
         if _state_has_current_success(state, candidate_id=candidate_id or None):
@@ -766,6 +784,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
     archive_id = _safe_text(item.get("archiveId") or "", 120)
     summary.update({
         "ok": site_status in {"completed", "skipped"},
+        "localStatus": str(item.get("status") or ""),
         "status": "partial_success" if str(item.get("status") or "").lower() == "partial_success" else ("success" if site_status == "completed" else site_status),
         "recommendationId": rec_id,
         "recommendationSent": bool(item.get("recommendationSent") or rec_id),
@@ -878,22 +897,216 @@ def _cooldown_until_from(now_dt: datetime, minutes: int) -> str:
     return (now_dt + timedelta(minutes=max(DEFAULT_COOLDOWN_MINUTES, int(minutes or DEFAULT_COOLDOWN_MINUTES)))).replace(microsecond=0).isoformat()
 
 
-def _state_upsert(conn: sqlite3.Connection, *, guild_id: int | None, subject_key: str, subject_name: str, fields: dict[str, Any]) -> None:
+def _state_upsert(conn: sqlite3.Connection, *, guild_id: int | None, subject_key: str, subject_name: str, fields: dict[str, Any], expected_claim_token: str | None = None) -> None:
     now = utc_now()
-    current = conn.execute(f"SELECT subject_key FROM {STATE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=?", (guild_id, guild_id, subject_key)).fetchone()
+    current = conn.execute(f"SELECT active_claim_token FROM {STATE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=?", (guild_id, guild_id, subject_key)).fetchone()
+    active_claim = current[0] if current else None
+    if expected_claim_token is not None and active_claim != expected_claim_token:
+        return
+    if expected_claim_token is None and active_claim and fields.get("active_claim_token") != active_claim:
+        return
     base = {"guild_id": guild_id, "subject_key": subject_key, "subject_name": subject_name, "updated_at": now}
     base.update(fields)
     if current:
         assignments = ", ".join(f"{k}=?" for k in base if k not in {"guild_id", "subject_key"})
         values = [base[k] for k in base if k not in {"guild_id", "subject_key"}]
-        conn.execute(f"UPDATE {STATE_TABLE} SET {assignments} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=?", [*values, guild_id, guild_id, subject_key])
+        conn.execute(f"UPDATE {STATE_TABLE} SET {assignments} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND active_claim_token IS ?", [*values, guild_id, guild_id, subject_key, active_claim])
     else:
         cols = ", ".join(base.keys())
         placeholders = ", ".join(["?"] * len(base))
         conn.execute(f"INSERT INTO {STATE_TABLE} ({cols}) VALUES ({placeholders})", list(base.values()))
 
 
+class SourceRefreshClaimLost(RuntimeError):
+    pass
+
+
+@contextmanager
+def _source_refresh_fence(db_path: str):
+    # Kernel ownership survives cancelled awaiters and is released on process exit.
+    path = os.path.abspath(db_path) + ".source-refresh.lock"
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    acquired = False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("source_refresh_fence_not_regular")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            pass
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _require_refresh_claim(conn: sqlite3.Connection, queue_id: int, claim_token: str) -> None:
+    row = conn.execute(f"SELECT q.status, q.claim_token, s.active_claim_token FROM {QUEUE_TABLE} q LEFT JOIN {STATE_TABLE} s ON s.guild_id IS q.guild_id AND s.subject_key=q.subject_key WHERE q.id=?", (queue_id,)).fetchone()
+    if not row or row[0] != "running" or row[1] != claim_token or row[2] != claim_token:
+        raise SourceRefreshClaimLost("source_refresh_claim_lost")
+
+
+def _record_refresh_effect(conn: sqlite3.Connection, queue_id: int, claim_token: str, stage: str, phase: str, result: dict[str, Any] | None = None) -> None:
+    _require_refresh_claim(conn, queue_id, claim_token)
+    if stage not in {"workspace", "archive", "recommendation"} or phase not in {"before", "after"}:
+        raise ValueError("invalid_source_refresh_effect")
+    raw = conn.execute(f"SELECT delivery_receipts_json FROM {QUEUE_TABLE} WHERE id=?", (queue_id,)).fetchone()[0]
+    receipts = json.loads(raw or "{}")
+    if phase == "before":
+        if stage in receipts:
+            raise SourceRefreshClaimLost("source_refresh_effect_already_started")
+        receipts[stage] = {"phase": "started"}
+    else:
+        if receipts.get(stage, {}).get("phase") != "started":
+            raise SourceRefreshClaimLost("source_refresh_effect_not_started")
+        receipt = {"phase": "returned", "ok": bool((result or {}).get("ok"))}
+        for key in ("archiveId", "recommendationId", "candidateId", "id", "status"):
+            value = (result or {}).get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                receipt[key] = str(value)[:200]
+        receipts[stage] = receipt
+    changed = conn.execute(f"UPDATE {QUEUE_TABLE} SET delivery_receipts_json=? WHERE id=? AND status='running' AND claim_token=? AND EXISTS (SELECT 1 FROM {STATE_TABLE} s WHERE s.guild_id IS {QUEUE_TABLE}.guild_id AND s.subject_key={QUEUE_TABLE}.subject_key AND s.active_claim_token=?)", (json.dumps(receipts, sort_keys=True), queue_id, claim_token, claim_token))
+    if not changed.rowcount:
+        conn.rollback()
+        raise SourceRefreshClaimLost("source_refresh_claim_lost")
+    conn.commit()
+
+
+def _refresh_result_receipt(row: sqlite3.Row, claim_token: str, result: dict[str, Any], now_dt: datetime, cooldown_minutes: int) -> dict[str, Any]:
+    completed = utc_now()
+    fields: dict[str, Any] = {"candidate_id": _safe_candidate_id(row["candidate_id"]) or None, "active_claim_token": None}
+    if result.get("status") == "no_target":
+        status, error = "skipped", "no_target"
+        fields.update(last_refresh_status="no_target", last_refresh_completed_at=completed, last_failure_at=completed, last_error=error)
+    elif result.get("sent") or (result.get("archiveSent") and not result.get("recommendationSent") and result.get("status") == "partial_success"):
+        partial = bool(result.get("archiveSent") and not result.get("recommendationSent") and result.get("status") == "partial_success")
+        send_result = result.get("sendResult") or {}
+        recommendation_id = str(send_result.get("recommendationId") or send_result.get("recommendation_id") or result.get("recommendationId") or send_result.get("id") or "")[:120]
+        counts = result.get("sourceCounts")
+        status, error = "succeeded", None
+        fields.update(last_refresh_status="partial_success" if partial else "succeeded", last_refresh_completed_at=completed, last_recommendation_id=recommendation_id, last_evidence_hash=_evidence_hash_for_result(result), last_evidence_count=sum(int(v or 0) for v in counts.values()) if isinstance(counts, dict) else int(row["evidence_count"] or 0), last_error="compact_recommendation_rejected" if partial else None, cooldown_until=_cooldown_until_from(now_dt, cooldown_minutes))
+    else:
+        status, error = "failed", "delivery_or_generation_failed"
+        fields.update(last_refresh_status="failed", last_failure_at=completed, last_error=error)
+    send_result, archive_result = result.get("sendResult") or {}, result.get("archiveResult") or {}
+    item = {"status": fields["last_refresh_status"], "recommendationId": fields.get("last_recommendation_id") or "", "recommendationSent": bool(result.get("recommendationSent", send_result.get("ok", result.get("sent")))), "archiveSent": bool(result.get("archiveSent", archive_result.get("ok"))), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "caseReportGenerated": _result_case_report_generated(result), "subjectMemoryPacketGenerated": _result_subject_memory_packet_generated(result)}
+    return {"version": 1, "queue_id": row["id"], "claim_token": claim_token, "status": status, "error": error, "fields": fields, "item": item}
+
+
+def _refresh_route_fingerprint(environ: dict[str, str], callback_base_url: str | None) -> str:
+    material = [get_dossier_ingest_url(environ, callback_base_url=callback_base_url), get_source_file_archive_url(environ, callback_base_url=callback_base_url), is_dossier_ingest_token_configured(environ), is_source_file_archive_token_configured(environ)]
+    return hashlib.sha256(json.dumps(material).encode("utf-8")).hexdigest()
+
+
+def _saved_refresh_route_matches(row: sqlite3.Row, environ: dict[str, str]) -> bool:
+    saved = row["callback_base_url"] or ""
+    if saved and normalize_trusted_site_callback_base_url(saved, environ=environ) != saved:
+        return False
+    return row["route_fingerprint"] == _refresh_route_fingerprint(environ, saved or None)
+
+
+def _recover_refresh_claims(conn: sqlite3.Connection, *, guild_id: int | None, subject_key: str | None, queue_id: int | None, max_items: int, environ: dict[str, str]) -> list[dict[str, Any]]:
+    where, params = "status='running' AND claim_token IS NOT NULL", []
+    if guild_id is not None:
+        where += " AND guild_id=?"
+        params.append(guild_id)
+    if subject_key:
+        where += " AND subject_key=?"
+        params.append(source_refresh_subject_key(subject_key))
+    if queue_id is not None:
+        where += " AND id=?"
+        params.append(queue_id)
+    rows = conn.execute(f"SELECT * FROM {QUEUE_TABLE} WHERE {where} ORDER BY id LIMIT ?", [*params, max(1, max_items)]).fetchall()
+    items = []
+    for row in rows:
+        claim_token = row["claim_token"]
+        try:
+            _require_refresh_claim(conn, row["id"], claim_token)
+        except SourceRefreshClaimLost:
+            conn.execute(f"UPDATE {QUEUE_TABLE} SET status='recovery_required', last_error='subject_claim_reconciliation_required' WHERE id=? AND status='running' AND claim_token=?", (row["id"], claim_token))
+            conn.commit()
+            continue
+        try:
+            effects = json.loads(row["delivery_receipts_json"] or "{}")
+            receipt = json.loads(row["result_receipt_json"] or "null")
+            if not isinstance(effects, dict):
+                raise ValueError("invalid_effect_receipts")
+            field_keys = {"candidate_id", "active_claim_token", "last_refresh_status", "last_refresh_completed_at", "last_failure_at", "last_error", "last_recommendation_id", "last_evidence_hash", "last_evidence_count", "cooldown_until"}
+            item_keys = {"status", "recommendationId", "recommendationSent", "archiveSent", "archiveId", "archiveStatus", "caseReportGenerated", "subjectMemoryPacketGenerated"}
+            valid = isinstance(receipt, dict) and receipt.get("version") == 1 and receipt.get("queue_id") == row["id"] and receipt.get("claim_token") == claim_token and "error" in receipt and isinstance(receipt.get("fields"), dict) and isinstance(receipt.get("item"), dict)
+            if valid:
+                fields, item = receipt["fields"], receipt["item"]
+                expected_states = {"succeeded": {"succeeded", "partial_success"}, "skipped": {"no_target"}, "failed": {"failed"}}
+                base_fields = {"candidate_id", "active_claim_token", "last_refresh_status", "last_error"}
+                required_fields = {
+                    "succeeded": base_fields | {"last_refresh_completed_at", "last_recommendation_id", "last_evidence_hash", "last_evidence_count", "cooldown_until"},
+                    "skipped": base_fields | {"last_refresh_completed_at", "last_failure_at"},
+                    "failed": base_fields | {"last_failure_at"},
+                }
+                valid = (
+                    set(fields) <= field_keys
+                    and receipt.get("status") in required_fields
+                    and set(fields) == required_fields.get(receipt.get("status"), set())
+                    and fields["candidate_id"] == (_safe_candidate_id(row["candidate_id"]) or None)
+                    and fields["active_claim_token"] is None
+                    and fields["last_refresh_status"] in expected_states.get(receipt.get("status"), set())
+                    and all(value is None or type(value) in {str, int} for value in fields.values())
+                    and set(item) == item_keys
+                    and item["status"] == fields["last_refresh_status"]
+                    and isinstance(item["recommendationSent"], bool)
+                    and isinstance(item["archiveSent"], bool)
+                    and isinstance(item["recommendationId"], str)
+                    and isinstance(item["archiveId"], str)
+                    and all(value is None or type(value) in {str, int, bool} for value in item.values())
+                    and (receipt["error"] is None or isinstance(receipt["error"], str))
+                )
+                if valid:
+                    valid = all(parse_iso(fields[key]) is not None for key in ("last_refresh_completed_at", "last_failure_at", "cooldown_until") if key in fields)
+                if valid and receipt["status"] == "succeeded":
+                    valid = (
+                        isinstance(fields["last_recommendation_id"], str)
+                        and fields["last_recommendation_id"] == item["recommendationId"]
+                        and type(fields["last_evidence_count"]) is int
+                        and fields["last_evidence_count"] >= 0
+                        and isinstance(fields["last_evidence_hash"], str)
+                        and re.fullmatch(r"[0-9a-f]{16}", fields["last_evidence_hash"]) is not None
+                        and ((item["status"] == "succeeded" and item["recommendationSent"]) or (item["status"] == "partial_success" and item["archiveSent"] and not item["recommendationSent"]))
+                    )
+                if valid and receipt["status"] == "skipped":
+                    valid = not item["archiveSent"] and not item["recommendationSent"]
+            if row["result_receipt_json"] is not None and not valid:
+                raise ValueError("invalid_result_receipt")
+        except (ValueError, TypeError):
+            effects, receipt, valid = {"unknown": True}, None, False
+        if valid and receipt.get("status") in {"succeeded", "skipped"}:
+            status, error = receipt["status"], receipt["error"]
+            fields = receipt["fields"]
+            items.append({**receipt["item"], "subject": row["subject_name"], "reason": "recovered_saved_result"})
+        elif effects or (valid and (receipt["item"]["archiveSent"] or receipt["item"]["recommendationSent"])) or not _saved_refresh_route_matches(row, environ):
+            status, error = "recovery_required", "delivery_receipt_reconciliation_required"
+            fields = {"last_refresh_status": status, "last_error": error, "active_claim_token": None}
+        else:
+            status, error = "queued", "interrupted_before_delivery"
+            fields = {"last_refresh_status": status, "last_error": error, "active_claim_token": None}
+        conn.execute(f"UPDATE {QUEUE_TABLE} SET status=?, last_error=?, updated_at=? WHERE id=? AND status='running' AND claim_token=?", (status, error, utc_now(), row["id"], claim_token))
+        _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields=fields, expected_claim_token=claim_token)
+        conn.commit()
+    return items
+
+
 def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = None, dry_run: bool = False, max_items: int = DEFAULT_MAX_AUTOMATIC_PER_CYCLE, cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, force: bool = False, bypass_cooldown: bool = False, refresh_mode: str = "automatic", subject_key: str | None = None, queue_id: int | None = None, callback_base_url: str | None = None) -> dict[str, Any]:
+    kwargs = dict(guild_id=guild_id, dry_run=dry_run, max_items=max_items, cooldown_minutes=cooldown_minutes, lookup_func=lookup_func, sender=sender, environ=environ, force=force, bypass_cooldown=bypass_cooldown, refresh_mode=refresh_mode, subject_key=subject_key, queue_id=queue_id, callback_base_url=callback_base_url)
+    if dry_run:
+        return _process_source_file_refresh_queue(db_path, **kwargs)
+    with _source_refresh_fence(db_path) as acquired:
+        if not acquired:
+            return {"ok": True, "dryRun": False, "processed": 0, "skipped": 0, "failed": 0, "items": [], "reason": "worker_busy"}
+        return _process_source_file_refresh_queue(db_path, **kwargs)
+
+
+def _process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = None, dry_run: bool = False, max_items: int = DEFAULT_MAX_AUTOMATIC_PER_CYCLE, cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, force: bool = False, bypass_cooldown: bool = False, refresh_mode: str = "automatic", subject_key: str | None = None, queue_id: int | None = None, callback_base_url: str | None = None) -> dict[str, Any]:
     now_dt = datetime.now(timezone.utc).replace(microsecond=0)
     now = now_dt.isoformat()
     env = environ if environ is not None else os.environ
@@ -903,7 +1116,28 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
     conn.row_factory = sqlite3.Row
     try:
         ensure_source_file_refresh_schema(conn)
-        where = "status IN ('queued','deferred','cooldown','failed') AND (not_before_at IS NULL OR not_before_at<=?)"
+        conn.commit()
+        if not dry_run:
+            recovered = _recover_refresh_claims(conn, guild_id=guild_id, subject_key=subject_key, queue_id=queue_id, max_items=max_items, environ=env)
+            summary["items"].extend(recovered)
+            summary["processed"] += sum(item["status"] in {"succeeded", "partial_success"} for item in recovered)
+            summary["skipped"] += sum(item["status"] == "no_target" for item in recovered)
+            blocked_where, blocked_params = "status IN ('running','recovery_required')", []
+            if guild_id is not None:
+                blocked_where += " AND guild_id=?"
+                blocked_params.append(guild_id)
+            if subject_key:
+                blocked_where += " AND subject_key=?"
+                blocked_params.append(source_refresh_subject_key(subject_key))
+            if queue_id is not None:
+                blocked_where += f" AND (id=? OR (guild_id IS (SELECT guild_id FROM {QUEUE_TABLE} WHERE id=?) AND subject_key=(SELECT subject_key FROM {QUEUE_TABLE} WHERE id=?)))"
+                blocked_params.extend((queue_id, queue_id, queue_id))
+            blocked = conn.execute(f"SELECT subject_name FROM {QUEUE_TABLE} WHERE {blocked_where} ORDER BY id LIMIT ?", [*blocked_params, max(1, max_items)]).fetchall()
+            for blocked_row in blocked:
+                summary["items"].append({"subject": blocked_row["subject_name"], "status": "recovery_required", "reason": "delivery_receipt_reconciliation_required"})
+            if queue_id is not None and blocked:
+                return summary
+        where = f"status IN ('queued','deferred','cooldown','failed') AND (not_before_at IS NULL OR not_before_at<=?) AND NOT EXISTS (SELECT 1 FROM {QUEUE_TABLE} other WHERE other.guild_id IS {QUEUE_TABLE}.guild_id AND other.subject_key={QUEUE_TABLE}.subject_key AND other.id<>{QUEUE_TABLE}.id AND other.status IN ('running','recovery_required'))"
         params: list[Any] = [now]
         if guild_id is not None:
             where += " AND guild_id=?"
@@ -954,8 +1188,21 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                 summary["skipped"] += 1
                 summary["items"].append({"subject": row["subject_name"], "status": "cooldown", "reason": "cooldown", "cooldownUntil": cooldown_until.isoformat()})
                 continue
-            conn.execute(f"UPDATE {QUEUE_TABLE} SET status='running', updated_at=?, last_attempt_at=?, attempts=attempts+1, last_error=NULL WHERE id=?", (now, now, row["id"]))
-            _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_started_at": now, "last_refresh_status": "running", "candidate_id": row_candidate_id or None})
+            claim_token = uuid.uuid4().hex
+            selected_callback = normalize_trusted_site_callback_base_url(callback_base_url, environ=env) or None
+            if row["claim_token"]:
+                if not _saved_refresh_route_matches(row, env) or (selected_callback and selected_callback != row["callback_base_url"]):
+                    conn.execute(f"UPDATE {QUEUE_TABLE} SET status='recovery_required', last_error='delivery_route_reconciliation_required' WHERE id=? AND status IN ('queued','deferred','cooldown','failed')", (row["id"],))
+                    conn.commit()
+                    summary["items"].append({"subject": row["subject_name"], "status": "recovery_required", "reason": "delivery_route_reconciliation_required"})
+                    continue
+                selected_callback = row["callback_base_url"] or None
+            claimed = conn.execute(f"UPDATE {QUEUE_TABLE} SET status='running', updated_at=?, last_attempt_at=?, attempts=attempts+1, last_error=NULL, claim_token=?, delivery_receipts_json='{{}}', result_receipt_json=NULL, callback_base_url=?, route_fingerprint=? WHERE id=? AND status IN ('queued','deferred','cooldown','failed') AND attempts=? AND candidate_id IS ? AND NOT EXISTS (SELECT 1 FROM {QUEUE_TABLE} other WHERE other.guild_id IS ? AND other.subject_key=? AND other.id<>? AND other.status IN ('running','recovery_required'))", (now, now, claim_token, selected_callback, _refresh_route_fingerprint(env, selected_callback), row["id"], row["attempts"], row["candidate_id"], row["guild_id"], row["subject_key"], row["id"]))
+            if not claimed.rowcount:
+                conn.rollback()
+                summary["items"].append({"subject": row["subject_name"], "status": "recovery_required", "reason": "active_or_changed_claim"})
+                continue
+            _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_started_at": now, "last_refresh_status": "running", "candidate_id": row_candidate_id or None, "active_claim_token": claim_token})
             conn.commit()
             logging.info("source_refresh_started subject_key=%s mode=%s", row["subject_key"], mode)
             if report_missing:
@@ -974,13 +1221,20 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                         environ=env,
                         force=force,
                         diagnostics=False,
-                        callback_base_url=callback_base_url or None,
+                        callback_base_url=selected_callback,
                         lookup_key=lookup_key,
                         lookup_value=lookup_value,
+                        effect_observer=lambda stage, phase, effect_result=None: _record_refresh_effect(conn, row["id"], claim_token, stage, phase, effect_result),
                     )
+                _require_refresh_claim(conn, row["id"], claim_token)
+                receipt = _refresh_result_receipt(row, claim_token, result, now_dt, cooldown_minutes)
+                saved = conn.execute(f"UPDATE {QUEUE_TABLE} SET result_receipt_json=? WHERE id=? AND status='running' AND claim_token=? AND EXISTS (SELECT 1 FROM {STATE_TABLE} s WHERE s.guild_id IS {QUEUE_TABLE}.guild_id AND s.subject_key={QUEUE_TABLE}.subject_key AND s.active_claim_token=?)", (json.dumps(receipt, sort_keys=True), row["id"], claim_token, claim_token))
+                if not saved.rowcount:
+                    raise SourceRefreshClaimLost("source_refresh_claim_lost")
+                conn.commit()
                 if result.get("status") == "no_target":
-                    conn.execute(f"UPDATE {QUEUE_TABLE} SET status='skipped', updated_at=?, last_error='no_target' WHERE id=?", (utc_now(), row["id"]))
-                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": "no_target", "last_failure_at": utc_now(), "last_error": "no_target", "candidate_id": row_candidate_id or None})
+                    conn.execute(f"UPDATE {QUEUE_TABLE} SET status='skipped', updated_at=?, last_error='no_target' WHERE id=? AND status='running' AND claim_token=?", (utc_now(), row["id"], claim_token))
+                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields=receipt["fields"], expected_claim_token=claim_token)
                     conn.commit()
                     logging.info("source_refresh_skipped subject_key=%s reason=no_target", row["subject_key"])
                     summary["skipped"] += 1
@@ -990,14 +1244,12 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     recommendation_id = str(send_result.get("recommendationId") or send_result.get("recommendation_id") or result.get("recommendationId") or send_result.get("id") or "")[:120]
                     archive_result = result.get("archiveResult") or {}
                     archive_id = str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120]
-                    cooldown_until_text = _cooldown_until_from(now_dt, cooldown_minutes)
-                    evidence_count = sum(int(v or 0) for v in (result.get("sourceCounts") or {}).values()) if isinstance(result.get("sourceCounts"), dict) else int(row["evidence_count"] or 0)
                     partial_success = bool(result.get("archiveSent") and not result.get("recommendationSent") and result.get("status") == "partial_success")
                     item_status = "partial_success" if partial_success else "succeeded"
                     partial_reason = "compact_recommendation_rejected" if partial_success else ""
                     item_reason = CASE_REPORT_BACKFILL_REASON if report_missing and not partial_reason else partial_reason
-                    conn.execute(f"UPDATE {QUEUE_TABLE} SET status='succeeded', updated_at=?, last_error=NULL WHERE id=?", (utc_now(), row["id"]))
-                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": item_status, "last_recommendation_id": recommendation_id, "last_evidence_hash": _evidence_hash_for_result(result), "last_evidence_count": evidence_count, "last_error": partial_reason or None, "cooldown_until": cooldown_until_text, "candidate_id": row_candidate_id or None})
+                    conn.execute(f"UPDATE {QUEUE_TABLE} SET status='succeeded', updated_at=?, last_error=NULL WHERE id=? AND status='running' AND claim_token=?", (utc_now(), row["id"], claim_token))
+                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields=receipt["fields"], expected_claim_token=claim_token)
                     conn.commit()
                     if partial_success:
                         logging.warning("source_refresh_partial_success subject_key=%s archive_ok=true compact_recommendation_ok=false reason=compact_recommendation_rejected archive_id=%s", row["subject_key"], archive_id or "none")
@@ -1016,24 +1268,37 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                         err = _safe_text(send_result.get("error") or "recommendation_send_failed", 240)
                     else:
                         err = _safe_text(send_result.get("error") or archive_result.get("error") or result.get("suppressedReason") or result.get("status") or "send_failed", 240)
-                    conn.execute(f"UPDATE {QUEUE_TABLE} SET status='failed', updated_at=?, last_error=? WHERE id=?", (utc_now(), err, row["id"]))
-                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_status": "failed", "last_failure_at": utc_now(), "last_error": err, "candidate_id": row_candidate_id or None})
+                    effects = conn.execute(f"SELECT delivery_receipts_json FROM {QUEUE_TABLE} WHERE id=?", (row["id"],)).fetchone()[0]
+                    failure_status = "recovery_required" if json.loads(effects or "{}") else "failed"
+                    conn.execute(f"UPDATE {QUEUE_TABLE} SET status=?, updated_at=?, last_error=? WHERE id=? AND status='running' AND claim_token=?", (failure_status, utc_now(), err, row["id"], claim_token))
+                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_status": failure_status, "last_failure_at": utc_now(), "last_error": err, "candidate_id": row_candidate_id or None, "active_claim_token": None}, expected_claim_token=claim_token)
                     conn.commit()
                     logging.warning("source_refresh_failed subject_key=%s error=%s", row["subject_key"], err)
                     if report_missing:
                         logging.warning("source_case_report_backfill_failed subject_key=%s error=%s trigger=%s", row["subject_key"], err, backfill_trigger)
                     summary["failed"] += 1
-                    summary["items"].append({"subject": row["subject_name"], "status": "failed", "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "recommendationSent": bool(result.get("recommendationSent")), "archiveSent": bool(result.get("archiveSent")), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "recommendationId": str(send_result.get("recommendationId") or result.get("recommendationId") or "")[:120], "caseReportBackfill": bool(report_missing), "caseReportBackfillTrigger": backfill_trigger, "caseReportGenerated": _result_case_report_generated(result), "subjectMemoryPacketGenerated": _result_subject_memory_packet_generated(result)})
+                    summary["items"].append({"subject": row["subject_name"], "status": failure_status, "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "recommendationSent": bool(result.get("recommendationSent")), "archiveSent": bool(result.get("archiveSent")), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "recommendationId": str(send_result.get("recommendationId") or result.get("recommendationId") or "")[:120], "caseReportBackfill": bool(report_missing), "caseReportBackfillTrigger": backfill_trigger, "caseReportGenerated": _result_case_report_generated(result), "subjectMemoryPacketGenerated": _result_subject_memory_packet_generated(result)})
+            except SourceRefreshClaimLost:
+                conn.rollback()
+                summary["items"].append({"subject": row["subject_name"], "status": "recovery_required", "reason": "source_refresh_claim_lost"})
             except Exception as exc:
+                conn.rollback()
+                try:
+                    _require_refresh_claim(conn, row["id"], claim_token)
+                except SourceRefreshClaimLost:
+                    summary["items"].append({"subject": row["subject_name"], "status": "recovery_required", "reason": "source_refresh_claim_lost"})
+                    continue
                 err = _safe_text(exc, 240)
-                conn.execute(f"UPDATE {QUEUE_TABLE} SET status='failed', updated_at=?, last_error=? WHERE id=?", (utc_now(), err, row["id"]))
-                _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_status": "failed", "last_failure_at": utc_now(), "last_error": err, "candidate_id": row_candidate_id or None})
+                effects = conn.execute(f"SELECT delivery_receipts_json FROM {QUEUE_TABLE} WHERE id=?", (row["id"],)).fetchone()[0]
+                failure_status = "recovery_required" if json.loads(effects or "{}") else "failed"
+                conn.execute(f"UPDATE {QUEUE_TABLE} SET status=?, updated_at=?, last_error=? WHERE id=? AND status='running' AND claim_token=?", (failure_status, utc_now(), err, row["id"], claim_token))
+                _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_status": failure_status, "last_failure_at": utc_now(), "last_error": err, "candidate_id": row_candidate_id or None, "active_claim_token": None}, expected_claim_token=claim_token)
                 conn.commit()
                 logging.warning("source_refresh_failed subject_key=%s error=%s", row["subject_key"], err)
                 if report_missing:
                     logging.warning("source_case_report_backfill_failed subject_key=%s error=%s trigger=%s", row["subject_key"], err, backfill_trigger)
                 summary["failed"] += 1
-                summary["items"].append({"subject": row["subject_name"], "status": "failed", "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "caseReportBackfill": bool(report_missing)})
+                summary["items"].append({"subject": row["subject_name"], "status": failure_status, "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "caseReportBackfill": bool(report_missing)})
     finally:
         conn.close()
     logging.info("source_refresh_worker_cycle processed=%s skipped=%s failed=%s", summary["processed"], summary["skipped"], summary["failed"])
@@ -1143,6 +1408,8 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             callback_base_url=callback_base_url or None,
         )
         item = (local.get("items") or [{}])[0]
+        if not item and local.get("reason") == "worker_busy":
+            item = {"status": "deferred", "reason": "worker_busy", "error": "worker_busy"}
         status = item.get("status")
         if status in {"succeeded", "partial_success"}:
             rec_id = _safe_text(item.get("recommendationId") or "", 120)

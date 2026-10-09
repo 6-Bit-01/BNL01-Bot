@@ -6280,6 +6280,7 @@ def run_source_file_enrichment(
     diagnostics: bool = False,
     callback_base_url: str | None = None,
     workspace_creator: Callable[[dict[str, Any], str, dict[str, str] | None], dict[str, Any]] = create_existing_dossier_update_target,
+    effect_observer: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     canonical_key = lookup_key if lookup_key in {"subject", "alias", "candidateId", "normalizedName"} else "subject"
     target_value = (lookup_value if lookup_value is not None else subject) or ""
@@ -6298,7 +6299,11 @@ def run_source_file_enrichment(
             )
         if dry_run:
             return _target_setup_result(target_value, dry_run=True, status="target_setup_required")
+        if effect_observer:
+            effect_observer("workspace", "before")
         setup_result = workspace_creator(lookup_result, str(target_value), environ)
+        if effect_observer:
+            effect_observer("workspace", "after", setup_result)
         if not setup_result.get("ok"):
             return _target_setup_result(
                 target_value,
@@ -6473,7 +6478,11 @@ def run_source_file_enrichment(
     packet["caseReportGenerated"] = bool((archive_payload or {}).get("sourceFileCaseReportV1"))
     archive_required = is_source_file_archive_token_configured(environ)
     if archive_required:
+        if effect_observer:
+            effect_observer("archive", "before")
         archive_result = _call_site_sender(archive_sender, archive_payload, environ=environ, callback_base_url=callback_base_url)
+        if effect_observer:
+            effect_observer("archive", "after", archive_result)
     else:
         archive_result = {"ok": True, "archiveId": None, "error": "", "status": "not_configured_skipped"}
         logging.info("source_file_archive_send_skipped reason=archive_token_not_configured subject_key=%s", _subject_key(subject))
@@ -6485,7 +6494,11 @@ def run_source_file_enrichment(
 
     payload = sanitize_compact_recommendation_payload(payload, packet=packet, archive_id=packet.get("archiveId") or "")
     packet["payload"] = payload
+    if effect_observer:
+        effect_observer("recommendation", "before")
     send_result = _call_site_sender(sender, payload, environ=environ, callback_base_url=callback_base_url)
+    if effect_observer:
+        effect_observer("recommendation", "after", send_result)
     packet["sendResult"] = send_result
     packet["recommendationSent"] = bool((send_result or {}).get("ok"))
     packet["recommendationId"] = (send_result or {}).get("recommendationId") or (send_result or {}).get("id") or ""
