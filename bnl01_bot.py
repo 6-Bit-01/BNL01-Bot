@@ -527,6 +527,11 @@ from bnl_broadcast_ballads import (
     attribution_review_schema as ballad_attribution_review_schema,
 )
 from bnl_tiktok_show_ledger import build_broadcast_ballad_evidence
+from bnl_song_workspace import (
+    execute_command as execute_song_command, prepare_delivery as prepare_song_delivery, ROUTE as SONG_ROUTE,
+    SongGeneration, SongFailure, SongNoRedirect, read_context as read_song_context,
+    response_schema as song_response_schema,
+)
 
 from bnl_gemini_routing import (
     DEFAULT_FALLBACK_MODEL,
@@ -33280,6 +33285,9 @@ def _generation_config_for_model(
         )
     if route in {'moment_meaning_background', 'relationship_meaning_background'}:
         config_kwargs['response_mime_type'] = 'application/json'
+    if route == SONG_ROUTE:
+        config_kwargs['response_mime_type'] = 'application/json'
+        config_kwargs['response_schema'] = song_response_schema()
     if route in {BALLAD_ROUTE, BALLAD_MANUAL_ROUTE}:
         config_kwargs['response_mime_type'] = 'application/json'
         config_kwargs['response_schema'] = ballad_response_schema()
@@ -38092,6 +38100,67 @@ async def _generate_website_relay_guarded(guild_id: int, *, allow_quiet_sources:
 
 
 _ballad_cycle_task = None
+_song_cycle_task = None
+# The maintained factual owner supplies only relevant music/BNL background,
+# without forcing its personnel roster into an unrelated song.
+SONG_BACKGROUND = "\n".join(line for line in render_prompt_canon_block().splitlines()
+    if line.startswith(("- The music and collective existed", "- BARCODE Radio is",
+                        "- You are the BARCODE Network Liaison Entity")))
+
+
+def _song_control_request_sync(method="GET", payload=None):
+    base = _journal_website_base_url()
+    if not base or not BNL_API_KEY:
+        return None
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme != "https" or parsed.netloc != "www.barcode-network.com" or parsed.username or parsed.password:
+        return None
+    headers = {"Accept": "application/json", "x-api-key": BNL_API_KEY}
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if len(data) > 262144:
+            raise ValueError("song_receipt_size")
+    request = urllib.request.Request(base + "/api/bnl/songs", data=data, headers=headers, method=method)
+    with urllib.request.build_opener(SongNoRedirect()).open(request, timeout=10) as response:
+        raw = response.read(262145)
+    if len(raw) > 262144:
+        raise ValueError("song_control_size")
+    return json.loads(raw.decode("utf-8"))
+
+
+async def _run_song_control_cycle():
+    """Use the existing heartbeat; isolate private song failures from Ballads/Journal."""
+    try:
+        control = await asyncio.to_thread(_song_control_request_sync)
+        if not isinstance(control, dict) or control.get("contractVersion") != 1:
+            return
+        commands = control.get("commands")
+        if not isinstance(commands, list):
+            return
+        for command in commands[:2]:
+            async def generate(prompt):
+                if not await asyncio.to_thread(check_quota_availability, SONG_ROUTE):
+                    raise SongFailure("BUDGET_UNAVAILABLE")
+                result = await asyncio.wait_for(_generate_gemini_content_result_async(
+                    "You are BNL-01, the BARCODE Network Liaison Entity.\n"
+                    + _BNL01_PACKET_VOICE_PROMPT + "\n" + SONG_BACKGROUND + "\n" + prompt,
+                    SONG_ROUTE,
+                ), timeout=240)
+                if not result.success:
+                    raise SongFailure("BUDGET_UNAVAILABLE" if result.error_category == GENERATION_ERROR_LOCAL_MODEL_BUDGET
+                                      else "PROVIDER_UNAVAILABLE")
+                return SongGeneration(result.text, result.finish_reason)
+
+            receipt = await execute_song_command(DB_FILE, BNL_PRIMARY_GUILD_ID, command,
+                generate=generate, context_reader=lambda options: read_song_context(DB_FILE, BNL_PRIMARY_GUILD_ID, options))
+            if receipt is not None:
+                receipt = await prepare_song_delivery(DB_FILE, BNL_PRIMARY_GUILD_ID, command, receipt)
+                await asyncio.to_thread(_song_control_request_sync, "POST", receipt)
+    except Exception as exc:
+        # Never log options, lyrics, provider messages, member identity or API keys.
+        logging.info("song_control_cycle_unavailable error_type=%s", type(exc).__name__)
 
 
 def _ballad_control_request_sync(method="GET", payload=None):
@@ -38157,9 +38226,11 @@ async def _run_ballad_control_cycle():
 
 @tasks.loop(minutes=1)
 async def website_presence_heartbeat_task():
-    global _ballad_cycle_task
+    global _ballad_cycle_task, _song_cycle_task
     if BNL_PRIMARY_GUILD_ID and (_ballad_cycle_task is None or _ballad_cycle_task.done()):
         _ballad_cycle_task = asyncio.create_task(_run_ballad_control_cycle())
+    if BNL_PRIMARY_GUILD_ID and (_song_cycle_task is None or _song_cycle_task.done()):
+        _song_cycle_task = asyncio.create_task(_run_song_control_cycle())
     if BNL_WEBSITE_CONTRACT_VERSION != "2":
         return
     flags = get_bnl_control_flags()
