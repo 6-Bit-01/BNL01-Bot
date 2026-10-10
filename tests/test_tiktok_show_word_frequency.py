@@ -769,5 +769,141 @@ class TikTokArchivedWordFrequencyTests(unittest.TestCase):
         self.assertNotIn("occurrenceCount=0", render_tiktok_show_word_frequency(result))
 
 
+
+class TikTokCurrentWordCountRequestRegressionTests(unittest.TestCase):
+    """One human word selector must survive current-episode source handoff."""
+
+    @staticmethod
+    def _eleven_originals():
+        texts = (
+            "Butt butt!", "butt", "BUTT?", "butt, butts", "no butt?",
+            "butt... butt", "butts", "BUTTS!", "butter", "about", "butt",
+        )
+        return [event(index, text, stamp("2026-10-03T03:00:00Z") + index * 1000,
+                      prefix="current-butt") for index, text in enumerate(texts)]
+
+    @staticmethod
+    def _active_show():
+        current = show()
+        current.update(status="open", milestones=current["milestones"][:1],
+                       _evidenceObservedThroughMs=stamp("2026-10-03T04:18:14Z"))
+        return current
+
+    def test_target_before_word_count_uses_the_existing_show_request_owner(self):
+        for query, target in (
+            ("BNL butt word count. Tonight\u2019s show. Go.", "butt"),
+            ("BNL, butts word count in this stream.", "butts"),
+            ('"butt" word count during the last TikTok stream', "butt"),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(requested_tiktok_show_word_count(query), target)
+                self.assertTrue(is_tiktok_show_analysis_query(query))
+        self.assertEqual(requested_tiktok_show_word_count(
+            "What is the word count in TikTok chat?"), "")
+
+    def test_targetless_current_stream_correction_is_an_eligible_human_followup(self):
+        self.assertTrue(is_tiktok_show_analysis_followup("Current stream not last stream"))
+        query = ("Count word butt in the last TikTok stream\n"
+                 "Current follow-up: Current stream not last stream")
+        self.assertEqual(requested_tiktok_show_word_count(query), "butt")
+
+    def test_affirmative_current_stream_beats_negated_last_stream(self):
+        active = self._active_show()
+        older = show("2026-09-25")
+        query = ("Count word butt in the last TikTok stream\n"
+                 "Current follow-up: Current stream not last stream")
+        selected, source = select_show_for_tiktok_analysis(
+            {"currentShow": active, "latestShow": older, "shows": [older]}, query,
+            now=datetime(2026, 10, 3, 4, 18, 14, tzinfo=timezone.utc))
+        self.assertEqual((selected.get("sessionId"), source),
+                         (active["sessionId"], "currentShow"))
+
+    def test_eleven_originals_measure_singular_and_plural_independently(self):
+        records = self._eleven_originals()
+        results = [count_tiktok_show_word_frequency(
+            show(), records, "Count word " + target + " in this stream")
+            for target in ("butt", "butts")]
+        singular, plural = results
+        self.assertEqual((singular["status"], singular["occurrenceCount"],
+                          singular["matchingMessageCount"]), ("complete", 9, 7))
+        self.assertEqual((plural["status"], plural["occurrenceCount"],
+                          plural["matchingMessageCount"]), ("complete", 3, 3))
+        for result in results:
+            self.assertEqual(result["capturedMessageCount"], 11)
+            self.assertEqual(len(result["originalSourceRefs"]), 11)
+            self.assertEqual(result["sessionId"], show()["sessionId"])
+            self.assertEqual((result["windowStartMs"], result["windowEndMs"]),
+                             tiktok_show_word_frequency_bounds_ms(show()))
+        self.assertNotEqual(singular["sourceDigest"], plural["sourceDigest"])
+
+    def test_active_count_freezes_first_receipts_without_conflating_plural(self):
+        active = self._active_show()
+        records = self._eleven_originals()
+        records[-1]["ingested_at_ms"] = active["_evidenceObservedThroughMs"] + 1
+        singular = count_tiktok_show_word_frequency(
+            active, records, "Count word butt in this stream")
+        plural = count_tiktok_show_word_frequency(
+            active, records, "Count word butts in this stream")
+        self.assertEqual((singular["status"], singular["capturedMessageCount"],
+                          singular["occurrenceCount"], singular["matchingMessageCount"]),
+                         ("complete", 10, 8, 6))
+        self.assertEqual((plural["occurrenceCount"], plural["matchingMessageCount"]), (3, 3))
+        self.assertEqual(singular["windowEndMs"], active["_evidenceObservedThroughMs"])
+        self.assertNotIn(records[-1]["event_id"],
+                         [ref["sourceKey"] for ref in singular["originalSourceRefs"]])
+
+    def test_missing_and_partial_originals_cannot_replace_a_verified_zero(self):
+        records = self._eleven_originals()
+        partial = [dict(item) for item in records]
+        partial[-1]["ingested_at_ms"] = None
+        cases = ((None, "unavailable"), ([], "unavailable"), (partial, "partial"))
+        for originals, status in cases:
+            with self.subTest(status=status, source_missing=originals is None):
+                result = count_tiktok_show_word_frequency(
+                    show(), originals, "Count word goat in this stream")
+                self.assertEqual(result["status"], status)
+                self.assertIsNone(result["occurrenceCount"])
+                self.assertNotIn("occurrenceCount=0", render_tiktok_show_word_frequency(result))
+        zero = count_tiktok_show_word_frequency(show(), records, "Count word goat in this stream")
+        self.assertEqual((zero["status"], zero["capturedMessageCount"],
+                          zero["occurrenceCount"]), ("complete", 11, 0))
+
+    def test_unavailable_count_prompt_keeps_the_requested_word_and_episode(self):
+        result = count_tiktok_show_word_frequency(show(), None, "Count word butt in this stream")
+        rendered = render_tiktok_show_word_frequency(result)
+        self.assertIn('"butt"', rendered)
+        self.assertIn(show()["sessionId"], rendered)
+        self.assertIn("Coverage=unavailable", rendered)
+        self.assertNotIn("occurrenceCount=0", rendered)
+
+    def test_packet_relative_night_keeps_the_native_resolved_word_request(self):
+        from types import SimpleNamespace
+        from bnl_unified_intelligence_packet import _show_episode_query
+
+        current = "Tonight\u2019s show. Go."
+        resolved = "Count word butt in TikTok chat\nCurrent follow-up: " + current
+        request = SimpleNamespace(
+            user_text=current, now=datetime(2026, 10, 3, 7, 1, tzinfo=timezone.utc),
+            show_episode_artist_request=None, show_episode_selection_text=resolved,
+            show_episode_dates=("2026-10-02",))
+        packet_query = _show_episode_query(request)
+        self.assertEqual(requested_tiktok_show_word_count(packet_query), "butt")
+        self.assertIn("Current follow-up: " + current, packet_query)
+        self.assertIn("2026-10-02", packet_query)
+
+    def test_packet_current_explicit_history_keeps_its_own_word_and_date(self):
+        from types import SimpleNamespace
+        from bnl_unified_intelligence_packet import _show_episode_query
+
+        current = "Count word butts during the September 25, 2026 TikTok stream"
+        request = SimpleNamespace(
+            user_text=current, now=datetime(2026, 10, 3, 7, 1, tzinfo=timezone.utc),
+            show_episode_artist_request=None,
+            show_episode_selection_text="Count word butt during the October 2, 2026 stream",
+            show_episode_dates=("2026-10-02",))
+        packet_query = _show_episode_query(request)
+        self.assertEqual(packet_query, current)
+        self.assertEqual(requested_tiktok_show_word_count(packet_query), "butts")
+
 if __name__ == "__main__":
     unittest.main()

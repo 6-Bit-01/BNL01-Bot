@@ -1134,6 +1134,192 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
         self.assertIn("occurrenceCount=10; matchingMessageCount=2", context)
         self.assertIn("windowUTC=2026-09-26T01:41:01.622000+00:00", context)
 
+    def _seed_tonight_word_count_originals(self):
+        self._empty_source_database("tonight-native-session")
+        texts = (
+            "Butt butt!", "butt", "BUTT?", "butt, butts", "no butt?",
+            "butt... butt", "butts", "BUTTS!", "butter", "about", "butt",
+        )
+        for index, text in enumerate(texts):
+            event_id = "tonight-original-%02d" % index
+            occurred_at = self._stamp("2026-10-03T03:30:00Z") + index * 1000
+            self.assertTrue(bnl01_bot.record_journal_source_event(
+                self.db_path, guild_id=77, source_kind="tiktok_live_chat",
+                source_key=event_id, occurred_at_ms=occurred_at,
+                ingested_at_ms=occurred_at + 100,
+                raw_text=text, sanitized_summary=text, channel_policy="public_context",
+                subject_ref="tiktok_handle:" + event_id, private_display_name="@" + event_id,
+                public_usable=True, metadata={
+                    "eventType": "comment", "handle": event_id,
+                    "sessionId": self.current["sessionId"],
+                },
+            ).ok)
+        # These originals belong to other sessions, outside the selected window.
+        # Their distinct totals expose either a latest-show or date-only fallback.
+        for event_id, instant, session_id, count in (
+            ("older-butt-original", "2026-09-26T03:00:00Z", self.latest["sessionId"], 31),
+            ("rehearsal-butt-original", "2026-10-02T20:10:00Z", "same-date-rehearsal", 23),
+        ):
+            occurred_at = self._stamp(instant)
+            text = "butt " * count
+            self.assertTrue(bnl01_bot.record_journal_source_event(
+                self.db_path, guild_id=77, source_kind="tiktok_live_chat",
+                source_key=event_id, occurred_at_ms=occurred_at,
+                ingested_at_ms=occurred_at + 100,
+                raw_text=text, sanitized_summary=text, channel_policy="public_context",
+                subject_ref="tiktok_handle:" + event_id, private_display_name="@" + event_id,
+                public_usable=True, metadata={
+                    "eventType": "comment", "handle": event_id, "sessionId": session_id,
+                },
+            ).ok)
+
+    def _tonight_native_session_model(self, *, archived):
+        selected_show = self._show(
+            self.current["sessionId"], "2026-10-02", "2026-10-03", active=not archived,
+        )
+        rehearsal = {
+            "sessionId": "same-date-rehearsal", "title": "BARCODE rehearsal",
+            "showDate": "2026-10-02", "status": "archived", "milestones": [
+                {"eventType": "broadcast_started", "occurredAt": "2026-10-02T20:00:00Z"},
+                {"eventType": "session_archived", "occurredAt": "2026-10-02T20:30:00Z"},
+            ],
+        }
+        archive = {
+            "latestShow": rehearsal if archived else self.latest,
+            "shows": [rehearsal, self.latest, self.older],
+        }
+        if archived:
+            # The canonical queue id must find this archived node even when
+            # another same-date session occupies latestShow and the first slot.
+            archive["shows"].append(selected_show)
+        else:
+            archive["currentShow"] = selected_show
+        model = self.authorized_read_model(archive)
+        model["sections"]["queue"] = {
+            "available": True, "accessScope": "public", "session": {
+                "id": self.current["sessionId"], "showDate": "2026-10-02",
+                "title": "BARCODE Radio", "purpose": "live_broadcast",
+                "status": "archived" if archived else "open",
+                "broadcastPhase": "ended" if archived else "live",
+            },
+        }
+        return model
+
+    def _tonight_word_count_context(self, question, *, model, conversation_context=""):
+        # Freeze the existing calendar owner alongside the bridge observation
+        # clock, so this test remains deterministic when run on another day.
+        with mock.patch(
+            "bnl_tiktok_live_context._pacific_show_date",
+            return_value=self.observed_at.astimezone(bnl01_bot.PACIFIC_TZ).date(),
+        ):
+            return self._context(
+                question, conversation_context=conversation_context, read_model=model,
+            )
+
+    def _assert_tonight_word_count(self, context, selected, rendered, *, word, archived):
+        self.assertEqual(selected["sessionId"], self.current["sessionId"])
+        self.assertEqual(selected["showDate"], "2026-10-02")
+        if archived:
+            self.assertNotIn("_evidenceObservedThroughMs", selected)
+        else:
+            self.assertEqual(selected["_evidenceObservedThroughMs"],
+                             int(self.observed_at.timestamp() * 1000))
+        self.assertEqual({event["event_id"] for event in rendered[1]}, {
+            "tonight-original-%02d" % index for index in range(11)
+        })
+        self.assertTrue(all(
+            event["metadata"]["sessionId"] == self.current["sessionId"]
+            for event in rendered[1]
+        ))
+        count, matching = (9, 7) if word == "butt" else (3, 3)
+        self.assertIn('- Word "%s": occurrenceCount=%s; matchingMessageCount=%s; matchingSpeakerCount=%s' %
+                      (word, count, matching, matching), context)
+        self.assertIn("eligibleCapturedMessagesChecked=11", context)
+        self.assertNotIn("occurrenceCount=31", context)
+        self.assertNotIn("occurrenceCount=23", context)
+        self.assertNotIn("Coverage=unavailable", context)
+
+    def test_tonight_native_queue_session_survives_midnight_and_immediate_archival(self):
+        self._seed_tonight_word_count_originals()
+        for instant, archived in (
+            ("2026-10-03T06:59:00Z", False),
+            ("2026-10-03T07:01:00Z", False),
+            ("2026-10-03T08:10:00Z", True),
+        ):
+            self.observed_at = datetime.fromisoformat(instant.replace("Z", "+00:00"))
+            for question, word in (
+                ("BNL butt word count. Tonight’s show. Go", "butt"),
+                ("BNL butts word count. Tonight’s show. Go", "butts"),
+                ("Count butt in the current TikTok stream", "butt"),
+            ):
+                with self.subTest(instant=instant, archived=archived, question=question):
+                    context, selected, rendered = self._tonight_word_count_context(
+                        question, model=self._tonight_native_session_model(archived=archived),
+                    )
+                    self._assert_tonight_word_count(
+                        context, selected, rendered, word=word, archived=archived,
+                    )
+
+    def test_same_user_current_stream_correction_retains_word_across_archival(self):
+        self._seed_tonight_word_count_originals()
+        correction = "Current stream not last stream"
+        conversation = (
+            "User/member: BNL butt word count. Last stream. Go\n"
+            "BNL-01: The older stream had 31; my guessed word was panda.\n"
+            "User/member (current payload fragment): " + correction
+        )
+        for instant, archived in (
+            ("2026-10-03T06:59:00Z", False),
+            ("2026-10-03T07:01:00Z", False),
+            ("2026-10-03T08:10:00Z", True),
+        ):
+            with self.subTest(instant=instant, archived=archived):
+                self.observed_at = datetime.fromisoformat(instant.replace("Z", "+00:00"))
+                context, selected, rendered = self._tonight_word_count_context(
+                    correction, conversation_context=conversation,
+                    model=self._tonight_native_session_model(archived=archived),
+                )
+                self._assert_tonight_word_count(
+                    context, selected, rendered, word="butt", archived=archived,
+                )
+                self.assertIn("Current follow-up: " + correction, rendered[2])
+                self.assertNotIn("guessed word", rendered[2])
+                self.assertNotIn("31;", rendered[2])
+
+    def test_missing_stale_or_mismatched_native_queue_identity_keeps_counts_unavailable(self):
+        self._seed_tonight_word_count_originals()
+        self.observed_at = datetime(2026, 10, 3, 8, 10, tzinfo=timezone.utc)
+        for archived in (False, True):
+            for failure in ("missing", "stale", "mismatched", "conflicting_alias"):
+                for question in (
+                    "BNL butt word count. Tonight’s show. Go",
+                    "Count butt in the current TikTok stream",
+                ):
+                    with self.subTest(archived=archived, failure=failure, question=question):
+                        model = self._tonight_native_session_model(archived=archived)
+                        queue = model["sections"]["queue"]
+                        if failure == "missing":
+                            queue["session"].pop("id")
+                        elif failure == "stale":
+                            queue.update(available=False, reason="stale")
+                        elif failure == "mismatched":
+                            queue["session"]["id"] = "unmatched-current-session"
+                        else:
+                            queue["session"]["sessionId"] = self.latest["sessionId"]
+                        context, _selected, rendered = self._tonight_word_count_context(
+                            question, model=model,
+                        )
+                        self.assertIsNone(rendered[1])
+                        self.assertNotIn("occurrenceCount=9", context)
+                        self.assertNotIn("occurrenceCount=31", context)
+                        self.assertNotIn("occurrenceCount=23", context)
+                        self.assertNotIn("occurrenceCount=0", context)
+                        self.assertTrue(
+                            "Coverage=unavailable" in context
+                            or "no public show timeline was selected" in context,
+                            context,
+                        )
+
     def test_missing_current_tiktok_live_does_not_count_an_archived_show(self):
         question = "How many times did TikTok chat say panda in this TikTok live?"
         context, selected_show, rendered_args = self._context(question, include_current=False)
