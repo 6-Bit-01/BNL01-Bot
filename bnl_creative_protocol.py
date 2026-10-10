@@ -151,6 +151,10 @@ Creative standards and constructive pushback:
   their subject, intended mood, leading genre, era and requested lyric length.
 """
 
+# Reuse the same craft for private songs without the chat headings/show defaults.
+SONGCRAFT_PROTOCOL = (SUNO_LYRIC_PROTOCOL.split('Songcraft (apply within the requested song or revision, not ordinary chat):', 1)[1]
+    .replace('a few concrete show moments', 'a few concrete moments'))
+
 _GLITCH_FORMS = (
     "fractured brackets", "misaligned punctuation", "brief redaction gaps",
     "broken mathematical glyphs", "staggered symbol fragments",

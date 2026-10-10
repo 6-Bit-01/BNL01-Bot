@@ -348,6 +348,10 @@ def initialize(db_file):
           guild_id INTEGER NOT NULL, command_id TEXT NOT NULL,
           show_id TEXT NOT NULL, state TEXT NOT NULL, receipt TEXT,
           created_at TEXT NOT NULL, PRIMARY KEY(guild_id,command_id));
+        CREATE TABLE IF NOT EXISTS bnl_song_commands (
+          guild_id INTEGER NOT NULL, command_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+          state TEXT NOT NULL, receipt TEXT, context_basis TEXT, created_at TEXT NOT NULL,
+          PRIMARY KEY(guild_id,command_id));
         CREATE TABLE IF NOT EXISTS bnl_ballad_versions (
           guild_id INTEGER NOT NULL, show_id TEXT NOT NULL, version_id TEXT NOT NULL,
           ordinal INTEGER NOT NULL, document TEXT NOT NULL,

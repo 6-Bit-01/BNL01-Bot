@@ -240,6 +240,13 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             provider_retries=0, allow_fallback=False,
             showday_protected=normalized_route == "broadcast_ballad_background",
         )
+    if normalized_route == "barcode_song_manual":
+        # Owner/Crew requested copy uses existing direct-work budget priority.
+        # One physical attempt, priced/reserved by the shared gateway; no fallback.
+        return GeminiRoutePolicy(
+            lane="conversation", max_output_tokens=16_384,
+            legacy_thinking_budget=2_048, provider_retries=0, allow_fallback=False,
+        )
     if normalized_route == "ordinary_chat_single_packet_canary":
         # Direct chat uses one physical attempt, without model fallback.
         return GeminiRoutePolicy(
