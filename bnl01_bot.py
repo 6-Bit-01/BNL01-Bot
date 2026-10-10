@@ -2310,9 +2310,9 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
     return dict(defaults)
 
 
-def _bnl_read_model_source_scope(url: str, api_key: str) -> tuple:
+def _bnl_read_model_source_scope(url: str, api_key: str | None) -> tuple:
     # Do not retain or expose a second plaintext copy of the service key.
-    return (url, hashlib.sha256(api_key.encode("utf-8")).hexdigest())
+    return (url, hashlib.sha256((api_key or "").encode("utf-8")).hexdigest())
 
 
 def _valid_bnl_read_model_snapshot(data: dict, *, authenticated: bool) -> bool:
@@ -3151,6 +3151,11 @@ class WebsiteReadModelContext(str):
 
     def for_original_quote_lookup(self, show_keys, *, current_images: bool = False) -> str:
         selected_keys = set(show_keys)
+        if self.word_frequency_show is not None:
+            # Native count evidence belongs to the turn's requester and its
+            # revalidatable source basis. A room-derived website total must
+            # never coexist with that count or supply an unproved target.
+            selected_keys.update(key for key, _indexes in self.historical_sections)
         omitted_indexes = {
             index
             for show_key, indexes in self.historical_sections
@@ -4000,6 +4005,23 @@ def maybe_build_bnl_read_model_context(
         user_text,
         conversation_context,
     )
+    if (
+        int(subject_user_id or 0) > 0
+        and requested_tiktok_show_word_count(show_analysis_request)
+        and not requested_tiktok_show_word_count(user_text)
+    ):
+        # A count correction inherits this requester's eligible human target,
+        # before any website originals are read or a measured block is rendered.
+        requester_context = ""
+        if (conversation_basis is not None
+                and conversation_basis.current_user_id == int(subject_user_id)
+                and conversation_basis.guild_id == int(guild_id)):
+            requester_context = "\n".join(
+                "User/member: " + " ".join(item.text.split())
+                for item in sorted(conversation_basis.evidence_items, key=lambda item: item.source_id)
+                if item.speaker_user_id == int(subject_user_id)
+            )
+        show_analysis_request = resolve_tiktok_show_analysis_request(user_text, requester_context)
     if explicit_show_analysis or contextual_candidate:
         resolution_mode = (
             "explicit"
@@ -4346,13 +4368,14 @@ def build_tiktok_show_evidence_context_for_turn(
         guild_id=guild_id, subject_user_id=subject_user_id,
     )
     tiktok_show_evidence_query = str(user_text or "")
-    if (
+    requester_count_basis_available = bool(
         conversation_basis is not None
         and int(subject_user_id or 0) > 0
         and conversation_basis.current_user_id == int(subject_user_id)
         and conversation_basis.guild_id == int(guild_id)
         and not image_queries
-    ):
+    )
+    if requester_count_basis_available:
         # Reload originals for a bounded correction from this requester. Prior
         # BNL replies and other speakers cannot supply the count request.
         human_count_context = "\n".join(
@@ -4369,7 +4392,18 @@ def build_tiktok_show_evidence_context_for_turn(
         if count_request and requested_tiktok_show_word_count(count_request):
             tiktok_show_evidence_query = count_request
     native_count_source = getattr(website_read_model_context, "word_frequency_show", None)
-    native_count_request = getattr(website_read_model_context, "show_selection_text", "")
+    native_count_request = tiktok_show_evidence_query
+    if native_count_source is not None and not image_queries:
+        if requested_tiktok_show_word_count(tiktok_show_evidence_query):
+            native_count_request = tiktok_show_evidence_query
+            if isinstance(website_read_model_context, WebsiteReadModelContext):
+                website_read_model_context.show_selection_text = native_count_request
+        else:
+            if isinstance(website_read_model_context, WebsiteReadModelContext):
+                website_read_model_context.show_selection_text = ""
+            # Only a resolved per-turn count can supply this target. Missing
+            # requester evidence cannot borrow a room-derived website word.
+            return ""
     if native_count_source is not None and requested_tiktok_show_word_count(native_count_request) and not image_queries:
         context = build_tiktok_show_evidence_context(
             DB_FILE, guild_id=guild_id, user_text=native_count_request,
@@ -41141,6 +41175,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
                 if (
                     batch_image_queries or batch_show_selection.get("original_quote_lookup")
+                    or getattr(batch_website_read_model_context, "word_frequency_show", None) is not None
                     or (batch_show_basis is not None and batch_show_selection.get("word_frequency_lookup"))
                 )
                 and isinstance(batch_website_read_model_context, WebsiteReadModelContext)
@@ -44231,6 +44266,7 @@ def build_user_aware_prompt(
         )
         if (
             image_queries or show_selection.get("original_quote_lookup")
+            or getattr(website_read_model_context, "word_frequency_show", None) is not None
             or (show_basis is not None and show_selection.get("word_frequency_lookup"))
         )
         and isinstance(website_read_model_context, WebsiteReadModelContext)

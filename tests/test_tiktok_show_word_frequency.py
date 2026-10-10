@@ -812,6 +812,28 @@ class TikTokCurrentWordCountRequestRegressionTests(unittest.TestCase):
                 }, query)
                 self.assertEqual(selected["sessionId"], session_id)
 
+    def test_generic_live_episode_word_count_does_not_become_a_literal_zero(self):
+        originals = [event(1, "hello world", stamp("2026-10-03T03:00:00Z"))]
+        for query in (
+            "What is the total TikTok live word count during the last stream?",
+            "What is the total TikTok lives word count during the last stream?",
+            "What is the episode word count in TikTok chat?",
+            "What is the overall word count during the last stream?",
+            *("What is the %s word count in TikTok chat?" % descriptor
+              for descriptor in ("episodes", "session", "sessions", "broadcast", "broadcasts", "aggregate")),
+        ):
+            with self.subTest(generic_word_total=query):
+                self.assertEqual(requested_tiktok_show_word_count(query), "")
+                self.assertIsNone(count_tiktok_show_word_frequency(show(), originals, query))
+        for target in ("live", "lives", "episode", "overall", "episodes", "session", "sessions",
+                       "broadcast", "broadcasts", "aggregate"):
+            for query in ('"%s" word count during the last stream' % target,
+                          "Count word %s during the last stream" % target):
+                with self.subTest(explicit_literal=query):
+                    measured = count_tiktok_show_word_frequency(show(), originals, query)
+                    self.assertEqual((measured["word"], measured["status"], measured["occurrenceCount"]),
+                                     (target, "complete", 0))
+
     def test_targetless_current_stream_correction_is_an_eligible_human_followup(self):
         self.assertTrue(is_tiktok_show_analysis_followup("Current stream not last stream"))
         query = ("Count word butt in the last TikTok stream\n"
@@ -939,6 +961,73 @@ class TikTokCurrentWordCountRequestRegressionTests(unittest.TestCase):
         packet_query = _show_episode_query(request)
         self.assertEqual(packet_query, current)
         self.assertEqual(requested_tiktok_show_word_count(packet_query), "butts")
+
+    def test_packet_targetless_current_correction_retains_the_resolved_word(self):
+        from types import SimpleNamespace
+        from bnl_unified_intelligence_packet import _show_episode_query
+
+        current = "Current stream not last stream"
+        for original in ("Count word butt in the last stream", "BNL butt word count. Last stream. Go"):
+            resolved = original + "\nCurrent follow-up: " + current
+            request = SimpleNamespace(
+                user_text=current, now=datetime(2026, 10, 3, 7, 1, tzinfo=timezone.utc),
+                show_episode_artist_request=None, show_episode_selection_text=resolved,
+                show_episode_dates=("2026-10-02",))
+            with self.subTest(original=original):
+                packet_query = _show_episode_query(request)
+                self.assertEqual(requested_tiktok_show_word_count(packet_query), "butt")
+                self.assertIn("Current follow-up: " + current, packet_query)
+                self.assertIn("2026-10-02", packet_query)
+
+    def test_packet_targetless_historical_correction_keeps_word_without_prior_date(self):
+        from types import SimpleNamespace
+        from bnl_unified_intelligence_packet import _show_episode_query
+
+        for current in ("Last stream", "Yesterday's show",
+                        "What about that same chat during the last stream?",
+                        "The September 25, 2026 stream"):
+            resolved = "Count word butt in current TikTok stream\nCurrent follow-up: " + current
+            request = SimpleNamespace(
+                user_text=current, now=datetime(2026, 10, 3, 7, 1, tzinfo=timezone.utc),
+                show_episode_artist_request=None, show_episode_selection_text=resolved,
+                show_episode_dates=("2026-10-02",))
+            with self.subTest(current=current):
+                packet_query = _show_episode_query(request)
+                self.assertEqual(packet_query, resolved)
+                self.assertEqual(requested_tiktok_show_word_count(packet_query), "butt")
+                self.assertNotIn("2026-10-02", packet_query)
+
+    def test_packet_new_human_historical_count_keeps_its_word_and_scope(self):
+        from types import SimpleNamespace
+        from bnl_unified_intelligence_packet import _show_episode_query
+
+        for current in ("Count word butts during the September 25, 2026 stream",
+                        "Count word butts during yesterday's show",
+                        "Count word butts during the last stream"):
+            request = SimpleNamespace(
+                user_text=current, now=datetime(2026, 10, 3, 7, 1, tzinfo=timezone.utc),
+                show_episode_artist_request=None,
+                show_episode_selection_text="Count word butt in current TikTok stream",
+                show_episode_dates=("2026-10-02",))
+            with self.subTest(current=current):
+                packet_query = _show_episode_query(request)
+                self.assertEqual(packet_query, current)
+                self.assertEqual(requested_tiktok_show_word_count(packet_query), "butts")
+                self.assertNotIn("2026-10-02", packet_query)
+
+    def test_packet_independent_historical_recap_does_not_revive_a_prior_count(self):
+        from types import SimpleNamespace
+        from bnl_unified_intelligence_packet import _show_episode_query
+
+        current = "Recap the 2026-09-25 show"
+        request = SimpleNamespace(
+            user_text=current, now=datetime(2026, 10, 3, 7, 1, tzinfo=timezone.utc),
+            show_episode_artist_request=None,
+            show_episode_selection_text="Count word butt in tonight's show",
+            show_episode_dates=("2026-10-02",))
+        packet_query = _show_episode_query(request)
+        self.assertEqual(packet_query, current)
+        self.assertEqual(requested_tiktok_show_word_count(packet_query), "")
 
 if __name__ == "__main__":
     unittest.main()

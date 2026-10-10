@@ -1345,6 +1345,68 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
 
 
 
+class BnlNativeWordFrequencyRequesterHandoffTests(unittest.TestCase):
+    def test_optional_read_model_api_key_keeps_an_opaque_source_scope(self):
+        no_key = bnl01_bot._bnl_read_model_source_scope("https://example.test/read-model", None)
+        self.assertEqual(no_key, bnl01_bot._bnl_read_model_source_scope(
+            "https://example.test/read-model", ""))
+        self.assertEqual(no_key[1], hashlib.sha256(b"").hexdigest())
+        self.assertNotEqual(no_key, bnl01_bot._bnl_read_model_source_scope(
+            "https://example.test/read-model", "test-optional-key"))
+
+    def test_native_turn_uses_requester_count_target_before_room_website_target(self):
+        correction = "Current stream not last stream"
+        requester = "Count word butt in TikTok chat last stream"
+        other = "Count word butts in TikTok chat last stream"
+        items = tuple(bnl01_bot.build_conversation_evidence_item(
+            text=text, source_id=index + 1, speaker_user_id=user_id, speaker_label=label,
+        ) for index, (text, user_id, label) in enumerate((
+            (requester, 42, "Test Member"), (other, 43, "Test Other Member"),
+        )))
+        for eligible_requester in (True, False, None):
+            with self.subTest(eligible_requester=eligible_requester):
+                basis = None if eligible_requester is None else bnl01_bot.ConversationPromptSourceBasis(
+                    expected_digest="test-conversation", rendered_context="", guild_id=77,
+                    current_user_id=42, channel_id=9001, channel_name="bnl-testing",
+                    channel_policy="sealed_test", evidence_items=items if eligible_requester else items[1:],
+                )
+                website_lines = (
+                    "Useful public queue context",
+                    '- Word "butts": occurrenceCount=3; matchingMessageCount=3',
+                )
+                website = bnl01_bot.WebsiteReadModelContext(
+                    "\n".join(website_lines), rendered_lines=website_lines,
+                    historical_sections=(("test-current", (1,)),),
+                    word_frequency_show={"showKey": "test-current"},
+                    show_selection_text=other + "\nCurrent follow-up: " + correction,
+                    word_frequency_channel_policy="sealed_test",
+                )
+                selection = {}
+                with (
+                    mock.patch.object(bnl01_bot, "env_queue_production_enabled", return_value=True),
+                    mock.patch.object(bnl01_bot, "_consented_tiktok_show_subject_user_id", return_value=42),
+                    mock.patch.object(bnl01_bot, "build_tiktok_show_evidence_context",
+                                      side_effect=lambda *_args, **kwargs: kwargs["user_text"]) as reader,
+                ):
+                    context = bnl01_bot.build_tiktok_show_evidence_context_for_turn(
+                        guild_id=77, user_text=correction, subject_user_id=42,
+                        website_read_model_context=website, conversation_basis=basis, selection_out=selection,
+                    )
+                if eligible_requester:
+                    self.assertEqual(bnl01_bot.requested_tiktok_show_word_count(context), "butt")
+                    self.assertIn(requester, context)
+                    self.assertNotIn(other, context)
+                    self.assertEqual(selection["user_text"], context)
+                    reader.assert_called_once()
+                else:
+                    self.assertEqual(context, "")
+                    self.assertEqual(website.show_selection_text, "")
+                    reader.assert_not_called()
+                cleaned_website = website.for_original_quote_lookup(())
+                self.assertIn("Useful public queue context", cleaned_website)
+                self.assertNotIn('Word "butts": occurrenceCount=3', cleaned_website)
+
+
 class BnlWordFrequencyRepairBasisTests(unittest.TestCase):
     @staticmethod
     def _basis(text, digest, count):

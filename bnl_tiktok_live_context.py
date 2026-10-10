@@ -729,7 +729,8 @@ def _tiktok_show_word_count_targets(user_text: str) -> list[tuple[int, int, str]
         if not word or (group == 3 and word in {
             "the", "a", "an", "what", "which", "total", "whole", "entire", "full",
             "is", "its", "this", "that", "my", "our", "your", "his", "her", "their",
-            "chat", "show", "stream", "tiktok",
+            "chat", "show", "stream", "tiktok", "live", "lives", "episode", "episodes",
+            "session", "sessions", "broadcast", "broadcasts", "overall", "aggregate",
         }):
             continue
         targets.append((*match.span(group), word))
@@ -3798,7 +3799,9 @@ def build_durable_show_prompt_context(
         frequency = count_tiktok_show_word_frequency({}, None, user_text)
         if frequency is not None:
             frequency.update(showKey="", reason="selected_episode_unavailable")
-            return "Durable TikTok show analysis context:\n" + render_tiktok_show_word_frequency(frequency)
+            return ("Durable TikTok show analysis context:\n"
+                    "- Availability: no public show timeline was selected for this request.\n"
+                    + render_tiktok_show_word_frequency(frequency))
         available_dates = sorted({str(item.get("showDate") or "")
                                   for item in tiktok_show_records(archive) if item.get("showDate")})
         return (

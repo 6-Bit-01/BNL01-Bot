@@ -479,7 +479,8 @@ class ShowWordCountDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def _current_word_count_delivery(self, *, enabled, request, prior_request="",
                                            grouped=False, withdraw=False, authority_loss="",
-                                           archive_during_await=False):
+                                           archive_during_await=False, interfering_other_request="",
+                                           expect_missing_target=False):
         self._seed_current_word_count()
         self.assertNotIn("id", self.read_model["sections"]["queue"]["session"])
         channel_id = next(self.channel_ids)
@@ -487,6 +488,13 @@ class ShowWordCountDeliveryTests(unittest.IsolatedAsyncioTestCase):
         if prior_request:
             delivery.RequestedShowDateDeliveryTests._capture_human_history(
                 self, "sealed_test", channel_id, (prior_request,),
+            )
+        if interfering_other_request:
+            bot.save_user_message(
+                43, "Test Other Member", 77, interfering_other_request,
+                channel_name="bnl-testing", channel_policy="sealed_test",
+                channel_id=channel_id, message_id=channel_id * 100 + 1,
+                route_mode="normal_chat", directed_to_bnl=True,
             )
         self.fetch.reset_mock()
         frequencies, packets, calls = [], [], []
@@ -504,6 +512,8 @@ class ShowWordCountDeliveryTests(unittest.IsolatedAsyncioTestCase):
             return packet
 
         answer = "The current captured TikTok chat has 9 whole-word butt occurrences across 7 matching messages."
+        if expect_missing_target:
+            answer = "Which word should I count in the current stream?"
         fresh_answer = answer.replace("9 whole-word", "7 whole-word").replace("7 matching", "6 matching")
         unavailable_answer = "I cannot verify an exact current chat total from the source available now."
 
@@ -587,6 +597,15 @@ class ShowWordCountDeliveryTests(unittest.IsolatedAsyncioTestCase):
                          bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE if enabled else "get_gemini_response")
         expected_answer = unavailable_answer if authority_loss else fresh_answer if withdraw else answer
         self.assertEqual(sent, [expected_answer])
+        if expect_missing_target:
+            self.assertFalse(any(entry[3] and entry[3]["word"] == "butts" for entry in frequencies))
+            other_count = 'Word "butts": occurrenceCount='
+            self.assertTrue(all(other_count not in prompt for prompt in calls))
+            for packet in packets:
+                self.assertEqual(bot.requested_tiktok_show_word_count(
+                    packet.request.show_episode_selection_text), "")
+                self.assertFalse(any(other_count in item.text for item in packet.items))
+            return
         rolling.assert_not_called()
         selected = [entry for entry in frequencies if entry[3] and (
             entry[3]["sessionId"] == "delivery-current-frequency"
@@ -671,6 +690,11 @@ class ShowWordCountDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(request, native_request.show_episode_selection_text)
             if prior_request:
                 self.assertIn(prior_request, native_request.show_episode_selection_text)
+        if interfering_other_request:
+            self.assertTrue(all(entry[3]["word"] == "butt" for entry in selected))
+            other_total = 'Word "butts": occurrenceCount=3; matchingMessageCount=3'
+            self.assertTrue(all(other_total not in prompt for prompt in calls))
+            self.assertFalse(any(other_total in item.text for packet in packets for item in packet.items))
         for wrong_count in (17, 31):
             self.assertTrue(all("occurrenceCount=" + str(wrong_count) not in prompt for prompt in calls))
             for packet in packets:
@@ -690,6 +714,29 @@ class ShowWordCountDeliveryTests(unittest.IsolatedAsyncioTestCase):
             enabled=True, request="Current stream not last stream",
             prior_request='BNL, how many times did TikTok chat say the word "butt" during the last stream?',
         )
+
+    async def test_direct_current_correction_ignores_newer_other_member_word_target(self):
+        await self._current_word_count_delivery(
+            enabled=False, request="Current stream not last stream",
+            prior_request="Count word butt in TikTok chat last stream",
+            interfering_other_request="Count word butts in TikTok chat last stream",
+        )
+
+    async def test_packet_current_correction_ignores_newer_other_member_word_target(self):
+        await self._current_word_count_delivery(
+            enabled=True, request="Current stream not last stream",
+            prior_request="Count word butt in TikTok chat last stream",
+            interfering_other_request="Count word butts in TikTok chat last stream",
+        )
+
+    async def test_bare_current_correction_does_not_adopt_other_member_word_target(self):
+        for enabled in (False, True):
+            with self.subTest(packet_enabled=enabled):
+                await self._current_word_count_delivery(
+                    enabled=enabled, request="Current stream not last stream",
+                    interfering_other_request="Count word butts in TikTok chat last stream",
+                    expect_missing_target=True,
+                )
 
     async def test_direct_affirmative_current_count_beats_negated_last_stream(self):
         await self._current_word_count_delivery(
