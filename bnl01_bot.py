@@ -529,7 +529,8 @@ from bnl_broadcast_ballads import (
 from bnl_tiktok_show_ledger import build_broadcast_ballad_evidence
 from bnl_song_workspace import (
     execute_command as execute_song_command, prepare_delivery as prepare_song_delivery, ROUTE as SONG_ROUTE,
-    SongGeneration, SongFailure, SongNoRedirect, read_context as read_song_context,
+    SongGeneration, SongFailure, SongNoRedirect, SongContext, read_context as read_song_context,
+    context_is_current as song_context_is_current, retrieval_query as song_retrieval_query,
     response_schema as song_response_schema,
 )
 
@@ -23921,7 +23922,8 @@ _AMBIENT_SOURCE_FIELDS = {
 }
 
 
-def _ambient_source_rows(conn, table, guild_id, *, row_ids=None, limit=100, window_end=None):
+def _ambient_source_rows(conn, table, guild_id, *, row_ids=None, limit=100, window_end=None,
+                         require_current_originals: bool = False):
     """Bounded reads of existing owners; never include raw operator notes."""
     fields = _AMBIENT_SOURCE_FIELDS[table]
     if table == "conversations":
@@ -23946,7 +23948,8 @@ def _ambient_source_rows(conn, table, guild_id, *, row_ids=None, limit=100, wind
             return []
         if len(ids) > 400:
             return [row for start in range(0, len(ids), 400)
-                    for row in _ambient_source_rows(conn, table, guild_id, row_ids=ids[start:start + 400])]
+                    for row in _ambient_source_rows(conn, table, guild_id, row_ids=ids[start:start + 400],
+                                                     require_current_originals=require_current_originals)]
         cursor = conn.execute(f"SELECT {fields} FROM {table} WHERE guild_id=? AND id IN ({','.join('?' for _ in ids)})",
                               (guild_id, *ids))
     names = [column[0] for column in cursor.description]
@@ -23954,6 +23957,7 @@ def _ambient_source_rows(conn, table, guild_id, *, row_ids=None, limit=100, wind
     if table in {"conversations", "memory_tiers"}:
         _, blocked = _public_conversation_recall_controls(
             conn, guild_id=guild_id, source_users={row['id']: row['user_id'] for row in rows}, source_table=table,
+            require_current_originals=require_current_originals,
         )
         rows = [row for row in rows if row['id'] not in blocked]
     if table == 'conversations':
@@ -23989,13 +23993,15 @@ def _ambient_tier_sources(conn, guild_id, tier_id):
     return tuple(row[0] for row in rows) if 0 < len(rows) <= 32 else ()
 
 
-def revalidate_ambient_local_sources(guild_id: int, basis: dict) -> bool:
+def revalidate_ambient_local_sources(guild_id: int, basis: dict, *,
+                                     require_current_originals: bool = False) -> bool:
     if basis.get('guild_id') != guild_id:
         return False
     try:
         with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
             for table, expected in basis.get('rows', {}).items():
-                rows = _ambient_source_rows(conn, table, guild_id, row_ids=expected)
+                rows = _ambient_source_rows(conn, table, guild_id, row_ids=expected,
+                                            require_current_originals=require_current_originals)
                 if {row['id']: _ambient_source_hash(row) for row in rows} != expected:
                     return False
                 if table == 'broadcast_memory' and any(not _valid_until_active(row['valid_until']) for row in rows):
@@ -24024,11 +24030,13 @@ def revalidate_ambient_local_sources(guild_id: int, basis: dict) -> bool:
 
 
 def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_MESSAGES,
-                                   *, source_basis: dict | None = None, dated: bool = False):
+                                   *, source_basis: dict | None = None, dated: bool = False,
+                                   require_current_originals: bool = False):
     with closing(sqlite3.connect("file:%s?mode=ro" % DB_FILE, uri=True, timeout=0.1)) as conn:
         frozen_end = (source_basis or {}).get('ambient_source_window_end')
         rows = _ambient_source_rows(conn, 'conversations', guild_id, limit=limit,
-                                    window_end=datetime.fromisoformat(frozen_end) if frozen_end else None)
+                                    window_end=datetime.fromisoformat(frozen_end) if frozen_end else None,
+                                    require_current_originals=require_current_originals)
     _remember_ambient_sources(source_basis, 'conversations', rows)
     if source_basis is not None:
         source_basis['recent_conversation_ids'] = tuple(row['id'] for row in rows)
@@ -28975,16 +28983,26 @@ class ConversationPromptSourceBasis:
 
 def _public_conversation_recall_controls(
     conn: sqlite3.Connection, *, guild_id: int, source_users: dict[int, int],
-    source_table: str = 'conversations',
+    source_table: str = 'conversations', require_current_originals: bool = False,
 ) -> tuple[str, frozenset[int]]:
     """Read explicit original/tier controls without promoting ledger text."""
     if source_table not in {'conversations', 'memory_tiers'}:
         raise ValueError('unsupported_recall_source_table')
+    strict_blocked = frozenset()
+    if require_current_originals:
+        if source_table != 'conversations':
+            raise ValueError('strict_original_controls_require_conversations')
+        # Reuse the show owner's current original lifecycle/privacy/correction
+        # policy; keep the existing subject-scoped recall controls below too.
+        from bnl_tiktok_show_ledger import _show_original_conversation_state
+        _, strict_blocked = _show_original_conversation_state(
+            conn, guild_id=guild_id, row_roles={row_id: 'user' for row_id in source_users},
+        )
     columns = {str(row[1]) for row in conn.execute(
         "PRAGMA main.table_info(memory_ledger_entries)"
     )}
     if not columns or not source_users:
-        return _prompt_source_digest("[]"), frozenset()
+        return _prompt_source_digest(json.dumps(sorted(strict_blocked))), frozenset(strict_blocked)
     required = {
         "entry_id", "guild_id", "source_table", "source_row_id",
         "subject_key", "lifecycle_status",
@@ -28992,8 +29010,8 @@ def _public_conversation_recall_controls(
     if not required.issubset(columns):
         raise sqlite3.DatabaseError("conversation_control_schema_unavailable")
     entries = {}
-    controls = []
-    blocked = set()
+    controls = [(row_id, 'strict_original_control') for row_id in strict_blocked]
+    blocked = set(strict_blocked)
     row_ids = sorted(source_users)
     for start in range(0, len(row_ids), 400):
         chunk = row_ids[start:start + 400]
@@ -29098,6 +29116,7 @@ def build_named_public_conversation_context(
     channel_id: int = 0, channel_name: str = "",
     conversation_basis=None,
     conversation_context_result: ConversationContextResult | None = None,
+    require_current_originals: bool = False, read_status: dict | None = None,
 ) -> tuple[str, ConversationPromptSourceBasis | None]:
     """Read original public messages for the resolved member and topic.
 
@@ -29107,6 +29126,8 @@ def build_named_public_conversation_context(
     """
     from bnl_conversation_context_v2 import _unsafe_row
 
+    if read_status is not None:
+        read_status.update(status='not_requested')
     subjects, user_text, query = _named_public_recall_scope(
         situation_frame=situation_frame, guild_id=guild_id,
         route_mode=route_mode, channel_policy=channel_policy, user_text=user_text,
@@ -29115,9 +29136,13 @@ def build_named_public_conversation_context(
     )
     if not subjects:
         return "", None
+    if read_status is not None:
+        read_status.update(status='reading')
     selected_date = requested_show_date(user_text)
     history_window = requested_history_window(user_text)
     if has_explicit_show_date(user_text) and not selected_date:
+        if read_status is not None:
+            read_status.update(status='invalid_scope')
         return "", None
     query_terms = memory_relevance_terms(query)
     candidates = []
@@ -29191,6 +29216,8 @@ def build_named_public_conversation_context(
                 "channel_id", "channel_policy", "timestamp",
             }
             if not required.issubset(columns):
+                if read_status is not None:
+                    read_status.update(status='unavailable')
                 return "", None
             fields = (
                 "id", "role", "content", "user_id", "user_name", "channel_id",
@@ -29233,7 +29260,7 @@ def build_named_public_conversation_context(
                 conn, guild_id=int(guild_id), source_users={
                     int(source["id"]): int(source["user_id"])
                     for source, _label, _text in candidates
-                },
+                }, require_current_originals=require_current_originals,
             )
             candidates = [
                 candidate for candidate in candidates
@@ -29275,20 +29302,27 @@ def build_named_public_conversation_context(
                 _digest, blocked_neighbors = _public_conversation_recall_controls(
                     conn, guild_id=int(guild_id), source_users={
                         int(item[0]["id"]): int(item[0]["user_id"]) for item in neighbors
-                    },
+                    }, require_current_originals=require_current_originals,
                 )
                 for neighbor in neighbors:
                     if int(neighbor[0]["id"]) not in blocked_neighbors:
                         add_candidate(neighbor)
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        if read_status is not None:
+            read_status.update(status='unavailable')
         return "", None
     if not selected:
+        if read_status is not None:
+            read_status.update(status='missing')
         return "", None
     selected.sort(key=lambda item: (observed_order(item), int(item[0]["id"])))
     rendered = header + "\n".join(item[3] for item in selected)
     row_ids = tuple(int(item[0]["id"]) for item in selected)
+    # Strict consumers use the refresher's stable ID order for source identity;
+    # authored messages still render chronologically above.
+    digest_rows = sorted(selected, key=lambda item: int(item[0]["id"])) if require_current_originals else selected
     digest = _prompt_source_digest(json.dumps(
-        [_conversation_prompt_row_snapshot(item[0]) for item in selected],
+        [_conversation_prompt_row_snapshot(item[0]) for item in digest_rows],
         ensure_ascii=False, separators=(",", ":"),
     ))
     basis = ConversationPromptSourceBasis(
@@ -29307,11 +29341,13 @@ def build_named_public_conversation_context(
             current_turn=False,
         ) for source, label, text, _line in selected),
     )
+    if read_status is not None:
+        read_status.update(status='available', source_rows=len(row_ids))
     logging.info(
         "named_public_conversation_context_loaded subject_count=%s selection=%s "
-        "query_terms=%s source_row_ids=%s chars=%s",
+        "query_terms=%s source_row_count=%s chars=%s",
         len(basis.participant_user_ids), "date" if selected_date else "topic" if query else "recent",
-        len(query_terms), json.dumps(row_ids), len(rendered),
+        len(query_terms), len(row_ids), len(rendered),
     )
     return rendered, basis
 
@@ -31582,6 +31618,7 @@ def _conversation_prompt_selected_digest(
     *,
     guild_id: int,
     source_row_ids: tuple[int, ...],
+    require_current_originals: bool = False,
 ) -> str:
     """Hash the current revisions of exact prompt sources, including deletes."""
     ids = tuple(
@@ -31590,11 +31627,12 @@ def _conversation_prompt_selected_digest(
     if not ids:
         return _prompt_source_digest("[]")
     placeholders = ",".join("?" for _ in ids)
-    has_message_id = "message_id" in _conversations_columns()
-    message_id_expr = (
-        "message_id" if has_message_id else "NULL AS message_id"
-    )
-    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+    connection = (_open_member_memory_read_connection() if require_current_originals
+                  else sqlite3.connect(DB_FILE))
+    with closing(connection) as conn, conn:
+        columns = ({str(row[1]) for row in conn.execute("PRAGMA main.table_info(conversations)")}
+                   if require_current_originals else _conversations_columns())
+        message_id_expr = "message_id" if "message_id" in columns else "NULL AS message_id"
         rows = conn.execute(
             f"""
             SELECT id, role, content, user_id, user_name, channel_id,
@@ -32455,6 +32493,7 @@ def refresh_prompt_source_basis(
     *,
     journal_control_snapshot: JournalControlSnapshot | None = None,
     journal_control_snapshot_provided: bool = False,
+    require_current_originals: bool = False,
 ) -> tuple[PromptSourceBasis, bool]:
     """Synchronously rebuild one source basis after any provider await."""
     if isinstance(basis, FinalizedShowPromptSourceBasis):
@@ -32657,6 +32696,7 @@ def refresh_prompt_source_basis(
         _conversation_prompt_selected_digest(
             guild_id=basis.guild_id,
             source_row_ids=tracked_conversation_row_ids,
+            require_current_originals=require_current_originals,
         )
         if tracked_conversation_row_ids
         else _conversation_prompt_candidate_digest(
@@ -32683,7 +32723,7 @@ def refresh_prompt_source_basis(
                     and (not basis.active_exchange or item.source_id in {
                         source.source_id for source in basis.referent_source_evidence_items
                     })
-                },
+                }, require_current_originals=require_current_originals,
             )
     fresh = replace(
         basis, expected_digest=fresh_digest,
@@ -38128,6 +38168,164 @@ def _song_control_request_sync(method="GET", payload=None):
     return json.loads(raw.decode("utf-8"))
 
 
+def _song_named_public_subjects(query):
+    """Use the current guild's public label owner without inventing a speaker."""
+    guild = client.get_guild(BNL_PRIMARY_GUILD_ID)
+    if guild is None or int(getattr(guild, 'id', 0) or 0) != BNL_PRIMARY_GUILD_ID:
+        return (), ''
+    named, unresolved = _named_public_member_subjects(guild, query)
+    named = named[:3]
+    digest = _prompt_source_digest(json.dumps(
+        (BNL_PRIMARY_GUILD_ID, named, unresolved), ensure_ascii=False, separators=(',', ':'),
+    ))
+    return named, digest
+
+
+def _song_named_public_chat_is_current(ref):
+    if (set(ref) != {'sourceKind', 'guildId', 'query', 'bindingDigest', 'sourceBasis'}
+            or ref['guildId'] != BNL_PRIMARY_GUILD_ID
+            or not isinstance(ref['query'], str) or len(ref['query']) > 6000):
+        return False
+    named, binding = _song_named_public_subjects(ref['query'])
+    if not named or binding != ref['bindingDigest']:
+        return False
+    value = ref['sourceBasis']
+    if value is None:
+        return True
+    if not isinstance(value, dict) or set(value) != {'expectedDigest', 'sourceRowIds', 'sourceUsers', 'controlDigest'}:
+        return False
+    if any(not isinstance(value[key], str) or not re.fullmatch(r'[a-f0-9]{64}', value[key])
+           for key in ('expectedDigest', 'controlDigest')):
+        return False
+    ids, users = value['sourceRowIds'], value['sourceUsers']
+    if (not isinstance(ids, (list, tuple)) or not 1 <= len(ids) <= 64
+            or any(type(row_id) is not int or row_id <= 0 for row_id in ids)
+            or len(set(ids)) != len(ids) or not isinstance(users, (list, tuple)) or len(users) != len(ids)):
+        return False
+    named_ids = {user_id for user_id, _label in named}
+    source_users = {}
+    for pair in users:
+        if (not isinstance(pair, (list, tuple)) or len(pair) != 2
+                or any(type(value) is not int or value <= 0 for value in pair)
+                or pair[0] in source_users or pair[1] not in named_ids):
+            return False
+        source_users[pair[0]] = pair[1]
+    if set(source_users) != set(ids):
+        return False
+    basis = ConversationPromptSourceBasis(
+        expected_digest=value['expectedDigest'], rendered_context='', guild_id=BNL_PRIMARY_GUILD_ID,
+        current_user_id=0, channel_id=0, channel_name='', channel_policy='public_home',
+        source_row_ids=tuple(ids), revalidation_row_ids=tuple(ids),
+        public_recall_control_digest=value['controlDigest'],
+        evidence_items=tuple(build_conversation_evidence_item(
+            text='', source_id=row_id, speaker_user_id=user_id, speaker_label='', current_turn=False,
+        ) for row_id, user_id in source_users.items()),
+    )
+    _fresh, changed = refresh_prompt_source_basis(basis, require_current_originals=True)
+    return not changed
+
+
+def _read_song_public_context(options, *, base=None):
+    """Reuse BNL's public memory and original conversation owners for songs."""
+    query = song_retrieval_query(options, base=base)
+    named, binding = _song_named_public_subjects(query)
+    context = read_song_context(DB_FILE, BNL_PRIMARY_GUILD_ID, options, base=base,
+        public_subjects=tuple((subject_key_for_user(user_id), label) for user_id, label in named))
+    named_status, named_rows = {'status': 'not_requested'}, 0
+    if named:
+        # Arrangement cues can resolve a public name, but never masquerade as
+        # the person's discussion topic or requested history date.
+        semantic = song_retrieval_query({key: options.get(key, '') for key in ('idea', 'revisionInstructions')})
+        history_query = semantic or ' '.join(label for _user_id, label in named)
+        frame = build_situation_frame_v1(
+            route_allowed=True, route_mode='normal_chat', conversation_surface='discord',
+            channel_policy='public_home', current_text=history_query,
+            subject_user_ids=tuple(user_id for user_id, _label in named),
+            subject_label_hints=tuple(label for _user_id, label in named), response_act='observe',
+        )
+        original_text, source = build_named_public_conversation_context(
+            situation_frame=frame, guild_id=BNL_PRIMARY_GUILD_ID, route_mode='normal_chat',
+            channel_policy='public_home', user_text=history_query,
+            require_current_originals=True, read_status=named_status,
+        )
+        if named_status['status'] == 'unavailable':
+            logging.info('song_public_context_unavailable named_subjects=%s named_status=unavailable', len(named))
+            raise SongFailure('CONTEXT_UNAVAILABLE')
+        source_basis = None
+        if source is not None:
+            named_rows = len(source.source_row_ids)
+            if named_rows > 64:
+                raise SongFailure('CONTEXT_UNAVAILABLE')
+            source_basis = {'expectedDigest': source.expected_digest, 'sourceRowIds': source.source_row_ids,
+                'sourceUsers': tuple((int(item.source_id), int(item.speaker_user_id)) for item in source.evidence_items),
+                'controlDigest': source.public_recall_control_digest}
+        context = SongContext(context.text + ('\n' + original_text if original_text else ''), context.basis + ({
+            'sourceKind': 'named_public_chat', 'guildId': BNL_PRIMARY_GUILD_ID,
+            'query': query, 'bindingDigest': binding, 'sourceBasis': source_basis,
+        },))
+    basis = {'guild_id': BNL_PRIMARY_GUILD_ID,
+             'ambient_source_window_end': datetime.now(timezone.utc).isoformat()}
+    rows = get_recent_guild_user_messages(BNL_PRIMARY_GUILD_ID, limit=24,
+                                         source_basis=basis, dated=True, require_current_originals=True)
+    lines, used = [], 0
+    for label, original in rows[-12:]:
+        if should_exclude_from_prompt_history('user', original):
+            continue
+        text = sanitize_history_text(original, limit=max(1, len(original)))
+        name = _safe_prompt_display_label(label, 'public participant')
+        if not text or len(text) > 1200:
+            continue
+        line = name + ': ' + text
+        if used + len(line) > 5000:
+            continue
+        lines.append(line)
+        used += len(line)
+    if lines:
+        context = SongContext(context.text + '\nRECENT ORIGINAL PUBLIC CONVERSATION (human-authored inspiration; '
+            'co-occurrence does not prove friendship or personal traits):\n' + '\n'.join(lines),
+            context.basis + ({'sourceKind': 'recent_public_chat', 'basis': basis},))
+    logging.info('song_public_context_assembled named_subjects=%s named_original_rows=%s named_status=%s source_counts=%s chars=%s',
+        len(named), named_rows, named_status['status'],
+        json.dumps(dict(Counter(ref['sourceKind'] for ref in context.basis)), sort_keys=True), len(context.text))
+    return context
+
+def _song_public_context_is_current(context):
+    """Keep the same original-source controls at generation, delivery and replay."""
+    other = []
+    try:
+        for ref in context.basis:
+            if ref.get('sourceKind') == 'named_public_chat':
+                if not _song_named_public_chat_is_current(ref):
+                    return False
+                continue
+            if ref.get('sourceKind') != 'recent_public_chat':
+                other.append(ref)
+                continue
+            if set(ref) != {'sourceKind', 'basis'}:
+                return False
+            value = ref['basis']
+            if (set(value) != {'guild_id', 'ambient_source_window_end', 'rows', 'recent_conversation_ids'}
+                    or value['guild_id'] != BNL_PRIMARY_GUILD_ID
+                    or set(value['rows']) != {'conversations'}):
+                return False
+            hashes = value['rows']['conversations']
+            if not isinstance(hashes, dict) or not 1 <= len(hashes) <= 24:
+                return False
+            # JSON receipts stringify integer map keys; restore only this known source family.
+            restored = {int(key): digest for key, digest in hashes.items()
+                        if str(key).isdigit() and int(key) > 0 and isinstance(digest, str)}
+            ids = value['recent_conversation_ids']
+            if (len(restored) != len(hashes) or not isinstance(ids, (list, tuple))
+                    or len(ids) > 24 or set(ids) != set(restored)):
+                return False
+            frozen = {**value, 'rows': {'conversations': restored}}
+            if not revalidate_ambient_local_sources(BNL_PRIMARY_GUILD_ID, frozen, require_current_originals=True):
+                return False
+        return song_context_is_current(DB_FILE, BNL_PRIMARY_GUILD_ID, SongContext('', tuple(other)))
+    except (TypeError, ValueError, KeyError, OSError, sqlite3.Error):
+        return False
+
+
 async def _run_song_control_cycle():
     """Use the existing heartbeat; isolate private song failures from Ballads/Journal."""
     try:
@@ -38152,9 +38350,12 @@ async def _run_song_control_cycle():
                 return SongGeneration(result.text, result.finish_reason)
 
             receipt = await execute_song_command(DB_FILE, BNL_PRIMARY_GUILD_ID, command,
-                generate=generate, context_reader=lambda options: read_song_context(DB_FILE, BNL_PRIMARY_GUILD_ID, options))
+                generate=generate, context_reader=lambda options: _read_song_public_context(
+                    options, base=None if command['kind'] == 'generate' else command['base']),
+                context_current=_song_public_context_is_current)
             if receipt is not None:
-                receipt = await prepare_song_delivery(DB_FILE, BNL_PRIMARY_GUILD_ID, command, receipt)
+                receipt = await prepare_song_delivery(DB_FILE, BNL_PRIMARY_GUILD_ID, command, receipt,
+                                                      context_current=_song_public_context_is_current)
                 await asyncio.to_thread(_song_control_request_sync, "POST", receipt)
     except Exception as exc:
         # Never log options, lyrics, provider messages, member identity or API keys.

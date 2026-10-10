@@ -696,15 +696,30 @@ complete Suno/songwriting protocol: sustained multisyllabic phrasing, coherent
 2–4-style blends, default 1970–2010 era, 1,400-character lyric minimum unless
 directed otherwise, and compact generated Style copy (250–400 characters,
 500 maximum). The existing final Style formatter supplies that ceiling without
-another model call. User edits remain intact during lyric-only regeneration.
-The existing 2,000-word lyric maximum and five-minute structure target remain.
+another model call. Lyric-only regeneration preserves the current title and
+Style; Style-only regeneration preserves the title and lyrics. The existing
+2,000-word lyric maximum and five-minute structure target remain.
 
 This workspace is freeform: directions can all be empty, no episode is required,
-and musical form serves the subject. Context uses the existing public canon/lore,
-source-revalidated public Moments, current original-backed retained show views,
-and up to twelve exact released Ballad references for subject/arrangement variety.
-Episode memories are optional inspiration; neither a recap nor a participant
-roll call is required. Released creative work is never evidence for a real event.
+and musical form serves the subject. All directions and bounded existing copy
+rank public retrieval without becoming evidence; arrangement-only requests
+retain broad recall. A new Generate does not inherit the previous song's subject.
+Public Moments retain their attributed contributions. The shared brain's existing
+current public Discord member-label resolver reaches explicitly requested people,
+and its named history reader supplies older whole original public messages.
+Duplicate names remain unresolved; current canon bindings retain their existing
+owner. Exact recorded subjects draw on governed public background and public
+conversation assessments without guessing platform aliases. Explicit people
+receive priority over incidental contributors within the same bounded retrieval.
+Current original-backed retained show views preserve historical queue/music
+facts, keeping artist credits, submitters, accepted tracks and confirmed plays
+distinct. Bounded recent original public Discord conversation also supplies
+current inspiration. The existing public canon/lore and up to twelve exact
+released Ballad references remain available for subject/arrangement variety.
+Relevant people and topics can connect naturally without a required cast or
+invented relationships, quotations or permanent traits. Neither a recap nor a
+participant roll call is required. Released creative work and generated copy
+are never evidence for a real event.
 Private producer feedback, unpublished Ballads, account data, personal memory
 and Relationship state are excluded. No separate memory/catalog or learning
 store is created, and private workspace lyrics never become factual memory.
