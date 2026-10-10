@@ -798,8 +798,19 @@ class TikTokCurrentWordCountRequestRegressionTests(unittest.TestCase):
             with self.subTest(query=query):
                 self.assertEqual(requested_tiktok_show_word_count(query), target)
                 self.assertTrue(is_tiktok_show_analysis_query(query))
-        self.assertEqual(requested_tiktok_show_word_count(
-            "What is the word count in TikTok chat?"), "")
+        for query in ("What is the word count in TikTok chat?", "My word count in TikTok chat"):
+            self.assertEqual(requested_tiktok_show_word_count(query), "")
+        active, older = self._active_show(), show("2026-09-25")
+        for query, target, session_id in (
+            ('"tonight" word count during the last stream', "tonight", older["sessionId"]),
+            ('"last" word count in the current stream', "last", active["sessionId"]),
+        ):
+            with self.subTest(literal_scope_word=target):
+                self.assertEqual(requested_tiktok_show_word_count(query), target)
+                selected, _source = select_show_for_tiktok_analysis({
+                    "currentShow": active, "latestShow": older,
+                }, query)
+                self.assertEqual(selected["sessionId"], session_id)
 
     def test_targetless_current_stream_correction_is_an_eligible_human_followup(self):
         self.assertTrue(is_tiktok_show_analysis_followup("Current stream not last stream"))
@@ -867,6 +878,30 @@ class TikTokCurrentWordCountRequestRegressionTests(unittest.TestCase):
         zero = count_tiktok_show_word_frequency(show(), records, "Count word goat in this stream")
         self.assertEqual((zero["status"], zero["capturedMessageCount"],
                           zero["occurrenceCount"]), ("complete", 11, 0))
+
+    def test_archived_count_requires_a_recorded_end_in_source_and_ledger(self):
+        start = stamp("2026-10-03T02:05:35.254Z")
+        records = [event(0, "quiet", start)]
+        query = "Count word butt in this stream"
+        for archive_end in (None, "not-a-recorded-time", False):
+            selected = show()
+            selected["milestones"] = [selected["milestones"][0], {
+                "eventType": "track_loaded", "occurredAt": "2026-10-03T03:00:00Z",
+            }]
+            if archive_end is not None:
+                selected["milestones"].append({
+                    "eventType": "session_archived", "occurredAt": archive_end,
+                })
+            selected["_evidenceObservedThroughMs"] = stamp("2026-10-03T08:10:00Z")
+            for source in (selected, build_tiktok_show_evidence_ledger(selected, records)):
+                with self.subTest(archive_end=archive_end, ledger="lifecycle" in source):
+                    result = count_tiktok_show_word_frequency(source, records, query)
+                    self.assertEqual(result["status"], "unavailable")
+                    self.assertIsNone(result["windowEndMs"])
+                    self.assertIsNone(result["occurrenceCount"])
+                    self.assertNotIn("occurrenceCount=0", render_tiktok_show_word_frequency(result))
+        verified = count_tiktok_show_word_frequency(show(), records, query)
+        self.assertEqual((verified["status"], verified["occurrenceCount"]), ("complete", 0))
 
     def test_unavailable_count_prompt_keeps_the_requested_word_and_episode(self):
         result = count_tiktok_show_word_frequency(show(), None, "Count word butt in this stream")

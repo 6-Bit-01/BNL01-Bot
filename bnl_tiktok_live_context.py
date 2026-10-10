@@ -199,6 +199,8 @@ _SHOW_ANALYSIS_PATTERNS = (
 )
 
 _SHOW_ANALYSIS_FOLLOWUP_PATTERNS = (
+    r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
+    r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b",
     r"\b(?:quote|cite)\b.{0,80}\b(?:comments?|words?|messages?)\b",
     r"\b(?:mood|tone|atmosphere|vibes?|sentiment)\b",
     r"\b(?:you|anyone|people|they)\b.{0,35}\b(?:feel|felt|notice|noticed|sense|sensed)\b"
@@ -717,6 +719,20 @@ def _tiktok_show_word_count_targets(user_text: str) -> list[tuple[int, int, str]
         ("count", r"\bcount(?:ed)?\s+"),
     )
     targets = []
+    for match in re.finditer(literal + r"\s+word\s+count\b", query, re.I):
+        if any(start < match.start() < end for start, end in quoted_spans):
+            continue
+        group = next((index for index in (1, 2, 3) if match.group(index) is not None), None)
+        if group is None:
+            continue
+        word = match.group(group).strip().casefold()
+        if not word or (group == 3 and word in {
+            "the", "a", "an", "what", "which", "total", "whole", "entire", "full",
+            "is", "its", "this", "that", "my", "our", "your", "his", "her", "their",
+            "chat", "show", "stream", "tiktok",
+        }):
+            continue
+        targets.append((*match.span(group), word))
     for kind, prefix in prefixes:
         for match in re.finditer(prefix + literal, query, re.I):
             if any(start <= match.start() < end for start, end in quoted_spans):
@@ -807,6 +823,14 @@ def _tiktok_word_frequency_target_inert_query(user_text: str) -> str:
     return query
 
 
+_TIKTOK_WORD_FREQUENCY_CURRENT_SCOPE_RE = re.compile(
+    r"\b(?:now|currently|right now|today|tonight|this evening)\b|"
+    r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
+    r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b",
+    re.I,
+)
+
+
 def _tiktok_word_frequency_scope_query(user_text: str) -> str:
     """Keep the word inert while the latest explicit human episode scope wins."""
     query = _tiktok_word_frequency_target_inert_query(user_text)
@@ -821,12 +845,53 @@ def _tiktok_word_frequency_scope_query(user_text: str) -> str:
             current, re.I,
         )
     ):
-        return current
-    return query
+        query = current
+    affirmative_scope = re.sub(
+        r"\b(?:not|rather than|instead of)\s+(?:the\s+)?"
+        r"(?:(?:last|latest|previous|prior|past|current|this)\s+"
+        r"(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
+        r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)|"
+        r"last night|yesterday|tonight|today|this evening|right now|currently|now)\b",
+        " ", query, flags=re.I,
+    )
+    # An affirmative current scope owns this count. A negated historical
+    # selector cannot send its target back to the previous finalized stream.
+    return (affirmative_scope
+            if _TIKTOK_WORD_FREQUENCY_CURRENT_SCOPE_RE.search(affirmative_scope)
+            else query)
 
 
 def tiktok_show_word_frequency_bounds_ms(show: Any) -> Tuple[Optional[int], Optional[int]]:
     """Count within recorded session/intake bounds without moving the broadcast clock."""
+    recorded_archive_end = None
+    if isinstance(show, Mapping) and (
+        _show_has_archive_boundary(show)
+        or str(show.get("lifecycle") or "").casefold() == "finalized"
+    ):
+        finalized = str(show.get("lifecycle") or "").casefold() == "finalized"
+        field = "operationalEvents" if finalized and "operationalEvents" in show else "milestones"
+        events = show.get(field)
+        archive_ends = []
+        for event in events if isinstance(events, (list, tuple)) else ():
+            if not isinstance(event, Mapping) or event.get("eventType") != "session_archived":
+                continue
+            if field == "milestones":
+                timestamp = _iso_epoch_ms(event.get("occurredAt"))
+            else:
+                value = event.get("occurredAtMs")
+                try:
+                    timestamp = None if isinstance(value, bool) else int(value)
+                except (TypeError, ValueError, OverflowError):
+                    timestamp = None
+            if timestamp is not None and timestamp > 0:
+                archive_ends.append(timestamp)
+        if archive_ends:
+            recorded_archive_end = max(archive_ends)
+        elif not (finalized and "milestones" not in show and "operationalEvents" not in show):
+            # Archived status is not a recorded endpoint. A retained ledger's
+            # operational events also prevent laundering a last-track fallback
+            # into a complete count via its numeric endedAtMs projection.
+            return None, None
     start_ms, end_ms = show_timeline_bounds_ms(show)
     if not isinstance(show, Mapping):
         return start_ms, end_ms
@@ -838,6 +903,8 @@ def tiktok_show_word_frequency_bounds_ms(show: Any) -> Tuple[Optional[int], Opti
             start_ms, end_ms = map(int, values)
         except (KeyError, TypeError, ValueError, OverflowError):
             return None, None
+    if recorded_archive_end is not None:
+        end_ms = recorded_archive_end
     recorded_starts = [start_ms]
     for field in ("milestones", "operationalEvents"):
         events = show.get(field)
@@ -868,12 +935,7 @@ def tiktok_show_word_frequency_current_requested(user_text: str) -> bool:
     query = _tiktok_word_frequency_scope_query(user_text)
     if has_explicit_show_date(query) or requested_recent_show_count(query) is not None:
         return False
-    return bool(re.search(
-        r"\b(?:now|currently|right now)\b|"
-        r"\b(?:current|this)\s+(?:(?:private|public)\s+)?(?:(?:tiktok|tik tok)\s+)?"
-        r"(?:rehearsal|shows?|broadcasts?|sessions?|streams?|lives?|episodes?)\b",
-        query, re.I,
-    ))
+    return bool(_TIKTOK_WORD_FREQUENCY_CURRENT_SCOPE_RE.search(query))
 
 
 def count_tiktok_show_word_frequency(
@@ -1072,7 +1134,8 @@ def render_tiktok_show_word_frequency(result: Mapping[str, Any]) -> str:
         lines.append("- Speaker total measures distinct captured chat identity keys, using the source-owned subject reference and existing speaker-key fallback. This does not infer unique people or merge accounts.")
         lines.append("- Answer with these measured totals for this selected stream. Counts cover captured originals; they do not certify receipt of every platform event.")
     else:
-        lines.append("- No exact word total is available for this incomplete source window. Do not report zero or substitute a rolling live buffer, an older show, selected excerpts, or a previous BNL answer.")
+        lines.append("- Word %s: no exact total is available for this incomplete source window. Do not report zero or substitute a rolling live buffer, an older show, selected excerpts, or a previous BNL answer."
+                     % json.dumps(result.get("word")))
     return "\n".join(lines)
 
 
@@ -3732,6 +3795,10 @@ def build_durable_show_prompt_context(
     intent = classify_tiktok_show_analysis_intent(user_text)
     show, source_key = select_show_for_tiktok_analysis(archive, user_text)
     if not show:
+        frequency = count_tiktok_show_word_frequency({}, None, user_text)
+        if frequency is not None:
+            frequency.update(showKey="", reason="selected_episode_unavailable")
+            return "Durable TikTok show analysis context:\n" + render_tiktok_show_word_frequency(frequency)
         available_dates = sorted({str(item.get("showDate") or "")
                                   for item in tiktok_show_records(archive) if item.get("showDate")})
         return (

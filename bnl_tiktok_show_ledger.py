@@ -30,6 +30,7 @@ from bnl_canon_source_contract import (
     public_show_evidence_archive,
     show_queue_evidence_authorization,
     show_queue_evidence_authorization_receipt_valid,
+    website_queue_access_scope,
 )
 from bnl_memory_ledger import (
     LINEAGE_TYPES,
@@ -445,6 +446,100 @@ def _seal_authorized_show_ledger(
     sealed["sourceAuthorization"] = dict(authorization_receipt)
     sealed["sourceDigest"] = _canonical_digest(sealed)
     return _safe_document(sealed)
+
+
+def build_tiktok_show_word_frequency_source(
+    read_model: Mapping[str, Any], show: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Carry one native public episode through the existing source seal."""
+    authorization = show_queue_evidence_authorization(dict(read_model))
+    if not authorization.get("usable"):
+        return None
+    session_id = str(show.get("sessionId") or "").strip()
+    aliases = {str(show.get(field) or "").strip()
+               for field in ("sessionId", "showSessionId") if field in show}
+    sections = read_model.get("sections") or {}
+    queue = sections.get("queue") or read_model.get("queue") or {}
+    session = queue.get("session") or queue.get("currentSession") or {}
+    queue_aliases = {str(session.get(field) or "").strip()
+                     for field in ("sessionId", "id") if field in session}
+    if (not session_id or aliases != {session_id} or queue_aliases != {session_id}
+            or queue.get("available") is not True or queue.get("reason") not in (None, "")
+            or website_queue_access_scope(dict(read_model)) != "public"
+            or (session.get("showDate") and session.get("showDate") != show.get("showDate"))
+            or (not _show_has_archive_boundary(show)
+                and str(session.get("broadcastPhase") or session.get("phase") or "").lower()
+                    not in {"live", "broadcast_active"})):
+        return None
+    expected = {key: value for key, value in show.items()
+                if key != "_evidenceObservedThroughMs"}
+    authorized = any(
+        {key: value for key, value in candidate.items()
+         if key != "_evidenceObservedThroughMs"} == expected
+        for candidate in tiktok_show_records(public_show_evidence_archive(dict(read_model)))
+    )
+    if not authorized:
+        # A private transient queue record cannot acquire a public source seal.
+        return None
+    ledger = build_tiktok_show_evidence_ledger(show, [])
+    if not ledger:
+        return None
+    for field in ("sessionId", "showSessionId", "roomId", "milestones",
+                  "_evidenceObservedThroughMs"):
+        if field in show:
+            ledger[field] = json.loads(json.dumps(show[field]))
+    return _seal_authorized_show_ledger(ledger, authorization["receipt"])
+
+
+def refresh_tiktok_show_word_frequency_source(
+    read_model: Mapping[str, Any], source: Mapping[str, Any], *,
+    observed_through_ms: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Validate fresh public authority while retaining the frozen count window."""
+    frozen = _safe_document(source)
+    authorization = show_queue_evidence_authorization(dict(read_model))
+    if frozen is None or not authorization.get("usable"):
+        return None
+    session_id = str(frozen.get("sessionId") or "").strip()
+    selected = next((show for show in tiktok_show_records(
+        public_show_evidence_archive(dict(read_model))
+    ) if str(show.get("sessionId") or "").strip() == session_id), None)
+    if selected is None or selected.get("showDate") != frozen.get("showDate"):
+        return None
+    aliases = {str(selected.get(field) or "").strip()
+               for field in ("sessionId", "showSessionId") if field in selected}
+    if aliases != {session_id} or str(selected.get("roomId") or "") != str(frozen.get("roomId") or ""):
+        return None
+    sections = read_model.get("sections") or {}
+    queue = sections.get("queue") or read_model.get("queue") or {}
+    session = queue.get("session") or queue.get("currentSession") or {}
+    queue_aliases = {str(session.get(field) or "").strip()
+                     for field in ("sessionId", "id") if field in session}
+    if (queue.get("available") is not True or queue.get("reason") not in (None, "")
+            or queue_aliases != {session_id} or website_queue_access_scope(dict(read_model)) != "public"
+            or (session.get("showDate") and session.get("showDate") != frozen.get("showDate"))):
+        return None
+    fresh_archived = _show_has_archive_boundary(selected)
+    if _show_has_archive_boundary(frozen) and not fresh_archived:
+        return None
+    if not fresh_archived:
+        if (str(session.get("broadcastPhase") or session.get("phase") or "").lower() not in {"live", "broadcast_active"}
+                or isinstance(observed_through_ms, bool)
+                or not isinstance(observed_through_ms, int) or observed_through_ms <= 0):
+            return None
+        selected = {**selected, "_evidenceObservedThroughMs": observed_through_ms}
+    frozen_start, frozen_end = tiktok_show_word_frequency_bounds_ms(frozen)
+    fresh_start, fresh_end = tiktok_show_word_frequency_bounds_ms(selected)
+    if (fresh_start != frozen_start or frozen_start is None or frozen_end is None
+            or fresh_end is None or fresh_end < frozen_end
+            or (not fresh_archived and fresh_end > observed_through_ms)
+            or (_show_has_archive_boundary(frozen) and fresh_end != frozen_end)):
+        return None
+    # A newly archived version validates the same episode; it cannot extend
+    # the active generation's cutoff or admit later originals.
+    return _seal_authorized_show_ledger(
+        frozen, authorization["receipt"], prior_ledger=frozen,
+    )
 
 
 def _context_digest(*values: Any) -> str:
@@ -4567,6 +4662,7 @@ def select_tiktok_show_episode_context_items(
     now: Any = None,
     max_shows: int = 8,
     artist_labels: tuple[str, ...] = (),
+    selected_show_keys: tuple[str, ...] = (),
 ) -> tuple[TikTokShowEpisodeContextItem, ...]:
     """Select compact show evidence for the existing intelligence packet.
 
@@ -4586,6 +4682,10 @@ def select_tiktok_show_episode_context_items(
         )
     except (sqlite3.DatabaseError, TypeError, ValueError):
         return ()
+    if selected_show_keys:
+        loaded = [row for row in loaded if row.get("showKey") in selected_show_keys]
+        if not loaded:
+            return ()
     if music_submission_history_requested(user_text) and (artist_labels or self_public_activity_requested(user_text)):
         text, selected = _artist_submission_history_view(
             [row["ledger"] for row in loaded], user_text=user_text,
@@ -4604,7 +4704,7 @@ def select_tiktok_show_episode_context_items(
                        if requested_tiktok_show_word_count(user_text) else user_text)
     # A finalized-only reader cannot answer an undated active-episode count.
     # A current human date or exact recorded key can still request that root.
-    if tiktok_show_word_frequency_current_requested(user_text) and not any(
+    if tiktok_show_word_frequency_current_requested(user_text) and not selected_show_keys and not any(
         row.get("showKey") and re.search(
             r"(?<![\w-])" + re.escape(str(row["showKey"])) + r"(?![\w-])", frequency_scope,
         ) for row in loaded
@@ -4804,6 +4904,7 @@ def tiktok_show_episode_context_item_versions(
     subject_user_id: int, allow_subject_continuity: bool = False,
     now: Any = None,
     artist_labels: tuple[str, ...] = (),
+    selected_show_keys: tuple[str, ...] = (),
 ) -> dict[str, str]:
     """Rebuild linked show views together within the caller's fresh snapshot."""
 
@@ -4815,6 +4916,7 @@ def tiktok_show_episode_context_item_versions(
         allow_subject_continuity=allow_subject_continuity,
         now=now,
         artist_labels=artist_labels,
+        selected_show_keys=selected_show_keys,
     )
     return {item.source_ref: item.source_digest for item in items}
 
@@ -4953,7 +5055,7 @@ def _lookup_tiktok_show_word_frequency(
     """Reuse the fresh original reader under an already selected episode root."""
     diagnostics: dict[str, Any] = {}
     try:
-        show = {**ledger, "milestones": [
+        show = ledger if "milestones" in ledger else {**ledger, "milestones": [
             {"eventType": "broadcast_started",
              "occurredAt": _utc_iso_from_ms(int(ledger["startedAtMs"]))},
             {"eventType": "session_archived",
@@ -5098,8 +5200,9 @@ def build_tiktok_show_evidence_context(
     selection_out: Optional[dict] = None,
     image_queries: tuple[CurrentImageShowQuery, ...] = (),
     artist_labels: tuple[str, ...] = (),
+    word_frequency_show: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    """Render relevant finalized BARCODE show memory for ordinary conversation."""
+    """Render relevant BARCODE show memory through its existing source owner."""
 
     if selection_out is not None:
         selection_out.clear()
@@ -5111,6 +5214,34 @@ def build_tiktok_show_evidence_context(
             f"- Original chat records were not searched: {reason}."]
         ) if image_query_lines else ""
 
+    if word_frequency_show is not None:
+        # This transient native source was selected and publicly sealed by the
+        # website owner. Never enter finalized SQL/date ranking for this count,
+        # including when that supplied source has become unusable.
+        ledger = _safe_document(word_frequency_show)
+        if ledger is None or not requested_tiktok_show_word_count(user_text) or int(guild_id or 0) <= 0:
+            frequency = count_tiktok_show_word_frequency({}, None, user_text)
+            if frequency is None:
+                return unavailable_context("the selected native episode is unavailable")
+            frequency.update(showKey="", reason="native_source_unavailable")
+            if selection_out is not None:
+                selection_out.update(
+                    user_text=user_text, selection_user_text=user_text, candidate_context=False,
+                    source_refs=(), authored_excerpts=(), word_frequency_lookup=(frequency,),
+                    word_frequency_show={},
+                )
+            return "Durable BARCODE Radio show episode memory:\n" + render_tiktok_show_word_frequency(frequency)
+        frequency = _lookup_tiktok_show_word_frequency(
+            db_file, guild_id=guild_id, ledger=ledger, user_text=user_text,
+        )
+        if selection_out is not None:
+            selection_out.update(
+                user_text=user_text, selection_user_text=user_text, candidate_context=False,
+                source_refs=((ledger["showKey"], ledger["sourceDigest"]),),
+                word_frequency_lookup=(frequency,), word_frequency_show=ledger,
+                authored_excerpts=(),
+            )
+        return "Durable BARCODE Radio show episode memory:\n" + render_tiktok_show_word_frequency(frequency)
     if image_queries:
         current_human_dates = requested_show_dates(user_text)
         if (

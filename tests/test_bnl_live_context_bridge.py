@@ -1247,18 +1247,26 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
             ("2026-10-03T08:10:00Z", True),
         ):
             self.observed_at = datetime.fromisoformat(instant.replace("Z", "+00:00"))
-            for question, word in (
-                ("BNL butt word count. Tonight’s show. Go", "butt"),
-                ("BNL butts word count. Tonight’s show. Go", "butts"),
-                ("Count butt in the current TikTok stream", "butt"),
-            ):
-                with self.subTest(instant=instant, archived=archived, question=question):
-                    context, selected, rendered = self._tonight_word_count_context(
-                        question, model=self._tonight_native_session_model(archived=archived),
-                    )
-                    self._assert_tonight_word_count(
-                        context, selected, rendered, word=word, archived=archived,
-                    )
+            for identity_shape in ("legacy", "canonical_only", "equal_aliases"):
+                model = self._tonight_native_session_model(archived=archived)
+                session = model["sections"]["queue"]["session"]
+                if identity_shape != "legacy":
+                    session["sessionId"] = self.current["sessionId"]
+                if identity_shape == "canonical_only":
+                    session.pop("id")
+                for question, word in (
+                    ("BNL butt word count. Tonight's show. Go", "butt"),
+                    ("BNL butts word count. Tonight's show. Go", "butts"),
+                    ("Count butt in the current TikTok stream", "butt"),
+                ):
+                    with self.subTest(instant=instant, archived=archived,
+                                      identity_shape=identity_shape, question=question):
+                        context, selected, rendered = self._tonight_word_count_context(
+                            question, model=model,
+                        )
+                        self._assert_tonight_word_count(
+                            context, selected, rendered, word=word, archived=archived,
+                        )
 
     def test_same_user_current_stream_correction_retains_word_across_archival(self):
         self._seed_tonight_word_count_originals()
@@ -1290,7 +1298,8 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
         self._seed_tonight_word_count_originals()
         self.observed_at = datetime(2026, 10, 3, 8, 10, tzinfo=timezone.utc)
         for archived in (False, True):
-            for failure in ("missing", "stale", "mismatched", "conflicting_alias"):
+            for failure in ("missing", "stale", "mismatched", "conflicting_alias",
+                            "canonical_correct_legacy_wrong"):
                 for question in (
                     "BNL butt word count. Tonight’s show. Go",
                     "Count butt in the current TikTok stream",
@@ -1304,8 +1313,12 @@ class BnlShowWordFrequencyIntegrationTests(unittest.TestCase):
                             queue.update(available=False, reason="stale")
                         elif failure == "mismatched":
                             queue["session"]["id"] = "unmatched-current-session"
-                        else:
+                        elif failure == "conflicting_alias":
                             queue["session"]["sessionId"] = self.latest["sessionId"]
+                        else:
+                            queue["session"].update(
+                                sessionId=self.current["sessionId"], id=self.latest["sessionId"],
+                            )
                         context, _selected, rendered = self._tonight_word_count_context(
                             question, model=model,
                         )

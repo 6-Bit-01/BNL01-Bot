@@ -60,6 +60,8 @@ from bnl_tiktok_live_context import (
     relative_prior_show_requested,
     requested_history_window,
     requested_tiktok_show_word_count,
+    tiktok_show_word_frequency_current_requested,
+    _show_has_archive_boundary,
     select_show_for_tiktok_analysis,
     show_conversation_interval_requested,
     tiktok_show_evidence_key,
@@ -75,6 +77,8 @@ from bnl_tiktok_show_ledger import (
     TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT,
     broad_show_history_requested,
     build_tiktok_show_evidence_context,
+    build_tiktok_show_word_frequency_source,
+    refresh_tiktok_show_word_frequency_source,
     ensure_tiktok_show_evidence_schema,
     load_tiktok_show_source_events,
     load_show_timeline_discord_messages,
@@ -3130,6 +3134,9 @@ class WebsiteReadModelContext(str):
         show_awareness_only: bool = False,
         continuation_show_dates: tuple[str, ...] = (),
         show_selection_dates: tuple[str, ...] = (),
+        show_selection_text: str = "",
+        word_frequency_show: dict | None = None,
+        word_frequency_channel_policy: str = "unknown",
     ):
         context = super().__new__(cls, text)
         context.rendered_lines = rendered_lines
@@ -3137,6 +3144,9 @@ class WebsiteReadModelContext(str):
         context.show_awareness_only = show_awareness_only
         context.continuation_show_dates = continuation_show_dates
         context.show_selection_dates = show_selection_dates
+        context.show_selection_text = show_selection_text
+        context.word_frequency_show = word_frequency_show
+        context.word_frequency_channel_policy = word_frequency_channel_policy
         return context
 
     def for_original_quote_lookup(self, show_keys, *, current_images: bool = False) -> str:
@@ -3165,6 +3175,11 @@ def build_bnl_read_model_context(
 ) -> str:
     """Build a compact prompt block from the channel-authorized read model."""
 
+    source_read_model = read_model
+    count_request = tiktok_show_analysis_request or user_text
+    native_current_count = tiktok_show_word_frequency_current_requested(count_request)
+    native_count_identity_valid = False
+    word_frequency_show = {} if native_current_count else None
     declared_access_scope = website_queue_access_scope(read_model)
     independent_history = "publicHistory" in _read_model_sections(read_model)
     public_archive = public_show_evidence_archive(read_model) if independent_history else {}
@@ -3207,9 +3222,15 @@ def build_bnl_read_model_context(
         current_show = _first_mapping(archive.get("currentShow"))
         session = _first_mapping(queue.get("session"), queue.get("currentSession"))
         current_id = str(current_show.get("sessionId") or "")
-        session_id = str(session.get("id") or session.get("sessionId") or "")
+        session_aliases = {str(session.get(field) or "").strip()
+                           for field in ("sessionId", "id") if field in session}
+        count_queue_valid = bool(
+            queue.get("available") is True and queue.get("reason") in (None, "")
+            and len(session_aliases) == 1 and "" not in session_aliases
+        )
+        session_id = (next(iter(session_aliases)) if count_queue_valid else "") if requested_tiktok_show_word_count(count_request) else str(session.get("id") or session.get("sessionId") or "")
         if (current_id and current_id == session_id
-                and str(session.get("broadcastPhase") or "").lower() in {"live", "broadcast_active"}
+                and str(session.get("broadcastPhase") or session.get("phase") or "").lower() in {"live", "broadcast_active"}
                 and current_show.get("status") != "archived"
                 and _bnl_read_model_cached_at is not None):
             # Freeze one read's live boundary before loading its source rows.
@@ -3222,6 +3243,33 @@ def build_bnl_read_model_context(
                 public_archive = {**public_archive, "currentShow": {
                     **public_current, "_evidenceObservedThroughMs": int(_bnl_read_model_cached_at.timestamp() * 1000),
                 }}
+        if native_current_count:
+            count_archive = (
+                archive if declared_access_scope == "private" and private_queue_allowed
+                else public_archive if independent_history else archive
+            )
+            selected = next((show for show in tiktok_show_records(count_archive)
+                             if count_queue_valid and str(show.get("sessionId") or "").strip() == session_id), None)
+            native_count_identity_valid = selected is not None
+            if selected is not None:
+                # The canonical session owns tonight across midnight and its
+                # immediate archival. No date/latest-show selector may replace it.
+                selected = dict(selected)
+                if (not _show_has_archive_boundary(selected)
+                        and str(session.get("broadcastPhase") or session.get("phase") or "").lower() in {"live", "broadcast_active"}
+                        and _bnl_read_model_cached_at is not None):
+                    selected["_evidenceObservedThroughMs"] = int(_bnl_read_model_cached_at.timestamp() * 1000)
+                archive = {"currentShow": selected}
+                if declared_access_scope != "private" or not private_queue_allowed:
+                    public_archive = {"currentShow": selected}
+                elif independent_history:
+                    public_archive = {}
+            else:
+                # Keep a known active record only as unavailable scope. Incoming
+                # cutoffs were removed, so it cannot certify any measured total.
+                archive = {"currentShow": current_show} if current_show and not _show_has_archive_boundary(current_show) else {}
+                public_current = _first_mapping(public_archive.get("currentShow"))
+                public_archive = {"currentShow": public_current} if public_current and not _show_has_archive_boundary(public_current) else {}
     preparation_context = ""
     if show_preparation_requested(user_text) and (public_archive or declared_access_scope == "public"):
         preparation_archive = public_archive if independent_history else archive
@@ -3646,6 +3694,10 @@ def build_bnl_read_model_context(
                     durable_events = _load_durable_tiktok_show_events(
                         scoped_archive, show_analysis_text,
                     )
+                    if native_current_count and native_count_identity_valid and selected_show:
+                        word_frequency_show = build_tiktok_show_word_frequency_source(
+                            source_read_model, selected_show,
+                        ) or {}
                     if day:
                         lines.append(f"\nRequested show date: {day}")
                     discord_interval_args = {}
@@ -3824,6 +3876,9 @@ def build_bnl_read_model_context(
             prior_queue_request, available_show_dates=available_show_dates,
         ),
         show_selection_dates=tuple(dict.fromkeys(show_selection_dates)),
+        show_selection_text=show_analysis_text if requested_tiktok_show_word_count(show_analysis_text) else "",
+        word_frequency_show=word_frequency_show,
+        word_frequency_channel_policy=channel_policy,
     )
 
 
@@ -3839,15 +3894,19 @@ def build_light_show_awareness(read_model: dict, channel_policy: str) -> str:
     if website_queue_access_scope(public_model) != "public":
         return ""
     queue = _website_read_model_queue(public_model)
+    if queue.get("available") is False:
+        return ""
     session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+    session_id = session.get("sessionId") or session.get("id")
     phase = str(session.get("broadcastPhase") or session.get("phase") or "").lower()
-    if (not session.get("id") or session.get("status") not in {"prepared", "open", "closed"}
+    if (not session_id or session.get("status") not in {"prepared", "open", "closed"}
             or phase not in {"warmup", "submission_window", "broadcast_active", "live"}):
         return ""
+    session = {**session, "sessionId": session_id}
     lines = [
         "Current public BARCODE show context (temporary):",
         "- " + "; ".join(f"{key}={_compact_public_text(session.get(key), 100)}"
-                          for key in ("id", "title", "showDate", "status", "broadcastPhase")
+                          for key in ("sessionId", "title", "showDate", "status", "broadcastPhase")
                           if session.get(key) is not None),
         "- Use this show as a possible referent for ambiguous show-room conversation. "
         "Explicit subjects, another date, topic changes and corrections take precedence. "
@@ -4309,6 +4368,21 @@ def build_tiktok_show_evidence_context_for_turn(
         )
         if count_request and requested_tiktok_show_word_count(count_request):
             tiktok_show_evidence_query = count_request
+    native_count_source = getattr(website_read_model_context, "word_frequency_show", None)
+    native_count_request = getattr(website_read_model_context, "show_selection_text", "")
+    if native_count_source is not None and requested_tiktok_show_word_count(native_count_request) and not image_queries:
+        context = build_tiktok_show_evidence_context(
+            DB_FILE, guild_id=guild_id, user_text=native_count_request,
+            subject_user_id=selected_subject_user_id, selection_out=selection_out,
+            word_frequency_show=native_count_source,
+        )
+        if selection_out is not None and context:
+            selection_out.update(
+                subject_user_id=selected_subject_user_id, user_text=native_count_request,
+                word_frequency_channel_policy=getattr(website_read_model_context, "word_frequency_channel_policy", "unknown"),
+                word_frequency_source_scope=_bnl_read_model_source_scope(BNL_READ_MODEL_URL, BNL_API_KEY),
+            )
+        return context
     request_owns_show_date = bool(
         has_explicit_show_date(tiktok_show_evidence_query)
         or requested_show_date(
@@ -29339,6 +29413,9 @@ class FinalizedShowPromptSourceBasis:
     authored_excerpts: tuple[FinalizedShowAuthoredExcerpt, ...] = ()
     image_queries: tuple[CurrentImageShowQuery, ...] = ()
     artist_identity_request: IntelligencePacketRequest | None = None
+    word_frequency_show: dict | None = None
+    word_frequency_channel_policy: str = "unknown"
+    word_frequency_source_scope: tuple = ()
 
 
 def _finalized_show_basis_digest(
@@ -29416,6 +29493,9 @@ def build_finalized_show_prompt_source_basis(
         authored_excerpts=authored_excerpts,
         image_queries=tuple(selection.get("image_queries") or ()),
         artist_identity_request=selection.get("artist_identity_request"),
+        word_frequency_show=selection.get("word_frequency_show"),
+        word_frequency_channel_policy=str(selection.get("word_frequency_channel_policy") or "unknown"),
+        word_frequency_source_scope=tuple(selection.get("word_frequency_source_scope") or ()),
     )
 
 
@@ -30487,6 +30567,8 @@ def _build_unified_intelligence_packet_shadow(
     show_episode_dates: tuple[str, ...] = (),
     show_episode_selection_text: str = "",
     show_episode_artist_request: IntelligencePacketRequest | None = None,
+    show_episode_keys: tuple[str, ...] = (),
+    show_episode_word_frequency_show: dict | None = None,
     situation_frame: SituationFrameV1 | None = None,
 ) -> UnifiedIntelligencePacket | None:
     """Build and persist one packet receipt without exposing it to the prompt."""
@@ -30650,6 +30732,8 @@ def _build_unified_intelligence_packet_shadow(
         show_episode_dates=show_episode_dates,
         show_episode_selection_text=show_episode_selection_text,
         show_episode_artist_request=show_episode_artist_request,
+        show_episode_keys=show_episode_keys,
+        show_episode_word_frequency_show=show_episode_word_frequency_show,
         participant_user_ids=participants,
         direct_state="direct" if current_direct else "indirect",
         conversation_evidence=evidence,
@@ -30796,6 +30880,8 @@ def build_unified_response_assessment_shadow(
     show_state_present: bool = False,
     website_read_model_present: bool = False,
     show_episode_dates: tuple[str, ...] = (),
+    show_episode_selection_text: str = "",
+    show_episode_word_frequency_show: dict | None = None,
     source_context_present: bool = False,
     source_context_snapshot: str = "",
     packet_source_context_authorized: bool | None = None,
@@ -30956,9 +31042,20 @@ def build_unified_response_assessment_shadow(
         ),
         show_episode_dates=show_episode_dates,
         show_episode_selection_text=next((
-            basis.selection_user_text for basis in prompt_source_bases
+            basis.user_text if requested_tiktok_show_word_count(basis.user_text) else basis.selection_user_text
+            for basis in prompt_source_bases
             if isinstance(basis, FinalizedShowPromptSourceBasis)
-        ), ""),
+        ), show_episode_selection_text),
+        show_episode_keys=next((
+            basis.show_keys for basis in prompt_source_bases
+            if isinstance(basis, FinalizedShowPromptSourceBasis)
+            and requested_tiktok_show_word_count(basis.user_text)
+        ), ()),
+        show_episode_word_frequency_show=next((
+            basis.word_frequency_show for basis in prompt_source_bases
+            if isinstance(basis, FinalizedShowPromptSourceBasis)
+            and basis.word_frequency_show is not None
+        ), show_episode_word_frequency_show),
         show_episode_artist_request=next((
             basis.artist_identity_request for basis in prompt_source_bases
             if isinstance(basis, FinalizedShowPromptSourceBasis)
@@ -32454,6 +32551,31 @@ def refresh_prompt_source_basis(
     """Synchronously rebuild one source basis after any provider await."""
     if isinstance(basis, FinalizedShowPromptSourceBasis):
         selection: dict = {}
+        native_source = basis.word_frequency_show
+        if native_source is not None:
+            native_source = {}
+            if (
+                env_queue_production_enabled()
+                and basis.word_frequency_channel_policy in PUBLIC_CHAT_POLICIES | {"sealed_test"}
+                and basis.word_frequency_source_scope == _bnl_read_model_source_scope(BNL_READ_MODEL_URL, BNL_API_KEY)
+            ):
+                fresh_model = fetch_bnl_read_model(force=True)
+                safe_model = safe_bnl_read_model_for_consumption(
+                    fresh_model, basis.word_frequency_channel_policy,
+                )
+                fresh_queue = _first_mapping(_read_model_sections(safe_model).get("queue"), safe_model.get("queue"))
+                fresh_session = _first_mapping(fresh_queue.get("session"), fresh_queue.get("currentSession"))
+                aliases = {str(fresh_session.get(field) or "").strip()
+                           for field in ("sessionId", "id") if field in fresh_session}
+                if (fresh_queue.get("available") is True
+                        and fresh_queue.get("reason") in (None, "")
+                        and website_queue_access_scope(safe_model) == "public"
+                        and aliases == {str(basis.word_frequency_show.get("sessionId") or "")}):
+                    native_source = refresh_tiktok_show_word_frequency_source(
+                        fresh_model, basis.word_frequency_show,
+                        observed_through_ms=(int(_bnl_read_model_cached_at.timestamp() * 1000)
+                                             if _bnl_read_model_cached_at is not None else None),
+                    ) or {}
         selected_subject_user_id = _consented_tiktok_show_subject_user_id(
             guild_id=basis.guild_id, subject_user_id=basis.subject_user_id,
         )
@@ -32465,13 +32587,14 @@ def refresh_prompt_source_basis(
                 subject_user_id=selected_subject_user_id,
                 selection_user_text=basis.selection_user_text,
                 pinned_show_keys=basis.show_keys,
+                **({"word_frequency_show": native_source} if basis.word_frequency_show is not None else {}),
                 **({"artist_labels": _show_artist_labels(basis.artist_identity_request)}
                    if basis.artist_identity_request is not None else {}),
                 **({"image_queries": basis.image_queries} if basis.image_queries else {}),
                 candidate_context=basis.candidate_context,
                 selection_out=selection,
             )
-            if env_queue_production_enabled()
+            if env_queue_production_enabled() or basis.word_frequency_show is not None
             else ""
         )
         refs = tuple(selection.get("source_refs") or ())
@@ -32490,6 +32613,8 @@ def refresh_prompt_source_basis(
             rendered_context=context,
             subject_user_id=selected_subject_user_id,
             authored_excerpts=authored_excerpts,
+            show_keys=tuple(str(ref[0]) for ref in refs) if basis.word_frequency_show is not None else basis.show_keys,
+            word_frequency_show=native_source,
         )
         return fresh, fresh.expected_digest != basis.expected_digest
     if isinstance(basis, PublicationPromptSourceBasis):
@@ -40817,7 +40942,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             batch_finalized_show_packet_owner = (
                 finalized_show_packet_owner_requested(
-                    combined_text,
+                    batch_show_basis.user_text if batch_show_basis is not None and batch_show_selection.get("word_frequency_lookup") else combined_text,
                     batch_tiktok_show_evidence_context,
                 )
             )
@@ -41406,6 +41531,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     show_episode_dates=tuple(dict.fromkeys(re.findall(
                         r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b", batch_website_read_model_context or "",
                     ))) if show_conversation_interval_requested(combined_text) else (),
+                    show_episode_selection_text=getattr(batch_website_read_model_context, "show_selection_text", ""),
+                    show_episode_word_frequency_show=getattr(batch_website_read_model_context, "word_frequency_show", None),
                     operational_context_snapshot=(
                         batch_operational_queue_packet_snapshot
                     ),
@@ -44123,7 +44250,7 @@ def build_user_aware_prompt(
         else ""
     )
     finalized_show_packet_owner = finalized_show_packet_owner_requested(
-        clean_content,
+        show_basis.user_text if show_basis is not None and show_selection.get("word_frequency_lookup") else clean_content,
         tiktok_show_evidence_context,
     )
     if (
@@ -44421,6 +44548,8 @@ def build_user_aware_prompt(
         show_episode_dates=tuple(dict.fromkeys(re.findall(
             r"\bshowDate=(20\d{2}-\d{2}-\d{2})\b", website_read_model_context or "",
         ))) if show_conversation_interval_requested(clean_content) else (),
+        show_episode_selection_text=getattr(website_read_model_context, "show_selection_text", ""),
+        show_episode_word_frequency_show=getattr(website_read_model_context, "word_frequency_show", None),
         source_context_present=(
             False
             if ordinary_chat_single_packet
@@ -49119,7 +49248,7 @@ def build_ordinary_chat_response_repair_prompt(
                 and isinstance(basis, FinalizedShowPromptSourceBasis)
                 and isinstance(fresh, FinalizedShowPromptSourceBasis)
                 and requested_tiktok_show_word_count(fresh.user_text)
-                and fresh.show_keys == basis.show_keys
+                and (fresh.show_keys == basis.show_keys or fresh.word_frequency_show == {})
                 and str(fresh.rendered_context or "").strip()
             ):
                 # A word total can be recomputed from the same pinned originals.
