@@ -469,24 +469,31 @@ class LightShowAwarenessTests(unittest.TestCase):
             "capabilities": {"queueProduction": True},
             "sections": {"queue": {
                 "available": True, "accessScope": "private" if private else "public",
-                "session": {"id": "test-show", "title": "Test Broadcast", "showDate": "2026-09-12",
-                            "status": status, "broadcastPhase": phase},
+                "session": {"sessionId": "test-show", "title": "Test Broadcast", "showDate": "2026-09-12",
+                            "status": status, "broadcastPhase": phase, "queueOpen": False},
+                "status": {"activeCount": 44, "capacity": 44, "pressure": "max"},
                 "queueUrl": "https://example.test/queue",
-                "nowPlaying": {"artist": "Test Artist", "title": "Test Track",
+                "nowPlaying": {"submittedArtistName": "Test Member", "submittedSongTitle": "Test Track",
                                "publicSourceUrl": "https://example.test/song",
                                "uploadedFileUrl": "https://private.example.test/upload"},
             }},
         }
 
     def test_ordinary_conversation_gets_small_current_context_from_existing_owner(self):
+        refreshed = self.model()
+        refreshed["sections"]["queue"]["session"]["sessionId"] = "test-refreshed-show"
         with mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", 77), \
              mock.patch.object(bot, "_bnl_read_model_cache", self.model()), \
              mock.patch.object(bot, "BNL_QUEUE_PRODUCTION_ENABLED", True), \
-             mock.patch.object(bot, "fetch_bnl_read_model", return_value=self.model()) as fetch:
+             mock.patch.object(bot, "fetch_bnl_read_model", return_value=refreshed) as fetch:
             context = bot.maybe_build_bnl_read_model_context(
-                "I love this song.", "public_home", guild_id=77)
+                "These colors look good.", "public_home", guild_id=77)
         fetch.assert_called_once_with()
-        self.assertIn("Test Artist", context)
+        self.assertIn("sessionId=test-refreshed-show", context)
+        self.assertNotIn("sessionId=test-show;", context)
+        self.assertIsInstance(context, bot.WebsiteReadModelContext)
+        self.assertTrue(context.show_awareness_only)
+        self.assertIn("Test Member", context)
         self.assertIn("https://example.test/song", context)
         self.assertNotIn("private.example", context)
         self.assertLess(len(context), 1500)
@@ -504,7 +511,8 @@ class LightShowAwarenessTests(unittest.TestCase):
     def test_no_cross_guild_or_private_room_background_fetch(self):
         with mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", 77), \
              mock.patch.object(bot, "fetch_bnl_read_model") as fetch:
-            for guild, policy in ((88, "public_home"), (77, "private"), (0, "public_home")):
+            for guild, policy in ((88, "public_home"), (77, "private"),
+                                  (77, "internal_controlled"), (0, "public_home")):
                 self.assertEqual(bot.maybe_build_bnl_read_model_context(
                     "I like these colors.", policy, guild_id=guild), "")
             fetch.assert_not_called()
@@ -521,6 +529,96 @@ class LightShowAwarenessTests(unittest.TestCase):
         self.assertNotIn("Now playing:", context)
         self.assertIn("Preparation is not on-air", context)
         self.assertIn("corrections take precedence", context)
+
+    def test_canonical_session_identity_keeps_closed_full_broadcast_eligible(self):
+        model = self.model(status="closed")
+        queue = model["sections"]["queue"]
+        self.assertFalse(queue["session"]["queueOpen"])
+        self.assertEqual(queue["status"]["activeCount"], queue["status"]["capacity"])
+        context = bot.build_light_show_awareness(model, "public_home")
+        self.assertIn("sessionId=test-show", context)
+        self.assertIn("status=closed", context)
+        self.assertIn("Now playing: Test Member", context)
+        self.assertIn("https://example.test/song", context)
+
+    def test_legacy_id_fallback_accepts_missing_availability_field(self):
+        for declared_availability in (True, None):
+            with self.subTest(available=declared_availability):
+                model = self.model()
+                queue = model["sections"]["queue"]
+                queue["session"]["id"] = queue["session"].pop("sessionId")
+                if declared_availability is None:
+                    queue.pop("available")
+                context = bot.build_light_show_awareness(model, "public_home")
+                self.assertIn("sessionId=test-show", context)
+                self.assertIn("Now playing:", context)
+
+    def test_canonical_identity_wins_over_conflicting_legacy_id(self):
+        model = self.model()
+        model["sections"]["queue"]["session"]["id"] = "test-legacy-show"
+        context = bot.build_light_show_awareness(model, "public_home")
+        self.assertIn("sessionId=test-show", context)
+        self.assertNotIn("test-legacy-show", context)
+
+    def test_missing_session_identity_does_not_activate_awareness(self):
+        model = self.model()
+        model["sections"]["queue"]["session"].pop("sessionId")
+        self.assertEqual(bot.build_light_show_awareness(model, "public_home"), "")
+
+    def test_explicitly_unavailable_queue_cannot_reuse_retained_session(self):
+        for identity_key in ("id", "sessionId"):
+            with self.subTest(identity_key=identity_key):
+                model = self.model()
+                queue = model["sections"]["queue"]
+                queue["available"] = False
+                if identity_key == "id":
+                    queue["session"]["id"] = queue["session"].pop("sessionId")
+                self.assertEqual(bot.build_light_show_awareness(model, "public_home"), "")
+
+    def test_ordinary_conversation_drops_excluded_refreshed_sources(self):
+        unavailable = self.model()
+        unavailable["sections"]["queue"]["available"] = False
+        for refreshed in ({}, self.model(private=True),
+                          self.model(phase="ended", status="archived"), unavailable):
+            with self.subTest(refreshed=refreshed), \
+                 mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", 77), \
+                 mock.patch.object(bot, "_bnl_read_model_cache", self.model()), \
+                 mock.patch.object(bot, "fetch_bnl_read_model", return_value=refreshed) as fetch:
+                context = bot.maybe_build_bnl_read_model_context(
+                    "These colors look good.", "public_home", guild_id=77)
+                self.assertEqual(context, "")
+                fetch.assert_called_once_with()
+
+    def test_ordinary_conversation_without_current_cache_starts_no_fetch(self):
+        with mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", 77), \
+             mock.patch.object(bot, "_bnl_read_model_cache", {}), \
+             mock.patch.object(bot, "fetch_bnl_read_model") as fetch:
+            self.assertEqual(bot.maybe_build_bnl_read_model_context(
+                "These colors look good.", "public_home", guild_id=77), "")
+            fetch.assert_not_called()
+
+    def test_ordinary_conversation_respects_disabled_queue_gates(self):
+        for local_enabled, remote_enabled in ((False, True), (True, False)):
+            model = self.model()
+            model["capabilities"]["queueProduction"] = remote_enabled
+            with self.subTest(local=local_enabled, remote=remote_enabled), \
+                 mock.patch.dict(os.environ, {"BNL_QUEUE_PRODUCTION_ENABLED": str(local_enabled).lower()}), \
+                 mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", 77), \
+                 mock.patch.object(bot, "_bnl_read_model_cache", model), \
+                 mock.patch.object(bot, "fetch_bnl_read_model") as fetch:
+                self.assertEqual(bot.build_light_show_awareness(model, "public_home"), "")
+                self.assertEqual(bot.maybe_build_bnl_read_model_context(
+                    "These colors look good.", "public_home", guild_id=77), "")
+                fetch.assert_not_called()
+
+    def test_disabled_reader_cannot_return_cached_show_awareness(self):
+        with mock.patch.object(bot, "BNL_READ_MODEL_ENABLED", False), \
+             mock.patch.object(bot, "BNL_PRIMARY_GUILD_ID", 77), \
+             mock.patch.object(bot, "_bnl_read_model_cache", self.model()), \
+             mock.patch.object(bot.urllib.request, "urlopen") as http:
+            self.assertEqual(bot.maybe_build_bnl_read_model_context(
+                "These colors look good.", "public_home", guild_id=77), "")
+            http.assert_not_called()
 
     def test_stale_cache_is_not_used_to_keep_show_active(self):
         from test_read_model_refresh_recovery import Response

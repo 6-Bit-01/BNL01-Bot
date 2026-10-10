@@ -498,6 +498,11 @@ class IntelligencePacketRequest:
     # The native reader's resolved human person/topic continuation. A later
     # packet projection must not select a different episode for the same turn.
     show_episode_selection_text: str = ""
+    # Exact roots already selected by the existing show source owner.
+    show_episode_keys: tuple[str, ...] = ()
+    # A supplied native count, including an unavailable empty record, remains
+    # owned by its revalidatable prompt basis rather than finalized projections.
+    show_episode_word_frequency_show: Mapping[str, Any] | None = None
     # The selected human history request may own the artist while a followup
     # asks about another role, such as who submitted those tracks.
     show_episode_artist_request: IntelligencePacketRequest | None = None
@@ -3355,7 +3360,12 @@ def _episode_items(
 
 
 def _show_episode_query(request: IntelligencePacketRequest) -> str:
-    from bnl_tiktok_live_context import has_explicit_show_date, requested_show_dates
+    from bnl_tiktok_live_context import (
+        _tiktok_word_frequency_scope_query, has_explicit_show_date,
+        is_tiktok_show_analysis_followup, is_tiktok_show_analysis_query,
+        requested_recent_show_count, requested_show_dates,
+        requested_tiktok_show_word_count,
+    )
     from bnl_unified_response_assessment import music_submission_history_query
 
     query = str(request.user_text or "")[:8000]
@@ -3364,9 +3374,28 @@ def _show_episode_query(request: IntelligencePacketRequest) -> str:
     history_query = music_submission_history_query(query)
     if history_query:
         return history_query
-    if has_explicit_show_date(query) or requested_show_dates(query, now=request.now or None):
+    if requested_tiktok_show_word_count(request.show_episode_selection_text):
+        resolved_query = str(request.show_episode_selection_text)[:8000]
+        current_has_target = bool(requested_tiktok_show_word_count(query))
+        if (not current_has_target and is_tiktok_show_analysis_query(query)
+                and not is_tiktok_show_analysis_followup(query)):
+            return query
+        scope_query = _tiktok_word_frequency_scope_query(
+            query if current_has_target else resolved_query,
+        )
+        if (has_explicit_show_date(scope_query)
+                or requested_show_dates(scope_query, now=request.now or None,
+                                        include_current_relative=False)
+                or requested_recent_show_count(scope_query) is not None):
+            # A new historical count owns its word. A targetless correction
+            # retains the resolved word and drops the previously selected date.
+            return query if current_has_target else resolved_query
+        # The native source owns today's/tonight's episode across midnight.
+        # Its resolved human request keeps the complete literal count target.
+        query = resolved_query
+    elif has_explicit_show_date(query) or requested_show_dates(query, now=request.now or None):
         return query
-    if request.show_episode_selection_text:
+    elif request.show_episode_selection_text:
         query = str(request.show_episode_selection_text)[:8000]
     dates = tuple(day for day in request.show_episode_dates if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", day))
     return query + (" " + " ".join(dates) if dates else "")
@@ -3387,6 +3416,10 @@ def _show_episode_items(
     attributed Community Canon / Open Signal utterances.
     """
 
+    if getattr(request, "show_episode_word_frequency_show", None) is not None:
+        # The native count basis owns this window, even when withdrawn. A later
+        # finalized record for the same session cannot supply a second count.
+        return []
     queue_enabled = env_queue_production_enabled(
         dict(environ) if environ is not None else None
     )
@@ -3432,6 +3465,8 @@ def _show_episode_items(
         allow_subject_continuity=allow_subject_continuity,
         now=request.now or None,
         artist_labels=show_artist_labels_for_request(conn, request, environ=environ),
+        **({"selected_show_keys": tuple(request.show_episode_keys)}
+           if getattr(request, "show_episode_keys", ()) else {}),
     )) if queue_enabled else []
     measurements = select_tiktok_engagement_context_items(
         conn, guild_id=int(request.guild_id or 0), user_text=_show_episode_query(request),
@@ -6387,6 +6422,9 @@ def _show_episode_versions(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
+    if getattr(packet.request, "show_episode_word_frequency_show", None) is not None:
+        # Do not reacquire a finalized count after a frozen native read.
+        return {}
     measured_windows = {
         item.source_ref: tiktok_engagement_window_version(
             conn, guild_id=int(packet.request.guild_id or 0), source_ref=item.source_ref,
@@ -6425,6 +6463,8 @@ def _show_episode_versions(
         ),
         now=packet.request.now or None,
         artist_labels=show_artist_labels_for_request(conn, packet.request, environ=environ),
+        **({"selected_show_keys": tuple(packet.request.show_episode_keys)}
+           if getattr(packet.request, "show_episode_keys", ()) else {}),
     ), **measured_windows}
 
 
