@@ -18391,7 +18391,9 @@ def build_operations_brief_context(guild_id: int, user_text: str) -> str:
     bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
     lines.append(f"- Website relay flag: {'enabled' if relay_enabled else 'disabled'}")
     lines.append(f"- Website bridge configured: {'yes' if bridge_configured else 'no'}")
-    lines.append("- Known gaps: website dossiers not connected yet; queue runtime not connected yet; payment event state not connected yet; public chatter layer not implemented yet.")
+    lines.append("- Capability evidence: Use only fresh, eligible source context supplied for this request to describe website dossiers, queue runtime, payment event state, or public chatter (including TikTok).")
+    lines.append("- Without fresh eligible evidence, current state is unknown; do not infer connected, disconnected, or unimplemented. Configuration and enabled flags do not establish current runtime health.")
+    lines.append("- Existing privacy, channel-access, and production gates still apply; this operations summary grants no additional access or action authority.")
     lines.append("- Next-step categories: broadcast memory note, Discord announcement, website update suggestion, dossier seed suggestion (not canon), recap candidate, admin-only note.")
     if is_internal_operations_request(user_text):
         lines.append("- Request intent appears operational; prioritize action guidance over diagnostics.")
