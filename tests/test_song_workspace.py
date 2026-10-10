@@ -55,7 +55,7 @@ def seed_ballad(db, published_at):
 
 class SongWorkspaceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.assertIsNotNone(songs, 'private song command worker is missing')
+        self.assertIsNotNone(songs, 'BARCODE song command worker is missing')
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = str(Path(self.tmp.name) / 'creative.db')
@@ -84,7 +84,7 @@ class SongWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('AUTHORIZED SHOW EVIDENCE', self.calls[0])
         self.assertIn('No forced cast', self.calls[0])
 
-    def test_private_song_keeps_the_complete_ballad_songwriting_requirements(self):
+    def test_barcode_song_keeps_the_complete_ballad_songwriting_requirements(self):
         prompt = songs.build_prompt(self.command, songs.SongContext())
         for requirement in ('1,400 characters', '2–4 contrasting genres/styles', '1970–2010',
                             '250–400 characters', '500 characters', 'multisyllabic rhyme families'):
@@ -92,6 +92,51 @@ class SongWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('form', prompt)
         self.assertIn('No show or episode is required', prompt)
         self.assertNotIn('Style maximum 6000 characters', prompt)
+
+    async def test_focused_public_material_uses_ballad_composition_at_the_writer_boundary(self):
+        # Removing source-language/theme guidance from the song adapter must fail,
+        # even when its original public excerpts still reach the provider.
+        command = {**self.command, 'options': {
+            'idea': 'A song about Test Member', 'musicalDirection': 'rock', 'mood': 'angry'}}
+        originals = ('Relevant original public Discord messages:\n'
+            '- Test Member (2026-10-01): My crooked paper lantern is still waiting for daylight.\n'
+            '- Test Member (2026-10-04): The lantern came back; bring the daylight home.\n'
+            '- Test Member (2026-10-08): I keep returning to unfinished journeys and waiting for daylight.')
+        result = await self.execute(command, context_reader=lambda _: songs.SongContext(originals),
+                                    context_current=lambda _: True)
+        self.assertEqual(result['outcome'], 'applied')
+        self.assertEqual(len(self.calls), 1)
+        prompt = self.calls[0]
+        for source in originals.splitlines()[1:]:
+            self.assertTrue(source in prompt, 'original public source missing: ' + source)
+        for requirement in ('distinctive things people ACTUALLY SAID',
+                            'surrounding exchange and its speaker',
+                            'seed a hook, rhyme, image or scene',
+                            'motif, tension or hook', 'recurring themes and callbacks',
+                            'An explicitly requested focused subject still takes precedence'):
+            self.assertTrue(requirement in prompt, requirement)
+        direction = json.loads(prompt.split('OPTIONAL USER DIRECTION JSON: ', 1)[1].split('\n', 1)[0])
+        self.assertEqual(direction, command['options'])
+        self.assertIn('No show or episode is required', prompt)
+        self.assertIn('No forced cast', prompt)
+        self.assertNotIn('palette.angle/topics', prompt)
+        self.assertNotIn('Return one JSON object in this order: title, style, palette', prompt)
+
+    def test_ballad_and_workspace_consume_the_same_source_reasoning_contract(self):
+        episode = dict(id='show-draft', showId='show-1', kind='generate', options={})
+        prompts = (ballads.build_prompt(episode, 'Authorized episode originals', []),
+                   songs.build_prompt(self.command, songs.SongContext('Authorized public originals')))
+        for prompt in prompts:
+            for requirement in ('distinctive things people ACTUALLY SAID',
+                                'Adapt source language naturally for singing',
+                                'motif, tension or hook', 'Preserve banter as banter'):
+                self.assertTrue(requirement in prompt, requirement)
+        self.assertIn('palette.angle/topics', prompts[0])
+        self.assertIn('beginning, middle and end of the episode', prompts[0])
+        self.assertIn('linerNotes contains four short public-facing strings', prompts[0])
+        self.assertNotIn('palette.angle/topics', prompts[1])
+        self.assertIn('lyrics maximum 40000 characters AND 2000', prompts[1])
+        self.assertIn('no more than 300 seconds', prompts[1])
 
     async def test_new_style_uses_existing_compact_copy_boundary_and_preserves_lyrics(self):
         from bnl_creative_protocol import SUNO_STYLE_MAX_CHARS
@@ -109,7 +154,7 @@ class SongWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(selector.call_args.kwargs['require_topic_overlap'])
         self.assertGreaterEqual(selector.call_args.kwargs['max_results'], 6)
 
-    def test_released_catalog_and_finalized_show_context_reach_song_without_private_drafts(self):
+    def test_released_catalog_and_finalized_show_context_reach_song_without_unreleased_drafts(self):
         from types import SimpleNamespace
         import bnl_broadcast_ballads as ballads
         catalog = seed_ballad(self.db, '2026-08-28T12:00:00Z')

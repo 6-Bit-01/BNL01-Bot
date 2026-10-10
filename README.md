@@ -689,7 +689,7 @@ Before merging a runtime change:
 3. Confirm CI passes on Python 3.9 and 3.12.
 4. Keep live behavior, memory governance, public/private evidence boundaries, and website contract changes in explicitly scoped PRs.
 
-## Private BARCODE songwriting
+## BARCODE songwriting
 
 Authorized Owner/Crew commands reuse the Broadcast Ballads shared BNL mind and
 complete Suno/songwriting protocol: sustained multisyllabic phrasing, coherent
@@ -705,8 +705,11 @@ and musical form serves the subject. All directions and bounded existing copy
 rank public retrieval without becoming evidence; arrangement-only requests
 retain broad recall. A new Generate does not inherit the previous song's subject.
 Public Moments retain their attributed contributions. The shared brain's existing
-current public Discord member-label resolver reaches explicitly requested people,
-and its named history reader supplies older whole original public messages.
+public Discord member-label resolver reaches explicitly requested people using
+current names and eligible public-original names for the same current member.
+Its named history reader supplies whole attributed original messages, with an
+8,000-character / 64-original bound for songs and unchanged ordinary-chat defaults.
+A song-request prefix guides the writer without becoming a history search topic.
 Duplicate names remain unresolved; current canon bindings retain their existing
 owner. Exact recorded subjects draw on governed public background and public
 conversation assessments without guessing platform aliases. Explicit people
@@ -716,13 +719,16 @@ facts, keeping artist credits, submitters, accepted tracks and confirmed plays
 distinct. Bounded recent original public Discord conversation also supplies
 current inspiration. The existing public canon/lore and up to twelve exact
 released Ballad references remain available for subject/arrangement variety.
-Relevant people and topics can connect naturally without a required cast or
-invented relationships, quotations or permanent traits. Neither a recap nor a
-participant roll call is required. Released creative work and generated copy
+Both writers use the actual Broadcast Ballad composition guidance: understand
+the speaker and surrounding exchange, let distinctive real phrasing seed hooks,
+rhymes and scenes, and connect supported topics, recurring themes and callbacks
+through a musical motif and emotional movement. Focused directions take
+precedence without a required cast, invented relationships or permanent traits.
+Neither a recap nor a participant roll call is required. Released creative work and generated copy
 are never evidence for a real event.
 Private producer feedback, unpublished Ballads, account data, personal memory
 and Relationship state are excluded. No separate memory/catalog or learning
-store is created, and private workspace lyrics never become factual memory.
+store is created, and generated song lyrics never become factual memory.
 
 Source lineage is retained in existing command receipts and checked before and
 after generation, before delivery and on replay. Withdrawn/corrected originals

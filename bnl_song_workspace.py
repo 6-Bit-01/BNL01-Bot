@@ -1,4 +1,4 @@
-"""Private website song commands using the existing creative SQLite receipt owner.
+"""Website song commands using the existing creative SQLite receipt owner.
 
 The member service owns actor authorization, private drafts and leases. These
 receipts prevent repeated physical model calls; they are never factual memory.
@@ -16,7 +16,8 @@ import sqlite3
 import urllib.request
 
 from bnl_broadcast_ballads import initialize as initialize_creative_store
-from bnl_creative_protocol import SUNO_LYRIC_PROTOCOL, SUNO_STYLE_MAX_CHARS, bound_suno_style_copy, creative_variation_hint
+from bnl_creative_protocol import (SUNO_LYRIC_PROTOCOL, SUNO_STYLE_MAX_CHARS,
+    bound_suno_style_copy, creative_variation_hint, source_driven_composition_guidance)
 
 ROUTE = 'barcode_song_manual'
 ERROR_CODES = frozenset({'INVALID_COMMAND', 'BUDGET_UNAVAILABLE', 'PROVIDER_UNAVAILABLE',
@@ -416,7 +417,7 @@ def build_prompt(command, context):
     }[kind]
     return '\n'.join((
         SUNO_LYRIC_PROTOCOL,
-        'Private BARCODE songwriting workspace. ' + instructions,
+        'BARCODE songwriting workspace. ' + instructions,
         'All options are optional. Empty fields mean choose a compelling subject, sound, mood and structure yourself. '
         'No show or episode is required. Keep BARCODE\'s music-first spirit and BNL\'s dry wit; a song can explore any sound.',
         'Connect naturally relevant public people, their attributed remarks, topics and recorded music when it serves the song. '
@@ -435,6 +436,7 @@ def build_prompt(command, context):
         'Established fictional BARCODE imagery is available when useful; it does not prove real events. '
         'Use the creative catalog to vary subject, hook, rhythm, vocal character, section shape and musical movement; '
         'changing genre labels alone is not enough. User musical direction takes precedence over optional variation.',
+        source_driven_composition_guidance(),
         creative_variation_hint(vocal_task=True),
         'OPTIONAL USER DIRECTION JSON: ' + json.dumps(command['options'], ensure_ascii=False),
         'EXISTING COPY JSON: ' + json.dumps(

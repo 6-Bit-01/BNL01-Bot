@@ -16042,6 +16042,7 @@ def _named_public_member_subjects(
     *,
     typed_subject_user_ids: tuple[int, ...] = (),
     addressee_user_ids: tuple[int, ...] = (),
+    include_public_original_labels: bool = False,
 ) -> tuple[tuple[tuple[int, str], ...], tuple[str, ...]]:
     """Resolve complete public member labels through the live guild cache.
 
@@ -16051,6 +16052,10 @@ def _named_public_member_subjects(
     turn already supplies one typed subject identity. Word boundaries already
     present in a spaced or CamelCase label may be written with or without
     spaces. Canon names continue through the existing canon owner.
+
+    The explicit song option may also read currently eligible original public
+    author labels for those same cached accounts. Labels never establish a
+    cross-platform identity, and ordinary chat keeps its current cache scope.
     """
     value = str(text or "")
     if guild is None or not value.strip():
@@ -16065,6 +16070,32 @@ def _named_public_member_subjects(
         for alias in (identity.name, *identity.aliases)
     }
     owner_user_id = int(BNL_OWNER_USER_ID or 0)
+    current_member_ids = set()
+
+    def public_label(raw):
+        literal = str(raw or "").strip()
+        label = _safe_prompt_display_label(literal, "")
+        if not label or label.casefold() != literal.casefold():
+            return None
+        key = re.sub(r"\s+", "", label).casefold()
+        if key in canon_keys:
+            return None
+        words = re.split(
+            r"\s+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])",
+            label,
+        )
+        return label, key, r"[^\S\r\n]*".join(re.escape(word) for word in words)
+
+    def add_label(user_id, raw):
+        parsed = public_label(raw)
+        if parsed is None:
+            return
+        label, key, pattern = parsed
+        labels.setdefault(key, label)
+        member_labels.setdefault((key, user_id), label)
+        aliases.setdefault(key, set()).add(user_id)
+        label_patterns.setdefault(key, set()).add(pattern)
+
     for member in getattr(guild, "members", ()) or ():
         user_id = int(getattr(member, "id", 0) or 0)
         if user_id <= 0 or bool(getattr(member, "bot", False)):
@@ -16073,28 +16104,48 @@ def _named_public_member_subjects(
         # inspect the owner's account display fields for additional aliases.
         if user_id == owner_user_id:
             continue
+        current_member_ids.add(user_id)
         for raw in (
             getattr(member, "display_name", ""),
             getattr(member, "global_name", ""),
             getattr(member, "name", ""),
         ):
-            literal = str(raw or "").strip()
-            label = _safe_prompt_display_label(literal, "")
-            if not label or label.casefold() != literal.casefold():
-                continue
-            key = re.sub(r"\s+", "", label).casefold()
-            if key in canon_keys:
-                continue
-            labels.setdefault(key, label)
-            member_labels.setdefault((key, user_id), label)
-            aliases.setdefault(key, set()).add(user_id)
-            words = re.split(
-                r"\s+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])",
-                label,
+            add_label(user_id, raw)
+    if include_public_original_labels and current_member_ids:
+        # A public original binds its recorded author label to the same stable
+        # Discord account. A rename does not invent an alias or account link.
+        # Keep this opt-in source read out of ordinary conversation routing.
+        from bnl_conversation_context_v2 import _unsafe_row
+
+        def label_requested(raw):
+            parsed = public_label(raw)
+            return bool(parsed and re.search(
+                r"(?<!\w)(?:%s)(?!\w)" % parsed[2], value, re.I,
+            ))
+
+        with closing(_open_member_memory_read_connection()) as conn:
+            conn.create_function("public_member_label_requested", 1, label_requested)
+            # Match before reading originals; an arbitrary recency cap could
+            # erase an older author or hide a second account with that label.
+            rows = conn.execute(
+                """SELECT id,user_id,user_name,content FROM main.conversations
+                WHERE guild_id=? AND role='user' AND user_id>0
+                  AND channel_policy IN ('public_home','public_context','public_selective')
+                  AND public_member_label_requested(user_name)=1
+                ORDER BY id""", (int(getattr(guild, "id", 0) or 0),),
+            ).fetchall()
+            candidates = [row for row in rows
+                if int(row[1]) in current_member_ids
+                and not should_exclude_from_prompt_history("user", row[3])
+                and not _unsafe_row({"role": "user", "content": row[3]})]
+            _control_digest, blocked = _public_conversation_recall_controls(
+                conn, guild_id=int(getattr(guild, "id", 0) or 0),
+                source_users={int(row[0]): int(row[1]) for row in candidates},
+                require_current_originals=True,
             )
-            label_patterns.setdefault(key, set()).add(
-                r"[^\S\r\n]*".join(re.escape(word) for word in words)
-            )
+            for row_id, user_id, label, _content in candidates:
+                if int(row_id) not in blocked:
+                    add_label(int(user_id), label)
     matches = []
     for key, user_ids in aliases.items():
         for match in re.finditer(
@@ -29117,14 +29168,27 @@ def build_named_public_conversation_context(
     conversation_basis=None,
     conversation_context_result: ConversationContextResult | None = None,
     require_current_originals: bool = False, read_status: dict | None = None,
+    character_budget: int | None = None, source_row_limit: int | None = None,
 ) -> tuple[str, ConversationPromptSourceBasis | None]:
     """Read original public messages for the resolved member and topic.
 
     Person, date and source controls define eligibility. Query overlap ranks
     the stored history before bounding candidates, but a zero score cannot
     hide otherwise eligible originals. Neither operation invents identity.
+    An explicit creative-call budget is bounded to 8,000 characters; ordinary
+    chat retains its configured allowance. An optional source limit bounds
+    the same selected originals without cutting an utterance into fragments.
     """
     from bnl_conversation_context_v2 import _unsafe_row
+
+    if character_budget is not None and (
+        type(character_budget) is not int or not 0 <= character_budget <= 8000
+    ):
+        raise ValueError("named_public_character_budget_out_of_bounds")
+    if source_row_limit is not None and (
+        type(source_row_limit) is not int or not 1 <= source_row_limit <= 64
+    ):
+        raise ValueError("named_public_source_row_limit_out_of_bounds")
 
     if read_status is not None:
         read_status.update(status='not_requested')
@@ -29177,13 +29241,15 @@ def build_named_public_conversation_context(
             return 0.0
 
     header = "Relevant original public Discord messages:\n"
-    budget = max(0, MEMORY_PROMPT_BUDGET_PUBLIC)
+    budget = max(0, MEMORY_PROMPT_BUDGET_PUBLIC) if character_budget is None else character_budget
     used = len(header)
     selected = []
     selected_ids = set()
 
     def add_candidate(candidate):
         nonlocal used
+        if source_row_limit is not None and len(selected) >= source_row_limit:
+            return False
         source, label, text = candidate
         if int(source["id"]) in selected_ids:
             return False
@@ -38173,7 +38239,13 @@ def _song_named_public_subjects(query):
     guild = client.get_guild(BNL_PRIMARY_GUILD_ID)
     if guild is None or int(getattr(guild, 'id', 0) or 0) != BNL_PRIMARY_GUILD_ID:
         return (), ''
-    named, unresolved = _named_public_member_subjects(guild, query)
+    try:
+        named, unresolved = _named_public_member_subjects(
+            guild, query, include_public_original_labels=True,
+        )
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        logging.info('song_public_context_unavailable named_subjects=0 named_status=unavailable')
+        raise SongFailure('CONTEXT_UNAVAILABLE')
     named = named[:3]
     digest = _prompt_source_digest(json.dumps(
         (BNL_PRIMARY_GUILD_ID, named, unresolved), ensure_ascii=False, separators=(',', ':'),
@@ -38237,6 +38309,13 @@ def _read_song_public_context(options, *, base=None):
         # the person's discussion topic or requested history date.
         semantic = song_retrieval_query({key: options.get(key, '') for key in ('idea', 'revisionInstructions')})
         history_query = semantic or ' '.join(label for _user_id, label in named)
+        # The requested output medium is not the person's history topic.
+        # Remove only a leading composition request; an inner factual topic
+        # such as "Chris's song" remains available to the existing ranker.
+        history_query = re.sub(
+            r'^\s*(?:please\s+)?(?:(?:write|create|compose|make|generate)(?:\s+me)?\s+)?'
+            r'(?:a\s+)?song\s+(?:about|for)\s+', '', history_query, count=1, flags=re.I,
+        ).strip() or ' '.join(label for _user_id, label in named)
         frame = build_situation_frame_v1(
             route_allowed=True, route_mode='normal_chat', conversation_surface='discord',
             channel_policy='public_home', current_text=history_query,
@@ -38247,6 +38326,7 @@ def _read_song_public_context(options, *, base=None):
             situation_frame=frame, guild_id=BNL_PRIMARY_GUILD_ID, route_mode='normal_chat',
             channel_policy='public_home', user_text=history_query,
             require_current_originals=True, read_status=named_status,
+            character_budget=8000, source_row_limit=64,
         )
         if named_status['status'] == 'unavailable':
             logging.info('song_public_context_unavailable named_subjects=%s named_status=unavailable', len(named))
@@ -38322,7 +38402,7 @@ def _song_public_context_is_current(context):
             if not revalidate_ambient_local_sources(BNL_PRIMARY_GUILD_ID, frozen, require_current_originals=True):
                 return False
         return song_context_is_current(DB_FILE, BNL_PRIMARY_GUILD_ID, SongContext('', tuple(other)))
-    except (TypeError, ValueError, KeyError, OSError, sqlite3.Error):
+    except (TypeError, ValueError, KeyError, OSError, sqlite3.Error, SongFailure):
         return False
 
 

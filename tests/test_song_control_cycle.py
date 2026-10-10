@@ -470,6 +470,215 @@ class SongNamedPublicOriginalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module_reader.call_args.kwargs['public_subjects'], (('discord_user:43', 'Chris'),))
         self.assertIn('result', transport.call_args_list[1].args[1])
 
+    async def test_song_named_history_keeps_whole_quotes_and_callbacks_beyond_chat_budget(self):
+        originals = (
+            'I called this the midnight train: send the unfinished track and let the room hear where it is going. '
+            'I want to hear that chorus again, with the guitar up front and the little bell still at the end.',
+            'The midnight train is back. My exact advice was, "Keep the odd little melody; it gives the song its own face." '
+            + ('I listened for the way the rhythm changed after the quiet opening, how the bass answered the guitar, '
+              'and whether the last chorus made the earlier rough idea feel complete. ' * 7).rstrip(),
+            'That little bell is our midnight train callback again. Send the finished version when it is ready; '
+            'I will listen to the whole thing and share the link with the room.',
+        )
+        self.assertGreater(len(originals[1]), 900)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            stamp = datetime.fromisoformat(conn.execute('SELECT timestamp FROM conversations WHERE id=12').fetchone()[0])
+            conn.execute('UPDATE conversations SET content=? WHERE id=12', (originals[0],))
+            for row_id, original in ((13, originals[1]), (14, originals[2])):
+                conn.execute("INSERT INTO conversations VALUES (?,43,'Chris',?,'user',9001,'public_home',?,77,'public-stage',?)",
+                    (row_id, original, (stamp + timedelta(seconds=(row_id - 12) * 30)).isoformat(), 9000 + row_id))
+                conn.execute("INSERT INTO memory_ledger_entries VALUES (?,77,'conversations',?,'discord_user:43','active',1,'observation')",
+                    ('root-' + str(row_id), str(row_id)))
+            for row_id, marker, policy, guild, role in (
+                (15, 'PRIVATE DRAFT MARKER', 'sealed_test', 77, 'user'),
+                (16, 'OTHER GUILD MARKER', 'public_home', 78, 'user'),
+                (17, 'WITHDRAWN ORIGINAL MARKER', 'public_home', 77, 'user'),
+                (18, 'PRIOR MODEL MARKER', 'public_home', 77, 'model'),
+            ):
+                conn.execute("INSERT INTO conversations VALUES (?,43,'Chris',?,?,9001,?,?,?,'public-stage',?)",
+                    (row_id, marker, role, policy, (stamp + timedelta(seconds=row_id)).isoformat(), guild, 9000 + row_id))
+                conn.execute("INSERT INTO memory_ledger_entries VALUES (?,?,'conversations',?,'discord_user:43','active',?,'observation')",
+                    ('root-' + str(row_id), guild, str(row_id), 0 if row_id == 17 else 1))
+        frame = build_situation_frame_v1(route_allowed=True, route_mode='normal_chat',
+            conversation_surface='discord', channel_policy='public_home', current_text='Song about Chris',
+            subject_user_ids=(43,), subject_label_hints=('Chris',))
+        chat, _basis = named_sources.build_named_public_conversation_context(
+            situation_frame=frame, guild_id=77, route_mode='normal_chat', channel_policy='public_home',
+            user_text='Song about Chris', require_current_originals=True)
+        self.assertLessEqual(len(chat), 900)
+        self.assertNotIn(originals[1], chat)
+        provider = mock.AsyncMock(return_value=bot.GenerationResult(True, json.dumps(self.output)))
+        with mock.patch.object(bot, '_generate_gemini_content_result_async', provider), \
+             mock.patch.object(bot, '_song_control_request_sync', side_effect=[self.control, {'ok': True}]) as transport:
+            await bot._run_song_control_cycle()
+        self.assertEqual(provider.await_count, 1)
+        prompt = provider.call_args.args[0]
+        for original in originals:
+            self.assertTrue(original in prompt, 'complete named public original did not reach song writer')
+        self.assertLess(prompt.index(originals[0]), prompt.index(originals[1]))
+        self.assertLess(prompt.index(originals[1]), prompt.index(originals[2]))
+        self.assertIn('Chris in #public-stage', prompt)
+        for marker in ('PRIVATE DRAFT MARKER', 'OTHER GUILD MARKER', 'WITHDRAWN ORIGINAL MARKER', 'PRIOR MODEL MARKER'):
+            self.assertNotIn(marker, prompt)
+        self.assertIn('result', transport.call_args_list[1].args[1])
+        context = bot._read_song_public_context(self.command['options'])
+        named = next(ref for ref in context.basis if ref['sourceKind'] == 'named_public_chat')
+        self.assertEqual(named['sourceBasis']['sourceRowIds'], (12, 13, 14))
+        self.assertLessEqual(len(named['sourceBasis']['sourceRowIds']), 64)
+        serialized = SongContext('', tuple(json.loads(json.dumps(context.basis))))
+        self.assertTrue(bot._song_public_context_is_current(serialized))
+        self.change('UPDATE memory_ledger_entries SET public_usable=0 WHERE entry_id=?', ('root-13',))
+        self.assertFalse(bot._song_public_context_is_current(serialized))
+        self.assertNotIn(originals[1], bot._read_song_public_context(self.command['options']).text)
+
+    def test_expanded_song_history_keeps_existing_64_original_limit_and_json_revalidation(self):
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            stamp = datetime.fromisoformat(conn.execute('SELECT timestamp FROM conversations WHERE id=12').fetchone()[0])
+            for row_id in range(13, 93):
+                conn.execute("INSERT INTO conversations VALUES (?,43,'Chris',?,'user',9001,'public_home',?,77,'public-stage',?)",
+                    (row_id, 'The little bell returns, take ' + str(row_id) + '.',
+                     (stamp + timedelta(seconds=row_id)).isoformat(), 9000 + row_id))
+                conn.execute("INSERT INTO memory_ledger_entries VALUES (?,77,'conversations',?,'discord_user:43','active',1,'observation')",
+                    ('root-' + str(row_id), str(row_id)))
+        context = bot._read_song_public_context(self.command['options'])
+        named = next(ref for ref in context.basis if ref['sourceKind'] == 'named_public_chat')
+        self.assertEqual(len(named['sourceBasis']['sourceRowIds']), 64)
+        self.assertEqual(len(named['sourceBasis']['sourceUsers']), 64)
+        self.assertTrue(bot._song_public_context_is_current(SongContext('', tuple(json.loads(json.dumps(context.basis))))))
+
+    def test_named_reader_explicit_limits_are_bounded_and_ordinary_budget_is_unchanged(self):
+        frame = build_situation_frame_v1(route_allowed=True, route_mode='normal_chat',
+            conversation_surface='discord', channel_policy='public_home', current_text='Song about Chris',
+            subject_user_ids=(43,), subject_label_hints=('Chris',))
+        arguments = dict(situation_frame=frame, guild_id=77, route_mode='normal_chat',
+            channel_policy='public_home', user_text='Song about Chris', require_current_originals=True)
+        default, _ = named_sources.build_named_public_conversation_context(**arguments)
+        explicit, _ = named_sources.build_named_public_conversation_context(**arguments,
+            character_budget=900, source_row_limit=64)
+        self.assertEqual(default, explicit)
+        self.assertLessEqual(len(default), 900)
+        for key, value in (('character_budget', -1), ('character_budget', 8001),
+                           ('character_budget', True), ('source_row_limit', 0),
+                           ('source_row_limit', 65), ('source_row_limit', '64')):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                named_sources.build_named_public_conversation_context(**arguments, **{key: value})
+
+    async def test_song_request_medium_does_not_displace_newer_public_callback_from_bounded_history(self):
+        callback = 'I left a tiny brass bell by the station; that is the midnight train joke from yesterday.'
+        generic = 'I heard another song in the room today, take '
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            stamp = datetime.fromisoformat(conn.execute('SELECT timestamp FROM conversations WHERE id=12').fetchone()[0])
+            # Output-medium matches can exhaust the reader's existing 1,200
+            # SQL candidate bound before its final content/recency ranking.
+            for row_id in range(13, 1214):
+                original = callback if row_id == 1213 else generic + str(row_id) + '.'
+                conn.execute("INSERT INTO conversations VALUES (?,43,'Chris',?,'user',9001,'public_home',?,77,'public-stage',?)",
+                    (row_id, original, (stamp + timedelta(seconds=7200 if row_id == 1213 else row_id)).isoformat(), 9000 + row_id))
+                conn.execute("INSERT INTO memory_ledger_entries VALUES (?,77,'conversations',?,'discord_user:43','active',1,'observation')",
+                    ('root-' + str(row_id), str(row_id)))
+        provider = mock.AsyncMock(return_value=bot.GenerationResult(True, json.dumps(self.output)))
+        with mock.patch.object(bot, '_generate_gemini_content_result_async', provider), \
+             mock.patch.object(bot, '_song_control_request_sync', side_effect=[self.control, {'ok': True}]) as transport:
+            await bot._run_song_control_cycle()
+        self.assertEqual(provider.await_count, 1)
+        self.assertTrue(callback in provider.call_args.args[0], 'output-medium ranking crowded out newer public callback')
+        self.assertTrue('"idea": "Song about Chris"' in provider.call_args.args[0], 'writer direction was rewritten')
+        self.assertIn('result', transport.call_args_list[1].args[1])
+        with mock.patch.object(bot, 'build_named_public_conversation_context', wraps=named_sources.build_named_public_conversation_context) as reader:
+            for idea, expected, broad in (
+                ('Song about Chris', 'Chris', True),
+                ('write a song about Chris', 'Chris', True),
+                ("Chris's song", "Chris's song", False),
+                ("Song about Chris's song", "Chris's song", False),
+            ):
+                with self.subTest(idea=idea):
+                    context = await asyncio.to_thread(bot._read_song_public_context, {'idea': idea})
+                    self.assertEqual(reader.call_args.kwargs['user_text'], expected)
+                    self.assertEqual(callback in context.text, broad)
+                    self.assertTrue(generic in context.text, 'actual music topic vanished from source selection')
+
+    async def test_renamed_current_member_keeps_eligible_original_author_label_for_writer(self):
+        self.member.display_name = self.member.global_name = self.member.name = 'Current Member'
+        provider = mock.AsyncMock(return_value=bot.GenerationResult(True, json.dumps(self.output)))
+        with mock.patch.object(bot, '_generate_gemini_content_result_async', provider), \
+             mock.patch.object(bot, '_song_control_request_sync', side_effect=[self.control, {'ok': True}]) as transport, \
+             mock.patch.object(bot, 'read_song_context', return_value=SongContext()) as module_reader:
+            await bot._run_song_control_cycle()
+        self.assertEqual(provider.await_count, 1)
+        self.assertTrue(self.text in provider.call_args.args[0], 'eligible older renamed-member original did not reach writer')
+        self.assertEqual(module_reader.call_args.kwargs['public_subjects'], (('discord_user:43', 'Chris'),))
+        self.assertIn('result', transport.call_args_list[1].args[1])
+
+    def test_historical_author_lookup_is_song_only_and_merges_current_name_collisions(self):
+        self.member.display_name = self.member.global_name = self.member.name = 'Current Member'
+        self.assertEqual(named_sources._named_public_member_subjects(self.guild, 'Song about Chris'), ((), ()))
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ((43, 'Chris'),))
+        self.guild.members.append(SimpleNamespace(id=44, display_name='Chris', global_name='', name='', bot=False))
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ())
+
+    def test_eligible_historical_labels_keep_collisions_until_private_source_is_withdrawn(self):
+        self.member.display_name = self.member.global_name = self.member.name = 'Current Member'
+        self.guild.members.append(SimpleNamespace(id=44, display_name='Other Current Member', global_name='', name='', bot=False))
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            stamp = conn.execute('SELECT timestamp FROM conversations WHERE id=12').fetchone()[0]
+            conn.execute("INSERT INTO conversations VALUES (13,44,'Chris','A different public author.', 'user',9001,'public_home',?,77,'public-stage',9013)", (stamp,))
+            conn.execute("INSERT INTO memory_ledger_entries VALUES ('root-13',77,'conversations','13','discord_user:44','active',1,'observation')")
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ())
+        self.change('UPDATE memory_ledger_entries SET public_usable=0 WHERE entry_id=?', ('root-13',))
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ((43, 'Chris'),))
+
+    def test_historical_label_requires_current_guild_member_and_public_original(self):
+        self.member.display_name = self.member.global_name = self.member.name = 'Current Member'
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ((43, 'Chris'),))
+        self.guild.members.clear()
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ())
+        self.guild.members.append(self.member)
+        self.member.bot = True
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ())
+        self.member.bot = False
+        self.guild.id = 78
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ())
+        self.guild.id = 77
+        for sql in (
+            "UPDATE conversations SET channel_policy='sealed_test'",
+            "UPDATE conversations SET role='model'",
+            "UPDATE conversations SET guild_id=78",
+        ):
+            with self.subTest(sql=sql):
+                self.change(sql)
+                self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ())
+                self.change("UPDATE conversations SET channel_policy='public_home',role='user',guild_id=77")
+
+    def test_historical_author_labels_still_require_complete_labels(self):
+        self.member.display_name = self.member.global_name = self.member.name = 'Current Member'
+        self.change("UPDATE conversations SET user_name='Chris Crew'")
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris')[0], ())
+        self.assertEqual(bot._song_named_public_subjects('Song about Chris Crew')[0], ((43, 'Chris Crew'),))
+
+    async def test_historical_source_read_unavailable_blocks_provider(self):
+        provider = mock.AsyncMock(return_value=bot.GenerationResult(True, json.dumps(self.output)))
+        with mock.patch.object(named_sources, '_open_member_memory_read_connection', side_effect=sqlite3.DatabaseError('unavailable')), \
+             mock.patch.object(bot, '_generate_gemini_content_result_async', provider), \
+             mock.patch.object(bot, '_song_control_request_sync', side_effect=[self.control, {'ok': True}]) as transport:
+            await bot._run_song_control_cycle()
+        self.assertEqual(provider.await_count, 0)
+        self.assertEqual(transport.call_args_list[1].args[1].get('errorCode'), 'CONTEXT_UNAVAILABLE')
+
+    async def test_renamed_member_original_withdrawal_blocks_exact_receipt_replay(self):
+        self.member.display_name = self.member.global_name = self.member.name = 'Current Member'
+        provider = mock.AsyncMock(return_value=bot.GenerationResult(True, json.dumps(self.output)))
+        with mock.patch.object(bot, '_generate_gemini_content_result_async', provider), \
+             mock.patch.object(bot, '_song_control_request_sync', side_effect=[self.control, OSError('failed delivery'), self.control, {'ok': True}]) as transport:
+            await bot._run_song_control_cycle()
+            self.assertEqual(provider.await_count, 1)
+            self.assertTrue(self.text in provider.call_args.args[0], 'renamed-member original missing before withdrawal')
+            self.assertIn('result', transport.call_args_list[1].args[1])
+            self.change('UPDATE memory_ledger_entries SET public_usable=0')
+            await bot._run_song_control_cycle()
+        self.assertEqual(provider.await_count, 1)
+        self.assertEqual(transport.call_args_list[3].args[1].get('errorCode'), 'CONTEXT_UNAVAILABLE')
+        self.assertNotIn('result', transport.call_args_list[3].args[1])
+
     def test_duplicate_name_wrong_guild_and_private_original_never_seed_named_history(self):
         self.assertIn(self.text, bot._read_song_public_context(self.command['options']).text)
         duplicate = SimpleNamespace(id=44, display_name='Chris', global_name='', name='', bot=False)
@@ -487,7 +696,10 @@ class SongNamedPublicOriginalTests(unittest.IsolatedAsyncioTestCase):
         serialized = SongContext('', tuple(json.loads(json.dumps(context.basis))))
         self.assertTrue(bot._song_public_context_is_current(serialized))
         self.member.display_name = self.member.global_name = self.member.name = 'Renamed Member'
+        self.assertTrue(bot._song_public_context_is_current(serialized))
+        self.guild.members.clear()
         self.assertFalse(bot._song_public_context_is_current(serialized))
+        self.guild.members.append(self.member)
         self.member.display_name = self.member.global_name = self.member.name = 'Chris'
         self.change('UPDATE memory_ledger_entries SET public_usable=0')
         self.assertFalse(bot._song_public_context_is_current(serialized))
