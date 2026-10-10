@@ -117,12 +117,13 @@ def _local_version(conn, guild_id, show_id, version_id):
         return None
 
 
-def select_editorial_publications(conn, guild_id, snapshot, *, observed_before, topic_text="", limit=2):
+def select_editorial_publications(conn, guild_id, snapshot, *, observed_before, topic_text="", limit=2,
+                                  lookback_days=PUBLICATION_LOOKBACK_DAYS, max_results=2):
     """Exact released versions, within a bounded historical window; no lyrics."""
     if not snapshot or snapshot.get("available") is not True:
         return []
     end = datetime.fromisoformat(observed_before.replace("Z", "+00:00"))
-    start = end - timedelta(days=PUBLICATION_LOOKBACK_DAYS)
+    start = end - timedelta(days=max(1, min(int(lookback_days), 3650)))
     terms = set(re.findall(r"\w{4,}", topic_text.casefold()))
     selected = []
     for song in sorted(snapshot["songs"], key=lambda s: datetime.fromisoformat(s["publishedAt"].replace("Z", "+00:00")), reverse=True):
@@ -155,7 +156,7 @@ def select_editorial_publications(conn, guild_id, snapshot, *, observed_before, 
         selected.append({"summary": text, "basis": basis, "showLink": song["url"],
                          "publication_card": {key: card[key][:limit]
                                               for key, limit in PUBLICATION_CARD_LIMITS.items()}})
-        if len(selected) >= max(1, min(limit, 2)):
+        if len(selected) >= max(1, min(limit, max(1, min(int(max_results), 12)))):
             break
     return selected
 

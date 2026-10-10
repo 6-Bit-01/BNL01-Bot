@@ -38101,11 +38101,9 @@ async def _generate_website_relay_guarded(guild_id: int, *, allow_quiet_sources:
 
 _ballad_cycle_task = None
 _song_cycle_task = None
-# The maintained factual owner supplies only relevant music/BNL background,
-# without forcing its personnel roster into an unrelated song.
-SONG_BACKGROUND = "\n".join(line for line in render_prompt_canon_block().splitlines()
-    if line.startswith(("- The music and collective existed", "- BARCODE Radio is",
-                        "- You are the BARCODE Network Liaison Entity")))
+# The same maintained public canon and shared BNL mind used by Ballads.
+# A source roster is context, never a requirement to name everyone in a song.
+SONG_BACKGROUND = render_prompt_canon_block() + "\n" + render_ecosystem_lore_block()
 
 
 def _song_control_request_sync(method="GET", payload=None):
@@ -38144,8 +38142,8 @@ async def _run_song_control_cycle():
                 if not await asyncio.to_thread(check_quota_availability, SONG_ROUTE):
                     raise SongFailure("BUDGET_UNAVAILABLE")
                 result = await asyncio.wait_for(_generate_gemini_content_result_async(
-                    "You are BNL-01, the BARCODE Network Liaison Entity.\n"
-                    + _BNL01_PACKET_VOICE_PROMPT + "\n" + SONG_BACKGROUND + "\n" + prompt,
+                    BNL01_PACKET_OWNED_SYSTEM_PROMPT + "\n" + SONG_BACKGROUND + "\n"
+                    + prompt.removeprefix(SUNO_LYRIC_PROTOCOL + "\n"),
                     SONG_ROUTE,
                 ), timeout=240)
                 if not result.success:

@@ -688,3 +688,28 @@ Before merging a runtime change:
 2. Run `make check` on a supported Python version.
 3. Confirm CI passes on Python 3.9 and 3.12.
 4. Keep live behavior, memory governance, public/private evidence boundaries, and website contract changes in explicitly scoped PRs.
+
+## Private BARCODE songwriting
+
+Authorized Owner/Crew commands reuse the Broadcast Ballads shared BNL mind and
+complete Suno/songwriting protocol: sustained multisyllabic phrasing, coherent
+2–4-style blends, default 1970–2010 era, 1,400-character lyric minimum unless
+directed otherwise, and compact generated Style copy (250–400 characters,
+500 maximum). The existing final Style formatter supplies that ceiling without
+another model call. User edits remain intact during lyric-only regeneration.
+The existing 2,000-word lyric maximum and five-minute structure target remain.
+
+This workspace is freeform: directions can all be empty, no episode is required,
+and musical form serves the subject. Context uses the existing public canon/lore,
+source-revalidated public Moments, current original-backed retained show views,
+and up to twelve exact released Ballad references for subject/arrangement variety.
+Episode memories are optional inspiration; neither a recap nor a participant
+roll call is required. Released creative work is never evidence for a real event.
+Private producer feedback, unpublished Ballads, account data, personal memory
+and Relationship state are excluded. No separate memory/catalog or learning
+store is created, and private workspace lyrics never become factual memory.
+
+Source lineage is retained in existing command receipts and checked before and
+after generation, before delivery and on replay. Withdrawn/corrected originals
+or unreleased references invalidate pending copy. The current-source fence is
+optional on the existing show reader; its legacy defaults stay unchanged.

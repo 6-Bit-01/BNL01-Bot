@@ -1124,6 +1124,7 @@ def _load_show_discord_exchanges(
     limit: int = TIKTOK_SHOW_EVIDENCE_MAX_CONVERSATION_ROWS,
     messages_out: list[dict[str, Any]] | None = None,
     window_bounds: tuple[int, int] | None = None,
+    require_current_originals: bool = False,
 ) -> Optional[list[dict[str, Any]]]:
     """Pair public in-show Discord messages with BNL's recorded responses.
 
@@ -1227,6 +1228,14 @@ def _load_show_discord_exchanges(
     normalized_rows.sort(
         key=lambda item: (int(item["occurredAtMs"]), int(item["id"]))
     )
+    if require_current_originals:
+        # Fresh passive chatter has no retained interaction to revalidate.
+        # Its original's lifecycle and incoming corrections still own use.
+        _originals, blocked = _show_original_conversation_state(
+            conn, guild_id=int(guild_id),
+            row_roles={int(row["id"]): row["role"] for row in normalized_rows},
+        )
+        normalized_rows = [row for row in normalized_rows if int(row["id"]) not in blocked]
     if messages_out is not None:
         # The timeline retains ordinary public chatter independently of BNL
         # response pairing. It never marks those messages as addressed to BNL.
@@ -2942,6 +2951,7 @@ def _authored_show_messages(ledger: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def _show_interval_messages(
     conn: sqlite3.Connection, *, guild_id: int, ledger: Mapping[str, Any],
+    require_current_originals: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Enrich a selected interval from its existing public conversation owner.
 
@@ -2954,6 +2964,7 @@ def _show_interval_messages(
         result = _load_show_discord_exchanges(
             conn, guild_id=guild_id, show={}, messages_out=discord_rows,
             window_bounds=(int(ledger.get("startedAtMs") or 0), int(ledger.get("endedAtMs") or 0)),
+            require_current_originals=require_current_originals,
         )
     except (sqlite3.DatabaseError, TypeError, ValueError):
         result = None
@@ -2984,9 +2995,13 @@ def load_show_timeline_discord_messages(
 def _show_recall_messages(
     conn: sqlite3.Connection, *, guild_id: int, ledger: Mapping[str, Any],
     diagnostics_out: Optional[dict] = None,
+    require_current_originals: bool = False,
 ) -> list[dict[str, Any]]:
     """Reuse the fresh public conversation read for bounded episode recall."""
-    messages, complete = _show_interval_messages(conn, guild_id=guild_id, ledger=ledger)
+    messages, complete = _show_interval_messages(
+        conn, guild_id=guild_id, ledger=ledger,
+        require_current_originals=require_current_originals,
+    )
     if diagnostics_out is not None:
         diagnostics_out.update(discord_complete=complete)
     timeline = sorted((
@@ -4567,6 +4582,7 @@ def select_tiktok_show_episode_context_items(
     now: Any = None,
     max_shows: int = 8,
     artist_labels: tuple[str, ...] = (),
+    require_current_originals: bool = False,
 ) -> tuple[TikTokShowEpisodeContextItem, ...]:
     """Select compact show evidence for the existing intelligence packet.
 
@@ -4574,6 +4590,8 @@ def select_tiktok_show_episode_context_items(
     separate authority views for show/community scope, retained participants,
     or caller-authorized subject continuity. With continuity allowed, the
     speaker's bounded background does not require matching request words.
+    Creative consumers can require a fresh original-source fence for cached
+    human views. Independently valid first-party operations retain their owner.
     """
 
     if int(guild_id or 0) <= 0 or not str(user_text or "").strip():
@@ -4631,23 +4649,60 @@ def select_tiktok_show_episode_context_items(
     selected_ranked = ranked[: (
         max(1, min(int(max_shows or 1), 12)) if multi_show else 1
     )]
+    quote_literals = _current_show_quote_literals(user_text)
+
+    def current_originals_for_row(row):
+        ledger = row["ledger"]
+        original = _lookup_original_show_quotes(
+            "", guild_id=guild_id, ledger=ledger, literals=quote_literals,
+            source_conn=conn,
+        )
+        # Retained Discord exchanges keep their existing age-out policy, but
+        # current correction/privacy controls and surviving originals still
+        # own whether their cached participant/topic projection is eligible.
+        retained = _merge_retained_discord_exchanges(
+            (), ledger, connection=conn, guild_id=guild_id,
+        )
+        original["cached_projection_current"] = bool(
+            original["cached_projection_current"]
+            and retained == list(ledger.get("discordInteractions") or ())
+        )
+        original["source_digest"] = _context_digest(original["source_digest"], retained)
+        return original
+
+    current_originals = {
+        str(row.get("showKey") or ""): current_originals_for_row(row)
+        for _score, _rank, row, _matches in selected_ranked
+    } if require_current_originals else {}
     preparation_items = []
     if show_preparation_requested(user_text):
         related = _load_show_related_sources(conn, guild_id=guild_id)
         for _score, _rank, row, _matches in selected_ranked[:2]:
+            original = current_originals.get(str(row.get("showKey") or ""))
+            if require_current_originals and not (
+                original and original["status"] == "complete"
+                and original["cached_projection_current"]
+            ):
+                continue
             view = _show_preparation_view(
                 conn, guild_id=guild_id, ledger=row["ledger"], related_sources=related,
                 same_date_show_count=sum(1 for candidate in loaded
                     if candidate["ledger"].get("showDate") == row["ledger"].get("showDate")),
             )
-            preparation_items.append(_show_context_item(
+            preparation_item = _show_context_item(
                 kind="dialogue", loaded_rows=(row,), source_class=SourceClass.EVIDENCE_PROJECTION.value,
                 confidence=Confidence.HIGH.value, subject_key="barcode_radio",
                 text=_render_show_preparation(view),
                 participants=tuple(m["subjectRef"] for m in view["messages"] if m["role"] == "user"),
                 score=205.0, usage="show_linked_preparation",
                 uncertainty_status="linked_pre_show_evidence_not_on_air",
-            ))
+            )
+            if require_current_originals:
+                preparation_item = replace(preparation_item, source_digest=_context_digest(
+                    preparation_item.source_digest, original["source_digest"],
+                    original["status"], original["reason"],
+                ))
+            preparation_items.append(preparation_item)
         if show_preparation_only_requested(user_text):
             return tuple(preparation_items)
     if requested_tiktok_show_word_count(user_text):
@@ -4669,23 +4724,27 @@ def select_tiktok_show_episode_context_items(
                 item.source_digest, frequency.get("sourceDigest"), frequency.get("status"),
             )))
         return tuple(frequency_items)
-    quote_literals = _current_show_quote_literals(user_text)
     if quote_literals:
         # Match the ordinary reader's bounded show scope for fresh raw scans.
         # Non-lookup community recall retains its existing broader selection.
         selected_ranked = selected_ranked[:TIKTOK_SHOW_EVIDENCE_RECALL_SHOW_LIMIT]
     selected_rows = [item[2] for item in selected_ranked]
     lookups = {
-        str(row.get("showKey") or ""): _lookup_original_show_quotes(
+        str(row.get("showKey") or ""): (current_originals[str(row.get("showKey") or "")]
+            if require_current_originals else _lookup_original_show_quotes(
             "", guild_id=guild_id, ledger=row["ledger"], literals=quote_literals,
             source_conn=conn,
-        ) for row in selected_rows
-    } if quote_literals else {}
+        )) for row in selected_rows
+    } if quote_literals or require_current_originals else {}
     # A lookup's fresh originals also own whether human-derived cached packet
     # views remain usable. Independently valid operations keep their owner.
     authored_rows = [
         row for row in selected_rows
-        if not lookups or lookups[str(row.get("showKey") or "")]["cached_projection_current"]
+        if not lookups or (
+            lookups[str(row.get("showKey") or "")]["cached_projection_current"]
+            and (not require_current_originals
+                 or lookups[str(row.get("showKey") or "")]["status"] == "complete")
+        )
     ]
     participant_matches = [
         participant
@@ -4706,7 +4765,10 @@ def select_tiktok_show_episode_context_items(
     interval_item = None
     if len(authored_rows) == 1 and not quote_literals and show_conversation_interval_requested(user_text):
         row = authored_rows[0]
-        messages, discord_complete = _show_interval_messages(conn, guild_id=guild_id, ledger=row["ledger"])
+        messages, discord_complete = _show_interval_messages(
+            conn, guild_id=guild_id, ledger=row["ledger"],
+            require_current_originals=require_current_originals,
+        )
         interval = build_show_interval_conversation(
             row["ledger"], user_text, messages=messages, discord_complete=discord_complete,
         )
@@ -4762,9 +4824,12 @@ def select_tiktok_show_episode_context_items(
     # community items with their existing source classes. Only its shortened
     # dialogue view is replaced by the complete chronological conversation.
     messages_by_show = None
-    if interval_item is None and not quote_literals and _SHOW_QUERY_RE.search(user_text):
+    if interval_item is None and not quote_literals and (
+        _SHOW_QUERY_RE.search(user_text) or require_current_originals
+    ):
         messages_by_show = {str(row["showKey"]): _show_recall_messages(
             conn, guild_id=guild_id, ledger=row["ledger"],
+            require_current_originals=require_current_originals,
         ) for row in authored_rows}
     dialogue_item = interval_item or _dialogue_episode_context_item(
         authored_rows,
@@ -4788,6 +4853,8 @@ def tiktok_show_episode_context_item_version(
     allow_subject_continuity: bool = False,
     now: Any = None,
     artist_labels: tuple[str, ...] = (),
+    max_shows: int = 8,
+    require_current_originals: bool = False,
 ) -> str:
     """Rebuild a selected item and return its current source digest."""
 
@@ -4795,7 +4862,8 @@ def tiktok_show_episode_context_item_version(
         conn, guild_id=guild_id, user_text=user_text,
         subject_user_id=subject_user_id,
         allow_subject_continuity=allow_subject_continuity, now=now,
-        artist_labels=artist_labels,
+        artist_labels=artist_labels, max_shows=max_shows,
+        require_current_originals=require_current_originals,
     ).get(str(source_ref or ""), "")
 
 
@@ -4804,6 +4872,8 @@ def tiktok_show_episode_context_item_versions(
     subject_user_id: int, allow_subject_continuity: bool = False,
     now: Any = None,
     artist_labels: tuple[str, ...] = (),
+    max_shows: int = 8,
+    require_current_originals: bool = False,
 ) -> dict[str, str]:
     """Rebuild linked show views together within the caller's fresh snapshot."""
 
@@ -4815,6 +4885,8 @@ def tiktok_show_episode_context_item_versions(
         allow_subject_continuity=allow_subject_continuity,
         now=now,
         artist_labels=artist_labels,
+        max_shows=max_shows,
+        require_current_originals=require_current_originals,
     )
     return {item.source_ref: item.source_digest for item in items}
 
