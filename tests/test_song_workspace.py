@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import hashlib
+import bnl_broadcast_ballads as ballads
 import sqlite3
 import tempfile
 import unittest
@@ -15,6 +17,40 @@ if song_spec:
 else:
     songs = None
 
+
+class CatalogResponse:
+    status = 200
+
+    def __init__(self, catalog):
+        self.body = json.dumps({"ballads": catalog}).encode()
+
+    def read(self, limit=-1):
+        return self.body[:limit] if limit >= 0 else self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+def seed_ballad(db, published_at):
+    ballads.initialize(db)
+    version = dict(id="released-1", showId="show-1", ordinal=1, title="The Chairs Stayed Warm",
+                   style="Chamber soul with dub bass", palette={"genres": "chamber soul"},
+                   lyrics="LYRICS_ARE_NOT_TESTIMONY", rawOutput="PRIVATE_RAW_OUTPUT",
+                   options={"feedback": "PRIVATE_PRODUCER_FEEDBACK"}, author="BNL-01")
+    with closing(sqlite3.connect(db)) as conn, conn:
+        for ordinal, title in ((1, version["title"]), (2, "UNPUBLISHED_NEWER_DRAFT")):
+            saved = {**version, "ordinal": ordinal, "id": f"released-{ordinal}", "title": title}
+            saved["contentHash"] = hashlib.sha256(json.dumps(saved, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            conn.execute("INSERT INTO bnl_ballad_versions VALUES (?,?,?,?,?)",
+                         (1, "show-1", saved["id"], ordinal, json.dumps(saved)))
+    return [{"show": {"sessionId": "show-1", "title": "Friday Radio", "showDate": "2026-08-28"},
+             "version": {key: version[key] for key in ("id", "title", "lyrics", "style", "palette", "author")},
+             "linerNotes": {"about": "A song about the last light", "inspiration": "A creative interpretation",
+                            "mentions": "", "inspiredBy": "An earlier broadcast"},
+             "publishedAt": published_at, "audioId": "audio-1", "duration": 180,
+             "presentation": {"credits": "BNL-01"}, "artistLinks": []}]
 
 class SongWorkspaceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -45,7 +81,92 @@ class SongWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertIn('All options are optional', self.calls[0])
         self.assertNotIn('AUTHORIZED SHOW EVIDENCE', self.calls[0])
-        self.assertIn('Do not add real people, named characters or cast lists', self.calls[0])
+        self.assertIn('Do not add real people or cast lists', self.calls[0])
+
+    def test_private_song_keeps_the_complete_ballad_songwriting_requirements(self):
+        prompt = songs.build_prompt(self.command, songs.SongContext())
+        for requirement in ('1,400 characters', '2–4 contrasting genres/styles', '1970–2010',
+                            '250–400 characters', '500 characters', 'multisyllabic rhyme families'):
+            self.assertTrue(requirement in prompt, requirement)
+        self.assertIn('form', prompt)
+        self.assertIn('No show or episode is required', prompt)
+        self.assertNotIn('Style maximum 6000 characters', prompt)
+
+    async def test_new_style_uses_existing_compact_copy_boundary_and_preserves_lyrics(self):
+        from bnl_creative_protocol import SUNO_STYLE_MAX_CHARS
+        self.output['style'] = '1978 chamber pop and dub; close dry voice. ' + 'Warm acoustic arrangement ' * 35
+        result = await self.execute()
+        self.assertEqual(result['outcome'], 'applied')
+        self.assertLessEqual(len(result['result']['style']), SUNO_STYLE_MAX_CHARS)
+        self.assertEqual(result['result']['lyrics'], self.output['lyrics'])
+
+    def test_blank_song_can_draw_on_broad_existing_public_memory(self):
+        with mock.patch('bnl_moment_engine.select_public_situation_moment_gists', return_value=()) as selector:
+            with closing(sqlite3.connect(':memory:')) as conn:
+                songs.read_context_on_connection(conn, 77, {})
+        self.assertTrue(selector.call_args.kwargs['broad_recall'])
+        self.assertFalse(selector.call_args.kwargs['require_topic_overlap'])
+        self.assertGreaterEqual(selector.call_args.kwargs['max_results'], 6)
+
+    def test_released_catalog_and_finalized_show_context_reach_song_without_private_drafts(self):
+        from types import SimpleNamespace
+        import bnl_broadcast_ballads as ballads
+        catalog = seed_ballad(self.db, '2026-08-28T12:00:00Z')
+        with mock.patch('urllib.request.urlopen', return_value=CatalogResponse(catalog)):
+            snapshot = ballads.read_publication_catalog('https://www.barcode-network.com')
+        show = SimpleNamespace(kind='dialogue', text='Public listeners joked about a crooked paper lantern.',
+                               source_ref='show:one:dialogue', source_digest='show-v1')
+        with mock.patch('bnl_moment_engine.select_public_situation_moment_gists', return_value=()), \
+             mock.patch('bnl_tiktok_show_ledger.select_tiktok_show_episode_context_items', return_value=(show,)) as reader:
+            with closing(sqlite3.connect(self.db)) as conn:
+                context = songs.read_context_on_connection(conn, 1, {}, publication_snapshot=snapshot,
+                                                         now='2026-10-10T12:00:00Z')
+        self.assertIn('crooked paper lantern', context.text)
+        self.assertIn('The Chairs Stayed Warm', context.text)
+        prompt = songs.build_prompt(self.command, context)
+        self.assertIn('PRIOR CREATIVE CATALOG', prompt)
+        for private in ('PRIVATE_PRODUCER_FEEDBACK', 'PRIVATE_RAW_OUTPUT', 'UNPUBLISHED_NEWER_DRAFT',
+                        'LYRICS_ARE_NOT_TESTIMONY'):
+            self.assertNotIn(private, prompt)
+        self.assertTrue(reader.call_args.kwargs['require_current_originals'])
+        self.assertEqual(reader.call_args.kwargs['subject_user_id'], 0)
+        self.assertFalse(reader.call_args.kwargs['allow_subject_continuity'])
+
+    async def test_released_song_withdrawal_invalidates_saved_inspiration(self):
+        import bnl_broadcast_ballads as ballads
+        catalog = seed_ballad(self.db, '2026-08-28T12:00:00Z')
+        with mock.patch('urllib.request.urlopen', return_value=CatalogResponse(catalog)):
+            snapshot = ballads.read_publication_catalog('https://www.barcode-network.com')
+        with closing(sqlite3.connect(self.db)) as conn:
+            context = songs.read_context_on_connection(conn, 1, {}, publication_snapshot=snapshot,
+                                                     now='2026-10-10T12:00:00Z')
+        self.assertIn('The Chairs Stayed Warm', context.text)
+        async def generate(prompt):
+            return songs.SongGeneration(json.dumps(self.output))
+        with mock.patch('bnl_broadcast_ballads.read_publication_catalog', return_value=snapshot):
+            result = await songs.execute_command(self.db, 1, self.command, generate=generate,
+                                                context_reader=lambda _: context)
+        self.assertEqual(result['outcome'], 'applied')
+        with mock.patch('bnl_broadcast_ballads.read_publication_catalog', return_value={'available':True,'songs':[]}):
+            replay = await songs.execute_command(self.db, 1, self.command, generate=generate,
+                                                context_reader=lambda _: context)
+        self.assertEqual(replay['errorCode'], 'CONTEXT_UNAVAILABLE')
+        self.assertNotIn('result', replay)
+
+    def test_show_revision_revalidation_uses_the_same_frozen_public_read_scope(self):
+        basis = ({'sourceKind':'show_episode','sourceId':'show:one:dialogue','sourceVersion':'v1',
+                  'query':'last 3 shows community','observedAt':'2026-10-10T12:00:00Z','maxShows':3},)
+        context = songs.SongContext('Public scene', basis)
+        with closing(sqlite3.connect(self.db)):
+            pass
+        with mock.patch('bnl_tiktok_show_ledger.tiktok_show_episode_context_item_versions',
+                        return_value={'show:one:dialogue':'v1'}) as versions:
+            self.assertTrue(songs.context_is_current(self.db, 77, context))
+        self.assertTrue(versions.call_args.kwargs['require_current_originals'])
+        self.assertEqual(versions.call_args.kwargs['max_shows'], 3)
+        self.assertEqual(versions.call_args.kwargs['now'], '2026-10-10T12:00:00Z')
+        with mock.patch('bnl_tiktok_show_ledger.tiktok_show_episode_context_item_versions', return_value={}):
+            self.assertFalse(songs.context_is_current(self.db, 77, context))
 
     async def test_replay_and_a_reclaimed_lease_deliver_saved_result_without_another_generation(self):
         first = await self.execute()
@@ -277,7 +398,7 @@ class SongWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             with closing(sqlite3.connect(':memory:')) as conn:
                 context = songs.read_context_on_connection(conn, 77, {})
         self.assertEqual(context.text, '')
-        self.assertEqual(selector.call_args.kwargs['topic_text'], 'BARCODE music community')
+        self.assertEqual(selector.call_args.kwargs['topic_text'], '')
         self.assertEqual(selector.call_args.kwargs['allowed_channel_policies'], ('public_home', 'public_context'))
         self.assertFalse(selector.call_args.kwargs['prepare_schema'])
 

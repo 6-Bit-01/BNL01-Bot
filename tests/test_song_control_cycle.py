@@ -13,6 +13,7 @@ from urllib import request, parse, error, response
 from io import BytesIO
 from email.message import Message
 from bnl_gemini_routing import policy_for_route
+from bnl_creative_protocol import SUNO_LYRIC_PROTOCOL
 import bnl_song_workspace as songs
 from bnl_song_workspace import SongContext, SongFailure, SongGeneration, ROUTE, execute_command, read_context, prepare_delivery
 
@@ -28,7 +29,8 @@ bot = ModuleType('song_runtime_functions')
 bot.__dict__.update(dict(asyncio=asyncio, json=json, logging=logging, urllib=SimpleNamespace(request=request, parse=parse),
     SONG_ROUTE=ROUTE, SongFailure=SongFailure, SongGeneration=SongGeneration,
     execute_song_command=execute_command, prepare_song_delivery=prepare_delivery, read_song_context=read_context,
-    _BNL01_PACKET_VOICE_PROMPT='Voice: dry wit.', SONG_BACKGROUND='BARCODE is music-first.',
+    BNL01_PACKET_OWNED_SYSTEM_PROMPT='Shared BNL mind\n' + SUNO_LYRIC_PROTOCOL,
+    SUNO_LYRIC_PROTOCOL=SUNO_LYRIC_PROTOCOL, SONG_BACKGROUND='BARCODE is music-first.',
     BNL_PRIMARY_GUILD_ID=77, DB_FILE='', BNL_API_KEY='key',
     BNL_WEBSITE_CONTRACT_VERSION='1', _ballad_cycle_task=None,
     GENERATION_ERROR_LOCAL_MODEL_BUDGET='local_model_budget_exhausted',
@@ -72,7 +74,9 @@ class SongControlCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.call_args.args[1], ROUTE)
         self.assertEqual(transport.call_args_list[1].args[1], transport.call_args_list[3].args[1])
         self.assertEqual(transport.call_args_list[3].args[1]['result'], self.output)
-        self.assertNotIn('CAST CONTEXT', provider.call_args.args[0])
+        self.assertIn('Shared BNL mind', provider.call_args.args[0])
+        self.assertEqual(provider.call_args.args[0].count(SUNO_LYRIC_PROTOCOL), 1)
+        self.assertIn('BARCODE is music-first', provider.call_args.args[0])
 
     async def test_budget_denial_prevents_provider_and_only_delivers_allowlisted_failure(self):
         self.assertTrue(hasattr(bot, '_run_song_control_cycle'), 'private song bridge cycle is missing')
