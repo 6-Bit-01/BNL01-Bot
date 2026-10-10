@@ -9,11 +9,13 @@ import itertools
 import os
 import sqlite3
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
 import test_requested_show_date_delivery as delivery
 from bnl_journal_source_store import purge_user_bound_conversation_sources_on_connection
+from bnl_tiktok_live_context import count_tiktok_show_word_frequency
 from test_conversation_batching import FakeAuthor, FakeChannel, FakeGuild, FakeMessage
 
 
@@ -401,6 +403,200 @@ class ShowWordCountDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_packet_word_correction_withdrawal_refreshes_count_before_one_send(self):
         await self._corrected_word_delivery(enabled=True, withdraw=True)
 
+
+
+    def _seed_current_word_count(self):
+        def stamp(value):
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+
+        def show(session_id, day, start, end=None):
+            milestones = [{"eventType": "broadcast_started", "occurredAt": start}]
+            if end:
+                milestones.append({"eventType": "session_archived", "occurredAt": end})
+            return {
+                "sessionId": session_id, "showDate": day, "title": "Test Broadcast",
+                "status": "archived" if end else "open", "milestones": milestones,
+            }
+
+        current = show("delivery-current-frequency", "2026-10-02", "2026-10-03T02:05:35.254Z")
+        latest = show("delivery-latest-frequency", "2026-09-25",
+                      "2026-09-26T02:05:35.254Z", "2026-09-26T08:08:03.054Z")
+        rehearsal = show("delivery-same-date-rehearsal", "2026-10-02",
+                         "2026-10-03T00:05:00Z", "2026-10-03T01:00:00Z")
+        self.observed_at = datetime(2026, 10, 3, 4, 18, 14, tzinfo=timezone.utc)
+        self.current_start_ms = stamp(current["milestones"][0]["occurredAt"])
+        self.current_end_ms = int(self.observed_at.timestamp() * 1000)
+        self.current_source_refs = []
+        self.current_first_receipts = {}
+        originals = (
+            "Butt butt!", "butt", "BUTT?", "butt, butts", "no butt?",
+            "butt... butt", "butts", "BUTTS!", "butter", "about", "butt",
+        )
+        records = [
+            ("delivery-current-original-" + str(index), current["sessionId"],
+             self.current_start_ms + 1000 * (index + 1), text)
+            for index, text in enumerate(originals)
+        ] + [
+            ("delivery-latest-original", latest["sessionId"],
+             stamp("2026-09-26T03:00:00Z"), "butt " * 17),
+            ("delivery-rehearsal-original", rehearsal["sessionId"],
+             stamp("2026-10-03T00:30:00Z"), "butt " * 31),
+        ]
+        for index, (source_key, session_id, occurred, text) in enumerate(records):
+            ingested = occurred + 100
+            result = delivery.record_source_event(
+                bot.DB_FILE, guild_id=77, source_kind="tiktok_live_chat",
+                source_key=source_key, occurred_at_ms=occurred, ingested_at_ms=ingested,
+                raw_text=text, sanitized_summary=text, channel_policy="public_context",
+                subject_ref="tiktok_handle:test.count." + str(index),
+                private_display_name="Test Count Viewer " + str(index), public_usable=True,
+                metadata={"eventType": "comment", "handle": "test.count." + str(index),
+                          "sessionId": session_id},
+            )
+            self.assertTrue(result.ok)
+            if session_id == current["sessionId"]:
+                self.current_first_receipts[source_key] = ingested
+                self.current_source_refs.append({
+                    "sourceKind": "tiktok_live_chat", "sourceKey": source_key,
+                    "contentHash": result.content_hash, "occurredAtMs": occurred,
+                })
+        self.read_model = delivery.show_fixture.authorized_read_model({
+            "currentShow": current, "latestShow": latest, "shows": [rehearsal, latest],
+        })
+        self.read_model["sections"]["queue"] = {
+            "available": True, "accessScope": "public", "session": {
+                "id": current["sessionId"], "showDate": current["showDate"],
+                "title": "Test Broadcast", "status": "open", "broadcastPhase": "live",
+            },
+        }
+        synced = delivery.show_fixture.sync_tiktok_show_evidence_ledgers(
+            bot.DB_FILE, guild_id=77, read_model=self.read_model,
+            artist_identity_index=delivery.show_fixture.artist_index(),
+            environ=delivery.show_fixture.ENABLED_QUEUE_ENV,
+        )
+        self.assertEqual(synced["projectionErrors"], 0)
+        self.fetch.return_value = self.read_model
+
+    async def _current_word_count_delivery(self, *, enabled, request, prior_request=""):
+        self._seed_current_word_count()
+        channel_id = next(self.channel_ids)
+        self.addCleanup(bot._recent_room_events.pop, (77, channel_id), None)
+        if prior_request:
+            delivery.RequestedShowDateDeliveryTests._capture_human_history(
+                self, "sealed_test", channel_id, (prior_request,),
+            )
+        frequencies, packets = [], []
+        real_packet_builder = bot.build_unified_intelligence_packet
+
+        def observe_count(show, originals, query):
+            result = count_tiktok_show_word_frequency(show, originals, query)
+            frequencies.append((show, originals, query, result))
+            return result
+
+        def observe_packet(*args, **kwargs):
+            packet = real_packet_builder(*args, **kwargs)
+            packets.append(packet)
+            return packet
+
+        answer = "The current captured TikTok chat has 9 whole-word butt occurrences across 7 matching messages."
+
+        async def provider_answer(_prompt, *_args, **kwargs):
+            if kwargs.get("attempt_counter") is not None:
+                kwargs["attempt_counter"].mark_started()
+            return answer
+
+        with (
+            self._packet_env(enabled, channel_id),
+            mock.patch.object(bot, "_bnl_read_model_cached_at", self.observed_at),
+            mock.patch("bnl_tiktok_live_context.count_tiktok_show_word_frequency", new=observe_count),
+            mock.patch.object(bot, "build_unified_intelligence_packet", new=observe_packet),
+            mock.patch.object(bot, "load_tiktok_show_source_events",
+                              wraps=bot.load_tiktok_show_source_events) as reader,
+            mock.patch.object(bot, "build_live_prompt_context",
+                              wraps=bot.build_live_prompt_context) as rolling,
+        ):
+            self._assert_packet_scope(enabled, channel_id)
+            message, generation, _guard = await self._direct(channel_id, provider_answer, request=request)
+
+        generation.assert_awaited_once()
+        self.assertEqual(generation.await_args.kwargs["route"],
+                         bot.ORDINARY_CHAT_SINGLE_PACKET_ROUTE if enabled else "get_gemini_response")
+        self.assertEqual(message.replies + message.channel.sent, [answer])
+        rolling.assert_not_called()
+        selected = [entry for entry in frequencies if entry[3]
+                    and entry[3]["sessionId"] == "delivery-current-frequency"]
+        self.assertTrue(selected, "The authoritative current session never reached the real counter")
+        selected_show, originals, resolved, receipt = selected[-1]
+        self.assertEqual(bot.requested_tiktok_show_word_count(resolved), "butt")
+        if prior_request:
+            self.assertIn(prior_request, resolved)
+            self.assertIn("Current follow-up: " + request, resolved)
+        self.assertEqual(selected_show["_evidenceObservedThroughMs"], self.current_end_ms)
+        self.assertEqual({event["event_id"]: event["ingested_at_ms"] for event in originals},
+                         self.current_first_receipts)
+        self.assertEqual(receipt["originalSourceRefs"], self.current_source_refs)
+        self.assertEqual((receipt["status"], receipt["word"], receipt["capturedMessageCount"],
+                          receipt["occurrenceCount"], receipt["matchingMessageCount"]),
+                         ("complete", "butt", 11, 9, 7))
+        self.assertEqual((receipt["windowStartMs"], receipt["windowEndMs"]),
+                         (self.current_start_ms, self.current_end_ms))
+        self.assertTrue(any(call.kwargs.get("word_frequency")
+                            and call.kwargs["show"].get("sessionId") == receipt["sessionId"]
+                            for call in reader.call_args_list))
+        prompt = generation.await_args.args[0]
+        for evidence in (
+            'Word "butt": occurrenceCount=9; matchingMessageCount=7',
+            'sessionId="delivery-current-frequency"',
+            "windowUTC=2026-10-03T02:05:35.254000+00:00 through 2026-10-03T04:18:14+00:00 inclusive",
+            "eligibleCapturedMessagesChecked=11",
+            "originalWindowRevision=" + receipt["sourceDigest"],
+        ):
+            self.assertIn(evidence, prompt)
+        self.assertTrue(packets, "The native source handoff never reached packet assembly")
+        for packet in packets:
+            native_request = packet.request
+            self.assertEqual(bot.requested_tiktok_show_word_count(
+                native_request.show_episode_selection_text), "butt")
+            self.assertIn(request, native_request.show_episode_selection_text)
+            if prior_request:
+                self.assertIn(prior_request, native_request.show_episode_selection_text)
+        for wrong_count in (17, 31):
+            self.assertNotIn("occurrenceCount=" + str(wrong_count), prompt)
+            for packet in packets:
+                self.assertFalse(any("occurrenceCount=" + str(wrong_count) in item.text
+                                     for item in packet.items))
+
+    async def test_direct_current_stream_correction_retains_same_user_count_target(self):
+        await self._current_word_count_delivery(
+            enabled=False, request="Current stream not last stream",
+            prior_request='BNL, how many times did TikTok chat say the word "butt" during the last stream?',
+        )
+
+    async def test_packet_current_stream_correction_retains_same_user_count_target(self):
+        await self._current_word_count_delivery(
+            enabled=True, request="Current stream not last stream",
+            prior_request='BNL, how many times did TikTok chat say the word "butt" during the last stream?',
+        )
+
+    async def test_direct_affirmative_current_count_beats_negated_last_stream(self):
+        await self._current_word_count_delivery(
+            enabled=False, request='BNL, count the word "butt" in the current stream, not the last stream.',
+        )
+
+    async def test_packet_affirmative_current_count_beats_negated_last_stream(self):
+        await self._current_word_count_delivery(
+            enabled=True, request='BNL, count the word "butt" in the current stream, not the last stream.',
+        )
+
+    async def test_direct_natural_tonights_show_count_keeps_singular_word_and_source_receipt(self):
+        await self._current_word_count_delivery(
+            enabled=False, request="BNL butt word count. Tonight’s show. Go",
+        )
+
+    async def test_packet_natural_tonights_show_count_keeps_singular_word_and_source_receipt(self):
+        await self._current_word_count_delivery(
+            enabled=True, request="BNL butt word count. Tonight’s show. Go",
+        )
 
 
 class ShowWordCountFollowupSourceOwnerTests(unittest.TestCase):
